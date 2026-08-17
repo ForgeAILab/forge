@@ -21,6 +21,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime"
 version = "0.1.0"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=04a772db28a86dbc7cd5c6413e97504d1e4fba05#04a772db28a86dbc7cd5c6413e97504d1e4fba05"
 dependencies = [
  "agent-runtime-ability",
  "agent-runtime-context",
@@ -45,6 +46,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-ability"
 version = "0.1.0"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=04a772db28a86dbc7cd5c6413e97504d1e4fba05#04a772db28a86dbc7cd5c6413e97504d1e4fba05"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-registry",
@@ -56,6 +58,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-context"
 version = "0.1.0"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=04a772db28a86dbc7cd5c6413e97504d1e4fba05#04a772db28a86dbc7cd5c6413e97504d1e4fba05"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-registry",
@@ -66,6 +69,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-core"
 version = "0.1.0"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=04a772db28a86dbc7cd5c6413e97504d1e4fba05#04a772db28a86dbc7cd5c6413e97504d1e4fba05"
 dependencies = [
  "agent-runtime-registry",
  "async-trait",
@@ -83,6 +87,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-lcm"
 version = "0.1.0"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=04a772db28a86dbc7cd5c6413e97504d1e4fba05#04a772db28a86dbc7cd5c6413e97504d1e4fba05"
 dependencies = [
  "agent-runtime-context",
  "agent-runtime-core",
@@ -96,6 +101,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-provider"
 version = "0.1.0"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=04a772db28a86dbc7cd5c6413e97504d1e4fba05#04a772db28a86dbc7cd5c6413e97504d1e4fba05"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-registry",
@@ -111,6 +117,7 @@ dependencies = [
 [[package]]
 name = "agent-runtime-registry"
 version = "0.1.0"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=04a772db28a86dbc7cd5c6413e97504d1e4fba05#04a772db28a86dbc7cd5c6413e97504d1e4fba05"
 dependencies = [
  "serde",
 ]

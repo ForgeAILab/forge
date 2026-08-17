@@ -63,6 +63,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Native Agent Chat turns against a ChatGPT-OAuth (Codex backend) provider no
+  longer fail with "Provider: Responses reasoning signature changed". The
+  backend re-encrypts a reasoning item's `encrypted_content` on every
+  serialization, so the terminal `response.completed` payload never matches
+  the streamed item byte-for-byte; the embedded runtime's Responses adapter
+  treated that as a malformed stream. Forge now uses the runtime's dedicated
+  ChatGPT/Codex preset (agent-runtime `04a772d`), which carries the Codex CLI
+  identifying headers itself and reads only usage from the terminal payload —
+  the same contract Codex CLI applies.
 - Starting a browser provider login no longer fails with "redirect_origin is
   not a configured trusted origin" when the UI is served from an origin the
   operator never configured (a LAN address, a hostname, or a non-default dev
