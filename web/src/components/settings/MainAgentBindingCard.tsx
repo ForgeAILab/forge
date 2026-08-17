@@ -5,45 +5,41 @@ import { Button } from '@/components/ui/button'
 import { Select } from '@/components/ui/select'
 import { Card } from '@/components/ui/card'
 import { ErrorPanel, SectionKicker, StateBadge } from '@/features/federation/components'
-import { numberValue } from '@/features/federation/format'
+import { humanize, isDirectAgent, numberValue, runtimeDisplayNames } from '@/features/federation/format'
 import {
   isVersionConflict,
-  useAgentProfilesQuery,
   useMainAgentBindingQuery,
   useSetMainAgentBindingMutation,
 } from '@/features/federation/hooks'
 import type { FederatedAgent, MainAgentBindingInput } from '@/features/federation/types'
 import { ApiError } from '@/api/client'
 
+/** One-line harness/model summary of an agent, as shown under binding pickers. */
+export function agentSummary(agent: FederatedAgent): string {
+  const runtime = isDirectAgent(agent.backend_kind)
+    ? 'Direct'
+    : (runtimeDisplayNames[agent.executor_type] ?? humanize(agent.executor_type))
+  return `${runtime} · ${agent.model ?? 'model not set'}`
+}
+
 export function MainAgentBindingCard({
   agents,
   onConnect,
-  onChangeModel,
 }: {
   agents: FederatedAgent[]
   onConnect: () => void
-  onChangeModel: (agent: FederatedAgent) => void
 }) {
   const bindingQuery = useMainAgentBindingQuery()
   const setBinding = useSetMainAgentBindingMutation()
   const [identityId, setIdentityId] = useState('')
-  const [profileId, setProfileId] = useState('')
   const [formError, setFormError] = useState<string | null>(null)
   const bindingMissing = bindingQuery.error instanceof ApiError && bindingQuery.error.status === 404
   const selectedAgent = agents.find((agent) => agent.id === identityId)
-  const profilesQuery = useAgentProfilesQuery(identityId || undefined)
-  const profiles = profilesQuery.data ?? []
 
   useEffect(() => {
     if (!bindingQuery.data) return
     setIdentityId(bindingQuery.data.identity_id)
-    setProfileId(bindingQuery.data.profile_id)
   }, [bindingQuery.data])
-
-  useEffect(() => {
-    if (!selectedAgent || profileId) return
-    setProfileId(selectedAgent.profile_id)
-  }, [profileId, selectedAgent])
 
   const identityOptions = useMemo(() => {
     const options = agents.map((agent) => ({
@@ -57,26 +53,14 @@ export function MainAgentBindingCard({
     return options
   }, [agents, bindingQuery.data?.identity_id])
 
-  const profileOptions = profiles.map((profile) => ({
-    value: profile.id,
-    label: `${profile.provider ?? profile.executor_type} · ${profile.model ?? 'profile'}`,
-  }))
-
-  function chooseIdentity(nextIdentityId: string) {
-    setIdentityId(nextIdentityId)
-    setProfileId(agents.find((agent) => agent.id === nextIdentityId)?.profile_id ?? '')
-    setFormError(null)
-  }
-
   async function save() {
-    if (!identityId || !profileId) {
-      setFormError('Choose a Main Agent identity and profile before saving.')
+    if (!identityId) {
+      setFormError('Choose a Main Agent before saving.')
       return
     }
     setFormError(null)
     const input: MainAgentBindingInput = {
       identity_id: identityId,
-      profile_id: profileId,
       expected_version: numberValue(bindingQuery.data?.version, 0),
       autonomy_policy: bindingQuery.data?.autonomy_policy ?? {},
     }
@@ -118,11 +102,11 @@ export function MainAgentBindingCard({
         <div>
           <SectionKicker>Main Agent Chat</SectionKicker>
           <h2 className="mt-1 text-lg font-semibold tracking-tight text-foreground">
-            One account-owned Main Agent binding
+            One account-owned Main Agent
           </h2>
           <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
-            Choose the one identity and profile that can answer the global timeline. Connecting an
-            identity alone never binds it to Main.
+            Choose the agent that answers the global timeline. The binding follows the agent&apos;s
+            settings — edit the agent to change its model or policy.
           </p>
         </div>
         <StateBadge
@@ -133,48 +117,30 @@ export function MainAgentBindingCard({
 
       {agents.length === 0 ? (
         <div className="mt-5 rounded-md border border-border-subtle bg-background/60 px-3 py-3 text-sm text-muted-foreground">
-          Connect an identity below before selecting a Main Agent.
+          Create an agent before selecting a Main Agent.
         </div>
       ) : (
-        <div className="mt-5 grid gap-4 md:grid-cols-2">
-          <div className="space-y-2">
-            <label
-              htmlFor="main-agent-identity"
-              className="font-mono text-micro font-semibold uppercase tracking-[0.8px] text-muted-foreground"
-            >
-              Identity
-            </label>
-            <Select
-              id="main-agent-identity"
-              value={identityId}
-              options={identityOptions}
-              placeholder="Select identity"
-              onChange={chooseIdentity}
-              aria-label="Main Agent identity"
-            />
-          </div>
-          <div className="space-y-2">
-            <label
-              htmlFor="main-agent-profile"
-              className="font-mono text-micro font-semibold uppercase tracking-[0.8px] text-muted-foreground"
-            >
-              Profile
-            </label>
-            <Select
-              id="main-agent-profile"
-              value={profileId}
-              options={profileOptions}
-              placeholder={profilesQuery.isLoading ? 'Loading profiles…' : 'Select profile'}
-              onChange={setProfileId}
-              disabled={!identityId || profilesQuery.isLoading || profileOptions.length === 0}
-              aria-label="Main Agent profile"
-            />
-            {profilesQuery.isError ? (
-              <p className="text-xs text-destructive" role="alert">
-                Profiles are unavailable for this identity.
-              </p>
-            ) : null}
-          </div>
+        <div className="mt-5 max-w-md space-y-2">
+          <label
+            htmlFor="main-agent-identity"
+            className="font-mono text-micro font-semibold uppercase tracking-[0.8px] text-muted-foreground"
+          >
+            Agent
+          </label>
+          <Select
+            id="main-agent-identity"
+            value={identityId}
+            options={identityOptions}
+            placeholder="Select agent"
+            onChange={(next) => {
+              setIdentityId(next)
+              setFormError(null)
+            }}
+            aria-label="Main Agent"
+          />
+          {selectedAgent ? (
+            <p className="text-xs leading-5 text-muted-foreground">{agentSummary(selectedAgent)}</p>
+          ) : null}
         </div>
       )}
 
@@ -188,20 +154,12 @@ export function MainAgentBindingCard({
         </div>
         <Button
           onClick={() => void save()}
-          disabled={setBinding.isPending || !identityId || !profileId || agents.length === 0}
+          disabled={setBinding.isPending || !identityId || agents.length === 0}
         >
           {setBinding.isPending ? 'Saving…' : bindingMissing ? 'Set Main Agent' : 'Save Main Agent'}
         </Button>
-        <Button
-          type="button"
-          variant="outline"
-          disabled={!selectedAgent}
-          onClick={() => selectedAgent && onChangeModel(selectedAgent)}
-        >
-          Change model…
-        </Button>
         <Button type="button" variant="outline" onClick={onConnect}>
-          Connect identity
+          New agent
         </Button>
       </div>
       {formError ? (

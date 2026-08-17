@@ -5,6 +5,7 @@ import {
   CheckCircle,
   ChatCircleDots,
   CircleNotch,
+  Flask,
   PaperPlaneTilt,
   Robot,
   UserCircle,
@@ -16,6 +17,8 @@ import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 import { ContextManifestDialog } from '@/features/federation/ContextManifestInspector'
 import { ErrorPanel, EmptyPanel, LoadingPanel, StateBadge } from '@/features/federation/components'
+import { ErrorCard } from '@/components/chat/error-card'
+import { LoadingState } from '@/components/chat/loading-state'
 import {
   useAgentChatMessagesQuery,
   useAgentChatTurnsQuery,
@@ -34,6 +37,7 @@ type TurnState =
   | 'sending'
   | 'queued'
   | 'leased'
+  | 'awaiting_input'
   | 'running'
   | 'retry_wait'
   | 'succeeded'
@@ -64,6 +68,7 @@ function authorLabel(message: AgentChatMessage, agentName?: string): string {
 function normalizeTurnState(status: string | undefined): TurnState {
   const value = status?.toLowerCase()
   if (value === 'leased') return 'leased'
+  if (value === 'awaiting_input' || value === 'awaiting') return 'awaiting_input'
   if (value === 'running' || value === 'processing') return 'running'
   if (value === 'retry_wait' || value === 'retrying' || value === 'retry') return 'retry_wait'
   if (
@@ -81,11 +86,12 @@ function normalizeTurnState(status: string | undefined): TurnState {
 
 function turnLabel(state: TurnState): string {
   return {
-    sending: 'Sending',
-    queued: 'Queued',
-    leased: 'Leased',
-    running: 'Running',
-    retry_wait: 'Retrying',
+    sending: 'Sending…',
+    queued: 'Queued…',
+    leased: 'Thinking…',
+    awaiting_input: 'Awaiting input…',
+    running: 'Thinking…',
+    retry_wait: 'Retrying…',
     succeeded: 'Succeeded',
     failed: 'Failed',
     cancelled: 'Cancelled',
@@ -97,6 +103,7 @@ function turnIcon(state: TurnState) {
     state === 'sending' ||
     state === 'queued' ||
     state === 'leased' ||
+    state === 'awaiting_input' ||
     state === 'running' ||
     state === 'retry_wait'
   ) {
@@ -120,16 +127,52 @@ function isLiveTurn(turn: AgentChatTurn): boolean {
     state === 'sending' ||
     state === 'queued' ||
     state === 'leased' ||
+    state === 'awaiting_input' ||
     state === 'running' ||
     state === 'retry_wait'
   )
 }
 
-function TurnStateCard({ state, detail }: { state: TurnState; detail?: string | null }) {
+function TurnStateCard({
+  state,
+  detail,
+  startedAt,
+}: {
+  state: TurnState
+  detail?: string | null
+  startedAt?: string | null
+}) {
+  if (
+    state === 'sending' ||
+    state === 'queued' ||
+    state === 'leased' ||
+    state === 'awaiting_input' ||
+    state === 'running' ||
+    state === 'retry_wait'
+  ) {
+    return (
+      <LoadingState
+        label={turnLabel(state)}
+        status={state}
+        startedAt={startedAt}
+      />
+    )
+  }
+
+  if (state === 'failed') {
+    return (
+      <ErrorCard
+        title="Turn failed"
+        description={detail ?? 'The agent turn could not complete.'}
+        severity="error"
+      />
+    )
+  }
+
   return (
     <div
       className={cn('flex items-center gap-2 rounded-lg border px-3 py-2 text-xs', turnTone(state))}
-      role={state === 'failed' ? 'alert' : 'status'}
+      role="status"
       aria-live="polite"
     >
       <span className="shrink-0">{turnIcon(state)}</span>
@@ -265,7 +308,11 @@ function MessageCard({
       {turnsForMessage.map((turn) => (
         <div key={turn.id} className="mt-3 flex min-w-0 flex-wrap items-center gap-2">
           <div className="min-w-0 flex-1">
-            <TurnStateCard state={normalizeTurnState(turn.status)} detail={turn.error} />
+            <TurnStateCard
+              state={normalizeTurnState(turn.status)}
+              detail={turn.error}
+              startedAt={turn.created_at}
+            />
           </div>
           {isLiveTurn(turn) && onCancelTurn ? (
             <Button
@@ -319,11 +366,15 @@ export function ChatComposer({
   disabledReason,
   isSending,
   onSend,
+  onStartGenesis,
+  isStartingGenesis,
 }: {
   disabled?: boolean
   disabledReason?: string
   isSending?: boolean
   onSend: (content: string) => Promise<void>
+  onStartGenesis?: (initialIdea: string) => Promise<void>
+  isStartingGenesis?: boolean
 }) {
   const [content, setContent] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -369,11 +420,37 @@ export function ChatComposer({
           }}
           placeholder="Ask this agent to take the next bounded step…"
           rows={2}
-          disabled={disabled || isSending}
+          disabled={disabled || isSending || isStartingGenesis}
           aria-label="Chat message"
           aria-describedby={describedBy || undefined}
           className="min-w-0 flex-1"
         />
+        {onStartGenesis ? (
+          <Button
+            type="button"
+            variant="outline"
+            onClick={async () => {
+              const idea = content.trim()
+              setError(null)
+              try {
+                await onStartGenesis(idea)
+                setContent('')
+              } catch (cause) {
+                setError(cause instanceof Error ? cause.message : 'Product Genesis could not start.')
+              }
+            }}
+            disabled={disabled || isSending || isStartingGenesis}
+            aria-label="Start a product"
+            className="gap-1.5 h-10 px-3 text-xs font-medium shrink-0"
+          >
+            {isStartingGenesis ? (
+              <CircleNotch size={14} className="animate-spin" aria-hidden />
+            ) : (
+              <Flask size={14} aria-hidden />
+            )}
+            Start a product
+          </Button>
+        ) : null}
         <Button
           type="submit"
           size="icon"
@@ -402,6 +479,8 @@ export function AgentChatTimeline({
   isSending,
   onSend,
   onCancelTurn,
+  onStartGenesis,
+  isStartingGenesis,
 }: {
   chat: AgentChat
   agentName?: string
@@ -410,6 +489,8 @@ export function AgentChatTimeline({
   isSending?: boolean
   onSend: (content: string) => Promise<void>
   onCancelTurn?: (turnId: string, expectedVersion: number) => Promise<void>
+  onStartGenesis?: (initialIdea: string) => Promise<void>
+  isStartingGenesis?: boolean
 }) {
   const messagesQuery = useAgentChatMessagesQuery(chat.id)
   const turnsQuery = useAgentChatTurnsQuery(chat.id)
@@ -496,11 +577,32 @@ export function AgentChatTimeline({
         }}
       >
         {messages.length === 0 ? (
-          <EmptyPanel
-            title="No turns yet"
-            description="Send a bounded request. Forge will show queued, running, retrying, and terminal turn states here."
-            icon={<ChatCircleDots size={19} aria-hidden />}
-          />
+          <div className="flex flex-col items-center justify-center p-6 text-center">
+            <EmptyPanel
+              title="No turns yet"
+              description="Send a bounded request. Forge will show queued, running, retrying, and terminal turn states here."
+              icon={<ChatCircleDots size={19} aria-hidden />}
+            />
+            {onStartGenesis ? (
+              <div className="mt-4">
+                <Button
+                  type="button"
+                  onClick={async () => {
+                    await onStartGenesis('')
+                  }}
+                  disabled={isStartingGenesis || isSending}
+                  className="gap-2"
+                >
+                  {isStartingGenesis ? (
+                    <CircleNotch size={15} className="animate-spin" aria-hidden />
+                  ) : (
+                    <Flask size={15} aria-hidden />
+                  )}
+                  Start a product
+                </Button>
+              </div>
+            ) : null}
+          </div>
         ) : null}
         {messages.map((message) => (
           <MessageCard
@@ -529,7 +631,11 @@ export function AgentChatTimeline({
           .map((turn) => (
             <div key={turn.id} className="flex min-w-0 flex-wrap items-center gap-2">
               <div className="min-w-0 flex-1">
-                <TurnStateCard state={normalizeTurnState(turn.status)} detail={turn.error} />
+                <TurnStateCard
+                  state={normalizeTurnState(turn.status)}
+                  detail={turn.error}
+                  startedAt={turn.created_at}
+                />
               </div>
               {isLiveTurn(turn) && onCancelTurn ? (
                 <Button
@@ -578,6 +684,8 @@ export function AgentChatTimeline({
         }
         isSending={isSending || retrying}
         onSend={onSend}
+        onStartGenesis={onStartGenesis}
+        isStartingGenesis={isStartingGenesis}
       />
     </div>
   )

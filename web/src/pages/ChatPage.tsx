@@ -8,6 +8,10 @@ import { ChatSetupRequired } from '@/components/chat/chat-setup-required'
 import { ProjectAgentWorkbench } from '@/components/chat/project-agent-workbench'
 import { ProductGenesisControls } from '@/features/product-genesis/ProductGenesisControls'
 import {
+  useProductGenesisActiveQuery,
+  useStartProductGenesisMutation,
+} from '@/features/product-genesis/hooks'
+import {
   useAgentChatQuery,
   useAgentChatsQuery,
   useCancelAgentChatTurnMutation,
@@ -124,6 +128,9 @@ export function ChatPage({ projectId }: { projectId?: string }) {
   const chatQuery = useAgentChatQuery(activeChatId)
   const sendMutation = useSendAgentChatMessageMutation(chatQuery.data?.id)
   const cancelMutation = useCancelAgentChatTurnMutation(chatQuery.data?.id)
+  const activeGenesisQuery = useProductGenesisActiveQuery()
+  const startGenesisMutation = useStartProductGenesisMutation()
+  const hasActiveGenesis = Boolean(activeGenesisQuery.data?.session)
   const activeAgentName = activeSource?.identity_name ?? undefined
   const activeProjectName = projectNameFor(projectId, projects)
   const activeReady = Boolean(
@@ -308,6 +315,18 @@ export function ChatPage({ projectId }: { projectId?: string }) {
               isSending={sendMutation.isPending}
               onSend={sendMessage}
               onCancelTurn={cancelTurn}
+              onStartGenesis={
+                !projectId && !hasActiveGenesis
+                  ? async (initialIdea) => {
+                      await startGenesisMutation.mutateAsync({
+                        initial_idea: initialIdea || null,
+                        maturity: 'mvp',
+                        preferred_project_agent_identity_id: null,
+                      })
+                    }
+                  : undefined
+              }
+              isStartingGenesis={startGenesisMutation.isPending}
             />
           ) : (
             <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto p-4 sm:p-6">

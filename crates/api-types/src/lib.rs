@@ -74,6 +74,8 @@ fn export_typescript() {
     ProductGenesisStartResponse::export().expect("export ProductGenesisStartResponse");
     ProductGenesisActiveResponse::export().expect("export ProductGenesisActiveResponse");
     CancelProductGenesisRequest::export().expect("export CancelProductGenesisRequest");
+    ApplyProductGenesisGuidedSetupRequest::export()
+        .expect("export ApplyProductGenesisGuidedSetupRequest");
     WorkMode::export().expect("export WorkMode");
     CreateRepoRequest::export().expect("export CreateRepoRequest");
     UpdateRepoRequest::export().expect("export UpdateRepoRequest");

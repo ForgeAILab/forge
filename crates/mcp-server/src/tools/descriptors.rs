@@ -322,11 +322,10 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
             "Propose replacement of the account's singular Main Agent binding using optimistic concurrency.",
             json!({
                 "identity_id": { "type": "string" },
-                "profile_id": { "type": "string" },
                 "expected_version": { "type": "integer" },
                 "autonomy_policy": { "type": "object" }
             }),
-            &["identity_id", "profile_id", "expected_version"],
+            &["identity_id", "expected_version"],
         ),
         tool_descriptor(
             "forge_get_project_agent",
@@ -340,7 +339,6 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
             json!({
                 "project_id": { "type": "string" },
                 "identity_id": { "type": "string" },
-                "profile_id": { "type": "string" },
                 "expected_version": { "type": "integer" },
                 "permission_ceiling": { "type": "object" },
                 "autonomy_policy": { "type": "object" },
@@ -349,8 +347,8 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
             }),
             required(
                 scoped_project,
-                &["project_id", "identity_id", "profile_id", "expected_version"],
-                &["identity_id", "profile_id", "expected_version"],
+                &["project_id", "identity_id", "expected_version"],
+                &["identity_id", "expected_version"],
             ),
         ),
         tool_descriptor(

@@ -89,6 +89,14 @@ pub trait ProductGenesisStore: Send + Sync {
         expected_version: i64,
         source_message_id: &str,
     ) -> Result<ProductGenesisSession>;
+    async fn apply_guided_setup(
+        &self,
+        id: &str,
+        expected_version: i64,
+        maturity: Option<ProductMaturity>,
+        preferred_project_agent_identity_id: Option<String>,
+        provenance: Option<String>,
+    ) -> Result<ProductGenesisSession>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -268,6 +276,43 @@ impl ProductGenesisService {
         }
         self.store
             .add_source_message(id, expected_version, &source_message_id)
+            .await
+    }
+
+    pub async fn apply_guided_setup(
+        &self,
+        id: &str,
+        expected_version: i64,
+        maturity: Option<ProductMaturity>,
+        preferred_project_agent_identity_id: Option<String>,
+        provenance: Option<String>,
+    ) -> Result<ProductGenesisSession> {
+        let current = self.get(id).await?;
+        if current.lifecycle != ProductGenesisLifecycle::Discovering {
+            return Err(ServiceError::InvalidOperation {
+                message: "guided setup can only be applied while discovering".to_owned(),
+            });
+        }
+        if current.version != expected_version {
+            return Err(ServiceError::Conflict(format!(
+                "Product Genesis session version changed (expected {expected_version}, current {})",
+                current.version
+            )));
+        }
+        if maturity.is_none() && preferred_project_agent_identity_id.is_none() {
+            return Err(ServiceError::InvalidOperation {
+                message: "guided setup requires either maturity or preferred Project Agent"
+                    .to_owned(),
+            });
+        }
+        self.store
+            .apply_guided_setup(
+                id,
+                expected_version,
+                maturity,
+                preferred_project_agent_identity_id,
+                provenance,
+            )
             .await
     }
 }
@@ -526,6 +571,62 @@ impl ProductGenesisStore for SqliteProductGenesisStore {
             return Err(ServiceError::Db(DbError::VersionConflict));
         }
         transaction.commit().await.map_err(db_error)?;
+        self.get(id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("product_genesis_session", id))
+    }
+
+    async fn apply_guided_setup(
+        &self,
+        id: &str,
+        expected_version: i64,
+        maturity: Option<ProductMaturity>,
+        preferred_project_agent_identity_id: Option<String>,
+        _provenance: Option<String>,
+    ) -> Result<ProductGenesisSession> {
+        let now = now_rfc3339();
+        let maturity_str = maturity.map(|m| m.as_str().to_owned());
+        let changed = sqlx::query(
+            "UPDATE product_genesis_session
+             SET maturity = COALESCE(?, maturity),
+                 preferred_project_agent_identity_id = COALESCE(?, preferred_project_agent_identity_id),
+                 setup_applied_at = ?,
+                 version = version + 1,
+                 updated_at = ?
+             WHERE id = ? AND version = ? AND lifecycle = 'discovering' AND setup_applied_at IS NULL",
+        )
+        .bind(maturity_str.as_deref())
+        .bind(preferred_project_agent_identity_id.as_deref())
+        .bind(&now)
+        .bind(&now)
+        .bind(id)
+        .bind(expected_version)
+        .execute(self.db.pool())
+        .await
+        .map_err(db_error)?;
+
+        if changed.rows_affected() == 0 {
+            let current = self.get(id).await?;
+            let Some(current) = current else {
+                return Err(ServiceError::not_found("product_genesis_session", id));
+            };
+            if current.version != expected_version {
+                return Err(ServiceError::Conflict(format!(
+                    "Product Genesis session version changed (expected {expected_version}, current {})",
+                    current.version
+                )));
+            }
+            if current.lifecycle != ProductGenesisLifecycle::Discovering {
+                return Err(ServiceError::Conflict(format!(
+                    "Product Genesis session is in {:?} state, guided setup can only be applied while discovering",
+                    current.lifecycle
+                )));
+            }
+            return Err(ServiceError::Conflict(
+                "Product Genesis guided setup has already been applied for this session".to_owned(),
+            ));
+        }
+
         self.get(id)
             .await?
             .ok_or_else(|| ServiceError::not_found("product_genesis_session", id))
@@ -845,6 +946,40 @@ mod tests {
                     .push(source_message_id.to_owned());
                 session.version += 1;
             }
+            Ok(session.clone())
+        }
+
+        async fn apply_guided_setup(
+            &self,
+            id: &str,
+            expected_version: i64,
+            maturity: Option<ProductMaturity>,
+            preferred_project_agent_identity_id: Option<String>,
+            _provenance: Option<String>,
+        ) -> Result<ProductGenesisSession> {
+            let mut sessions = self.sessions.lock().expect("store lock");
+            let session = sessions
+                .get_mut(id)
+                .ok_or_else(|| ServiceError::not_found("product_genesis_session", id))?;
+            if session.version != expected_version {
+                return Err(ServiceError::Conflict(format!(
+                    "Product Genesis session version changed (expected {expected_version}, current {})",
+                    session.version
+                )));
+            }
+            if session.lifecycle != ProductGenesisLifecycle::Discovering {
+                return Err(ServiceError::Conflict(format!(
+                    "Product Genesis session is in {:?} state, guided setup can only be applied while discovering",
+                    session.lifecycle
+                )));
+            }
+            if let Some(m) = maturity {
+                session.maturity = m;
+            }
+            if let Some(agent) = preferred_project_agent_identity_id {
+                session.preferred_project_agent_identity_id = Some(agent);
+            }
+            session.version += 1;
             Ok(session.clone())
         }
     }

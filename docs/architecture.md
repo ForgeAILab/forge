@@ -71,14 +71,20 @@ are `Arc`) and used as Axum state.
 
 ### Identity, profiles, and explicit authority
 
-`agent_identity` is the stable account-owned product identity. A connected
-identity may remain unbound, serve as the account's Main Agent, or serve as a
-Project Agent through explicit bindings. Runtime and model configuration lives
-in immutable `agent_profile` revisions; selecting a profile updates only the
-identity's versioned pointer. CLI profiles preserve the existing executor path,
-while native profiles select the Forge-hosted Agent Runtime backend. Credentials
-are write-only protected values referenced by opaque handles, never profile
-fields.
+`agent_identity` is the stable account-owned product identity — the one
+user-facing "agent" with a directly-editable definition: harness (CLI or
+direct), default model, reasoning, permission policy, and system prompt. A
+connected identity may remain unbound, serve as the account's Main Agent, or
+serve as a Project Agent through explicit bindings. A binding names only the
+identity; each turn resolves the identity's current settings, so edits apply
+without rebinding, and the binding row's stored profile reference is a
+bind-time snapshot reserved for future per-binding overrides. Internally,
+settings are stored as immutable `agent_profile` revisions and every edit
+publishes a new revision behind the identity's versioned pointer — an
+implementation detail, not a user-facing concept. CLI profiles preserve the
+existing executor path, while native profiles select the Forge-hosted Agent
+Runtime backend. Credentials are write-only protected values referenced by
+opaque handles, never profile fields.
 
 `MainAgentBinding` is the account's single active global assistant binding.
 `ProjectAgentBinding` is the single active manager binding for each operational
@@ -117,10 +123,12 @@ cannot admit Project Agent turns until the user resolves the identity.
 
 User-message or handoff admission atomically appends the guarded immutable
 message, its durable domain event, and one queued turn job. A turn exposes the
-finite states `queued`, `leased`, `retry_wait`, `succeeded`, `failed`, or
+finite states `queued`, `leased`, `awaiting_input`, `retry_wait`, `succeeded`, `failed`, or
 `cancelled`. Database-backed leases, optimistic versions, finite retry budgets,
 and idempotency keys prevent duplicate turns and silent success after a failed
-response commit. Authorized non-terminal turns may be cancelled with their
+response commit. When a turn yields a runtime questionnaire interaction, it parks in
+`awaiting_input` without consuming retry attempts; answering the interaction re-leases
+and resumes the turn. Authorized non-terminal turns may be cancelled with their
 current optimistic version and an idempotency key; stale or terminal
 cancellation attempts are rejected. Progressive output is transient; success or failure appends
 one immutable canonical assistant outcome with provenance, usage, duration,

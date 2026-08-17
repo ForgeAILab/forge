@@ -14,7 +14,6 @@ import {
   getMissionControl,
   getProviderAuthorization,
   listContextManifests,
-  listAgentProfiles,
   listAgentSessions,
   listFederatedAgents,
   listAgentProviderCapabilities,
@@ -25,7 +24,6 @@ import {
   removeProviderEntry,
   renameProviderEntry,
   rotateAgentSession,
-  selectAgentProfile,
   setMainAgentBinding,
   setProjectAgentBinding,
   setAgentSessionStatus,
@@ -68,15 +66,6 @@ export function useFederatedAgentsQuery() {
     queryKey: federationQueryKeys.agents,
     queryFn: () => listFederatedAgents(),
     staleTime: 10_000,
-  })
-}
-
-export function useAgentProfilesQuery(identityId: string | undefined) {
-  return useQuery({
-    queryKey: federationQueryKeys.profiles(identityId ?? 'none'),
-    queryFn: () => listAgentProfiles(identityId!),
-    enabled: Boolean(identityId),
-    staleTime: 15_000,
   })
 }
 
@@ -147,18 +136,6 @@ export function useCreateAgentSessionMutation(identityId: string) {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: federationQueryKeys.sessions(identityId) })
       void queryClient.invalidateQueries({ queryKey: federationQueryKeys.agents })
-    },
-  })
-}
-
-export function useSelectAgentProfileMutation(identityId: string) {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: ({ profileId, version }: { profileId: string; version: number }) =>
-      selectAgentProfile(identityId, profileId, version),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.agents })
-      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.profiles(identityId) })
     },
   })
 }

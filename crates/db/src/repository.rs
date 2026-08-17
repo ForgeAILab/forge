@@ -740,6 +740,7 @@ pub trait AgentChatTransactionRepo: Send + Sync {
         input: CompleteAgentChatTurn,
     ) -> Result<CompletedAgentChatTurn>;
     async fn fail_agent_chat_turn(&self, input: FailAgentChatTurn) -> Result<AgentChatTurnJob>;
+    async fn park_agent_chat_turn(&self, input: ParkAgentChatTurn) -> Result<AgentChatTurnJob>;
     /// Cancel a queued/leased/retry-wait turn and append the cancellation
     /// event in the same transaction.  The idempotency key is represented by
     /// the event dedupe key so retries do not require a second turn-job store.
@@ -1845,6 +1846,7 @@ pub struct UpdateAgentChatTurnJob {
     pub id: String,
     pub expected_version: i64,
     pub status: AgentChatTurnState,
+    pub pending_interaction_id: Option<Option<String>>,
     pub lease_owner: Option<Option<String>>,
     pub leased_until: Option<Option<String>>,
     pub attempt_count: Option<i64>,
@@ -1904,6 +1906,15 @@ pub struct FailAgentChatTurn {
     pub next_attempt_at: Option<String>,
     pub error_code: String,
     pub error_message: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkAgentChatTurn {
+    pub turn_job_id: String,
+    pub expected_version: i64,
+    pub lease_owner: String,
+    pub pending_interaction_id: String,
     pub updated_at: String,
 }
 

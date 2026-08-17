@@ -14,7 +14,6 @@ import { ErrorPanel, PageHeader } from '@/features/federation/components'
 import { AddProviderWizard, ProvidersTab } from '@/features/federation/ProvidersTab'
 import { AgentsTab, NewAgentDialog } from '@/features/federation/AgentsTab'
 import { BindingsTab } from '@/features/federation/BindingsTab'
-import { ChangeModelDialog, type ChangeModelBindingContext } from '@/features/federation/ChangeModelDialog'
 
 const EMPTY_AGENTS: FederatedAgent[] = []
 const EMPTY_CHAT_ENTRIES: AgentChatEntry[] = []
@@ -45,10 +44,6 @@ export function FederatedAgentsPage() {
   const [addProviderOpen, setAddProviderOpen] = useState(false)
   const [wizardOpen, setWizardOpen] = useState(false)
   const [wizardEntryId, setWizardEntryId] = useState<string | null>(null)
-  const [changeModelTarget, setChangeModelTarget] = useState<{
-    agent: FederatedAgent
-    binding?: ChangeModelBindingContext
-  } | null>(null)
 
   // A deep link (`?identity=...`) always wins the current selection.
   useEffect(() => {
@@ -69,10 +64,6 @@ export function FederatedAgentsPage() {
   function openNewAgentWizard(preselectedEntryId: string | null = null) {
     setWizardEntryId(preselectedEntryId)
     setWizardOpen(true)
-  }
-
-  function openChangeModel(agent: FederatedAgent, binding?: ChangeModelBindingContext) {
-    setChangeModelTarget({ agent, binding })
   }
 
   return (
@@ -162,7 +153,6 @@ export function FederatedAgentsPage() {
           onSelect={setSelectedId}
           providerFilter={providerFilter}
           onProviderFilterChange={setProviderFilter}
-          onChangeModel={(agent) => openChangeModel(agent)}
           onNewAgent={() => openNewAgentWizard(null)}
         />
       ) : agentsQuery.isError && chatsQuery.isError ? (
@@ -188,8 +178,7 @@ export function FederatedAgentsPage() {
           chatsError={chatsQuery.isError}
           onRetryChats={() => void chatsQuery.refetch()}
           onConnect={() => openNewAgentWizard(null)}
-          onChangeModel={(agent, binding) => openChangeModel(agent, binding)}
-          highlightedProjectId={routeSearch.project}
+          urlProjectId={routeSearch.project}
         />
       )}
 
@@ -213,12 +202,6 @@ export function FederatedAgentsPage() {
           setTab('providers')
           setAddProviderOpen(true)
         }}
-      />
-      <ChangeModelDialog
-        agent={changeModelTarget?.agent ?? null}
-        entries={entries}
-        binding={changeModelTarget?.binding}
-        onClose={() => setChangeModelTarget(null)}
       />
     </div>
   )

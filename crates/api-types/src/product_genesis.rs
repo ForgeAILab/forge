@@ -89,6 +89,16 @@ pub struct CancelProductGenesisRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct ApplyProductGenesisGuidedSetupRequest {
+    pub expected_version: i64,
+    pub maturity: Option<ProductMaturity>,
+    pub preferred_project_agent_identity_id: Option<String>,
+    pub provenance: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
 pub struct ProductGenesisStartResponse {
     pub session: ProductGenesisSession,
     pub main_chat_id: String,

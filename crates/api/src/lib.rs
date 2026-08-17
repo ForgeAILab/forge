@@ -141,6 +141,10 @@ pub fn api_router(state: AppState) -> Router {
             "/api/v1/account/main-agent/product-genesis/{session_id}/cancel",
             post(routes::product_genesis::cancel_product_genesis),
         )
+        .route(
+            "/api/v1/account/main-agent/product-genesis/{session_id}/guided-setup",
+            post(routes::product_genesis::apply_product_genesis_guided_setup),
+        )
         .route("/api/v1/admin/users", get(routes::admin::list_users))
         .route(
             "/api/v1/admin/users/{id}",

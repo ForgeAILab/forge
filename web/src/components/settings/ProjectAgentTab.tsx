@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link } from '@tanstack/react-router'
 import { ArrowUpRight, Robot, ShieldCheck } from '@phosphor-icons/react'
 import { toast } from 'sonner'
@@ -17,13 +17,13 @@ import {
 import { DEFAULT_PROJECT_PERMISSION_CEILING, numberValue } from '@/features/federation/format'
 import {
   isVersionConflict,
-  useAgentProfilesQuery,
   useFederatedAgentsQuery,
   useProjectAgentBindingQuery,
   useSetProjectAgentBindingMutation,
 } from '@/features/federation/hooks'
-import type { FederatedAgent, ProjectAgentBindingInput } from '@/features/federation/types'
+import type { ProjectAgentBindingInput } from '@/features/federation/types'
 import { ApiError } from '@/api/client'
+import { agentSummary } from './MainAgentBindingCard'
 
 function policyValues(policy: Record<string, unknown> | null | undefined): string[] {
   const allowed = policy?.allowed
@@ -36,59 +36,33 @@ export function ProjectAgentTab({
   projectId,
   projectName,
   highlighted = false,
-  onChangeModel,
 }: {
   projectId: string
   projectName?: string
   highlighted?: boolean
-  onChangeModel?: (agent: FederatedAgent) => void
 }) {
   const bindingQuery = useProjectAgentBindingQuery(projectId)
   const agentsQuery = useFederatedAgentsQuery()
   const [identityId, setIdentityId] = useState('')
-  const [profileId, setProfileId] = useState('')
   const [wakeBudget, setWakeBudget] = useState('3')
   const [formError, setFormError] = useState<string | null>(null)
   const setBinding = useSetProjectAgentBindingMutation(projectId)
   const bindingMissing = bindingQuery.error instanceof ApiError && bindingQuery.error.status === 404
   const agents = agentsQuery.data?.items ?? []
   const selectedAgent = agents.find((agent) => agent.id === identityId)
-  const profilesQuery = useAgentProfilesQuery(identityId || undefined)
-  const profiles = profilesQuery.data ?? []
   const permissionCeiling = bindingQuery.data?.permission_ceiling ?? DEFAULT_PROJECT_PERMISSION_CEILING
 
   useEffect(() => {
     const binding = bindingQuery.data
     if (!binding) return
     setIdentityId(binding.identity_id ?? '')
-    setProfileId(binding.profile_id ?? '')
     setWakeBudget(String(numberValue(binding.wake_budget, 3)))
   }, [bindingQuery.data])
 
-  useEffect(() => {
-    if (!selectedAgent || profileId) return
-    setProfileId(selectedAgent.profile_id)
-  }, [profileId, selectedAgent])
-
-  const profileOptions = useMemo(
-    () =>
-      profiles.map((profile) => ({
-        value: profile.id,
-        label: `${profile.provider ?? profile.executor_type} · ${profile.model ?? 'profile'}`,
-      })),
-    [profiles],
-  )
-
-  function chooseIdentity(nextIdentityId: string) {
-    setIdentityId(nextIdentityId)
-    setProfileId(agents.find((agent) => agent.id === nextIdentityId)?.profile_id ?? '')
-    setFormError(null)
-  }
-
   async function save(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (!identityId || !profileId) {
-      setFormError('Choose an identity and a profile before saving the Project Agent.')
+    if (!identityId) {
+      setFormError('Choose an agent before saving the Project Agent.')
       return
     }
     const parsedWakeBudget = Number(wakeBudget)
@@ -99,7 +73,6 @@ export function ProjectAgentTab({
     setFormError(null)
     const input: ProjectAgentBindingInput = {
       identity_id: identityId,
-      profile_id: profileId,
       expected_version: numberValue(bindingQuery.data?.version, 0),
       permission_ceiling: permissionCeiling,
       autonomy_policy: bindingQuery.data?.autonomy_policy ?? {},
@@ -129,7 +102,7 @@ export function ProjectAgentTab({
     return (
       <ErrorPanel
         title="Project Agent setup unavailable"
-        description="Forge could not load the authorized binding or identity roster. Retry before changing this Project's agent."
+        description="Forge could not load the authorized binding or agent roster. Retry before changing this Project's agent."
         onRetry={() => {
           void bindingQuery.refetch()
           void agentsQuery.refetch()
@@ -147,13 +120,13 @@ export function ProjectAgentTab({
           <SectionKicker>{projectName ?? 'Project Agent'}</SectionKicker>
           <h2 className="mt-1 text-page font-semibold tracking-tight">Connect one Project Agent</h2>
           <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
-            A Project has one durable Agent Chat and one binding. Connect an identity in Agent
-            settings before selecting it here.
+            A Project has one durable Agent Chat and one binding. Create an agent in Agent settings
+            before selecting it here.
           </p>
         </div>
         <EmptyPanel
-          title="No connected identities"
-          description="Unbound identities stay in Agent settings until you explicitly choose one for this Project."
+          title="No agents yet"
+          description="Agents stay in Agent settings until you explicitly choose one for this Project."
           icon={<Robot size={19} />}
         />
         <Link
@@ -178,8 +151,8 @@ export function ProjectAgentTab({
           {bindingMissing ? 'Not configured' : 'Project Agent binding'}
         </h2>
         <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
-          Select the single identity and profile admitted to this Project&apos;s durable Agent Chat.
-          Replacing it preserves the chat timeline and uses optimistic concurrency.
+          Select the single agent admitted to this Project&apos;s durable Agent Chat. The binding
+          follows the agent&apos;s settings; replacing it preserves the chat timeline.
         </p>
       </div>
 
@@ -191,7 +164,7 @@ export function ProjectAgentTab({
                 htmlFor="project-agent-identity"
                 className="font-mono text-micro font-semibold uppercase tracking-[0.8px] text-muted-foreground"
               >
-                Identity
+                Agent
               </label>
               <Select
                 id="project-agent-identity"
@@ -200,37 +173,18 @@ export function ProjectAgentTab({
                   value: agent.id,
                   label: `${agent.name} · ${agent.provider ?? agent.executor_type}`,
                 }))}
-                placeholder="Select identity"
-                onChange={chooseIdentity}
-                aria-label="Project Agent identity"
+                placeholder="Select agent"
+                onChange={(next) => {
+                  setIdentityId(next)
+                  setFormError(null)
+                }}
+                aria-label="Project Agent"
               />
               <p className="text-xs leading-5 text-muted-foreground">
-                Only this selected identity is bound to the Project. Connecting an identity does not
-                grant it Project access.
+                {selectedAgent
+                  ? agentSummary(selectedAgent)
+                  : 'Only the selected agent is bound to the Project. Creating an agent does not grant it Project access.'}
               </p>
-            </div>
-
-            <div className="space-y-2">
-              <label
-                htmlFor="project-agent-profile"
-                className="font-mono text-micro font-semibold uppercase tracking-[0.8px] text-muted-foreground"
-              >
-                Profile
-              </label>
-              <Select
-                id="project-agent-profile"
-                value={profileId}
-                options={profileOptions}
-                placeholder={profilesQuery.isLoading ? 'Loading profiles…' : 'Select profile'}
-                onChange={setProfileId}
-                disabled={!identityId || profilesQuery.isLoading || profileOptions.length === 0}
-                aria-label="Project Agent profile"
-              />
-              {profilesQuery.isError ? (
-                <p className="text-xs text-destructive" role="alert">
-                  Profiles are unavailable for this identity.
-                </p>
-              ) : null}
             </div>
 
             <div className="space-y-2">
@@ -313,23 +267,13 @@ export function ProjectAgentTab({
           </p>
         ) : null}
         <div className="flex flex-wrap items-center gap-3">
-          <Button type="submit" disabled={setBinding.isPending || !identityId || !profileId}>
+          <Button type="submit" disabled={setBinding.isPending || !identityId}>
             {setBinding.isPending
               ? 'Saving…'
               : bindingMissing
                 ? 'Set Project Agent'
                 : 'Save Project Agent'}
           </Button>
-          {onChangeModel ? (
-            <Button
-              type="button"
-              variant="outline"
-              disabled={!selectedAgent}
-              onClick={() => selectedAgent && onChangeModel(selectedAgent)}
-            >
-              Change model…
-            </Button>
-          ) : null}
           {bindingQuery.data?.chat_id ? (
             <span className="font-mono text-micro text-muted-foreground">
               Timeline {bindingQuery.data.chat_id.slice(0, 8)}…

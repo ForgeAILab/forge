@@ -1,33 +1,42 @@
-import { Robot } from '@phosphor-icons/react'
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
+import { Robot, ShieldCheck } from '@phosphor-icons/react'
+import { useUpdateAgent } from '@/api/hooks'
 import { Button } from '@/components/ui/button'
 import { CollapsibleSection } from '@/components/ui/collapsible-section'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Select } from '@/components/ui/select'
+import { Textarea } from '@/components/ui/textarea'
+import { ModelSelector } from '@/components/execution-config/ModelSelector'
+import { PolicySelector } from '@/components/execution-config/PolicySelector'
+import { ReasoningSelector } from '@/components/execution-config/ReasoningSelector'
+import { getReasoningOptionsForModel, useDiscoveredOptions } from '@/hooks/useDiscoveredOptions'
 import type { AgentChatEntry } from '@/features/agent-chat/types'
-import { useAgentProfilesQuery, useSelectAgentProfileMutation, isVersionConflict } from '@/features/federation/hooks'
+import {
+  federationQueryKeys,
+  isVersionConflict,
+  useAgentProviderCapabilitiesQuery,
+  useConnectEmbeddedProfileMutation,
+} from '@/features/federation/hooks'
 import type { FederatedAgent } from '@/features/federation/types'
 import type { ProviderEntryResponse } from '@/types/generated'
 import { StateBadge, StatusDot } from '@/features/federation/components'
-import { allowedPolicyValues, humanize, runtimeDisplayNames } from './format'
+import { DEFAULT_CEILING, humanize, isDirectAgent, runtimeDisplayNames } from './format'
 
 export function AgentDetailPanel({
   agent,
   entries,
   chatEntries,
-  onChangeModel,
 }: {
   agent: FederatedAgent
   entries: ProviderEntryResponse[]
   chatEntries: AgentChatEntry[]
-  onChangeModel: (agent: FederatedAgent) => void
 }) {
-  const profilesQuery = useAgentProfilesQuery(agent.id)
-  const selectProfile = useSelectAgentProfileMutation(agent.id)
-  const [profileError, setProfileError] = useState<string | null>(null)
-  const profiles = profilesQuery.data ?? []
-  const selectedProfile = profiles.find((profile) => profile.id === agent.profile_id)
-  const selectedEntry = entries.find((entry) => entry.id === selectedProfile?.credential_handle_id)
+  const credentialEntry = entries.find((entry) => entry.id === agent.credential_handle_id)
   const requiresRecovery =
-    selectedEntry != null && (selectedEntry.status === 'revoked' || selectedEntry.status === 'invalid')
+    credentialEntry != null &&
+    (credentialEntry.status === 'revoked' || credentialEntry.status === 'invalid')
   const connectionStatus = requiresRecovery
     ? 'recovery_required'
     : (agent.effective_status ?? agent.status)
@@ -36,21 +45,6 @@ export function AgentDetailPanel({
   const boundChips = chatEntries
     .filter((entry) => entry.identity_id === agent.id)
     .map((entry) => (entry.kind === 'main' ? 'Main Agent' : (entry.project_name ?? 'Project Agent')))
-
-  async function selectProfileVersion(profileId: string) {
-    setProfileError(null)
-    try {
-      await selectProfile.mutateAsync({ profileId, version: agent.version })
-    } catch (cause) {
-      setProfileError(
-        isVersionConflict(cause)
-          ? 'Agent changed in another session. Refresh the roster before selecting a profile.'
-          : cause instanceof Error
-            ? cause.message
-            : 'Profile selection failed.',
-      )
-    }
-  }
 
   return (
     <div className="flex flex-1 flex-col overflow-y-auto">
@@ -65,7 +59,7 @@ export function AgentDetailPanel({
           </div>
           <p className="mt-1 truncate font-mono text-xs text-muted-foreground">
             {runtimeDisplayNames[runtime] ?? humanize(runtime)}
-            {selectedEntry ? ` · ${selectedEntry.label}` : ''}
+            {credentialEntry ? ` · ${credentialEntry.label}` : ''}
           </p>
           {boundChips.length > 0 ? (
             <div className="mt-2 flex flex-wrap gap-1.5">
@@ -86,7 +80,7 @@ export function AgentDetailPanel({
         {/* Stat grid */}
         <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
           {[
-            { label: 'Model', value: agent.model ?? 'Pending' },
+            { label: 'Model', value: agent.model ?? 'Not set' },
             { label: 'Provider', value: agent.provider ? humanize(agent.provider) : 'CLI-managed' },
             {
               label: agent.reasoning_effort ? 'Reasoning' : 'Permission',
@@ -109,66 +103,15 @@ export function AgentDetailPanel({
           ))}
         </div>
 
-        <div>
-          <Button onClick={() => onChangeModel(agent)}>Change model…</Button>
-        </div>
+        <AgentSettingsForm agent={agent} entries={entries} />
 
-        {/* Profiles */}
-        <section aria-labelledby="agent-detail-profiles-heading">
-          <h3
-            id="agent-detail-profiles-heading"
-            className="mb-3 font-mono text-micro font-semibold uppercase tracking-[0.8px] text-muted-foreground"
+        {requiresRecovery ? (
+          <p
+            className="rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning"
+            role="status"
           >
-            Profiles
-          </h3>
-          {profilesQuery.isLoading ? (
-            <p className="text-xs text-muted-foreground">Loading profiles…</p>
-          ) : null}
-          {profilesQuery.isError ? (
-            <p className="text-xs text-destructive">Profiles are unavailable for this agent.</p>
-          ) : null}
-          {profileError ? (
-            <p className="mt-2 text-xs text-destructive" role="alert">
-              {profileError}
-            </p>
-          ) : null}
-          <div className="space-y-2">
-            {profiles.map((profile) => (
-              <div
-                key={profile.id}
-                className="flex items-center justify-between gap-3 rounded-md border border-border-subtle bg-card px-3 py-2"
-              >
-                <div className="min-w-0">
-                  <p className="truncate text-xs font-medium text-foreground">
-                    {profile.provider ?? profile.executor_type} · {profile.model ?? 'unknown model'}
-                  </p>
-                  <p className="mt-0.5 font-mono text-micro text-muted-foreground">
-                    v{profile.version} · {profile.id === agent.profile_id ? 'selected' : 'available'}
-                  </p>
-                </div>
-                {profile.id !== agent.profile_id ? (
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    disabled={selectProfile.isPending}
-                    onClick={() => void selectProfileVersion(profile.id)}
-                  >
-                    Select
-                  </Button>
-                ) : (
-                  <span className="font-mono text-micro uppercase text-primary">Current</span>
-                )}
-              </div>
-            ))}
-            {profiles.length === 0 && !profilesQuery.isLoading ? (
-              <p className="text-xs text-muted-foreground">No profiles published yet.</p>
-            ) : null}
-          </div>
-        </section>
-
-        {agent.description ? (
-          <p className="border-t border-border-subtle pt-4 text-xs leading-5 text-muted-foreground">
-            {agent.description}
+            This agent&apos;s provider entry is disconnected. Reconnect the entry or move the agent
+            onto another one before relying on its Main or Project binding.
           </p>
         ) : null}
 
@@ -180,46 +123,310 @@ export function AgentDetailPanel({
               <dd className="truncate font-mono text-foreground">{agent.id}</dd>
             </div>
             <div className="flex justify-between gap-4">
-              <dt className="text-muted-foreground">Current profile</dt>
-              <dd className="truncate font-mono text-foreground">{agent.profile_id}</dd>
-            </div>
-            <div className="flex justify-between gap-4">
               <dt className="text-muted-foreground">Connection</dt>
               <dd className="inline-flex items-center gap-1.5 text-foreground">
                 <StatusDot status={connectionStatus} />
                 {humanize(connectionStatus)}
               </dd>
             </div>
-          </dl>
-          {requiresRecovery ? (
-            <p
-              className="mt-3 rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning"
-              role="status"
-            >
-              This agent&apos;s provider entry is disconnected. Publish a profile on another entry
-              before relying on its Main or Project binding.
-            </p>
-          ) : null}
-          <div className="mt-4 border-t border-border-subtle pt-3">
-            <p className="text-xs text-muted-foreground">Profile tool ceiling</p>
-            <div className="mt-2 flex flex-wrap gap-1.5" aria-label="Profile tool ceiling">
-              {allowedPolicyValues(selectedProfile?.tool_policy).length > 0 ? (
-                allowedPolicyValues(selectedProfile?.tool_policy).map((capability) => (
-                  <span key={capability} className="rounded bg-muted px-2 py-1 font-mono text-micro text-foreground">
-                    {capability}
-                  </span>
-                ))
-              ) : (
-                <span className="text-xs text-muted-foreground">Unavailable in this projection.</span>
-              )}
+            <div className="flex justify-between gap-4">
+              <dt className="text-muted-foreground">Max concurrent tasks</dt>
+              <dd className="font-mono text-foreground">{agent.max_concurrent_tasks}</dd>
             </div>
-            <p className="mt-2 text-micro leading-5 text-muted-foreground">
-              This is a ceiling, not a grant. Effective permissions are recomputed for each account,
-              Main Agent Chat, Project Agent Chat, or Task scope.
-            </p>
-          </div>
+          </dl>
         </CollapsibleSection>
       </div>
     </div>
+  )
+}
+
+/**
+ * The agent's settings, edited directly in the panel: fields show the current
+ * values and a Save/Discard bar appears once something changes. Bindings
+ * follow the agent, so saving here is all it takes — no profile publishing or
+ * rebinding steps.
+ */
+function AgentSettingsForm({
+  agent,
+  entries,
+}: {
+  agent: FederatedAgent
+  entries: ProviderEntryResponse[]
+}) {
+  const queryClient = useQueryClient()
+  const direct = isDirectAgent(agent.backend_kind)
+  const runtime = agent.executor_type === 'embedded' ? 'direct' : agent.executor_type
+  const credentialEntry = entries.find((entry) => entry.id === agent.credential_handle_id)
+  const [name, setName] = useState(agent.name)
+  const [description, setDescription] = useState(agent.description ?? '')
+  const [entryId, setEntryId] = useState(agent.credential_handle_id ?? '')
+  const [model, setModel] = useState(agent.model ?? '')
+  const [reasoningEffort, setReasoningEffort] = useState(agent.reasoning_effort ?? '')
+  const [permissionPolicy, setPermissionPolicy] = useState<string | null>(
+    agent.permission_policy ?? null,
+  )
+  const [systemPrompt, setSystemPrompt] = useState(agent.prompt_template ?? '')
+  const [error, setError] = useState<string>()
+
+  const activeEntries = entries.filter((entry) => entry.status === 'configured')
+  const capabilities = useAgentProviderCapabilitiesQuery()
+  const discovered = useDiscoveredOptions(agent.id, direct ? null : agent.executor_type)
+
+  const connectProfile = useConnectEmbeddedProfileMutation()
+  const updateAgent = useUpdateAgent()
+
+  function syncFromAgent() {
+    setName(agent.name)
+    setDescription(agent.description ?? '')
+    setEntryId(agent.credential_handle_id ?? '')
+    setModel(agent.model ?? '')
+    setReasoningEffort(agent.reasoning_effort ?? '')
+    setPermissionPolicy(agent.permission_policy ?? null)
+    setSystemPrompt(agent.prompt_template ?? '')
+    setError(undefined)
+  }
+
+  // Re-sync when another agent is selected or a save lands (version bump).
+  useEffect(() => {
+    syncFromAgent()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agent.id, agent.version])
+
+  const dirty =
+    name !== agent.name ||
+    description !== (agent.description ?? '') ||
+    model !== (agent.model ?? '') ||
+    systemPrompt !== (agent.prompt_template ?? '') ||
+    (direct
+      ? entryId !== (agent.credential_handle_id ?? '')
+      : reasoningEffort !== (agent.reasoning_effort ?? '') ||
+        permissionPolicy !== (agent.permission_policy ?? null))
+
+  const selectedEntryCapability = useMemo(() => {
+    const entry = activeEntries.find((candidate) => candidate.id === entryId)
+    if (!entry) return undefined
+    return capabilities.data?.items.find((item) => item.provider === entry.provider)
+  }, [activeEntries, capabilities.data?.items, entryId])
+
+  const modelSuggestions = discovered.data?.models ?? []
+  const reasoningOptionsForModel = useMemo(
+    () => getReasoningOptionsForModel(discovered.data, model),
+    [discovered.data, model],
+  )
+  const pending = connectProfile.isPending || updateAgent.isPending
+
+  async function submit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!dirty) return
+    if (!name.trim()) {
+      setError('A name is required.')
+      return
+    }
+    if (!model.trim()) {
+      setError('A model is required.')
+      return
+    }
+    setError(undefined)
+    try {
+      if (direct) {
+        if (!entryId) {
+          setError('A provider entry is required for a direct agent.')
+          return
+        }
+        // Name and description live on the identity; the runtime settings
+        // publish internally as the agent's next settings revision.
+        let version = agent.version
+        if (name.trim() !== agent.name || description.trim() !== (agent.description ?? '')) {
+          const updated = await updateAgent.mutateAsync({
+            agentId: agent.id,
+            body: {
+              name: name.trim(),
+              description: description.trim() ? description.trim() : null,
+              version,
+            },
+          })
+          version = updated.version
+        }
+        await connectProfile.mutateAsync({
+          identityId: agent.id,
+          input: {
+            version,
+            credential_id: entryId,
+            model: model.trim(),
+            system_prompt: systemPrompt.trim() ? systemPrompt.trim() : null,
+            permission_policy: agent.permission_policy ?? 'scoped_proposals',
+            tool_policy: DEFAULT_CEILING,
+          },
+        })
+      } else {
+        await updateAgent.mutateAsync({
+          agentId: agent.id,
+          body: {
+            name: name.trim(),
+            description: description.trim() ? description.trim() : null,
+            model: model.trim(),
+            reasoning_effort: reasoningEffort.trim() ? reasoningEffort.trim() : null,
+            permission_policy: permissionPolicy,
+            prompt_template: systemPrompt.trim() ? systemPrompt.trim() : null,
+            version: agent.version,
+          },
+        })
+      }
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.agents })
+    } catch (cause) {
+      setError(
+        isVersionConflict(cause)
+          ? 'This agent changed in another session. Refresh and try again.'
+          : cause instanceof Error
+            ? cause.message
+            : 'The agent settings could not be saved.',
+      )
+    }
+  }
+
+  return (
+    <section aria-labelledby="agent-detail-settings-heading">
+      <h3
+        id="agent-detail-settings-heading"
+        className="mb-3 font-mono text-micro font-semibold uppercase tracking-[0.8px] text-muted-foreground"
+      >
+        Settings
+      </h3>
+      <form onSubmit={(event) => void submit(event)} className="space-y-4">
+        <dl className="divide-y divide-border-subtle rounded-md border border-border-subtle bg-card">
+          <div className="flex items-center justify-between gap-4 px-3 py-2">
+            <dt className="text-xs text-muted-foreground">Harness</dt>
+            <dd className="truncate text-xs font-medium text-foreground">
+              {direct
+                ? 'Direct · built-in runtime'
+                : (runtimeDisplayNames[runtime] ?? humanize(runtime))}
+            </dd>
+          </div>
+          {!direct ? (
+            <div className="flex items-center justify-between gap-4 px-3 py-2">
+              <dt className="text-xs text-muted-foreground">Credential</dt>
+              <dd className="truncate text-xs font-medium text-foreground">
+                {credentialEntry
+                  ? `${humanize(credentialEntry.provider)} · ${credentialEntry.label}`
+                  : 'CLI-managed login'}
+              </dd>
+            </div>
+          ) : null}
+        </dl>
+
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="space-y-2">
+            <Label htmlFor="agent-settings-name">Name</Label>
+            <Input
+              id="agent-settings-name"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              required
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="agent-settings-description">Description</Label>
+            <Input
+              id="agent-settings-description"
+              value={description}
+              onChange={(event) => setDescription(event.target.value)}
+              placeholder="What this agent is for"
+            />
+          </div>
+
+          {direct ? (
+            <>
+              <div className="space-y-2">
+                <Label htmlFor="agent-settings-entry">Provider entry</Label>
+                <Select
+                  id="agent-settings-entry"
+                  value={entryId}
+                  placeholder={activeEntries.length === 0 ? 'No connected entries' : 'Select entry'}
+                  onChange={setEntryId}
+                  disabled={activeEntries.length === 0}
+                  options={activeEntries.map((entry) => ({
+                    value: entry.id,
+                    label: `${humanize(entry.provider)} · ${entry.label}`,
+                  }))}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="agent-settings-model">Model</Label>
+                <Input
+                  id="agent-settings-model"
+                  value={model}
+                  onChange={(event) => setModel(event.target.value)}
+                  placeholder={selectedEntryCapability?.default_model ?? 'e.g. claude-sonnet-5'}
+                  required
+                />
+              </div>
+            </>
+          ) : (
+            <>
+              <ModelSelector
+                id="agent-settings-model"
+                models={modelSuggestions}
+                recentModelIds={[]}
+                value={model.trim() ? model : null}
+                isLoading={discovered.isFetching}
+                hasError={discovered.isError}
+                onChange={(next) => {
+                  setModel(next ?? '')
+                  setReasoningEffort('')
+                }}
+              />
+              <ReasoningSelector
+                id="agent-settings-reasoning"
+                options={reasoningOptionsForModel}
+                value={reasoningEffort.trim() ? reasoningEffort : null}
+                isLoading={discovered.isFetching}
+                hasError={discovered.isError}
+                onChange={(next) => setReasoningEffort(next ?? '')}
+              />
+              <PolicySelector
+                id="agent-settings-policy"
+                className="sm:col-span-2"
+                value={permissionPolicy}
+                onChange={setPermissionPolicy}
+              />
+            </>
+          )}
+
+          <div className="space-y-2 sm:col-span-2">
+            <Label htmlFor="agent-settings-prompt">System prompt (optional)</Label>
+            <Textarea
+              id="agent-settings-prompt"
+              value={systemPrompt}
+              onChange={(event) => setSystemPrompt(event.target.value)}
+              placeholder="A bounded role for this agent"
+              rows={3}
+            />
+          </div>
+        </div>
+
+        {error ? (
+          <p role="alert" className="text-xs text-destructive">
+            {error}
+          </p>
+        ) : null}
+
+        <div className="flex flex-wrap items-center gap-3 border-t border-border-subtle pt-3">
+          <p className="min-w-0 flex-1 text-micro leading-5 text-muted-foreground">
+            {dirty
+              ? 'Unsaved changes. Saving applies to every bound scope with the agent’s next turn.'
+              : 'Every scope this agent is bound to follows these settings. Task launches can still override them per execution.'}
+          </p>
+          {dirty ? (
+            <Button type="button" variant="ghost" size="sm" onClick={syncFromAgent} disabled={pending}>
+              Discard
+            </Button>
+          ) : null}
+          <Button type="submit" size="sm" disabled={pending || !dirty}>
+            <ShieldCheck size={14} aria-hidden />
+            {pending ? 'Saving…' : 'Save settings'}
+          </Button>
+        </div>
+      </form>
+    </section>
   )
 }

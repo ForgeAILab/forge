@@ -622,6 +622,9 @@ impl AgentChatTurnJobRepo for SqliteDb {
         if current.version != input.expected_version {
             return Err(DbError::VersionConflict);
         }
+        let pending_interaction_id = input
+            .pending_interaction_id
+            .unwrap_or(current.pending_interaction_id);
         let lease_owner = input.lease_owner.unwrap_or(current.lease_owner);
         let leased_until = input.leased_until.unwrap_or(current.leased_until);
         let attempt_count = input.attempt_count.unwrap_or(current.attempt_count);
@@ -636,6 +639,7 @@ impl AgentChatTurnJobRepo for SqliteDb {
             AgentChatTurnState::Succeeded
                 | AgentChatTurnState::Failed
                 | AgentChatTurnState::Cancelled
+                | AgentChatTurnState::AwaitingInput
         ) {
             (None, None)
         } else {
@@ -643,12 +647,13 @@ impl AgentChatTurnJobRepo for SqliteDb {
         };
         let updated = sqlx::query(
             "UPDATE agent_chat_turn_job
-             SET status = ?, lease_owner = ?, leased_until = ?, attempt_count = ?,
+             SET status = ?, pending_interaction_id = ?, lease_owner = ?, leased_until = ?, attempt_count = ?,
                  next_attempt_at = ?, response_message_id = ?, error_code = ?,
                  error_message = ?, version = version + 1, updated_at = ?
              WHERE id = ? AND version = ?",
         )
         .bind(input.status.to_string())
+        .bind(pending_interaction_id.as_deref())
         .bind(lease_owner.as_deref())
         .bind(leased_until.as_deref())
         .bind(attempt_count)
@@ -766,6 +771,44 @@ impl AgentChatTransactionRepo for SqliteDb {
         let mut message_input = input.message.clone();
         message_input.sequence = sequence;
         let message = insert_chat_message(&mut transaction, &message_input).await?;
+
+        let parked_rows = sqlx::query(
+            "SELECT id, pending_interaction_id, version FROM agent_chat_turn_job
+             WHERE chat_id = ? AND status = 'awaiting_input'",
+        )
+        .bind(&input.turn.chat_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+
+        for row in parked_rows {
+            let pid: String = row.try_get("id")?;
+            let pending_interaction_id: Option<String> = row.try_get("pending_interaction_id")?;
+            let pver: i64 = row.try_get("version")?;
+            if let Some(iid) = pending_interaction_id {
+                let _ = sqlx::query(
+                    "UPDATE protected_interaction SET status = 'cancelled', version = version + 1, updated_at = ?
+                     WHERE id = ? AND status = 'pending'",
+                )
+                .bind(&input.turn.created_at)
+                .bind(&iid)
+                .execute(&mut *transaction)
+                .await;
+            }
+            let _ = sqlx::query(
+                "UPDATE agent_chat_turn_job
+                 SET status = 'cancelled', pending_interaction_id = NULL,
+                     error_code = 'superseded_by_user_message',
+                     error_message = 'superseded by newer user message',
+                     version = version + 1, updated_at = ?
+                 WHERE id = ? AND version = ? AND status = 'awaiting_input'",
+            )
+            .bind(&input.turn.created_at)
+            .bind(&pid)
+            .bind(pver)
+            .execute(&mut *transaction)
+            .await;
+        }
+
         sqlx::query(
             "INSERT INTO agent_chat_turn_job (
                 id, chat_id, triggering_message_id, responder_identity_id, profile_id,
@@ -984,6 +1027,38 @@ impl AgentChatTransactionRepo for SqliteDb {
         Ok(turn)
     }
 
+    async fn park_agent_chat_turn(&self, input: ParkAgentChatTurn) -> Result<AgentChatTurnJob> {
+        let mut transaction = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE agent_chat_turn_job
+             SET status = 'awaiting_input', pending_interaction_id = ?,
+                 lease_owner = NULL, leased_until = NULL,
+                 attempt_count = MAX(0, attempt_count - 1),
+                 next_attempt_at = NULL, error_code = NULL,
+                 error_message = NULL, version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ? AND status = 'leased' AND lease_owner = ?",
+        )
+        .bind(&input.pending_interaction_id)
+        .bind(&input.updated_at)
+        .bind(&input.turn_job_id)
+        .bind(input.expected_version)
+        .bind(&input.lease_owner)
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() == 0 {
+            return Err(DbError::VersionConflict);
+        }
+        let turn = sqlx::query("SELECT * FROM agent_chat_turn_job WHERE id = ?")
+            .bind(&input.turn_job_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(DbError::from)
+            .and_then(map_agent_chat_turn_job)?;
+        append_agent_chat_turn_awaiting_event(self, &mut transaction, &turn).await?;
+        transaction.commit().await?;
+        Ok(turn)
+    }
+
     async fn cancel_agent_chat_turn(&self, input: CancelAgentChatTurn) -> Result<AgentChatTurnJob> {
         let mut transaction = self.pool.begin().await?;
         let dedupe_key = format!(
@@ -1028,7 +1103,10 @@ impl AgentChatTransactionRepo for SqliteDb {
         }
         if !matches!(
             current.status,
-            AgentChatTurnState::Queued | AgentChatTurnState::Leased | AgentChatTurnState::RetryWait
+            AgentChatTurnState::Queued
+                | AgentChatTurnState::Leased
+                | AgentChatTurnState::RetryWait
+                | AgentChatTurnState::AwaitingInput
         ) {
             return Err(DbError::VersionConflict);
         }
@@ -1040,7 +1118,7 @@ impl AgentChatTransactionRepo for SqliteDb {
                  error_message = 'cancelled by user', version = version + 1,
                  updated_at = ?
              WHERE id = ? AND version = ?
-               AND status IN ('queued', 'leased', 'retry_wait')",
+               AND status IN ('queued', 'leased', 'retry_wait', 'awaiting_input')",
         )
         .bind(&input.updated_at)
         .bind(&input.turn_job_id)
@@ -1313,6 +1391,43 @@ async fn append_agent_chat_turn_failure_event(
     DomainEventRepo::append_event_in_tx(db, transaction, &event).await
 }
 
+async fn append_agent_chat_turn_awaiting_event(
+    db: &SqliteDb,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    turn: &AgentChatTurnJob,
+) -> Result<DomainEvent> {
+    let event = CreateDomainEvent {
+        id: new_uuid_v4(),
+        event_type: "agent_chat.turn.awaiting_input".to_owned(),
+        entity_type: "agent_chat_turn_job".to_owned(),
+        entity_id: turn.id.clone(),
+        actor_type: "system".to_owned(),
+        actor_id: None,
+        scope_type: "agent_chat".to_owned(),
+        scope_id: turn.chat_id.clone(),
+        correlation_id: turn.correlation_id.clone(),
+        causation_id: turn.causation_id.clone(),
+        causation_depth: turn.causation_depth,
+        dedupe_key: Some(format!(
+            "agent-chat-event:agent_chat.turn.awaiting_input:{}:{}",
+            turn.id, turn.version
+        )),
+        payload_json: serde_json::json!({
+            "turn_job_id": turn.id,
+            "chat_id": turn.chat_id,
+            "responder_identity_id": turn.responder_identity_id,
+            "status": turn.status.to_string(),
+            "pending_interaction_id": turn.pending_interaction_id,
+            "attempt_count": turn.attempt_count,
+            "max_attempts": turn.max_attempts,
+            "version": turn.version,
+        })
+        .to_string(),
+        created_at: turn.updated_at.clone(),
+    };
+    DomainEventRepo::append_event_in_tx(db, transaction, &event).await
+}
+
 fn bounded_event_text(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
@@ -1526,6 +1641,7 @@ fn map_agent_chat_turn_job(row: SqliteRow) -> Result<AgentChatTurnJob> {
         canonical_scope_type: row.try_get("canonical_scope_type")?,
         canonical_scope_id: row.try_get("canonical_scope_id")?,
         status: parse_enum(row.try_get::<String, _>("status")?)?,
+        pending_interaction_id: row.try_get("pending_interaction_id")?,
         dedupe_key: row.try_get("dedupe_key")?,
         lease_owner: row.try_get("lease_owner")?,
         leased_until: row.try_get("leased_until")?,

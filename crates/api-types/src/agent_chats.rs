@@ -58,6 +58,7 @@ pub enum AgentChatMessageStatus {
 pub enum AgentChatTurnStatus {
     Queued,
     Leased,
+    AwaitingInput,
     RetryWait,
     Succeeded,
     Failed,
@@ -114,22 +115,24 @@ pub struct ProjectAgentBindingResponse {
     pub updated_at: String,
 }
 
+/// Binds one agent to the account's Main scope. The binding follows the
+/// agent's current settings; the stored profile snapshot is server-resolved.
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
 #[ts(export)]
 pub struct SetMainAgentBindingRequest {
     pub identity_id: String,
-    pub profile_id: String,
     pub expected_version: i64,
     #[serde(default)]
     #[ts(type = "Record<string, unknown>")]
     pub autonomy_policy: Value,
 }
 
+/// Binds one agent to a Project scope. The binding follows the agent's
+/// current settings; the stored profile snapshot is server-resolved.
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
 #[ts(export)]
 pub struct SetProjectAgentBindingRequest {
     pub identity_id: String,
-    pub profile_id: String,
     pub expected_version: i64,
     #[serde(default)]
     #[ts(type = "Record<string, unknown>")]
@@ -231,6 +234,7 @@ pub struct AgentChatTurnJobResponse {
     pub responder_identity_id: Option<String>,
     pub responder_profile_id: Option<String>,
     pub status: AgentChatTurnStatus,
+    pub pending_interaction_id: Option<String>,
     pub attempt_count: i64,
     pub max_attempts: i64,
     pub lease_expires_at: Option<String>,

@@ -9,14 +9,14 @@ use std::sync::Arc;
 
 use db::{
     new_uuid_v4, now_rfc3339, AccountMainAgentBinding, AccountMainAgentBindingRepo,
-    AdmitAgentChatTurn, AdmitAgentHandoff, AgentChat, AgentChatMessage, AgentChatMessageAuthorType,
-    AgentChatMessageRepo, AgentChatMessageStatus, AgentChatRepo, AgentChatTransactionRepo,
-    AgentChatTurnJob, AgentChatTurnJobRepo, AgentChatTurnState, AgentHandoff, AgentHandoffRepo,
-    AgentProfileRepo, AgentRepo, CancelAgentChatTurn, CompleteAgentChatTurn,
-    CreateAccountMainAgentBinding, CreateAgentChat, CreateAgentChatMessage, CreateAgentChatTurnJob,
-    CreateAgentHandoff, CreateProjectAgentBinding, FailAgentChatTurn, ProjectAgentBinding,
-    ProjectAgentBindingRepo, ProjectMemberRepo, ReplaceAccountMainAgentBinding,
-    ReplaceProjectAgentBinding, UpdateAgentChat,
+    AdmitAgentChatTurn, AdmitAgentHandoff, Agent, AgentChat, AgentChatMessage,
+    AgentChatMessageAuthorType, AgentChatMessageRepo, AgentChatMessageStatus, AgentChatRepo,
+    AgentChatTransactionRepo, AgentChatTurnJob, AgentChatTurnJobRepo, AgentChatTurnState,
+    AgentHandoff, AgentHandoffRepo, AgentProfileRepo, AgentRepo, CancelAgentChatTurn,
+    CompleteAgentChatTurn, CreateAccountMainAgentBinding, CreateAgentChat, CreateAgentChatMessage,
+    CreateAgentChatTurnJob, CreateAgentHandoff, CreateProjectAgentBinding, FailAgentChatTurn,
+    ProjectAgentBinding, ProjectAgentBindingRepo, ProjectMemberRepo,
+    ReplaceAccountMainAgentBinding, ReplaceProjectAgentBinding, UpdateAgentChat,
 };
 use serde_json::json;
 
@@ -39,7 +39,6 @@ pub struct SetMainAgentBindingInput {
     pub actor_user_id: String,
     pub account_id: String,
     pub identity_id: String,
-    pub profile_id: String,
     pub autonomy_policy_json: String,
     pub tool_policy_revision: String,
     pub expected_version: Option<i64>,
@@ -51,7 +50,6 @@ pub struct SetProjectAgentBindingInput {
     pub actor_user_id: String,
     pub project_id: String,
     pub identity_id: Option<String>,
-    pub profile_id: Option<String>,
     pub state: String,
     pub autonomy_policy_json: String,
     pub permission_ceiling_json: String,
@@ -253,7 +251,10 @@ where
         if input.actor_user_id != input.account_id {
             return Err(ServiceError::not_found("account", input.account_id));
         }
-        self.require_owned_profile(&input.actor_user_id, &input.identity_id, &input.profile_id)
+        // The binding names the agent; its profile column is a bind-time
+        // snapshot of the agent's current settings, re-resolved on every turn.
+        let identity = self
+            .require_owned_identity(&input.actor_user_id, &input.identity_id)
             .await?;
         self.ensure_main_chat(&input.account_id).await?;
         let account_id = input.account_id.clone();
@@ -262,7 +263,7 @@ where
             id: new_uuid_v4(),
             account_id: account_id.clone(),
             identity_id: input.identity_id,
-            profile_id: input.profile_id,
+            profile_id: identity.profile_id,
             autonomy_policy_json: input.autonomy_policy_json,
             tool_policy_revision: input.tool_policy_revision,
             created_at: now.clone(),
@@ -310,23 +311,26 @@ where
         self.ensure_project_chat(&input.project_id).await?;
         let project_id = input.project_id.clone();
         let activate = input.state == ACTIVE_BINDING_STATE;
+        // Snapshot of the bound agent's current settings; turns re-resolve
+        // the agent's live profile rather than trusting this column.
+        let mut profile_snapshot = None;
         if input.state == ACTIVE_BINDING_STATE {
-            let (Some(identity_id), Some(profile_id)) =
-                (input.identity_id.as_deref(), input.profile_id.as_deref())
-            else {
+            let Some(identity_id) = input.identity_id.as_deref() else {
                 return Err(ServiceError::invalid_operation(
-                    "active Project Agent binding requires an identity and profile",
+                    "active Project Agent binding requires an identity",
                 ));
             };
-            self.require_owned_profile(&input.actor_user_id, identity_id, profile_id)
+            let identity = self
+                .require_owned_identity(&input.actor_user_id, identity_id)
                 .await?;
+            profile_snapshot = Some(identity.profile_id);
         }
         let now = now_rfc3339();
         let replacement = CreateProjectAgentBinding {
             id: new_uuid_v4(),
             project_id: project_id.clone(),
             identity_id: input.identity_id,
-            profile_id: input.profile_id,
+            profile_id: profile_snapshot,
             state: input.state,
             autonomy_policy_json: input.autonomy_policy_json,
             permission_ceiling_json: input.permission_ceiling_json,
@@ -577,6 +581,34 @@ where
         })
     }
 
+    pub async fn append_awaiting_input(
+        &self,
+        job: &AgentChatTurnJob,
+        lease_owner: &str,
+        pending_interaction_id: &str,
+    ) -> Result<AgentChatTurnJob> {
+        if job.status != AgentChatTurnState::Leased
+            || job.lease_owner.as_deref() != Some(lease_owner)
+        {
+            return Err(ServiceError::Conflict(
+                "Agent Chat turn lease is no longer active".to_owned(),
+            ));
+        }
+        let now = now_rfc3339();
+        AgentChatTransactionRepo::park_agent_chat_turn(
+            &*self.db,
+            db::ParkAgentChatTurn {
+                turn_job_id: job.id.clone(),
+                expected_version: job.version,
+                lease_owner: lease_owner.to_owned(),
+                pending_interaction_id: pending_interaction_id.to_owned(),
+                updated_at: now,
+            },
+        )
+        .await
+        .map_err(Into::into)
+    }
+
     pub async fn append_failure(
         &self,
         job: &AgentChatTurnJob,
@@ -655,6 +687,9 @@ where
             ));
         }
         let binding = self.responder_for_chat(&target).await?;
+        let source_responder = self
+            .responder_for_identity(source_binding.identity_id.clone())
+            .await?;
         let guarded = guard_agent_chat_content(&input.content)?;
         if guarded.content.chars().count() > MAX_HANDOFF_CONTENT_CHARS {
             return Err(ServiceError::invalid_operation(
@@ -697,7 +732,7 @@ where
             outcome: Some("handoff_delivered".to_owned()),
             model: None,
             // Preserve source attribution on the delivered message.
-            profile_id: Some(source_binding.profile_id.clone()),
+            profile_id: Some(source_responder.profile_id.clone()),
             session_id: None,
             context_manifest_id: None,
             token_usage_json: None,
@@ -837,10 +872,7 @@ where
                         .ok_or_else(|| {
                             ServiceError::Conflict("Main Agent binding is not configured".into())
                         })?;
-                Ok(ResponderBinding {
-                    identity_id: binding.identity_id,
-                    profile_id: binding.profile_id,
-                })
+                self.responder_for_identity(binding.identity_id).await
             }
             PROJECT_CHAT_KIND => {
                 let project_id = chat
@@ -851,39 +883,42 @@ where
                     ProjectAgentBindingRepo::get_active_project_binding(&*self.db, project_id)
                         .await?
                         .filter(|binding| {
-                            binding.state == ACTIVE_BINDING_STATE
-                                && binding.identity_id.is_some()
-                                && binding.profile_id.is_some()
+                            binding.state == ACTIVE_BINDING_STATE && binding.identity_id.is_some()
                         })
                         .ok_or_else(|| {
                             ServiceError::Conflict("Project Agent binding is not configured".into())
                         })?;
-                Ok(ResponderBinding {
-                    identity_id: binding.identity_id.expect("checked above"),
-                    profile_id: binding.profile_id.expect("checked above"),
-                })
+                self.responder_for_identity(binding.identity_id.expect("checked above"))
+                    .await
             }
             _ => Err(ServiceError::not_found("agent_chat", chat.id.clone())),
         }
     }
 
-    async fn require_owned_profile(
+    /// A binding names the responding agent; the profile serving the turn is
+    /// always the agent's *current* one, so settings edits apply to the next
+    /// turn without republishing or rebinding.
+    async fn responder_for_identity(&self, identity_id: String) -> Result<ResponderBinding> {
+        let identity = AgentRepo::get_by_id(&*self.db, &identity_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent_identity", identity_id.clone()))?;
+        Ok(ResponderBinding {
+            identity_id,
+            profile_id: identity.profile_id,
+        })
+    }
+
+    async fn require_owned_identity(
         &self,
         actor_user_id: &str,
         identity_id: &str,
-        profile_id: &str,
-    ) -> Result<()> {
-        let identity = AgentRepo::get_by_id(&*self.db, identity_id)
+    ) -> Result<Agent> {
+        AgentRepo::get_by_id(&*self.db, identity_id)
             .await?
             .filter(|identity| {
                 identity.owner_id.as_deref() == Some(actor_user_id) && !identity.paused
             })
-            .ok_or_else(|| ServiceError::not_found("agent_identity", identity_id.to_owned()))?;
-        AgentProfileRepo::get_profile(&*self.db, profile_id)
-            .await?
-            .filter(|profile| profile.identity_id == identity.id)
-            .map(|_| ())
-            .ok_or_else(|| ServiceError::not_found("agent_profile", profile_id.to_owned()))
+            .ok_or_else(|| ServiceError::not_found("agent_identity", identity_id.to_owned()))
     }
 
     async fn require_project_member(&self, actor_user_id: &str, project_id: &str) -> Result<()> {

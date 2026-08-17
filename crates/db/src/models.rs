@@ -1013,6 +1013,7 @@ pub struct AgentChatMessage {
 pub enum AgentChatTurnState {
     Queued,
     Leased,
+    AwaitingInput,
     RetryWait,
     Succeeded,
     Failed,
@@ -1029,6 +1030,7 @@ pub struct AgentChatTurnJob {
     pub canonical_scope_type: String,
     pub canonical_scope_id: String,
     pub status: AgentChatTurnState,
+    pub pending_interaction_id: Option<String>,
     pub dedupe_key: String,
     pub lease_owner: Option<String>,
     pub leased_until: Option<String>,
@@ -1777,6 +1779,7 @@ enum_strings!(AgentChatMessageStatus {
 enum_strings!(AgentChatTurnState {
     Queued => "queued",
     Leased => "leased",
+    AwaitingInput => "awaiting_input",
     RetryWait => "retry_wait",
     Succeeded => "succeeded",
     Failed => "failed",

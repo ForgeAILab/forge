@@ -218,19 +218,18 @@ both and performs the exchange, exactly as it does for the web flow. Browser
 login from a remote origin is rejected with an error pointing here, because no
 listener could answer the callback.
 
-Main and Project bindings are singular, versioned resources. Replacing a
-binding preserves the existing Agent Chat and historical attribution. A
-missing binding leaves the chat available for setup but admits no model turn
-until a new binding is selected.
+Main and Project bindings are singular, versioned resources. A binding names
+only the agent — turns follow the agent's current settings, so editing the
+agent applies without rebinding. Replacing a binding preserves the existing
+Agent Chat and historical attribution. A missing binding leaves the chat
+available for setup but admits no model turn until a new binding is selected.
 
 ```bash
 forge-ctl embedded main get
-forge-ctl embedded main set <IDENTITY_ID> --profile-id <PROFILE_ID> \
-  --version <VERSION>
+forge-ctl embedded main set <IDENTITY_ID> --version <VERSION>
 
 forge-ctl embedded project get <PROJECT_ID>
-forge-ctl embedded project set <PROJECT_ID> <IDENTITY_ID> \
-  --profile-id <PROFILE_ID> --version <VERSION>
+forge-ctl embedded project set <PROJECT_ID> <IDENTITY_ID> --version <VERSION>
 ```
 
 Agent Chats are singular timelines: one global Main Chat and one Project Agent

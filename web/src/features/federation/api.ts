@@ -13,7 +13,6 @@ import type {
 } from '@/types/generated'
 import type {
   AgentConnectionHealth,
-  AgentProfile,
   AgentSession,
   AttentionItem,
   ContextManifest,
@@ -57,10 +56,6 @@ export function listFederatedAgents(limit = 100, cursor?: string): Promise<Page<
   })
 }
 
-export function listAgentProfiles(identityId: string): Promise<AgentProfile[]> {
-  return apiFetch<AgentProfile[]>(`/agents/${identityId}/profiles`)
-}
-
 /** Register a CLI-harness agent, optionally powered by a provider entry. */
 export function registerHarnessAgent(input: {
   name: string
@@ -69,6 +64,7 @@ export function registerHarnessAgent(input: {
   model?: string | null
   reasoning_effort?: string | null
   permission_policy?: string | null
+  prompt_template?: string | null
   credential_id?: string | null
 }): Promise<FederatedAgent> {
   return apiFetch<FederatedAgent>('/agents', {
@@ -108,17 +104,6 @@ export function createAgentSession(
 
 export function listAgentSessions(identityId: string): Promise<AgentSession[]> {
   return apiFetch<AgentSession[]>(`/agents/${identityId}/sessions`)
-}
-
-export function selectAgentProfile(
-  identityId: string,
-  profileId: string,
-  version: number,
-): Promise<FederatedAgent> {
-  return apiFetch<FederatedAgent>(`/agents/${identityId}/profiles/${profileId}/select`, {
-    method: 'POST',
-    body: JSON.stringify({ version }),
-  })
 }
 
 export function rotateAgentSession(sessionId: string, version: number): Promise<AgentSession> {

@@ -308,8 +308,9 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
         let finish = finish_result?;
         persist_result?;
 
-        match finish {
-            TurnFinish::Completed => {}
+        let pending_interaction_id = match finish {
+            TurnFinish::Completed => None,
+            TurnFinish::NeedsInput { request } => Some(request.to_string()),
             TurnFinish::Cancelled { .. } => {
                 return Err(AgentHostError::Runtime("turn cancelled".to_owned()));
             }
@@ -322,12 +323,7 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
                     None => "turn failed".to_owned(),
                 }));
             }
-            TurnFinish::NeedsInput { .. } => {
-                return Err(AgentHostError::Runtime(
-                    "turn requires protected host interaction".to_owned(),
-                ));
-            }
-        }
+        };
         let history = session.history();
         let text = history
             .iter()
@@ -360,6 +356,7 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
                 .get(CounterKind::Output)
                 .saturating_add(usage.get(CounterKind::Reasoning)),
             context_manifest,
+            pending_interaction_id,
         })
     }
 

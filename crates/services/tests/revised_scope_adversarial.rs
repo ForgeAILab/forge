@@ -168,7 +168,6 @@ async fn main_identity(db: &Arc<SqliteDb>, identity_id: &str) -> String {
             actor_user_id: "user-1".to_owned(),
             account_id: "user-1".to_owned(),
             identity_id: identity_id.to_owned(),
-            profile_id,
             autonomy_policy_json: "{}".to_owned(),
             tool_policy_revision: "test".to_owned(),
             expected_version: None,

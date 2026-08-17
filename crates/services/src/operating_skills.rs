@@ -32,7 +32,7 @@ pub const MAIN_OPERATING_SKILL_POLICY_JSON: &str =
 pub const MAIN_OPERATING_SKILL_POLICY_DIGEST: &str =
     "9dc9e64f97e693c2dd384a5d60aede819aac52f95fc30fea1f56ac7b7b1075a8";
 pub const MAIN_OPERATING_SKILL_CONTENT_DIGEST: &str =
-    "e3f17959ebd107103f11b78be281bcf3ce41d7bba9bbf97fe93dafa8c4609b1e";
+    "23de8e721bffa33e8ff49fcdb43d46d7bb5638cf0cbe3f4df70f938242f443d3";
 
 /// The baseline skill is compiled into the server and rendered fresh each
 /// turn, so unlike the two seeded skills it has no database row to validate
@@ -592,7 +592,7 @@ Never upgrade an assumption, hypothesis, or research claim into a user decision.
 DISCOVERY METHOD
 1. Reconstruct the current state from the latest Charter draft and approved decisions before asking anything.
 2. Identify the smallest set of unknowns that can change Project identity, target user, core loop, MVP boundary, architecture/risk, success, or definition of done.
-3. Ask no more than two high-information questions in one turn. Prefer concrete trade-offs and examples over broad questionnaires. Explain briefly why an answer matters when it is not obvious.
+3. Ask no more than two high-information questions in one turn (via the questionnaire tool or concise prose). Prefer concrete trade-offs and examples over broad questionnaires. Explain briefly why an answer matters when it is not obvious.
 4. Do not re-ask a settled question unless new evidence creates a named conflict. Surface the conflict and its source.
 5. If the user does not know, propose a reversible default, label it as an assumption, and state how the Project Agent can validate it.
 6. Stop grilling when the readiness gate is met. Do not force enterprise-depth documentation onto a small Project.
@@ -975,24 +975,22 @@ mod tests {
     }
 
     #[test]
-    fn v076_seeded_skill_bodies_match_renderer_and_sha256_digests() {
+    fn seeded_skill_bodies_match_renderer_and_sha256_digests() {
         const V076_MIGRATION: &str =
             include_str!("../../db/migrations/V076__project_charter_milestones_media.sql");
+        const V080_MIGRATION: &str =
+            include_str!("../../db/migrations/V080__awaiting_input_turn_status.sql");
 
-        fn seeded_body(migration: &str, revision_id: &str, title: &str) -> String {
-            let revision_marker = format!("        '{revision_id}'");
-            let row_start = migration
-                .find(&revision_marker)
-                .expect("V076 seeds the expected operating-skill revision");
-            let body_marker = format!("        '{title}");
-            let body_start = migration[row_start..]
+        fn seeded_body(migration: &str, title: &str) -> String {
+            let body_marker = format!("'{title}");
+            let body_start = migration
                 .find(&body_marker)
-                .map(|offset| row_start + offset + 9)
-                .expect("V076 contains the operating-skill canonical body");
+                .map(|offset| offset + 1)
+                .expect("migration contains the operating-skill canonical body");
             let body_end = migration[body_start..]
-                .find("',\n        '{")
+                .find("',\n")
                 .map(|offset| body_start + offset)
-                .expect("V076 terminates the canonical body before policy metadata");
+                .expect("migration terminates the canonical body before policy metadata");
             migration[body_start..body_end].replace("''", "'")
         }
 
@@ -1002,21 +1000,23 @@ mod tests {
             hex::encode(Sha256::digest(value.as_bytes()))
         }
 
-        for (revision_id, title, renderer_body, expected_digest) in [
+        for (migration, revision_id, title, renderer_body, expected_digest) in [
             (
-                "forge.main.project-discovery/v2@1",
+                V080_MIGRATION,
+                "forge.main.project-discovery/v2@2",
                 "Forge Main Agent",
                 canonical_main_operating_skill_body(),
                 MAIN_OPERATING_SKILL_CONTENT_DIGEST,
             ),
             (
+                V076_MIGRATION,
                 "forge.project.orchestration/v1@1",
                 "Forge Project Agent",
                 canonical_project_operating_skill_body(),
                 PROJECT_OPERATING_SKILL_CONTENT_DIGEST,
             ),
         ] {
-            let seeded = seeded_body(V076_MIGRATION, revision_id, title);
+            let seeded = seeded_body(migration, title);
             assert_eq!(seeded, renderer_body, "seeded body drift for {revision_id}");
             assert_eq!(
                 sha256_hex(&seeded),

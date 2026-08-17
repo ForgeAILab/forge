@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { CaretRight, Key, MagnifyingGlass, Plus, Robot, ShieldCheck } from '@phosphor-icons/react'
+import { CaretRight, Key, MagnifyingGlass, Plus, Robot, ShieldCheck, TerminalWindow } from '@phosphor-icons/react'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -26,13 +26,19 @@ import {
 } from '@/features/federation/hooks'
 import type { FederatedAgent } from '@/features/federation/types'
 import type { CliRuntimeEntryResponse, ProviderEntryResponse } from '@/types/generated'
-import { EmptyPanel, ErrorPanel, LoadingPanel, StateBadge, StatusDot } from '@/features/federation/components'
+import { EmptyPanel, ErrorPanel, LoadingPanel, StatusDot } from '@/features/federation/components'
 import { AgentDetailPanel } from './AgentDetailPanel'
 import { DEFAULT_CEILING, humanize, runtimeDisplayNames, runtimeOptionsForEntry } from './format'
 
-type WizardRuntime = { runtime: string; support_level: string; reason: string | null }
+/** The chosen harness: a direct provider entry, or a CLI runtime kind. */
+type HarnessChoice =
+  | { kind: 'direct'; entryId: string }
+  | { kind: 'cli'; runtime: string }
 
-/** Three-step registration: authentication source → runtime → configure. */
+/**
+ * Two-step creation: choose the harness (direct or CLI), then set the agent's
+ * defaults — model, reasoning, policy, prompt, description.
+ */
 export function NewAgentDialog({
   open,
   onClose,
@@ -51,59 +57,68 @@ export function NewAgentDialog({
   const capabilities = useAgentProviderCapabilitiesQuery()
   const createEmbedded = useCreateEmbeddedAgentMutation()
   const registerHarness = useRegisterHarnessAgentMutation()
-  const [entryId, setEntryId] = useState<string | null>(preselectedEntryId)
-  const [cliKind, setCliKind] = useState<string | null>(null)
-  const [runtime, setRuntime] = useState<string | null>(null)
+  const [harness, setHarness] = useState<HarnessChoice | null>(null)
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [model, setModel] = useState('')
   const [reasoningEffort, setReasoningEffort] = useState('')
   const [permissionPolicy, setPermissionPolicy] = useState<string | null>(null)
   const [systemPrompt, setSystemPrompt] = useState('')
+  const [credentialId, setCredentialId] = useState('')
   const [error, setError] = useState<string>()
   const inFlight = useRef(false)
 
   useEffect(() => {
     if (!open) return
-    setEntryId(preselectedEntryId)
-    setCliKind(null)
-    setRuntime(null)
+    setHarness(preselectedEntryId ? { kind: 'direct', entryId: preselectedEntryId } : null)
     setName('')
     setDescription('')
     setModel('')
     setReasoningEffort('')
     setPermissionPolicy(null)
     setSystemPrompt('')
+    setCredentialId('')
     setError(undefined)
   }, [open, preselectedEntryId])
 
   const activeEntries = entries.filter((entry) => entry.status === 'configured')
-  const selectedEntry = activeEntries.find((entry) => entry.id === entryId) ?? null
-  const runtimeOptions: WizardRuntime[] = selectedEntry
-    ? runtimeOptionsForEntry(capabilities.data?.items, selectedEntry)
-    : cliKind
-      ? [{ runtime: cliKind, support_level: 'stable', reason: null }]
-      : []
+  const selectedEntry =
+    harness?.kind === 'direct'
+      ? (activeEntries.find((entry) => entry.id === harness.entryId) ?? null)
+      : null
+  const cliRuntime = harness?.kind === 'cli' ? harness.runtime : null
   const capability = selectedEntry
     ? capabilities.data?.items.find((item) => item.provider === selectedEntry.provider)
     : undefined
-  const step: 1 | 2 | 3 = !selectedEntry && !cliKind ? 1 : !runtime ? 2 : 3
-  const isHarness = Boolean(runtime && runtime !== 'direct')
-  const discovered = useDiscoveredOptions(null, isHarness ? runtime : null)
+  const step: 1 | 2 = harness ? 2 : 1
+  const discovered = useDiscoveredOptions(null, cliRuntime)
   const reasoningOptionsForModel = useMemo(
     () => getReasoningOptionsForModel(discovered.data, model.trim() ? model : null),
     [discovered.data, model],
   )
+  const uniqueCliRuntimes = cliRuntimes.filter(
+    (runtimeEntry, index, all) =>
+      all.findIndex((candidate) => candidate.kind === runtimeEntry.kind) === index,
+  )
+  /** Entries whose provider can power the chosen CLI harness via injection. */
+  const harnessCredentialEntries = useMemo(() => {
+    if (!cliRuntime) return []
+    return activeEntries.filter((entry) =>
+      runtimeOptionsForEntry(capabilities.data?.items, entry).some(
+        (option) => option.runtime === cliRuntime && option.support_level !== 'unavailable',
+      ),
+    )
+  }, [activeEntries, capabilities.data?.items, cliRuntime])
 
   useEffect(() => {
-    if (step === 3 && selectedEntry && !model) {
+    if (step === 2 && selectedEntry && !model) {
       setModel(capability?.default_model ?? '')
     }
   }, [capability?.default_model, model, selectedEntry, step])
 
   async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (inFlight.current || !runtime) return
+    if (inFlight.current || !harness) return
     if (!name.trim()) {
       setError('A name is required.')
       return
@@ -111,7 +126,7 @@ export function NewAgentDialog({
     inFlight.current = true
     setError(undefined)
     try {
-      if (runtime === 'direct' && selectedEntry) {
+      if (harness.kind === 'direct' && selectedEntry) {
         if (!model.trim()) {
           setError('A model is required for a direct agent.')
           return
@@ -125,15 +140,16 @@ export function NewAgentDialog({
           account_permission_ceiling: DEFAULT_CEILING,
           tool_policy: DEFAULT_CEILING,
         })
-      } else {
+      } else if (harness.kind === 'cli') {
         await registerHarness.mutateAsync({
           name: name.trim(),
           description: description.trim() ? description.trim() : null,
-          executor_type: runtime,
+          executor_type: harness.runtime,
           model: model.trim() ? model.trim() : null,
           reasoning_effort: reasoningEffort.trim() ? reasoningEffort.trim() : null,
           permission_policy: permissionPolicy,
-          credential_id: selectedEntry?.id ?? null,
+          prompt_template: systemPrompt.trim() ? systemPrompt.trim() : null,
+          credential_id: credentialId || null,
         })
       }
       onClose()
@@ -149,75 +165,86 @@ export function NewAgentDialog({
       <DialogContent className="max-w-2xl">
         <DialogHeader>
           <p className="font-mono text-micro font-semibold uppercase tracking-[1px] text-muted-foreground">
-            New agent · step {step} of 3
+            New agent · step {step} of 2
           </p>
           <DialogTitle className="mt-1">
-            {step === 1
-              ? 'Choose an authentication source'
-              : step === 2
-                ? 'Choose a runtime'
-                : 'Configure the agent'}
+            {step === 1 ? 'Choose the harness' : 'Set the agent defaults'}
           </DialogTitle>
           <DialogDescription>
             {step === 1
-              ? 'Pick the provider entry or CLI-managed runtime this agent authenticates with.'
-              : step === 2
-                ? 'Compatibility comes from the server capability catalog.'
-                : 'Creation publishes an immutable profile. Bindings stay unchanged until you assign them.'}
+              ? 'An agent runs directly on the built-in runtime, or through a CLI harness.'
+              : 'These defaults apply everywhere the agent is bound. You can change them any time.'}
           </DialogDescription>
         </DialogHeader>
 
         {step === 1 ? (
-          <div className="mt-5 space-y-3">
-            {activeEntries.length === 0 && cliRuntimes.length === 0 ? (
+          <div className="mt-5 space-y-4">
+            {activeEntries.length === 0 && uniqueCliRuntimes.length === 0 ? (
               <EmptyPanel
-                title="No authentication sources"
+                title="No harness available"
                 description="Add a provider first, or authenticate a CLI on a connected runtime."
                 icon={<Key size={19} />}
               />
             ) : null}
-            {activeEntries.map((entry) => (
-              <button
-                key={entry.id}
-                type="button"
-                className="flex w-full items-center justify-between gap-3 rounded-md border border-border-subtle bg-card px-3 py-2 text-left hover:border-ember-border"
-                onClick={() => setEntryId(entry.id)}
-              >
-                <div className="min-w-0">
-                  <p className="truncate text-sm font-medium text-foreground">
-                    {humanize(entry.provider)} · {entry.label}
-                  </p>
-                  <p className="mt-0.5 text-xs text-muted-foreground">
-                    {entry.credential_method === 'oauth_bundle' ? 'OAuth login' : 'API key'} · used by{' '}
-                    {entry.used_by.length}
-                  </p>
-                </div>
-                <CaretRight size={15} className="shrink-0 text-muted-foreground" aria-hidden />
-              </button>
-            ))}
-            {cliRuntimes
-              .filter(
-                (runtimeEntry, index, all) =>
-                  all.findIndex((candidate) => candidate.kind === runtimeEntry.kind) === index,
-              )
-              .map((runtimeEntry) => (
-                <button
-                  key={runtimeEntry.kind}
-                  type="button"
-                  className="flex w-full items-center justify-between gap-3 rounded-md border border-border-subtle bg-card px-3 py-2 text-left hover:border-ember-border"
-                  onClick={() => setCliKind(runtimeEntry.kind)}
-                >
-                  <div className="min-w-0">
-                    <p className="truncate text-sm font-medium text-foreground">
-                      {runtimeDisplayNames[runtimeEntry.kind] ?? humanize(runtimeEntry.kind)}
-                    </p>
-                    <p className="mt-0.5 text-xs text-muted-foreground">
-                      Uses its own CLI login · {humanize(runtimeEntry.availability)}
-                    </p>
-                  </div>
-                  <CaretRight size={15} className="shrink-0 text-muted-foreground" aria-hidden />
-                </button>
-              ))}
+            {activeEntries.length > 0 ? (
+              <div className="space-y-2">
+                <p className="font-mono text-micro font-semibold uppercase tracking-[0.8px] text-muted-foreground">
+                  Direct · built-in runtime
+                </p>
+                {activeEntries.map((entry) => (
+                  <button
+                    key={entry.id}
+                    type="button"
+                    className="flex w-full items-center justify-between gap-3 rounded-md border border-border-subtle bg-card px-3 py-2 text-left hover:border-ember-border"
+                    onClick={() => setHarness({ kind: 'direct', entryId: entry.id })}
+                  >
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium text-foreground">
+                        {humanize(entry.provider)} · {entry.label}
+                      </p>
+                      <p className="mt-0.5 text-xs text-muted-foreground">
+                        {entry.credential_method === 'oauth_bundle' ? 'OAuth login' : 'API key'} · used
+                        by {entry.used_by.length}
+                      </p>
+                    </div>
+                    <CaretRight size={15} className="shrink-0 text-muted-foreground" aria-hidden />
+                  </button>
+                ))}
+              </div>
+            ) : null}
+            {uniqueCliRuntimes.length > 0 ? (
+              <div className="space-y-2">
+                <p className="font-mono text-micro font-semibold uppercase tracking-[0.8px] text-muted-foreground">
+                  CLI harness
+                </p>
+                {uniqueCliRuntimes.map((runtimeEntry) => (
+                  <button
+                    key={runtimeEntry.kind}
+                    type="button"
+                    className="flex w-full items-center justify-between gap-3 rounded-md border border-border-subtle bg-card px-3 py-2 text-left hover:border-ember-border"
+                    onClick={() => setHarness({ kind: 'cli', runtime: runtimeEntry.kind })}
+                  >
+                    <div className="flex min-w-0 items-center gap-2.5">
+                      <TerminalWindow size={16} className="shrink-0 text-primary" aria-hidden />
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-medium text-foreground">
+                          {runtimeDisplayNames[runtimeEntry.kind] ?? humanize(runtimeEntry.kind)}
+                          {runtimeEntry.version ? (
+                            <span className="ml-2 font-mono text-xs text-muted-foreground">
+                              v{runtimeEntry.version}
+                            </span>
+                          ) : null}
+                        </p>
+                        <p className="mt-0.5 text-xs text-muted-foreground">
+                          {humanize(runtimeEntry.availability)} · CLI-managed or provider credential
+                        </p>
+                      </div>
+                    </div>
+                    <CaretRight size={15} className="shrink-0 text-muted-foreground" aria-hidden />
+                  </button>
+                ))}
+              </div>
+            ) : null}
             <DialogFooter className="gap-2">
               <Button type="button" variant="outline" onClick={onAddProvider}>
                 <Plus size={15} aria-hidden />
@@ -228,64 +255,14 @@ export function NewAgentDialog({
         ) : null}
 
         {step === 2 ? (
-          <div className="mt-5 space-y-3">
-            <p className="text-xs text-muted-foreground">
-              Source:{' '}
-              <strong className="text-foreground">
-                {selectedEntry
-                  ? `${humanize(selectedEntry.provider)} · ${selectedEntry.label}`
-                  : (runtimeDisplayNames[cliKind ?? ''] ?? humanize(cliKind))}
-              </strong>
-            </p>
-            {runtimeOptions.map((option) => {
-              const unavailable = option.support_level === 'unavailable'
-              return (
-                <button
-                  key={option.runtime}
-                  type="button"
-                  disabled={unavailable}
-                  className={`flex w-full items-center justify-between gap-3 rounded-md border px-3 py-2 text-left ${unavailable ? 'cursor-not-allowed border-border-subtle bg-muted/40 opacity-70' : 'border-border-subtle bg-card hover:border-ember-border'}`}
-                  onClick={() => setRuntime(option.runtime)}
-                >
-                  <div className="min-w-0">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <p className="text-sm font-medium text-foreground">
-                        {runtimeDisplayNames[option.runtime] ?? humanize(option.runtime)}
-                      </p>
-                      <StateBadge status={option.support_level} label={humanize(option.support_level)} />
-                    </div>
-                    {option.reason ? (
-                      <p className="mt-0.5 text-xs text-muted-foreground">{option.reason}</p>
-                    ) : null}
-                  </div>
-                  {!unavailable ? (
-                    <CaretRight size={15} className="shrink-0 text-muted-foreground" aria-hidden />
-                  ) : null}
-                </button>
-              )
-            })}
-            <DialogFooter>
-              <Button
-                type="button"
-                variant="ghost"
-                onClick={() => {
-                  setEntryId(null)
-                  setCliKind(null)
-                }}
-              >
-                Back
-              </Button>
-            </DialogFooter>
-          </div>
-        ) : null}
-
-        {step === 3 ? (
           <form onSubmit={submit} className="mt-5 space-y-4">
             <p className="text-xs text-muted-foreground">
-              {selectedEntry
-                ? `${humanize(selectedEntry.provider)} · ${selectedEntry.label}`
-                : 'CLI-managed login'}{' '}
-              → {runtimeDisplayNames[runtime ?? ''] ?? humanize(runtime)}
+              Harness:{' '}
+              <strong className="text-foreground">
+                {selectedEntry
+                  ? `Direct · ${humanize(selectedEntry.provider)} · ${selectedEntry.label}`
+                  : (runtimeDisplayNames[cliRuntime ?? ''] ?? humanize(cliRuntime))}
+              </strong>
             </p>
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
@@ -298,7 +275,7 @@ export function NewAgentDialog({
                   required
                 />
               </div>
-              {isHarness ? (
+              {cliRuntime ? (
                 <ModelSelector
                   id="agent-model"
                   models={discovered.data?.models ?? []}
@@ -322,7 +299,7 @@ export function NewAgentDialog({
                   />
                 </div>
               )}
-              {isHarness ? (
+              {cliRuntime ? (
                 <>
                   <ReasoningSelector
                     id="agent-reasoning"
@@ -337,6 +314,22 @@ export function NewAgentDialog({
                     value={permissionPolicy}
                     onChange={setPermissionPolicy}
                   />
+                  <div className="space-y-2 sm:col-span-2">
+                    <Label htmlFor="agent-credential">Credential</Label>
+                    <Select
+                      id="agent-credential"
+                      value={credentialId}
+                      onChange={setCredentialId}
+                      options={[
+                        { value: '', label: 'CLI-managed login' },
+                        ...harnessCredentialEntries.map((entry) => ({
+                          value: entry.id,
+                          label: `${humanize(entry.provider)} · ${entry.label}`,
+                        })),
+                      ]}
+                      aria-label="Harness credential"
+                    />
+                  </div>
                 </>
               ) : null}
               <div className="space-y-2 sm:col-span-2">
@@ -345,21 +338,19 @@ export function NewAgentDialog({
                   id="agent-description"
                   value={description}
                   onChange={(event) => setDescription(event.target.value)}
-                  placeholder="What this agent is for"
+                  placeholder="What this agent is for — other agents use this to pick it"
                 />
               </div>
-              {runtime === 'direct' ? (
-                <div className="space-y-2 sm:col-span-2">
-                  <Label htmlFor="agent-prompt">System prompt (optional)</Label>
-                  <Textarea
-                    id="agent-prompt"
-                    value={systemPrompt}
-                    onChange={(event) => setSystemPrompt(event.target.value)}
-                    placeholder="A bounded role for this agent"
-                    rows={3}
-                  />
-                </div>
-              ) : null}
+              <div className="space-y-2 sm:col-span-2">
+                <Label htmlFor="agent-prompt">System prompt (optional)</Label>
+                <Textarea
+                  id="agent-prompt"
+                  value={systemPrompt}
+                  onChange={(event) => setSystemPrompt(event.target.value)}
+                  placeholder="A bounded role for this agent"
+                  rows={3}
+                />
+              </div>
             </div>
             {error ? (
               <p role="alert" className="text-xs text-destructive">
@@ -367,7 +358,7 @@ export function NewAgentDialog({
               </p>
             ) : null}
             <DialogFooter className="gap-2">
-              <Button type="button" variant="ghost" onClick={() => setRuntime(null)}>
+              <Button type="button" variant="ghost" onClick={() => setHarness(null)}>
                 Back
               </Button>
               <Button type="submit" disabled={createEmbedded.isPending || registerHarness.isPending}>
@@ -414,7 +405,7 @@ function RosterRow({
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm font-medium">{agent.name}</p>
         <p className="mt-0.5 truncate text-xs text-muted-foreground">
-          {runtimeDisplayNames[runtime] ?? humanize(runtime)} · {agent.model ?? 'profile pending'}
+          {runtimeDisplayNames[runtime] ?? humanize(runtime)} · {agent.model ?? 'model not set'}
         </p>
       </div>
     </button>
@@ -430,7 +421,7 @@ function EmptyDetailPanel() {
         </div>
         <p className="text-sm font-medium">Select an agent</p>
         <p className="mt-1 text-xs text-muted-foreground">
-          Choose an agent from the list to view its model, profiles, and bindings
+          Choose an agent from the list to view and edit its settings
         </p>
       </div>
     </div>
@@ -449,7 +440,6 @@ export function AgentsTab({
   onSelect,
   providerFilter,
   onProviderFilterChange,
-  onChangeModel,
   onNewAgent,
 }: {
   agents: FederatedAgent[]
@@ -462,7 +452,6 @@ export function AgentsTab({
   onSelect: (id: string | null) => void
   providerFilter: string
   onProviderFilterChange: (value: string) => void
-  onChangeModel: (agent: FederatedAgent) => void
   onNewAgent: () => void
 }) {
   const [query, setQuery] = useState('')
@@ -602,7 +591,6 @@ export function AgentsTab({
                 agent={selectedAgent}
                 entries={entries}
                 chatEntries={chatEntries}
-                onChangeModel={onChangeModel}
               />
             ) : (
               <EmptyDetailPanel />

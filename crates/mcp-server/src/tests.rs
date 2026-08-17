@@ -102,7 +102,6 @@ async fn seed_chat_account(state: &AppState) -> (String, String, String) {
             actor_user_id: "chat-user".to_owned(),
             account_id: "chat-user".to_owned(),
             identity_id: identity_id.clone(),
-            profile_id: profile_id.clone(),
             autonomy_policy_json: "{}".to_owned(),
             tool_policy_revision: "test".to_owned(),
             expected_version: None,
@@ -113,7 +112,7 @@ async fn seed_chat_account(state: &AppState) -> (String, String, String) {
     (identity_id, profile_id, "chat-user".to_owned())
 }
 
-async fn seed_chat_project(state: &AppState, identity_id: &str, profile_id: &str) -> String {
+async fn seed_chat_project(state: &AppState, identity_id: &str) -> String {
     let now = now_rfc3339();
     let project_id = new_uuid_v4();
     ProjectRepo::create(
@@ -155,7 +154,6 @@ async fn seed_chat_project(state: &AppState, identity_id: &str, profile_id: &str
             actor_user_id: "chat-user".to_owned(),
             project_id: project_id.clone(),
             identity_id: Some(identity_id.to_owned()),
-            profile_id: Some(profile_id.to_owned()),
             state: "active".to_owned(),
             autonomy_policy_json: "{}".to_owned(),
             permission_ceiling_json: "{}".to_owned(),
@@ -752,8 +750,8 @@ fn mcp_chat_send_uses_atomic_admission_and_deduplicates() {
 fn mcp_handoff_admits_delivery_and_target_turn_atomically() {
     run_async(async {
         let state = sqlite_state().await;
-        let (identity_id, profile_id, user_id) = seed_chat_account(&state).await;
-        let project_id = seed_chat_project(&state, &identity_id, &profile_id).await;
+        let (identity_id, _profile_id, user_id) = seed_chat_account(&state).await;
+        let project_id = seed_chat_project(&state, &identity_id).await;
         let context = McpContext {
             project_id: None,
             user_id: Some(user_id.clone()),

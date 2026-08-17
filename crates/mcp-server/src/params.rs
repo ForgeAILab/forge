@@ -180,7 +180,6 @@ pub(crate) struct GetAgentSessionParams {
 #[derive(Debug, Deserialize)]
 pub(crate) struct BindMainAgentParams {
     pub(crate) identity_id: String,
-    pub(crate) profile_id: String,
     pub(crate) expected_version: i64,
     #[serde(default)]
     pub(crate) autonomy_policy: Value,
@@ -190,7 +189,6 @@ pub(crate) struct BindMainAgentParams {
 pub(crate) struct BindProjectAgentParams {
     pub(crate) project_id: String,
     pub(crate) identity_id: String,
-    pub(crate) profile_id: String,
     pub(crate) expected_version: i64,
     #[serde(default)]
     pub(crate) permission_ceiling: Value,

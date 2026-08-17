@@ -8,15 +8,43 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Agent management no longer surfaces profiles anywhere. An agent is one
+  directly-editable definition — harness (CLI or direct), default model,
+  reasoning, permission policy, system prompt, description — edited inline in
+  the `/agents` detail panel: the settings render as live form fields and a
+  Save/Discard bar appears once something changes, for both CLI-harness and
+  direct agents (`ChangeModelDialog` and the profile list/selector UI are
+  deleted). Profile revisions still exist internally as the immutable history
+  of an agent's settings, but they are no longer a user-facing concept.
+- Main and Project Agent bindings now name only the agent.
+  `PUT /api/v1/account/main-agent` and `PUT /api/v1/projects/{id}/project-agent`
+  no longer accept `profile_id`; every turn resolves the bound agent's
+  *current* settings, so editing an agent applies to its next turn in every
+  bound scope without rebinding. The binding row's stored profile reference
+  is now a bind-time snapshot reserved for future per-binding overrides.
+- The New agent wizard is harness-first: step 1 picks how the agent runs
+  (a direct provider entry, or a CLI harness listed with its version), step 2
+  sets the defaults — model, reasoning, policy, description, system prompt,
+  and, for CLI harnesses, an optional powering provider entry.
+- `forge-ctl embedded main set` and `forge-ctl embedded project set` drop
+  their `--profile-id` flag to match the binding API.
+
+- `AgentChatTurnStatus` gains `awaiting_input` to represent turns parked for
+  runtime questionnaire interactions. API consumers and SSE event listeners
+  must handle the new state. A parked turn references its pending protected
+  interaction and releases its execution lease without consuming retry attempts.
+- The pre-chat Product Genesis configuration form and permanent header button
+  have been removed from the web UI. Discovery now starts directly from the Main
+  Chat composer or empty state (composer text seeds the initial idea; omitted
+  maturity defaults to `mvp`). Setup may be collected in-conversation and
+  persisted once via the typed guided-setup action
+  `POST /api/v1/account/main-agent/product-genesis/{session_id}/guided-setup`.
 - Launching a task no longer offers a "Save changes to agent" checkbox on
   the launch dialog's model/reasoning/policy overrides. Those overrides
   remain execution-scoped (they only affect the run being launched); the
   side effect that silently PATCHed the agent's persistent defaults from the
-  Task Detail launch flow is gone. Persistent model changes now live
-  entirely in Agent Settings (`/agents`) — `ChangeModelDialog` also gained a
-  real "Update model" path for CLI-harness agents there (previously they had
-  no way to change their model at all from `/agents`; only the removed
-  launch-dialog checkbox could touch it).
+  Task Detail launch flow is gone. Persistent model changes now live entirely
+  in Agent Settings (`/agents`), edited inline in the agent's detail panel.
 
 ### Added
 
@@ -35,6 +63,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Redesigned the Providers and Bindings tabs on `/agents`. Provider cards now
+  lead with the entry's own name (provider name as subtitle), a clean
+  Connected/Revoked/Error badge, and a small inline refresh button beside the
+  header that refreshes the entry's status and usage; the per-card
+  "test connection" box/buttons and the technical endpoint URL row are gone
+  (the wizard's final step keeps only a quiet auto-run connectivity line), and
+  the card's Disconnect button is styled destructive. CLI runtime cards show
+  the runtime display name over the daemon host/id with an
+  Authenticated/Not Logged In/Unavailable badge. The Bindings tab is now a
+  master/detail matching the Agents tab: a searchable scope roster (Global
+  Main Agent plus every project, each badged with its bound agent or
+  "Not configured") on the left and the selected scope's binding configuration
+  on the right, with `?project={id}` auto-selecting that project; the
+  read-only "Bound agent scopes" projection stays below.
 - Redesigned the `/agents` page. The Agents tab is now a Runtimes-style
   master/detail: a searchable/filterable roster on the left, one agent's
   model, profiles, and bound scopes on the right — the inline session list

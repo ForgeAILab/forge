@@ -195,7 +195,7 @@ struct MainArgs {
 enum MainCommand {
     /// Inspect the current binding and setup state.
     Get,
-    /// Replace the binding with an account-owned identity/profile revision.
+    /// Bind an account-owned agent; the binding follows its settings.
     Set(BindingSetArgs),
 }
 
@@ -209,15 +209,13 @@ struct ProjectAgentArgs {
 enum ProjectAgentCommand {
     /// Inspect the current Project Agent binding and setup state.
     Get { project_id: String },
-    /// Replace the binding with an account-owned identity/profile revision.
+    /// Bind an account-owned agent; the binding follows its settings.
     Set(ProjectAgentSetArgs),
 }
 
 #[derive(Args)]
 struct BindingSetArgs {
     identity_id: String,
-    #[arg(long)]
-    profile_id: String,
     #[arg(long)]
     version: i64,
     #[arg(long)]
@@ -228,8 +226,6 @@ struct BindingSetArgs {
 struct ProjectAgentSetArgs {
     project_id: String,
     identity_id: String,
-    #[arg(long)]
-    profile_id: String,
     #[arg(long)]
     version: i64,
     #[arg(long)]
@@ -762,7 +758,6 @@ async fn main_binding(client: &ForgeClient, output: &OutputFormat, args: &MainAr
                     "/api/v1/account/main-agent",
                     &SetMainAgentBindingRequest {
                         identity_id: args.identity_id.clone(),
-                        profile_id: args.profile_id.clone(),
                         expected_version: args.version,
                         autonomy_policy: args
                             .autonomy_policy
@@ -796,7 +791,6 @@ async fn project_binding(
                     &format!("/api/v1/projects/{}/project-agent", args.project_id),
                     &SetProjectAgentBindingRequest {
                         identity_id: args.identity_id.clone(),
-                        profile_id: args.profile_id.clone(),
                         expected_version: args.version,
                         permission_ceiling: args
                             .permission_ceiling

@@ -66,11 +66,10 @@ export function runtimeOptionsForEntry(
 }
 
 /**
- * A CLI-harness identity (Codex/Claude Code/Cursor/... executor types) can't
- * publish an embedded profile — only "native"/"embedded" backends can. Used
- * to gate ChangeModelDialog's "new model" mode.
+ * A direct agent runs on the built-in runtime against a provider entry;
+ * anything else is a CLI harness (Codex/Claude Code/Cursor/... executors).
  */
-export function canPublishEmbeddedProfile(backendKind: string): boolean {
+export function isDirectAgent(backendKind: string): boolean {
   return backendKind === 'native' || backendKind === 'embedded'
 }
 

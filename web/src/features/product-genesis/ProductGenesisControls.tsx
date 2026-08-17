@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
 import {
   ArrowClockwise,
@@ -13,39 +13,27 @@ import {
   X,
 } from '@phosphor-icons/react'
 import { ApiError } from '@/api/client'
-import { useAgentsQuery } from '@/api/hooks'
 import { useAuthStore } from '@/stores/auth'
 import { ConflictDetails } from '@/components/conflict-details'
 import { Button } from '@/components/ui/button'
+import { ErrorCard } from '@/components/chat/error-card'
+import { LoadingState } from '@/components/chat/loading-state'
 import {
   useApproveProductGenesisCharterRevisionMutation,
   useCancelProductGenesisMutation,
   useCreateProjectFromCharterApprovalMutation,
   useProductGenesisActiveQuery,
   useProductGenesisCharterQuery,
-  useStartProductGenesisMutation,
 } from './hooks'
 import type {
   ProductAgentSelection,
   ProductGenesisCharterResponse,
   ProductGenesisSession,
-  ProductMaturity,
   ProjectCharterApproval,
   ProjectCharterReadiness,
   ProjectCharterRevision,
 } from './types'
 import { productGenesisVersion } from './types'
-
-const maturities: Array<{ value: ProductMaturity; label: string; hint: string }> = [
-  { value: 'prototype', label: 'Prototype', hint: 'Cheap learning loop and reversible decisions' },
-  { value: 'mvp', label: 'MVP', hint: 'Smallest reliable end-to-end outcome' },
-  { value: 'production', label: 'Production', hint: 'Operations, security, support, and release' },
-  {
-    value: 'critical',
-    label: 'Critical',
-    hint: 'Safety, recovery, auditability, and rollout gates',
-  },
-]
 
 function lifecycleLabel(value: string): string {
   return value.replaceAll('_', ' ')
@@ -608,17 +596,12 @@ function CharterReviewPanel({
 
 export function ProductGenesisControls() {
   const activeQuery = useProductGenesisActiveQuery()
-  const startMutation = useStartProductGenesisMutation()
   const cancelMutation = useCancelProductGenesisMutation()
   const active = activeQuery.data?.session ?? null
   const charterQuery = useProductGenesisCharterQuery(active?.id)
   const approveMutation = useApproveProductGenesisCharterRevisionMutation(active?.id)
   const createMutation = useCreateProjectFromCharterApprovalMutation()
-  const agentsQuery = useAgentsQuery()
-  const [open, setOpen] = useState(false)
-  const [maturity, setMaturity] = useState<ProductMaturity>('mvp')
-  const [initialIdea, setInitialIdea] = useState('')
-  const [preferredAgentId, setPreferredAgentId] = useState('')
+  const [inspecting, setInspecting] = useState(false)
   const [selectedRevisionId, setSelectedRevisionId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [conflict, setConflict] = useState(false)
@@ -636,10 +619,6 @@ export function ProductGenesisControls() {
     authorization: ReturnType<typeof createAuthorization>
   } | null>(null)
 
-  const availableAgents = useMemo(
-    () => (agentsQuery.data?.items ?? []).filter((agent) => !agent.paused),
-    [agentsQuery.data?.items],
-  )
   const charterData = charterQuery.data
   const approval = charterData?.approval ?? lastApproval
   const draftRevision = charterData?.current_draft_revision ?? null
@@ -652,6 +631,13 @@ export function ProductGenesisControls() {
     selectedRevision.lifecycle !== 'approved',
   )
   const projectId = createdProjectId ?? active?.project_id ?? null
+
+  const isDiscovering = active?.lifecycle === 'discovering'
+  const isReady = active?.lifecycle === 'ready_for_project'
+  const hasApprovalCandidate = Boolean(
+    draftRevision?.lifecycle === 'proposed' || approval || charterData?.current_approved_revision,
+  )
+  const showFullPanel = !isDiscovering || isReady || hasApprovalCandidate || inspecting
 
   useEffect(() => {
     if (!charterData) return
@@ -670,26 +656,11 @@ export function ProductGenesisControls() {
       setCreatedProjectId(null)
       setConflict(false)
       setConflictError(null)
+      setInspecting(false)
       approvalAttemptRef.current = null
       createAttemptRef.current = null
     }
   }, [active])
-
-  async function start() {
-    setError(null)
-    try {
-      await startMutation.mutateAsync({
-        maturity,
-        initial_idea: initialIdea.trim() || null,
-        preferred_project_agent_identity_id: preferredAgentId || null,
-      })
-      setInitialIdea('')
-      setPreferredAgentId('')
-      setOpen(false)
-    } catch (cause) {
-      setError(getApiErrorMessage(cause, 'Product Genesis could not start.'))
-    }
-  }
 
   async function cancel() {
     if (!active) return
@@ -827,198 +798,111 @@ export function ProductGenesisControls() {
   }
 
   if (activeQuery.isLoading) {
-    return (
-      <span className="text-xs text-muted-foreground" aria-busy="true">
-        Loading Product Genesis…
-      </span>
-    )
+    return <LoadingState label="Loading Product Genesis…" compact />
   }
 
   if (activeQuery.isError) {
     return (
-      <div className="flex items-center gap-2 text-xs text-destructive" role="alert">
-        Product Genesis status is unavailable.
-        <Button type="button" variant="ghost" size="sm" onClick={() => void activeQuery.refetch()}>
-          <ArrowClockwise size={13} aria-hidden /> Retry
-        </Button>
-      </div>
+      <ErrorCard
+        title="Product Genesis status is unavailable"
+        description="Could not load the active Product Genesis session."
+        severity="error"
+        action={{ label: 'Retry', onClick: () => void activeQuery.refetch() }}
+      />
     )
+  }
+
+  if (!active) {
+    return null
   }
 
   return (
     <div className="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-2">
-      {active ? (
-        <>
-          <div className="flex min-w-0 flex-wrap items-center gap-2 rounded-lg border border-ember-border bg-ember-surface px-3 py-2">
-            <Flask size={15} className="shrink-0 text-primary" aria-hidden />
-            <span className="min-w-0 text-xs text-foreground">
-              Genesis · {lifecycleLabel(active.lifecycle)} · {active.maturity}
-            </span>
-            {projectId && active.lifecycle === 'handed_off' ? (
-              <Link
-                to="/projects/$projectId/chat"
-                params={{ projectId }}
-                className="inline-flex items-center gap-1 text-xs font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                Continue with Project Agent
-                <ArrowRight size={13} aria-hidden />
-              </Link>
-            ) : null}
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              onClick={() => void cancel()}
-              disabled={cancelMutation.isPending || active.lifecycle === 'handed_off'}
-              aria-label="Cancel Product Genesis"
-            >
-              {cancelMutation.isPending ? (
-                <CircleNotch size={14} className="animate-spin" aria-hidden />
-              ) : (
-                <X size={14} aria-hidden />
-              )}
-              Cancel
-            </Button>
-          </div>
-          {charterQuery.isLoading ? (
-            <div
-              className="basis-full rounded-lg border border-border-subtle bg-card p-4"
-              aria-busy="true"
-            >
-              <div className="h-4 w-40 animate-pulse rounded bg-muted" />
-              <div className="mt-3 h-3 w-full animate-pulse rounded bg-muted" />
-              <div className="mt-2 h-3 w-4/5 animate-pulse rounded bg-muted" />
-            </div>
-          ) : charterQuery.isError ? (
-            <div
-              className="basis-full rounded-lg border border-destructive/40 bg-destructive/5 p-3"
-              role="alert"
-            >
-              <p className="text-xs text-destructive">
-                Charter projection is unavailable; approval is disabled.
-              </p>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="mt-2"
-                onClick={() => void charterQuery.refetch()}
-              >
-                <ArrowClockwise size={13} aria-hidden /> Retry Charter
-              </Button>
-            </div>
-          ) : charterData ? (
-            <CharterReviewPanel
-              active={active}
-              charterData={charterData}
-              selectedRevisionId={selectedRevisionId}
-              onRevisionChange={setSelectedRevisionId}
-              approval={approval}
-              approvalPending={approveMutation.isPending}
-              createPending={createMutation.isPending}
-              onApprove={(revision) => void approve(revision)}
-              onCreate={() => void createProject()}
-              onRefresh={refreshCharter}
-              stale={stale}
-              conflict={conflict}
-              conflictError={conflictError}
-            />
-          ) : null}
-        </>
-      ) : (
+      <div className="flex min-w-0 flex-wrap items-center gap-2 rounded-lg border border-ember-border bg-ember-surface px-3 py-2">
+        <Flask size={15} className="shrink-0 text-primary" aria-hidden />
+        <span className="min-w-0 text-xs text-foreground">
+          Genesis · {lifecycleLabel(active.lifecycle)} · {active.maturity}
+        </span>
+        {draftRevision && isDiscovering ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={() => setInspecting((v) => !v)}
+            className="text-xs text-primary hover:text-primary gap-1 px-1.5 h-6"
+          >
+            <FileText size={13} aria-hidden />
+            {inspecting ? 'Hide Charter' : 'Inspect Charter'}
+          </Button>
+        ) : null}
+        {projectId && active.lifecycle === 'handed_off' ? (
+          <Link
+            to="/projects/$projectId/chat"
+            params={{ projectId }}
+            className="inline-flex items-center gap-1 text-xs font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            Continue with Project Agent
+            <ArrowRight size={13} aria-hidden />
+          </Link>
+        ) : null}
         <Button
           type="button"
-          variant="outline"
+          variant="ghost"
           size="sm"
-          onClick={() => setOpen((value) => !value)}
+          onClick={() => void cancel()}
+          disabled={cancelMutation.isPending || active.lifecycle === 'handed_off'}
+          aria-label="Cancel Product Genesis"
         >
-          <Flask size={15} aria-hidden /> Product Genesis
+          {cancelMutation.isPending ? (
+            <CircleNotch size={14} className="animate-spin" aria-hidden />
+          ) : (
+            <X size={14} aria-hidden />
+          )}
+          Cancel
         </Button>
-      )}
-      {open && !active ? (
-        <div className="basis-full min-w-0 rounded-lg border border-border-subtle bg-card p-3 shadow-xs">
-          <div className="grid min-w-0 gap-3 sm:grid-cols-[minmax(0,12rem)_minmax(0,1fr)_minmax(0,14rem)_auto] sm:items-end">
-            <label className="grid min-w-0 gap-1 text-xs font-medium text-foreground">
-              Maturity
-              <select
-                value={maturity}
-                onChange={(event) => setMaturity(event.target.value as ProductMaturity)}
-                className="h-9 min-w-0 rounded-md border border-border bg-background px-2 text-sm font-normal focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                aria-label="Product maturity"
-              >
-                {maturities.map((item) => (
-                  <option key={item.value} value={item.value}>
-                    {item.label}
-                  </option>
-                ))}
-              </select>
-              <span className="font-normal text-muted-foreground">
-                {maturities.find((item) => item.value === maturity)?.hint}
-              </span>
-            </label>
-            <label className="grid min-w-0 gap-1 text-xs font-medium text-foreground">
-              Initial idea <span className="font-normal text-muted-foreground">optional</span>
-              <textarea
-                value={initialIdea}
-                onChange={(event) => setInitialIdea(event.target.value)}
-                rows={2}
-                maxLength={2000}
-                placeholder="What should the Main Agent help discover?"
-                className="min-w-0 resize-y rounded-md border border-border bg-background px-2 py-2 text-sm font-normal focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                aria-label="Product Genesis initial idea"
-              />
-            </label>
-            <label className="grid min-w-0 gap-1 text-xs font-medium text-foreground">
-              Project Agent preference{' '}
-              <span className="font-normal text-muted-foreground">optional</span>
-              <select
-                value={preferredAgentId}
-                onChange={(event) => setPreferredAgentId(event.target.value)}
-                disabled={agentsQuery.isLoading}
-                className="h-9 min-w-0 rounded-md border border-border bg-background px-2 text-sm font-normal focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
-                aria-label="Preferred Project Agent"
-              >
-                <option value="">
-                  {agentsQuery.isLoading ? 'Loading agents…' : 'Let Main Agent recommend'}
-                </option>
-                {availableAgents.map((agent) => (
-                  <option key={agent.id} value={agent.id}>
-                    {agent.name}
-                  </option>
-                ))}
-              </select>
-              <span className="font-normal text-muted-foreground">
-                The final revision set is server-verified before approval.
-              </span>
-            </label>
-            <Button type="button" onClick={() => void start()} disabled={startMutation.isPending}>
-              {startMutation.isPending ? (
-                <CircleNotch size={15} className="animate-spin" aria-hidden />
-              ) : (
-                <ArrowRight size={15} aria-hidden />
-              )}
-              Start discovery
-            </Button>
+      </div>
+
+      {showFullPanel ? (
+        charterQuery.isLoading ? (
+          <div className="basis-full">
+            <LoadingState label="Loading Charter projection…" />
           </div>
-          {error ? (
-            <p className="mt-2 text-xs text-destructive" role="alert">
-              {error}
-            </p>
-          ) : null}
-          <p className="mt-2 font-mono text-micro uppercase tracking-[0.08em] text-muted-foreground">
-            Uses the existing Main Agent timeline · no Room or extra conversation
-          </p>
-        </div>
+        ) : charterQuery.isError ? (
+          <div className="basis-full">
+            <ErrorCard
+              title="Charter projection is unavailable"
+              description="Charter projection could not be loaded; approval is disabled."
+              severity="error"
+              action={{ label: 'Retry Charter', onClick: () => void charterQuery.refetch() }}
+            />
+          </div>
+        ) : charterData ? (
+          <CharterReviewPanel
+            active={active}
+            charterData={charterData}
+            selectedRevisionId={selectedRevisionId}
+            onRevisionChange={setSelectedRevisionId}
+            approval={approval}
+            approvalPending={approveMutation.isPending}
+            createPending={createMutation.isPending}
+            onApprove={(revision) => void approve(revision)}
+            onCreate={() => void createProject()}
+            onRefresh={refreshCharter}
+            stale={stale}
+            conflict={conflict}
+            conflictError={conflictError}
+          />
+        ) : null
       ) : null}
-      {error && !active && !open ? (
-        <p className="basis-full text-xs text-destructive" role="alert">
-          {error}
-        </p>
-      ) : null}
-      {active && error ? (
-        <p className="basis-full text-xs text-destructive" role="alert">
-          {error}
-        </p>
+      {error ? (
+        <ErrorCard
+          title="Product Genesis error"
+          description={error}
+          severity={conflict ? 'conflict' : 'error'}
+          action={conflict ? { label: 'Refresh', onClick: refreshCharter } : undefined}
+          technicalDetails={conflictError}
+          className="basis-full"
+        />
       ) : null}
     </div>
   )

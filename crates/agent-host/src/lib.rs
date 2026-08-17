@@ -197,6 +197,7 @@ pub struct AgentTurnOutput {
     /// Final Agent Runtime context/LCM metadata. Bodies and protected state
     /// are intentionally absent; Forge links this to its domain manifest.
     pub context_manifest: Option<RuntimeContextManifestLink>,
+    pub pending_interaction_id: Option<String>,
 }
 
 #[async_trait]

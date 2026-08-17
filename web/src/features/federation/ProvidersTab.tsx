@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import {
   ArrowClockwise,
   ArrowUpRight,
@@ -24,6 +25,7 @@ import {
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
+  federationQueryKeys,
   useAgentProviderCapabilitiesQuery,
   useCancelProviderAuthorizationMutation,
   useCreateProviderEntryMutation,
@@ -52,8 +54,13 @@ import {
 } from '@/features/federation/components'
 import { formatResetRelative, humanize, runtimeDisplayNames, shortId, windowLabel } from './format'
 
-/** Live connectivity check for a stored provider entry. */
-export function ProviderConnectionTest({
+/**
+ * One-shot live connectivity check for a stored provider entry, rendered as a
+ * single quiet status line. The check runs itself when `autoRun` is set; there
+ * is deliberately no manual "test again" clutter here — the provider card's
+ * refresh button covers manual re-checks.
+ */
+function ProviderConnectionTest({
   entryId,
   autoRun = false,
 }: {
@@ -92,50 +99,33 @@ export function ProviderConnectionTest({
   }, [autoRun, entryId, runTest])
 
   return (
-    <div
-      className="rounded-md border border-border-subtle bg-muted/20 px-3 py-2.5"
-      role="status"
-      aria-live="polite"
-    >
+    <p className="flex flex-wrap items-center gap-1.5 text-xs" role="status" aria-live="polite">
       {pending ? (
-        <span className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+        <>
           <CircleNotch size={14} className="animate-spin text-primary" aria-hidden />
-          Testing the provider connection…
-        </span>
+          <span className="text-muted-foreground">Checking the provider connection…</span>
+        </>
       ) : result?.status === 'ok' ? (
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <span className="inline-flex items-center gap-1.5 text-xs font-medium text-success">
-            <CheckCircle size={15} aria-hidden />
+        <>
+          <CheckCircle size={14} className="text-success" aria-hidden />
+          <span className="font-medium text-success">
             Provider responding · {result.latency_ms} ms
-            {result.message ? (
-              <span className="font-normal text-muted-foreground">· {result.message}</span>
-            ) : null}
           </span>
-          <Button size="sm" variant="ghost" onClick={() => runTest(entryId)}>
-            Test again
-          </Button>
-        </div>
+          {result.message ? (
+            <span className="text-muted-foreground">· {result.message}</span>
+          ) : null}
+        </>
       ) : result != null || failure != null ? (
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <span className="inline-flex items-center gap-1.5 text-xs font-medium text-destructive">
-            <WarningCircle size={15} aria-hidden />
+        <>
+          <WarningCircle size={14} className="text-destructive" aria-hidden />
+          <span className="font-medium text-destructive">
             {result?.message ?? failure ?? 'The connection test failed.'}
           </span>
-          <Button size="sm" variant="outline" onClick={() => runTest(entryId)}>
-            Retry test
-          </Button>
-        </div>
+        </>
       ) : (
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <span className="text-xs text-muted-foreground">
-            Check that this provider responds with the stored credential.
-          </span>
-          <Button size="sm" variant="outline" onClick={() => runTest(entryId)}>
-            Test connection
-          </Button>
-        </div>
+        <span className="text-muted-foreground">Forge verifies the stored credential once.</span>
       )}
-    </div>
+    </p>
   )
 }
 
@@ -160,38 +150,6 @@ function UsageSummary({ usage }: { usage: ProviderUsage }) {
             .join(' · ')}
         </p>
       ) : null}
-    </div>
-  )
-}
-
-/** Lazily-fetched per-entry usage line with a manual refresh affordance. */
-function ProviderUsageLine({ entryId }: { entryId: string }) {
-  const usageQuery = useProviderUsageQuery(entryId)
-  return (
-    <div className="mt-3 flex items-center justify-between gap-2 rounded-md border border-border-subtle bg-muted/20 px-3 py-2">
-      <div className="min-w-0 flex-1 text-xs">
-        {usageQuery.isLoading ? (
-          <span className="text-muted-foreground">Checking usage…</span>
-        ) : usageQuery.isError ? (
-          <span className="text-muted-foreground">Usage unavailable</span>
-        ) : usageQuery.data ? (
-          <UsageSummary usage={usageQuery.data} />
-        ) : null}
-      </div>
-      <button
-        type="button"
-        aria-label="Refresh usage"
-        title="Refresh usage"
-        className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        onClick={() => void usageQuery.refetch()}
-        disabled={usageQuery.isFetching}
-      >
-        <ArrowClockwise
-          size={13}
-          className={usageQuery.isFetching ? 'animate-spin' : ''}
-          aria-hidden
-        />
-      </button>
     </div>
   )
 }
@@ -501,7 +459,7 @@ export function AddProviderWizard({
                 ? 'Only the methods the server declares are offered. A guided login never replaces the API-key alternative.'
                 : step === 3
                   ? 'A successful connection stores a protected credential and creates a provider entry — it does not create an agent. Secrets never return to this screen.'
-                  : 'The credential is stored. Test the connection, then create an agent on this entry whenever you are ready.'}
+                  : 'The credential is stored. Create an agent on this entry whenever you are ready.'}
           </DialogDescription>
         </DialogHeader>
 
@@ -620,7 +578,7 @@ export function AddProviderWizard({
               className="flex items-start gap-2 rounded-md border border-success/30 bg-success/10 px-3 py-2.5 text-sm text-foreground"
               role="status"
             >
-              <ShieldCheck size={16} className="mt-0.5 shrink-0 text-success" aria-hidden />
+              <CheckCircle size={16} className="mt-0.5 shrink-0 text-success" aria-hidden />
               <span>
                 <strong>{connected.label}</strong> is connected. No agent was created.
               </span>
@@ -629,7 +587,7 @@ export function AddProviderWizard({
               <ProviderConnectionTest entryId={connected.id} autoRun />
             ) : (
               <p className="text-xs text-muted-foreground">
-                The entry is stored; run a connection test from its card on the Providers tab.
+                The entry is stored on the server and appears on its card in the Providers tab.
               </p>
             )}
             <DialogFooter className="gap-2">
@@ -656,11 +614,28 @@ function ProviderEntryCard({
 }) {
   const rename = useRenameProviderEntryMutation()
   const remove = useRemoveProviderEntryMutation()
+  const queryClient = useQueryClient()
+  const usageQuery = useProviderUsageQuery(entry.status === 'configured' ? entry.id : undefined)
   const [renaming, setRenaming] = useState(false)
   const [confirmingRemoval, setConfirmingRemoval] = useState(false)
   const [label, setLabel] = useState(entry.label)
   const [error, setError] = useState<string>()
   const [notice, setNotice] = useState<string>()
+
+  const statusBadge =
+    entry.status === 'configured'
+      ? { status: 'active', label: 'Connected' }
+      : entry.status === 'revoked'
+        ? { status: 'error', label: 'Revoked' }
+        : entry.status === 'invalid'
+          ? { status: 'error', label: 'Error' }
+          : { status: entry.status, label: humanize(entry.status) }
+
+  /** Refresh the entry's status and usage in place from the server. */
+  function refreshStatus() {
+    void queryClient.invalidateQueries({ queryKey: federationQueryKeys.credentials })
+    if (entry.status === 'configured') void usageQuery.refetch()
+  }
 
   async function submitRename(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -703,14 +678,27 @@ function ProviderEntryCard({
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
-            <h3 className="truncate text-sm font-semibold text-foreground">
-              {humanize(entry.provider)}
-            </h3>
-            <StateBadge status={entry.status} label={humanize(entry.status)} />
+            <h3 className="truncate text-sm font-semibold text-foreground">{entry.label}</h3>
+            <StateBadge status={statusBadge.status} label={statusBadge.label} />
           </div>
-          <p className="mt-1 truncate text-xs text-muted-foreground">{entry.label}</p>
+          <p className="mt-1 truncate text-xs text-muted-foreground">{humanize(entry.provider)}</p>
         </div>
-        <Key size={17} className="shrink-0 text-primary" aria-hidden />
+        <div className="flex shrink-0 items-center gap-2">
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            aria-label="Refresh provider status"
+            title="Refresh provider status"
+            onClick={refreshStatus}
+          >
+            <ArrowClockwise
+              size={14}
+              className={usageQuery.isFetching ? 'animate-spin' : ''}
+              aria-hidden
+            />
+          </Button>
+          <Key size={17} className="text-primary" aria-hidden />
+        </div>
       </div>
       <dl className="mt-3 space-y-1.5 text-xs">
         <div className="flex justify-between gap-3">
@@ -727,12 +715,6 @@ function ProviderEntryCard({
             </dd>
           </div>
         ) : null}
-        {entry.base_url ? (
-          <div className="flex justify-between gap-3">
-            <dt className="text-muted-foreground">Endpoint</dt>
-            <dd className="truncate font-mono text-foreground">{entry.base_url}</dd>
-          </div>
-        ) : null}
         <div className="flex justify-between gap-3">
           <dt className="text-muted-foreground">Last used</dt>
           <dd className="text-foreground">
@@ -740,7 +722,17 @@ function ProviderEntryCard({
           </dd>
         </div>
       </dl>
-      {entry.status === 'configured' ? <ProviderUsageLine entryId={entry.id} /> : null}
+      {entry.status === 'configured' ? (
+        <div className="mt-3 rounded-md border border-border-subtle bg-muted/20 px-3 py-2 text-xs">
+          {usageQuery.isLoading ? (
+            <span className="text-muted-foreground">Checking usage…</span>
+          ) : usageQuery.isError ? (
+            <span className="text-muted-foreground">Usage unavailable</span>
+          ) : usageQuery.data ? (
+            <UsageSummary usage={usageQuery.data} />
+          ) : null}
+        </div>
+      ) : null}
       <button
         type="button"
         className="mt-3 inline-flex items-center gap-1.5 text-left text-xs font-medium text-primary hover:underline"
@@ -799,11 +791,6 @@ function ProviderEntryCard({
           {notice}
         </p>
       ) : null}
-      {entry.status === 'configured' ? (
-        <div className="mt-3">
-          <ProviderConnectionTest entryId={entry.id} />
-        </div>
-      ) : null}
       {entry.status !== 'revoked' && !confirmingRemoval ? (
         <div className="mt-4 flex gap-2 border-t border-border-subtle pt-3">
           {!renaming ? (
@@ -811,7 +798,12 @@ function ProviderEntryCard({
               Rename
             </Button>
           ) : null}
-          <Button size="sm" variant="outline" onClick={() => setConfirmingRemoval(true)}>
+          <Button
+            size="sm"
+            variant="outline"
+            className="text-destructive hover:bg-destructive/10 hover:border-destructive/30"
+            onClick={() => setConfirmingRemoval(true)}
+          >
             Disconnect
           </Button>
         </div>
@@ -822,6 +814,11 @@ function ProviderEntryCard({
 
 function CliRuntimeCard({ runtime }: { runtime: CliRuntimeEntryResponse }) {
   const authenticated = runtime.availability === 'authenticated'
+  const badgeLabel = authenticated
+    ? 'Authenticated'
+    : runtime.availability === 'unauthenticated'
+      ? 'Not Logged In'
+      : 'Unavailable'
   return (
     <Card className="flex flex-col p-4">
       <div className="flex items-start justify-between gap-3">
@@ -830,14 +827,16 @@ function CliRuntimeCard({ runtime }: { runtime: CliRuntimeEntryResponse }) {
             <h3 className="truncate text-sm font-semibold text-foreground">
               {runtimeDisplayNames[runtime.kind] ?? humanize(runtime.kind)}
             </h3>
+            {runtime.version ? (
+              <span className="font-mono text-xs text-muted-foreground">v{runtime.version}</span>
+            ) : null}
             <StateBadge
               status={authenticated ? 'healthy' : 'unavailable'}
-              label={humanize(runtime.availability)}
+              label={badgeLabel}
             />
           </div>
           <p className="mt-1 truncate text-xs text-muted-foreground">
-            {runtime.daemon_hostname ?? runtime.daemon_id} · {humanize(runtime.daemon_status)}
-            {runtime.version ? ` · ${runtime.version}` : ''}
+            {runtime.daemon_hostname ?? runtime.daemon_id}
           </p>
         </div>
         <TerminalWindow size={17} className="shrink-0 text-primary" aria-hidden />

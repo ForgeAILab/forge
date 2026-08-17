@@ -347,3 +347,144 @@ async fn agent_chat_turn_cancel_is_versioned_idempotent_and_cursor_bounded() {
     .expect("cancellation event is durable");
     assert_eq!(event_count, 1);
 }
+
+#[tokio::test]
+async fn agent_chat_turn_parks_awaiting_input_and_can_be_cancelled() {
+    let workspace = common::TestDir::new("agent-chat-awaiting-input");
+    let harness = common::test_app(workspace.path(), "agent-chat-awaiting-input").await;
+    let token = common::test_jwt();
+
+    let connected: ConnectedEmbeddedAgentResponse = common::connect_embedded_agent(
+        &harness.app,
+        &token,
+        "main-awaiting-agent",
+        "main-awaiting",
+        "main-awaiting-secret",
+        json!({"permissions": ["read_agent_chat", "propose_message"]}),
+        json!({"allowed": ["read_agent_chat", "propose_message"]}),
+    )
+    .await;
+
+    let binding: MainAgentBindingResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::PUT,
+        "/api/v1/account/main-agent",
+        &token,
+        json!({
+            "identity_id": connected.agent.id,
+            "profile_id": connected.profile.id,
+            "expected_version": 0,
+            "autonomy_policy": {}
+        }),
+        StatusCode::OK,
+    )
+    .await;
+
+    let send_response: SendAgentChatMessageResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/agent-chats/{}/messages", binding.chat_id),
+        &token,
+        json!({
+            "content": "A message that will park awaiting input"
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
+    let turn_job = send_response.turn_job.expect("admitted turn job");
+
+    // Since turn_job was queued and not leased with 'test-lease-owner', update to leased first
+    let _leased = db::AgentChatTurnJobRepo::update_agent_chat_turn_job(
+        &*harness.state.db,
+        db::UpdateAgentChatTurnJob {
+            id: turn_job.id.clone(),
+            expected_version: turn_job.version,
+            status: db::AgentChatTurnState::Leased,
+            pending_interaction_id: None,
+            lease_owner: Some(Some("test-lease-owner".to_owned())),
+            leased_until: Some(Some(db::now_rfc3339())),
+            attempt_count: Some(1),
+            next_attempt_at: None,
+            response_message_id: None,
+            error_code: None,
+            error_message: None,
+            updated_at: db::now_rfc3339(),
+        },
+    )
+    .await
+    .expect("lease turn");
+
+    // Create an embedded agent session and protected interaction
+    let session_row: (String,) =
+        sqlx::query_as("SELECT id FROM agent_session WHERE identity_id = ? LIMIT 1")
+            .bind(&connected.agent.id)
+            .fetch_one(harness.state.db.pool())
+            .await
+            .expect("session exists");
+
+    sqlx::query(
+        "INSERT INTO protected_interaction (
+            id, session_id, interaction_kind, prompt_redacted, status, version, created_at, updated_at
+         ) VALUES (?, ?, 'questionnaire', 'questionnaire (1 question)', 'pending', 1, ?, ?)",
+    )
+    .bind("test-interaction-1")
+    .bind(&session_row.0)
+    .bind(db::now_rfc3339())
+    .bind(db::now_rfc3339())
+    .execute(harness.state.db.pool())
+    .await
+    .expect("insert protected interaction");
+
+    let parked = db::AgentChatTransactionRepo::park_agent_chat_turn(
+        &*harness.state.db,
+        db::ParkAgentChatTurn {
+            turn_job_id: turn_job.id.clone(),
+            expected_version: _leased.version,
+            lease_owner: "test-lease-owner".to_owned(),
+            pending_interaction_id: "test-interaction-1".to_owned(),
+            updated_at: db::now_rfc3339(),
+        },
+    )
+    .await
+    .expect("park turn");
+    assert_eq!(parked.status, db::AgentChatTurnState::AwaitingInput);
+    assert_eq!(
+        parked.pending_interaction_id.as_deref(),
+        Some("test-interaction-1")
+    );
+    assert_eq!(parked.attempt_count, 0); // attempt_count decremented so no burn
+
+    // Read via API
+    let turns: Vec<AgentChatTurnJobResponse> = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/agent-chats/{}/turns", binding.chat_id),
+        &token,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].status, AgentChatTurnStatus::AwaitingInput);
+    assert_eq!(
+        turns[0].pending_interaction_id.as_deref(),
+        Some("test-interaction-1")
+    );
+
+    // Cancel while parked in awaiting_input
+    let cancelled: AgentChatTurnJobResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!(
+            "/api/v1/agent-chats/{}/turns/{}/cancel",
+            binding.chat_id, parked.id
+        ),
+        &token,
+        json!({
+            "expected_version": parked.version,
+            "idempotency_key": "cancel-parked-turn"
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(cancelled.status, AgentChatTurnStatus::Cancelled);
+}

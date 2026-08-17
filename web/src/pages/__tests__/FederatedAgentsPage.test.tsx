@@ -94,8 +94,6 @@ vi.mock('@/features/federation/hooks', () => ({
     isError: false,
     refetch: vi.fn(),
   }),
-  useAgentProfilesQuery: () => ({ data: [], isLoading: false, isError: false }),
-  useSelectAgentProfileMutation: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useCreateEmbeddedAgentMutation: () => ({ mutateAsync: createEmbeddedAgent, isPending: false }),
   useRegisterHarnessAgentMutation: () => ({
     mutateAsync: registerHarnessAgent,
@@ -276,6 +274,16 @@ const cliRuntimes = [
     login_hint: 'Run `claude` on the host and complete its login',
     used_by: [],
   },
+  {
+    kind: 'codex',
+    daemon_id: 'daemon-1',
+    daemon_hostname: 'forge-host',
+    daemon_status: 'online',
+    availability: 'authenticated',
+    version: '0.9.4',
+    login_hint: null,
+    used_by: [],
+  },
 ]
 
 const agent: FederatedAgent = {
@@ -389,47 +397,69 @@ describe('FederatedAgentsPage', () => {
     expect(screen.getByText('Project Agent bindings')).toBeTruthy()
   })
 
-  it('selects an agent from the roster and opens Change model from its detail panel', () => {
+  it('shows an agent\'s settings in the panel and edits a direct agent inline', async () => {
     renderPage()
     fireEvent.click(screen.getByText('Forge Guide'))
-    fireEvent.click(screen.getByRole('button', { name: /change model…/i }))
-    const dialog = within(screen.getByRole('dialog'))
-    expect(dialog.getByText(/Forge Guide/)).toBeTruthy()
-    expect(dialog.getByText(/New model on an entry/i)).toBeTruthy()
+    // The panel shows the agent's settings directly — no profile list, no dialog.
+    expect(screen.queryByText(/profiles/i)).toBeNull()
+    expect(screen.getByText('Harness')).toBeTruthy()
+    // The save bar stays disabled until something actually changes.
+    const save = screen.getByRole('button', { name: /save settings/i }) as HTMLButtonElement
+    expect(save.disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'gpt-6' } })
+    expect(save.disabled).toBe(false)
+    fireEvent.click(save)
+    await vi.waitFor(() =>
+      expect(connectProfile).toHaveBeenCalledWith({
+        identityId: 'agent-1',
+        input: expect.objectContaining({
+          credential_id: 'credential-1',
+          model: 'gpt-6',
+          version: 1,
+        }),
+      }),
+    )
+    expect(updateAgent).not.toHaveBeenCalled()
   })
 
-  it('changes a CLI-harness agent model directly through the core agent PATCH', async () => {
+  it('discards inline edits back to the agent\'s current settings', () => {
+    renderPage()
+    fireEvent.click(screen.getByText('Forge Guide'))
+    fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'gpt-6' } })
+    fireEvent.click(screen.getByRole('button', { name: /discard/i }))
+    expect((screen.getByLabelText('Model') as HTMLInputElement).value).toBe('gpt-test')
+    expect(connectProfile).not.toHaveBeenCalled()
+  })
+
+  it('edits a CLI-harness agent inline through the core agent PATCH', async () => {
     renderPage()
     fireEvent.click(screen.getByText('Codex Runner'))
-    fireEvent.click(screen.getByRole('button', { name: /change model…/i }))
-    const dialog = within(screen.getByRole('dialog'))
-    expect(dialog.getByText(/Codex Runner/)).toBeTruthy()
-    // No more "can only switch between published profiles" hint — CLI-harness
-    // agents get a real, direct model-change path now.
-    expect(screen.queryByText(/change the model itself in the harness/i)).toBeNull()
 
-    fireEvent.click(dialog.getByRole('tab', { name: /update settings/i }))
-    // The dialog reuses the launch-dialog selectors: model and reasoning come
+    // The panel reuses the launch-dialog selectors: model and reasoning come
     // from discovery, policy from the shared PolicySelector.
-    fireEvent.click(dialog.getByLabelText('Model'))
+    fireEvent.click(screen.getByLabelText('Model'))
     fireEvent.click(within(screen.getByRole('listbox')).getByRole('option', { name: /GPT-5\.2 Codex/i }))
-    fireEvent.click(dialog.getByLabelText('Reasoning'))
+    fireEvent.click(screen.getByLabelText('Reasoning'))
     fireEvent.click(within(screen.getByRole('listbox')).getByRole('option', { name: /High/ }))
-    fireEvent.click(dialog.getByLabelText('Policy'))
+    fireEvent.click(screen.getByLabelText('Policy'))
     fireEvent.click(within(screen.getByRole('listbox')).getByRole('option', { name: /Supervised/ }))
-    fireEvent.click(dialog.getByRole('button', { name: /change model/i }))
+    fireEvent.click(screen.getByRole('button', { name: /save settings/i }))
 
     await vi.waitFor(() =>
       expect(updateAgent).toHaveBeenCalledWith({
         agentId: 'agent-2',
         body: {
+          name: 'Codex Runner',
+          description: 'A CLI-harness worker.',
           model: 'gpt-5.2-codex',
           reasoning_effort: 'high',
           permission_policy: 'supervised',
+          prompt_template: null,
           version: 3,
         },
       }),
     )
+    expect(connectProfile).not.toHaveBeenCalled()
   })
 
   it('lists provider entries and CLI runtimes with usage on the providers tab', () => {
@@ -521,13 +551,14 @@ describe('FederatedAgentsPage', () => {
     )
   })
 
-  it('creates a direct agent from a provider entry through the wizard', async () => {
+  it('creates a direct agent from a provider entry through the two-step wizard', async () => {
     renderPage()
     fireEvent.click(screen.getAllByRole('button', { name: /new agent/i })[0])
     const wizard = within(screen.getByRole('dialog'))
+    // Step 1 groups direct provider entries and CLI harnesses (with versions).
+    expect(wizard.getByText('Claude Code harness')).toBeTruthy()
+    expect(wizard.getByText('v2.1.0')).toBeTruthy()
     fireEvent.click(wizard.getByRole('button', { name: /Openai · Work key/i }))
-    expect(wizard.getByText('Codex CLI harness')).toBeTruthy()
-    fireEvent.click(wizard.getByRole('button', { name: /Direct · built-in runtime/i }))
     fireEvent.change(wizard.getByLabelText('Agent name'), { target: { value: 'Main guide' } })
     fireEvent.change(wizard.getByLabelText('Model'), { target: { value: 'gpt-5' } })
     fireEvent.click(wizard.getByRole('button', { name: /create agent/i }))
@@ -542,23 +573,15 @@ describe('FederatedAgentsPage', () => {
     )
   })
 
-  it('disables incompatible runtimes with the server-provided reason', () => {
-    renderPage()
-    fireEvent.click(screen.getAllByRole('button', { name: /new agent/i })[0])
-    fireEvent.click(screen.getByRole('button', { name: /Openai · Personal ChatGPT/i }))
-    const codexOption = screen
-      .getByText(/OAuth handoff into the Codex CLI is not supported/)
-      .closest('button') as HTMLButtonElement
-    expect(codexOption.disabled).toBe(true)
-  })
-
-  it('creates a harness agent referencing a provider entry', async () => {
+  it('creates a harness agent, optionally powered by a compatible provider entry', async () => {
     renderPage()
     fireEvent.click(screen.getAllByRole('button', { name: /new agent/i })[0])
     const wizard = within(screen.getByRole('dialog'))
-    fireEvent.click(wizard.getByRole('button', { name: /Openai · Work key/i }))
     fireEvent.click(wizard.getByRole('button', { name: /Codex CLI harness/i }))
     fireEvent.change(wizard.getByLabelText('Agent name'), { target: { value: 'Codex worker' } })
+    // Only entries the capability catalog admits for this harness are offered.
+    fireEvent.click(wizard.getByLabelText('Harness credential'))
+    fireEvent.click(within(screen.getByRole('listbox')).getByRole('option', { name: /Work key/i }))
     fireEvent.click(wizard.getByRole('button', { name: /create agent/i }))
     await vi.waitFor(() =>
       expect(registerHarnessAgent).toHaveBeenCalledWith(

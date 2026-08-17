@@ -284,13 +284,16 @@ shared hidden context or a second chat.
 
 ## Starting a Project from Main Chat
 
-Use the global Main Chat for Product Genesis. The server-owned
-`forge.main.project-discovery/v2` skill keeps the discovery turn bounded (at
-most two consequential questions), separates facts from user decisions,
-research, assumptions, and hypotheses, and maintains a revisioned Project
-Charter. It recommends the Project name, mode (`compact` or `standard`), scope,
-non-goals, success signal, constraints, and selected Project Agent; only the
-user approves the exact Charter revision.
+Use the global Main Chat for Product Genesis by typing an idea into the composer
+and selecting "Start a product" or initiating discovery from the empty state.
+Discovery creates a typed session with sensible defaults (`mvp` maturity, no
+agent preference), and setup parameters can be tailored in-conversation through
+the runtime questionnaire. The server-owned `forge.main.project-discovery/v2`
+skill keeps the discovery turn bounded (at most two consequential questions),
+separates facts from user decisions, research, assumptions, and hypotheses, and
+maintains a revisioned Project Charter. It recommends the Project name, mode
+(`compact` or `standard`), scope, non-goals, success signal, constraints, and
+selected Project Agent; only the user approves the exact Charter revision.
 
 The Main Chat shows the exact Charter content/render digests and approval target.
 Approval creates a single-use receipt. Project creation then uses the typed

@@ -163,18 +163,19 @@ database for historical provenance.
 | POST   | `/api/v1/agent-sessions/{session_id}/interactions/{interaction_id}/answer` | Answer a protected interaction with an optimistic version |
 | POST   | `/api/v1/agent-sessions/{session_id}/interactions/{interaction_id}/cancel` | Cancel a protected interaction with an optimistic version |
 | GET    | `/api/v1/account/main-agent` | `V071+` — Get the account's single Main Agent binding |
-| PUT    | `/api/v1/account/main-agent` | `V071+` — Create or replace the account's Main Agent binding with optimistic concurrency |
+| PUT    | `/api/v1/account/main-agent` | `V071+` — Create or replace the account's Main Agent binding with optimistic concurrency. The request names only the agent (`identity_id`); the binding follows that agent's current settings |
 | POST   | `/api/v1/account/main-agent/product-genesis` | `V072+` — Start one typed Product Genesis session in the existing Main Chat and admit its first finite turn |
 | GET    | `/api/v1/account/main-agent/product-genesis/active` | `V072+` — Return the authenticated account's active Genesis session, if any |
 | GET    | `/api/v1/account/main-agent/product-genesis/{session_id}` | `V072+` — Read one Genesis session owned by the authenticated account, including lifecycle, source references, and optimistic version |
 | POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/cancel` | `V072+` — Cancel an active Genesis session with `expected_version` and an optional reason |
+| POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/guided-setup` | `V080+` — Apply guided setup (maturity / preferred agent) to a `discovering` Genesis session at most once |
 | GET    | `/api/v1/projects/{id}/project-agent` | `V071+` — Get the Project's single Project Agent binding |
-| PUT    | `/api/v1/projects/{id}/project-agent` | `V071+` — Create or replace the Project Agent binding with optimistic concurrency |
+| PUT    | `/api/v1/projects/{id}/project-agent` | `V071+` — Create or replace the Project Agent binding with optimistic concurrency. The request names only the agent (`identity_id`); the binding follows that agent's current settings |
 | GET    | `/api/v1/agent-chats` | `V071+` — List the authorized global Main chat and bound Project chats for the switcher |
 | GET    | `/api/v1/agent-chats/{chat_id}` | `V071+` — Get chat metadata, binding state, and visible turn status |
 | GET    | `/api/v1/agent-chats/{chat_id}/messages` | `V071+` — List immutable authorized Agent Chat messages |
 | POST   | `/api/v1/agent-chats/{chat_id}/messages` | `V071+` — Admit one guarded user message and exactly one queued turn |
-| GET    | `/api/v1/agent-chats/{chat_id}/turns` | `V071+` — List finite turn state (`queued`, `leased`, `retry_wait`, `succeeded`, `failed`, `cancelled`) |
+| GET    | `/api/v1/agent-chats/{chat_id}/turns` | `V071+` — List finite turn state (`queued`, `leased`, `awaiting_input`, `retry_wait`, `succeeded`, `failed`, `cancelled`) |
 | POST   | `/api/v1/agent-chats/{chat_id}/turns/{turn_id}/cancel` | `V071+` — Cancel an owned non-terminal turn with `expected_version` and an idempotency key |
 | GET    | `/api/v1/projects/{id}/agent-handoffs` | `V071+` — List immutable Main-to-Project handoff records |
 | POST   | `/api/v1/projects/{id}/agent-handoffs` | `V071+` — Publish one bounded, provenance-linked handoff and at most one target turn |
@@ -537,10 +538,13 @@ version and idempotency key; replays return the committed execution/result.
 
 The account's Main Agent has one global Agent Chat. Each operational Project has
 one Project Agent Chat, created atomically with its Project Agent binding. The
-chat remains stable when the bound identity or selected profile is replaced;
-messages, handoffs, memory references, and session provenance remain attached
-to the canonical chat scope. Connected but unbound identities do not create
-additional chats.
+chat remains stable when the bound agent is replaced; messages, handoffs,
+memory references, and session provenance remain attached to the canonical
+chat scope. A binding names only the agent — each turn resolves that agent's
+current settings revision, so editing an agent applies to its next turn
+without rebinding. The binding row's stored profile reference is a bind-time
+snapshot reserved for future per-binding overrides. Connected but unbound
+identities do not create additional chats.
 
 Message admission authorizes the chat and current binding, applies content
 guards, appends one immutable user message, creates exactly one queued turn job,

@@ -1088,13 +1088,14 @@ pub(super) async fn forge_set_main_agent(
     require_account_scope(context)?;
     let user_id = authenticated_user(context)?;
     let params: BindMainAgentParams = parse_params(params)?;
-    require_owned_profile(state, user_id, &params.identity_id, &params.profile_id).await?;
+    let identity = require_owned_identity_for_user(state, user_id, &params.identity_id).await?;
     let now = now_rfc3339();
     let replacement = CreateAccountMainAgentBinding {
         id: new_uuid_v4(),
         account_id: user_id.to_owned(),
         identity_id: params.identity_id,
-        profile_id: params.profile_id,
+        // Bind-time snapshot; turns re-resolve the agent's current profile.
+        profile_id: identity.profile_id,
         autonomy_policy_json: policy_json(params.autonomy_policy),
         tool_policy_revision: "default".to_owned(),
         created_at: now.clone(),
@@ -1160,7 +1161,7 @@ pub(super) async fn forge_set_project_agent(
     let user_id = authenticated_user(context)?;
     let params: BindProjectAgentParams = parse_params(params)?;
     require_project_admin(state, &params.project_id, user_id).await?;
-    require_owned_profile(state, user_id, &params.identity_id, &params.profile_id).await?;
+    let identity = require_owned_identity_for_user(state, user_id, &params.identity_id).await?;
     if params.wake_budget < 0 {
         return Err(invalid_field_error(
             "wake_budget",
@@ -1173,7 +1174,8 @@ pub(super) async fn forge_set_project_agent(
         id: new_uuid_v4(),
         project_id: params.project_id.clone(),
         identity_id: Some(params.identity_id),
-        profile_id: Some(params.profile_id),
+        // Bind-time snapshot; turns re-resolve the agent's current profile.
+        profile_id: Some(identity.profile_id),
         state: "active".to_owned(),
         autonomy_policy_json: policy_json(params.autonomy_policy),
         permission_ceiling_json: policy_json(params.permission_ceiling),
@@ -1451,12 +1453,11 @@ async fn require_owned_identity(
     Ok(identity)
 }
 
-async fn require_owned_profile(
+async fn require_owned_identity_for_user(
     state: &AppState,
     user_id: &str,
     identity_id: &str,
-    profile_id: &str,
-) -> Result<(), McpToolError> {
+) -> Result<db::Agent, McpToolError> {
     require_owned_identity(
         state,
         &McpContext {
@@ -1465,17 +1466,7 @@ async fn require_owned_profile(
         },
         identity_id,
     )
-    .await?;
-    let profile = AgentProfileRepo::get_profile(&*state.db, profile_id)
-        .await?
-        .ok_or_else(|| McpToolError::not_found("agent_profile", profile_id.to_owned()))?;
-    if profile.identity_id != identity_id {
-        return Err(McpToolError::not_found(
-            "agent_profile",
-            profile_id.to_owned(),
-        ));
-    }
-    Ok(())
+    .await
 }
 
 fn require_account_scope(context: &McpContext) -> Result<(), McpToolError> {
@@ -1694,11 +1685,13 @@ fn turn_response(job: AgentChatTurnJob) -> AgentChatTurnJobResponse {
         status: match job.status {
             AgentChatTurnState::Queued => AgentChatTurnStatus::Queued,
             AgentChatTurnState::Leased => AgentChatTurnStatus::Leased,
+            AgentChatTurnState::AwaitingInput => AgentChatTurnStatus::AwaitingInput,
             AgentChatTurnState::RetryWait => AgentChatTurnStatus::RetryWait,
             AgentChatTurnState::Succeeded => AgentChatTurnStatus::Succeeded,
             AgentChatTurnState::Failed => AgentChatTurnStatus::Failed,
             AgentChatTurnState::Cancelled => AgentChatTurnStatus::Cancelled,
         },
+        pending_interaction_id: job.pending_interaction_id,
         attempt_count: job.attempt_count,
         max_attempts: job.max_attempts,
         lease_expires_at: job.leased_until,

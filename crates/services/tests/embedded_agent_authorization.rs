@@ -154,14 +154,13 @@ async fn attach_approved_charter(db: &SqliteDb, project_id: &str) {
 #[tokio::test]
 async fn main_chat_is_not_task_capable_even_with_broad_identity_policy() {
     let db = sqlite_db().await;
-    let (identity_id, profile_id) = identity(&db).await;
+    let (identity_id, _profile_id) = identity(&db).await;
     let chats = AgentChatService::new(Arc::clone(&db));
     chats
         .set_main_binding(SetMainAgentBindingInput {
             actor_user_id: "user-1".to_owned(),
             account_id: "user-1".to_owned(),
             identity_id: identity_id.clone(),
-            profile_id,
             autonomy_policy_json: "{}".to_owned(),
             tool_policy_revision: "test".to_owned(),
             expected_version: None,
@@ -191,7 +190,7 @@ async fn main_chat_is_not_task_capable_even_with_broad_identity_policy() {
 #[tokio::test]
 async fn project_chat_gets_task_management_only_after_charter_setup_for_its_owning_project() {
     let db = sqlite_db().await;
-    let (identity_id, profile_id) = identity(&db).await;
+    let (identity_id, _profile_id) = identity(&db).await;
     let now = now_rfc3339();
     ProjectRepo::create(
         &*db,
@@ -227,7 +226,6 @@ async fn project_chat_gets_task_management_only_after_charter_setup_for_its_owni
             actor_user_id: "user-1".to_owned(),
             project_id: "project-a".to_owned(),
             identity_id: Some(identity_id.clone()),
-            profile_id: Some(profile_id),
             state: "active".to_owned(),
             autonomy_policy_json: "{}".to_owned(),
             permission_ceiling_json: serde_json::json!({

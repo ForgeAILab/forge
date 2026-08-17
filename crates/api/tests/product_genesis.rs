@@ -846,3 +846,81 @@ fn jwt_for(subject: &str, email: &str) -> String {
     )
     .expect("encode alternate test jwt")
 }
+
+#[tokio::test]
+async fn product_genesis_guided_setup_sets_maturity_once_with_optimistic_concurrency() {
+    let workspace = common::TestDir::new("product-genesis-guided-setup");
+    let harness = common::test_app(workspace.path(), "product-genesis-guided-setup").await;
+    let app = &harness.app;
+    let token = common::test_jwt();
+
+    let connected = connect_genesis_agent(app, &token, "genesis-main").await;
+
+    let _binding: api_types::MainAgentBindingResponse = common::json_request_with_bearer(
+        app,
+        Method::PUT,
+        "/api/v1/account/main-agent",
+        &token,
+        json!({
+            "identity_id": connected.agent.id,
+            "profile_id": connected.profile.id,
+            "expected_version": 0,
+            "autonomy_policy": {}
+        }),
+        StatusCode::OK,
+    )
+    .await;
+
+    // Start with omitted parameters defaults to mvp
+    let started: ProductGenesisStartResponse = common::json_request_with_bearer(
+        app,
+        Method::POST,
+        "/api/v1/account/main-agent/product-genesis",
+        &token,
+        json!({
+            "initial_idea": "An MVP product idea"
+        }),
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(started.session.maturity, api_types::ProductMaturity::Mvp);
+    assert_eq!(started.session.version, 2); // created at 1, source message added -> 2
+
+    // Apply guided setup with expected version
+    let updated: ProductGenesisSession = common::json_request_with_bearer(
+        app,
+        Method::POST,
+        &format!(
+            "/api/v1/account/main-agent/product-genesis/{}/guided-setup",
+            started.session.id
+        ),
+        &token,
+        json!({
+            "expected_version": started.session.version,
+            "maturity": "production",
+            "provenance": "interaction-123"
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(updated.maturity, api_types::ProductMaturity::Production);
+    assert_eq!(updated.version, started.session.version + 1);
+
+    // Re-applying guided setup fails with 409 Conflict (set-once)
+    let reapply: ErrorResponse = common::json_request_with_bearer(
+        app,
+        Method::POST,
+        &format!(
+            "/api/v1/account/main-agent/product-genesis/{}/guided-setup",
+            started.session.id
+        ),
+        &token,
+        json!({
+            "expected_version": updated.version,
+            "maturity": "critical"
+        }),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert!(reapply.message.contains("already been applied"));
+}

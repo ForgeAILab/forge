@@ -6,8 +6,9 @@
 //! never accepts a caller-supplied chat or account identity as authority.
 
 use api_types::{
-    CancelProductGenesisRequest, ProductGenesisActiveResponse, ProductGenesisStartResponse,
-    ProductMaturity, StartProductGenesisRequest,
+    ApplyProductGenesisGuidedSetupRequest, CancelProductGenesisRequest,
+    ProductGenesisActiveResponse, ProductGenesisStartResponse, ProductMaturity,
+    StartProductGenesisRequest,
 };
 use axum::{
     extract::{Path, State},
@@ -149,6 +150,30 @@ pub async fn cancel_product_genesis(
     }
     let session = genesis
         .cancel(&current.id, request.expected_version, request.reason)
+        .await?;
+    Ok(Json(session))
+}
+
+/// Apply guided setup (maturity and/or preferred agent) to an active Genesis session at most once.
+pub async fn apply_product_genesis_guided_setup(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(session_id): Path<String>,
+    Json(request): Json<ApplyProductGenesisGuidedSetupRequest>,
+) -> ApiResult<Json<api_types::ProductGenesisSession>> {
+    let genesis = ProductGenesisService::for_sqlite(state.db.clone());
+    let current = genesis.get(&session_id).await?;
+    if current.account_id != user.user_id {
+        return Err(ApiError::not_found("product_genesis_session", session_id));
+    }
+    let session = genesis
+        .apply_guided_setup(
+            &current.id,
+            request.expected_version,
+            request.maturity,
+            request.preferred_project_agent_identity_id,
+            request.provenance,
+        )
         .await?;
     Ok(Json(session))
 }

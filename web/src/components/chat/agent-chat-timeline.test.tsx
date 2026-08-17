@@ -79,6 +79,7 @@ const queuedTurn: AgentChatTurn = {
   responder_identity_id: 'agent-1',
   responder_profile_id: 'profile-1',
   status: 'queued',
+  pending_interaction_id: null,
   attempt_count: 0n,
   max_attempts: 3n,
   lease_expires_at: null,
@@ -172,12 +173,13 @@ describe('AgentChatTimeline polling', () => {
   })
 
   it.each([
-    ['queued', 'Queued'],
-    ['leased', 'Leased'],
-    ['retry_wait', 'Retrying'],
-    ['failed', 'Failed'],
-    ['cancelled', 'Cancelled'],
-    ['succeeded', 'Succeeded'],
+    ['queued', /Queued/],
+    ['leased', /Thinking/],
+    ['awaiting_input', /Awaiting input/],
+    ['retry_wait', /Retrying/],
+    ['failed', /Turn failed|Failed/],
+    ['cancelled', /Cancelled/],
+    ['succeeded', /Succeeded/],
   ] as const)(
     'renders the finite %s state beside its triggering message',
     async (status, label) => {
@@ -220,7 +222,7 @@ describe('AgentChatTimeline polling', () => {
       await Promise.resolve()
     })
 
-    expect(screen.getByText('Sending')).toBeTruthy()
+    expect(screen.getByText(/Sending/)).toBeTruthy()
   })
 
   it('offers cancellation for a live turn using its current optimistic version', async () => {

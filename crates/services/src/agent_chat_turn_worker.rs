@@ -109,6 +109,7 @@ pub struct CompletedAgentChatTurn {
     pub token_usage_json: Option<String>,
     pub duration_ms: i64,
     pub context_manifest_id: Option<String>,
+    pub pending_interaction_id: Option<String>,
 }
 
 struct LoadedAgentChatTurn {
@@ -935,9 +936,11 @@ impl FederatedAgentChatTurnRunner {
         let binding = ProjectAgentBindingRepo::get_active_project_binding(&*self.db, project_id)
             .await?
             .filter(|binding| {
+                // The binding names the agent; the job's profile is the
+                // enqueue-time snapshot of that agent's settings, already
+                // proven to belong to the identity during admission.
                 binding.state == "active"
                     && binding.identity_id.as_deref() == Some(agent.id.as_str())
-                    && binding.profile_id.as_deref() == Some(profile.id.as_str())
             })
             .ok_or_else(|| {
                 ServiceError::invalid_operation(
@@ -959,7 +962,7 @@ impl FederatedAgentChatTurnRunner {
         // stale Rust model cannot accidentally turn a missing column into a
         // permissive default.
         let binding_row = sqlx::query(
-            "SELECT id, project_id, state, identity_id, profile_id,
+            "SELECT id, project_id, state, identity_id,
                     operating_skill_revision_id, policy_revision, policy_digest,
                     charter_id, charter_revision_id, charter_setup_required
              FROM project_agent_binding
@@ -977,7 +980,6 @@ impl FederatedAgentChatTurnRunner {
         let binding_state: String = binding_row.try_get("state")?;
         let binding_project_id: String = binding_row.try_get("project_id")?;
         let binding_identity_id: Option<String> = binding_row.try_get("identity_id")?;
-        let binding_profile_id: Option<String> = binding_row.try_get("profile_id")?;
         let binding_skill_revision_id: Option<String> =
             binding_row.try_get("operating_skill_revision_id")?;
         let binding_policy_revision: String = binding_row.try_get("policy_revision")?;
@@ -996,7 +998,6 @@ impl FederatedAgentChatTurnRunner {
             if binding_state != "active"
                 || binding_project_id != project_id
                 || binding_identity_id.as_deref() != Some(agent.id.as_str())
-                || binding_profile_id.as_deref() != Some(profile.id.as_str())
                 || binding_charter_setup_required != 1
             {
                 return Err(ServiceError::invalid_operation(
@@ -1135,7 +1136,6 @@ impl FederatedAgentChatTurnRunner {
         if binding_state != "active"
             || binding_project_id != project_id
             || binding_identity_id.as_deref() != Some(agent.id.as_str())
-            || binding_profile_id.as_deref() != Some(profile.id.as_str())
             || binding_charter_setup_required != 0
             || binding_policy_revision.trim().is_empty()
             || binding_policy_digest.trim().is_empty()
@@ -2398,6 +2398,7 @@ impl FederatedAgentChatTurnRunner {
             ),
             duration_ms: started.elapsed().as_millis() as i64,
             context_manifest_id,
+            pending_interaction_id: output.pending_interaction_id,
         })
     }
 
@@ -2661,6 +2662,7 @@ impl FederatedAgentChatTurnRunner {
             token_usage_json: None,
             duration_ms,
             context_manifest_id,
+            pending_interaction_id: None,
         })
     }
 }
@@ -2799,7 +2801,7 @@ impl AgentChatTurnWorker {
                        WHERE prior.id <> job.id
                          AND prior.responder_identity_id = job.responder_identity_id
                          AND prior.canonical_scope_id = job.canonical_scope_id
-                         AND prior.status IN ('queued', 'leased', 'retry_wait')
+                         AND prior.status IN ('queued', 'leased', 'retry_wait', 'awaiting_input')
                          AND (prior.created_at < job.created_at
                               OR (prior.created_at = job.created_at AND prior.id < job.id))
                    )
@@ -2875,6 +2877,113 @@ impl AgentChatTurnWorker {
             .execute(self.db.pool())
             .await?;
         }
+        self.recover_parked().await?;
+        Ok(())
+    }
+
+    async fn recover_parked(&self) -> Result<()> {
+        let now = now_rfc3339();
+        let parked_rows = sqlx::query(
+            "SELECT id, pending_interaction_id, version
+             FROM agent_chat_turn_job
+             WHERE status = 'awaiting_input'
+             ORDER BY created_at ASC, id ASC",
+        )
+        .fetch_all(self.db.pool())
+        .await?;
+
+        for row in parked_rows {
+            let id: String = row.try_get("id")?;
+            let pending_interaction_id: Option<String> = row.try_get("pending_interaction_id")?;
+            let version: i64 = row.try_get("version")?;
+
+            let Some(interaction_id) = pending_interaction_id else {
+                let _ = sqlx::query(
+                    "UPDATE agent_chat_turn_job
+                     SET status = 'failed', error_code = 'interaction_orphaned',
+                         error_message = 'turn parked without interaction reference',
+                         version = version + 1, updated_at = ?
+                     WHERE id = ? AND version = ? AND status = 'awaiting_input'",
+                )
+                .bind(&now)
+                .bind(&id)
+                .bind(version)
+                .execute(self.db.pool())
+                .await;
+                continue;
+            };
+
+            let interaction =
+                sqlx::query("SELECT status, expires_at FROM protected_interaction WHERE id = ?")
+                    .bind(&interaction_id)
+                    .fetch_optional(self.db.pool())
+                    .await?;
+
+            match interaction {
+                None => {
+                    let _ = sqlx::query(
+                        "UPDATE agent_chat_turn_job
+                         SET status = 'failed', error_code = 'interaction_orphaned',
+                             error_message = 'pending interaction not found',
+                             version = version + 1, updated_at = ?
+                         WHERE id = ? AND version = ? AND status = 'awaiting_input'",
+                    )
+                    .bind(&now)
+                    .bind(&id)
+                    .bind(version)
+                    .execute(self.db.pool())
+                    .await;
+                }
+                Some(irow) => {
+                    let istatus: String = irow.try_get("status")?;
+                    let expires_at: Option<String> = irow.try_get("expires_at")?;
+                    if istatus == "answered" {
+                        let _ = sqlx::query(
+                            "UPDATE agent_chat_turn_job
+                             SET status = 'queued', pending_interaction_id = NULL,
+                                 next_attempt_at = NULL, version = version + 1, updated_at = ?
+                             WHERE id = ? AND version = ? AND status = 'awaiting_input'",
+                        )
+                        .bind(&now)
+                        .bind(&id)
+                        .bind(version)
+                        .execute(self.db.pool())
+                        .await;
+                    } else if istatus == "cancelled" {
+                        let _ = sqlx::query(
+                            "UPDATE agent_chat_turn_job
+                             SET status = 'cancelled', pending_interaction_id = NULL,
+                                 error_code = 'interaction_cancelled',
+                                 error_message = 'pending interaction was cancelled',
+                                 version = version + 1, updated_at = ?
+                             WHERE id = ? AND version = ? AND status = 'awaiting_input'",
+                        )
+                        .bind(&now)
+                        .bind(&id)
+                        .bind(version)
+                        .execute(self.db.pool())
+                        .await;
+                    } else if istatus == "expired"
+                        || (expires_at.as_deref().is_some()
+                            && expires_at.as_deref().unwrap() <= now.as_str())
+                    {
+                        let _ = sqlx::query(
+                            "UPDATE agent_chat_turn_job
+                             SET status = 'failed', pending_interaction_id = NULL,
+                                 error_code = 'interaction_expired',
+                                 error_message = 'pending interaction expired',
+                                 version = version + 1, updated_at = ?
+                             WHERE id = ? AND version = ? AND status = 'awaiting_input'",
+                        )
+                        .bind(&now)
+                        .bind(&id)
+                        .bind(version)
+                        .execute(self.db.pool())
+                        .await;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2896,7 +3005,28 @@ impl AgentChatTurnWorker {
             .unwrap_or(job.clone());
         match result {
             Ok(turn) => {
-                if let Err(error) = self.commit_success(&commit_job, turn).await {
+                if let Some(pending_interaction_id) = turn.pending_interaction_id {
+                    if let Err(error) = self
+                        .chat_service
+                        .append_awaiting_input(
+                            &commit_job,
+                            &self.lease_owner,
+                            &pending_interaction_id,
+                        )
+                        .await
+                    {
+                        tracing::warn!(job_id = %commit_job.id, error = %error, "Agent Chat awaiting input commit failed");
+                        let _ = self
+                            .chat_service
+                            .append_failure(
+                                &commit_job,
+                                &self.lease_owner,
+                                "awaiting_input_commit_failed",
+                                "Agent Chat awaiting input state could not be committed",
+                            )
+                            .await;
+                    }
+                } else if let Err(error) = self.commit_success(&commit_job, turn).await {
                     tracing::warn!(job_id = %commit_job.id, error = %error, "Agent Chat response commit failed");
                     let _ = self
                         .chat_service
