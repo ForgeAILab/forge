@@ -51,9 +51,27 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Providers tab show their usage window(s) from the new usage endpoint. The
   dead legacy `web/src/pages/agents/` UI (unreferenced since the federated
   agents rewrite) is deleted.
+- The agent dialogs on `/agents` use the launch-dialog selectors again
+  instead of bare model/effort text fields. For a CLI-harness agent,
+  `ChangeModelDialog`'s "Update settings" tab (renamed from "Update model")
+  now offers the discovered-model combo box, the per-model reasoning
+  selector, and the permission-policy selector (Auto / Supervised / Plan),
+  persisting all three through `PATCH /api/v1/agents/{id}`. The New Agent
+  wizard's configure step gains the same three selectors for CLI-harness
+  runtimes (discovery keyed by executor type), sending `reasoning_effort`
+  and `permission_policy` on creation.
 
 ### Fixed
 
+- Starting a browser provider login no longer fails with "redirect_origin is
+  not a configured trusted origin" when the UI is served from an origin the
+  operator never configured (a LAN address, a hostname, or a non-default dev
+  port). `POST /api/v1/provider-authorizations` now also trusts the origin
+  the authenticated request itself arrived from — the `Origin` header from a
+  browser, or the dialed `Host` (honoring `X-Forwarded-Proto`) from
+  `forge-ctl` — since bouncing the browser back to where it already is cannot
+  redirect it anywhere new. Explicitly configured `cors_origins` /
+  `public_base_url` origins keep working as before.
 - A native Agent Chat session no longer wedges permanently after a failed
   turn ("Conflict: cannot accept a new turn over a non-terminal checkpoint").
   The embedded runtime synchronized its lossless context memory (LCM) before

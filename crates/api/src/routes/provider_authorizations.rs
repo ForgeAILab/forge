@@ -5,6 +5,7 @@ use api_types::{
 };
 use axum::{
     extract::{Path, Query, State},
+    http::{header, HeaderMap},
     response::Redirect,
     Json,
 };
@@ -19,13 +20,34 @@ use crate::{
 pub async fn start_provider_authorization(
     State(state): State<AppState>,
     user: AuthenticatedUser,
+    headers: HeaderMap,
     Json(request): Json<StartProviderAuthorizationRequest>,
 ) -> ApiResult<Json<ProviderAuthorizationOperationResponse>> {
     let operation = state
         .provider_authorization_service
-        .start(user.user_id, request)
+        .start(user.user_id, request, request_origin(&headers))
         .await?;
     Ok(Json(operation_response(operation)?))
+}
+
+/// The origin this request arrived from: the browser-asserted `Origin` header
+/// when present, otherwise the `Host` the client dialed (honoring
+/// `X-Forwarded-Proto` behind a reverse proxy).
+fn request_origin(headers: &HeaderMap) -> Option<String> {
+    if let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    {
+        return Some(origin.to_owned());
+    }
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())?;
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("http");
+    Some(format!("{proto}://{host}"))
 }
 
 pub async fn get_provider_authorization(

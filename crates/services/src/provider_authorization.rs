@@ -232,6 +232,7 @@ impl ProviderAuthorizationService {
         &self,
         owner_user_id: String,
         request: StartProviderAuthorizationRequest,
+        request_origin: Option<String>,
     ) -> Result<ProviderAuthorizationOperation> {
         let since = (Utc::now() - ChronoDuration::minutes(1)).to_rfc3339();
         let recent = sqlx::query_scalar::<_, i64>(
@@ -260,6 +261,7 @@ impl ProviderAuthorizationService {
             .validate_redirect_origin(
                 &request.redirect_origin,
                 request.method == ProviderCredentialMethod::BrowserOauth,
+                request_origin.as_deref(),
             )
             .await?;
         if request.credential_label.trim().is_empty() {
@@ -1041,6 +1043,7 @@ impl ProviderAuthorizationService {
         &self,
         origin: &str,
         require_trusted: bool,
+        request_origin: Option<&str>,
     ) -> Result<String> {
         let parsed = Url::parse(origin).map_err(|_| {
             ServiceError::invalid_operation("redirect_origin must be an absolute URL")
@@ -1057,19 +1060,30 @@ impl ProviderAuthorizationService {
             ));
         }
         let normalized = parsed.origin().ascii_serialization();
-        if require_trusted
-            && !self
-                .trusted_origins
-                .read()
-                .expect("provider authorization origin lock poisoned")
-                .iter()
-                .any(|value| value == &normalized)
-        {
+        if require_trusted && !self.is_trusted_redirect_origin(&normalized, request_origin) {
             return Err(ServiceError::AuthorizationDenied {
                 message: "redirect_origin is not a configured trusted origin".to_owned(),
             });
         }
         Ok(normalized)
+    }
+
+    /// Besides operator-configured origins, the origin the authenticated
+    /// request itself arrived from is trusted: bouncing the browser back to
+    /// where it already is cannot send it anywhere new.
+    fn is_trusted_redirect_origin(&self, normalized: &str, request_origin: Option<&str>) -> bool {
+        if self
+            .trusted_origins
+            .read()
+            .expect("provider authorization origin lock poisoned")
+            .iter()
+            .any(|value| value == normalized)
+        {
+            return true;
+        }
+        request_origin
+            .and_then(|value| Url::parse(value).ok())
+            .is_some_and(|url| url.origin().ascii_serialization() == normalized)
     }
 
     /// Picks the OAuth `redirect_uri` for a browser ceremony, and the listener
@@ -1752,26 +1766,48 @@ mod tests {
         }));
         assert_eq!(
             service
-                .validate_redirect_origin("http://localhost:5173", true)
+                .validate_redirect_origin("http://localhost:5173", true, None)
                 .await
                 .expect("configured origin is accepted"),
             "http://localhost:5173"
         );
         assert!(service
-            .validate_redirect_origin("https://attacker.example", true)
+            .validate_redirect_origin("https://attacker.example", true, None)
+            .await
+            .is_err());
+        // The origin the request itself arrived from is trusted even when the
+        // operator never configured it — the bounce lands where the browser
+        // already is.
+        assert_eq!(
+            service
+                .validate_redirect_origin(
+                    "http://10.0.0.2:8080",
+                    true,
+                    Some("http://10.0.0.2:8080")
+                )
+                .await
+                .expect("the request's own origin is accepted"),
+            "http://10.0.0.2:8080"
+        );
+        assert!(service
+            .validate_redirect_origin(
+                "https://attacker.example",
+                true,
+                Some("http://10.0.0.2:8080")
+            )
             .await
             .is_err());
         // Device flows record the origin without trusting it: nothing ever
         // redirects a browser there.
         assert_eq!(
             service
-                .validate_redirect_origin("https://forge.example.com", false)
+                .validate_redirect_origin("https://forge.example.com", false, None)
                 .await
                 .expect("device flows accept any well-formed origin"),
             "https://forge.example.com"
         );
         assert!(service
-            .validate_redirect_origin("not-a-url", false)
+            .validate_redirect_origin("not-a-url", false, None)
             .await
             .is_err());
     }
@@ -1814,11 +1850,11 @@ mod tests {
         let (service, owner) = test_service().await;
         let mut request = browser_request();
         request.loopback_port = None;
-        assert!(service.start(owner.clone(), request).await.is_err());
+        assert!(service.start(owner.clone(), request, None).await.is_err());
 
         let mut request = browser_request();
         request.loopback_port = Some(9999);
-        assert!(service.start(owner.clone(), request).await.is_err());
+        assert!(service.start(owner.clone(), request, None).await.is_err());
     }
 
     #[tokio::test]
@@ -1832,7 +1868,7 @@ mod tests {
         // Trusted, but the browser is not on this machine, so nothing could
         // ever answer the localhost callback.
         let error = service
-            .start(owner, request)
+            .start(owner, request, None)
             .await
             .expect_err("remote browser cannot own a localhost callback");
         assert!(error.to_string().contains("same machine"));
@@ -1847,7 +1883,7 @@ mod tests {
         request.loopback_owner = LoopbackOwner::Server;
         request.loopback_port = None;
         let operation = service
-            .start(owner.clone(), request)
+            .start(owner.clone(), request, None)
             .await
             .expect("browser authorization starts");
         let authorization_url =
@@ -1897,7 +1933,7 @@ mod tests {
     async fn browser_denial_is_terminal_redacted_and_replay_safe() {
         let (service, owner) = test_service().await;
         let operation = service
-            .start(owner.clone(), browser_request())
+            .start(owner.clone(), browser_request(), None)
             .await
             .expect("browser authorization starts");
         let state = callback_state(&operation);
@@ -1942,7 +1978,7 @@ mod tests {
     async fn expired_callback_never_reaches_token_exchange() {
         let (service, owner) = test_service().await;
         let operation = service
-            .start(owner.clone(), browser_request())
+            .start(owner.clone(), browser_request(), None)
             .await
             .expect("browser authorization starts");
         let state = callback_state(&operation);
@@ -1965,7 +2001,7 @@ mod tests {
     async fn failed_finalization_is_terminal_and_erases_transient_state() {
         let (service, owner) = test_service().await;
         let operation = service
-            .start(owner.clone(), browser_request())
+            .start(owner.clone(), browser_request(), None)
             .await
             .expect("browser authorization starts");
         let exchanging = service
@@ -2005,7 +2041,7 @@ mod tests {
     async fn malformed_callback_is_terminal_and_redacted() {
         let (service, owner) = test_service().await;
         let operation = service
-            .start(owner, browser_request())
+            .start(owner, browser_request(), None)
             .await
             .expect("browser authorization starts");
         let state = callback_state(&operation);
@@ -2028,12 +2064,12 @@ mod tests {
         let (service, owner) = test_service().await;
         for _ in 0..5 {
             service
-                .start(owner.clone(), browser_request())
+                .start(owner.clone(), browser_request(), None)
                 .await
                 .expect("start remains inside account budget");
         }
         assert!(matches!(
-            service.start(owner, browser_request()).await,
+            service.start(owner, browser_request(), None).await,
             Err(ServiceError::RateLimited {
                 retry_after_seconds: 60
             })

@@ -14,6 +14,9 @@ import {
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
+import { ModelSelector } from '@/components/execution-config/ModelSelector'
+import { PolicySelector } from '@/components/execution-config/PolicySelector'
+import { ReasoningSelector } from '@/components/execution-config/ReasoningSelector'
 import { getReasoningOptionsForModel, useDiscoveredOptions } from '@/hooks/useDiscoveredOptions'
 import { SectionKicker } from '@/features/federation/components'
 import {
@@ -68,6 +71,7 @@ export function ChangeModelDialog({
   const [entryId, setEntryId] = useState('')
   const [model, setModel] = useState('')
   const [reasoningEffort, setReasoningEffort] = useState('')
+  const [permissionPolicy, setPermissionPolicy] = useState<string | null>(null)
   const [profileId, setProfileId] = useState('')
   const [error, setError] = useState<string>()
 
@@ -96,6 +100,7 @@ export function ChangeModelDialog({
     setEntryId(activeEntries.find((entry) => entry.id === agent.credential_handle_id)?.id ?? activeEntries[0]?.id ?? '')
     setModel(agent.model ?? '')
     setReasoningEffort(agent.reasoning_effort ?? '')
+    setPermissionPolicy(agent.permission_policy ?? null)
     setProfileId(otherProfiles[0]?.id ?? '')
     setError(undefined)
     // Reset only when the target agent identity changes.
@@ -184,6 +189,7 @@ export function ChangeModelDialog({
           body: {
             model: model.trim(),
             reasoning_effort: reasoningEffort.trim() ? reasoningEffort.trim() : null,
+            permission_policy: permissionPolicy,
             version: agent.version,
           },
         })
@@ -237,7 +243,7 @@ export function ChangeModelDialog({
                 className={`flex-1 rounded px-3 py-1.5 text-xs font-medium transition-colors ${mode === 'new' ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
                 onClick={() => setMode('new')}
               >
-                {canPublish ? 'New model on an entry' : 'Update model'}
+                {canPublish ? 'New model on an entry' : 'Update settings'}
               </button>
             </div>
 
@@ -302,50 +308,34 @@ export function ChangeModelDialog({
                 </div>
               </>
             ) : (
-              <>
-                <div className="space-y-2">
-                  <Label htmlFor="change-model-model">Model</Label>
-                  <Input
-                    id="change-model-model"
-                    list={`${formId}-model-suggestions`}
-                    value={model}
-                    onChange={(event) => setModel(event.target.value)}
-                    placeholder="e.g. gpt-5.2-codex"
-                    required
-                  />
-                  {modelSuggestions.length > 0 ? (
-                    <datalist id={`${formId}-model-suggestions`}>
-                      {modelSuggestions.map((suggestion) => (
-                        <option key={suggestion.id} value={suggestion.id}>
-                          {suggestion.displayName}
-                        </option>
-                      ))}
-                    </datalist>
-                  ) : null}
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="change-model-reasoning">Reasoning effort</Label>
-                  {reasoningOptionsForModel.length > 0 ? (
-                    <Select
-                      id="change-model-reasoning"
-                      value={reasoningEffort}
-                      placeholder="Unspecified"
-                      onChange={setReasoningEffort}
-                      options={reasoningOptionsForModel.map((option) => ({
-                        value: option.id,
-                        label: option.label,
-                      }))}
-                    />
-                  ) : (
-                    <Input
-                      id="change-model-reasoning"
-                      value={reasoningEffort}
-                      onChange={(event) => setReasoningEffort(event.target.value)}
-                      placeholder="e.g. medium (optional)"
-                    />
-                  )}
-                </div>
-              </>
+              <div className="grid gap-2 sm:grid-cols-2">
+                <ModelSelector
+                  id="change-model-model"
+                  models={modelSuggestions}
+                  recentModelIds={[]}
+                  value={model.trim() ? model : null}
+                  isLoading={discovered.isFetching}
+                  hasError={discovered.isError}
+                  onChange={(next) => {
+                    setModel(next ?? '')
+                    setReasoningEffort('')
+                  }}
+                />
+                <ReasoningSelector
+                  id="change-model-reasoning"
+                  options={reasoningOptionsForModel}
+                  value={reasoningEffort.trim() ? reasoningEffort : null}
+                  isLoading={discovered.isFetching}
+                  hasError={discovered.isError}
+                  onChange={(next) => setReasoningEffort(next ?? '')}
+                />
+                <PolicySelector
+                  id="change-model-policy"
+                  className="sm:col-span-2"
+                  value={permissionPolicy}
+                  onChange={setPermissionPolicy}
+                />
+              </div>
             )}
 
             {error ? (

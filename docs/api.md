@@ -144,7 +144,7 @@ database for historical provenance.
 | POST   | `/api/v1/providers/{id}/test` | Live connection test: one minimal authenticated request against the entry's API; returns `status` (`ok`/`failed`), `latency_ms`, a redacted `message`, and `checked_at` |
 | GET    | `/api/v1/providers/{id}/usage` | Account usage (rate-limit windows) for the entry, e.g. ChatGPT's 5h/weekly windows; `source` is `probe` when live data was fetched, `unknown` (empty `windows`, a `detail` message) otherwise — only ChatGPT-OAuth (Codex backend) entries are probeable today |
 | DELETE | `/api/v1/providers/{id}?version={version}` | Disconnect a provider entry; returns redacted provider-revocation status plus the affected agents, which become visibly unhealthy |
-| POST   | `/api/v1/provider-authorizations` | Start a finite browser/device provider authorization operation |
+| POST   | `/api/v1/provider-authorizations` | Start a finite browser/device provider authorization operation. Browser flows require `redirect_origin` to be a trusted origin: a configured `cors_origins` / `public_base_url` entry, the server's own serving origin, or the origin the request itself arrived from (`Origin` header, else dialed `Host`) |
 | GET    | `/api/v1/provider-authorizations/{id}` | Poll an account-owned provider authorization operation |
 | POST   | `/api/v1/provider-authorizations/{id}/cancel` | Cancel a non-terminal provider authorization using `expected_version` |
 | GET    | `/api/v1/provider-authorizations/{provider}/callback` | Complete a browser callback after validating the protected state and trusted redirect origin |

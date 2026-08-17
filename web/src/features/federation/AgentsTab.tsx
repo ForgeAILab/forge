@@ -13,6 +13,10 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
+import { ModelSelector } from '@/components/execution-config/ModelSelector'
+import { PolicySelector } from '@/components/execution-config/PolicySelector'
+import { ReasoningSelector } from '@/components/execution-config/ReasoningSelector'
+import { getReasoningOptionsForModel, useDiscoveredOptions } from '@/hooks/useDiscoveredOptions'
 import { cn } from '@/lib/cn'
 import type { AgentChatEntry } from '@/features/agent-chat/types'
 import {
@@ -53,6 +57,8 @@ export function NewAgentDialog({
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [model, setModel] = useState('')
+  const [reasoningEffort, setReasoningEffort] = useState('')
+  const [permissionPolicy, setPermissionPolicy] = useState<string | null>(null)
   const [systemPrompt, setSystemPrompt] = useState('')
   const [error, setError] = useState<string>()
   const inFlight = useRef(false)
@@ -65,6 +71,8 @@ export function NewAgentDialog({
     setName('')
     setDescription('')
     setModel('')
+    setReasoningEffort('')
+    setPermissionPolicy(null)
     setSystemPrompt('')
     setError(undefined)
   }, [open, preselectedEntryId])
@@ -80,6 +88,12 @@ export function NewAgentDialog({
     ? capabilities.data?.items.find((item) => item.provider === selectedEntry.provider)
     : undefined
   const step: 1 | 2 | 3 = !selectedEntry && !cliKind ? 1 : !runtime ? 2 : 3
+  const isHarness = Boolean(runtime && runtime !== 'direct')
+  const discovered = useDiscoveredOptions(null, isHarness ? runtime : null)
+  const reasoningOptionsForModel = useMemo(
+    () => getReasoningOptionsForModel(discovered.data, model.trim() ? model : null),
+    [discovered.data, model],
+  )
 
   useEffect(() => {
     if (step === 3 && selectedEntry && !model) {
@@ -117,6 +131,8 @@ export function NewAgentDialog({
           description: description.trim() ? description.trim() : null,
           executor_type: runtime,
           model: model.trim() ? model.trim() : null,
+          reasoning_effort: reasoningEffort.trim() ? reasoningEffort.trim() : null,
+          permission_policy: permissionPolicy,
           credential_id: selectedEntry?.id ?? null,
         })
       }
@@ -282,15 +298,47 @@ export function NewAgentDialog({
                   required
                 />
               </div>
-              <div className="space-y-2">
-                <Label htmlFor="agent-model">Model{runtime === 'direct' ? '' : ' (optional)'}</Label>
-                <Input
+              {isHarness ? (
+                <ModelSelector
                   id="agent-model"
-                  value={model}
-                  onChange={(event) => setModel(event.target.value)}
-                  required={runtime === 'direct'}
+                  models={discovered.data?.models ?? []}
+                  recentModelIds={[]}
+                  value={model.trim() ? model : null}
+                  isLoading={discovered.isFetching}
+                  hasError={discovered.isError}
+                  onChange={(next) => {
+                    setModel(next ?? '')
+                    setReasoningEffort('')
+                  }}
                 />
-              </div>
+              ) : (
+                <div className="space-y-2">
+                  <Label htmlFor="agent-model">Model</Label>
+                  <Input
+                    id="agent-model"
+                    value={model}
+                    onChange={(event) => setModel(event.target.value)}
+                    required
+                  />
+                </div>
+              )}
+              {isHarness ? (
+                <>
+                  <ReasoningSelector
+                    id="agent-reasoning"
+                    options={reasoningOptionsForModel}
+                    value={reasoningEffort.trim() ? reasoningEffort : null}
+                    isLoading={discovered.isFetching}
+                    hasError={discovered.isError}
+                    onChange={(next) => setReasoningEffort(next ?? '')}
+                  />
+                  <PolicySelector
+                    id="agent-policy"
+                    value={permissionPolicy}
+                    onChange={setPermissionPolicy}
+                  />
+                </>
+              ) : null}
               <div className="space-y-2 sm:col-span-2">
                 <Label htmlFor="agent-description">Description</Label>
                 <Input

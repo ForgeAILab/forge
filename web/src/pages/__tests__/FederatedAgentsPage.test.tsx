@@ -61,10 +61,30 @@ vi.mock('@/api/hooks', () => ({
   useProjectsQuery: () => ({ data: { items: [] }, isLoading: false, isError: false, refetch: vi.fn() }),
   useUpdateAgent: () => ({ mutateAsync: updateAgent, isPending: false }),
 }))
-// ChangeModelDialog offers model suggestions from discovery; not under test here.
+// The agent dialogs reuse the launch-dialog selectors, which need discovered
+// options to offer models and reasoning efforts.
 vi.mock('@/hooks/useDiscoveredOptions', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/hooks/useDiscoveredOptions')>()),
-  useDiscoveredOptions: () => ({ data: undefined, isLoading: false, isError: false }),
+  useDiscoveredOptions: () => ({
+    data: {
+      models: [
+        {
+          id: 'gpt-5.2-codex',
+          displayName: 'GPT-5.2 Codex',
+          provider: 'OpenAI',
+          reasoningOptions: ['medium', 'high'],
+        },
+      ],
+      reasoningOptions: [
+        { id: 'medium', label: 'Medium' },
+        { id: 'high', label: 'High' },
+      ],
+      permissionPolicies: ['auto', 'supervised', 'plan'],
+    },
+    isLoading: false,
+    isFetching: false,
+    isError: false,
+  }),
 }))
 vi.mock('@/features/federation/hooks', () => ({
   isVersionConflict: () => false,
@@ -388,16 +408,26 @@ describe('FederatedAgentsPage', () => {
     // agents get a real, direct model-change path now.
     expect(screen.queryByText(/change the model itself in the harness/i)).toBeNull()
 
-    fireEvent.click(dialog.getByRole('tab', { name: /update model/i }))
-    const modelInput = dialog.getByLabelText('Model')
-    fireEvent.change(modelInput, { target: { value: 'gpt-5.2-codex' } })
-    fireEvent.change(dialog.getByLabelText('Reasoning effort'), { target: { value: 'high' } })
+    fireEvent.click(dialog.getByRole('tab', { name: /update settings/i }))
+    // The dialog reuses the launch-dialog selectors: model and reasoning come
+    // from discovery, policy from the shared PolicySelector.
+    fireEvent.click(dialog.getByLabelText('Model'))
+    fireEvent.click(within(screen.getByRole('listbox')).getByRole('option', { name: /GPT-5\.2 Codex/i }))
+    fireEvent.click(dialog.getByLabelText('Reasoning'))
+    fireEvent.click(within(screen.getByRole('listbox')).getByRole('option', { name: /High/ }))
+    fireEvent.click(dialog.getByLabelText('Policy'))
+    fireEvent.click(within(screen.getByRole('listbox')).getByRole('option', { name: /Supervised/ }))
     fireEvent.click(dialog.getByRole('button', { name: /change model/i }))
 
     await vi.waitFor(() =>
       expect(updateAgent).toHaveBeenCalledWith({
         agentId: 'agent-2',
-        body: { model: 'gpt-5.2-codex', reasoning_effort: 'high', version: 3 },
+        body: {
+          model: 'gpt-5.2-codex',
+          reasoning_effort: 'high',
+          permission_policy: 'supervised',
+          version: 3,
+        },
       }),
     )
   })
