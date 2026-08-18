@@ -22,6 +22,12 @@ import {
 import type { FederatedAgent } from '@/features/federation/types'
 import type { ProviderEntryResponse } from '@/types/generated'
 import { StateBadge, StatusDot } from '@/features/federation/components'
+import {
+  formatCost,
+  formatDuration,
+  formatRate,
+  formatTokens,
+} from '@/components/settings/project-settings-utils'
 import { DEFAULT_CEILING, humanize, isDirectAgent, runtimeDisplayNames } from './format'
 
 export function AgentDetailPanel({
@@ -90,15 +96,41 @@ export function AgentDetailPanel({
                   ? humanize(agent.permission_policy)
                   : '—',
             },
-            { label: 'Total runs', value: agent.total_runs },
+            {
+              label: 'Total runs',
+              value: agent.total_runs,
+              detail: agent.success_rate != null ? `${formatRate(agent.success_rate)} success` : undefined,
+            },
+            {
+              label: 'Tokens used',
+              value: formatTokens(agent.total_tokens ?? 0),
+              detail: `${formatTokens(agent.total_input_tokens ?? 0)} in / ${formatTokens(agent.total_output_tokens ?? 0)} out`,
+            },
+            {
+              label: 'Est. cost',
+              value: formatCost(agent.total_cost_usd ?? null),
+            },
+            {
+              label: 'Success rate',
+              value: agent.success_rate != null ? formatRate(agent.success_rate) : '—',
+            },
+            {
+              label: 'Avg duration',
+              value: formatDuration(agent.avg_duration_ms ?? null),
+            },
           ].map((stat) => (
             <div key={stat.label} className="rounded-lg border border-border-subtle bg-muted/40 px-3.5 py-3">
-              <p className="mb-2 font-mono text-micro font-semibold uppercase tracking-[0.8px] text-muted-foreground">
+              <p className="mb-1.5 font-mono text-micro font-semibold uppercase tracking-[0.8px] text-muted-foreground">
                 {stat.label}
               </p>
               <p className="truncate font-mono text-lg font-semibold tabular-nums text-foreground" title={String(stat.value)}>
                 {stat.value}
               </p>
+              {'detail' in stat && stat.detail ? (
+                <p className="mt-1 truncate font-mono text-[11px] text-muted-foreground">
+                  {stat.detail}
+                </p>
+              ) : null}
             </div>
           ))}
         </div>

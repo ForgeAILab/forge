@@ -30,6 +30,7 @@ database for historical provenance.
 | GET    | `/api/v1/projects/{id}` | Get project |
 | PATCH  | `/api/v1/projects/{id}` | Update project |
 | DELETE | `/api/v1/projects/{id}` | Delete a Project through the guarded, transactional teardown of its Project-owned records |
+| GET    | `/api/v1/projects/{id}/analytics` | Read Project analytics (CI steps, review summary, token and cost breakdown by model and by agent) |
 | GET    | `/api/v1/account/main-agent/product-genesis/{session_id}/charter` | Read the active Genesis Charter and revision/approval state |
 | POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/charter/revisions` | Append an immutable Genesis Charter draft revision |
 | POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/charter/revisions/{revision_id}/approve` | Create the exact principal-bound, single-use Charter approval receipt |

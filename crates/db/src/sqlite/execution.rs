@@ -20,7 +20,7 @@ impl ExecutionRepo for SqliteDb {
     }
 
     async fn stats_by_agent(&self, agent_id: &str) -> Result<AgentExecutionStats> {
-        let row = sqlx::query(
+        let run_row = sqlx::query(
             "SELECT \
                 COUNT(*) AS total_runs, \
                 COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) AS completed_runs, \
@@ -36,9 +36,9 @@ impl ExecutionRepo for SqliteDb {
         .fetch_one(&self.pool)
         .await?;
 
-        let total_runs: i64 = row.try_get("total_runs")?;
-        let completed_runs: i64 = row.try_get("completed_runs")?;
-        let avg_duration_ms = row
+        let total_runs: i64 = run_row.try_get("total_runs")?;
+        let completed_runs: i64 = run_row.try_get("completed_runs")?;
+        let avg_duration_ms = run_row
             .try_get::<Option<f64>, _>("avg_duration_ms")?
             .map(|duration| duration.round() as i64);
         let success_rate = if total_runs > 0 {
@@ -47,10 +47,36 @@ impl ExecutionRepo for SqliteDb {
             None
         };
 
+        let usage_row = sqlx::query(
+            "SELECT \
+                COALESCE(SUM(eu.input_tokens), 0) AS total_input_tokens, \
+                COALESCE(SUM(eu.output_tokens), 0) AS total_output_tokens, \
+                COALESCE(SUM(eu.cache_read_tokens), 0) AS total_cache_read_tokens, \
+                COALESCE(SUM(eu.cache_write_tokens), 0) AS total_cache_write_tokens, \
+                SUM(eu.cost_usd) AS total_cost_usd \
+             FROM execution_usage eu \
+             JOIN execution e ON eu.execution_id = e.id \
+             WHERE e.agent_id = ?",
+        )
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let total_input_tokens: i64 = usage_row.try_get("total_input_tokens")?;
+        let total_output_tokens: i64 = usage_row.try_get("total_output_tokens")?;
+        let total_cache_read_tokens: i64 = usage_row.try_get("total_cache_read_tokens")?;
+        let total_cache_write_tokens: i64 = usage_row.try_get("total_cache_write_tokens")?;
+        let total_cost_usd: Option<f64> = usage_row.try_get("total_cost_usd")?;
+
         Ok(AgentExecutionStats {
             total_runs,
             avg_duration_ms,
             success_rate,
+            total_input_tokens,
+            total_output_tokens,
+            total_cache_read_tokens,
+            total_cache_write_tokens,
+            total_cost_usd,
         })
     }
 

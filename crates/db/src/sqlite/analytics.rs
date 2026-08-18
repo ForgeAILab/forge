@@ -252,6 +252,140 @@ impl ProjectAnalyticsRepo for SqliteDb {
         let total_count_row = total_count_query.build().fetch_one(self.pool()).await?;
         let execution_count = total_count_row.try_get::<i64, _>("execution_count")?;
 
+        let mut agent_query = sqlx::QueryBuilder::<Sqlite>::new(
+            "SELECT \
+                a.id AS agent_id, \
+                a.name AS agent_name, \
+                a.executor_type AS executor_type, \
+                a.model AS model, \
+                COUNT(DISTINCT e.id) AS execution_count, \
+                COALESCE(SUM(CASE WHEN e.status = 'completed' THEN 1 ELSE 0 END), 0) AS completed_runs, \
+                AVG(CASE \
+                    WHEN e.status != 'running' \
+                    THEN (JULIANDAY(e.updated_at) - JULIANDAY(e.created_at)) * 86400000 \
+                    ELSE NULL \
+                END) AS avg_duration_ms \
+             FROM agent_current a \
+             JOIN execution e ON e.agent_id = a.id \
+             JOIN task t ON e.task_id = t.id \
+             WHERE t.project_id = ",
+        );
+        agent_query.push_bind(project_id);
+        if let Some(from) = from {
+            agent_query.push(" AND e.created_at >= ").push_bind(from);
+        }
+        if let Some(to) = to {
+            agent_query.push(" AND e.created_at <= ").push_bind(to);
+        }
+        agent_query.push(" GROUP BY a.id, a.name, a.executor_type, a.model ORDER BY a.name ASC");
+        let agent_rows = agent_query.build().fetch_all(self.pool()).await?;
+
+        let mut agent_usage_query = sqlx::QueryBuilder::<Sqlite>::new(
+            "SELECT \
+                e.agent_id AS agent_id, \
+                COALESCE(SUM(eu.input_tokens), 0) AS input_tokens, \
+                COALESCE(SUM(eu.output_tokens), 0) AS output_tokens, \
+                COALESCE(SUM(eu.cache_read_tokens), 0) AS cache_read_tokens, \
+                COALESCE(SUM(eu.cache_write_tokens), 0) AS cache_write_tokens, \
+                SUM(eu.cost_usd) AS cost_usd \
+             FROM execution_usage eu \
+             JOIN execution e ON eu.execution_id = e.id \
+             JOIN task t ON e.task_id = t.id \
+             WHERE e.agent_id IS NOT NULL AND t.project_id = ",
+        );
+        agent_usage_query.push_bind(project_id);
+        if let Some(from) = from {
+            agent_usage_query
+                .push(" AND eu.created_at >= ")
+                .push_bind(from);
+        }
+        if let Some(to) = to {
+            agent_usage_query
+                .push(" AND eu.created_at <= ")
+                .push_bind(to);
+        }
+        agent_usage_query.push(" GROUP BY e.agent_id");
+        let agent_usage_rows = agent_usage_query.build().fetch_all(self.pool()).await?;
+
+        struct AgentUsageRow {
+            input_tokens: i64,
+            output_tokens: i64,
+            cache_read_tokens: i64,
+            cache_write_tokens: i64,
+            cost_usd: Option<f64>,
+        }
+        let mut usage_by_agent: std::collections::HashMap<String, AgentUsageRow> =
+            std::collections::HashMap::new();
+        for row in agent_usage_rows {
+            let agent_id: String = row.try_get("agent_id")?;
+            let input_tokens = row.try_get::<Option<i64>, _>("input_tokens")?.unwrap_or(0);
+            let output_tokens = row.try_get::<Option<i64>, _>("output_tokens")?.unwrap_or(0);
+            let cache_read_tokens = row
+                .try_get::<Option<i64>, _>("cache_read_tokens")?
+                .unwrap_or(0);
+            let cache_write_tokens = row
+                .try_get::<Option<i64>, _>("cache_write_tokens")?
+                .unwrap_or(0);
+            let cost_usd = row.try_get::<Option<f64>, _>("cost_usd")?;
+            usage_by_agent.insert(
+                agent_id,
+                AgentUsageRow {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    cost_usd,
+                },
+            );
+        }
+
+        let mut by_agent = Vec::with_capacity(agent_rows.len());
+        for row in agent_rows {
+            let agent_id: String = row.try_get("agent_id")?;
+            let agent_name: String = row.try_get("agent_name")?;
+            let executor_type: String = row.try_get("executor_type")?;
+            let model: Option<String> = row.try_get("model")?;
+            let exec_count: i64 = row.try_get("execution_count")?;
+            let completed_runs: i64 = row.try_get("completed_runs")?;
+            let avg_duration_ms = row
+                .try_get::<Option<f64>, _>("avg_duration_ms")?
+                .map(|d| d.round() as i64);
+            let success_rate = if exec_count > 0 {
+                Some(completed_runs as f64 / exec_count as f64)
+            } else {
+                None
+            };
+
+            let usage = usage_by_agent.remove(&agent_id);
+            let (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd) =
+                if let Some(u) = usage {
+                    (
+                        u.input_tokens,
+                        u.output_tokens,
+                        u.cache_read_tokens,
+                        u.cache_write_tokens,
+                        u.cost_usd,
+                    )
+                } else {
+                    (0, 0, 0, 0, None)
+                };
+
+            by_agent.push(AgentTokenBreakdown {
+                agent_id,
+                agent_name,
+                executor_type,
+                model,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                cost_usd,
+                execution_count: exec_count,
+                success_rate,
+                avg_duration_ms,
+            });
+        }
+
         Ok(ProjectTokenStats {
             total_input_tokens,
             total_output_tokens,
@@ -260,6 +394,7 @@ impl ProjectAnalyticsRepo for SqliteDb {
             total_cost_usd,
             execution_count,
             by_model,
+            by_agent,
         })
     }
 
@@ -410,6 +545,80 @@ mod tests {
         .expect("task creates");
 
         (project_id, repo_id, task_id)
+    }
+
+    async fn seed_agent(db: &SqliteDb, name: &str, model: Option<&str>) -> String {
+        let agent = AgentRepo::create(
+            db,
+            CreateAgent {
+                id: crate::new_uuid_v4(),
+                name: name.to_owned(),
+                description: None,
+                executor_type: "claude-code".to_owned(),
+                model: model.map(str::to_owned),
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "[]".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: None,
+                daemon_id: None,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: AgentStatus::Idle,
+                last_heartbeat_at: None,
+                is_default: false,
+                paused: false,
+                owner_id: None,
+                visibility: "global".to_owned(),
+                created_at: crate::now_rfc3339(),
+                updated_at: crate::now_rfc3339(),
+            },
+        )
+        .await
+        .expect("agent creates");
+        agent.id
+    }
+
+    async fn seed_execution_with_agent(
+        db: &SqliteDb,
+        task_id: &str,
+        agent_id: Option<&str>,
+        status: ExecutionStatus,
+        created_at: &str,
+    ) -> String {
+        let execution_id = crate::new_uuid_v4();
+        ExecutionRepo::create(
+            db,
+            CreateExecution {
+                id: execution_id.clone(),
+                task_id: task_id.to_owned(),
+                agent_id: agent_id.map(str::to_owned),
+                role: "reviewer".to_owned(),
+                status,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                workspace_id: None,
+                created_at: created_at.to_owned(),
+                updated_at: created_at.to_owned(),
+            },
+        )
+        .await
+        .expect("execution creates");
+        execution_id
     }
 
     async fn seed_execution(db: &SqliteDb, task_id: &str, created_at: &str) -> String {
@@ -740,6 +949,91 @@ mod tests {
         assert_eq!(stats.by_model.len(), 1);
         assert_eq!(stats.by_model[0].provider, "openai");
         assert_eq!(stats.by_model[0].execution_count, 1);
+    }
+
+    #[tokio::test]
+    async fn token_analytics_by_agent() {
+        let db = sqlite_db().await;
+        let (project_id, _repo_id, task_id) = seed_project_repo_task(&db).await;
+        let agent_a = seed_agent(&db, "Agent Alpha", Some("gpt-4.1")).await;
+        let agent_b = seed_agent(&db, "Agent Beta", Some("claude-3-7-sonnet")).await;
+
+        let exec_a = seed_execution_with_agent(
+            &db,
+            &task_id,
+            Some(&agent_a),
+            ExecutionStatus::Completed,
+            "2026-04-10T00:00:00Z",
+        )
+        .await;
+        let exec_b = seed_execution_with_agent(
+            &db,
+            &task_id,
+            Some(&agent_b),
+            ExecutionStatus::Failed,
+            "2026-04-11T00:00:00Z",
+        )
+        .await;
+
+        seed_execution_usage(
+            &db,
+            &exec_a,
+            "gpt-4.1",
+            200,
+            50,
+            20,
+            10,
+            Some(0.25),
+            "2026-04-10T00:00:00Z",
+        )
+        .await;
+        seed_execution_usage(
+            &db,
+            &exec_b,
+            "claude-3-7-sonnet",
+            100,
+            40,
+            0,
+            0,
+            Some(0.12),
+            "2026-04-11T00:00:00Z",
+        )
+        .await;
+
+        let stats = ProjectAnalyticsRepo::get_project_token_analytics(&db, &project_id, None, None)
+            .await
+            .expect("token analytics computed");
+
+        assert_eq!(stats.by_agent.len(), 2);
+        assert_eq!(stats.by_agent[0].agent_id, agent_a);
+        assert_eq!(stats.by_agent[0].agent_name, "Agent Alpha");
+        assert_eq!(stats.by_agent[0].input_tokens, 200);
+        assert_eq!(stats.by_agent[0].output_tokens, 50);
+        assert_eq!(stats.by_agent[0].cache_read_tokens, 20);
+        assert_eq!(stats.by_agent[0].cache_write_tokens, 10);
+        assert_eq!(stats.by_agent[0].cost_usd, Some(0.25));
+        assert_eq!(stats.by_agent[0].execution_count, 1);
+        assert_eq!(stats.by_agent[0].success_rate, Some(1.0));
+
+        assert_eq!(stats.by_agent[1].agent_id, agent_b);
+        assert_eq!(stats.by_agent[1].agent_name, "Agent Beta");
+        assert_eq!(stats.by_agent[1].input_tokens, 100);
+        assert_eq!(stats.by_agent[1].output_tokens, 40);
+        assert_eq!(stats.by_agent[1].cost_usd, Some(0.12));
+        assert_eq!(stats.by_agent[1].execution_count, 1);
+        assert_eq!(stats.by_agent[1].success_rate, Some(0.0));
+
+        // Test stats_by_agent directly as well
+        let stats_a = ExecutionRepo::stats_by_agent(&db, &agent_a)
+            .await
+            .expect("stats_by_agent");
+        assert_eq!(stats_a.total_runs, 1);
+        assert_eq!(stats_a.success_rate, Some(1.0));
+        assert_eq!(stats_a.total_input_tokens, 200);
+        assert_eq!(stats_a.total_output_tokens, 50);
+        assert_eq!(stats_a.total_cache_read_tokens, 20);
+        assert_eq!(stats_a.total_cache_write_tokens, 10);
+        assert_eq!(stats_a.total_cost_usd, Some(0.25));
     }
 
     #[tokio::test]

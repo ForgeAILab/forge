@@ -486,4 +486,10 @@ fn export_typescript() {
     TaskProgressCounts::export().expect("export TaskProgressCounts");
     ValidationResult::export().expect("export ValidationResult");
     VersionedDigest::export().expect("export VersionedDigest");
+    ProjectAnalyticsResponse::export().expect("export ProjectAnalyticsResponse");
+    CiStepAnalytics::export().expect("export CiStepAnalytics");
+    TokenUsageAnalytics::export().expect("export TokenUsageAnalytics");
+    ModelTokenBreakdown::export().expect("export ModelTokenBreakdown");
+    AgentTokenBreakdown::export().expect("export AgentTokenBreakdown");
+    ReviewSummaryAnalytics::export().expect("export ReviewSummaryAnalytics");
 }

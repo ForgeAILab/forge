@@ -1,12 +1,13 @@
 use std::collections::HashSet;
 
 use api_types::{
-    parse_project_hooks_json, CiStepAnalytics, CreateProjectFromCharterApprovalRequest,
-    CreateProjectFromCharterApprovalResponse, CreateProjectRequest,
-    ModelTokenBreakdown as ApiModelTokenBreakdown, PaginatedResponse, ProjectAnalyticsResponse,
-    ProjectHookRunResponse, ProjectHookRunStatus, ProjectHookRunsResponse, ProjectResponse,
-    ProjectSettings, ReviewConfig, ReviewSummaryAnalytics, StateKind, TestLifecycleHookRequest,
-    TokenUsageAnalytics, UpdateProjectRequest, UpdateProjectWorkflowRequest, WorkflowDefinition,
+    parse_project_hooks_json, AgentTokenBreakdown as ApiAgentTokenBreakdown, CiStepAnalytics,
+    CreateProjectFromCharterApprovalRequest, CreateProjectFromCharterApprovalResponse,
+    CreateProjectRequest, ModelTokenBreakdown as ApiModelTokenBreakdown, PaginatedResponse,
+    ProjectAnalyticsResponse, ProjectHookRunResponse, ProjectHookRunStatus,
+    ProjectHookRunsResponse, ProjectResponse, ProjectSettings, ReviewConfig,
+    ReviewSummaryAnalytics, StateKind, TestLifecycleHookRequest, TokenUsageAnalytics,
+    UpdateProjectRequest, UpdateProjectWorkflowRequest, WorkflowDefinition,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -15,9 +16,10 @@ use axum::{
     Json,
 };
 use db::{
-    new_uuid_v4, now_rfc3339, AgentProfileRepo, AgentRepo, CiStepStats, CreateProject,
-    ModelTokenBreakdown, PageRequest, ProjectAnalyticsRepo, ProjectHookRun, ProjectHookRunRepo,
-    ProjectRepo, ProjectReviewSummary, ProjectTokenStats, SortBy, SortOrder, UpdateProject,
+    new_uuid_v4, now_rfc3339, AgentProfileRepo, AgentRepo, AgentTokenBreakdown, CiStepStats,
+    CreateProject, ModelTokenBreakdown, PageRequest, ProjectAnalyticsRepo, ProjectHookRun,
+    ProjectHookRunRepo, ProjectRepo, ProjectReviewSummary, ProjectTokenStats, SortBy, SortOrder,
+    UpdateProject,
 };
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde::Deserialize;
@@ -319,6 +321,7 @@ pub async fn get_project_analytics(
         total_cost_usd,
         execution_count,
         by_model,
+        by_agent,
     } = token_usage;
     let token_usage = TokenUsageAnalytics {
         total_input_tokens,
@@ -348,6 +351,38 @@ pub async fn get_project_analytics(
                     cache_write_tokens,
                     cost_usd,
                     execution_count,
+                },
+            )
+            .collect(),
+        by_agent: by_agent
+            .into_iter()
+            .map(
+                |AgentTokenBreakdown {
+                     agent_id,
+                     agent_name,
+                     executor_type,
+                     model,
+                     input_tokens,
+                     output_tokens,
+                     cache_read_tokens,
+                     cache_write_tokens,
+                     cost_usd,
+                     execution_count,
+                     success_rate,
+                     avg_duration_ms,
+                 }| ApiAgentTokenBreakdown {
+                    agent_id,
+                    agent_name,
+                    executor_type,
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    cost_usd,
+                    execution_count,
+                    success_rate,
+                    avg_duration_ms,
                 },
             )
             .collect(),

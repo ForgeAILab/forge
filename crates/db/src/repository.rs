@@ -633,6 +633,11 @@ pub struct AgentExecutionStats {
     pub total_runs: i64,
     pub avg_duration_ms: Option<i64>,
     pub success_rate: Option<f64>,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cache_read_tokens: i64,
+    pub total_cache_write_tokens: i64,
+    pub total_cost_usd: Option<f64>,
 }
 
 #[async_trait]
@@ -2077,6 +2082,22 @@ pub struct ModelTokenBreakdown {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct AgentTokenBreakdown {
+    pub agent_id: String,
+    pub agent_name: String,
+    pub executor_type: String,
+    pub model: Option<String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub cost_usd: Option<f64>,
+    pub execution_count: i64,
+    pub success_rate: Option<f64>,
+    pub avg_duration_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProjectTokenStats {
     pub total_input_tokens: i64,
     pub total_output_tokens: i64,
@@ -2085,6 +2106,7 @@ pub struct ProjectTokenStats {
     pub total_cost_usd: Option<f64>,
     pub execution_count: i64,
     pub by_model: Vec<ModelTokenBreakdown>,
+    pub by_agent: Vec<AgentTokenBreakdown>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

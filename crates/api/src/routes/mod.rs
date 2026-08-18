@@ -635,6 +635,15 @@ pub fn agent_response(
         total_runs: stats.total_runs,
         avg_duration_ms: stats.avg_duration_ms,
         success_rate: stats.success_rate,
+        total_input_tokens: stats.total_input_tokens,
+        total_output_tokens: stats.total_output_tokens,
+        total_cache_read_tokens: stats.total_cache_read_tokens,
+        total_cache_write_tokens: stats.total_cache_write_tokens,
+        total_tokens: stats.total_input_tokens
+            + stats.total_output_tokens
+            + stats.total_cache_read_tokens
+            + stats.total_cache_write_tokens,
+        total_cost_usd: stats.total_cost_usd,
         is_default: agent.is_default,
         paused: agent.paused,
         owner_id: agent.owner_id,

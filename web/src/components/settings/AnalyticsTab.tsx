@@ -198,6 +198,52 @@ export function AnalyticsTab({ projectId }: { projectId: string }) {
               </div>
 
               <div className="space-y-2">
+                <p className="text-sm font-medium">By Agent</p>
+                {(tokenUsage?.by_agent?.length ?? 0) === 0 ? (
+                  <p className="text-sm text-muted-foreground">No agent usage data</p>
+                ) : (
+                  <div className="overflow-x-auto rounded-md border">
+                    <table className="min-w-full text-sm">
+                      <thead className="bg-muted/50">
+                        <tr className="text-left">
+                          <th className="px-3 py-2 font-medium">Agent</th>
+                          <th className="px-3 py-2 font-medium">Executor</th>
+                          <th className="px-3 py-2 font-medium">Model</th>
+                          <th className="px-3 py-2 font-medium">{productTerm('run', 0)}</th>
+                          <th className="px-3 py-2 font-medium">Success Rate</th>
+                          <th className="px-3 py-2 font-medium">Input</th>
+                          <th className="px-3 py-2 font-medium">Output</th>
+                          <th className="px-3 py-2 font-medium">Cache Read</th>
+                          <th className="px-3 py-2 font-medium">Cache Write</th>
+                          <th className="px-3 py-2 font-medium">Cost</th>
+                          <th className="px-3 py-2 font-medium">Avg Duration</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {tokenUsage?.by_agent.map((agent) => (
+                          <tr key={agent.agent_id} className="border-t">
+                            <td className="px-3 py-2 font-medium">{agent.agent_name}</td>
+                            <td className="px-3 py-2 text-xs font-mono text-muted-foreground">{agent.executor_type}</td>
+                            <td className="px-3 py-2 text-xs">{agent.model ?? '—'}</td>
+                            <td className="px-3 py-2">{agent.execution_count}</td>
+                            <td className="px-3 py-2">
+                              {agent.success_rate != null ? formatRate(agent.success_rate) : '—'}
+                            </td>
+                            <td className="px-3 py-2">{formatTokens(agent.input_tokens)}</td>
+                            <td className="px-3 py-2">{formatTokens(agent.output_tokens)}</td>
+                            <td className="px-3 py-2">{formatTokens(agent.cache_read_tokens)}</td>
+                            <td className="px-3 py-2">{formatTokens(agent.cache_write_tokens)}</td>
+                            <td className="px-3 py-2">{formatCost(agent.cost_usd)}</td>
+                            <td className="px-3 py-2">{formatDuration(agent.avg_duration_ms)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+
+              <div className="space-y-2">
                 <p className="text-sm font-medium">By Model</p>
                 {(tokenUsage?.by_model.length ?? 0) === 0 ? (
                   <p className="text-sm text-muted-foreground">No token data</p>

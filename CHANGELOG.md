@@ -6,6 +6,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Added
+
+- Per-agent token usage, estimated cost, total runs, success rate, and duration analytics across the system:
+  - `AgentResponse` includes `total_input_tokens`, `total_output_tokens`, `total_cache_read_tokens`, `total_cache_write_tokens`, `total_tokens`, and `total_cost_usd`.
+  - `ProjectAnalyticsResponse` (`GET /api/v1/projects/{id}/analytics`) includes `by_agent` breakdown with token counts, estimated price, runs, success rate, and average duration.
+  - Agent Settings detail panel displays token consumption and estimated cost cards.
+  - Project Settings Analytics tab displays a "By Agent" breakdown table.
+
 ### Breaking
 
 - The Agent Chat page no longer carries the Project workbench side rail
