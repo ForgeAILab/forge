@@ -456,23 +456,67 @@ impl ProjectOrchestrationActionService {
         payload: &Value,
     ) -> Result<Value> {
         let document_id = string(payload, "document_id")?;
-        let document = ProjectOrchestrationRepo::get_project_document(&*self.db, &document_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project_document", document_id.clone()))?;
+        let kind_text = string(payload, "kind")?;
+        let kind = parse_document_kind(&kind_text)
+            .ok_or_else(|| ServiceError::invalid_operation("Project Document kind is invalid"))?;
+        let title = string(payload, "title")?;
+        let document_action = string(payload, "action")?;
+        let document =
+            match ProjectOrchestrationRepo::get_project_document(&*self.db, &document_id).await? {
+                Some(document) => document,
+                // A Charter-created Project starts with no Documents and the
+                // Agent surface has no separate create operation, so the first
+                // draft_revision of an unknown Document id creates the Document.
+                None if document_action == "draft_revision"
+                    && payload
+                        .get("base_revision_id")
+                        .map(Value::is_null)
+                        .unwrap_or(true) =>
+                {
+                    if !db::validate_uuid_v4(&document_id) {
+                        return Err(ServiceError::invalid_operation(
+                            "Project Document id must be a new UUID v4",
+                        ));
+                    }
+                    let now = now_rfc3339();
+                    sqlx::query(
+                        "INSERT INTO project_document (
+                        id, project_id, kind, title, lifecycle, approval_policy,
+                        current_draft_revision_id, current_approved_revision_id,
+                        version, created_at, updated_at
+                     ) VALUES (?, ?, ?, ?, 'draft', 'user_or_project_agent', NULL, NULL, 1, ?, ?)",
+                    )
+                    .bind(&document_id)
+                    .bind(project_id)
+                    .bind(&kind_text)
+                    .bind(&title)
+                    .bind(&now)
+                    .bind(&now)
+                    .execute(self.db.pool())
+                    .await?;
+                    ProjectOrchestrationRepo::get_project_document(&*self.db, &document_id)
+                        .await?
+                        .ok_or_else(|| {
+                            ServiceError::not_found("project_document", document_id.clone())
+                        })?
+                }
+                None => {
+                    return Err(ServiceError::not_found(
+                        "project_document",
+                        document_id.clone(),
+                    ));
+                }
+            };
         if document.project_id != project_id {
             return Err(ServiceError::invalid_operation(
                 "Project Document action crosses Project scope",
             ));
         }
-        let kind_text = string(payload, "kind")?;
-        let kind = parse_document_kind(&kind_text)
-            .ok_or_else(|| ServiceError::invalid_operation("Project Document kind is invalid"))?;
-        if document.kind != kind_text || document.title != string(payload, "title")? {
+        if document.kind != kind_text || document.title != title {
             return Err(ServiceError::conflict(
                 "Project Document identity does not match the proposal",
             ));
         }
-        let document_action = string(payload, "action")?;
         if document_action == "approve" {
             return self
                 .materialize_document_approval(action, project_id, payload, &document)
@@ -1245,8 +1289,134 @@ impl ProjectOrchestrationActionService {
         }
 
         let content = if let Some(content) = payload.get("content") {
-            from_value::<ExecutionBaselineContent>(&json!({ "content": content }), "content")?
+            // Derive the release-policy digest from the caller's own frozen
+            // policy when it is omitted from a full content object.
+            let mut content_value = content.clone();
+            // The Charter ArtifactRef digests are server truths: resolve them
+            // from the referenced approved revision instead of requiring the
+            // caller to reproduce them byte-for-byte.
+            if let Some(revision_id) = content_value
+                .get("charter_revision")
+                .and_then(|reference| reference.get("revision_id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            {
+                let charter = sqlx::query(
+                    "SELECT c.id AS artifact_id, r.content_digest, r.render_version,
+                            r.rendered_digest
+                     FROM project_charter_revision r
+                     JOIN project_charter c ON c.id = r.charter_id
+                     WHERE r.id = ? AND c.project_id = ? AND r.lifecycle = 'approved'",
+                )
+                .bind(&revision_id)
+                .bind(project_id)
+                .fetch_optional(self.db.pool())
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::conflict(
+                        "baseline Charter revision is not approved and Project-scoped",
+                    )
+                })?;
+                content_value["charter_revision"] = json!({
+                    "artifact_id": charter.try_get::<String, _>("artifact_id")?,
+                    "revision_id": revision_id,
+                    "content_digest": charter.try_get::<String, _>("content_digest")?,
+                    "render_version": charter.try_get::<String, _>("render_version")?,
+                    "render_digest": charter.try_get::<String, _>("rendered_digest")?,
+                });
+            }
+            // Document ArtifactRef digests are likewise server truths keyed
+            // by revision_id.
+            let document_reference_ids: Vec<(usize, String)> = content_value
+                .get("document_revisions")
+                .and_then(Value::as_array)
+                .map(|references| {
+                    references
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, reference)| {
+                            reference
+                                .get("revision_id")
+                                .and_then(Value::as_str)
+                                .map(|revision_id| (index, revision_id.to_owned()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (index, revision_id) in document_reference_ids {
+                let row = sqlx::query(
+                    "SELECT d.id AS artifact_id, r.content_digest, r.render_version,
+                            r.rendered_digest
+                     FROM project_document_revision r
+                     JOIN project_document d ON d.id = r.document_id
+                     WHERE r.id = ? AND d.project_id = ?",
+                )
+                .bind(&revision_id)
+                .bind(project_id)
+                .fetch_optional(self.db.pool())
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::conflict("baseline Document revision is not Project-scoped")
+                })?;
+                content_value["document_revisions"][index] = json!({
+                    "artifact_id": row.try_get::<String, _>("artifact_id")?,
+                    "revision_id": revision_id,
+                    "content_digest": row.try_get::<String, _>("content_digest")?,
+                    "render_version": row.try_get::<String, _>("render_version")?,
+                    "render_digest": row.try_get::<String, _>("rendered_digest")?,
+                });
+            }
+            if let Some(object) = content_value.as_object_mut() {
+                let digest_missing = object
+                    .get("release_policy_digest")
+                    .and_then(Value::as_str)
+                    .map(|value| value.trim().is_empty())
+                    .unwrap_or(true);
+                if digest_missing {
+                    if let Some(policy_value) = object.get("release_policy").cloned() {
+                        let policy: api_types::ExecutionBaselineReleasePolicy =
+                            serde_json::from_value(policy_value).map_err(|error| {
+                                ServiceError::invalid_operation(format!(
+                                    "invalid release policy: {error}"
+                                ))
+                            })?;
+                        let digest = crate::execution_baseline::release_policy_digest(&policy)
+                            .map_err(|error| {
+                                ServiceError::invalid_operation(format!(
+                                    "release policy digest: {error}"
+                                ))
+                            })?;
+                        object.insert("release_policy_digest".to_owned(), json!(digest));
+                    }
+                }
+            }
+            from_value::<ExecutionBaselineContent>(&json!({ "content": content_value }), "content")?
         } else {
+            let release_policy_value = payload.get("release_policy").cloned().ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "execution baseline proposals require a complete frozen release_policy",
+                )
+            })?;
+            // The digest is derived from the caller's own frozen policy; the
+            // server computes it when the caller omits it.
+            let release_policy_digest_value = match payload
+                .get("release_policy_digest")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                Some(digest) => digest.to_owned(),
+                None => {
+                    let policy: api_types::ExecutionBaselineReleasePolicy =
+                        serde_json::from_value(release_policy_value.clone()).map_err(|error| {
+                            ServiceError::invalid_operation(format!(
+                                "invalid release policy: {error}"
+                            ))
+                        })?;
+                    crate::execution_baseline::release_policy_digest(&policy).map_err(|error| {
+                        ServiceError::invalid_operation(format!("release policy digest: {error}"))
+                    })?
+                }
+            };
             let charter_revision_id = string(payload, "charter_revision_id")?;
             let charter = sqlx::query(
                 "SELECT c.id AS artifact_id, r.content_digest, r.render_version,
@@ -1286,15 +1456,8 @@ impl ProjectOrchestrationActionService {
                     })?,
                 "primary_milestone_id": payload.get("primary_milestone_id").cloned().unwrap_or(Value::Null),
                 "release_policy_revision": string(payload, "release_policy_revision")?,
-                "release_policy_digest": string(payload, "release_policy_digest")?,
-                "release_policy": payload
-                    .get("release_policy")
-                    .cloned()
-                    .ok_or_else(|| {
-                        ServiceError::invalid_operation(
-                            "execution baseline proposals require a complete frozen release_policy",
-                        )
-                    })?,
+                "release_policy_digest": release_policy_digest_value,
+                "release_policy": release_policy_value,
                 "acceptance_evidence_matrix": payload.get("acceptance_evidence_matrix").cloned().unwrap_or_else(|| json!([])),
                 "capability_classes": payload.get("capability_classes").cloned().unwrap_or_else(|| json!([])),
                 "risk_classes": payload.get("risk_classes").cloned().unwrap_or_else(|| json!([])),

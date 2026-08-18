@@ -3,6 +3,7 @@ import { Link } from '@tanstack/react-router'
 import {
   ArrowClockwise,
   ArrowRight,
+  CaretDown,
   CheckCircle,
   CircleNotch,
   FileText,
@@ -593,15 +594,92 @@ function CharterReviewPanel({
     </section>
   )
 }
-
+/** Compact Genesis status chip for the chat header: lifecycle + cancel. */
 export function ProductGenesisControls() {
   const activeQuery = useProductGenesisActiveQuery()
   const cancelMutation = useCancelProductGenesisMutation()
   const active = activeQuery.data?.session ?? null
+  const [error, setError] = useState<string | null>(null)
+  const projectId = active?.project_id ?? null
+
+  async function cancel() {
+    if (!active) return
+    setError(null)
+    try {
+      await cancelMutation.mutateAsync({
+        sessionId: active.id,
+        input: {
+          expected_version: productGenesisVersion(active),
+          reason: 'cancelled_from_main_chat',
+        },
+      })
+    } catch (cause) {
+      setError(getApiErrorMessage(cause, 'Product Genesis could not be cancelled.'))
+    }
+  }
+
+  if (activeQuery.isLoading) {
+    return <LoadingState label="Loading Product Genesis…" compact />
+  }
+  if (activeQuery.isError || !active) {
+    return null
+  }
+
+  return (
+    <div className="flex min-w-0 items-center gap-2">
+      <div className="flex min-w-0 flex-wrap items-center gap-2 rounded-lg border border-ember-border bg-ember-surface px-3 py-1.5">
+        <Flask size={14} className="shrink-0 text-primary" aria-hidden />
+        <span className="min-w-0 truncate text-xs text-foreground">
+          Genesis · {lifecycleLabel(active.lifecycle)} · {active.maturity}
+        </span>
+        {projectId && active.lifecycle === 'handed_off' ? (
+          <Link
+            to="/projects/$projectId/chat"
+            params={{ projectId }}
+            className="inline-flex items-center gap-1 text-xs font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            Continue with Project Agent
+            <ArrowRight size={13} aria-hidden />
+          </Link>
+        ) : null}
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          onClick={() => void cancel()}
+          disabled={cancelMutation.isPending || active.lifecycle === 'handed_off'}
+          aria-label="Cancel Product Genesis"
+          className="h-6 px-1.5"
+        >
+          {cancelMutation.isPending ? (
+            <CircleNotch size={13} className="animate-spin" aria-hidden />
+          ) : (
+            <X size={13} aria-hidden />
+          )}
+          Cancel
+        </Button>
+      </div>
+      {error ? (
+        <p className="text-xs text-destructive" role="alert">
+          {error}
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
+/**
+ * The Charter review as a compact chat-timeline card: one summary row with
+ * the approval actions always visible, expandable into the full review
+ * panel. Lives in the Main chat conversation instead of a dedicated area.
+ */
+export function ProductGenesisCharterCard() {
+  const activeQuery = useProductGenesisActiveQuery()
+  const active = activeQuery.data?.session ?? null
   const charterQuery = useProductGenesisCharterQuery(active?.id)
   const approveMutation = useApproveProductGenesisCharterRevisionMutation(active?.id)
   const createMutation = useCreateProjectFromCharterApprovalMutation()
-  const [inspecting, setInspecting] = useState(false)
+  const [expanded, setExpanded] = useState(false)
   const [selectedRevisionId, setSelectedRevisionId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [conflict, setConflict] = useState(false)
@@ -632,13 +710,6 @@ export function ProductGenesisControls() {
   )
   const projectId = createdProjectId ?? active?.project_id ?? null
 
-  const isDiscovering = active?.lifecycle === 'discovering'
-  const isReady = active?.lifecycle === 'ready_for_project'
-  const hasApprovalCandidate = Boolean(
-    draftRevision?.lifecycle === 'proposed' || approval || charterData?.current_approved_revision,
-  )
-  const showFullPanel = !isDiscovering || isReady || hasApprovalCandidate || inspecting
-
   useEffect(() => {
     if (!charterData) return
     setSelectedRevisionId((current) =>
@@ -656,27 +727,11 @@ export function ProductGenesisControls() {
       setCreatedProjectId(null)
       setConflict(false)
       setConflictError(null)
-      setInspecting(false)
+      setExpanded(false)
       approvalAttemptRef.current = null
       createAttemptRef.current = null
     }
   }, [active])
-
-  async function cancel() {
-    if (!active) return
-    setError(null)
-    try {
-      await cancelMutation.mutateAsync({
-        sessionId: active.id,
-        input: {
-          expected_version: productGenesisVersion(active),
-          reason: 'cancelled_from_main_chat',
-        },
-      })
-    } catch (cause) {
-      setError(getApiErrorMessage(cause, 'Product Genesis could not be cancelled.'))
-    }
-  }
 
   async function approve(revision: ProjectCharterRevision) {
     const charter = charterData?.charter
@@ -797,86 +852,133 @@ export function ProductGenesisControls() {
     void charterQuery.refetch()
   }
 
-  if (activeQuery.isLoading) {
-    return <LoadingState label="Loading Product Genesis…" compact />
-  }
+  if (!active || activeQuery.isLoading || activeQuery.isError) return null
+  if (!charterData || charterData.revisions.length === 0) return null
 
-  if (activeQuery.isError) {
-    return (
-      <ErrorCard
-        title="Product Genesis status is unavailable"
-        description="Could not load the active Product Genesis session."
-        severity="error"
-        action={{ label: 'Retry', onClick: () => void activeQuery.refetch() }}
-      />
-    )
-  }
-
-  if (!active) {
-    return null
-  }
+  const workingName =
+    selectedRevision?.content.identity.working_name ??
+    draftRevision?.content.identity.working_name ??
+    'Charter'
+  const vision = selectedRevision?.content.identity.one_line_vision ?? ''
+  const revisionNumber = selectedRevision
+    ? charterData.revisions.length -
+      charterData.revisions.findIndex((revision) => revision.id === selectedRevision.id)
+    : charterData.revisions.length
+  const lifecycle = approval
+    ? projectId
+      ? 'project created'
+      : 'approved'
+    : (selectedRevision?.lifecycle ?? 'proposed')
+  const canApprove = Boolean(
+    !approval &&
+    charterData.charter &&
+    selectedRevision &&
+    selectedRevision.lifecycle === 'proposed' &&
+    !stale &&
+    charterData.selected_project_agent,
+  )
 
   return (
-    <div className="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-2">
-      <div className="flex min-w-0 flex-wrap items-center gap-2 rounded-lg border border-ember-border bg-ember-surface px-3 py-2">
-        <Flask size={15} className="shrink-0 text-primary" aria-hidden />
-        <span className="min-w-0 text-xs text-foreground">
-          Genesis · {lifecycleLabel(active.lifecycle)} · {active.maturity}
+    <section
+      aria-label={`Project Charter ${workingName}`}
+      className="min-w-0 max-w-full overflow-hidden rounded-xl border border-ember-border/60 bg-card shadow-xs"
+    >
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((current) => !current)}
+        className="flex w-full min-w-0 items-center gap-2.5 px-4 py-3 text-left transition-colors hover:bg-muted/30"
+      >
+        <FileText size={16} className="shrink-0 text-primary" aria-hidden />
+        <span className="min-w-0 truncate text-sm font-semibold text-foreground">
+          Project Charter — {workingName}
         </span>
-        {draftRevision && isDiscovering ? (
+        <span className="shrink-0 rounded-full border border-border-subtle bg-muted/40 px-2 py-0.5 font-mono text-micro uppercase tracking-[0.08em] text-muted-foreground">
+          rev {revisionNumber} · {lifecycleLabel(lifecycle)}
+        </span>
+        <CaretDown
+          size={13}
+          className={`ml-auto shrink-0 text-muted-foreground transition-transform ${expanded ? 'rotate-180' : ''}`}
+          aria-hidden
+        />
+      </button>
+      {vision ? (
+        <p className="truncate px-4 pb-2 text-xs text-muted-foreground">
+          {vision}
+        </p>
+      ) : null}
+      <div className="flex flex-wrap items-center gap-2 border-t border-border-subtle px-4 py-2.5">
+        {canApprove && selectedRevision ? (
           <Button
             type="button"
-            variant="ghost"
             size="sm"
-            onClick={() => setInspecting((v) => !v)}
-            className="text-xs text-primary hover:text-primary gap-1 px-1.5 h-6"
+            onClick={() => void approve(selectedRevision)}
+            disabled={approveMutation.isPending}
           >
-            <FileText size={13} aria-hidden />
-            {inspecting ? 'Hide Charter' : 'Inspect Charter'}
+            {approveMutation.isPending ? (
+              <CircleNotch size={13} className="animate-spin" aria-hidden />
+            ) : (
+              <ShieldCheck size={13} aria-hidden />
+            )}
+            Approve this revision
           </Button>
         ) : null}
-        {projectId && active.lifecycle === 'handed_off' ? (
+        {approval && approval.state === 'active' && !projectId ? (
+          <Button
+            type="button"
+            size="sm"
+            onClick={() => void createProject()}
+            disabled={createMutation.isPending}
+          >
+            {createMutation.isPending ? (
+              <CircleNotch size={13} className="animate-spin" aria-hidden />
+            ) : (
+              <CheckCircle size={13} aria-hidden />
+            )}
+            Create project & hand off
+          </Button>
+        ) : null}
+        {projectId ? (
           <Link
             to="/projects/$projectId/chat"
             params={{ projectId }}
-            className="inline-flex items-center gap-1 text-xs font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="inline-flex items-center gap-1.5 text-xs font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
-            Continue with Project Agent
+            Continue with the Project Agent
             <ArrowRight size={13} aria-hidden />
           </Link>
+        ) : null}
+        {!canApprove && !approval && !projectId ? (
+          <span className="text-xs text-muted-foreground">
+            {charterData.selected_project_agent
+              ? 'Waiting for a proposed revision to approve.'
+              : 'No eligible Project Agent is selected yet.'}
+          </span>
         ) : null}
         <Button
           type="button"
           variant="ghost"
           size="sm"
-          onClick={() => void cancel()}
-          disabled={cancelMutation.isPending || active.lifecycle === 'handed_off'}
-          aria-label="Cancel Product Genesis"
+          onClick={refreshCharter}
+          className="ml-auto h-7 px-2 text-xs text-muted-foreground"
         >
-          {cancelMutation.isPending ? (
-            <CircleNotch size={14} className="animate-spin" aria-hidden />
-          ) : (
-            <X size={14} aria-hidden />
-          )}
-          Cancel
+          <ArrowClockwise size={13} aria-hidden />
+          Refresh
         </Button>
       </div>
-
-      {showFullPanel ? (
-        charterQuery.isLoading ? (
-          <div className="basis-full">
-            <LoadingState label="Loading Charter projection…" />
-          </div>
-        ) : charterQuery.isError ? (
-          <div className="basis-full">
-            <ErrorCard
-              title="Charter projection is unavailable"
-              description="Charter projection could not be loaded; approval is disabled."
-              severity="error"
-              action={{ label: 'Retry Charter', onClick: () => void charterQuery.refetch() }}
-            />
-          </div>
-        ) : charterData ? (
+      {error ? (
+        <div className="border-t border-border-subtle px-4 py-2.5">
+          <ErrorCard
+            title="Product Genesis error"
+            description={error}
+            severity={conflict ? 'conflict' : 'error'}
+            action={conflict ? { label: 'Refresh', onClick: refreshCharter } : undefined}
+            technicalDetails={conflictError}
+          />
+        </div>
+      ) : null}
+      {expanded ? (
+        <div className="max-h-[60vh] overflow-y-auto border-t border-border-subtle p-3">
           <CharterReviewPanel
             active={active}
             charterData={charterData}
@@ -892,18 +994,8 @@ export function ProductGenesisControls() {
             conflict={conflict}
             conflictError={conflictError}
           />
-        ) : null
+        </div>
       ) : null}
-      {error ? (
-        <ErrorCard
-          title="Product Genesis error"
-          description={error}
-          severity={conflict ? 'conflict' : 'error'}
-          action={conflict ? { label: 'Refresh', onClick: refreshCharter } : undefined}
-          technicalDetails={conflictError}
-          className="basis-full"
-        />
-      ) : null}
-    </div>
+    </section>
   )
 }

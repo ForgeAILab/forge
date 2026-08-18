@@ -168,7 +168,9 @@ describe('AgentChatTimeline polling', () => {
     })
 
     expect(screen.getByText('assistant response arrived')).toBeTruthy()
-    expect(screen.getByText('Succeeded')).toBeTruthy()
+    // A succeeded turn whose response message is in the timeline stays silent —
+    // the agent message itself is the visible outcome.
+    expect(screen.queryByText('Succeeded')).toBeNull()
     expect(view.container.firstChild).toBe(timelineRoot)
   })
 
@@ -202,11 +204,11 @@ describe('AgentChatTimeline polling', () => {
 
       expect(screen.getByText(label)).toBeTruthy()
       if (status === 'failed' || status === 'cancelled') {
-        const retry = screen.getByRole('button', { name: /Retry You turn/ })
+        const retry = screen.getByRole('button', { name: 'Retry turn' })
         fireEvent.click(retry)
         await vi.waitFor(() => expect(onSend).toHaveBeenCalledWith('queued request'))
       } else {
-        expect(screen.queryByRole('button', { name: /Retry You turn/ })).toBeNull()
+        expect(screen.queryByRole('button', { name: 'Retry turn' })).toBeNull()
       }
     },
   )
@@ -314,6 +316,107 @@ describe('AgentChatTimeline polling', () => {
     expect(view.container.querySelector('[aria-label="Chat timeline"]')?.className).toContain(
       'overflow-x-hidden',
     )
+  })
+})
+
+describe('AgentChatTimeline session dividers', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    mocks.listAgentChatTurns.mockResolvedValue([])
+    mocks.listAgentHandoffs.mockResolvedValue([])
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.clearAllMocks()
+  })
+
+  it('divides messages that are hours apart into separate sessions', async () => {
+    mocks.listAgentChatMessages.mockResolvedValue({
+      items: [
+        userMessage,
+        { ...assistantMessage, created_at: '2026-08-13T18:00:00Z' },
+      ],
+      next_cursor: null,
+      has_more: false,
+    })
+
+    renderTimeline()
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(screen.getByRole('separator')).toBeTruthy()
+  })
+
+  it('keeps a close conversation as one session', async () => {
+    mocks.listAgentChatMessages.mockResolvedValue({
+      items: [userMessage, assistantMessage],
+      next_cursor: null,
+      has_more: false,
+    })
+
+    renderTimeline()
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(screen.queryByRole('separator')).toBeNull()
+  })
+})
+
+describe('ChatComposer commands', () => {
+  it('opens the / menu, inserts the picked command, and runs it with its argument', async () => {
+    const run = vi.fn(async () => undefined)
+    const onSend = vi.fn(async () => undefined)
+    render(
+      <ChatComposer
+        onSend={onSend}
+        commands={[
+          { name: 'start-product', description: 'Start Product Genesis', run },
+        ]}
+      />,
+    )
+
+    const textbox = screen.getByRole('textbox', { name: 'Chat message' }) as HTMLTextAreaElement
+    fireEvent.change(textbox, { target: { value: '/start' } })
+    expect(screen.getByRole('option', { name: /start-product/ })).toBeTruthy()
+
+    fireEvent.keyDown(textbox, { key: 'Enter' })
+    expect(textbox.value).toBe('/start-product ')
+
+    fireEvent.change(textbox, { target: { value: '/start-product an ice cream app' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+    await vi.waitFor(() => expect(run).toHaveBeenCalledWith('an ice cream app'))
+    expect(onSend).not.toHaveBeenCalled()
+  })
+
+  it('rejects an unknown command without sending it as a message', async () => {
+    const onSend = vi.fn(async () => undefined)
+    render(
+      <ChatComposer
+        onSend={onSend}
+        commands={[
+          {
+            name: 'start-product',
+            description: 'Start Product Genesis',
+            run: vi.fn(async () => undefined),
+          },
+        ]}
+      />,
+    )
+
+    const textbox = screen.getByRole('textbox', { name: 'Chat message' })
+    fireEvent.change(textbox, { target: { value: '/nope do it' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+    await vi.waitFor(() =>
+      expect(screen.getByRole('alert').textContent).toContain('Unknown command /nope'),
+    )
+    expect(onSend).not.toHaveBeenCalled()
   })
 })
 

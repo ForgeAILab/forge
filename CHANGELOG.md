@@ -8,6 +8,89 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- The Agent Chat page no longer carries the Project workbench side rail
+  (inline create forms for tasks, documents, decisions, and milestones), the
+  "Project records" pill navigation, or the scope-affordance chips. The chat
+  is a clean conversation surface; the agent performs those actions directly
+  from chat (`task.propose` and the other chat-scope tools), and project
+  configuration lives in Project Settings, linked from the chat header.
+
+### Changed
+
+- Agent Chat timelines (Main chat, Project chat, and the floating launcher)
+  were redesigned: user messages render as right-aligned bubbles, agent
+  replies render as markdown with a visible copy/meta/provenance row, and a
+  turn's live state (queued/thinking/retrying) renders as its own expandable
+  activity entry in the timeline — no longer inside the user message card —
+  with cancel and retry actions always visible. Provenance inspection is a
+  compact fingerprint icon in the message meta row, and messages more than
+  two hours apart are separated by a timestamped session divider.
+- The chat composer supports slash commands: typing `/` opens a command menu
+  (↑↓ + Enter to pick). Product Genesis starts with `/start-product <idea>`
+  instead of the removed "Start a product" button.
+
+### Fixed
+
+- The typed orchestration tool schemas are now flat `type: object`
+  envelopes: several provider function-calling APIs (notably Gemini) accept
+  only an OpenAPI-style object at the parameters root and silently drop
+  `oneOf`, leaving models blind to the envelope. Per-operation payload
+  shapes are summarized in a generated description, and the exact contracts
+  stay enforced by the host and server validators, whose errors return to
+  the model in-turn.
+- `project.document draft_revision` creates the Document row on the first
+  draft of an unknown id: a Charter-created Project starts with no Documents
+  and the Agent surface has no separate create operation, so the Delivery
+  Brief could never be drafted.
+- Execution-baseline proposals no longer demand byte-exact server-derived
+  values from the caller: `release_policy_digest`, `rendered_view`,
+  `content_digest`/`render_digest`, and the Charter/Document ArtifactRef
+  digests are resolved or derived server-side from the referenced ids (and
+  verified only when a caller round-trips exact server values). Previously a
+  model could never produce a valid baseline.
+- `expected_baseline_version` and the render/digest fields are optional in
+  the baseline payload validator; a fresh draft defaults to the created
+  baseline's version.
+- New `services` examples `baseline_probe` and `task_probe` replay the exact
+  Project Agent tool calls against a database named by `FORGE_PROBE_DB`,
+  so orchestration payload changes can be verified deterministically without
+  driving a model.
+- Charter-created Projects no longer fail every Project Agent turn with
+  "Project primary milestone points at a Project with no active milestones":
+  the primary-milestone pointer validator now accepts the freshly seeded
+  `planned` milestone before activation.
+- Project Agent turns after the first no longer fail with "Project Agent
+  turn has no exact consumed Charter handoff": the worker re-verifies the
+  handoff packet against its recorded consumption delivery instead of
+  requiring the handoff to point at the current turn's own ids.
+- `charter.draft` no longer requires `rendered_view`/`render_version` at any
+  validation layer (tool schema, host validator, provider validator) — the
+  server renders the canonical view itself and verifies those fields only
+  when a caller round-trips exact server values; the typed tool also strips
+  model-supplied values, which can never match the server renderer
+  byte-for-byte.
+- Failed coordination operations now log their underlying service error at
+  warn level instead of collapsing silently into "Forge tool provider
+  failed".
+- The `db` crate has a `build.rs` with `rerun-if-changed=migrations`, so a
+  newly added migration can no longer be silently missing from an
+  incremental build (`include_dir` pitfall).
+- The server-side orchestration authority guard no longer rejects payload
+  keys named `scope`: the canonical Charter content schema requires a domain
+  `scope` section, so every well-formed Main Agent Charter draft was refused
+  with "scope and authority are server-derived". Scope-override injection
+  stays blocked through the `scope_type`/`scope_id` keys.
+- Typed orchestration tool schemas now emit `type` and a one-value `enum`
+  beside every string `const` (and a `type` beside bare string enums).
+  Gemini's function-calling schema subset drops bare `const`, so Gemini
+  models emitted `{}` for `action` fields and every Charter/orchestration
+  proposal failed schema validation.
+- Migration `V081` repoints `operating_skill.current_revision_id` at the
+  Main operating-skill revision `@2` that `V080` seeded but never activated,
+  which made every Main Agent Genesis turn fail with "operating skill is not
+  the canonical server contract". The error message now also says to restart
+  the server so pending migrations reseed the skill.
+
 - Agent management no longer surfaces profiles anywhere. An agent is one
   directly-editable definition — harness (CLI or direct), default model,
   reasoning, permission policy, system prompt, description — edited inline in

@@ -988,7 +988,7 @@ fn execution_baseline_content_schema() -> Value {
             "milestone_definition_revision_ids": string_array_schema(),
             "primary_milestone_id": string_or_null_schema(),
             "release_policy_revision": {"type":"string","minLength":1},
-            "release_policy_digest": {"type":"string","minLength":1},
+            "release_policy_digest": {"type":"string","minLength":1,"description":"Omit. The server derives the digest from the frozen release_policy; provide only to round-trip an exact server value."},
             "release_policy": execution_baseline_release_policy_schema(),
             "acceptance_evidence_matrix": {"type":"array","items":object_schema(json!({
                 "id":{"type":"string","minLength":1},
@@ -1012,6 +1012,9 @@ fn execution_baseline_content_schema() -> Value {
             "rollback_and_recovery": string_array_schema(),
             "exclusions": string_array_schema()
         }),
+        // `release_policy_digest` stays optional: the server derives it from
+        // the caller's own frozen policy, so requiring it forces the model to
+        // compute a SHA-256 it cannot produce.
         &[
             "charter_revision",
             "document_revisions",
@@ -1019,7 +1022,6 @@ fn execution_baseline_content_schema() -> Value {
             "milestone_ids",
             "milestone_definition_revision_ids",
             "release_policy_revision",
-            "release_policy_digest",
             "release_policy",
             "adaptive_envelope",
         ],
@@ -1030,16 +1032,19 @@ fn orchestration_payload_schema(operation: &str) -> Value {
     match operation {
         MAIN_CHARTER_DRAFT_OPERATION => object_schema(
             json!({
-                "action":{"const":"save_revision"},"charter_id":{"type":"string","minLength":1},"base_revision_id":string_or_null_schema(),"project_mode":{"type":"string","enum":["compact","standard"]},"maturity":{"type":"string","enum":["prototype","mvp","production","critical"]},"content":charter_content_schema(),"rendered_view":{"type":"string","minLength":1},"render_version":{"type":"string","minLength":1},"provenance":revision_provenance_schema()
+                "action":{"const":"save_revision"},"charter_id":{"type":"string","minLength":1},"base_revision_id":string_or_null_schema(),"project_mode":{"type":"string","enum":["compact","standard"]},"maturity":{"type":"string","enum":["prototype","mvp","production","critical"]},"content":charter_content_schema(),"rendered_view":{"type":"string","minLength":1,"description":"Omit. The server renders the canonical view from content; provide only to round-trip an exact server-rendered value."},"render_version":{"type":"string","minLength":1,"description":"Omit. The server stamps its own render version; provide only to round-trip an exact server value."},"provenance":revision_provenance_schema()
             }),
+            // `rendered_view`/`render_version` stay optional: the server
+            // renders the canonical view itself and only verifies these
+            // fields when a caller round-trips them. Requiring them forces
+            // the model to reproduce the server renderer byte-for-byte,
+            // which always fails.
             &[
                 "action",
                 "charter_id",
                 "project_mode",
                 "maturity",
                 "content",
-                "rendered_view",
-                "render_version",
                 "provenance",
             ],
         ),
@@ -1278,68 +1283,161 @@ fn orchestration_payload_schema(operation: &str) -> Value {
     }
 }
 
-fn orchestration_proposal_schema(operations: &BTreeSet<String>) -> Value {
-    let variants = operations
-        .iter()
-        .map(|operation| {
-            object_schema(
-                json!({
-                    "operation":{"const":operation},
-                    "payload":orchestration_payload_schema(operation),
-                    "dedupe_key":{"type":"string","minLength":1},
-                    "correlation_id":{"type":"string","minLength":1},
-                    "causation_id":string_or_null_schema(),
-                    "causation_depth":{"type":"integer","minimum":0,"maximum":8},
-                }),
-                &["operation", "payload", "dedupe_key", "correlation_id"],
-            )
+/// Adds `type`/`enum` beside every string `const` in a JSON schema (and a
+/// `type` beside bare string enums). JSON Schema `const` alone falls outside
+/// the OpenAPI-style subset some provider function-calling APIs accept —
+/// Gemini drops the constraint entirely and models then emit `{}` for the
+/// field — so every string const also carries the equivalent one-value enum.
+fn portable_const_schema(mut schema: Value) -> Value {
+    fn walk(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                if let Some(constant) = map.get("const").and_then(Value::as_str).map(str::to_owned)
+                {
+                    map.entry("type").or_insert_with(|| json!("string"));
+                    map.entry("enum").or_insert_with(|| json!([constant]));
+                } else if !map.contains_key("type") {
+                    let all_strings =
+                        map.get("enum")
+                            .and_then(Value::as_array)
+                            .is_some_and(|options| {
+                                !options.is_empty() && options.iter().all(Value::is_string)
+                            });
+                    if all_strings {
+                        map.insert("type".to_owned(), json!("string"));
+                    }
+                }
+                for entry in map.values_mut() {
+                    walk(entry);
+                }
+            }
+            Value::Array(values) => values.iter_mut().for_each(walk),
+            _ => {}
+        }
+    }
+    walk(&mut schema);
+    schema
+}
+
+/// Summarizes one operation's payload contract as a guidance line for the
+/// declared tool schema. Handles both single-variant payload schemas and
+/// `oneOf` payloads (e.g. document draft vs. approval).
+fn orchestration_payload_summary(schema: &Value) -> String {
+    fn variant_summary(variant: &Value) -> Option<String> {
+        let properties = variant.get("properties")?;
+        let action = properties.get("action").map(|action| {
+            action
+                .get("const")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| {
+                    action.get("enum").and_then(Value::as_array).map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    })
+                })
+                .unwrap_or_default()
+        });
+        let required = variant
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        Some(match action {
+            Some(action) if !action.is_empty() => {
+                format!("action={action}; required: [{required}]")
+            }
+            _ => format!("required: [{required}]"),
         })
-        .collect::<Vec<_>>();
+    }
+    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array) {
+        return variants
+            .iter()
+            .filter_map(variant_summary)
+            .collect::<Vec<_>>()
+            .join(" OR ");
+    }
+    variant_summary(schema).unwrap_or_default()
+}
+
+// The declared envelope is a plain `type: object` schema: several provider
+// function-calling APIs (notably Gemini) accept only an OpenAPI-style object
+// at the parameters root and silently drop `oneOf`, leaving the model blind
+// to the envelope — it then emits flattened payload fields and the whole
+// attempt dies at provider-side schema validation. Per-operation payload
+// shapes are summarized in the description instead, and the exact contracts
+// stay enforced by `validate_orchestration_proposal_arguments` plus the
+// server-side validators, whose errors return to the model in-turn.
+fn orchestration_proposal_schema(operations: &BTreeSet<String>) -> Value {
+    let mut guidance =
+        vec!["Payload shape by operation (exact contract enforced server-side):".to_owned()];
+    for operation in operations {
+        let summary = orchestration_payload_summary(&orchestration_payload_schema(operation));
+        guidance.push(format!("- {operation}: {summary}"));
+    }
     json!({
         "type":"object",
         "required":["operation","payload","dedupe_key","correlation_id"],
         "properties":{
             "operation":{"type":"string","enum":operations.iter().collect::<Vec<_>>()},
-            "payload":{"oneOf":operations.iter().map(|operation| orchestration_payload_schema(operation)).collect::<Vec<_>>()},
+            "payload":{"type":"object","description":guidance.join("\n")},
             "dedupe_key":{"type":"string","minLength":1},
             "correlation_id":{"type":"string","minLength":1},
             "causation_id":string_or_null_schema(),
             "causation_depth":{"type":"integer","minimum":0,"maximum":8},
         },
-        "oneOf":variants,
         "additionalProperties":false,
     })
 }
 
+fn orchestration_read_arguments_schema(operation: &str) -> Value {
+    match operation {
+        MAIN_CHARTER_READ_OPERATION => object_schema(
+            json!({"charter_id":string_or_null_schema(),"revision_id":string_or_null_schema(),"genesis_session_id":string_or_null_schema()}),
+            &[],
+        ),
+        PROJECT_CURRENT_STATE_OPERATION => described_object_schema(
+            json!({
+                "limit":{"type":"integer","minimum":1,"maximum":64}
+            }),
+            &[],
+            "Returns the server-derived closed EffectiveProjectState projection for the bound Project, including Charter/baseline references, approved Documents, Decisions, reconciliation/conflict records, Task/validation summaries, milestones/readiness, releases, unreleased changes, and source watermark/version. The response is scope-bound and never accepts a Project or authority selector.",
+        ),
+        _ => object_schema(json!({}), &[]),
+    }
+}
+
 fn orchestration_read_schema(operations: &BTreeSet<String>) -> Value {
-    let variants = operations
-        .iter()
-        .map(|operation| {
-            let arguments = match operation.as_str() {
-                MAIN_CHARTER_READ_OPERATION => object_schema(
-                    json!({"charter_id":string_or_null_schema(),"revision_id":string_or_null_schema(),"genesis_session_id":string_or_null_schema()}),
-                    &[],
-                ),
-                PROJECT_CURRENT_STATE_OPERATION => described_object_schema(
-                    json!({
-                        "limit":{"type":"integer","minimum":1,"maximum":64}
-                    }),
-                    &[],
-                    "Returns the server-derived closed EffectiveProjectState projection for the bound Project, including Charter/baseline references, approved Documents, Decisions, reconciliation/conflict records, Task/validation summaries, milestones/readiness, releases, unreleased changes, and source watermark/version. The response is scope-bound and never accepts a Project or authority selector.",
-                ),
-                _ => object_schema(json!({}), &[]),
-            };
-            object_schema(
-                json!({"operation":{"const":operation},"arguments":arguments}),
-                &["operation"],
-            )
-        })
-        .collect::<Vec<_>>();
+    let mut guidance = vec!["Arguments by operation:".to_owned()];
+    for operation in operations {
+        let arguments = orchestration_read_arguments_schema(operation);
+        let keys = arguments
+            .get("properties")
+            .and_then(Value::as_object)
+            .map(|map| map.keys().cloned().collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        guidance.push(if keys.is_empty() {
+            format!("- {operation}: no arguments")
+        } else {
+            format!("- {operation}: optional {{{keys}}}")
+        });
+    }
     json!({
         "type":"object",
         "required":["operation"],
-        "properties":{"operation":{"type":"string","enum":operations.iter().collect::<Vec<_>>()},"arguments":{"type":"object"}},
-        "oneOf":variants,
+        "properties":{
+            "operation":{"type":"string","enum":operations.iter().collect::<Vec<_>>()},
+            "arguments":{"type":"object","description":guidance.join("\n")},
+        },
         "additionalProperties":false,
     })
 }
@@ -1553,7 +1651,7 @@ impl ForgeScopeReadTool {
             "Read one bounded Forge resource from the current canonical scope.".to_owned()
         };
         let schema = if self.reject_authority_overrides {
-            orchestration_read_schema(&self.operations)
+            portable_const_schema(orchestration_read_schema(&self.operations))
         } else {
             json!({
                 "type": "object",
@@ -1837,7 +1935,7 @@ impl ForgeScopeProposeTool {
             "Submit a typed Forge proposal in the current canonical scope.".to_owned()
         };
         let schema = if self.reject_authority_overrides {
-            orchestration_proposal_schema(&self.operations)
+            portable_const_schema(orchestration_proposal_schema(&self.operations))
         } else {
             json!({
                 "type": "object",
@@ -1879,11 +1977,37 @@ impl Tool for ForgeScopeProposeTool {
         arguments: Value,
         ctx: &PreparationContext,
     ) -> Result<PreparedToolCall, RuntimeError> {
-        let operation = required_string(&arguments, "operation")?;
+        let mut arguments = arguments;
+        let operation = required_string(&arguments, "operation")?.to_owned();
+        let operation = operation.as_str();
         if !self.operations.contains(operation) {
             return Err(RuntimeError::tool(
                 "Forge proposal operation is outside this scope",
             ));
+        }
+        if operation == MAIN_CHARTER_DRAFT_OPERATION {
+            // The server renders the canonical Charter view itself; a
+            // model-supplied render can never match it byte-for-byte, so
+            // these server-owned fields are dropped rather than compared.
+            if let Some(payload) = arguments.get_mut("payload").and_then(Value::as_object_mut) {
+                payload.remove("rendered_view");
+                payload.remove("render_version");
+            }
+        }
+        if operation == PROJECT_EXECUTION_BASELINE_OPERATION {
+            // The release-policy digest, rendered view, and revision digests
+            // are derived server-side from this same payload; model-echoed
+            // values can only ever produce false conflicts. They may appear
+            // at the payload top level or inside a full `content` object.
+            if let Some(payload) = arguments.get_mut("payload").and_then(Value::as_object_mut) {
+                payload.remove("release_policy_digest");
+                payload.remove("rendered_view");
+                payload.remove("content_digest");
+                payload.remove("render_digest");
+                if let Some(content) = payload.get_mut("content").and_then(Value::as_object_mut) {
+                    content.remove("release_policy_digest");
+                }
+            }
         }
         for field in ["dedupe_key", "correlation_id"] {
             if required_string(&arguments, field)?.trim().is_empty() {
@@ -2596,6 +2720,25 @@ mod tests {
     use super::*;
     use agent_runtime::core::{ids::ToolCallId, tool::Tool};
 
+    #[test]
+    fn portable_const_schema_adds_type_and_enum_for_provider_compatibility() {
+        let schema = portable_const_schema(json!({
+            "oneOf":[{"properties":{
+                "action":{"const":"save_revision"},
+                "kind":{"enum":["a","b"]},
+                "count":{"type":"integer","minimum":1}
+            }}]
+        }));
+        let action = &schema["oneOf"][0]["properties"]["action"];
+        assert_eq!(action["const"], "save_revision");
+        assert_eq!(action["type"], "string");
+        assert_eq!(action["enum"], json!(["save_revision"]));
+        let kind = &schema["oneOf"][0]["properties"]["kind"];
+        assert_eq!(kind["type"], "string");
+        let count = &schema["oneOf"][0]["properties"]["count"];
+        assert!(count.get("enum").is_none());
+    }
+
     fn scope(scope_type: CanonicalScopeType, access: WorkspaceAccess) -> CanonicalScope {
         CanonicalScope {
             scope_type,
@@ -2846,15 +2989,17 @@ mod tests {
                 .iter()
                 .any(|value| value == MAIN_CHARTER_READ_OPERATION)
         );
-        let current_state = spec.input_schema["oneOf"]
-            .as_array()
-            .expect("Project read operation variants")
-            .iter()
-            .find(|variant| {
-                variant["properties"]["operation"]["const"] == PROJECT_CURRENT_STATE_OPERATION
-            })
-            .expect("current Project state read variant");
-        let arguments = &current_state["properties"]["arguments"];
+        // The declared envelope is a plain object (no oneOf) with the
+        // per-operation guidance in the arguments description; the exact
+        // per-operation argument schema stays available to validators.
+        assert!(spec.input_schema.get("oneOf").is_none());
+        assert!(
+            spec.input_schema["properties"]["arguments"]["description"]
+                .as_str()
+                .expect("read guidance")
+                .contains(PROJECT_CURRENT_STATE_OPERATION)
+        );
+        let arguments = orchestration_read_arguments_schema(PROJECT_CURRENT_STATE_OPERATION);
         assert_eq!(arguments["additionalProperties"], false);
         assert_eq!(arguments["properties"]["limit"]["minimum"], 1);
         assert_eq!(arguments["properties"]["limit"]["maximum"], 64);
@@ -2888,24 +3033,42 @@ mod tests {
             .find(|tool| tool.spec().name == FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL)
             .expect("Main orchestration proposal tool");
         let spec = tool.spec();
-        let variants = spec.input_schema["oneOf"]
+        // The declared envelope is a plain object; per-operation payload
+        // guidance lives in the payload description and the exact payload
+        // contract in `orchestration_payload_schema`.
+        assert!(spec.input_schema.get("oneOf").is_none());
+        let operation_enum = spec.input_schema["properties"]["operation"]["enum"]
             .as_array()
-            .expect("operation-specific variants");
-        let draft = variants
-            .iter()
-            .find(|variant| {
-                variant["properties"]["operation"]["const"] == MAIN_CHARTER_DRAFT_OPERATION
-            })
-            .expect("charter draft variant");
-        let payload = &draft["properties"]["payload"];
+            .expect("operation enum");
+        assert!(
+            operation_enum
+                .iter()
+                .any(|value| value == MAIN_CHARTER_DRAFT_OPERATION)
+        );
+        assert!(
+            spec.input_schema["properties"]["payload"]["description"]
+                .as_str()
+                .expect("payload guidance")
+                .contains(MAIN_CHARTER_DRAFT_OPERATION)
+        );
+        let draft_payload = orchestration_payload_schema(MAIN_CHARTER_DRAFT_OPERATION);
+        let payload = &draft_payload;
+        for optional_render_field in ["rendered_view", "render_version"] {
+            assert!(
+                !payload["required"]
+                    .as_array()
+                    .expect("draft required fields")
+                    .iter()
+                    .any(|value| value == optional_render_field),
+                "{optional_render_field} must stay optional: models cannot reproduce the server renderer",
+            );
+        }
         for field in [
             "action",
             "charter_id",
             "project_mode",
             "maturity",
             "content",
-            "rendered_view",
-            "render_version",
             "provenance",
         ] {
             assert!(
@@ -2941,18 +3104,15 @@ mod tests {
                 "full Charter content must include {section}"
             );
         }
-        let create = variants
-            .iter()
-            .find(|variant| {
-                variant["properties"]["operation"]["const"] == MAIN_PROJECT_CREATE_OPERATION
-            })
-            .expect("project create variant");
-        assert_eq!(
-            create["properties"]["payload"]["required"],
-            json!(["action", "approval_id"])
+        assert!(
+            operation_enum
+                .iter()
+                .any(|value| value == MAIN_PROJECT_CREATE_OPERATION)
         );
+        let create_payload = orchestration_payload_schema(MAIN_PROJECT_CREATE_OPERATION);
+        assert_eq!(create_payload["required"], json!(["action", "approval_id"]));
         assert_eq!(
-            create["properties"]["payload"]["properties"]["action"]["const"],
+            create_payload["properties"]["action"]["const"],
             "create_from_approval"
         );
     }
@@ -2975,9 +3135,13 @@ mod tests {
             .find(|tool| tool.spec().name == FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL)
             .expect("Project orchestration proposal tool");
         let spec = tool.spec();
-        let variants = spec.input_schema["oneOf"]
+        assert!(spec.input_schema.get("oneOf").is_none());
+        let operation_enum = spec.input_schema["properties"]["operation"]["enum"]
             .as_array()
-            .expect("operation-specific variants");
+            .expect("operation enum");
+        let payload_guidance = spec.input_schema["properties"]["payload"]["description"]
+            .as_str()
+            .expect("payload guidance");
         for operation in [
             PROJECT_DOCUMENT_OPERATION,
             PROJECT_DECISION_OPERATION,
@@ -2987,11 +3151,15 @@ mod tests {
             PROJECT_READINESS_OPERATION,
             PROJECT_RELEASE_OPERATION,
         ] {
-            let variant = variants
-                .iter()
-                .find(|variant| variant["properties"]["operation"]["const"] == operation)
-                .unwrap_or_else(|| panic!("missing {operation} schema variant"));
-            let payload = &variant["properties"]["payload"];
+            assert!(
+                operation_enum.iter().any(|value| value == operation),
+                "missing {operation} in the operation enum"
+            );
+            assert!(
+                payload_guidance.contains(operation),
+                "payload guidance must describe {operation}"
+            );
+            let payload = orchestration_payload_schema(operation);
             assert_eq!(payload["type"], "object");
             assert_eq!(payload["additionalProperties"], false);
             assert!(
@@ -2999,32 +3167,22 @@ mod tests {
                     || payload["properties"]["action"].get("const").is_some()
             );
         }
-        let decision = variants
-            .iter()
-            .find(|variant| {
-                variant["properties"]["operation"]["const"] == PROJECT_DECISION_OPERATION
-            })
-            .expect("decision schema variant");
+        let decision = orchestration_payload_schema(PROJECT_DECISION_OPERATION);
         assert_eq!(
-            decision["properties"]["payload"]["properties"]["decision_class"]["const"],
+            decision["properties"]["decision_class"]["const"],
             "project_implementation"
         );
         assert_eq!(
-            decision["properties"]["payload"]["properties"]["action"]["enum"],
+            decision["properties"]["action"]["enum"],
             json!(["record_candidate", "record_effective"])
         );
         assert!(
-            decision["properties"]["payload"]["description"]
+            decision["description"]
                 .as_str()
                 .expect("decision description")
                 .contains("waivers")
         );
-        let readiness = variants
-            .iter()
-            .find(|variant| {
-                variant["properties"]["operation"]["const"] == PROJECT_READINESS_OPERATION
-            })
-            .expect("readiness schema variant");
+        let readiness = orchestration_payload_schema(PROJECT_READINESS_OPERATION);
         for field in [
             "milestone_id",
             "milestone_version",
@@ -3033,36 +3191,26 @@ mod tests {
             "release_policy_revision",
         ] {
             assert!(
-                readiness["properties"]["payload"]["required"]
+                readiness["required"]
                     .as_array()
                     .expect("readiness required fields")
                     .iter()
                     .any(|value| value == field)
             );
         }
-        let release = variants
-            .iter()
-            .find(|variant| {
-                variant["properties"]["operation"]["const"] == PROJECT_RELEASE_OPERATION
-            })
-            .expect("release candidate schema variant");
+        let release = orchestration_payload_schema(PROJECT_RELEASE_OPERATION);
         assert_eq!(
-            release["properties"]["payload"]["properties"]["action"]["const"],
+            release["properties"]["action"]["const"],
             "propose_candidate"
         );
         assert!(
-            release["properties"]["payload"]["description"]
+            release["description"]
                 .as_str()
                 .expect("release candidate description")
                 .contains("never approves")
         );
-        let document = variants
-            .iter()
-            .find(|variant| {
-                variant["properties"]["operation"]["const"] == PROJECT_DOCUMENT_OPERATION
-            })
-            .expect("document schema variant");
-        let document_payload = &document["properties"]["payload"];
+        let document_payload = orchestration_payload_schema(PROJECT_DOCUMENT_OPERATION);
+        let document_payload = &document_payload;
         assert_eq!(
             document_payload["properties"]["action"]["enum"],
             json!(["draft_revision", "propose_approval", "approve"])
@@ -3136,12 +3284,8 @@ mod tests {
             .as_array()
             .expect("setup operation enum");
         assert_eq!(operations, &[json!(PROJECT_CHARTER_ADOPTION_OPERATION)]);
-        let variant = spec.input_schema["oneOf"]
-            .as_array()
-            .expect("setup variants")
-            .first()
-            .expect("adoption variant");
-        let payload = &variant["properties"]["payload"];
+        assert!(spec.input_schema.get("oneOf").is_none());
+        let payload = orchestration_payload_schema(PROJECT_CHARTER_ADOPTION_OPERATION);
         assert_eq!(payload["properties"]["action"]["const"], "draft_revision");
         assert_eq!(payload["additionalProperties"], false);
         assert!(

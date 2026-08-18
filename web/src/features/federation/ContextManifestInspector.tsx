@@ -285,12 +285,15 @@ export function ContextManifestDialog({
   initialContextScopeId,
   label = 'Inspect context manifest',
   contextHint,
+  compact = false,
 }: {
   initialManifestId?: string
   initialIdentityId?: string
   initialContextScopeId?: string
   label?: string
   contextHint?: string
+  /** Icon-only trigger for dense surfaces like chat message footers. */
+  compact?: boolean
 }) {
   const dialogId = useId().replaceAll(':', '')
   const fieldIds = {
@@ -352,16 +355,29 @@ export function ContextManifestDialog({
 
   return (
     <>
-      <Button
-        type="button"
-        variant="outline"
-        size="sm"
-        onClick={() => setOpen(true)}
-        aria-haspopup="dialog"
-      >
-        <Fingerprint size={14} aria-hidden />
-        {label}
-      </Button>
+      {compact ? (
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          aria-haspopup="dialog"
+          aria-label={label}
+          title={label}
+          className="inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <Fingerprint size={13} aria-hidden />
+        </button>
+      ) : (
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => setOpen(true)}
+          aria-haspopup="dialog"
+        >
+          <Fingerprint size={14} aria-hidden />
+          {label}
+        </Button>
+      )}
       <Dialog open={open} onOpenChange={setOpen} ariaLabel="Inspect context manifest">
         <DialogContent className="max-w-4xl">
           <DialogHeader>

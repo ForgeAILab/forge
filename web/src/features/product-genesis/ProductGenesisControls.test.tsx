@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '@/api/client'
-import { ProductGenesisControls } from './ProductGenesisControls'
+import { ProductGenesisCharterCard } from './ProductGenesisControls'
 import type {
   ProductGenesisCharterResponse,
   ProductGenesisSession,
@@ -205,6 +205,11 @@ function charterResponse(
   } as unknown as ProductGenesisCharterResponse
 }
 
+function renderExpandedCard() {
+  render(<ProductGenesisCharterCard />)
+  fireEvent.click(screen.getByRole('button', { name: /Project Charter/ }))
+}
+
 describe('ProductGenesisControls', () => {
   beforeEach(() => {
     state.active = {
@@ -231,14 +236,15 @@ describe('ProductGenesisControls', () => {
       refetch: vi.fn(),
     }
 
-    render(<ProductGenesisControls />)
+    renderExpandedCard()
 
     expect(screen.getByText('Approval unavailable · no exact revision')).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Approve exact Charter revision' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Approve this revision' })).toBeNull()
   })
 
   it('requires the explicit exact-revision approval action', () => {
-    render(<ProductGenesisControls />)
+    renderExpandedCard()
 
     const approvalButton = screen.getByRole('button', { name: 'Approve exact Charter revision' })
     expect((approvalButton as HTMLButtonElement).disabled).toBe(false)
@@ -261,7 +267,7 @@ describe('ProductGenesisControls', () => {
       refetch: vi.fn(),
     }
 
-    render(<ProductGenesisControls />)
+    renderExpandedCard()
 
     expect(screen.getByText(/No Project exists yet/)).toBeTruthy()
     expect(
@@ -278,7 +284,7 @@ describe('ProductGenesisControls', () => {
       charter_content_digest: revision.content_digest,
       charter_render_digest: revision.render_digest,
     })
-    render(<ProductGenesisControls />)
+    renderExpandedCard()
 
     fireEvent.click(screen.getByRole('button', { name: 'Approve exact Charter revision' }))
 
@@ -305,7 +311,7 @@ describe('ProductGenesisControls', () => {
         charter_render_digest: revision.render_digest,
       })
 
-    render(<ProductGenesisControls />)
+    renderExpandedCard()
     const approvalButton = screen.getByRole('button', { name: 'Approve exact Charter revision' })
 
     fireEvent.click(approvalButton)
@@ -340,7 +346,7 @@ describe('ProductGenesisControls', () => {
       ),
     )
 
-    render(<ProductGenesisControls />)
+    renderExpandedCard()
     fireEvent.click(screen.getByRole('button', { name: 'Approve exact Charter revision' }))
 
     await waitFor(() => expect(screen.getByText('project_charter')).toBeTruthy())

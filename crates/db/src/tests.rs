@@ -5742,3 +5742,27 @@ async fn stale_execution_baseline_cannot_mint_a_running_execution_after_read_gat
         "race guard does not duplicate a workspace"
     );
 }
+
+#[tokio::test]
+async fn operating_skills_point_at_their_latest_seeded_revisions() {
+    let db = sqlite_db().await;
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, current_revision_id FROM operating_skill ORDER BY id")
+            .fetch_all(db.pool())
+            .await
+            .expect("operating skills read");
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "forge.main.project-discovery/v2".to_owned(),
+                "forge.main.project-discovery/v2@2".to_owned(),
+            ),
+            (
+                "forge.project.orchestration/v1".to_owned(),
+                "forge.project.orchestration/v1@1".to_owned(),
+            ),
+        ],
+        "a seeded operating-skill revision must be repointed in the same release (V081 regression)"
+    );
+}

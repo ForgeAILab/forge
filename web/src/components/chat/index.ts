@@ -1,5 +1,6 @@
 export * from "./types"
 export * from "./chat-entry-container"
+export * from "./chat-markdown"
 export * from "./chat-assistant-message"
 export * from "./chat-user-message"
 export * from "./chat-system-message"

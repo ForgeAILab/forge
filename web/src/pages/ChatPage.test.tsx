@@ -1,6 +1,5 @@
-import { render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
-import { handoffProjectIdsForScope, ProjectRecordNavigation } from './ChatPage'
+import { handoffProjectIdsForScope } from './ChatPage'
 import type { AgentChatEntry } from '@/features/agent-chat/types'
 
 const entries: AgentChatEntry[] = [
@@ -52,26 +51,5 @@ describe('ChatPage scope isolation', () => {
 
   it('allows Main chat to read only explicit handoff metadata for authorized Projects', () => {
     expect(handoffProjectIdsForScope(undefined, entries)).toEqual(['project-a', 'project-b'])
-  })
-
-  it('deep-links every authoritative Project record from Project Agent Chat', () => {
-    render(<ProjectRecordNavigation projectId="project / alpha" />)
-
-    expect(screen.getByRole('navigation', { name: 'Project records' })).toBeTruthy()
-    expect(screen.getByRole('link', { name: 'Tasks' }).getAttribute('href')).toBe(
-      '/projects/project%20%2F%20alpha/tasks?sort_by=updated_at&sort_order=desc',
-    )
-    for (const [label, section] of [
-      ['Milestones', 'milestones'],
-      ['Documents', 'documents'],
-      ['Decisions', 'decisions'],
-      ['Evidence', 'evidence'],
-      ['Readiness', 'readiness'],
-      ['Releases', 'releases'],
-    ]) {
-      expect(screen.getByRole('link', { name: label }).getAttribute('href')).toBe(
-        `/projects/project%20%2F%20alpha/overview#${section}`,
-      )
-    }
   })
 })

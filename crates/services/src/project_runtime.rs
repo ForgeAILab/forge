@@ -1314,8 +1314,18 @@ fn validate_primary_milestone_pointer(
         .iter()
         .filter(|milestone| milestone.lifecycle == "active")
         .collect::<Vec<_>>();
+    // A Charter-created Project is born with its first milestone still
+    // `planned` and already referenced as primary; the pointer becomes
+    // active-only once any milestone activates.
+    let pointer_eligible = |primary_id: &str| {
+        milestones.iter().any(|milestone| {
+            milestone.id == primary_id
+                && matches!(milestone.lifecycle.as_str(), "active" | "planned")
+        })
+    };
     match (active.is_empty(), primary_milestone_id) {
         (true, None) => Ok(()),
+        (true, Some(primary_id)) if pointer_eligible(primary_id) => Ok(()),
         (true, Some(_)) => Err(ServiceError::conflict(
             "Project primary milestone points at a Project with no active milestones",
         )),
@@ -1355,6 +1365,17 @@ mod tests {
         assert!(
             validate_primary_milestone_pointer(&[milestone("planned", "planned")], None).is_ok()
         );
+        // A Charter-created Project starts with a planned primary milestone.
+        assert!(validate_primary_milestone_pointer(
+            &[milestone("planned", "planned")],
+            Some("planned"),
+        )
+        .is_ok());
+        assert!(validate_primary_milestone_pointer(
+            &[milestone("planned", "planned")],
+            Some("missing"),
+        )
+        .is_err());
         assert!(validate_primary_milestone_pointer(
             &[milestone("ready", "ready_for_release")],
             None,

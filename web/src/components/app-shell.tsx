@@ -498,6 +498,8 @@ export function AppShell({ children }: { children: ReactNode }) {
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const isGlobalChatRoute = pathname === '/chat'
   const isBoardRoute = /^\/projects\/[^/]+\/board$/.test(pathname)
+  // Chat pins its header and composer; only the message timeline scrolls.
+  const isChatRoute = pathname === '/chat' || /^\/projects\/[^/]+\/chat$/.test(pathname)
   const firstProjectId = projectsQuery.data?.pages[0]?.items[0]?.id
   const projectId = routeProjectId ?? storedProjectId ?? firstProjectId
   const effectiveCollapsed =
@@ -740,7 +742,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           id="main-content"
           className={cn(
             'min-h-0 flex-1 bg-card p-3 sm:p-4 lg:p-5',
-            isBoardRoute ? 'overflow-hidden' : 'overflow-auto',
+            isBoardRoute || isChatRoute ? 'overflow-hidden' : 'overflow-auto',
           )}
         >
           {children}

@@ -2477,7 +2477,8 @@ fn validate_execution_baseline_content_payload(value: &Value) -> Result<(), Agen
     }
     optional_payload_string(object, "primary_milestone_id")?;
     required_payload_string(object, "release_policy_revision")?;
-    required_payload_string(object, "release_policy_digest")?;
+    // The digest is server-derived from the frozen policy when omitted.
+    optional_payload_string(object, "release_policy_digest")?;
     validate_execution_baseline_release_policy_payload(required_payload_value(
         object,
         "release_policy",
@@ -2679,8 +2680,10 @@ fn validate_orchestration_payload(operation: &str, payload: &Value) -> Result<()
                 &["prototype", "mvp", "production", "critical"],
             )?;
             validate_charter_content_payload(required_payload_value(object, "content")?)?;
-            required_payload_string(object, "rendered_view")?;
-            required_payload_string(object, "render_version")?;
+            // The server renders the canonical view itself; these fields are
+            // verified only when a caller round-trips exact server values.
+            optional_payload_string(object, "rendered_view")?;
+            optional_payload_string(object, "render_version")?;
             validate_revision_provenance_payload(required_payload_value(object, "provenance")?)?;
         }
         MAIN_CHARTER_READINESS_OPERATION => {
@@ -2973,19 +2976,24 @@ fn validate_orchestration_payload(operation: &str, payload: &Value) -> Result<()
                 "action",
                 &["draft_revision", "revise", "propose_approval"],
             )?;
+            for field in ["baseline_id", "charter_revision_id"] {
+                required_payload_string(object, field)?;
+            }
+            // Render/digest values are server-derived and verified only when
+            // a caller round-trips exact server values.
             for field in [
-                "baseline_id",
-                "charter_revision_id",
                 "schema_version",
                 "render_version",
                 "rendered_view",
                 "content_digest",
                 "render_digest",
+                "base_revision_id",
             ] {
-                required_payload_string(object, field)?;
+                optional_payload_string(object, field)?;
             }
-            optional_payload_string(object, "base_revision_id")?;
-            required_payload_integer(object, "expected_baseline_version")?;
+            if object.get("expected_baseline_version").is_some() {
+                required_payload_integer(object, "expected_baseline_version")?;
+            }
             validate_execution_baseline_content_payload(required_payload_value(
                 object, "content",
             )?)?;
@@ -3224,7 +3232,12 @@ fn service_error(error: crate::ServiceError) -> AgentHostError {
             AgentHostError::Authority("Forge scope resource is unavailable".to_owned())
         }
         crate::ServiceError::InvalidOperation { message } => AgentHostError::Authority(message),
-        _ => AgentHostError::Runtime("Forge coordination operation failed".to_owned()),
+        other => {
+            // The runtime surfaces only a generic string to the model;
+            // keep the underlying cause observable for operators.
+            tracing::warn!(error = %other, "Forge coordination operation failed");
+            AgentHostError::Runtime("Forge coordination operation failed".to_owned())
+        }
     }
 }
 
@@ -3274,10 +3287,12 @@ fn is_auto_materialized_project_operation(operation: &str) -> bool {
 }
 
 fn reject_orchestration_authority_overrides(payload: &Value) -> Result<(), AgentHostError> {
+    // Bare `scope` is deliberately absent: the Charter content schema has a
+    // legitimate domain `scope` section, and a smuggled scope override is
+    // still caught through its `scope_type`/`scope_id` keys.
     const FORBIDDEN_FIELDS: &[&str] = &[
         "actor_identity_id",
         "identity_id",
-        "scope",
         "scope_type",
         "scope_id",
         "authority",

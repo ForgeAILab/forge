@@ -651,7 +651,9 @@ impl FederatedAgentChatTurnRunner {
                         || main_skill_content_digest != MAIN_OPERATING_SKILL_CONTENT_DIGEST
                     {
                         return Err(ServiceError::invalid_operation(
-                            "Main Agent Genesis operating skill is not the canonical server contract",
+                            "Main Agent Genesis operating skill does not match this server \
+                             build's canonical contract; restart the Forge server so pending \
+                             migrations reseed the operating skill",
                         ));
                     }
                     let charter_id: Option<String> = instruction_row.try_get("charter_id")?;
@@ -928,7 +930,7 @@ impl FederatedAgentChatTurnRunner {
         agent: &Agent,
         profile: &AgentProfile,
         project_chat_id: &str,
-        job: &AgentChatTurnJob,
+        _job: &AgentChatTurnJob,
     ) -> Result<ProjectOperatingSkillSnapshot> {
         // Authenticate the Project Agent binding before retrieving any
         // Project row.  The chat's project_id is a routing hint, not an ACL
@@ -1695,11 +1697,10 @@ impl FederatedAgentChatTurnRunner {
                             "Project handoff has no target turn provenance",
                         )
                     })?;
-                if handoff_target_message_id != job.triggering_message_id.as_str()
-                    || handoff_target_turn_id != job.id.as_str()
-                {
-                    continue;
-                }
+                // The handoff records the turn that first consumed it; every
+                // later turn in this Project chat re-verifies the same packet
+                // against that recorded delivery rather than expecting the
+                // handoff to point at itself.
                 let handoff_expectation = ProjectHandoffExpectation {
                     handoff_id: &handoff_id,
                     deduplication_key: &handoff_deduplication_key,
@@ -1718,8 +1719,8 @@ impl FederatedAgentChatTurnRunner {
                     approved_slug: approval_approved_slug.as_deref(),
                     target_chat_id: project_chat_id,
                     target_binding_id: &binding.id,
-                    target_message_id: &job.triggering_message_id,
-                    target_turn_id: &job.id,
+                    target_message_id: handoff_target_message_id,
+                    target_turn_id: handoff_target_turn_id,
                     charter_id: project_charter_id,
                     charter_revision_id: project_charter_revision_id,
                     charter_revision_number,
