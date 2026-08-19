@@ -324,6 +324,22 @@ Genesis Charter approval omits `expected_project_version` because no Project
 exists yet. Project adoption/amendment approval must provide that field as a
 positive current Project version; zero is not a compatibility sentinel.
 
+The Charter projection's `selected_project_agent` honors the session's
+preferred identity while it is eligible; otherwise the server auto-selects a
+deterministic eligible agent (account-owned, unpaused, current profile, not
+the active Main Agent, preferring identities without an active Project
+binding). It is `null` only when the account has no eligible agent at all, and
+approval still validates the exact identity/profile/skill/policy revision set
+the client submits.
+
+Charter lifecycle moments are anchored in the Main Chat history as durable
+system messages: saving a revision (either route or the Main Agent's
+`charter.draft` action), recording an approval receipt, and creating the
+Project each append one. The message ids are deterministic
+(`charter-proposal:{revision_id}`, `charter-approval:{approval_id}`,
+`genesis-project-created:{project_id}`), so replays never duplicate an anchor,
+and the appends are best-effort — they never fail the committed mutation.
+
 On success, one transaction creates the Project, Project Agent binding, Project
 Chat, Charter attachment, bounded immutable handoff, target message/turn job,
 domain events, Genesis `handed_off` state, and consumed receipt. There is no

@@ -187,6 +187,18 @@ impl TaskService {
         execution_id: &str,
         error: String,
     ) -> Result<db::Execution> {
+        // A WorkspaceLease or optimistic-version mismatch here is the
+        // in-transition dispatch race: the lease was pinned to the Task
+        // version observed inside the transition and the commit moved it.
+        // The dispatcher's recovery pass re-dispatches outside a transition,
+        // so these stay auto-resumable; anything else waits for a human.
+        let transient_authority_race =
+            error.contains("WorkspaceLease") || error.contains("version conflict");
+        let resume_policy = if transient_authority_race {
+            db::ResumePolicy::Auto
+        } else {
+            db::ResumePolicy::Manual
+        };
         let execution = ExecutionRepo::update(
             &*self.db,
             db::UpdateExecution {
@@ -196,7 +208,7 @@ impl TaskService {
                 stopped_by: Some(Some(
                     api_types::Actor::system(api_types::SystemComponent::Dispatch).display(),
                 )),
-                resume_policy: Some(Some(db::ResumePolicy::Manual)),
+                resume_policy: Some(Some(resume_policy)),
                 stopped_at: Some(Some(now_rfc3339())),
                 agent_session_id: None,
                 agent_message_id: None,

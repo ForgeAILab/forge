@@ -563,6 +563,18 @@ pub struct TaskProposalPayload {
     pub role_assignments: Option<Vec<api_types::InitialRoleAssignment>>,
     #[serde(default)]
     pub governance: Option<api_types::TaskGovernanceRequest>,
+    /// Flat baseline-provenance shortcuts for agent proposals. When no full
+    /// `governance` envelope is supplied, Forge binds the Task to the
+    /// Project's active user-approved execution baseline itself and threads
+    /// these fields into that server-derived envelope.
+    #[serde(default)]
+    pub plan_item_id: Option<String>,
+    #[serde(default)]
+    pub milestone_id: Option<String>,
+    #[serde(default)]
+    pub capability_class: Option<String>,
+    #[serde(default)]
+    pub risk_class: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -914,9 +926,9 @@ impl AgentActionService {
         if action.version != input.expected_version {
             return Err(ServiceError::Db(db::DbError::VersionConflict));
         }
-        let payload: TaskProposalPayload = serde_json::from_str(&action.payload_json)
+        let mut payload: TaskProposalPayload = serde_json::from_str(&action.payload_json)
             .map_err(|_| ServiceError::invalid_operation("task proposal payload is invalid"))?;
-        let task_state_config = match payload.task_state_config {
+        let task_state_config = match payload.task_state_config.take() {
             Some(config) => Some(config),
             None => {
                 let project = ProjectRepo::get_by_id(&*self.db, &project_id)
@@ -931,6 +943,13 @@ impl AgentActionService {
                     .map(|review| serde_json::json!({ "review": review }).to_string())
             }
         };
+        let governance = match payload.governance.take() {
+            Some(governance) => Some(governance),
+            None => {
+                self.derive_active_baseline_governance(&project_id, &payload)
+                    .await?
+            }
+        };
         let task = task_service
             .create_task_with_governance(
                 project_id,
@@ -942,7 +961,7 @@ impl AgentActionService {
                 task_state_config,
                 payload.merge_config,
                 payload.role_assignments,
-                payload.governance,
+                governance,
             )
             .await?;
         let result_json = serde_json::json!({ "task_id": task.id }).to_string();
@@ -959,6 +978,69 @@ impl AgentActionService {
             })
             .await?;
         Ok(ExecutedTaskProposal { task, execution })
+    }
+
+    /// Derive the server-authoritative governance envelope for an agent Task
+    /// proposal that did not carry one. A charter-backed Project with an
+    /// active user-approved execution baseline binds the Task to that exact
+    /// baseline revision; the proposal only needs to name the plan item and
+    /// (optionally) milestone/classes. Without an active baseline — or when
+    /// the proposal names no plan item, so baseline binding could never
+    /// validate — the proposal stays a pre-baseline plan and
+    /// `prepare_task_governance` applies the charter-only path.
+    async fn derive_active_baseline_governance(
+        &self,
+        project_id: &str,
+        payload: &TaskProposalPayload,
+    ) -> Result<Option<api_types::TaskGovernanceRequest>> {
+        if payload.plan_item_id.is_none() {
+            return Ok(None);
+        }
+        let current_charter_revision_id: Option<String> = sqlx::query_scalar(
+            "SELECT current_charter_revision_id FROM project
+             WHERE id = ? AND charter_status = 'charter_backed'
+               AND charter_setup_required = 0
+             LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .flatten();
+        let Some(current_charter_revision_id) = current_charter_revision_id else {
+            return Ok(None);
+        };
+        let baseline = sqlx::query(
+            "SELECT b.id, b.current_revision_id, r.primary_milestone_id
+             FROM project_execution_baseline AS b
+             JOIN project_execution_baseline_revision AS r
+               ON r.id = b.current_revision_id AND r.baseline_id = b.id
+             WHERE b.project_id = ? AND b.lifecycle = 'active'
+               AND r.lifecycle = 'approved'
+             ORDER BY b.updated_at DESC, b.id DESC LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+        let Some(baseline) = baseline else {
+            return Ok(None);
+        };
+        let baseline_id: String = baseline.try_get("id")?;
+        let baseline_revision_id: Option<String> = baseline.try_get("current_revision_id")?;
+        let primary_milestone_id: Option<String> = baseline.try_get("primary_milestone_id")?;
+        let Some(baseline_revision_id) = baseline_revision_id else {
+            return Ok(None);
+        };
+        Ok(Some(api_types::TaskGovernanceRequest {
+            charter_revision_id: Some(current_charter_revision_id),
+            baseline_id: Some(baseline_id),
+            baseline_revision_id: Some(baseline_revision_id),
+            plan_item_id: payload.plan_item_id.clone(),
+            milestone_id: payload.milestone_id.clone().or(primary_milestone_id),
+            document_revision_ids: Vec::new(),
+            capability_class: payload.capability_class.clone(),
+            risk_class: payload.risk_class.clone(),
+            provenance: None,
+        }))
     }
 }
 

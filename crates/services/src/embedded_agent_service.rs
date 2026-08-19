@@ -232,6 +232,12 @@ impl EmbeddedAgentService {
         self.tool_provider.set_public_search_config(config);
     }
 
+    /// Attach the shared TaskService so admitted agent `task.propose`
+    /// actions execute inline through the normal Task creation path.
+    pub fn set_task_service(&self, task_service: Arc<crate::TaskService>) {
+        self.tool_provider.set_task_service(task_service);
+    }
+
     pub fn native_backend(&self) -> Arc<NativeAgentRuntimeBackend> {
         Arc::clone(&self.native_backend)
     }
@@ -760,21 +766,24 @@ impl EmbeddedAgentService {
             .acquire_provider_credential(&handle.owner_user_id, &handle.id, 60_000)
             .await
             .map_err(redacted_host_error)?;
-        let env = agent_config
+        // `CommandOverrides` is `#[serde(flatten)]`ed into every CLI executor
+        // config, so the env map lives directly at `config.env` — a nested
+        // `command_overrides` object would be silently ignored on
+        // deserialization.
+        let config = agent_config
             .as_object_mut()
             .and_then(|snapshot| snapshot.get_mut("config"))
-            .and_then(Value::as_object_mut)
-            .map(|config| {
-                config
-                    .entry("command_overrides")
-                    .or_insert_with(|| json!({}))
-            })
-            .and_then(Value::as_object_mut)
-            .map(|overrides| overrides.entry("env").or_insert_with(|| json!({})))
             .and_then(Value::as_object_mut)
             .ok_or_else(|| {
                 ServiceError::invalid_operation("executor config snapshot is not injectable")
             })?;
+        let entry = config.entry("env").or_insert_with(|| json!({}));
+        if !entry.is_object() {
+            *entry = json!({});
+        }
+        let env = entry.as_object_mut().ok_or_else(|| {
+            ServiceError::invalid_operation("executor config snapshot is not injectable")
+        })?;
         env.insert(
             variable.to_owned(),
             Value::String(secret.expose().to_owned()),
@@ -1448,9 +1457,17 @@ impl EmbeddedAgentService {
             .resolve_to_addrs(host, &addresses)
             .build()
             .map_err(|_| "provider_endpoint_invalid".to_owned())?;
-        let response = client
-            .get(endpoint)
-            .bearer_auth(credential.expose())
+        // Gemini's AI Studio API rejects API keys sent as Bearer tokens; it
+        // authenticates via the `x-goog-api-key` header. Every other backend
+        // Forge probes takes standard Bearer auth.
+        let request = if profile.provider.as_deref() == Some("gemini") {
+            client
+                .get(endpoint)
+                .header("x-goog-api-key", credential.expose())
+        } else {
+            client.get(endpoint).bearer_auth(credential.expose())
+        };
+        let response = request
             .send()
             .await
             .map_err(|error| {
@@ -2375,8 +2392,10 @@ mod tests {
             .inject_provider_env(&mut snapshot)
             .await
             .expect("injection succeeds");
+        // `CommandOverrides` is flattened into executor configs, so the env
+        // map must land at `config.env` for deserialization to see it.
         assert_eq!(
-            snapshot["config"]["command_overrides"]["env"]["OPENAI_API_KEY"],
+            snapshot["config"]["env"]["OPENAI_API_KEY"],
             Value::String("injected-secret-value".to_owned())
         );
         // The stored agent row never gains the secret: injection mutates only

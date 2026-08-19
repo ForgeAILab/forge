@@ -420,6 +420,13 @@ export function TaskDetailPage({
       onRecoverTask('retry_hook')
       return
     }
+    if (
+      blockingAnnotation?.type === 'workflow_guard_rejected' &&
+      blockingAnnotation.recovery_actions?.includes('resume_session')
+    ) {
+      onRecoverTask('resume_session')
+      return
+    }
     approveGate.mutate(
       { taskId: task.id, stateName, body: { version: task.version } },
       { onError: (error) => toast.error(getApiErrorMessage(error, 'Gate approval failed')) },

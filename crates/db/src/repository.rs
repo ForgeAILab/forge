@@ -704,6 +704,9 @@ pub trait AgentChatMessageRepo: Send + Sync {
         &self,
         query: AgentChatMessageListQuery,
     ) -> Result<Page<AgentChatMessage>>;
+    /// Append one standalone message (no turn admission). The store allocates
+    /// the sequence; `input.sequence` is only a hint for fakes. The message id
+    /// is the idempotency key — a same-id replay returns the stored row.
     async fn append_agent_chat_message(
         &self,
         input: CreateAgentChatMessage,

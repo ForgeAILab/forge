@@ -157,6 +157,9 @@ pub struct GeminiConfig {
     pub check_every_n: Option<u32>,
     pub permission_policy: Option<PermissionPolicy>,
     pub prompt_template: Option<String>,
+    /// Gemini CLI session UUID to resume (`--resume <id>`). Set by the
+    /// workflow-guard follow-up path so bounce-back turns keep the session.
+    pub resume_session_id: Option<String>,
     #[serde(flatten)]
     pub command_overrides: CommandOverrides,
 }

@@ -15,9 +15,9 @@ use api_types::{
 };
 use db::{
     new_uuid_v4, now_rfc3339, AgentAction, AgentActionExecution, AgentActionExecutionStatus,
-    AgentActionPolicyResult, AgentActionStatus, AgentProfileRepo, AgentRepo, CreateProjectCharter,
-    CreateProjectCharterRevision, CreateProjectCharterRevisionAtomically, ProjectCharterRecord,
-    ProjectCharterRevisionRecord, ProjectOrchestrationRepo, SqliteDb,
+    AgentActionPolicyResult, AgentActionStatus, CreateProjectCharter, CreateProjectCharterRevision,
+    CreateProjectCharterRevisionAtomically, ProjectCharterRecord, ProjectCharterRevisionRecord,
+    ProjectOrchestrationRepo, SqliteDb,
 };
 use forge_agent_host::{
     MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
@@ -25,14 +25,13 @@ use forge_agent_host::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 use crate::{
     create_project_from_charter_approval, evaluate_project_charter_readiness,
-    render_and_digest_charter, semantic_revision_diff, AgentActionService,
-    CreateProjectAuthorization, CreateProjectFromCharterApprovalInput, Result, ServiceError,
-    CHARTER_READINESS_POLICY_VERSION, PROJECT_OPERATING_SKILL_KEY,
+    render_and_digest_charter, resolve_genesis_project_agent, semantic_revision_diff,
+    AgentActionService, CreateProjectAuthorization, CreateProjectFromCharterApprovalInput, Result,
+    ServiceError, CHARTER_READINESS_POLICY_VERSION,
 };
 
 const CHARTER_SCHEMA_VERSION: &str = "forge.project-charter/v1";
@@ -417,6 +416,26 @@ impl MainOrchestrationActionService {
             CHARTER_READINESS_POLICY_VERSION,
             &revision.created_at,
         );
+        // Durable, refresh-stable anchor in the Main Chat history. The
+        // deterministic id makes action replays append-once; a failed append
+        // never rolls back the committed revision.
+        let (message_id, content) = crate::charter_proposal_chat_message(
+            &revision.id,
+            revision.revision,
+            &draft.content.identity.working_name,
+            &draft.content.identity.one_line_vision,
+            Some(revision.change_summary.as_str()),
+        );
+        if let Err(error) = crate::append_system_chat_message(
+            &self.db,
+            &session.main_chat_id,
+            &message_id,
+            &content,
+        )
+        .await
+        {
+            tracing::warn!(%error, revision_id = %revision.id, "Charter proposal chat anchor failed");
+        }
         Ok(json!({
             "operation": MAIN_CHARTER_DRAFT_OPERATION,
             "genesis_session_id": session.id,
@@ -737,45 +756,17 @@ impl MainOrchestrationActionService {
         &self,
         session: &api_types::ProductGenesisSession,
     ) -> Result<Option<Value>> {
-        let Some(identity_id) = session.preferred_project_agent_identity_id.as_deref() else {
-            return Ok(None);
-        };
-        let Some(identity) = AgentRepo::get_by_id(&*self.db, identity_id).await? else {
-            return Ok(None);
-        };
-        if identity.owner_id.as_deref() != Some(session.account_id.as_str()) || identity.paused {
-            return Ok(None);
-        }
-        let profile = AgentProfileRepo::get_profile(&*self.db, &identity.profile_id)
+        Ok(resolve_genesis_project_agent(&self.db, session)
             .await?
-            .filter(|profile| profile.identity_id == identity.id)
-            .ok_or_else(|| ServiceError::not_found("agent_profile", identity.profile_id.clone()))?;
-        let operating_skill_revision: String = sqlx::query_scalar(
-            "SELECT revision.id
-             FROM operating_skill AS skill
-             JOIN operating_skill_revision AS revision
-               ON revision.id = skill.current_revision_id
-              AND revision.operating_skill_id = skill.id
-              AND revision.skill_key = skill.skill_key
-             WHERE skill.skill_key = ?
-               AND skill.lifecycle = 'active'
-               AND skill.current_revision_id IS NOT NULL
-             LIMIT 1",
-        )
-        .bind(PROJECT_OPERATING_SKILL_KEY)
-        .fetch_optional(self.db.pool())
-        .await?
-        .flatten()
-        .ok_or_else(|| {
-            ServiceError::conflict("the Project Agent operating skill has no active revision")
-        })?;
-        Ok(Some(json!({
-            "identity_id": identity.id,
-            "display_name": identity.name,
-            "profile_revision_id": profile.id,
-            "operating_skill_revision": operating_skill_revision,
-            "policy_digest": project_agent_policy_digest(&profile.tool_policy_json),
-        })))
+            .map(|selection| {
+                json!({
+                    "identity_id": selection.identity_id,
+                    "display_name": selection.display_name,
+                    "profile_revision_id": selection.profile_revision_id,
+                    "operating_skill_revision": selection.operating_skill_revision,
+                    "policy_digest": selection.policy_digest,
+                })
+            }))
     }
 }
 
@@ -950,13 +941,6 @@ fn parse_maturity(value: &str) -> Result<ProductMaturity> {
     }
 }
 
-fn project_agent_policy_digest(tool_policy_json: &str) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"forge.project-agent-policy/v1\0");
-    digest.update(tool_policy_json.as_bytes());
-    hex::encode(digest.finalize())
-}
-
 fn required_value(field: &'static str, value: &str) -> Result<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -972,7 +956,7 @@ mod tests {
     use super::*;
     use crate::MAIN_OPERATING_SKILL_KEY;
     use db::{
-        create_sqlite_pool, run_migrations, AgentActionRepo, CreateAgentAction,
+        create_sqlite_pool, run_migrations, AgentActionRepo, AgentRepo, CreateAgentAction,
         CreateAgentIdentity, CreateAgentProfile, User, UserRepo,
     };
 

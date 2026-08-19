@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
 import {
   ArrowClockwise,
@@ -258,18 +258,40 @@ function AgentSelectionPanel({ agent }: { agent: ProductAgentSelection | null })
   )
 }
 
+const CHARTER_SUMMARY_FIELDS: Array<{
+  label: string
+  value: (revision: ProjectCharterRevision) => string
+}> = [
+  { label: 'Working name', value: (revision) => revision.content.identity.working_name },
+  { label: 'Vision', value: (revision) => revision.content.identity.one_line_vision },
+  {
+    label: 'Problem',
+    value: (revision) => revision.content.problem_and_people.problem_or_opportunity,
+  },
+  {
+    label: 'Primary outcome',
+    value: (revision) => revision.content.core_experience.primary_outcome,
+  },
+  {
+    label: 'Must-have outcomes',
+    value: (revision) => revision.content.scope.must_have_outcomes.join(' · '),
+  },
+  {
+    label: 'Non-goals',
+    value: (revision) => revision.content.scope.explicit_non_goals.join(' · '),
+  },
+  {
+    label: 'Success boundary',
+    value: (revision) =>
+      revision.content.success.qualitative_outcome ??
+      revision.content.success.success_signals.join(' · '),
+  },
+]
+
 function CharterContentSummary({ revision }: { revision: ProjectCharterRevision }) {
-  const { content } = revision
-  const lines = [
-    ['Problem', content.problem_and_people.problem_or_opportunity],
-    ['Primary outcome', content.core_experience.primary_outcome],
-    ['Must-have outcomes', content.scope.must_have_outcomes.join(' · ')],
-    ['Non-goals', content.scope.explicit_non_goals.join(' · ')],
-    [
-      'Success boundary',
-      content.success.qualitative_outcome ?? content.success.success_signals.join(' · '),
-    ],
-  ].filter(([, value]) => value)
+  const lines = CHARTER_SUMMARY_FIELDS.map(
+    ({ label, value }) => [label, value(revision)] as const,
+  ).filter(([, value]) => value)
 
   return (
     <div className="grid gap-3 sm:grid-cols-2">
@@ -288,56 +310,98 @@ function CharterContentSummary({ revision }: { revision: ProjectCharterRevision 
   )
 }
 
+/**
+ * Side-by-side field comparison of the current revision against the one it
+ * replaced. Unchanged fields carry a check; changed fields are highlighted.
+ */
+function CharterRevisionCompare({
+  previous,
+  current,
+}: {
+  previous: ProjectCharterRevision
+  current: ProjectCharterRevision
+}) {
+  const rows = CHARTER_SUMMARY_FIELDS.map(({ label, value }) => ({
+    label,
+    before: value(previous),
+    after: value(current),
+  })).filter((row) => row.before || row.after)
+
+  return (
+    <div className="space-y-2" aria-label="Charter revision comparison">
+      <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-2 font-mono text-micro uppercase tracking-[0.08em] text-muted-foreground">
+        <span>Revision {versionNumber(previous.revision_number)} (previous)</span>
+        <span>Revision {versionNumber(current.revision_number)} (current)</span>
+      </div>
+      {rows.map((row) => {
+        const changed = row.before !== row.after
+        return (
+          <div key={row.label} className="min-w-0">
+            <p className="flex items-center gap-1.5 font-mono text-micro uppercase tracking-[0.08em] text-muted-foreground">
+              {changed ? (
+                <GitDiff size={12} className="text-warning" aria-label="Changed" />
+              ) : (
+                <CheckCircle size={12} className="text-success" aria-label="Unchanged" />
+              )}
+              {row.label}
+            </p>
+            <div className="mt-1 grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-2">
+              <p className="min-w-0 break-words rounded-md border border-border-subtle bg-background/50 p-2 text-xs leading-5 text-muted-foreground">
+                {row.before || '—'}
+              </p>
+              <p
+                className={`min-w-0 break-words rounded-md border p-2 text-xs leading-5 text-foreground ${
+                  changed
+                    ? 'border-warning/50 bg-warning/10'
+                    : 'border-border-subtle bg-background/50'
+                }`}
+              >
+                {row.after || '—'}
+              </p>
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 function CharterReviewPanel({
   active,
   charterData,
-  selectedRevisionId,
-  onRevisionChange,
+  revision: selectedRevision,
+  previousRevision,
   approval,
   approvalPending,
   createPending,
   onApprove,
   onCreate,
   onRefresh,
-  stale,
   conflict,
   conflictError,
 }: {
   active: ProductGenesisSession
   charterData: ProductGenesisCharterResponse
-  selectedRevisionId: string | null
-  onRevisionChange: (revisionId: string) => void
+  revision: ProjectCharterRevision | null
+  previousRevision: ProjectCharterRevision | null
   approval: ProjectCharterApproval | null
   approvalPending: boolean
   createPending: boolean
   onApprove: (revision: ProjectCharterRevision) => void
   onCreate: () => void
   onRefresh: () => void
-  stale: boolean
   conflict: boolean
   conflictError: unknown
 }) {
-  const {
-    charter,
-    revisions,
-    current_draft_revision: draft,
-    selected_project_agent: agent,
-  } = charterData
-  const selectedRevision =
-    revisions.find((revision) => revision.id === selectedRevisionId) ??
-    draft ??
-    revisions[0] ??
-    null
-  const isCurrentCandidate = Boolean(selectedRevision && draft && selectedRevision.id === draft.id)
+  const { charter, selected_project_agent: agent } = charterData
+  const [compare, setCompare] = useState(false)
   const readiness = selectedRevision?.readiness ?? null
   const canApprove = Boolean(
     charter &&
     selectedRevision &&
-    isCurrentCandidate &&
     selectedRevision.lifecycle !== 'approved' &&
     readiness?.status === 'ready' &&
     agent &&
-    !stale &&
     !conflict,
   )
   const projectId = active.project_id
@@ -388,22 +452,18 @@ function CharterReviewPanel({
             but they do not become project truth until this revision is explicitly approved.
           </p>
         </div>
-        <div className="flex min-w-0 items-center gap-2">
-          <label className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
-            <span className="sr-only">Inspect Charter revision</span>
-            <select
-              value={selectedRevision.id}
-              onChange={(event) => onRevisionChange(event.target.value)}
-              className="max-w-[13rem] rounded-md border border-border bg-background px-2 py-1.5 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              aria-label="Inspect Charter revision"
-            >
-              {revisions.map((revision) => (
-                <option key={revision.id} value={revision.id}>
-                  Revision {versionNumber(revision.revision_number)} · {revision.lifecycle}
-                </option>
-              ))}
-            </select>
-          </label>
+        <div className="flex min-w-0 items-center gap-3">
+          {previousRevision ? (
+            <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={compare}
+                onChange={(event) => setCompare(event.target.checked)}
+                className="accent-primary"
+              />
+              Compare with previous
+            </label>
+          ) : null}
           <Button
             type="button"
             variant="ghost"
@@ -452,7 +512,11 @@ function CharterReviewPanel({
               </p>
             </div>
             <div className="mt-3">
-              <CharterContentSummary revision={selectedRevision} />
+              {compare && previousRevision ? (
+                <CharterRevisionCompare previous={previousRevision} current={selectedRevision} />
+              ) : (
+                <CharterContentSummary revision={selectedRevision} />
+              )}
             </div>
             <details className="mt-3 rounded-md border border-border-subtle bg-muted/10 p-2.5">
               <summary className="cursor-pointer text-xs font-medium text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
@@ -493,13 +557,13 @@ function CharterReviewPanel({
               Approval records your explicit decision for this revision, both digests, the expected
               Charter version, and the selected Project Agent revision set.
             </p>
-            {stale || conflict ? (
+            {conflict ? (
               <p
                 className="mt-2 rounded-md border border-warning/40 bg-warning/10 px-2.5 py-2 text-xs leading-5 text-warning"
                 role="status"
               >
-              {conflict ? 'Conflict detected: server truth changed.' : 'This view is stale.'}{' '}
-                Refresh before approving an exact revision.
+                Conflict detected: server truth changed. Refresh before approving an exact
+                revision.
               </p>
             ) : null}
             {conflict ? (
@@ -513,7 +577,7 @@ function CharterReviewPanel({
               title={
                 canApprove
                   ? 'Approve this exact Charter revision'
-                  : 'Readiness, current revision, digests, and Project Agent selection must match Forge'
+                  : 'Readiness, digests, and Project Agent selection must match Forge'
               }
             >
               {approvalPending ? (
@@ -523,10 +587,10 @@ function CharterReviewPanel({
               )}
               Approve exact Charter revision
             </Button>
-            {!canApprove && !stale && !conflict ? (
+            {!canApprove && !conflict ? (
               <p className="mt-2 text-micro leading-4 text-muted-foreground">
-                Approval stays disabled until the displayed revision is current, readiness is ready,
-                and all Project Agent revision identifiers are present.
+                Approval stays disabled until readiness is ready and all Project Agent revision
+                identifiers are present.
               </p>
             ) : null}
             {approval ? (
@@ -668,19 +732,31 @@ export function ProductGenesisControls() {
   )
 }
 
+/** Imperative surface for typed approval ("approve" / the /approve command). */
+export type ProductGenesisCharterCardHandle = {
+  /** True when typing "approve" should be treated as an approval action. */
+  canApproveTyped: () => boolean
+  /** Approve the current proposed revision, then create the Project. */
+  approveTyped: () => Promise<void>
+}
+
 /**
- * The Charter review as a compact chat-timeline card: one summary row with
- * the approval actions always visible, expandable into the full review
- * panel. Lives in the Main chat conversation instead of a dedicated area.
+ * The Charter review as a compact pinned card above the Main Chat timeline:
+ * one summary row with the approval actions always visible, expandable into
+ * the full review panel. It stays in place while the conversation streams —
+ * it never trails the newest message. The card always shows the current
+ * revision (approved, else draft); revision history stays internal, exposed
+ * only through the side-by-side compare toggle. The ref handle lets the chat
+ * composer route a typed "approve" through the same exact-revision flow.
  */
-export function ProductGenesisCharterCard() {
+export const ProductGenesisCharterCard = forwardRef<ProductGenesisCharterCardHandle>(
+  function ProductGenesisCharterCard(_props, handleRef) {
   const activeQuery = useProductGenesisActiveQuery()
   const active = activeQuery.data?.session ?? null
   const charterQuery = useProductGenesisCharterQuery(active?.id)
   const approveMutation = useApproveProductGenesisCharterRevisionMutation(active?.id)
   const createMutation = useCreateProjectFromCharterApprovalMutation()
   const [expanded, setExpanded] = useState(false)
-  const [selectedRevisionId, setSelectedRevisionId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [conflict, setConflict] = useState(false)
   const [conflictError, setConflictError] = useState<unknown>(null)
@@ -699,30 +775,29 @@ export function ProductGenesisCharterCard() {
 
   const charterData = charterQuery.data
   const approval = charterData?.approval ?? lastApproval
-  const draftRevision = charterData?.current_draft_revision ?? null
   const selectedRevision =
-    charterData?.revisions.find((revision) => revision.id === selectedRevisionId) ?? draftRevision
-  const stale = Boolean(
-    selectedRevision &&
-    draftRevision &&
-    selectedRevision.id !== draftRevision.id &&
-    selectedRevision.lifecycle !== 'approved',
-  )
+    charterData?.current_approved_revision ??
+    charterData?.current_draft_revision ??
+    charterData?.revisions[0] ??
+    null
+  const previousRevision = selectedRevision
+    ? (charterData?.revisions
+        .filter(
+          (revision) =>
+            versionNumber(revision.revision_number) <
+            versionNumber(selectedRevision.revision_number),
+        )
+        .sort((a, b) => versionNumber(b.revision_number) - versionNumber(a.revision_number))[0] ??
+      null)
+    : null
   const projectId = createdProjectId ?? active?.project_id ?? null
 
   useEffect(() => {
-    if (!charterData) return
-    setSelectedRevisionId((current) =>
-      current && charterData.revisions.some((revision) => revision.id === current)
-        ? current
-        : (charterData.current_draft_revision?.id ?? charterData.revisions[0]?.id ?? null),
-    )
-    if (charterData.approval) setLastApproval(charterData.approval)
+    if (charterData?.approval) setLastApproval(charterData.approval)
   }, [charterData])
 
   useEffect(() => {
     if (!active) {
-      setSelectedRevisionId(null)
       setLastApproval(null)
       setCreatedProjectId(null)
       setConflict(false)
@@ -733,9 +808,12 @@ export function ProductGenesisCharterCard() {
     }
   }, [active])
 
-  async function approve(revision: ProjectCharterRevision) {
+  async function approve(revision: ProjectCharterRevision): Promise<ProjectCharterApproval> {
     const charter = charterData?.charter
-    if (!active || !charter || !charterData.selected_project_agent) return
+    if (!active || !charter) throw new Error('The Charter is not loaded yet. Refresh and retry.')
+    if (!charterData.selected_project_agent) {
+      throw new Error('No eligible Project Agent exists — create one in Agents first.')
+    }
     const agent = charterData.selected_project_agent
     setError(null)
     setConflict(false)
@@ -799,26 +877,35 @@ export function ProductGenesisCharterCard() {
         },
       })
       setLastApproval(result)
+      return result
     } catch (cause) {
       setConflict(isConflict(cause))
       setConflictError(cause)
-      setError(getApiErrorMessage(cause, 'The exact Charter revision could not be approved.'))
+      const message = getApiErrorMessage(
+        cause,
+        'The exact Charter revision could not be approved.',
+      )
+      setError(message)
+      throw new Error(message)
     }
   }
 
-  async function createProject() {
-    if (!approval || approval.state !== 'active') return
+  async function createProject(fromApproval?: ProjectCharterApproval): Promise<string> {
+    const receipt = fromApproval ?? approval
+    if (!receipt || receipt.state !== 'active') {
+      throw new Error('No active approval receipt exists to create the Project from.')
+    }
     setError(null)
     setConflict(false)
     setConflictError(null)
     try {
       const principalId = useAuthStore.getState().user?.id ?? null
-      const fingerprint = JSON.stringify({ approval_id: approval.id, principal_id: principalId })
+      const fingerprint = JSON.stringify({ approval_id: receipt.id, principal_id: principalId })
       const attempt =
         createAttemptRef.current?.fingerprint === fingerprint
           ? createAttemptRef.current
           : (() => {
-              const idempotencyKey = mutationId('product-genesis-project-create', approval.id)
+              const idempotencyKey = mutationId('product-genesis-project-create', receipt.id)
               const next = {
                 fingerprint,
                 idempotencyKey,
@@ -828,20 +915,21 @@ export function ProductGenesisCharterCard() {
               return next
             })()
       const result = await createMutation.mutateAsync({
-        approval_id: approval.id,
+        approval_id: receipt.id,
         idempotency_key: attempt.idempotencyKey,
         authorization: attempt.authorization,
       })
       setCreatedProjectId(result.project_id)
+      return result.project_id
     } catch (cause) {
       setConflict(isConflict(cause))
       setConflictError(cause)
-      setError(
-        getApiErrorMessage(
-          cause,
-          'Project creation and handoff failed. The approval receipt remains replayable.',
-        ),
+      const message = getApiErrorMessage(
+        cause,
+        'Project creation and handoff failed. The approval receipt remains replayable.',
       )
+      setError(message)
+      throw new Error(message)
     }
   }
 
@@ -852,17 +940,51 @@ export function ProductGenesisCharterCard() {
     void charterQuery.refetch()
   }
 
+  useImperativeHandle(handleRef, () => ({
+    canApproveTyped: () =>
+      Boolean(
+        active &&
+        charterData &&
+        !projectId &&
+        (approval?.state === 'active' ||
+          (!approval &&
+            charterData.charter &&
+            selectedRevision?.lifecycle === 'proposed' &&
+            charterData.selected_project_agent)),
+      ),
+    approveTyped: async () => {
+      if (!active || !charterData) {
+        throw new Error('No Product Genesis Charter is active in this chat.')
+      }
+      if (projectId) {
+        throw new Error('The Project already exists — continue in the Project chat.')
+      }
+      let receipt = approval
+      if (!receipt) {
+        if (
+          !charterData.charter ||
+          !selectedRevision ||
+          selectedRevision.lifecycle !== 'proposed'
+        ) {
+          throw new Error('No proposed Charter revision is awaiting approval yet.')
+        }
+        receipt = await approve(selectedRevision)
+      }
+      if (receipt.state === 'active') {
+        await createProject(receipt)
+      } else if (receipt.state !== 'consumed') {
+        throw new Error(`The approval receipt is ${receipt.state}. Refresh the Charter card.`)
+      }
+    },
+  }))
+
   if (!active || activeQuery.isLoading || activeQuery.isError) return null
   if (!charterData || charterData.revisions.length === 0) return null
 
-  const workingName =
-    selectedRevision?.content.identity.working_name ??
-    draftRevision?.content.identity.working_name ??
-    'Charter'
+  const workingName = selectedRevision?.content.identity.working_name ?? 'Charter'
   const vision = selectedRevision?.content.identity.one_line_vision ?? ''
   const revisionNumber = selectedRevision
-    ? charterData.revisions.length -
-      charterData.revisions.findIndex((revision) => revision.id === selectedRevision.id)
+    ? versionNumber(selectedRevision.revision_number)
     : charterData.revisions.length
   const lifecycle = approval
     ? projectId
@@ -874,14 +996,13 @@ export function ProductGenesisCharterCard() {
     charterData.charter &&
     selectedRevision &&
     selectedRevision.lifecycle === 'proposed' &&
-    !stale &&
     charterData.selected_project_agent,
   )
 
   return (
     <section
       aria-label={`Project Charter ${workingName}`}
-      className="min-w-0 max-w-full overflow-hidden rounded-xl border border-ember-border/60 bg-card shadow-xs"
+      className="mx-4 mt-3 min-w-0 max-w-full shrink-0 overflow-hidden rounded-xl border border-ember-border/60 bg-card shadow-xs sm:mx-5"
     >
       <button
         type="button"
@@ -912,7 +1033,7 @@ export function ProductGenesisCharterCard() {
           <Button
             type="button"
             size="sm"
-            onClick={() => void approve(selectedRevision)}
+            onClick={() => void approve(selectedRevision).catch(() => undefined)}
             disabled={approveMutation.isPending}
           >
             {approveMutation.isPending ? (
@@ -927,7 +1048,7 @@ export function ProductGenesisCharterCard() {
           <Button
             type="button"
             size="sm"
-            onClick={() => void createProject()}
+            onClick={() => void createProject().catch(() => undefined)}
             disabled={createMutation.isPending}
           >
             {createMutation.isPending ? (
@@ -950,9 +1071,20 @@ export function ProductGenesisCharterCard() {
         ) : null}
         {!canApprove && !approval && !projectId ? (
           <span className="text-xs text-muted-foreground">
-            {charterData.selected_project_agent
-              ? 'Waiting for a proposed revision to approve.'
-              : 'No eligible Project Agent is selected yet.'}
+            {charterData.selected_project_agent ? (
+              'Waiting for a proposed revision to approve.'
+            ) : (
+              <>
+                No eligible Project Agent exists —{' '}
+                <Link
+                  to="/agents"
+                  className="font-medium text-primary underline-offset-4 hover:underline"
+                >
+                  create one in Agents
+                </Link>{' '}
+                first.
+              </>
+            )}
           </span>
         ) : null}
         <Button
@@ -978,19 +1110,18 @@ export function ProductGenesisCharterCard() {
         </div>
       ) : null}
       {expanded ? (
-        <div className="max-h-[60vh] overflow-y-auto border-t border-border-subtle p-3">
+        <div className="max-h-[50vh] overflow-y-auto border-t border-border-subtle p-3">
           <CharterReviewPanel
             active={active}
             charterData={charterData}
-            selectedRevisionId={selectedRevisionId}
-            onRevisionChange={setSelectedRevisionId}
+            revision={selectedRevision}
+            previousRevision={previousRevision}
             approval={approval}
             approvalPending={approveMutation.isPending}
             createPending={createMutation.isPending}
-            onApprove={(revision) => void approve(revision)}
-            onCreate={() => void createProject()}
+            onApprove={(revision) => void approve(revision).catch(() => undefined)}
+            onCreate={() => void createProject().catch(() => undefined)}
             onRefresh={refreshCharter}
-            stale={stale}
             conflict={conflict}
             conflictError={conflictError}
           />
@@ -998,4 +1129,5 @@ export function ProductGenesisCharterCard() {
       ) : null}
     </section>
   )
-}
+  },
+)

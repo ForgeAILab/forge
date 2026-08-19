@@ -29,6 +29,18 @@ export function getHumanGateActions(
         blockingAnnotation.type === 'target_repo_dirty' ? 'Resume Merge' : 'Resume Task',
     }
   }
+  // A workflow guard rejected the agent's completed turn (e.g. the plan
+  // checklist is still open). The task stays in its active state but nothing
+  // advances until someone acts — send the agent back to finish.
+  if (
+    blockingAnnotation?.type === 'workflow_guard_rejected' &&
+    blockingAnnotation.recovery_actions?.includes('resume_session')
+  ) {
+    return {
+      stateName: task.status,
+      approveLabel: 'Send Back to Agent',
+    }
+  }
   if (task.blocked || task.failed) return null
 
   const state = workflow.states.find((candidate) => candidate.name === task.status)

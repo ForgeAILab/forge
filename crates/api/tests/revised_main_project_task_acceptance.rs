@@ -303,24 +303,25 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
         assert_eq!(scope_row.workspace_access, "deny");
     }
 
-    // A real repository keeps the subsequent TaskService claim on the normal
-    // Workspace path instead of reducing the worker assertion to metadata.
-    let repo_path = common::setup_git_repo(workspace.path());
-    let default_branch = git_default_branch(&repo_path);
-    let _repo = request_json(
+    // Genesis provisioning already registered a primary repository with an
+    // initial commit, which keeps the subsequent TaskService claim on the
+    // normal Workspace path instead of reducing the worker assertion to
+    // metadata.
+    let repos = request_json(
         app,
-        Method::POST,
+        Method::GET,
         &format!("/api/v1/projects/{project_id}/repos"),
         &token,
-        json!({
-            "name": "todo-repo",
-            "local_path": repo_path,
-            "remote_url": repo_path,
-            "default_branch": default_branch
-        }),
-        &[StatusCode::OK, StatusCode::CREATED],
+        Value::Null,
+        &[StatusCode::OK],
     )
     .await;
+    let provisioned_path = required_string(&repos["items"][0], &["local_path"]);
+    assert_eq!(
+        git_default_branch(std::path::Path::new(&provisioned_path)),
+        "main",
+        "provisioned Project repository is initialized on main"
+    );
 
     // The autonomous_v1 template has a canonical Worker role, which lets the
     // native Task session prove task_write without pretending that Project

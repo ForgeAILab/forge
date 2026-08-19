@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo } from 'react'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 import { Link } from '@tanstack/react-router'
 import { ArrowUpRight, GearSix } from '@phosphor-icons/react'
 import { Avatar } from '@/components/ui/avatar'
@@ -8,6 +8,7 @@ import { ChatSetupRequired } from '@/components/chat/chat-setup-required'
 import {
   ProductGenesisCharterCard,
   ProductGenesisControls,
+  type ProductGenesisCharterCardHandle,
 } from '@/features/product-genesis/ProductGenesisControls'
 import {
   useProductGenesisActiveQuery,
@@ -35,6 +36,11 @@ function projectNameFor(
 
 function isBindingReady(entry: AgentChatEntry | undefined): boolean {
   return Boolean(entry && entry.binding_state === 'active' && entry.chat_status === 'ready')
+}
+
+/** A bare typed "approve" (any casing, trailing punctuation allowed). */
+export function isApproveUtterance(content: string): boolean {
+  return /^approve[\s.!]*$/i.test(content.trim())
 }
 
 export function handoffProjectIdsForScope(
@@ -88,7 +94,16 @@ export function ChatPage({ projectId }: { projectId?: string }) {
     else setGlobalChat(chatQuery.data)
   }, [chatQuery.data, projectId, setGlobalChat, setProjectChat])
 
+  const charterCard = useRef<ProductGenesisCharterCardHandle>(null)
+
   async function sendMessage(content: string) {
+    // A bare "approve" while a Charter proposal awaits confirmation IS the
+    // interface confirmation: route it through the exact-revision approval
+    // instead of admitting a chat turn the agent cannot act on.
+    if (!projectId && isApproveUtterance(content) && charterCard.current?.canApproveTyped()) {
+      await charterCard.current.approveTyped()
+      return
+    }
     if (!chatQuery.data) throw new Error('This Agent Chat is not ready yet.')
     const admitted = await sendMutation.mutateAsync({ content, dedupe_key: null })
     if (admitted.turn_job) {
@@ -106,19 +121,29 @@ export function ChatPage({ projectId }: { projectId?: string }) {
     },
     [startGenesisMutation],
   )
-  const commands = useMemo<ChatCommand[]>(
-    () =>
-      !projectId && !hasActiveGenesis
-        ? [
-            {
-              name: 'start-product',
-              description: 'Start Product Genesis — draft a Charter from your idea',
-              run: startGenesis,
-            },
-          ]
-        : [],
-    [projectId, hasActiveGenesis, startGenesis],
-  )
+  const approveCharter = useCallback(async () => {
+    const handle = charterCard.current
+    if (!handle) throw new Error('No Product Genesis Charter is active in this chat.')
+    await handle.approveTyped()
+  }, [])
+  const commands = useMemo<ChatCommand[]>(() => {
+    if (projectId) return []
+    return hasActiveGenesis
+      ? [
+          {
+            name: 'approve',
+            description: 'Approve the proposed Project Charter and create the Project',
+            run: approveCharter,
+          },
+        ]
+      : [
+          {
+            name: 'start-product',
+            description: 'Start Product Genesis — draft a Charter from your idea',
+            run: startGenesis,
+          },
+        ]
+  }, [projectId, hasActiveGenesis, startGenesis, approveCharter])
 
   async function cancelTurn(turnId: string, expectedVersion: number) {
     await cancelMutation.mutateAsync({
@@ -216,17 +241,21 @@ export function ChatPage({ projectId }: { projectId?: string }) {
             <ChatSetupRequired projectId={projectId} />
           </div>
         ) : (
-          <AgentChatTimeline
-            chat={chatQuery.data}
-            agentName={activeAgentName}
-            projectId={projectId}
-            handoffProjectIds={handoffProjectIdsForScope(projectId, projectSources)}
-            isSending={sendMutation.isPending}
-            onSend={sendMessage}
-            onCancelTurn={cancelTurn}
-            commands={commands}
-            footer={!projectId ? <ProductGenesisCharterCard /> : undefined}
-          />
+          <>
+            {/* Pinned above the timeline so it never trails new messages and
+                the approval actions stay reachable while the chat streams. */}
+            {!projectId ? <ProductGenesisCharterCard ref={charterCard} /> : null}
+            <AgentChatTimeline
+              chat={chatQuery.data}
+              agentName={activeAgentName}
+              projectId={projectId}
+              handoffProjectIds={handoffProjectIdsForScope(projectId, projectSources)}
+              isSending={sendMutation.isPending}
+              onSend={sendMessage}
+              onCancelTurn={cancelTurn}
+              commands={commands}
+            />
+          </>
         )}
       </div>
     </div>

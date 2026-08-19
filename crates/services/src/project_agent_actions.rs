@@ -1941,9 +1941,16 @@ impl ProjectOrchestrationActionService {
                 project_url: Some(format!("/api/v1/projects/{project_id}/media/{asset_id}")),
                 author_type: "agent".to_owned(),
                 author_id: Some(action.actor_identity_id.clone()),
+                // Readiness replays this as a typed AuthorizationProvenance
+                // whose principal must equal the attachment author and whose
+                // action must be the evidence-attach receipt action; the
+                // admitted AgentAction row is the durable authorizing event.
                 authorization_json: json!({
-                    "operation": PROJECT_EVIDENCE_OPERATION,
-                    "action_id": action.id,
+                    "principal": {"kind": "agent", "id": action.actor_identity_id},
+                    "authorization_basis": "project_agent_binding_policy",
+                    "action": "project.evidence.attach",
+                    "event_id": action.id,
+                    "occurred_at": action.created_at,
                 })
                 .to_string(),
                 created_at: now_rfc3339(),

@@ -2,8 +2,8 @@ use super::*;
 
 use api_types::{Actor, StateKind, TaskAction, UserActionSource, WorkflowTrigger};
 use db::{
-    AgentListQuery, AgentRepo, AssigneeKind, ExecutionRepo, PageRequest, ProjectRepo, ReviewRepo,
-    ReviewStatus, SortBy, SortOrder, TaskRepo, TaskRoleAssignmentRepo,
+    Agent, AgentListQuery, AgentRepo, AssigneeKind, ExecutionRepo, PageRequest, ProjectRepo,
+    ReviewRepo, ReviewStatus, SortBy, SortOrder, TaskRepo, TaskRoleAssignmentRepo,
 };
 
 #[derive(Debug)]
@@ -456,9 +456,24 @@ impl TaskService {
         )
         .await?
         .items;
+        // The gemini CLI cannot self-authenticate headless: without a bound
+        // credential the run exits immediately. Prefer any agent that can
+        // actually execute before falling back to credential-less gemini.
+        let dispatchable =
+            |agent: &&Agent| agent.executor_type != "gemini" || agent.credential_ref.is_some();
         agents
             .iter()
-            .find(|agent| agent.is_default && !agent.paused)
+            .find(|agent| agent.is_default && !agent.paused && dispatchable(agent))
+            .or_else(|| {
+                agents
+                    .iter()
+                    .find(|agent| !agent.paused && dispatchable(agent))
+            })
+            .or_else(|| {
+                agents
+                    .iter()
+                    .find(|agent| agent.is_default && !agent.paused)
+            })
             .or_else(|| agents.iter().find(|agent| !agent.paused))
             .map(|agent| agent.id.clone())
             .ok_or_else(|| ServiceError::invalid_operation("no available agent to start task"))

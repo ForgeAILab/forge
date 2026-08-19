@@ -1,8 +1,11 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import type { ReactNode } from 'react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { createRef, type ReactNode } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '@/api/client'
-import { ProductGenesisCharterCard } from './ProductGenesisControls'
+import {
+  ProductGenesisCharterCard,
+  type ProductGenesisCharterCardHandle,
+} from './ProductGenesisControls'
 import type {
   ProductGenesisCharterResponse,
   ProductGenesisSession,
@@ -326,6 +329,49 @@ describe('ProductGenesisControls', () => {
       first.input.mutation.authorization.event_id,
     )
     expect(second.input.expected_project_version).toBeUndefined()
+  })
+
+  it('typed approval approves the current revision and then creates the Project', async () => {
+    state.approval.mockResolvedValueOnce({
+      id: 'approval-1',
+      state: 'active',
+      charter_revision_id: revision.id,
+      charter_content_digest: revision.content_digest,
+      charter_render_digest: revision.render_digest,
+    })
+    state.create.mockResolvedValueOnce({ project_id: 'project-1' })
+
+    const handle = createRef<ProductGenesisCharterCardHandle>()
+    render(<ProductGenesisCharterCard ref={handle} />)
+
+    expect(handle.current?.canApproveTyped()).toBe(true)
+    await act(async () => {
+      await handle.current!.approveTyped()
+    })
+
+    expect(state.approval).toHaveBeenCalledTimes(1)
+    expect(state.approval.mock.calls[0][0].revisionId).toBe(revision.id)
+    expect(state.create).toHaveBeenCalledTimes(1)
+    expect(state.create.mock.calls[0][0].approval_id).toBe('approval-1')
+  })
+
+  it('typed approval reports a clear error when nothing is approvable', async () => {
+    state.charter = {
+      data: charterResponse(null),
+      isLoading: false,
+      isError: false,
+      refetch: vi.fn(),
+    }
+
+    const handle = createRef<ProductGenesisCharterCardHandle>()
+    render(<ProductGenesisCharterCard ref={handle} />)
+
+    expect(handle.current?.canApproveTyped()).toBe(false)
+    await expect(handle.current!.approveTyped()).rejects.toThrow(
+      /No proposed Charter revision is awaiting approval/,
+    )
+    expect(state.approval).not.toHaveBeenCalled()
+    expect(state.create).not.toHaveBeenCalled()
   })
 
   it('shows conflict authority and expected/current revisions when approval races', async () => {

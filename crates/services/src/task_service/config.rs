@@ -91,7 +91,7 @@ pub(super) fn executor_snapshot_with_resume_thread(
                     Value::String(agent_session_id.to_owned()),
                 );
             }
-            Some("cursor") | Some("smith") => {
+            Some("cursor") | Some("smith") | Some("gemini") => {
                 config.insert(
                     "resume_session_id".to_owned(),
                     Value::String(agent_session_id.to_owned()),

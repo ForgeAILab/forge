@@ -5756,7 +5756,7 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
         vec![
             (
                 "forge.main.project-discovery/v2".to_owned(),
-                "forge.main.project-discovery/v2@2".to_owned(),
+                "forge.main.project-discovery/v2@3".to_owned(),
             ),
             (
                 "forge.project.orchestration/v1".to_owned(),
@@ -5764,5 +5764,92 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
             ),
         ],
         "a seeded operating-skill revision must be repointed in the same release (V081 regression)"
+    );
+}
+
+#[tokio::test]
+async fn append_agent_chat_message_allocates_sequences_and_replays_by_id() {
+    use crate::{AgentChatMessageAuthorType, AgentChatMessageRepo, AgentChatMessageStatus};
+
+    let db = sqlite_db().await;
+    let account_id = seed_user(&db).await;
+    // The V071 user-insert trigger provisions the account Main Chat.
+    let chat_id: String = sqlx::query_scalar(
+        "SELECT id FROM agent_chat WHERE account_id = ? AND kind = 'account_main'",
+    )
+    .bind(&account_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("provisioned Main Chat");
+    let count_before: i64 = sqlx::query_scalar("SELECT message_count FROM agent_chat WHERE id = ?")
+        .bind(&chat_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("message count");
+    let message = |id: &str| crate::CreateAgentChatMessage {
+        id: id.to_owned(),
+        chat_id: chat_id.clone(),
+        // Deliberately wrong: the store must allocate the real sequence.
+        sequence: 999,
+        author_type: AgentChatMessageAuthorType::System,
+        author_id: None,
+        content: "Charter revision 1 proposed".to_owned(),
+        content_guard_json: "{}".to_owned(),
+        sensitivity: "internal".to_owned(),
+        status: AgentChatMessageStatus::Complete,
+        outcome: None,
+        model: None,
+        profile_id: None,
+        session_id: None,
+        context_manifest_id: None,
+        token_usage_json: None,
+        duration_ms: None,
+        error: None,
+        correlation_id: new_uuid_v4(),
+        causation_id: None,
+        handoff_id: None,
+        source_type: "native".to_owned(),
+        source_id: None,
+        source_message_id: None,
+        source_room_id: None,
+        source_conversation_id: None,
+        source_sequence: None,
+        source_metadata_json: "{}".to_owned(),
+        created_at: now_rfc3339(),
+    };
+
+    let first = AgentChatMessageRepo::append_agent_chat_message(&db, message("anchor-1"))
+        .await
+        .expect("first append");
+    let second = AgentChatMessageRepo::append_agent_chat_message(&db, message("anchor-2"))
+        .await
+        .expect("second append");
+    assert_eq!(
+        second.sequence,
+        first.sequence + 1,
+        "sequences are allocated"
+    );
+    assert_ne!(
+        first.sequence, 999,
+        "the caller-supplied sequence is a hint only"
+    );
+
+    let replay = AgentChatMessageRepo::append_agent_chat_message(&db, message("anchor-1"))
+        .await
+        .expect("same-id replay");
+    assert_eq!(
+        replay.sequence, first.sequence,
+        "replay returns the stored row"
+    );
+
+    let count_after: i64 = sqlx::query_scalar("SELECT message_count FROM agent_chat WHERE id = ?")
+        .bind(&chat_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("message count");
+    assert_eq!(
+        count_after,
+        count_before + 2,
+        "a replay never consumes a sequence"
     );
 }

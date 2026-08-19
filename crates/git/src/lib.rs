@@ -432,6 +432,13 @@ pub async fn init(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Rename the currently checked-out branch (e.g. normalize a fresh repo's
+/// init.defaultBranch to the branch Forge registered).
+pub async fn rename_current_branch(repo_path: &Path, new_name: &str) -> Result<()> {
+    run_git(repo_path, &["branch", "-m", new_name]).await?;
+    Ok(())
+}
+
 /// Stage all files and commit.
 pub async fn commit_all(path: &Path, message: &str) -> Result<String> {
     stage_all(path).await?;

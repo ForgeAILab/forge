@@ -234,6 +234,7 @@ impl AppState {
                 .with_workspace_root(workspace_root.clone()),
         );
         execution_events.set_task_service(Arc::downgrade(&task_service));
+        embedded_agent_service.set_task_service(Arc::clone(&task_service));
         daemon_connections.set_embedded_execution_context(
             Arc::downgrade(&task_service),
             Arc::clone(&task_executor),

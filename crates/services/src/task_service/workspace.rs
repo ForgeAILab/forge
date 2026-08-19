@@ -486,7 +486,7 @@ pub(super) async fn reset_workspace(
     create_fresh_workspace(db, workspace_root, &refreshed, &task.id, repo_cache_locks).await
 }
 
-pub(super) fn default_workspace_root() -> PathBuf {
+pub(crate) fn default_workspace_root() -> PathBuf {
     std::env::var("FORGE_WORKSPACE_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("forge").join("worktrees"))

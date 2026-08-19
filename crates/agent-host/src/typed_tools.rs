@@ -1369,6 +1369,38 @@ fn orchestration_payload_summary(schema: &Value) -> String {
     variant_summary(schema).unwrap_or_default()
 }
 
+/// Payload guidance for the generic coordination proposal surface. The
+/// payload stays a free-form object at the schema level (provider
+/// function-calling APIs only reliably deliver flat object schemas), so the
+/// contract for operations with a typed server-side executor is carried in
+/// the property description; the exact shape stays enforced server-side and
+/// errors return to the model in-turn.
+fn coordination_payload_guidance(operations: &BTreeSet<String>) -> String {
+    let mut lines = Vec::new();
+    if operations.contains("task.propose") {
+        lines.push(concat!(
+            "task.propose — create a Task in the bound Project. Fields: ",
+            "title (required); description (outcome plus acceptance criteria); ",
+            "priority (integer, higher runs sooner); ",
+            "task_type (\"task\" implementation default, \"planning_task\", or \"discovery\"); ",
+            "plan_item_id (required for implementation Tasks once an execution baseline is ",
+            "active — the stable plan-item id from that baseline, for example \"pi-2\"); ",
+            "milestone_id (optional, defaults to the active baseline's primary milestone); ",
+            "capability_class / risk_class (only when the baseline declares allowed classes). ",
+            "Forge binds the Task to the Project's active user-approved baseline revision ",
+            "itself; never echo baseline ids or digests.",
+        ));
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Payload shape by operation (exact contract enforced server-side):\n- {}",
+            lines.join("\n- ")
+        )
+    }
+}
+
 // The declared envelope is a plain `type: object` schema: several provider
 // function-calling APIs (notably Gemini) accept only an OpenAPI-style object
 // at the parameters root and silently drop `oneOf`, leaving the model blind
@@ -1937,6 +1969,11 @@ impl ForgeScopeProposeTool {
         let schema = if self.reject_authority_overrides {
             portable_const_schema(orchestration_proposal_schema(&self.operations))
         } else {
+            let mut payload_property = json!({"type": ["object", "null"]});
+            let guidance = coordination_payload_guidance(&self.operations);
+            if !guidance.is_empty() {
+                payload_property["description"] = json!(guidance);
+            }
             json!({
                 "type": "object",
                 "required": ["operation", "payload", "dedupe_key", "correlation_id"],
@@ -1945,11 +1982,17 @@ impl ForgeScopeProposeTool {
                         "type": "string",
                         "enum": self.operations.iter().collect::<Vec<_>>(),
                     },
-                    "payload": {"type": "object"},
-                    "dedupe_key": {"type": "string", "minLength": 1},
-                    "correlation_id": {"type": "string", "minLength": 1},
-                    "causation_id": {"type": "string"},
-                    "causation_depth": {"type": "integer", "minimum": 0, "maximum": 8}
+                    "payload": payload_property,
+                    // Declared null-tolerant on purpose: some providers
+                    // (notably Gemini) emit explicit nulls, and a schema
+                    // violation in the provider's emitted call fails the
+                    // whole turn before Forge sees it. Presence and
+                    // non-emptiness stay enforced in `prepare`/server-side
+                    // validators, whose errors return to the model in-turn.
+                    "dedupe_key": {"type": ["string", "null"], "minLength": 1, "description": "Required non-null idempotency key"},
+                    "correlation_id": {"type": ["string", "null"], "minLength": 1, "description": "Required non-null correlation id"},
+                    "causation_id": string_or_null_schema(),
+                    "causation_depth": {"type": ["integer", "null"], "minimum": 0, "maximum": 8}
                 },
                 "additionalProperties": false
             })

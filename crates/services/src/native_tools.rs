@@ -37,11 +37,11 @@ use sqlx::Row;
 
 use crate::{
     agent_chat_policy::guard_agent_chat_content,
-    coordination_service::{AgentActionService, ProposeActionInput},
+    coordination_service::{AgentActionService, ExecuteTaskProposalInput, ProposeActionInput},
     memory::{MemoryAccessContext, MemoryService},
     project_runtime::{load_effective_project_state, ProjectCurrentStateResponse},
     ExecuteMainOrchestrationActionInput, ExecuteProjectOrchestrationActionInput,
-    MainOrchestrationActionService, ProjectOrchestrationActionService,
+    MainOrchestrationActionService, ProjectOrchestrationActionService, TaskService,
 };
 
 /// Forge-owned provider injected into native Agent Runtime compositions.
@@ -52,6 +52,9 @@ pub struct CoordinationToolProvider {
     memory: MemoryService,
     project_actions: ProjectOrchestrationActionService,
     public_search: Arc<RwLock<Option<PublicSearchConfig>>>,
+    /// Shared TaskService used to execute admitted `task.propose` actions
+    /// inline, so agent-proposed Tasks materialize without a separate caller.
+    task_service: Arc<RwLock<Option<Arc<TaskService>>>>,
 }
 
 impl std::fmt::Debug for CoordinationToolProvider {
@@ -69,8 +72,21 @@ impl CoordinationToolProvider {
             memory: MemoryService::new(Arc::clone(&db)),
             project_actions: ProjectOrchestrationActionService::new(Arc::clone(&db)),
             public_search: Arc::new(RwLock::new(None)),
+            task_service: Arc::new(RwLock::new(None)),
             db,
         }
+    }
+
+    /// Attach the shared TaskService so admitted `task.propose` actions
+    /// execute inline through the normal Task creation path.
+    pub fn set_task_service(&self, task_service: Arc<TaskService>) {
+        if let Ok(mut slot) = self.task_service.write() {
+            *slot = Some(task_service);
+        }
+    }
+
+    fn task_service_handle(&self) -> Option<Arc<TaskService>> {
+        self.task_service.read().ok().and_then(|slot| slot.clone())
     }
 
     /// Configure the optional public search endpoint used by native Main and
@@ -989,6 +1005,50 @@ impl CoordinationToolProvider {
                     "requires_user_authorization".to_owned(),
                     Value::Bool(requires_user_authorization),
                 );
+            }
+        } else if operation == "task.propose"
+            && action.policy_result == AgentActionPolicyResult::Allowed
+            && action.status == AgentActionStatus::Proposed
+        {
+            // An admitted Task proposal materializes through the normal
+            // TaskService path immediately; nothing else in the product
+            // executes it later. Validation failures (missing plan item,
+            // stale baseline, class outside the envelope) surface to the
+            // model as this tool call's error and can be corrected in-turn.
+            let Some(task_service) = self.task_service_handle() else {
+                return Err(AgentHostError::Configuration(
+                    "Task proposal execution is not wired to a TaskService".to_owned(),
+                ));
+            };
+            let executed = self
+                .actions
+                .execute_task_proposal(
+                    &task_service,
+                    ExecuteTaskProposalInput {
+                        action_id: action.id.clone(),
+                        expected_version: action.version,
+                        executed_by_id: actor_identity_id.to_owned(),
+                        idempotency_key: action.dedupe_key.clone(),
+                    },
+                )
+                .await
+                .map_err(service_error)?;
+            if let Some(object) = response.as_object_mut() {
+                object.insert("status".to_owned(), Value::String("executed".to_owned()));
+                object.insert("materialized".to_owned(), Value::Bool(true));
+                object.insert("domain_committed".to_owned(), Value::Bool(true));
+                object.insert(
+                    "execution_id".to_owned(),
+                    Value::String(executed.execution.id.clone()),
+                );
+                object.insert(
+                    "domain_result".to_owned(),
+                    serde_json::json!({
+                        "task_id": executed.task.id,
+                        "task_status": executed.task.status,
+                    }),
+                );
+                object.insert("requires_user_authorization".to_owned(), Value::Bool(false));
             }
         } else if is_orchestration_operation(operation) {
             // A proposal row is not a domain success. Protected Main

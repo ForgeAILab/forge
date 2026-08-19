@@ -66,6 +66,46 @@ impl std::fmt::Display for GenesisLifecycleError {
 
 impl std::error::Error for GenesisLifecycleError {}
 
+/// Deterministic id and body for the durable Main Chat system message that
+/// anchors one proposed Charter revision in the conversation history. The id
+/// is derived from the revision so replays never duplicate the message.
+pub fn charter_proposal_chat_message(
+    revision_id: &str,
+    revision_number: i64,
+    working_name: &str,
+    one_line_vision: &str,
+    change_summary: Option<&str>,
+) -> (String, String) {
+    let summary = change_summary
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Initial Charter revision.");
+    (
+        format!("charter-proposal:{revision_id}"),
+        format!(
+            "Charter revision {revision_number} proposed — {working_name}: {one_line_vision}\n\
+             {summary}\n\
+             Review it on the Charter card above the chat, then approve there or type /approve."
+        ),
+    )
+}
+
+/// Deterministic id and body for the durable Main Chat system message that
+/// records an exact Charter approval receipt.
+pub fn charter_approval_chat_message(
+    approval_id: &str,
+    revision_number: i64,
+    project_name: &str,
+) -> (String, String) {
+    (
+        format!("charter-approval:{approval_id}"),
+        format!(
+            "Charter revision {revision_number} approved — Project \u{201c}{project_name}\u{201d} \
+             can now be created from this exact revision."
+        ),
+    )
+}
+
 /// The durable store boundary for Genesis.  The DB adapter owns the physical
 /// table and transaction; the service owns admission, lifecycle, and prompt
 /// invariants.  Keeping this boundary explicit prevents a route or model turn

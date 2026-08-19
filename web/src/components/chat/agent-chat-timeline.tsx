@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
+import { Fragment, useEffect, useId, useMemo, useRef, useState } from 'react'
 import {
   ArrowDown,
   ArrowUpRight,
@@ -668,7 +668,6 @@ export function AgentChatTimeline({
   onSend,
   onCancelTurn,
   commands,
-  footer,
 }: {
   chat: AgentChat
   agentName?: string
@@ -678,8 +677,6 @@ export function AgentChatTimeline({
   onSend: (content: string) => Promise<void>
   onCancelTurn?: (turnId: string, expectedVersion: number) => Promise<void>
   commands?: ChatCommand[]
-  /** Rendered after the messages, inside the scrolling column (e.g. the Genesis Charter card). */
-  footer?: ReactNode
 }) {
   const messagesQuery = useAgentChatMessagesQuery(chat.id)
   const turnsQuery = useAgentChatTurnsQuery(chat.id)
@@ -865,7 +862,6 @@ export function AgentChatTimeline({
           {isSending && !turnInFlight ? (
             <LoadingState compact label="Sending…" status="sending" />
           ) : null}
-          {footer}
           <div ref={endRef} />
         </div>
       </div>

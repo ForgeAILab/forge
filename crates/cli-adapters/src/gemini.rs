@@ -14,7 +14,6 @@ use tokio::process::Child;
 use tokio::sync::Mutex as AsyncMutex;
 
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
-const PROMPT_SEND_TIMEOUT_SECONDS: u64 = 10;
 const FIRST_OUTPUT_TIMEOUT_SECONDS: u64 = 300;
 const MAX_SUMMARY_CHARS: usize = 500;
 
@@ -33,8 +32,14 @@ impl GeminiAdapter {
         serde_json::from_value(ctx.agent_config.clone()).unwrap_or_default()
     }
 
-    fn build_command(config: &GeminiConfig) -> tokio::process::Command {
-        let mut adapter_args = vec!["-p".to_owned(), "--output-format=json".to_owned()];
+    fn build_command(config: &GeminiConfig, prompt: &str) -> tokio::process::Command {
+        // Current Gemini CLI releases require the prompt as `-p`'s argument;
+        // a bare `-p` with the prompt on stdin exits 1 with usage help.
+        let mut adapter_args = vec![
+            "-p".to_owned(),
+            prompt.to_owned(),
+            "--output-format=json".to_owned(),
+        ];
 
         if config.yolo.unwrap_or(false) {
             adapter_args.push("--yolo".to_owned());
@@ -62,6 +67,11 @@ impl GeminiAdapter {
             adapter_args.push(check_every_n.to_string());
         }
 
+        if let Some(ref resume_session_id) = config.resume_session_id {
+            adapter_args.push("--resume".to_owned());
+            adapter_args.push(resume_session_id.clone());
+        }
+
         let builder = crate::command::CommandBuilder::new("gemini")
             .adapter_args(adapter_args)
             .overrides(&config.command_overrides);
@@ -71,7 +81,19 @@ impl GeminiAdapter {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env("NO_COLOR", "1");
+            .env("NO_COLOR", "1")
+            // Task worktrees are freshly created directories the user never
+            // opened interactively; without this the CLI refuses headless
+            // runs with an untrusted-directory error.
+            .env("GEMINI_CLI_TRUST_WORKSPACE", "true");
+        let key_injected = config
+            .command_overrides
+            .env
+            .as_ref()
+            .is_some_and(|env| env.contains_key("GEMINI_API_KEY"));
+        if key_injected && let Some(home) = ensure_api_key_home() {
+            cmd.env("GEMINI_CLI_HOME", home);
+        }
         cmd
     }
 
@@ -100,6 +122,23 @@ impl Default for GeminiAdapter {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The user-level `~/.gemini/settings.json` may pin OAuth auth, which the
+/// CLI prefers over an injected `GEMINI_API_KEY` and which fails headless.
+/// When Forge injects a provider API key, point the CLI at a Forge-owned
+/// home whose settings select API-key auth so the key actually drives the
+/// run.
+fn ensure_api_key_home() -> Option<PathBuf> {
+    let home = std::env::temp_dir().join("forge-gemini-api-key-home");
+    let settings_dir = home.join(".gemini");
+    std::fs::create_dir_all(&settings_dir).ok()?;
+    std::fs::write(
+        settings_dir.join("settings.json"),
+        r#"{"security":{"auth":{"selectedType":"gemini-api-key"}}}"#,
+    )
+    .ok()?;
+    Some(home)
 }
 
 #[async_trait]
@@ -138,7 +177,12 @@ impl CodingExecutorAdapter for GeminiAdapter {
 
     async fn execute(&self, ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
         let config = Self::resolve_config(&ctx);
-        let mut cmd = Self::build_command(&config);
+        let prompt = if let Some(template) = &config.prompt_template {
+            format!("{template}\n\n{}", ctx.description)
+        } else {
+            ctx.description.clone()
+        };
+        let mut cmd = Self::build_command(&config, &prompt);
         cmd.current_dir(&ctx.worktree_path);
 
         let mut child = cmd.spawn()?;
@@ -180,12 +224,6 @@ impl CodingExecutorAdapter for GeminiAdapter {
             )
             .await?;
 
-        let prompt = if let Some(template) = &config.prompt_template {
-            format!("{template}\n\n{}", ctx.description)
-        } else {
-            ctx.description.clone()
-        };
-
         let stream_result =
             stream_child_output(&ctx, stdin, stdout, stderr, &prompt, &mut writer).await;
 
@@ -220,7 +258,7 @@ impl CodingExecutorAdapter for GeminiAdapter {
                     return Ok(ExecutionResult {
                         status: ExecutionOutcome::Failed,
                         after_sha: None,
-                        agent_session_id: None,
+                        agent_session_id: stream.agent_session_id,
                         summary: stream.summary,
                         error: Some(e.to_string()),
                         usage: None,
@@ -235,7 +273,7 @@ impl CodingExecutorAdapter for GeminiAdapter {
         Ok(ExecutionResult {
             status: outcome,
             after_sha,
-            agent_session_id: None,
+            agent_session_id: stream.agent_session_id,
             summary: stream.summary,
             error,
             usage: None,
@@ -263,7 +301,13 @@ impl CodingExecutorAdapter for GeminiAdapter {
 
 struct StreamResult {
     summary: Option<String>,
+    agent_session_id: Option<String>,
 }
+
+/// Cap on the buffered stdout used to recover the final `--output-format=json`
+/// document. The CLI prints that document pretty-printed across many lines, so
+/// per-line JSON parsing never sees it.
+const STDOUT_TAIL_BUFFER_BYTES: usize = 1024 * 1024;
 
 async fn stream_child_output(
     _ctx: &ExecutionContext,
@@ -273,20 +317,9 @@ async fn stream_child_output(
     prompt: &str,
     writer: &mut LogWriter,
 ) -> Result<StreamResult, ExecutorError> {
-    match tokio::time::timeout(Duration::from_secs(PROMPT_SEND_TIMEOUT_SECONDS), async {
-        stdin.write_all(prompt.as_bytes()).await?;
-        stdin.shutdown().await
-    })
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(e.into()),
-        Err(_) => {
-            return Err(ExecutorError::Other(
-                "timed out sending prompt to gemini".to_owned(),
-            ));
-        }
-    }
+    // The prompt travels as `-p`'s argument; close stdin immediately so the
+    // CLI never waits on it.
+    let _ = stdin.shutdown().await;
     drop(stdin);
 
     writer
@@ -305,6 +338,8 @@ async fn stream_child_output(
     let mut stdout_done = false;
     let mut stderr_done = false;
     let mut summary = None;
+    let mut agent_session_id = None;
+    let mut stdout_tail = String::new();
     let mut saw_output = false;
     let first_output_timeout =
         tokio::time::sleep(Duration::from_secs(FIRST_OUTPUT_TIMEOUT_SECONDS));
@@ -321,6 +356,10 @@ async fn stream_child_output(
                 match line {
                     Ok(Some(line)) => {
                         saw_output = true;
+                        if stdout_tail.len() + line.len() < STDOUT_TAIL_BUFFER_BYTES {
+                            stdout_tail.push_str(&line);
+                            stdout_tail.push('\n');
+                        }
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
                             let kind = json
                                 .get("type")
@@ -340,6 +379,11 @@ async fn stream_child_output(
                                     .or_else(|| json.get("message").and_then(|v| v.as_str()))
                             {
                                 summary = Some(truncate_summary(content));
+                            }
+                            if let Some(session) =
+                                json.get("session_id").and_then(|v| v.as_str())
+                            {
+                                agent_session_id = Some(session.to_owned());
                             }
 
                             writer.write(log_kind, LogStream::Main, json).await?;
@@ -376,7 +420,47 @@ async fn stream_child_output(
         }
     }
 
-    Ok(StreamResult { summary })
+    // `--output-format=json` prints the final document pretty-printed over many
+    // lines, so the per-line parse above never sees it. Recover the session id
+    // and response text from the buffered tail.
+    if (agent_session_id.is_none() || summary.is_none())
+        && let Some(document) = parse_final_json_document(&stdout_tail)
+    {
+        if agent_session_id.is_none() {
+            agent_session_id = document
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+        }
+        if summary.is_none() {
+            summary = document
+                .get("response")
+                .and_then(|v| v.as_str())
+                .map(truncate_summary);
+        }
+    }
+
+    Ok(StreamResult {
+        summary,
+        agent_session_id,
+    })
+}
+
+/// Parse the last top-level JSON object out of buffered stdout. Scans forward
+/// from each `{` at line start so leading non-JSON noise (startup banners,
+/// npm output) doesn't break recovery.
+fn parse_final_json_document(stdout_tail: &str) -> Option<serde_json::Value> {
+    for (offset, _) in stdout_tail.rmatch_indices("\n{") {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&stdout_tail[offset + 1..]) {
+            return Some(value);
+        }
+    }
+    if stdout_tail.trim_start().starts_with('{')
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout_tail.trim())
+    {
+        return Some(value);
+    }
+    None
 }
 
 fn truncate_summary(content: &str) -> String {
@@ -461,6 +545,39 @@ mod tests {
     }
 
     #[test]
+    fn command_builder_forwards_resume_session_id() {
+        let config = GeminiConfig {
+            resume_session_id: Some("4297e3d8-c4d5-4789-bf33-63336047a747".to_owned()),
+            command_overrides: CommandOverrides::default(),
+            ..GeminiConfig::default()
+        };
+
+        let cmd = GeminiAdapter::build_command(&config, "finish the checklist");
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "--resume" && pair[1] == "4297e3d8-c4d5-4789-bf33-63336047a747"
+        }));
+    }
+
+    #[test]
+    fn parses_session_id_from_pretty_printed_final_document() {
+        let stdout_tail = "YOLO mode enabled\n{\n  \"session_id\": \"0d12b860-6661-4aa9-a885-3685b9f8bae5\",\n  \"response\": \"All done.\",\n  \"stats\": {\n    \"models\": {}\n  }\n}\n";
+        let document = parse_final_json_document(stdout_tail).expect("document");
+        assert_eq!(
+            document.get("session_id").and_then(|v| v.as_str()),
+            Some("0d12b860-6661-4aa9-a885-3685b9f8bae5")
+        );
+        assert_eq!(
+            document.get("response").and_then(|v| v.as_str()),
+            Some("All done.")
+        );
+    }
+
+    #[test]
     fn command_builder_maps_model_and_yolo() {
         let config = GeminiConfig {
             model: Some("gemini-2.5-pro".to_owned()),
@@ -469,7 +586,7 @@ mod tests {
             ..GeminiConfig::default()
         };
 
-        let cmd = GeminiAdapter::build_command(&config);
+        let cmd = GeminiAdapter::build_command(&config, "do the task");
         assert_eq!(cmd.as_std().get_program(), "gemini");
         let args: Vec<_> = cmd
             .as_std()
@@ -492,7 +609,7 @@ mod tests {
             ..GeminiConfig::default()
         };
 
-        let cmd = GeminiAdapter::build_command(&config);
+        let cmd = GeminiAdapter::build_command(&config, "do the task");
         let args: Vec<_> = cmd
             .as_std()
             .get_args()
@@ -511,7 +628,7 @@ mod tests {
             ..GeminiConfig::default()
         };
 
-        let cmd = GeminiAdapter::build_command(&config);
+        let cmd = GeminiAdapter::build_command(&config, "do the task");
         let args: Vec<_> = cmd
             .as_std()
             .get_args()
@@ -533,7 +650,7 @@ mod tests {
             ..GeminiConfig::default()
         };
 
-        let cmd = GeminiAdapter::build_command(&config);
+        let cmd = GeminiAdapter::build_command(&config, "do the task");
         assert_eq!(cmd.as_std().get_program(), "/usr/local/bin/gemini");
         let args: Vec<_> = cmd
             .as_std()

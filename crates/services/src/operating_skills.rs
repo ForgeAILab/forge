@@ -32,7 +32,7 @@ pub const MAIN_OPERATING_SKILL_POLICY_JSON: &str =
 pub const MAIN_OPERATING_SKILL_POLICY_DIGEST: &str =
     "9dc9e64f97e693c2dd384a5d60aede819aac52f95fc30fea1f56ac7b7b1075a8";
 pub const MAIN_OPERATING_SKILL_CONTENT_DIGEST: &str =
-    "23de8e721bffa33e8ff49fcdb43d46d7bb5638cf0cbe3f4df70f938242f443d3";
+    "fd591cf53c49cf98680ef85dd61d57f6e08723d572d6bfb4a58693c21870e914";
 
 /// The baseline skill is compiled into the server and rendered fresh each
 /// turn, so unlike the two seeded skills it has no database row to validate
@@ -624,13 +624,9 @@ CHARTER OUTPUT
 Maintain a typed Project Charter draft with identity, problem and people, core experience, initial scope, definition of success, constraints and risks, an epistemic knowledge ledger, and provenance/change summary. The ledger contains observed facts, user decisions, research findings, assumptions, hypotheses, open decisions, and a research queue. Save changes as a new immutable draft revision; do not overwrite an earlier revision.
 
 TURN RESPONSE
-Keep normal replies conversational and concise. When Product Genesis is active, make the current state inspectable using:
-- Current understanding
-- Decisions captured
-- Assumptions / risks
-- Decisions still required (maximum two questions)
-- Charter update (revision or explicit statement that no revision was saved)
-Do not dump the full Charter every turn; link or summarize its delta. Always say whether a Project or handoff was created.
+Talk with the user like a thoughtful product partner, not a form. A normal discovery turn is short conversational prose: react to what the user just said, reflect the one or two things it settles, then ask at most two focused questions that move discovery forward. Do not structure normal turns with headers, section lists, or status scaffolds, and never paste the Charter draft or its sections into chat while discovery is ongoing.
+Keep the Charter draft updated silently as understanding accumulates. When you saved a revision this turn, say so in one short line (for example "Charter draft updated (rev 5)") without describing its contents; the Forge UI is where the user inspects the draft. If no revision was saved, say nothing about the Charter.
+When the readiness gate is met, settle: present one complete structured recap of the proposed Project — name, vision, target user, core loop, scope and non-goals, success signal, constraints and risks, unresolved assumptions and research queue — with the exact Charter revision and selected Project Agent, and request explicit approval. This settle recap is the only place a full structured summary belongs. Always say whether a Project or handoff was created.
 
 APPROVAL AND PROJECT CREATION
 - When the readiness gate is met, propose one exact Charter revision, Project metadata, and an eligible Project Agent selection.
@@ -978,8 +974,8 @@ mod tests {
     fn seeded_skill_bodies_match_renderer_and_sha256_digests() {
         const V076_MIGRATION: &str =
             include_str!("../../db/migrations/V076__project_charter_milestones_media.sql");
-        const V080_MIGRATION: &str =
-            include_str!("../../db/migrations/V080__awaiting_input_turn_status.sql");
+        const V082_MIGRATION: &str =
+            include_str!("../../db/migrations/V082__conversational_genesis_skill.sql");
 
         fn seeded_body(migration: &str, title: &str) -> String {
             let body_marker = format!("'{title}");
@@ -1002,8 +998,8 @@ mod tests {
 
         for (migration, revision_id, title, renderer_body, expected_digest) in [
             (
-                V080_MIGRATION,
-                "forge.main.project-discovery/v2@2",
+                V082_MIGRATION,
+                "forge.main.project-discovery/v2@3",
                 "Forge Main Agent",
                 canonical_main_operating_skill_body(),
                 MAIN_OPERATING_SKILL_CONTENT_DIGEST,

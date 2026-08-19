@@ -401,8 +401,13 @@ impl TaskService {
                 log_sender: Some(log_tx),
             })
             .await;
+        let mut discarded_read_only_changes = false;
         let restore_result = if let Some(head) = read_only_head.as_deref() {
-            git::restore_worktree(std::path::Path::new(&workspace.worktree_path), head)
+            let worktree_path = std::path::Path::new(&workspace.worktree_path);
+            discarded_read_only_changes =
+                !git::is_worktree_clean(worktree_path).await.unwrap_or(true)
+                    || git::get_current_sha(worktree_path).await.ok().as_deref() != Some(head);
+            git::restore_worktree(worktree_path, head)
                 .await
                 .map_err(ServiceError::from)
         } else {
@@ -412,6 +417,20 @@ impl TaskService {
         restore_result?;
         if let Some(head) = read_only_head {
             result.after_sha = Some(head);
+        }
+        // A read-only execution that wrote anyway means the work was authored in
+        // the wrong task shape (e.g. an implementation task created as
+        // `planning_task`). The changes are already discarded by policy — fail
+        // the execution loudly instead of reporting a clean completion, so the
+        // lost work is visible and the task does not advance on nothing.
+        if discarded_read_only_changes && result.status == ExecutionOutcome::Completed {
+            result.status = ExecutionOutcome::Failed;
+            result.error = Some(format!(
+                "read-only execution produced worktree changes, which were discarded: \
+                 task_type '{}' (role '{}') never receives write access. If this task \
+                 implements code, recreate it as task_type 'task'.",
+                task.task_type, execution.role
+            ));
         }
         let max_turns_exceeded = max_turns_exceeded.load(std::sync::atomic::Ordering::SeqCst);
         let assistant_turn_count = assistant_turn_count.load(std::sync::atomic::Ordering::SeqCst);

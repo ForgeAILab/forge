@@ -473,81 +473,20 @@ impl AgentChatMessageRepo for SqliteDb {
         input: CreateAgentChatMessage,
     ) -> Result<AgentChatMessage> {
         let mut transaction = self.pool.begin().await?;
-        let inserted = sqlx::query(
-            "INSERT INTO agent_chat_message (
-                id, chat_id, sequence, author_type, author_id, content,
-                content_guard_json, sensitivity, status, outcome, model, profile_id,
-                session_id, context_manifest_id, token_usage_json, duration_ms, error,
-                correlation_id, causation_id, handoff_id, source_type, source_id,
-                source_message_id, source_room_id, source_conversation_id,
-                source_sequence, source_metadata_json, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&input.id)
-        .bind(&input.chat_id)
-        .bind(input.sequence)
-        .bind(input.author_type.to_string())
-        .bind(input.author_id.as_deref())
-        .bind(&input.content)
-        .bind(&input.content_guard_json)
-        .bind(&input.sensitivity)
-        .bind(input.status.to_string())
-        .bind(input.outcome.as_deref())
-        .bind(input.model.as_deref())
-        .bind(input.profile_id.as_deref())
-        .bind(input.session_id.as_deref())
-        .bind(input.context_manifest_id.as_deref())
-        .bind(input.token_usage_json.as_deref())
-        .bind(input.duration_ms)
-        .bind(input.error.as_deref())
-        .bind(&input.correlation_id)
-        .bind(input.causation_id.as_deref())
-        .bind(input.handoff_id.as_deref())
-        .bind(&input.source_type)
-        .bind(input.source_id.as_deref())
-        .bind(input.source_message_id.as_deref())
-        .bind(input.source_room_id.as_deref())
-        .bind(input.source_conversation_id.as_deref())
-        .bind(input.source_sequence)
-        .bind(&input.source_metadata_json)
-        .bind(&input.created_at)
-        .execute(&mut *transaction)
-        .await;
-        if let Err(error) = inserted {
-            if let Some(existing) = sqlx::query("SELECT * FROM agent_chat_message WHERE id = ?")
-                .bind(&input.id)
-                .fetch_optional(&mut *transaction)
-                .await?
-            {
-                transaction.commit().await?;
-                return map_agent_chat_message(existing);
-            }
-            return Err(map_chat_write_error(error));
-        }
-        let updated = sqlx::query(
-            "UPDATE agent_chat
-             SET message_count = message_count + 1,
-                 last_message_at = CASE
-                     WHEN last_message_at IS NULL OR last_message_at < ? THEN ?
-                     ELSE last_message_at END,
-                 version = version + 1, updated_at = ?
-             WHERE id = ?",
-        )
-        .bind(&input.created_at)
-        .bind(&input.created_at)
-        .bind(&input.created_at)
-        .bind(&input.chat_id)
-        .execute(&mut *transaction)
-        .await?;
-        if updated.rows_affected() == 0 {
-            return Err(DbError::NotFound);
-        }
-        let message = sqlx::query("SELECT * FROM agent_chat_message WHERE id = ?")
+        // The message id is the idempotency key: a replay with the same id
+        // returns the stored row without consuming another sequence.
+        if let Some(existing) = sqlx::query("SELECT * FROM agent_chat_message WHERE id = ?")
             .bind(&input.id)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(DbError::from)
-            .and_then(map_agent_chat_message)?;
+            .fetch_optional(&mut *transaction)
+            .await?
+        {
+            transaction.rollback().await?;
+            return map_agent_chat_message(existing);
+        }
+        let sequence =
+            allocate_chat_sequence(&mut transaction, &input.chat_id, &input.created_at).await?;
+        let input = CreateAgentChatMessage { sequence, ..input };
+        let message = insert_chat_message(&mut transaction, &input).await?;
         transaction.commit().await?;
         Ok(message)
     }

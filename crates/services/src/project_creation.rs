@@ -224,7 +224,7 @@ pub async fn create_project_from_charter_approval(
             .selected_policy_digest
             .clone()
             .ok_or_else(|| ServiceError::conflict("the consumed approval policy is missing"))?;
-        return create_atomic(
+        let created = create_atomic(
             &db,
             &approval,
             &input,
@@ -267,7 +267,9 @@ pub async fn create_project_from_charter_approval(
             // the durable operation identity used by the DB replay check.
             handoff.correlation_id.clone(),
         )
-        .await;
+        .await?;
+        provision_after_create(&db, &created).await;
+        return Ok(created);
     }
     if approval.lifecycle != "active" {
         return Err(ServiceError::conflict(
@@ -551,7 +553,7 @@ pub async fn create_project_from_charter_approval(
     .map_err(|error| {
         ServiceError::invalid_operation(format!("serialize default Project workflow: {error}"))
     })?;
-    create_atomic(
+    let created = create_atomic(
         &db,
         &approval,
         &input,
@@ -596,7 +598,40 @@ pub async fn create_project_from_charter_approval(
         account_id,
         correlation_id,
     )
-    .await
+    .await?;
+    provision_after_create(&db, &created).await;
+    // Durable Main Chat record of the completed handoff; best-effort because
+    // the Project and handoff are already committed.
+    let (message_id, content) = (
+        format!("genesis-project-created:{}", created.project.id),
+        format!(
+            "Project \u{201c}{}\u{201d} was created from the approved Charter and handed off to {}. \
+             Continue in the Project chat.",
+            created.project.name, identity.name
+        ),
+    );
+    if let Err(error) =
+        crate::append_system_chat_message(&db, &genesis.main_chat_id, &message_id, &content).await
+    {
+        tracing::warn!(%error, project_id = %created.project.id, "Project-created chat anchor failed");
+    }
+    Ok(created)
+}
+
+/// Best-effort executable provisioning (repository + default role
+/// assignments) after the atomic create commits. The Project itself is
+/// already durable, so a provisioning failure is logged rather than turned
+/// into a create failure; a creation replay retries it.
+async fn provision_after_create(db: &Arc<SqliteDb>, created: &CreatedProjectFromCharterApproval) {
+    if let Err(error) =
+        crate::project_provisioning::provision_genesis_project(db, &created.project.id).await
+    {
+        tracing::warn!(
+            project_id = %created.project.id,
+            %error,
+            "Genesis Project provisioning failed; attach a repository or role defaults manually"
+        );
+    }
 }
 
 struct CreateProjectBuild {

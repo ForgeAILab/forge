@@ -353,7 +353,19 @@ Genesis Project creation, binding, Project Chat, Charter attachment, handoff
 message/turn, events, `handed_off` transition, and receipt consumption are one
 database transaction. A failure leaves Genesis `ready_for_project`, the exact
 approval receipt `active`, and no partial Project or handoff; retry with the
-same idempotency key returns the original committed result if one exists. A
+same idempotency key returns the original committed result if one exists.
+After that transaction commits, `project_provisioning` makes the Project
+executable as a best-effort, idempotent step (retried on creation replay): it
+initializes a local git repository (first commit on `main`) under
+`<workspace_root>/repos/`, registers it as the primary repo, and seeds
+`default_role_assignments` (coder/reviewer) from the account's executor
+agents, preferring the Project Agent's provider family and never selecting
+Main/Project-bound identities. Agent `task.propose` executions on a
+charter-backed Project without an explicit governance envelope are bound
+server-side to the active user-approved execution baseline; the proposal
+payload carries only `plan_item_id` (required for implementation Tasks),
+optional `milestone_id` (defaults to the baseline's primary milestone), and
+optional capability/risk classes. A
 release or media-pin failure leaves the milestone `ready_for_release` with no
 partial manifest or pin. Migration failures leave legacy media references and
 bytes usable; physical cleanup is a separate guarded operation. These recovery

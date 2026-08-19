@@ -333,23 +333,8 @@ async fn v076_project_task_is_gated_by_active_user_approved_baseline() {
     let token = common::test_jwt();
     let fixture = create_genesis_project(app, &token, "v076-baseline").await;
 
-    let repo_path = common::setup_git_repo(workspace.path());
-    let default_branch = git_default_branch(&repo_path);
-    request_json(
-        app,
-        Method::POST,
-        &format!("/api/v1/projects/{}/repos", fixture.project_id),
-        &token,
-        json!({
-            "name": "v076-repository",
-            "local_path": repo_path,
-            "remote_url": repo_path,
-            "default_branch": default_branch
-        }),
-        &[StatusCode::CREATED, StatusCode::OK],
-    )
-    .await;
-
+    // Genesis provisioning already registered an initialized primary
+    // repository, which is what makes the Task below repository-capable.
     let baseline = create_baseline(app, &token, &fixture, false).await;
     let baseline_approval = sqlx::query(
         "SELECT principal_type, principal_id, lifecycle, baseline_id,

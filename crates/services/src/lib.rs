@@ -44,11 +44,13 @@ pub mod plan_artifact;
 pub mod pr_service;
 pub mod product_genesis;
 pub mod project_agent_actions;
+pub mod project_agent_selection;
 pub mod project_creation;
 pub mod project_documents;
 pub mod project_hooks;
 pub mod project_member_service;
 pub mod project_orchestration;
+pub mod project_provisioning;
 pub mod project_runtime;
 pub mod prompt_preview;
 pub mod provider_authorization;
@@ -69,9 +71,10 @@ pub use agent_chat_memory_consumer::{
 };
 pub use agent_chat_policy::{AgentChatOperation, AgentChatPolicyError, AgentChatScope};
 pub use agent_chat_service::{
-    AdmittedAgentChatMessage, AgentChatHandoffOutcome, AgentChatService, CancelAgentChatTurnInput,
-    CommittedAgentChatResponse, CreateAgentHandoffInput, SendAgentChatMessageInput,
-    SetMainAgentBindingInput, SetProjectAgentBindingInput,
+    append_system_chat_message, AdmittedAgentChatMessage, AgentChatHandoffOutcome,
+    AgentChatService, CancelAgentChatTurnInput, CommittedAgentChatResponse,
+    CreateAgentHandoffInput, SendAgentChatMessageInput, SetMainAgentBindingInput,
+    SetProjectAgentBindingInput,
 };
 pub use agent_chat_turn_policy::{
     bounded_error as bounded_agent_chat_error, claim as claim_agent_chat_turn,
@@ -170,14 +173,18 @@ pub use operating_skills::{
 pub use operator_status::OperatorStatusService;
 pub use operator_status_emitter::OperatorStatusEmitter;
 pub use product_genesis::{
-    render_product_genesis_prompt, validate_genesis_transition, GenesisLifecycleError,
-    GenesisPromptContext, NewProductGenesisSession, ProductGenesisService, ProductGenesisStart,
-    ProductGenesisStore, SqliteProductGenesisStore, TransitionProductGenesis,
-    PRODUCT_GENESIS_PROMPT_VERSION,
+    charter_approval_chat_message, charter_proposal_chat_message, render_product_genesis_prompt,
+    validate_genesis_transition, GenesisLifecycleError, GenesisPromptContext,
+    NewProductGenesisSession, ProductGenesisService, ProductGenesisStart, ProductGenesisStore,
+    SqliteProductGenesisStore, TransitionProductGenesis, PRODUCT_GENESIS_PROMPT_VERSION,
 };
 pub use project_agent_actions::{
     is_project_orchestration_operation, ExecuteProjectOrchestrationActionInput,
     ProjectOrchestrationActionService,
+};
+pub use project_agent_selection::{
+    current_project_agent_operating_skill_revision, project_agent_policy_digest,
+    resolve_genesis_project_agent, GenesisAgentSelection,
 };
 pub use project_creation::{
     create_project_from_charter_approval, CreateProjectAuthorization,

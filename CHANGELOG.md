@@ -6,6 +6,139 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Fixed
+
+- Gemini executions can now self-heal through workflow-guard rejections.
+  The gemini adapter captures the CLI's `session_id` from the final
+  `--output-format=json` document and honors `resume_session_id` via
+  `--resume`, so the guard bounce-back loop (e.g. "plan checklist
+  incomplete") sends the agent back to finish instead of hard-blocking the
+  task on the first rejection, and the `resume_session` recovery action
+  works for gemini-backed executions.
+- Read-only executions that write anyway now fail loudly. A
+  `planning_task`/`discovery` execution (or reviewer run) whose worktree
+  changed used to have its work silently discarded while the execution
+  reported `completed` — implementation work authored under the wrong task
+  type vanished without a trace. The discard still happens (the policy
+  stands), but the execution now fails with an error naming the task type
+  and the fix.
+- Auto-dispatch and Genesis role seeding no longer route work to a
+  credential-less gemini agent (whose CLI exits immediately) when any
+  other eligible agent exists.
+- Tasks blocked by a workflow guard now show a "Send Back to Agent" action
+  in the task detail sidebar, wired to the `resume_session` recovery.
+  Previously the task showed no action at all and looked permanently stuck.
+- Native (embedded) gemini agents are dispatchable again. The connection
+  health probe sent the AI Studio API key as a Bearer token, which Gemini
+  always rejects — every native gemini agent reported
+  `provider_authentication_failed` and the task dispatcher refused to
+  dispatch to it. The probe now authenticates with `x-goog-api-key`.
+- The context-manifest secret guard no longer rejects the literal policy
+  revision `forge-task-context-policy-1`: the `sk-` OpenAI-key marker only
+  matches at a word boundary, so ordinary words like "task-context" pass.
+  Previously every embedded Task execution failed with "protected values
+  cannot be stored in context manifest policy_revision".
+
+- Product Genesis projects are now executable end-to-end. Previously every
+  Task an agent proposed after handoff landed in the backlog and stayed
+  there forever: the project had no repository (the dispatcher silently
+  skips repo-less tasks), no default role assignments (no agent to
+  dispatch to), and the proposal carried no baseline provenance (the task
+  was never `runnable`). Now:
+  - Project creation from a Charter approval provisions a local git
+    repository under `<workspace_root>/repos/` (initialized with a first
+    commit on `main`) and registers it as the primary repo.
+  - It also seeds `default_role_assignments` (coder/reviewer) from the
+    account's executor agents, preferring the Project Agent's provider
+    family and excluding Main/Project-bound identities.
+  - `task.propose` binds the created Task to the project's active
+    user-approved execution baseline server-side when the payload names a
+    plan item but does not carry a full governance envelope; the payload
+    gains flat `plan_item_id`, `milestone_id`, `capability_class`, and
+    `risk_class` fields, and the chat tool schema documents the contract
+    (milestone defaults to the baseline's primary milestone). A proposal
+    that names no plan item still materializes as a pre-baseline,
+    non-runnable planning record.
+  - A baseline that declares no capability/risk classes no longer rejects
+    every repository-capable Task; an empty class list now means
+    "unconstrained" and the lease issuer's server-selected capability
+    profile applies.
+- Admitted agent `task.propose` actions now execute inline through the
+  normal TaskService path. Previously nothing in the product ever executed
+  them — the proposals stayed `proposed` forever and no Task was created.
+  Validation failures surface to the agent as the tool call's error and can
+  be corrected in-turn.
+- The generic chat proposal tool schema is null-tolerant for optional
+  fields (Gemini emits explicit nulls, which failed the runtime's argument
+  validation and killed the whole turn) and now documents the
+  `task.propose` payload contract in the tool description.
+- Provider API-key injection (`auth_source: forge_provider`) actually
+  reaches CLI executors now. `CommandOverrides` is `#[serde(flatten)]`ed
+  into executor configs, so the key must be written to `config.env`; the
+  injector wrote a nested `command_overrides` object that deserialization
+  silently ignored, leaving every harness run on the CLI's own login.
+- Gemini CLI executor: pass the prompt as `-p`'s argument (current CLIs
+  reject a bare `-p` with the prompt on stdin), trust the task worktree via
+  `GEMINI_CLI_TRUST_WORKSPACE`, and when a provider API key is injected,
+  point the CLI at a Forge-owned `GEMINI_CLI_HOME` that selects API-key
+  auth so a user-level OAuth `selectedAuthType` cannot override it.
+- Pre-dispatch execution failures caused by the in-transition
+  WorkspaceLease/version race are auto-resumable: the dispatcher's recovery
+  pass re-dispatches outside the transition. Previously they were pinned
+  `resume_policy: manual` and the role (typically the reviewer) stalled
+  forever.
+- Agent-attached milestone evidence stores a typed
+  `AuthorizationProvenance` receipt. The old `{operation, action_id}` shape
+  made every subsequent readiness evaluation fail with "corrupt immutable
+  evidence authorization JSON".
+- Genesis Charter approval is no longer blocked on "No eligible Project
+  Agent is selected yet". When the Genesis session has no (eligible)
+  preferred Project Agent, the server auto-selects a deterministic eligible
+  one — account-owned, unpaused, current profile, not the active Main
+  Agent, preferring identities without an active Project binding — so both
+  the Charter card and the Main Agent's `charter.approval_target` action
+  always carry a complete revision set. The card's empty state now only
+  appears when the account has no eligible agent at all and links to Agents
+  setup.
+- The Genesis Charter card is pinned above the Main Chat timeline instead
+  of trailing the newest message. It no longer scrolls away (or drags the
+  view away from the composer) while the conversation streams, and its
+  approval actions stay reachable; the expanded review scrolls internally.
+- Typing `approve` (or `/approve`) in the Main Chat now performs the exact
+  Charter approval and creates the Project. The composer routes the typed
+  confirmation through the same authenticated exact-revision flow as the
+  card's buttons (approval receipt, then atomic create-and-handoff), so it
+  remains an interface confirmation — previously typed approval was a dead
+  end ("awaiting interface confirmation") with no interface path from the
+  keyboard. A bare `approve` is only intercepted while a proposal is
+  actually awaiting confirmation; otherwise it is sent to the agent as a
+  normal message.
+
+### Added
+
+- The Charter lifecycle is anchored in the Main Chat history with durable
+  system messages: one per proposed revision (name, vision, change
+  summary), one for the exact approval receipt, and one when the Project
+  is created and handed off. The proposal survives refresh and handoff in
+  the transcript instead of living only in the transient card. Ids are
+  deterministic, so replays and retries never duplicate an anchor.
+  (`AgentChatMessageRepo::append_agent_chat_message` now allocates the
+  sequence server-side and treats the message id as its idempotency key.)
+
+### Changed
+
+- The Main Agent Product Genesis operating skill (revision
+  `forge.main.project-discovery/v2@3`) now mandates conversational
+  discovery: normal turns are short prose without structured scaffolds or
+  Charter dumps, Charter revisions are saved silently and acknowledged in
+  one line, and the single full structured recap happens at the
+  readiness-gate settle point where explicit approval is requested.
+- The Genesis Charter card always shows the current revision (approved,
+  else draft). The user-facing revision dropdown is gone — revision history
+  stays internal — replaced by a "Compare with previous" toggle that renders
+  the previous and current revisions side by side with changed fields
+  highlighted and unchanged fields checked.
+
 ### Added
 
 - Per-agent token usage, estimated cost, total runs, success rate, and duration analytics across the system:

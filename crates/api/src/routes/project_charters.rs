@@ -25,11 +25,10 @@ use db::{
     ProjectCharterRevisionRecord, ProjectMemberRepo, ProjectOrchestrationRepo, ProjectRepo,
 };
 use services::{
-    evaluate_project_charter_readiness, render_and_digest_charter, semantic_revision_diff,
-    validate_charter_approval_candidate, CHARTER_READINESS_POLICY_VERSION,
+    evaluate_project_charter_readiness, project_agent_policy_digest, render_and_digest_charter,
+    semantic_revision_diff, validate_charter_approval_candidate, CHARTER_READINESS_POLICY_VERSION,
     PROJECT_CHARTER_RENDER_VERSION, PROJECT_OPERATING_SKILL_KEY,
 };
-use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 use crate::{
@@ -1712,13 +1711,6 @@ fn valid_authorization_timestamp(value: &str) -> bool {
     };
     let elapsed = Utc::now().signed_duration_since(timestamp.with_timezone(&Utc));
     elapsed.num_seconds().abs() <= MAX_AUTHORIZATION_CLOCK_SKEW_SECONDS
-}
-
-fn project_agent_policy_digest(tool_policy_json: &str) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"forge.project-agent-policy/v1\0");
-    digest.update(tool_policy_json.as_bytes());
-    hex::encode(digest.finalize())
 }
 
 fn parse_project_mode(value: &str) -> ApiResult<ProjectMode> {

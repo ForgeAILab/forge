@@ -91,6 +91,10 @@ async fn main() {
         .map_or_else(|| PathBuf::from("."), PathBuf::from);
     let workspace_root = absolute_path(config.workspace.root.clone())
         .expect("Failed to resolve workspace root path");
+    // Components that cannot be handed the resolved root explicitly (e.g.
+    // Genesis repo provisioning inside the services crate) fall back to this
+    // env var; export the configured value so every path agrees.
+    std::env::set_var("FORGE_WORKSPACE_ROOT", &workspace_root);
 
     info!(
         bind_addr = %effective_config.server.bind,

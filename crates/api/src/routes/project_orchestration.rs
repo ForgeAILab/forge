@@ -24,8 +24,8 @@ use db::{
     ProjectOrchestrationRepo,
 };
 use services::{
-    evaluate_project_charter_readiness, render_and_digest_charter, semantic_revision_diff,
-    validate_charter_approval_candidate, CHARTER_READINESS_POLICY_VERSION,
+    evaluate_project_charter_readiness, project_agent_policy_digest, render_and_digest_charter,
+    semantic_revision_diff, validate_charter_approval_candidate, CHARTER_READINESS_POLICY_VERSION,
     PROJECT_CHARTER_RENDER_VERSION, PROJECT_OPERATING_SKILL_KEY,
 };
 
@@ -280,6 +280,25 @@ pub async fn save_genesis_charter_revision(
         record,
     )?;
     revision.readiness = Some(readiness);
+    // Durable, refresh-stable anchor in the Main Chat history; best-effort so
+    // the committed revision never fails on the chat write.
+    let (message_id, content) = services::charter_proposal_chat_message(
+        &revision.id,
+        revision.revision_number,
+        &revision.content.identity.working_name,
+        &revision.content.identity.one_line_vision,
+        Some(revision.provenance.change_summary.as_str()),
+    );
+    if let Err(error) = services::append_system_chat_message(
+        &state.db,
+        &session.main_chat_id,
+        &message_id,
+        &content,
+    )
+    .await
+    {
+        tracing::warn!(%error, revision_id = %revision.id, "Charter proposal chat anchor failed");
+    }
     Ok((StatusCode::CREATED, Json(revision)))
 }
 
@@ -405,6 +424,7 @@ pub async fn approve_genesis_charter_revision(
             "the selected Project Agent policy digest is stale",
         ));
     }
+    let approved_project_name = request.approved_project_name.clone();
     let record = ProjectOrchestrationRepo::approve_project_charter(
         &*state.db,
         ApproveProjectCharter {
@@ -439,6 +459,23 @@ pub async fn approve_genesis_charter_revision(
         },
     )
     .await?;
+    // Durable approval receipt anchor in the Main Chat history; best-effort so
+    // the committed approval never fails on the chat write.
+    let (message_id, content) = services::charter_approval_chat_message(
+        &record.id,
+        revision.revision_number,
+        &approved_project_name,
+    );
+    if let Err(error) = services::append_system_chat_message(
+        &state.db,
+        &session.main_chat_id,
+        &message_id,
+        &content,
+    )
+    .await
+    {
+        tracing::warn!(%error, approval_id = %record.id, "Charter approval chat anchor failed");
+    }
     Ok((StatusCode::CREATED, Json(api_approval(record)?)))
 }
 
@@ -549,27 +586,15 @@ async fn selected_project_agent(
     state: &AppState,
     session: &api_types::ProductGenesisSession,
 ) -> ApiResult<Option<ProductAgentSelection>> {
-    let Some(identity_id) = session.preferred_project_agent_identity_id.as_deref() else {
-        return Ok(None);
-    };
-    let Some(identity) = AgentRepo::get_by_id(&*state.db, identity_id).await? else {
-        return Ok(None);
-    };
-    if identity.owner_id.as_deref() != Some(session.account_id.as_str()) || identity.paused {
-        return Ok(None);
-    }
-    let profile = AgentProfileRepo::get_profile(&*state.db, &identity.profile_id)
+    Ok(services::resolve_genesis_project_agent(&state.db, session)
         .await?
-        .filter(|profile| profile.identity_id == identity.id)
-        .ok_or_else(|| ApiError::not_found("agent_profile", identity.profile_id.clone()))?;
-    let operating_skill_revision = current_project_agent_operating_skill_revision(state).await?;
-    Ok(Some(ProductAgentSelection {
-        identity_id: identity.id,
-        display_name: Some(identity.name),
-        profile_revision_id: profile.id,
-        operating_skill_revision,
-        policy_digest: project_agent_policy_digest(&profile.tool_policy_json),
-    }))
+        .map(|selection| ProductAgentSelection {
+            identity_id: selection.identity_id,
+            display_name: Some(selection.display_name),
+            profile_revision_id: selection.profile_revision_id,
+            operating_skill_revision: selection.operating_skill_revision,
+            policy_digest: selection.policy_digest,
+        }))
 }
 
 fn empty_genesis_charter(
@@ -859,14 +884,6 @@ fn parse_charter_lifecycle(value: &str) -> ApiResult<()> {
             "unknown Charter lifecycle: {value}"
         ))),
     }
-}
-
-fn project_agent_policy_digest(tool_policy_json: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut digest = Sha256::new();
-    digest.update(b"forge.project-agent-policy/v1\0");
-    digest.update(tool_policy_json.as_bytes());
-    hex::encode(digest.finalize())
 }
 
 fn parse_project_mode(value: &str) -> ApiResult<ProjectMode> {

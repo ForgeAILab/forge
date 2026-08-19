@@ -1335,15 +1335,27 @@ async fn validate_document_revisions(
 }
 
 fn require_allowed_class(requested: Option<&str>, allowed_json: &str, field: &str) -> Result<()> {
-    let Some(requested) = requested.filter(|value| !value.trim().is_empty()) else {
-        return Err(ServiceError::invalid_operation(format!(
-            "repository implementation Tasks require {field}"
-        )));
-    };
     let allowed: Value = serde_json::from_str(allowed_json).map_err(|error| {
         ServiceError::invalid_operation(format!("invalid baseline {field} list: {error}"))
     })?;
-    if !json_contains_identifier_value(&allowed, requested) {
+    // A baseline that declares no classes at all leaves the field
+    // unconstrained: the lease issuer falls back to the server-selected
+    // capability profile. Only a baseline that names classes turns the field
+    // into a required, closed choice.
+    let declares_classes = match &allowed {
+        Value::Array(values) => !values.is_empty(),
+        Value::Null => false,
+        _ => true,
+    };
+    let Some(requested) = requested.filter(|value| !value.trim().is_empty()) else {
+        if declares_classes {
+            return Err(ServiceError::invalid_operation(format!(
+                "repository implementation Tasks require {field}"
+            )));
+        }
+        return Ok(());
+    };
+    if declares_classes && !json_contains_identifier_value(&allowed, requested) {
         return Err(ServiceError::invalid_operation(format!(
             "Task {field} is outside the approved execution baseline"
         )));
