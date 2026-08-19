@@ -155,6 +155,9 @@ pub enum TaskToolRole {
     Worker,
     /// May read the worktree and run the fixed validation check only.
     Reviewer,
+    /// May read the worktree only; plans are authored through Task
+    /// metadata/native domain tools, never through worktree writes.
+    Planner,
 }
 
 impl TaskToolRole {
@@ -162,6 +165,7 @@ impl TaskToolRole {
         match (scope.workspace_access, role) {
             (WorkspaceAccess::TaskWrite, Some("worker" | "coder")) => Ok(Self::Worker),
             (WorkspaceAccess::TaskRead, Some("reviewer")) => Ok(Self::Reviewer),
+            (WorkspaceAccess::TaskRead, Some("planner")) => Ok(Self::Planner),
             (WorkspaceAccess::TaskWrite, Some(other))
             | (WorkspaceAccess::TaskRead, Some(other)) => Err(AgentHostError::Authority(format!(
                 "Task workspace access is not valid for role `{other}`"
@@ -326,6 +330,9 @@ impl ScopeToolComposition {
                             coverage_set.insert(Permission::ProcessSpawn);
                         }
                     }
+                    // The planner surface is the read tool above only: no
+                    // writes, no command spawn, no validation process.
+                    TaskToolRole::Planner => {}
                 }
                 if let Some(provider) = provider {
                     let (read_operations, propose_operations) = task_operations(role);
@@ -1386,7 +1393,10 @@ fn coordination_payload_guidance(operations: &BTreeSet<String>) -> String {
             "plan_item_id (required for implementation Tasks once an execution baseline is ",
             "active — the stable plan-item id from that baseline, for example \"pi-2\"); ",
             "milestone_id (optional, defaults to the active baseline's primary milestone); ",
-            "capability_class / risk_class (only when the baseline declares allowed classes). ",
+            "capability_class (when supplied it must be one of the server-approved profiles: ",
+            "\"repository_read\", \"repository_write\", \"read_only\", \"discovery_read\", ",
+            "\"planning_read\" — and, when the baseline declares allowed classes, also one of ",
+            "those); risk_class (only when the baseline declares allowed classes). ",
             "Forge binds the Task to the Project's active user-approved baseline revision ",
             "itself; never echo baseline ids or digests.",
         ));
@@ -3497,6 +3507,38 @@ mod tests {
         assert!(!reviewer_names.contains(&"forge_task_command".to_owned()));
         assert!(reviewer.coverage().contains(&Permission::FsRead));
         assert!(!reviewer.coverage().contains(&Permission::FsWrite));
+    }
+
+    #[test]
+    fn planner_surface_is_read_only_and_never_write_scoped() {
+        let planner = ScopeToolComposition::for_scope_with_permissions(
+            "identity-1",
+            scope(CanonicalScopeType::Task, WorkspaceAccess::TaskRead),
+            Some("planner"),
+            Some("/tmp/forge/task-1"),
+            &all_permissions(),
+            None,
+        )
+        .expect("planner composition");
+        let names = planner.tool_names();
+        assert!(names.contains(&"forge_task_read".to_owned()));
+        assert!(!names.contains(&"forge_task_write".to_owned()));
+        assert!(!names.contains(&"forge_task_command".to_owned()));
+        assert!(!names.contains(&"forge_task_validate".to_owned()));
+        assert!(planner.coverage().contains(&Permission::FsRead));
+        assert!(!planner.coverage().contains(&Permission::FsWrite));
+        assert!(!planner.coverage().contains(&Permission::ProcessSpawn));
+
+        // A planner session never composes against a write-capable scope.
+        let write_scoped = ScopeToolComposition::for_scope_with_permissions(
+            "identity-1",
+            scope(CanonicalScopeType::Task, WorkspaceAccess::TaskWrite),
+            Some("planner"),
+            Some("/tmp/forge/task-1"),
+            &all_permissions(),
+            None,
+        );
+        assert!(matches!(write_scoped, Err(AgentHostError::Authority(_))));
     }
 
     #[test]

@@ -195,6 +195,19 @@ impl ExecutionRepo for SqliteDb {
                 return Err(DbError::InvalidTransition);
             }
         }
+        let terminal_transition = match input.status.as_ref() {
+            Some(ExecutionStatus::Failed)
+                if !matches!(execution.status, ExecutionStatus::Failed) =>
+            {
+                Some("execution.failed")
+            }
+            Some(ExecutionStatus::Completed)
+                if !matches!(execution.status, ExecutionStatus::Completed) =>
+            {
+                Some("execution.completed")
+            }
+            _ => None,
+        };
 
         let mut query = sqlx::QueryBuilder::<Sqlite>::new("UPDATE execution SET ");
         let mut needs_comma = false;
@@ -258,12 +271,68 @@ impl ExecutionRepo for SqliteDb {
         if needs_comma {
             query.push(", ");
         }
-        query.push("updated_at = ").push_bind(input.updated_at);
+        query.push("updated_at = ").push_bind(&input.updated_at);
         query.push(" WHERE id = ").push_bind(&input.id);
-        query.build().execute(&self.pool).await?;
-        ExecutionRepo::get_by_id(self, &input.id)
+        let mut transaction = self.pool.begin().await?;
+        query.build().execute(&mut *transaction).await?;
+        let updated = sqlx::query("SELECT * FROM execution WHERE id = ?")
+            .bind(&input.id)
+            .fetch_optional(&mut *transaction)
             .await?
-            .ok_or(DbError::NotFound)
+            .map(map_execution)
+            .transpose()?
+            .ok_or(DbError::NotFound)?;
+        // Terminal outcomes are agent-critical: they must reach the durable
+        // ledger so Attention can project an incident (failure) or resolve
+        // one (a later success) and wake the responsible agent. The Task
+        // transition ledger alone has no trace of a failed dispatch.
+        if let Some(event_type) = terminal_transition {
+            let event_id = new_uuid_v4();
+            let error_summary: Option<String> = updated
+                .error
+                .as_deref()
+                .map(|error| error.chars().take(500).collect());
+            let project_id: Option<String> =
+                sqlx::query_scalar("SELECT project_id FROM task WHERE id = ?")
+                    .bind(&updated.task_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+            // Project scope: the supervising Project Agent is the wake
+            // target for a failed dispatch, not the task's executor.
+            let (scope_type, scope_id) = match project_id.as_ref() {
+                Some(project_id) => ("project", project_id.clone()),
+                None => ("task", updated.task_id.clone()),
+            };
+            let event = CreateDomainEvent {
+                id: event_id.clone(),
+                event_type: event_type.to_owned(),
+                entity_type: "task".to_owned(),
+                entity_id: updated.task_id.clone(),
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                scope_type: scope_type.to_owned(),
+                scope_id,
+                correlation_id: event_id.clone(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: Some(format!(
+                    "execution-terminal:{}:{}",
+                    updated.id, updated.status
+                )),
+                payload_json: serde_json::json!({
+                    "execution_id": updated.id,
+                    "task_id": updated.task_id,
+                    "project_id": project_id,
+                    "role": updated.role,
+                    "error": error_summary,
+                })
+                .to_string(),
+                created_at: updated.updated_at.clone(),
+            };
+            DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
+        }
+        transaction.commit().await?;
+        Ok(updated)
     }
 
     async fn update_last_activity_at(&self, id: &str, timestamp: &str) -> Result<()> {

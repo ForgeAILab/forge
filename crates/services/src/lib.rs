@@ -62,6 +62,7 @@ pub mod task_dispatcher;
 pub mod task_service;
 pub mod terminal_service;
 pub mod types;
+pub mod wake_turn_consumer;
 pub mod workflow;
 pub mod workspace_cleanup;
 pub mod workspace_execution_lock;
@@ -220,6 +221,9 @@ pub use task_dispatcher::TaskDispatcher;
 pub use task_service::{NewSubtaskInput, TaskService};
 pub use terminal_service::{TerminalActivityTracker, TerminalService};
 pub use types::Assignee;
+pub use wake_turn_consumer::{
+    wake_turn_consumer_lease_owner, wake_turn_consumer_name, WakeTurnConsumer, WakeTurnRun,
+};
 pub use workflow::template_service::WorkflowTemplateService;
 pub use workspace_cleanup::WorkspaceCleanupScheduler;
 pub use workspace_execution_lock::WorkspaceExecutionLockManager;

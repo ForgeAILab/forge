@@ -378,7 +378,6 @@ struct ProjectHandoffExpectation<'a> {
     create_authorization_occurred_at: &'a str,
     identity_id: &'a str,
     profile_revision_id: &'a str,
-    operating_skill_revision: &'a str,
     policy_revision: &'a str,
     policy_digest: &'a str,
     created_at: &'a str,
@@ -1316,12 +1315,18 @@ impl FederatedAgentChatTurnRunner {
             || charter_render_digest.trim().is_empty()
             || selected_identity_id.as_deref() != Some(agent.id.as_str())
             || selected_profile_id.as_deref() != Some(profile.id.as_str())
-            || selected_skill_revision_id.as_deref() != Some(binding_skill_revision_id.as_str())
+            // The approval receipt immutably records the skill revision that
+            // was current at approval time. The skill body is server-owned —
+            // the user approved the agent and policy, not the instruction
+            // text — so a later server-owned revision of the SAME skill key
+            // is admissible; the next block still requires the binding to
+            // carry the exact current server contract.
+            || !expected_skill_revision_id
+                .starts_with(&format!("{PROJECT_OPERATING_SKILL_KEY}@"))
             || selected_policy_revision.as_deref() != Some(binding_policy_revision.as_str())
             || selected_policy_digest.as_deref() != Some(binding_policy_digest.as_str())
             || expected_identity_id != agent.id
             || expected_profile_revision_id != profile.id
-            || expected_skill_revision_id != binding_skill_revision_id
             || expected_policy_revision != binding_policy_revision
             || expected_policy_digest != binding_policy_digest
             || expected_policy_digest != recomputed_policy_digest
@@ -1745,7 +1750,6 @@ impl FederatedAgentChatTurnRunner {
                     create_authorization_occurred_at: &create_authorization_occurred_at,
                     identity_id: &agent.id,
                     profile_revision_id: &profile.id,
-                    operating_skill_revision: &binding_skill_revision_id,
                     policy_revision: &binding_policy_revision,
                     policy_digest: &recomputed_policy_digest,
                     created_at: &handoff_created_at,
@@ -2323,16 +2327,25 @@ impl FederatedAgentChatTurnRunner {
                         workspace_access: WorkspaceAccess::Deny,
                     },
                     workspace_path: None,
-                    provider: NativeProviderConfig {
-                        provider,
-                        base_url: config.base_url,
-                        model: model.clone(),
-                        credential_handle_id: credential_ref.to_owned(),
-                        owner_user_id: owner_user_id.to_owned(),
-                        provider_account_id,
-                        context_tokens: config.context_tokens,
-                        max_input_tokens: config.max_input_tokens,
-                        max_output_tokens: config.max_output_tokens,
+                    provider: {
+                        let (context_tokens, max_input_tokens, max_output_tokens) =
+                            crate::embedded_agent_service::effective_native_limits(
+                                &provider,
+                                config.context_tokens,
+                                config.max_input_tokens,
+                                config.max_output_tokens,
+                            );
+                        NativeProviderConfig {
+                            provider,
+                            base_url: config.base_url,
+                            model: model.clone(),
+                            credential_handle_id: credential_ref.to_owned(),
+                            owner_user_id: owner_user_id.to_owned(),
+                            provider_account_id,
+                            context_tokens,
+                            max_input_tokens,
+                            max_output_tokens,
+                        }
                     },
                     system_prompt: compose_system_prompt(
                         profile.prompt_template.as_deref(),
@@ -3623,7 +3636,14 @@ fn validate_project_handoff_packet(
         && packet.approval.approved_at == expected.approval_created_at
         && packet.project_agent.identity_id == expected.identity_id
         && packet.project_agent.profile_revision_id == expected.profile_revision_id
-        && packet.project_agent.operating_skill_revision == expected.operating_skill_revision
+        // The immutable packet records the skill revision current at handoff
+        // time. The skill body is server-owned; the binding must carry the
+        // exact current server contract (validated separately), so the packet
+        // only needs to name a revision of the same server-owned skill key.
+        && packet
+            .project_agent
+            .operating_skill_revision
+            .starts_with(&format!("{PROJECT_OPERATING_SKILL_KEY}@"))
         && packet.project_agent.policy_revision == expected.policy_revision
         && packet.project_agent.policy_digest == expected.policy_digest
         && packet.content_classification == "approved_project_charter"
@@ -4317,7 +4337,7 @@ mod tests {
     #[test]
     fn project_operating_context_provenance_is_server_owned_and_bounded() {
         let sources = project_operating_context_sources(
-            "forge.project.orchestration/v1@1",
+            "forge.project.orchestration/v1@2",
             "project-skill-content-digest",
             &[
                 OperatingContextReference::included(
@@ -4346,7 +4366,7 @@ mod tests {
         );
         assert_eq!(
             sources[0].source_revision,
-            "forge.project.orchestration/v1@1"
+            "forge.project.orchestration/v1@2"
         );
         assert_eq!(
             sources[0].fragment_fingerprint,
@@ -4360,7 +4380,7 @@ mod tests {
         assert_eq!(sources[1].disposition, "included");
         assert_eq!(sources[2].ordinal, 2);
         let duplicate_resource_sources = project_operating_context_sources(
-            "forge.project.orchestration/v1@1",
+            "forge.project.orchestration/v1@2",
             "project-skill-content-digest",
             &[
                 OperatingContextReference::included(
@@ -4427,7 +4447,7 @@ mod tests {
         let prompt = compose_system_prompt(Some("profile data"), Some(&instruction))
             .expect("Project prompt should include the server-owned skill");
         let sources = project_operating_context_sources(
-            "forge.project.orchestration/v1@1",
+            "forge.project.orchestration/v1@2",
             "project-skill-content-digest",
             &[OperatingContextReference::included(
                 "handoff:opaque-receipt:6f3a4f5e",
@@ -4653,7 +4673,7 @@ mod tests {
             "project_agent": {
                 "identity_id": "identity-5",
                 "profile_revision_id": "profile-6",
-                "operating_skill_revision": "forge.project.orchestration/v1@1",
+                "operating_skill_revision": "forge.project.orchestration/v1@2",
                 "policy_revision": "forge.project-agent-policy/v1",
                 "policy_digest": "policy-digest-7"
             },
@@ -4753,7 +4773,6 @@ mod tests {
             create_authorization_occurred_at: "2026-08-13T00:00:00Z",
             identity_id: "identity-5",
             profile_revision_id: "profile-6",
-            operating_skill_revision: "forge.project.orchestration/v1@1",
             policy_revision: "forge.project-agent-policy/v1",
             policy_digest: "policy-digest-7",
             created_at: "2026-08-13T00:00:00Z",

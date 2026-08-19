@@ -471,6 +471,19 @@ scope-validated originating commitment, one delivery evidence/lifecycle
 projection.  Its event-derived dedupe keys make a crash between projection
 and receipt checkpoint safe to replay.
 
+The `agent-wake-turns` consumer (also started by `forge-cli`) closes the wake
+loop: each `agent.wake.admitted` event becomes one system-authored message
+plus a queued turn job on the woken identity's Agent Chat, composed from the
+durable Attention incident. It also delivers
+`project.execution_baseline.activated` straight to the Project Agent chat as
+a "begin execution" turn — a user approval is its own deterministic admission
+and consumes no wake budget. Terminal execution outcomes are mirrored into
+the ledger by `ExecutionRepo::update` (`execution.failed` /
+`execution.completed`, Project-scoped) so failed dispatches project
+`execution_failed` incidents; Project-scoped incidents with no more specific
+responder wake the active Project Agent binding, whose default wake budget is
+10 admissions per hour.
+
 The `events` crate still wraps `tokio::sync::broadcast`, and the SSE endpoint at
 `/api/v1/events` still drives live clients. For durable events it is a
 post-commit delivery/cache-invalidation projection, not authoritative history

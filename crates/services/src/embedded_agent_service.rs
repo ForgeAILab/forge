@@ -588,6 +588,7 @@ impl EmbeddedAgentService {
             tool_policy_json: input.tool_policy.to_string(),
             config_json: native_config_json(
                 &base_url,
+                &entry.provider,
                 input.context_tokens,
                 input.max_input_tokens,
                 input.max_output_tokens,
@@ -692,6 +693,7 @@ impl EmbeddedAgentService {
                 tool_policy_json: input.tool_policy.to_string(),
                 config_json: native_config_json(
                     &base_url,
+                    &entry.provider,
                     input.context_tokens,
                     input.max_input_tokens,
                     input.max_output_tokens,
@@ -1263,9 +1265,9 @@ impl EmbeddedAgentService {
                 })
             }
             RequestedCanonicalScope::Task { task_id, role } => {
-                if !matches!(role.as_str(), "worker" | "reviewer") {
+                if !matches!(role.as_str(), "worker" | "reviewer" | "planner") {
                     return Err(ServiceError::invalid_operation(
-                        "embedded Task sessions support only worker or reviewer roles",
+                        "embedded Task sessions support only worker, reviewer, or planner roles",
                     ));
                 }
                 let task = TaskRepo::get_by_id(&*self.db, task_id, false)
@@ -1310,10 +1312,12 @@ impl EmbeddedAgentService {
                     .ok_or_else(|| {
                         ServiceError::not_found("task_role_assignment", task_id.clone())
                     })?;
-                let access = if role == "reviewer" {
-                    WorkspaceAccess::TaskRead
-                } else {
-                    WorkspaceAccess::TaskWrite
+                let access = match role.as_str() {
+                    // Reviewer and planner sessions never receive worktree
+                    // write authority; planners author plans through Task
+                    // metadata/native tools only.
+                    "reviewer" | "planner" => WorkspaceAccess::TaskRead,
+                    _ => WorkspaceAccess::TaskWrite,
                 };
                 // A role-table preassignment is not itself a workspace grant.
                 // The workflow must have admitted the task and a live
@@ -1337,23 +1341,30 @@ impl EmbeddedAgentService {
                 .any(|execution| {
                     execution.status == ExecutionStatus::Running
                         && execution.agent_id.as_deref() == Some(identity.id.as_str())
-                        && if role == "reviewer" {
-                            execution.role == default_roles::REVIEWER
-                        } else {
-                            matches!(
+                        && match role.as_str() {
+                            "reviewer" => execution.role == default_roles::REVIEWER,
+                            "planner" => execution.role == default_roles::PLANNER,
+                            _ => matches!(
                                 execution.role.as_str(),
                                 default_roles::WORKER | default_roles::CODER
-                            )
+                            ),
                         }
                 });
                 let claim_admitted = role != "worker"
                     || (task.assignee_type.as_deref() == Some("agent")
                         && task.assignee_id.as_deref() == Some(identity.id.as_str()));
                 if !claim_admitted || !active_execution {
-                    return Err(ServiceError::not_found(
-                        "active_task_execution",
-                        task_id.clone(),
-                    ));
+                    // The Running execution row is re-queried here instead of
+                    // being threaded from the caller, so a stop/terminalize
+                    // racing this authorization makes the row disappear
+                    // between the runner's admission check and this lookup.
+                    // Name the race so the failure is diagnosable; recovery
+                    // stays with the dispatcher's normal retry pass.
+                    return Err(ServiceError::invalid_operation(format!(
+                        "no Running {role} execution for this identity on task {task_id}; \
+                         the execution likely stopped or was superseded between dispatch \
+                         admission and session authorization"
+                    )));
                 }
                 Ok(CanonicalScope {
                     scope_type: CanonicalScopeType::Task,
@@ -1467,16 +1478,13 @@ impl EmbeddedAgentService {
         } else {
             client.get(endpoint).bearer_auth(credential.expose())
         };
-        let response = request
-            .send()
-            .await
-            .map_err(|error| {
-                if error.is_timeout() {
-                    "provider_timeout".to_owned()
-                } else {
-                    "provider_unreachable".to_owned()
-                }
-            })?;
+        let response = request.send().await.map_err(|error| {
+            if error.is_timeout() {
+                "provider_timeout".to_owned()
+            } else {
+                "provider_unreachable".to_owned()
+            }
+        })?;
         let status = response.status().as_u16();
         if !response.status().is_success() {
             tracing::warn!(status, profile_id = %profile.id, "provider health probe rejected");
@@ -1782,17 +1790,59 @@ fn is_protected_runtime_field(key: &str) -> bool {
         || compact.ends_with("token")
 }
 
+/// Provider-aware native model limits `(context, max_input, max_output)`.
+/// The generic defaults are conservative; every current Gemini API model
+/// serves a 1M-token context window, and the generic 96k input budget made
+/// large Task context manifests fail with `budget_exceeded` before the model
+/// was even called.
+fn native_model_limits(provider: &str) -> (u32, u32, u32) {
+    match provider {
+        "gemini" => (1_048_576, 800_000, 64_000),
+        _ => (
+            DEFAULT_CONTEXT_TOKENS,
+            DEFAULT_MAX_INPUT_TOKENS,
+            DEFAULT_MAX_OUTPUT_TOKENS,
+        ),
+    }
+}
+
+/// Effective native model limits at load time. Profiles are immutable
+/// (schema-enforced), so rows created before provider-aware defaults carry
+/// the old generic triple baked into their config. That exact triple can only
+/// be a baked default — never a deliberate user choice of all three values —
+/// so it resolves to the provider defaults instead of capping the model.
+pub(crate) fn effective_native_limits(
+    provider: &str,
+    context_tokens: u32,
+    max_input_tokens: u32,
+    max_output_tokens: u32,
+) -> (u32, u32, u32) {
+    if (context_tokens, max_input_tokens, max_output_tokens)
+        == (
+            DEFAULT_CONTEXT_TOKENS,
+            DEFAULT_MAX_INPUT_TOKENS,
+            DEFAULT_MAX_OUTPUT_TOKENS,
+        )
+    {
+        native_model_limits(provider)
+    } else {
+        (context_tokens, max_input_tokens, max_output_tokens)
+    }
+}
+
 fn native_config_json(
     base_url: &str,
+    provider: &str,
     context_tokens: Option<u32>,
     max_input_tokens: Option<u32>,
     max_output_tokens: Option<u32>,
 ) -> Value {
+    let (default_context, default_input, default_output) = native_model_limits(provider);
     json!({
         "base_url": base_url.trim_end_matches('/'),
-        "context_tokens": context_tokens.unwrap_or(DEFAULT_CONTEXT_TOKENS),
-        "max_input_tokens": max_input_tokens.unwrap_or(DEFAULT_MAX_INPUT_TOKENS),
-        "max_output_tokens": max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
+        "context_tokens": context_tokens.unwrap_or(default_context),
+        "max_input_tokens": max_input_tokens.unwrap_or(default_input),
+        "max_output_tokens": max_output_tokens.unwrap_or(default_output),
         "runtime_revision": forge_agent_host::AGENT_RUNTIME_REVISION,
     })
 }
@@ -2052,6 +2102,7 @@ fn redacted_host_error(error: forge_agent_host::AgentHostError) -> ServiceError 
 fn task_role_admitted_by_workflow(active_role: Option<&str>, requested_role: &str) -> bool {
     match requested_role {
         "reviewer" => active_role == Some(default_roles::REVIEWER),
+        "planner" => active_role == Some(default_roles::PLANNER),
         "worker" => matches!(
             active_role,
             Some(default_roles::WORKER | default_roles::CODER)
@@ -2140,6 +2191,14 @@ mod tests {
         assert!(task_role_admitted_by_workflow(
             Some(default_roles::REVIEWER),
             "reviewer"
+        ));
+        assert!(task_role_admitted_by_workflow(
+            Some(default_roles::PLANNER),
+            "planner"
+        ));
+        assert!(!task_role_admitted_by_workflow(
+            Some(default_roles::CODER),
+            "planner"
         ));
         assert!(!task_role_admitted_by_workflow(None, "worker"));
         assert!(!task_role_admitted_by_workflow(

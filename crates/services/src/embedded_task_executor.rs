@@ -180,7 +180,7 @@ impl EmbeddedTaskExecutor {
                     scope: CanonicalScope {
                         scope_type: CanonicalScopeType::Task,
                         scope_id: ctx.task_id.clone(),
-                        workspace_access: if role == "reviewer"
+                        workspace_access: if is_read_only_task_role(role)
                             || executors::is_worktree_read_only(&ctx.agent_config)
                         {
                             WorkspaceAccess::TaskRead
@@ -189,16 +189,25 @@ impl EmbeddedTaskExecutor {
                         },
                     },
                     workspace_path: Some(ctx.worktree_path.clone()),
-                    provider: NativeProviderConfig {
-                        provider,
-                        base_url: config.base_url,
-                        model: model.clone(),
-                        credential_handle_id: credential_ref.to_owned(),
-                        owner_user_id: owner_user_id.clone(),
-                        provider_account_id,
-                        context_tokens: config.context_tokens,
-                        max_input_tokens: config.max_input_tokens,
-                        max_output_tokens: config.max_output_tokens,
+                    provider: {
+                        let (context_tokens, max_input_tokens, max_output_tokens) =
+                            crate::embedded_agent_service::effective_native_limits(
+                                &provider,
+                                config.context_tokens,
+                                config.max_input_tokens,
+                                config.max_output_tokens,
+                            );
+                        NativeProviderConfig {
+                            provider,
+                            base_url: config.base_url,
+                            model: model.clone(),
+                            credential_handle_id: credential_ref.to_owned(),
+                            owner_user_id: owner_user_id.clone(),
+                            provider_account_id,
+                            context_tokens,
+                            max_input_tokens,
+                            max_output_tokens,
+                        }
                     },
                     system_prompt,
                     history: Vec::new(),
@@ -560,11 +569,12 @@ impl TaskExecutor for EmbeddedTaskExecutor {
             .map_err(|error| ExecutorError::Other(error.to_string()))?;
         let requested_role = canonical_task_role(task_role)
             .map_err(|error| ExecutorError::Other(error.to_string()))?;
-        if requested_role == "reviewer" && !executors::is_worktree_read_only(&ctx.agent_config) {
-            return Err(ExecutorError::Other(
-                "embedded reviewer execution must use the existing read-only worktree path"
-                    .to_owned(),
-            ));
+        if is_read_only_task_role(requested_role)
+            && !executors::is_worktree_read_only(&ctx.agent_config)
+        {
+            return Err(ExecutorError::Other(format!(
+                "embedded {requested_role} execution must use the existing read-only worktree path"
+            )));
         }
         if execution.status != ExecutionStatus::Running
             || execution.task_id != ctx.task_id
@@ -681,10 +691,20 @@ fn canonical_task_role(role: &str) -> Result<&'static str> {
     match role {
         "worker" | "coder" => Ok("worker"),
         "reviewer" => Ok("reviewer"),
+        // Planner keeps its own canonical identity end-to-end: the Task role
+        // assignment lookup and the workflow-state admission both match on
+        // the literal `planner` role, and the native session receives the
+        // read-only Task workspace surface.
+        "planner" => Ok("planner"),
         other => Err(ServiceError::invalid_operation(format!(
             "embedded Task execution is not admitted for role `{other}`"
         ))),
     }
+}
+
+/// Roles whose native Task sessions never receive worktree write access.
+fn is_read_only_task_role(role: &str) -> bool {
+    matches!(role, "reviewer" | "planner")
 }
 
 /// Marker used by the Task runner when it invokes the executor.  Keeping this
@@ -755,11 +775,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_worker_and_reviewer_roles_receive_task_authority() {
+    fn only_known_task_roles_receive_task_authority() {
         assert_eq!(canonical_task_role("worker").unwrap(), "worker");
         assert_eq!(canonical_task_role("coder").unwrap(), "worker");
         assert_eq!(canonical_task_role("reviewer").unwrap(), "reviewer");
-        assert!(canonical_task_role("planner").is_err());
+        assert_eq!(canonical_task_role("planner").unwrap(), "planner");
+        assert!(canonical_task_role("merge_fixer").is_err());
+        assert!(canonical_task_role("").is_err());
+    }
+
+    #[test]
+    fn planner_and_reviewer_are_read_only_task_roles() {
+        assert!(is_read_only_task_role("planner"));
+        assert!(is_read_only_task_role("reviewer"));
+        assert!(!is_read_only_task_role("worker"));
+        assert!(!is_read_only_task_role("coder"));
     }
 
     #[test]

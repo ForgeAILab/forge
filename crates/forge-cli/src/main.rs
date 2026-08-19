@@ -281,6 +281,11 @@ async fn main() {
     let attention_projection = Arc::new(services::AttentionService::new(Arc::clone(&state.db)));
     let mut attention_projection_handle =
         attention_projection.start(state.shutdown_signal.subscribe());
+    let wake_turn_consumer = Arc::new(services::WakeTurnConsumer::new(
+        Arc::clone(&state.db),
+        services::wake_turn_consumer_lease_owner(),
+    ));
+    let mut wake_turn_consumer_handle = wake_turn_consumer.start(state.shutdown_signal.subscribe());
 
     if let Err(error) = state.workflow_template_service.initialize().await {
         warn!(%error, "workflow template initialization failed");
@@ -432,6 +437,15 @@ async fn main() {
             warn!("Attention projection worker did not stop before shutdown timeout");
             attention_projection_handle.abort();
             let _ = attention_projection_handle.await;
+        }
+    }
+    match tokio::time::timeout(Duration::from_secs(5), &mut wake_turn_consumer_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!(%error, "wake turn consumer failed during shutdown"),
+        Err(_) => {
+            warn!("wake turn consumer did not stop before shutdown timeout");
+            wake_turn_consumer_handle.abort();
+            let _ = wake_turn_consumer_handle.await;
         }
     }
 }

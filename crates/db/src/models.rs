@@ -4,6 +4,11 @@ use crate::pagination::PageRequest;
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, Row};
 
+/// Hourly wake-admission budget a Project Agent binding starts with. Zero
+/// disables autonomous wakes entirely, so every binding-creation path must
+/// use this default unless the user explicitly configured a budget.
+pub const DEFAULT_PROJECT_AGENT_WAKE_BUDGET: i64 = 10;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
     pub id: String,

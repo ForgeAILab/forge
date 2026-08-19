@@ -290,9 +290,9 @@ fn guard_manifest_field(name: &str, value: &str, max_len: usize) -> Result<()> {
     let lower = value.to_ascii_lowercase();
     // "sk-" only counts as an OpenAI-style key marker at a word boundary —
     // ordinary words like "task-context" contain the same bytes.
-    let has_key_prefix_marker = lower.match_indices("sk-").any(|(index, _)| {
-        index == 0 || !lower.as_bytes()[index - 1].is_ascii_alphanumeric()
-    });
+    let has_key_prefix_marker = lower
+        .match_indices("sk-")
+        .any(|(index, _)| index == 0 || !lower.as_bytes()[index - 1].is_ascii_alphanumeric());
     if lower.contains("authorization: bearer")
         || lower.contains("api_key")
         || has_key_prefix_marker

@@ -4318,7 +4318,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
                 operating_skill_revision_id, policy_revision, policy_digest,
                 charter_id, charter_revision_id, charter_setup_required,
                 created_at, updated_at
-             ) VALUES (?, ?, ?, ?, 'active', '{}', ?, '[]', 0, 1, NULL,
+             ) VALUES (?, ?, ?, ?, 'active', '{}', ?, '[]', ?, 1, NULL,
                        ?, ?, ?, ?, ?, 0, ?, ?)",
         )
         .bind(&input.project_agent_binding_id)
@@ -4326,6 +4326,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .bind(&identity_id)
         .bind(&profile_id)
         .bind(PROJECT_AGENT_PERMISSION_CEILING)
+        .bind(crate::DEFAULT_PROJECT_AGENT_WAKE_BUDGET)
         .bind(&skill_revision_id)
         .bind(
             approval

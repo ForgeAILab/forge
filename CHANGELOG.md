@@ -8,6 +8,56 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Native (embedded) agents can execute the `planner` role. The embedded
+  Task executor only admitted worker/coder/reviewer, so every genesis
+  project whose workflow has a planning state hard-failed with "embedded
+  Task execution is not admitted for role `planner`". Planner is now a
+  read-only native Task role: the session composes read-only tools (no
+  write/command surface) and the runner forces the read-only worktree
+  path, like reviewer.
+- Dispatch no longer hard-fails when the Task row moves between
+  WorkspaceLease issuance and launch. A role handoff, retry-metadata
+  clear, or concurrent transition bumps `task.version` and broke the
+  lease's exact-match verification ("active WorkspaceLease does not
+  exactly match Task execution authority"). The runner now revokes this
+  execution's stale lease and reissues once through the normal issuance
+  path (which re-validates assignment authority fresh) before failing
+  closed; authority held by another execution is never revoked.
+- The read-only discard error names the actual trigger. A reviewer run on
+  a normal `task` used to be told to "recreate it as task_type 'task'" —
+  which it already was. Role-triggered read-only (reviewer/planner) now
+  says the role never receives write access and implementation belongs to
+  the worker/coder role; the recreate-as-'task' remedy remains only for
+  `planning_task`/`discovery` task types.
+- A `capability_class` outside the server-approved set is rejected when
+  the Task is created, with an error enumerating the allowed values
+  (`repository_read`, `repository_write`, `read_only`, `discovery_read`,
+  `planning_read`). Previously a baseline authoring its own class names
+  (e.g. "implementation") admitted the Task and then every dispatch
+  failed with "not server-approved"; the chat `task.propose` contract now
+  documents the allowed values.
+- Workflow-dispatched worker/coder executions that "complete" without
+  touching the repository or advancing the workflow now fail instead of
+  leaving the task stuck `in_progress` forever. The failure consumes the
+  normal execution retry budget (deferred auto-redispatch, block on
+  exhaustion) and the reason is posted as a task comment so the next
+  attempt's prompt carries the feedback. User-claimed runs keep the old
+  completion semantics.
+- Milestone readiness now gates on every Task bound to the milestone
+  through governance, not only the Tasks its definition happens to list.
+  A milestone definition authored before (or without) an explicit Task
+  selection could compute `ready_for_release` while all of the
+  milestone's governed implementation Tasks were still open — staging an
+  empty release. Cancelled/archived/deleted governed Tasks do not gate.
+- Native Gemini agents no longer fail large Task turns with
+  `budget_exceeded`. Profiles were created with the generic conservative
+  limits (128k context / 96k input) although every current Gemini API
+  model serves a 1M-token context window; provider-aware defaults now
+  apply (1M context / 800k input / 64k output). Because profiles are
+  immutable, existing rows that carry the old generic triple baked into
+  their config resolve to the provider defaults at load time — that exact
+  triple can only be a baked default, never a deliberate choice of all
+  three values.
 - Gemini executions can now self-heal through workflow-guard rejections.
   The gemini adapter captures the CLI's `session_id` from the final
   `--output-format=json` document and honors `resume_session_id` via
@@ -116,6 +166,45 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Project Agents now drive work autonomously between user messages. The
+  wake pipeline is closed end to end:
+  - Terminal execution outcomes land in the durable event ledger
+    (`execution.failed` / `execution.completed`, Project-scoped), so a
+    failed dispatch finally has a durable trace. Attention projects an
+    `execution_failed` incident from it (auto-resolved by a later
+    successful run or a terminal Task transition).
+  - Project-scoped incidents with no more specific responder now wake the
+    Project Agent binding identity (previously most wakes resolved to an
+    executor identity that failed Project-scope eligibility, so nothing
+    was ever admitted).
+  - A new durable `agent-wake-turns` consumer delivers each admitted wake
+    as a system-authored message plus queued turn on the woken agent's
+    chat — the missing half of the wake design: leases were written but
+    nothing ever consumed them. Delivery is idempotent across crash
+    replay; on first startup the consumer fast-forwards past the existing
+    ledger instead of replaying stale wakes; and a `retry_exhausted`
+    incident about a chat's own turns is never delivered back to that
+    chat (feedback loop).
+  - Activating an execution baseline queues a "begin execution" turn for
+    the Project Agent directly (a user approval is its own deterministic
+    admission; no wake budget consumed), so approving the baseline is the
+    single moment work starts.
+  - Project Agent bindings start with a wake budget of 10/hour instead
+    of 0 (which disabled autonomous wakes entirely); existing bindings
+    are migrated.
+  - The Project operating skill (revision
+    `forge.project.orchestration/v1@2`) adds an AUTONOMOUS DRIVE
+    contract: system-authored turns are work orders, setup runs to a
+    single activation approval, claimed steps must exist as server
+    records, and missing prerequisites with eligible reversible defaults
+    are decided and recorded instead of asked. Turn admission now accepts
+    a newer server-owned revision of the approved skill key (the
+    immutable approval receipt keeps recording the revision selected at
+    approval time; the binding must still carry the exact current server
+    contract), and the immutable Charter handoff packet's recorded skill
+    revision is validated as a revision of the same server-owned skill
+    key rather than an exact match — so server-side skill upgrades no
+    longer brick existing Project chats.
 - The Charter lifecycle is anchored in the Main Chat history with durable
   system messages: one per proposed revision (name, vision, change
   summary), one for the exact approval receipt, and one when the Project

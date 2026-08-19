@@ -37,7 +37,7 @@ tokio-util = "0.7"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }
 tracing = { workspace = true }
 url = "2"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 which = "*"
 
 [dev-dependencies]

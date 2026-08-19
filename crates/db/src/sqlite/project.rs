@@ -53,13 +53,14 @@ impl ProjectRepo for SqliteDb {
                     id, project_id, identity_id, profile_id, state,
                     autonomy_policy_json, permission_ceiling_json, subscriptions_json,
                     wake_budget, version, created_at, updated_at
-                 ) VALUES (?, ?, ?, ?, 'active', '{}', ?, '[]', 0, ?, ?, ?)",
+                 ) VALUES (?, ?, ?, ?, 'active', '{}', ?, '[]', ?, ?, ?, ?)",
             )
             .bind(&binding_id)
             .bind(&input.id)
             .bind(&identity_id)
             .bind(&profile_id)
             .bind(DEFAULT_PROJECT_AGENT_PERMISSION_CEILING)
+            .bind(crate::DEFAULT_PROJECT_AGENT_WAKE_BUDGET)
             .bind(current.1)
             .bind(&input.created_at)
             .bind(&input.updated_at)

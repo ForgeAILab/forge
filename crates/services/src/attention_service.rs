@@ -1086,12 +1086,52 @@ impl AttentionService {
                 return Ok(Some(identity_id.to_owned()));
             }
         }
-        if event.entity_type == "task" || event.scope_type == "task" {
-            return Ok(sqlx::query_scalar::<_, String>(
+        // Only a task-scoped wake can admit the task assignee (scope
+        // eligibility matches on the assignment). A task event carried at
+        // project scope must wake the Project Agent instead — the assignee
+        // has no Project binding, so admission would only be suppressed.
+        if event.scope_type == "task" {
+            let assignee = sqlx::query_scalar::<_, String>(
                 "SELECT assignee_id FROM task
                  WHERE id = ? AND assignee_type = 'agent' AND assignee_id IS NOT NULL",
             )
-            .bind(&event.entity_id)
+            .bind(&event.scope_id)
+            .fetch_optional(self.db.pool())
+            .await?;
+            if assignee.is_some() {
+                return Ok(assignee);
+            }
+        }
+        // Project-scoped incidents with no more specific responder wake the
+        // Project Agent: it supervises the Project and is the identity that
+        // can act on review-ready work, failed dispatches, and stalls.
+        let project_id = match event.scope_type.as_str() {
+            "project" => Some(event.scope_id.clone()),
+            _ => {
+                let task_id = if event.entity_type == "task" {
+                    Some(event.entity_id.as_str())
+                } else if event.scope_type == "task" {
+                    Some(event.scope_id.as_str())
+                } else {
+                    None
+                };
+                match task_id {
+                    Some(task_id) => {
+                        sqlx::query_scalar::<_, String>("SELECT project_id FROM task WHERE id = ?")
+                            .bind(task_id)
+                            .fetch_optional(self.db.pool())
+                            .await?
+                    }
+                    None => None,
+                }
+            }
+        };
+        if let Some(project_id) = project_id {
+            return Ok(sqlx::query_scalar::<_, String>(
+                "SELECT identity_id FROM project_agent_binding
+                 WHERE project_id = ? AND state = 'active' AND identity_id IS NOT NULL",
+            )
+            .bind(&project_id)
             .fetch_optional(self.db.pool())
             .await?);
         }
@@ -1806,6 +1846,9 @@ fn classify_event(event: &DomainEvent) -> Option<&'static str> {
             _ => None,
         };
     }
+    if event_type == "execution.failed" {
+        return Some("execution_failed");
+    }
     None
 }
 
@@ -1840,8 +1883,12 @@ fn resolution_categories(event: &DomainEvent) -> Vec<&'static str> {
                 "retry_exhausted",
                 "review_ready",
                 "review_risk",
+                "execution_failed",
             ]);
         }
+    }
+    if event_type == "execution.completed" {
+        categories.push("execution_failed");
     }
     if event_type.contains("review")
         && (event_type.contains("passed") || event_type.contains("approved"))
@@ -1874,6 +1921,7 @@ fn category_metadata(category: &str) -> (i64, &'static str, &'static str) {
         "retry_exhausted" => (90, "Retry budget exhausted", "review_retry"),
         "review_ready" => (55, "Work is ready for review", "review"),
         "review_risk" => (85, "Review reported a risk", "inspect_review"),
+        "execution_failed" => (85, "Task execution failed", "inspect_run"),
         "runtime_offline" => (95, "Agent runtime is unavailable", "restore_runtime"),
         "budget_threshold" => (60, "Agent budget threshold reached", "review_budget"),
         "commitment_overdue" => (75, "Commitment is overdue", "review_commitment"),
@@ -2057,12 +2105,22 @@ mod tests {
                 "run_stalled",
                 "retry_exhausted",
                 "review_ready",
-                "review_risk"
+                "review_risk",
+                "execution_failed"
             ]
         );
         assert_eq!(
             classify_event(&event("project_release.candidate_requested", "{}")),
             Some("human_input_required")
+        );
+        assert_eq!(
+            classify_event(&event("execution.failed", r#"{"error":"boom"}"#)),
+            Some("execution_failed")
+        );
+        assert_eq!(classify_event(&event("execution.completed", "{}")), None);
+        assert_eq!(
+            resolution_categories(&event("execution.completed", "{}")),
+            vec!["execution_failed"]
         );
     }
 

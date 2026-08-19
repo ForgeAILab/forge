@@ -323,6 +323,10 @@ impl TaskService {
                 "risk_class",
             )?;
         }
+        // A baseline may author classes the server cannot dispatch; fail the
+        // proposal now with the allowed vocabulary instead of admitting a
+        // Task whose every dispatch would be refused by the lease issuer.
+        require_server_approved_capability_class(requested.capability_class.as_deref())?;
 
         // Every repository-capable Task becomes runnable only after the exact
         // current baseline revision is active and has a user approval receipt.
@@ -631,6 +635,31 @@ impl TaskService {
         principal_id: Option<&str>,
         execution_id: &str,
     ) -> Result<Option<db::WorkspaceLease>> {
+        self.issue_workspace_lease_with_operation_key(
+            task,
+            workspace,
+            role,
+            principal_id,
+            execution_id,
+            execution_id,
+        )
+        .await
+    }
+
+    /// The issuance body with an explicit idempotency key.  Normal issuance
+    /// keys on the execution id; a stale-lease reissue must use the
+    /// version-derived key because `operation_idempotency_key` is globally
+    /// UNIQUE across all lease rows (revoked ones included) and lease rows
+    /// are immutable by trigger.
+    async fn issue_workspace_lease_with_operation_key(
+        &self,
+        task: &db::Task,
+        workspace: &db::Workspace,
+        role: &str,
+        principal_id: Option<&str>,
+        execution_id: &str,
+        operation_key: &str,
+    ) -> Result<Option<db::WorkspaceLease>> {
         let Some(repo_id) = task.repo_id.as_deref() else {
             return Ok(None);
         };
@@ -678,7 +707,7 @@ impl TaskService {
             task_id: task.id.clone(),
             task_version: task.version,
             execution_id: execution_id.to_owned(),
-            operation_idempotency_key: execution_id.to_owned(),
+            operation_idempotency_key: operation_key.to_owned(),
             repository_binding_id: repo_id.to_owned(),
             base_ref,
             role: canonical_role.to_owned(),
@@ -1035,7 +1064,12 @@ impl TaskService {
             || lease.task_id != task.id
             || lease.task_version != task.version
             || lease.execution_id != execution_id
-            || lease.operation_idempotency_key != execution_id
+            // The lease is keyed either directly on the execution (claim /
+            // launch issuance) or on the version-derived reissue key minted
+            // after a Task-row movement; both stay bound to this execution.
+            || (lease.operation_idempotency_key != execution_id
+                && lease.operation_idempotency_key
+                    != workspace_lease_reissue_key(execution_id, lease.task_version))
             || lease.repository_binding_id != repo_id
             || lease.base_ref != base_ref
             || lease.role != canonical_role
@@ -1216,6 +1250,109 @@ impl TaskService {
         .map(Some)
     }
 
+    /// Verify a running execution's active WorkspaceLease and, when the
+    /// exact-match verification fails, recover once through the normal
+    /// issuance path instead of hard-failing the dispatch.
+    ///
+    /// Any Task-row mutation between lease issuance and this re-verify — a
+    /// role handoff, a retry-metadata clear, a concurrent transition — bumps
+    /// `task.version` and makes the stale lease fail the exact match even
+    /// though the execution's authority is otherwise intact. Recovery stays
+    /// fail-closed: only a lease held by this execution is revoked, the
+    /// reissue runs the full issuance validation (assignment authority is
+    /// re-resolved fresh, and issuance verifies the new lease), and exactly
+    /// one reissue attempt is made.
+    ///
+    /// Returns the fresh Task row the successful verification was performed
+    /// against, so callers do not keep using a stale snapshot.
+    pub(super) async fn verify_or_reissue_active_workspace_lease(
+        &self,
+        task: db::Task,
+        workspace: &db::Workspace,
+        role: &str,
+        principal_id: Option<&str>,
+        execution_id: &str,
+    ) -> Result<db::Task> {
+        let verify_error = match self
+            .verify_active_workspace_lease(&task, workspace, role, principal_id, execution_id)
+            .await
+        {
+            Ok(_lease) => return Ok(task),
+            Err(error) => error,
+        };
+        let Some(stale) = WorkspaceLeaseRepo::get_active_for_task(&*self.db, &task.id).await?
+        else {
+            return Err(verify_error);
+        };
+        if stale.execution_id != execution_id {
+            // Another execution owns the Task's active authority; this
+            // attempt genuinely lost the race and must fail closed.
+            return Err(verify_error);
+        }
+        tracing::info!(
+            task_id = %task.id,
+            execution_id,
+            lease_id = %stale.id,
+            %verify_error,
+            "reissuing this execution's WorkspaceLease after the Task row moved during dispatch"
+        );
+        self.revoke_workspace_lease(&stale).await;
+        let fresh_task = TaskRepo::get_by_id(&*self.db, &task.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+        // The reissue keeps the execution binding but must mint a distinct
+        // idempotency key: the key column is globally UNIQUE (revoked rows
+        // included) and lease rows are immutable, so the revoked lease's key
+        // can never be reused. Verification accepts the derived key form.
+        self.issue_workspace_lease_with_operation_key(
+            &fresh_task,
+            workspace,
+            role,
+            principal_id,
+            execution_id,
+            &workspace_lease_reissue_key(execution_id, fresh_task.version),
+        )
+        .await?
+        .ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "WorkspaceLease reissue did not produce an active lease",
+            )
+        })?;
+        Ok(fresh_task)
+    }
+
+    /// `verify_execution_workspace_authority` with the one-shot stale-lease
+    /// reissue above. Used by `run_execution`'s in-flight re-verifications;
+    /// the initial `start_execution` admission keeps the strict verify.
+    pub(super) async fn verify_or_reissue_execution_workspace_authority(
+        &self,
+        execution: &db::Execution,
+    ) -> Result<()> {
+        let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
+        let Some(workspace_id) = execution.workspace_id.as_deref() else {
+            if task.repo_id.is_some() {
+                return Err(ServiceError::invalid_operation(
+                    "repository execution requires a scheduler WorkspaceLease-backed workspace",
+                ));
+            }
+            return Ok(());
+        };
+        let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+        self.verify_or_reissue_active_workspace_lease(
+            task,
+            &workspace,
+            &execution.role,
+            execution.agent_id.as_deref(),
+            &execution.id,
+        )
+        .await
+        .map(|_task| ())
+    }
+
     pub(super) async fn revoke_workspace_lease(&self, lease: &db::WorkspaceLease) {
         if let Err(error) =
             WorkspaceLeaseRepo::revoke(&*self.db, &lease.id, lease.version, &now_rfc3339()).await
@@ -1227,6 +1364,15 @@ impl TaskService {
             );
         }
     }
+}
+
+/// Idempotency key for a lease reissued after the Task row moved.
+/// `operation_idempotency_key` is globally UNIQUE across every lease row
+/// (revoked included), so a reissue for the same execution needs a distinct,
+/// deterministic key; deriving it from the verified Task version keeps one
+/// reissue identity per (execution, task-version) pair.
+fn workspace_lease_reissue_key(execution_id: &str, task_version: i64) -> String {
+    format!("{execution_id}::reissue::v{task_version}")
 }
 
 fn canonical_workspace_lease_role(role: &str) -> Result<&'static str> {
@@ -1254,11 +1400,38 @@ fn capability_profile_digest(capability_class: &str) -> String {
     format!("sha256:{}", hex::encode(digest.finalize()))
 }
 
+/// The closed set of capability profiles the scheduler can turn into a
+/// WorkspaceLease. Baselines may author narrower subsets, but nothing outside
+/// this list is ever dispatchable, so Task admission validates against it up
+/// front (`require_server_approved_capability_class`).
+const SUPPORTED_CAPABILITY_PROFILES: &[&str] = &[
+    "repository_read",
+    "repository_write",
+    "read_only",
+    "discovery_read",
+    "planning_read",
+];
+
 fn is_supported_capability_profile(capability_class: &str) -> bool {
-    matches!(
-        capability_class,
-        "repository_read" | "repository_write" | "read_only" | "discovery_read" | "planning_read"
-    )
+    SUPPORTED_CAPABILITY_PROFILES.contains(&capability_class)
+}
+
+/// Reject a requested capability_class the lease issuer would refuse later.
+/// Without this, a baseline authoring its own class vocabulary (e.g.
+/// "implementation") admits the Task at creation and then every dispatch
+/// fails; the authoring agent never sees a correctable error.
+fn require_server_approved_capability_class(requested: Option<&str>) -> Result<()> {
+    let Some(capability_class) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    if !is_supported_capability_profile(capability_class) {
+        return Err(ServiceError::invalid_operation(format!(
+            "Task capability_class '{}' is not server-approved; allowed values: {}",
+            capability_class,
+            SUPPORTED_CAPABILITY_PROFILES.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 fn map_workspace_lease_row(row: sqlx::sqlite::SqliteRow) -> db::WorkspaceLease {
@@ -1649,5 +1822,57 @@ mod tests {
             .await
             .expect_err("pre-baseline planning must be read-only");
         assert!(error.to_string().contains("read-only"));
+    }
+
+    #[test]
+    fn capability_class_must_be_server_approved() {
+        assert!(require_server_approved_capability_class(None).is_ok());
+        assert!(require_server_approved_capability_class(Some("")).is_ok());
+        for approved in SUPPORTED_CAPABILITY_PROFILES {
+            assert!(require_server_approved_capability_class(Some(approved)).is_ok());
+        }
+        let error = require_server_approved_capability_class(Some("implementation"))
+            .expect_err("baseline-authored classes outside the server set are rejected");
+        let message = error.to_string();
+        assert!(message.contains("'implementation'"));
+        for approved in SUPPORTED_CAPABILITY_PROFILES {
+            assert!(
+                message.contains(approved),
+                "error must enumerate allowed value {approved}: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unapproved_capability_class_is_rejected_at_task_creation() {
+        let pool = db::create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("pool creates");
+        let service = TaskService::new(
+            Arc::new(db::SqliteDb::new(pool)),
+            Arc::new(EventBus::new(4)),
+        );
+        let error = service
+            .prepare_task_governance(
+                &charter_backed_project(),
+                Some(&"repo-1".to_owned()),
+                "task",
+                Some(TaskGovernanceRequest {
+                    charter_revision_id: Some("charter-revision-1".to_owned()),
+                    baseline_id: None,
+                    baseline_revision_id: None,
+                    plan_item_id: None,
+                    milestone_id: None,
+                    document_revision_ids: Vec::new(),
+                    capability_class: Some("implementation".to_owned()),
+                    risk_class: None,
+                    provenance: None,
+                }),
+            )
+            .await
+            .expect_err("a class the lease issuer would refuse fails at creation");
+        let message = error.to_string();
+        assert!(message.contains("not server-approved"));
+        assert!(message.contains("repository_write"));
     }
 }

@@ -3553,6 +3553,81 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
         Some("logs/run.jsonl".to_owned())
     );
 
+    // Terminal execution transitions land in the durable ledger at Project
+    // scope so Attention can project incidents and wake the Project Agent.
+    let completed_event: (String, String) =
+        sqlx::query_as("SELECT scope_type, scope_id FROM domain_event WHERE dedupe_key = ?")
+            .bind(format!("execution-terminal:{execution_id}:completed"))
+            .fetch_one(db.pool())
+            .await
+            .expect("completed execution event exists");
+    assert_eq!(completed_event.0, "project");
+    assert_eq!(completed_event.1, project_id.clone());
+
+    let failed_execution_id = new_uuid_v4();
+    ExecutionRepo::create(
+        &db,
+        CreateExecution {
+            id: failed_execution_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: Some(agent_id.clone()),
+            role: "executor".to_string(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("failing execution creates");
+    ExecutionRepo::update(
+        &db,
+        UpdateExecution {
+            id: failed_execution_id.clone(),
+            status: Some(ExecutionStatus::Failed),
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: Some(Some("executor exploded".to_owned())),
+            executor_config_snapshot_json: None,
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("execution fails");
+    let failed_event: (String, String, String) = sqlx::query_as(
+        "SELECT event_type, entity_id, payload_json FROM domain_event WHERE dedupe_key = ?",
+    )
+    .bind(format!("execution-terminal:{failed_execution_id}:failed"))
+    .fetch_one(db.pool())
+    .await
+    .expect("failed execution event exists");
+    assert_eq!(failed_event.0, "execution.failed");
+    assert_eq!(failed_event.1, task_id.clone());
+    assert!(failed_event.2.contains("executor exploded"));
+
     let review_id = new_uuid_v4();
     ReviewRepo::create(
         &db,
@@ -3695,7 +3770,7 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
             .unwrap()
             .items
             .len(),
-        1
+        2
     );
     assert_eq!(
         ReviewRepo::list_by_task(&db, &task_id).await.unwrap().len(),
@@ -5760,7 +5835,7 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
             ),
             (
                 "forge.project.orchestration/v1".to_owned(),
-                "forge.project.orchestration/v1@1".to_owned(),
+                "forge.project.orchestration/v1@2".to_owned(),
             ),
         ],
         "a seeded operating-skill revision must be repointed in the same release (V081 regression)"

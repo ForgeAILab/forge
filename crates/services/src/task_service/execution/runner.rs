@@ -107,14 +107,19 @@ impl TaskService {
         let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
-        self.verify_active_workspace_lease(
-            &task,
-            &workspace,
-            &execution.role,
-            execution.agent_id.as_deref(),
-            &execution.id,
-        )
-        .await?;
+        // A Task-row mutation since lease issuance (role handoff, metadata
+        // clear, concurrent transition) fails the exact-match verify; recover
+        // once through the normal issuance path instead of hard-failing, and
+        // keep working against the fresh Task row.
+        let task = self
+            .verify_or_reissue_active_workspace_lease(
+                task,
+                &workspace,
+                &execution.role,
+                execution.agent_id.as_deref(),
+                &execution.id,
+            )
+            .await?;
         let snapshot = execution
             .executor_config_snapshot_json
             .as_deref()
@@ -122,7 +127,7 @@ impl TaskService {
                 ServiceError::invalid_operation("execution missing executor config snapshot")
             })?;
         let mut agent_config = parse_json_value("executor config snapshot", snapshot)?;
-        if execution.role == crate::workflow::default_roles::REVIEWER
+        if read_only_execution_role(&execution.role)
             || matches!(task.task_type.as_str(), "planning_task" | "discovery")
         {
             executors::mark_worktree_read_only(&mut agent_config);
@@ -236,9 +241,10 @@ impl TaskService {
         // Workspace lock acquisition and pre-launch preparation can outlive
         // a lease or a baseline supersession.  Re-read the execution/task
         // bindings and acknowledge the lease immediately before handing
-        // control to an executor.
+        // control to an executor.  A stale lease left behind by a Task-row
+        // mutation is reissued once through the normal issuance path.
         if let Err(error) = self
-            .verify_execution_workspace_authority(&execution_before_launch)
+            .verify_or_reissue_execution_workspace_authority(&execution_before_launch)
             .await
         {
             let failure_message = error.to_string();
@@ -388,6 +394,29 @@ impl TaskService {
         } else {
             None
         };
+        // Baseline for detecting a "narrating" completion that changed
+        // nothing. Only workflow-dispatched (the snapshot carries the
+        // dispatcher's `dispatch.target_role` metadata), write-capable
+        // implementation executions are measured; user-launched/claimed runs
+        // and non-git worktrees are exempt.
+        let noop_completion_baseline = if read_only_head.is_none()
+            && matches!(
+                execution.role.as_str(),
+                crate::workflow::default_roles::WORKER | crate::workflow::default_roles::CODER
+            )
+            && task.task_type == "task"
+            && agent_config
+                .get("dispatch")
+                .and_then(|dispatch| dispatch.get("target_role"))
+                .is_some()
+        {
+            git::get_current_sha(std::path::Path::new(&workspace.worktree_path))
+                .await
+                .ok()
+                .map(|head| (head, task.status.clone(), task.version))
+        } else {
+            None
+        };
         let execution_result = executor
             .execute(ExecutionContext {
                 task_id: task.id.clone(),
@@ -418,19 +447,35 @@ impl TaskService {
         if let Some(head) = read_only_head {
             result.after_sha = Some(head);
         }
-        // A read-only execution that wrote anyway means the work was authored in
-        // the wrong task shape (e.g. an implementation task created as
-        // `planning_task`). The changes are already discarded by policy — fail
-        // the execution loudly instead of reporting a clean completion, so the
-        // lost work is visible and the task does not advance on nothing.
+        // A read-only execution that wrote anyway means the work was authored
+        // under an authority that never receives write access. The changes are
+        // already discarded by policy — fail the execution loudly instead of
+        // reporting a clean completion, so the lost work is visible and the
+        // task does not advance on nothing. Native (embedded) read-only
+        // sessions are additionally enforced at the tool-composition boundary
+        // (TaskRead scopes expose no write/command tools); this discard is the
+        // backstop for CLI executors, whose processes Forge cannot restrict to
+        // a read-only worktree.
         if discarded_read_only_changes && result.status == ExecutionOutcome::Completed {
             result.status = ExecutionOutcome::Failed;
-            result.error = Some(format!(
-                "read-only execution produced worktree changes, which were discarded: \
-                 task_type '{}' (role '{}') never receives write access. If this task \
-                 implements code, recreate it as task_type 'task'.",
-                task.task_type, execution.role
-            ));
+            // Name the actual trigger: read-only is forced either by the
+            // execution role (reviewer/planner) or by the task_type
+            // (planning_task/discovery). The remedy differs.
+            result.error = Some(if read_only_execution_role(&execution.role) {
+                format!(
+                    "read-only execution produced worktree changes, which were discarded: \
+                     role '{}' never receives write access. Implementation work belongs to \
+                     the worker/coder role.",
+                    execution.role
+                )
+            } else {
+                format!(
+                    "read-only execution produced worktree changes, which were discarded: \
+                     task_type '{}' never receives write access. If this task implements \
+                     code, recreate it as task_type 'task'.",
+                    task.task_type
+                )
+            });
         }
         let max_turns_exceeded = max_turns_exceeded.load(std::sync::atomic::Ordering::SeqCst);
         let assistant_turn_count = assistant_turn_count.load(std::sync::atomic::Ordering::SeqCst);
@@ -440,6 +485,41 @@ impl TaskService {
                 Some(limit) => format!("max turns exceeded ({assistant_turn_count}/{limit})"),
                 None => "max turns exceeded".to_owned(),
             });
+        }
+        // A write-capable implementation execution that "completes" while
+        // leaving the repository untouched and firing no workflow transition
+        // has done nothing the pipeline can advance on — the task would sit
+        // in its active state forever with a resume_policy no dispatcher pass
+        // redispatches. Fail it instead, so the normal executor-failure
+        // machinery (retry budget, deferred redispatch, block on exhaustion)
+        // governs. A run that legitimately transitioned the task (e.g. a
+        // verification turn) moves status/version and is exempt.
+        let mut completed_without_repository_effect = false;
+        if result.status == ExecutionOutcome::Completed {
+            if let Some((baseline_head, status_before, version_before)) =
+                noop_completion_baseline.as_ref()
+            {
+                let worktree_path = std::path::Path::new(&workspace.worktree_path);
+                let clean = git::is_worktree_clean(worktree_path).await.unwrap_or(false);
+                let head_unchanged = git::get_current_sha(worktree_path).await.ok().as_deref()
+                    == Some(baseline_head.as_str());
+                if clean && head_unchanged {
+                    let task_after = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                        .await?
+                        .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+                    if task_after.status == *status_before && task_after.version == *version_before
+                    {
+                        completed_without_repository_effect = true;
+                        result.status = ExecutionOutcome::Failed;
+                        result.error = Some(
+                            "execution completed without repository changes or a workflow \
+                             transition; implement the task in the worktree and commit the \
+                             result, or advance the workflow with a reason"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
         }
 
         let current_execution = ExecutionRepo::get_by_id(&*self.db, &execution_id)
@@ -647,6 +727,38 @@ impl TaskService {
                     "failed to handle executor-unavailable execution"
                 );
             }
+        } else if updated.status == ExecutionStatus::Failed && completed_without_repository_effect {
+            // Thread the failure into the next attempt's dispatch prompt (the
+            // dispatch context includes task comments), then run the normal
+            // executor-failure machinery regardless of role so the retry
+            // budget governs the redispatch and exhaustion blocks visibly.
+            if let Err(error) = self
+                .create_system_comment(
+                    &task.id,
+                    format!(
+                        "Execution {} completed without repository changes or a workflow \
+                         transition. Next attempt: implement the task in the worktree and \
+                         commit the result, or advance the workflow with an explicit reason.",
+                        updated.id
+                    ),
+                )
+                .await
+            {
+                tracing::warn!(
+                    execution_id = %updated.id,
+                    task_id = %updated.task_id,
+                    %error,
+                    "failed to record no-op completion feedback comment"
+                );
+            }
+            if let Err(error) = self.annotate_executor_failure_block(&updated).await {
+                tracing::warn!(
+                    execution_id = %updated.id,
+                    task_id = %updated.task_id,
+                    %error,
+                    "failed to schedule retry after commit-less completion"
+                );
+            }
         } else if updated.status == ExecutionStatus::Failed
             && should_block_task_for_failed_execution(&updated)
         {
@@ -747,7 +859,7 @@ impl TaskService {
                 ServiceError::invalid_operation("execution missing executor config snapshot")
             })?;
         let mut executor_config = parse_json_value("executor config snapshot", snapshot)?;
-        if execution.role == crate::workflow::default_roles::REVIEWER
+        if read_only_execution_role(&execution.role)
             || matches!(task.task_type.as_str(), "planning_task" | "discovery")
         {
             executors::mark_worktree_read_only(&mut executor_config);
@@ -772,6 +884,14 @@ impl TaskService {
             max_turns,
         })
     }
+}
+
+/// Roles whose executions never receive worktree write access, regardless of
+/// task_type: the reviewer validates and the planner authors plans through
+/// Task metadata/native tools, never through worktree writes.
+fn read_only_execution_role(role: &str) -> bool {
+    role == crate::workflow::default_roles::REVIEWER
+        || role == crate::workflow::default_roles::PLANNER
 }
 
 fn execution_description(execution: &Execution, task: &Task, agent_config: &Value) -> String {

@@ -312,7 +312,7 @@ impl MilestoneRuntime {
             .waiver_ids_in_tx(&mut tx, project_id, milestone_id)
             .await?;
         let (task_states, document_states) = self
-            .source_states_in_tx(&mut tx, project_id, &definition)
+            .source_states_in_tx(&mut tx, project_id, milestone_id, &definition)
             .await?;
         let commit_build_check_context = self
             .commit_build_check_context_in_tx(&mut tx, project_id, &task_states)
@@ -617,7 +617,7 @@ impl MilestoneRuntime {
             )
             .await?;
         let (task_states, document_states) = self
-            .source_states_in_tx(&mut tx, project_id, &definition)
+            .source_states_in_tx(&mut tx, project_id, milestone_id, &definition)
             .await?;
         let commit_build_check_context = self
             .commit_build_check_context_in_tx(&mut tx, project_id, &task_states)
@@ -2146,10 +2146,34 @@ impl MilestoneRuntime {
         &self,
         tx: &mut Transaction<'_, Sqlite>,
         project_id: &str,
+        milestone_id: &str,
         definition: &MilestoneDefinitionRevision,
     ) -> crate::Result<(Vec<ReadinessTaskState>, Vec<ReadinessDocumentState>)> {
-        let mut tasks = Vec::with_capacity(definition.content.task_ids.len());
-        for task_id in &definition.content.task_ids {
+        // A milestone gates on every Task bound to it, not only the ones its
+        // definition happens to list: governance binds Tasks to milestones at
+        // creation, and a definition authored before (or without) that Task
+        // selection must not compute "ready" while governed work is open.
+        // Cancelled/archived/deleted governed Tasks no longer gate.
+        let governed_task_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT g.task_id FROM project_task_governance g
+             JOIN task t ON t.id = g.task_id
+             WHERE g.milestone_id = ? AND t.project_id = ?
+               AND t.deleted_at IS NULL AND t.archived_at IS NULL
+               AND t.status != 'cancelled'
+             ORDER BY g.task_id",
+        )
+        .bind(milestone_id)
+        .bind(project_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        let mut selected_task_ids: Vec<&String> = definition.content.task_ids.iter().collect();
+        for task_id in &governed_task_ids {
+            if !selected_task_ids.contains(&task_id) {
+                selected_task_ids.push(task_id);
+            }
+        }
+        let mut tasks = Vec::with_capacity(selected_task_ids.len());
+        for task_id in selected_task_ids {
             let row = sqlx::query(
                 "SELECT version, type, status, deleted_at, updated_at
                  FROM task WHERE id = ? AND project_id = ?",

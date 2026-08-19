@@ -80,6 +80,187 @@ async fn run_execution_dispatches_shell_adapter_and_updates_execution() {
 }
 
 #[tokio::test]
+async fn workflow_dispatched_commitless_completion_fails_and_schedules_retry() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = service
+        .create_task(
+            project_id,
+            "No-op completion",
+            Some("narrate without changing anything".to_owned()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("task creates");
+    let claimed = service
+        .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
+        .await
+        .expect("task claims");
+    // Stamp the dispatcher metadata the workflow dispatch path records, so
+    // this run is measured as an autonomous role dispatch (user-claimed runs
+    // without the metadata stay exempt).
+    let execution = ExecutionRepo::get_by_id(&*db, &claimed.execution.id)
+        .await
+        .expect("execution loads")
+        .expect("execution exists");
+    let mut snapshot: serde_json::Value = serde_json::from_str(
+        execution
+            .executor_config_snapshot_json
+            .as_deref()
+            .expect("claimed execution has a snapshot"),
+    )
+    .expect("snapshot parses");
+    snapshot["dispatch"] = json!({ "target_role": execution.role });
+    ExecutionRepo::update(
+        &*db,
+        db::UpdateExecution {
+            id: claimed.execution.id.clone(),
+            status: None,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: Some(Some(snapshot.to_string())),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("dispatch metadata stamps");
+
+    let updated = service
+        .run_execution(claimed.execution.id.clone(), &NoDiffExecutor)
+        .await
+        .expect("execution runs");
+
+    assert_eq!(updated.status, ExecutionStatus::Failed);
+    assert!(
+        updated
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("without repository changes"),
+        "error names the commit-less completion: {:?}",
+        updated.error
+    );
+
+    // The failure enters the normal executor-failure machinery: the retry
+    // budget is consumed and the execution becomes dispatcher-resumable.
+    let after = ExecutionRepo::get_by_id(&*db, &claimed.execution.id)
+        .await
+        .expect("execution reloads")
+        .expect("execution exists");
+    assert_eq!(after.resume_policy, Some(db::ResumePolicy::Auto));
+    let task_after = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    let metadata: serde_json::Value =
+        serde_json::from_str(task_after.metadata_json.as_deref().unwrap_or("{}"))
+            .expect("task metadata parses");
+    assert_eq!(metadata["execution_retry_count"], 1);
+    assert!(
+        metadata.get("deferred_dispatch").is_some(),
+        "a deferred redispatch is scheduled: {metadata}"
+    );
+}
+
+#[tokio::test]
+async fn run_execution_reissues_stale_lease_after_task_row_moves() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = service
+        .create_task(
+            project_id,
+            "Lease survives task-row movement",
+            Some("printf lease-race-ok".to_owned()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("task creates");
+    let claimed = service
+        .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
+        .await
+        .expect("task claims");
+
+    // Any Task-row mutation between lease issuance and dispatch (role
+    // handoff, retry-metadata clear, concurrent transition) bumps the
+    // version and breaks the lease's exact match. The dispatch must
+    // recover by reissuing this execution's lease, not hard-fail.
+    sqlx::query("UPDATE task SET version = version + 1 WHERE id = ?")
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .expect("task version bumps");
+
+    let updated = service
+        .run_execution(claimed.execution.id, &NoDiffExecutor)
+        .await
+        .expect("execution recovers from the stale lease instead of failing");
+
+    assert_eq!(updated.status, ExecutionStatus::Completed);
+}
+
+#[tokio::test]
+async fn user_claimed_commitless_completion_stays_completed() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = service
+        .create_task(
+            project_id,
+            "Claimed no-op",
+            Some("user-invoked run".to_owned()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("task creates");
+    let claimed = service
+        .claim_task(task.id, Assignee::Agent(agent_id), None)
+        .await
+        .expect("task claims");
+
+    // No dispatcher metadata: the claim-launched run keeps the historical
+    // completion semantics even when it changes nothing.
+    let updated = service
+        .run_execution(claimed.execution.id, &NoDiffExecutor)
+        .await
+        .expect("execution runs");
+
+    assert_eq!(updated.status, ExecutionStatus::Completed);
+}
+
+#[tokio::test]
 async fn run_execution_emits_terminal_execution_event() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
