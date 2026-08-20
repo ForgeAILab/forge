@@ -22,6 +22,7 @@ import {
 } from '@/features/agent-chat/hooks'
 import type { AgentChatEntry } from '@/features/agent-chat/types'
 import { BaselineApprovalCard } from '@/features/agent-chat/BaselineApprovalCard'
+import { ProjectCharterApprovalCard } from '@/features/project-charter/ProjectCharterApprovalCard'
 import { useChatSelection } from '@/stores/chat'
 import { useProjectsInfiniteQuery } from '@/api/hooks'
 
@@ -246,6 +247,7 @@ export function ChatPage({ projectId }: { projectId?: string }) {
             {/* Pinned above the timeline so it never trails new messages and
                 the approval actions stay reachable while the chat streams. */}
             {!projectId ? <ProductGenesisCharterCard ref={charterCard} /> : null}
+            {projectId ? <ProjectCharterApprovalCard projectId={projectId} /> : null}
             {projectId ? <BaselineApprovalCard projectId={projectId} /> : null}
             <AgentChatTimeline
               chat={chatQuery.data}

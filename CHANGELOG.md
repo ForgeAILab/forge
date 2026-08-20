@@ -6,6 +6,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Added
+
+- A Project Agent's adoption Charter can be approved from the UI. The agent
+  can draft one but never approve it, so until now the draft dead-ended: the
+  Genesis approval card renders only in Main Chat, and Project Overview only
+  said to ask the agent for a Charter it had already written. The exact
+  revision now surfaces on both surfaces the user actually works in — pinned
+  in Project Agent Chat next to the conversation that produced it, and as a
+  real review-and-approve control in the Overview banner — sharing one hook so
+  neither can offer a different revision than the other. Approval goes through
+  the existing `POST /projects/{id}/charter/revisions/{revision_id}/approve`
+  contract, pinning the Charter and Project versions observed during review.
+
 ### Breaking
 
 - `project.charter.adoption` treats `charter_id` as a reference, not as the id

@@ -1,4 +1,5 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { fireEvent, render as rtlRender, screen, waitFor, within } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '@/api/client'
@@ -29,6 +30,7 @@ vi.mock('@tanstack/react-router', () => ({
 
 vi.mock('@/api/hooks', () => ({
   useProjectOverviewQuery: vi.fn(),
+  useProjectQuery: vi.fn(() => ({ data: undefined, isLoading: false })),
 }))
 
 const mediaFetch = vi.hoisted(() => vi.fn())
@@ -42,8 +44,29 @@ vi.mock('@/api/client', () => {
     }
   }
 
-  return { apiFetchBlob: mediaFetch, ApiError: MockApiError }
+  return {
+    apiFetchBlob: mediaFetch,
+    // The adoption banner reads the Project Charter; an empty projection keeps
+    // it on the "nothing to approve yet" branch these Overview tests assert.
+    apiFetch: vi.fn(async () => ({
+      charter: null,
+      revisions: [],
+      current_draft_revision: null,
+      current_approved_revision: null,
+      approval: null,
+      selected_project_agent: null,
+    })),
+    ApiError: MockApiError,
+  }
 })
+
+/** Every page render needs a QueryClient: the adoption banner queries. */
+function render(ui: ReactNode) {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false, gcTime: 0 } },
+  })
+  return rtlRender(<QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>)
+}
 
 const counts = {
   total: 8n,

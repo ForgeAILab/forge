@@ -22,6 +22,7 @@ import { useProjectOverviewQuery } from '@/api/hooks'
 import { ConflictDetails } from '@/components/conflict-details'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
+import { ProjectCharterAdoptionBanner } from '@/features/project-charter/ProjectCharterAdoptionBanner'
 import { isApiStatus } from '@/lib/api-error'
 import type {
   AcceptanceCheckSummary,
@@ -989,24 +990,7 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
         onRetry={() => void overviewQuery.refetch()}
       />
 
-      {setupRequired ? (
-        <div
-          className="flex min-w-0 items-start gap-3 rounded-lg border border-warning/40 bg-warning/10 p-4"
-          role="status"
-        >
-          <WarningCircle size={19} className="mt-0.5 shrink-0 text-warning" aria-hidden />
-          <div className="min-w-0">
-            <p className="font-medium text-foreground">
-              Charter adoption is required before release
-            </p>
-            <p className="mt-1 break-words text-sm leading-6 text-muted-foreground">
-              This Project predates an approved Charter. Tasks, evidence, Documents, and Project
-              Agent Chat remain usable; ask the Project Agent to prepare an adoption Charter for
-              explicit user approval.
-            </p>
-          </div>
-        </div>
-      ) : null}
+      {setupRequired ? <ProjectCharterAdoptionBanner projectId={projectId} /> : null}
 
       <div className="grid min-w-0 gap-5 xl:grid-cols-[minmax(0,1.45fr)_minmax(300px,0.75fr)]">
         <section
