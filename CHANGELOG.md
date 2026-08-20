@@ -24,6 +24,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   path, which rejects any `expected_charter_version` but 1. Whether the
   Charter shell exists now decides the path, so review feedback can be
   applied before approval instead of only after it.
+- A server restart no longer signs the web client out. The token-refresh call
+  cleared the session on *any* non-2xx and on transport failure, so every
+  restart — routine on a local-first app — discarded a still-valid refresh
+  token and bounced to `/login`. Only the server actually rejecting the
+  refresh token (400/401/403/422) ends the session; anything else surfaces as
+  a retryable `503` with the session intact.
+- The SSE event stream no longer goes silent 15 minutes into a sitting.
+  `EventSource` cannot send an `Authorization` header, so the access token
+  rides in the query string and is fixed for the life of a connection — past
+  its expiry every reconnect re-sent the same dead token and the stream stayed
+  down, which is what left "Thinking…" spinners pinned after a turn had
+  already finished. Reconnects now re-read the store and refresh a stale token
+  before dialing back in.
 
 ### Fixed
 

@@ -1,6 +1,25 @@
 import { useEffect } from 'react'
 import type { QueryClient } from '@tanstack/react-query'
 import { qk } from '@/api/query-keys'
+import { refreshAccess, useAuthStore } from '@/stores/auth'
+
+/** Margin that keeps a reconnect from racing an expiry it is about to cross. */
+const TOKEN_FRESHNESS_MARGIN_MS = 30_000
+
+/** True while the JWT's `exp` is still ahead. An unreadable token counts as stale. */
+function accessTokenIsFresh(token: string): boolean {
+  const payload = token.split('.')[1]
+  if (!payload) return false
+  try {
+    const claims = JSON.parse(
+      atob(payload.replace(/-/g, '+').replace(/_/g, '/')),
+    ) as { exp?: number }
+    if (typeof claims.exp !== 'number') return false
+    return claims.exp * 1000 - Date.now() > TOKEN_FRESHNESS_MARGIN_MS
+  } catch {
+    return false
+  }
+}
 
 /**
  * The backend sends SSE with:
@@ -233,6 +252,13 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
     let source: EventSource | null = null
     let backoffMs = 1000
     let backoffTimer: ReturnType<typeof setTimeout> | null = null
+    // EventSource cannot send an Authorization header, so the access token rides
+    // in the query string and is fixed for the life of a connection. Access
+    // tokens expire in 15 minutes, well inside a single sitting, after which
+    // every reconnect 401s with the same dead token and the live stream stays
+    // silent — a turn completes but its events never arrive. Re-read the store
+    // on each reconnect and mint a fresh token when the current one is stale.
+    let streamToken = accessToken
 
     const handleEvent = (event: MessageEvent<string>) => {
       const payload = parseSseData(event.data)
@@ -249,7 +275,7 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
         clearTimeout(backoffTimer)
         backoffTimer = null
       }
-      source = new EventSource(`/api/v1/events?token=${encodeURIComponent(accessToken)}`)
+      source = new EventSource(`/api/v1/events?token=${encodeURIComponent(streamToken)}`)
 
       // Listen on generic message (unnamed events)
       source.onmessage = handleEvent
@@ -355,16 +381,32 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
         source?.close()
         if (cancelled) return
         backoffTimer = setTimeout(() => {
-          if (!cancelled) {
-            backoffMs = Math.min(backoffMs * 2, 30_000)
-            connect()
-          }
+          void reconnect()
         }, backoffMs)
       }
 
       source.onopen = () => {
         backoffMs = 1000
       }
+    }
+
+    const reconnect = async () => {
+      if (cancelled) return
+      backoffMs = Math.min(backoffMs * 2, 30_000)
+      const current = useAuthStore.getState().accessToken
+      if (current && current !== streamToken) {
+        // Another caller already refreshed; use what the store holds.
+        streamToken = current
+      } else if (!accessTokenIsFresh(streamToken)) {
+        try {
+          streamToken = await refreshAccess()
+        } catch {
+          // Leave streamToken alone: a refresh that could not reach a verdict is
+          // retried on the next backoff tick, and a rejected refresh has already
+          // cleared the session, which unmounts this effect.
+        }
+      }
+      if (!cancelled) connect()
     }
 
     connect()

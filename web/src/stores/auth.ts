@@ -52,6 +52,24 @@ export const useAuthStore = create<AuthState>()(
 // Module-level singleton ensures concurrent 401s share one refresh request
 let pendingRefresh: Promise<string> | null = null
 
+/**
+ * A refresh failure the stored refresh token could still survive: the server was
+ * unreachable or answered with something other than a rejection of the token
+ * itself. Forge runs on the user's own machine and gets restarted constantly, so
+ * discarding the session on one of these would sign the user out every restart.
+ */
+export class RefreshUnavailableError extends Error {
+  constructor(cause: string) {
+    super(`Token refresh unavailable: ${cause}`)
+    this.name = 'RefreshUnavailableError'
+  }
+}
+
+/** Only the server rejecting the refresh token itself invalidates the session. */
+function refreshTokenRejected(status: number): boolean {
+  return status === 400 || status === 401 || status === 403 || status === 422
+}
+
 export async function refreshAccess(): Promise<string> {
   if (pendingRefresh) return pendingRefresh
 
@@ -62,12 +80,21 @@ export async function refreshAccess(): Promise<string> {
   }
 
   pendingRefresh = (async (): Promise<string> => {
-    const response = await fetch('/api/v1/auth/refresh', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ refresh_token: refreshToken }),
-    })
+    let response: Response
+    try {
+      response = await fetch('/api/v1/auth/refresh', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      })
+    } catch (error) {
+      // The server is down or restarting. The refresh token is still good.
+      throw new RefreshUnavailableError(error instanceof Error ? error.message : 'network error')
+    }
     if (!response.ok) {
+      if (!refreshTokenRejected(response.status)) {
+        throw new RefreshUnavailableError(`HTTP ${response.status}`)
+      }
       clearAuth()
       throw new Error('Token refresh failed')
     }

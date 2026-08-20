@@ -24,7 +24,7 @@ import type {
   WorkflowTemplateSummary,
 } from '@/types/generated'
 import type { ProjectHookRunsResponse } from '@/types/generated/bindings/ProjectHookRunsResponse'
-import { refreshAccess, useAuthStore } from '@/stores/auth'
+import { refreshAccess, RefreshUnavailableError, useAuthStore } from '@/stores/auth'
 
 const API_BASE = '/api/v1'
 
@@ -77,7 +77,12 @@ async function apiResponse(path: string, init?: ApiFetchInit): Promise<Response>
     let newToken: string
     try {
       newToken = await refreshAccess()
-    } catch {
+    } catch (error) {
+      // A refresh that could not reach a verdict leaves the session intact —
+      // bouncing to /login here would sign the user out on every server restart.
+      if (error instanceof RefreshUnavailableError) {
+        throw new ApiError(error.message, 503)
+      }
       useAuthStore.getState().clearAuth()
       window.location.href = '/login'
       throw new ApiError('Unauthorized', 401)
