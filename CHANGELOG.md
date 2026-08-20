@@ -8,6 +8,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Conflict, authorization, and task-availability errors from the Forge
+  coordination tools reach the model instead of collapsing into "Forge
+  coordination operation failed". A conflict's entire value is the value it
+  names — which version to send, which revision to base on — and the model
+  never saw any of it: a live run retried an adoption draft eight times, then
+  told the user the platform had locked the Charter pending approval, an
+  explanation it invented to fit an error it could not read. Genuinely
+  internal failures (database, git, review) stay generic.
+
+### Fixed
+
 - `project.charter.adoption` version conflicts name the value that would
   satisfy them. Nothing on the Project surface reads a Charter, so a model
   told only that its `expected_charter_version` is wrong has nowhere to look

@@ -3443,6 +3443,17 @@ fn service_error(error: crate::ServiceError) -> AgentHostError {
             AgentHostError::Authority("Forge scope resource is unavailable".to_owned())
         }
         crate::ServiceError::InvalidOperation { message } => AgentHostError::Authority(message),
+        // A conflict is the server telling the model what to send instead --
+        // which version, which base revision. Collapsing it into the generic
+        // string left the model guessing: a live run retried an adoption draft
+        // eight times, then told the user the platform had locked the Charter.
+        // The message is server-authored and names only ids the caller already
+        // holds, so it is safe to pass through.
+        crate::ServiceError::Conflict(message) => AgentHostError::Authority(message),
+        crate::ServiceError::TaskActionUnavailable { reason, .. } => {
+            AgentHostError::Authority(reason)
+        }
+        crate::ServiceError::AuthorizationDenied { message } => AgentHostError::Authority(message),
         other => {
             // The runtime surfaces only a generic string to the model;
             // keep the underlying cause observable for operators.
@@ -3582,6 +3593,32 @@ fn truncate(value: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conflict_errors_reach_the_model_with_their_instruction() {
+        // The whole value of a conflict is the value it names; a generic
+        // string leaves the model to guess and then invent an explanation.
+        let error = service_error(crate::ServiceError::Conflict(
+            "send expected_charter_version = 2".to_owned(),
+        ));
+        match error {
+            AgentHostError::Authority(message) => {
+                assert_eq!(message, "send expected_charter_version = 2");
+            }
+            other => panic!("conflict must reach the model verbatim, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unexpected_failures_stay_generic_for_the_model() {
+        let error = service_error(crate::ServiceError::Db(db::DbError::VersionConflict));
+        match error {
+            AgentHostError::Runtime(message) => {
+                assert_eq!(message, "Forge coordination operation failed");
+            }
+            other => panic!("internal failures must not leak, got {other:?}"),
+        }
+    }
 
     #[test]
     fn proposal_targets_are_derived_from_scope() {
