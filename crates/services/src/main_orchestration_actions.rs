@@ -263,8 +263,10 @@ impl MainOrchestrationActionService {
                 // repository call below writes this shell and its first
                 // revision in one transaction, so a failed revision cannot
                 // leave Genesis pointing at an empty Charter.
+                // The id is server-minted: agent payloads routinely carry
+                // placeholder ids, and this id becomes a global primary key.
                 ProjectCharterRecord {
-                    id: draft.charter_id.clone(),
+                    id: new_uuid_v4(),
                     account_id: account_id.clone(),
                     genesis_session_id: Some(session.id.clone()),
                     project_id: None,
@@ -1153,26 +1155,31 @@ mod tests {
             })
             .await
             .expect("typed draft execution");
-        let revision_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM project_charter_revision WHERE charter_id = 'charter-1'",
-        )
-        .fetch_one(db.pool())
-        .await
-        .expect("revision count");
-        assert_eq!(revision_count, 1);
-        let charter_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM project_charter WHERE id = 'charter-1'")
-                .fetch_one(db.pool())
-                .await
-                .expect("charter count");
+        // The first Charter shell id is server-minted; the agent-supplied
+        // "charter-1" placeholder must never become the primary key.
         let linked_charter: Option<String> = sqlx::query_scalar(
             "SELECT charter_id FROM product_genesis_session WHERE id = 'genesis-1'",
         )
         .fetch_one(db.pool())
         .await
         .expect("genesis charter pointer");
+        let minted_charter_id = linked_charter.expect("genesis links the minted charter");
+        assert_ne!(minted_charter_id, "charter-1");
+        let charter_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM project_charter WHERE id = ?")
+                .bind(&minted_charter_id)
+                .fetch_one(db.pool())
+                .await
+                .expect("charter count");
         assert_eq!(charter_count, 1);
-        assert_eq!(linked_charter.as_deref(), Some("charter-1"));
+        let revision_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM project_charter_revision WHERE charter_id = ?",
+        )
+        .bind(&minted_charter_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("revision count");
+        assert_eq!(revision_count, 1);
         let replay = service
             .execute(ExecuteMainOrchestrationActionInput {
                 action_id: action.id,

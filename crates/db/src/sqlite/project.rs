@@ -20,7 +20,7 @@ impl ProjectRepo for SqliteDb {
                 "Project Agent identity and profile must be selected together".to_owned(),
             ));
         }
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         sqlx::query("INSERT INTO project (id, name, settings, workflow_definition, workflow_template_name, primary_repo_id, owner_id, project_hooks_json, project_work_epoch, created_at, updated_at) VALUES (?, ?, ?, ?, NULL, ?, ?, '[]', 0, ?, ?)")
             .bind(&input.id)
             .bind(&input.name)
@@ -367,7 +367,7 @@ impl ProjectRepo for SqliteDb {
     }
 
     async fn delete(&self, id: &str) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::begin_immediate(&self.pool).await?;
         let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM project WHERE id = ?")
             .bind(id)
             .fetch_optional(&mut *tx)

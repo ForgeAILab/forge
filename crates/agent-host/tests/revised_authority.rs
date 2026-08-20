@@ -350,6 +350,79 @@ fn project_scope_catalog_contains_task_proposal_but_no_workspace() {
 }
 
 #[test]
+fn task_proposal_schema_declares_plan_item_binding_explicitly() {
+    // Providers such as Gemini only surface declared properties to the
+    // model; prose-only guidance loses `plan_item_id` and every proposal
+    // then materializes a silently unrunnable Task. The generic proposal
+    // payload must therefore declare the task.propose fields as real schema
+    // properties wherever task.propose is admitted.
+    let project_scope = CanonicalScope {
+        scope_type: CanonicalScopeType::Project,
+        scope_id: "project-a".to_owned(),
+        workspace_access: WorkspaceAccess::Deny,
+    };
+    let project_chat_scope = CanonicalScope {
+        scope_type: CanonicalScopeType::AgentChat,
+        scope_id: "project-chat-a".to_owned(),
+        workspace_access: WorkspaceAccess::Deny,
+    };
+    for (scope, project_chat) in [(project_scope, false), (project_chat_scope, true)] {
+        let composition = ScopeToolComposition::for_scope_with_permissions_and_project_chat(
+            "identity-project-a",
+            scope,
+            None,
+            None,
+            &broad_permissions(),
+            project_chat,
+            Some(Arc::new(NoopProvider)),
+        )
+        .expect("composition is valid");
+        let spec = composition
+            .tools()
+            .into_iter()
+            .find(|tool| tool.spec().name == "forge_scope_propose")
+            .expect("scope proposal tool exists")
+            .spec();
+        let payload = spec
+            .input_schema
+            .get("properties")
+            .and_then(|properties| properties.get("payload"))
+            .expect("payload property exists");
+        let properties = payload
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("task.propose payload fields are declared schema properties");
+        for field in [
+            "title",
+            "description",
+            "task_type",
+            "plan_item_id",
+            "milestone_id",
+            "capability_class",
+            "risk_class",
+        ] {
+            assert!(
+                properties.contains_key(field),
+                "payload schema must declare `{field}`"
+            );
+        }
+        let plan_item_description = properties
+            .get("plan_item_id")
+            .and_then(|schema| schema.get("description"))
+            .and_then(Value::as_str)
+            .expect("plan_item_id carries usage guidance");
+        assert!(
+            plan_item_description.contains("REQUIRED"),
+            "plan_item_id must be marked required for implementation Tasks: {plan_item_description}"
+        );
+        assert!(
+            plan_item_description.contains("execution baseline"),
+            "plan_item_id guidance names the active baseline as the id source: {plan_item_description}"
+        );
+    }
+}
+
+#[test]
 fn canonical_scope_rejects_filesystem_access_outside_task() {
     for scope_type in [
         CanonicalScopeType::Account,

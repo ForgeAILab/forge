@@ -379,7 +379,7 @@ impl AgentService {
         tracing::Span::current().record("agent_id", tracing::field::display(&agent_id));
         validate_required("agent_id", &agent_id)?;
         let task_service = TaskService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus));
-        let mut transaction = self.db.pool().begin().await?;
+        let mut transaction = db::begin_immediate(self.db.pool()).await?;
         let role_events = task_service
             .on_agent_deleted_in_tx(&mut transaction, &agent_id)
             .await?;

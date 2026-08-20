@@ -169,7 +169,7 @@ impl TaskService {
             created_at: now.clone(),
             updated_at: now.clone(),
         };
-        let mut transaction = self.db.pool().begin().await?;
+        let mut transaction = db::begin_immediate(self.db.pool()).await?;
         let mut task = TaskRepo::create_in_tx(&*self.db, &mut transaction, create_task).await?;
         if !task.is_automation {
             ProjectRepo::increment_project_work_epoch(
@@ -292,7 +292,7 @@ impl TaskService {
             created_at: now.clone(),
             updated_at: now.clone(),
         };
-        let mut transaction = self.db.pool().begin().await?;
+        let mut transaction = db::begin_immediate(self.db.pool()).await?;
         let task = TaskRepo::create_in_tx(&*self.db, &mut transaction, create_task).await?;
         if let Some(governance) = prepared_governance {
             self.insert_task_governance(

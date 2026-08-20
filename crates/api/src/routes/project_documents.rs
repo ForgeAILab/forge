@@ -177,7 +177,7 @@ pub async fn create_project_document(
     let kind = document_kind_name(request.kind).to_owned();
     let approval_policy = approval_policy_name(request.approval_policy).to_owned();
     let event_id = new_uuid_v4();
-    let mut tx = state.db.pool().begin().await?;
+    let mut tx = db::begin_immediate(state.db.pool()).await?;
     // Lock the Project version before allocating the Document identity.  The
     // expected version is the Project mutation token for creation, not a
     // caller-supplied hint which can be ignored while another Project write
@@ -529,7 +529,7 @@ pub async fn save_project_document_revision(
     let revision_id = new_uuid_v4();
     let created_at = now_rfc3339();
     let event_id = new_uuid_v4();
-    let mut tx = state.db.pool().begin().await?;
+    let mut tx = db::begin_immediate(state.db.pool()).await?;
     let document_row = sqlx::query(
         "SELECT version, current_draft_revision_id
          FROM project_document WHERE id = ? AND project_id = ?",
@@ -830,7 +830,7 @@ pub async fn approve_project_document(
             ));
         }
     }
-    let mut tx = state.db.pool().begin().await?;
+    let mut tx = db::begin_immediate(state.db.pool()).await?;
     if let Some(row) =
         sqlx::query("SELECT * FROM project_document_approval WHERE idempotency_key = ?")
             .bind(&storage_idempotency_key)
@@ -1220,7 +1220,7 @@ pub async fn create_decision_candidate(
     let now = now_rfc3339();
     let candidate_id = new_uuid_v4();
     let event_id = new_uuid_v4();
-    let mut tx = state.db.pool().begin().await?;
+    let mut tx = db::begin_immediate(state.db.pool()).await?;
     let project = sqlx::query("SELECT version FROM project WHERE id = ?")
         .bind(&project_id)
         .fetch_optional(&mut *tx)
@@ -1440,7 +1440,7 @@ pub async fn approve_decision_candidate(
         return Ok((StatusCode::OK, Json(decision_to_api(record)?)));
     }
     let now = now_rfc3339();
-    let mut tx = state.db.pool().begin().await?;
+    let mut tx = db::begin_immediate(state.db.pool()).await?;
     let project =
         sqlx::query("SELECT version, current_charter_revision_id FROM project WHERE id = ?")
             .bind(&project_id)
@@ -1744,7 +1744,7 @@ pub async fn reject_decision_candidate(
         return Ok((StatusCode::OK, Json(candidate_to_api(candidate)?)));
     }
     let now = now_rfc3339();
-    let mut tx = state.db.pool().begin().await?;
+    let mut tx = db::begin_immediate(state.db.pool()).await?;
     let project = sqlx::query("SELECT version FROM project WHERE id = ?")
         .bind(&project_id)
         .fetch_optional(&mut *tx)

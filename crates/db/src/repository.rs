@@ -177,6 +177,15 @@ pub trait AgentSessionRepo: Send + Sync {
     ) -> Result<Option<AgentSession>>;
     async fn update_agent_session(&self, input: UpdateAgentSession) -> Result<AgentSession>;
     async fn rotate_agent_session(&self, input: RotateAgentSession) -> Result<AgentSession>;
+    /// Startup crash recovery: suspends every native-backend session left in
+    /// a non-terminal status by a previous process. Native runtimes live
+    /// inside the server process, so after a restart those rows cannot
+    /// describe a live runtime. Suspension removes them from the active-scope
+    /// set without losing continuity — the LCM timeline is keyed by identity
+    /// and scope, not by the runtime session id, so the next
+    /// create-or-resume in the same scope resumes the same timeline.
+    /// Returns the number of sessions suspended.
+    async fn suspend_stale_native_sessions(&self, updated_at: &str) -> Result<u64>;
 }
 
 #[async_trait]

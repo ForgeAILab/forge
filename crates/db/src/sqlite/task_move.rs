@@ -56,7 +56,7 @@ impl TaskBoardRepo for SqliteDb {
     ) -> Result<MoveTaskPersistence> {
         validate_move_input(&input)?;
         let request_hash = normalized_request(&input)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::begin_immediate(&self.pool).await?;
 
         let reserved = sqlx::query(
             "INSERT INTO task_move_operation (operation_id, project_id, task_id, request_hash, state, created_at, updated_at) VALUES (?, ?, ?, ?, 'processing', ?, ?) ON CONFLICT(operation_id) DO NOTHING",

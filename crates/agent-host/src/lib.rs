@@ -203,6 +203,16 @@ pub struct AgentTurnOutput {
 #[async_trait]
 pub trait TurnEventSink: Send + Sync + fmt::Debug {
     async fn text_delta(&self, _text: &str) {}
+
+    /// A reasoning fragment. `redacted` fragments carry no readable text and
+    /// exist only as liveness/progress signals.
+    async fn reasoning_delta(&self, _text: &str, _redacted: bool) {}
+
+    /// A validated tool call left the model. Argument values are withheld by
+    /// the runtime; only the top-level key names are visible.
+    async fn tool_call_started(&self, _call_id: &str, _name: &str, _argument_keys: &[String]) {}
+
+    async fn tool_call_finished(&self, _call_id: &str, _name: &str, _is_error: bool) {}
 }
 
 #[derive(Debug, Default)]

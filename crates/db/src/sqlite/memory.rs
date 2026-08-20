@@ -228,7 +228,7 @@ impl ScopedMemoryRepository for SqliteDb {
         source_ref: &str,
     ) -> Result<(MemoryItem, bool)> {
         reject_retired_room_memory(item)?;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let existing = sqlx::query("SELECT * FROM memory_item WHERE scope_type = ? AND scope_id = ? AND source_type = ? AND source_type <> 'room' AND kind <> 'room_message' AND json_valid(metadata_json) AND json_extract(metadata_json, '$.source_ref') = ? ORDER BY created_at ASC, id ASC LIMIT 1")
             .bind(&item.scope_type)
             .bind(&item.scope_id)

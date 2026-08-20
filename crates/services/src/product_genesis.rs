@@ -426,7 +426,9 @@ impl ProductGenesisStore for SqliteProductGenesisStore {
         // Session and its immutable chat-instruction overlay are one durable
         // admission.  A failed instruction insert must not leave a Genesis
         // session that the runner cannot reconstruct after restart.
-        let mut transaction = self.db.pool().begin().await.map_err(db_error)?;
+        let mut transaction = db::begin_immediate(self.db.pool())
+            .await
+            .map_err(db_error)?;
         sqlx::query(
             "INSERT INTO product_genesis_session (
                 id, account_id, main_chat_id, prompt_revision, prompt_body, maturity,
@@ -557,7 +559,9 @@ impl ProductGenesisStore for SqliteProductGenesisStore {
         expected_version: i64,
         source_message_id: &str,
     ) -> Result<ProductGenesisSession> {
-        let mut transaction = self.db.pool().begin().await.map_err(db_error)?;
+        let mut transaction = db::begin_immediate(self.db.pool())
+            .await
+            .map_err(db_error)?;
         let row = sqlx::query(
             "SELECT version, source_message_ids_json
              FROM product_genesis_session WHERE id = ?",

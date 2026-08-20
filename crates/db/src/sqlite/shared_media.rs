@@ -194,7 +194,7 @@ impl SharedMediaRepo for SqliteDb {
             &input.final_storage_key,
             &input.staging_storage_key,
         )?;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let dedupe_key = format!(
             "project-media-upload:{}:{}",
             input.project_id, input.idempotency_key
@@ -442,7 +442,7 @@ impl SharedMediaRepo for SqliteDb {
             &input.storage_key,
             &format!("pending/{}", input.storage_key),
         )?;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let dedupe_key = format!(
             "project-media-upload:{}:{}",
             input.project_id, input.idempotency_key
@@ -575,7 +575,7 @@ impl SharedMediaRepo for SqliteDb {
         asset_id: &str,
         now: &str,
     ) -> Result<MediaAsset> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let row = sqlx::query(&format!(
             "SELECT {MEDIA_ASSET_COLUMNS} FROM media_asset
              WHERE id = ? AND project_id = ?"
@@ -647,7 +647,7 @@ impl SharedMediaRepo for SqliteDb {
                 "media checksum is not a SHA-256 digest".to_owned(),
             ));
         }
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let row = sqlx::query(&format!(
             "SELECT {MEDIA_ASSET_COLUMNS} FROM media_asset WHERE id = ?"
         ))
@@ -736,7 +736,7 @@ impl SharedMediaRepo for SqliteDb {
         &self,
         input: ProjectMediaTombstone,
     ) -> Result<Option<MediaAsset>> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let replay = replay_project_media_tombstone_in_tx(&mut transaction, &input).await?;
         transaction.commit().await?;
         Ok(replay)
@@ -768,7 +768,7 @@ impl SharedMediaRepo for SqliteDb {
                 "media tombstone requires a complete authorization envelope".to_owned(),
             ));
         }
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         if let Some(asset) = replay_project_media_tombstone_in_tx(&mut transaction, &input).await? {
             transaction.commit().await?;
             return Ok(asset);
@@ -975,7 +975,7 @@ impl SharedMediaRepo for SqliteDb {
         &self,
         input: CreateProjectMediaAttachmentMutation,
     ) -> Result<ProjectMediaAttachment> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let attachment = &input.attachment;
         let dedupe_key = format!(
             "project-evidence-attach:{}:{}",
@@ -1268,7 +1268,7 @@ impl SharedMediaRepo for SqliteDb {
         &self,
         input: SoftDeleteProjectMediaAttachmentMutation,
     ) -> Result<ProjectMediaAttachment> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let dedupe_key = format!(
             "project-evidence-remove:{}:{}",
             input.project_id, input.idempotency_key
@@ -1390,7 +1390,7 @@ impl SharedMediaRepo for SqliteDb {
         &self,
         input: CreateProjectMediaAttachment,
     ) -> Result<ProjectMediaAttachment> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         ensure_asset_attachable(&mut transaction, &input.asset_id, &input.project_id).await?;
         if input.availability != "available" {
             return Err(DbError::Check(
@@ -1477,7 +1477,7 @@ impl SharedMediaRepo for SqliteDb {
         id: &str,
         deleted_at: &str,
     ) -> Result<ProjectMediaAttachment> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let asset_id = sqlx::query_scalar::<_, String>(
             "SELECT asset_id FROM project_media_attachment WHERE id = ? AND deleted_at IS NULL",
         )
@@ -1517,7 +1517,7 @@ impl SharedMediaRepo for SqliteDb {
         &self,
         input: CreateProjectReleaseMediaPin,
     ) -> Result<ProjectReleaseMediaPin> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
 
         if !is_sha256_digest(&input.asset_checksum) {
             return Err(DbError::Check(
@@ -1616,7 +1616,7 @@ impl SharedMediaRepo for SqliteDb {
     }
 
     async fn reconcile_media_asset(&self, asset_id: &str, now: &str) -> Result<Option<MediaAsset>> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let asset = reconcile_media_asset_in_tx(&mut transaction, asset_id, now).await?;
         transaction.commit().await?;
         Ok(Some(asset))
@@ -1629,7 +1629,7 @@ impl SharedMediaRepo for SqliteDb {
         lease_expires_at: &str,
         limit: i64,
     ) -> Result<Vec<MediaAsset>> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let rows = sqlx::query(&format!(
             "SELECT {MEDIA_ASSET_COLUMNS}
              FROM media_asset
@@ -1702,7 +1702,7 @@ impl SharedMediaRepo for SqliteDb {
         lease_owner: &str,
         lease_expires_at: &str,
     ) -> Result<Option<MediaAsset>> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let row = sqlx::query(&format!(
             "SELECT {MEDIA_ASSET_COLUMNS} FROM media_asset WHERE id = ?"
         ))
@@ -1785,7 +1785,7 @@ impl SharedMediaRepo for SqliteDb {
         expected_version: i64,
         now: &str,
     ) -> Result<Option<MediaAsset>> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let asset = sqlx::query(&format!(
             "SELECT {MEDIA_ASSET_COLUMNS} FROM media_asset WHERE id = ?"
         ))
@@ -1852,7 +1852,7 @@ impl SharedMediaRepo for SqliteDb {
         expected_version: i64,
         deleted_at: &str,
     ) -> Result<Option<MediaAsset>> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let result = sqlx::query(
             "UPDATE media_asset
              SET gc_state = 'deleted', availability = 'purged',

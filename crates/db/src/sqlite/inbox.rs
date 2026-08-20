@@ -129,7 +129,7 @@ impl AgentInboxRepo for SqliteDb {
             .inbox_item_id
             .as_deref()
             .ok_or_else(|| DbError::Check("question must reference its inbox item".to_owned()))?;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         sqlx::query(
             "INSERT OR IGNORE INTO agent_inbox_item (
                 id, recipient_identity_id, scope_type, scope_id, kind, status, title, body,

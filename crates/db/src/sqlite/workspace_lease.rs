@@ -57,7 +57,7 @@ const WORKSPACE_LEASE_COLUMNS: &str = "id, project_id, task_id, task_version, ex
 #[async_trait]
 impl WorkspaceLeaseRepo for SqliteDb {
     async fn issue(&self, input: CreateWorkspaceLease) -> Result<WorkspaceLease> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::begin_immediate(&self.pool).await?;
         if let Some(row) = sqlx::query(&format!(
             "SELECT {WORKSPACE_LEASE_COLUMNS} FROM workspace_lease WHERE id = ?"
         ))
@@ -281,7 +281,7 @@ impl WorkspaceLeaseRepo for SqliteDb {
     }
 
     async fn expire(&self, now: &str, limit: i64) -> Result<Vec<WorkspaceLease>> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::begin_immediate(&self.pool).await?;
         let rows = sqlx::query(&format!(
             "SELECT {WORKSPACE_LEASE_COLUMNS} FROM workspace_lease
              WHERE status = 'active' AND expires_at <= ?

@@ -57,8 +57,8 @@ pub async fn list_attention(
     let items = page
         .items
         .into_iter()
-        .map(attention_service::attention_item)
-        .collect::<services::Result<Vec<_>>>()?;
+        .filter_map(attention_service::attention_item_lenient)
+        .collect::<Vec<_>>();
     let has_more = page.next_cursor.is_some();
     Ok(Json(AttentionListResponse {
         items,

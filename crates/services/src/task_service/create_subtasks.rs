@@ -24,7 +24,7 @@ impl TaskService {
             validate_required("title", &item.title)?;
         }
 
-        let mut transaction = self.db.pool().begin().await?;
+        let mut transaction = db::begin_immediate(self.db.pool()).await?;
         let start_order = sqlx::query_scalar::<_, i64>(
             "SELECT COALESCE(MAX(subtask_order) + 1, 0) FROM task WHERE parent_task_id = ? AND deleted_at IS NULL",
         )

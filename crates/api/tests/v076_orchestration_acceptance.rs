@@ -299,7 +299,7 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
             "project_mode": "compact",
             "selected_project_agent_identity_id": legacy_identity,
             "selected_project_agent_profile_revision_id": legacy_profile,
-            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@1",
+            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@2",
             "selected_project_agent_policy_digest": legacy_policy
         }),
         &[StatusCode::CREATED, StatusCode::OK],
@@ -1073,6 +1073,23 @@ async fn v076_project_evidence_is_scoped_pinned_and_user_attested() {
         json!([task_asset_id.clone()])
     );
 
+    // Governed Tasks gate milestone readiness; complete the helper Task so
+    // the readiness evaluation below can compute "ready".
+    let task_version = task["version"].as_i64().expect("task version");
+    let done_task = request_json(
+        app,
+        Method::POST,
+        &format!("/api/v1/tasks/{task_id}/transition"),
+        &token,
+        json!({
+            "status": "done",
+            "version": task_version,
+            "reason": "V076 evidence helper Task completed"
+        }),
+        &[StatusCode::OK],
+    )
+    .await;
+    assert_eq!(done_task["task"]["status"], json!("done"));
     let milestone = request_json(
         app,
         Method::GET,
@@ -2532,7 +2549,7 @@ async fn create_genesis_project(app: &Router, token: &str, prefix: &str) -> Gene
         "project_mode": "compact",
         "selected_project_agent_identity_id": project_identity,
         "selected_project_agent_profile_revision_id": project_profile,
-        "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@1",
+        "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@2",
         "selected_project_agent_policy_digest": policy_digest
     });
     let approval = request_json(
@@ -2699,7 +2716,6 @@ async fn create_baseline(
     let project_version = project["version"]
         .as_i64()
         .expect("baseline project version");
-    let baseline_id = "v076-baseline-id";
     let proposed = request_json(
         app,
         Method::POST,
@@ -2710,12 +2726,15 @@ async fn create_baseline(
                 "expected_version": project_version,
                 "idempotency_key": "v076-baseline-propose",
                 "authorization": user_authorization("project.execution_baseline.propose", "v076-baseline-propose-event")
-            },
-            "baseline_id": baseline_id
+            }
         }),
         &[StatusCode::CREATED, StatusCode::OK],
     )
     .await;
+    // The baseline shell id is server-minted; clients read it back from the
+    // proposal response.
+    let baseline_id = required_string(&proposed, &["baseline", "id"]);
+    let baseline_id = baseline_id.as_str();
     let baseline_version = proposed["baseline"]["version"]
         .as_i64()
         .expect("baseline version");
@@ -3371,7 +3390,7 @@ fn user_authorization_replay_variants(
 fn user_provenance(summary: &str) -> Value {
     json!({
         "author": {"kind": "user", "id": "test-user-id"},
-        "operating_skill_revision": "forge.project.orchestration/v1@1",
+        "operating_skill_revision": "forge.project.orchestration/v1@2",
         "source_refs": [],
         "change_summary": summary
     })

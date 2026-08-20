@@ -153,24 +153,38 @@ impl AttentionService {
 
         for event in events {
             if let Err(error) = self.project_event(&event).await {
-                let error_code = error_code(&error);
-                let error_message = bounded_error_message(&error);
-                let _ = self
-                    .record_health(UpsertAttentionConsumerHealth {
-                        consumer_name: CONSUMER_NAME.to_owned(),
-                        last_sequence,
-                        last_started_at: None,
-                        last_success_at: None,
-                        last_error_at: Some(now_rfc3339()),
-                        last_error_code: Some(error_code.to_owned()),
-                        last_error_message: Some(error_message),
-                        lease_owner: Some(owner.clone()),
-                        lease_until: None,
-                        processed_events_delta: 0,
-                        updated_at: now_rfc3339(),
-                    })
-                    .await;
-                return Err(error);
+                // A semantic dedupe/check conflict can never succeed on
+                // retry: retrying the same event forever wedges the cursor
+                // and silences the entire wake pipeline. Quarantine the
+                // event (complete it without projection) and keep going;
+                // transient errors still abort the poll and retry.
+                if !matches!(&error, ServiceError::Db(db::DbError::Check(_))) {
+                    let error_code = error_code(&error);
+                    let error_message = bounded_error_message(&error);
+                    let _ = self
+                        .record_health(UpsertAttentionConsumerHealth {
+                            consumer_name: CONSUMER_NAME.to_owned(),
+                            last_sequence,
+                            last_started_at: None,
+                            last_success_at: None,
+                            last_error_at: Some(now_rfc3339()),
+                            last_error_code: Some(error_code.to_owned()),
+                            last_error_message: Some(error_message),
+                            lease_owner: Some(owner.clone()),
+                            lease_until: None,
+                            processed_events_delta: 0,
+                            updated_at: now_rfc3339(),
+                        })
+                        .await;
+                    return Err(error);
+                }
+                tracing::error!(
+                    event_sequence = event.sequence,
+                    event_id = %event.id,
+                    event_type = %event.event_type,
+                    %error,
+                    "attention projection quarantined a poison event"
+                );
             }
 
             let completed_at = now_rfc3339();
@@ -271,7 +285,7 @@ impl AttentionService {
         let leased_until = (now + Duration::seconds(lease_seconds)).to_rfc3339();
         let cooldown_until = (now + Duration::seconds(cooldown_seconds)).to_rfc3339();
         let now = now.to_rfc3339();
-        let mut transaction = self.db.pool().begin().await?;
+        let mut transaction = db::begin_immediate(self.db.pool()).await?;
 
         let (budget, budget_scope_type, budget_scope_id) = self
             .wake_budget_in_tx(
@@ -399,9 +413,23 @@ impl AttentionService {
         // it can never admit a wake that has no durable action for a later
         // worker to consume.  This is an explicit domain action, not model
         // work, and its payload contains only bounded identifiers/metadata.
+        // The key must be unique per admission, not per incident: the same
+        // incident key legitimately re-admits after its lease expires, and a
+        // key that omits the triggering event would collide with the earlier
+        // admission's event (same key, different lease/cooldown payload) and
+        // permanently wedge the projection on a dedupe conflict. The
+        // causation event id is replay-stable, so re-projecting the same
+        // source event still deduplicates.
         let wake_action_dedupe = format!(
-            "agent-wake-admitted:{}:{}:{}:{}",
-            request.identity_id, request.scope_type, request.scope_id, request.incident_key
+            "agent-wake-admitted:{}:{}:{}:{}:{}",
+            request.identity_id,
+            request.scope_type,
+            request.scope_id,
+            request.incident_key,
+            request
+                .causation_id
+                .as_deref()
+                .unwrap_or(request.correlation_id.as_str())
         );
         let budget_json = budget_remaining
             .map(|remaining| remaining.to_string())
@@ -1937,6 +1965,7 @@ pub fn attention_item(item: AttentionProjection) -> Result<AttentionItem> {
         "retry_exhausted" => AttentionCategory::RetryExhausted,
         "review_ready" => AttentionCategory::ReviewReady,
         "review_risk" => AttentionCategory::ReviewRisk,
+        "execution_failed" => AttentionCategory::ExecutionFailed,
         "runtime_offline" => AttentionCategory::RuntimeOffline,
         "budget_threshold" => AttentionCategory::BudgetThreshold,
         "commitment_overdue" => AttentionCategory::CommitmentOverdue,
@@ -1977,6 +2006,18 @@ pub fn attention_item(item: AttentionProjection) -> Result<AttentionItem> {
         resolved_at: item.resolved_at,
         recommended_action: item.recommended_action,
     })
+}
+
+/// One projection row the reader cannot map (e.g. a category added on the
+/// write side first) must not take down the whole Mission Control feed.
+pub fn attention_item_lenient(item: AttentionProjection) -> Option<AttentionItem> {
+    match attention_item(item) {
+        Ok(item) => Some(item),
+        Err(error) => {
+            tracing::warn!(%error, "skipping unmappable attention projection row");
+            None
+        }
+    }
 }
 
 fn mission_work_item(task: db::Task) -> MissionControlWorkItem {

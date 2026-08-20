@@ -29,7 +29,7 @@ impl ReviewRepo for SqliteDb {
         finished_at: Option<String>,
         updated_at: &str,
     ) -> Result<Review> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let review = sqlx::query("SELECT * FROM review WHERE id = ?")
             .bind(id)
             .fetch_optional(&mut *transaction)

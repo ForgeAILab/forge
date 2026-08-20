@@ -19,8 +19,9 @@ use db::{
     AgentActionPolicyResult, AgentActionRepo, AgentActionStatus, ApproveProjectDocument,
     CreateAgentActionExecution, CreateDomainEvent, CreateProjectCharter,
     CreateProjectCharterRevision, CreateProjectCharterRevisionAtomically,
-    CreateProjectDecisionCandidate, CreateProjectDocumentRevision, CreateProjectMediaAttachment,
-    CreateProjectMilestone, CreateProjectMilestoneRevision, DomainEventRepo,
+    CreateProjectDecisionCandidate, CreateProjectDocument, CreateProjectDocumentAtomically,
+    CreateProjectDocumentRevision, CreateProjectMediaAttachment, CreateProjectMilestone,
+    CreateProjectMilestoneAtomically, CreateProjectMilestoneRevision, DomainEventRepo,
     ProjectOrchestrationRepo, SharedMediaRepo, SqliteDb,
 };
 use forge_agent_host::{
@@ -312,9 +313,16 @@ impl ProjectOrchestrationActionService {
             ));
         }
         let content: ProjectCharterContent = from_value(payload, "content")?;
+        // The render is derived from `content`, so the server produces it
+        // either way. Requiring the agent to reproduce it byte-for-byte is not
+        // something a model can do, and the Project surface exposes no draft
+        // operation to read the canonical render from. Match the Main Charter
+        // contract: verify a supplied render, otherwise use the server's.
         let render = crate::render_and_digest_charter(&content);
-        if string(payload, "rendered_view")? != render.rendered_view
-            || string(payload, "render_version")? != render.render_version
+        let supplied_view = optional_string(payload, "rendered_view");
+        let supplied_version = optional_string(payload, "render_version");
+        if supplied_view.is_some_and(|view| view != render.rendered_view)
+            || supplied_version.is_some_and(|version| version != render.render_version)
         {
             return Err(ServiceError::conflict(
                 "Charter adoption render does not match the server renderer",
@@ -455,58 +463,97 @@ impl ProjectOrchestrationActionService {
         project_id: &str,
         payload: &Value,
     ) -> Result<Value> {
-        let document_id = string(payload, "document_id")?;
+        let requested_document_id = string(payload, "document_id")?;
         let kind_text = string(payload, "kind")?;
         let kind = parse_document_kind(&kind_text)
             .ok_or_else(|| ServiceError::invalid_operation("Project Document kind is invalid"))?;
         let title = string(payload, "title")?;
         let document_action = string(payload, "action")?;
-        let document =
-            match ProjectOrchestrationRepo::get_project_document(&*self.db, &document_id).await? {
-                Some(document) => document,
-                // A Charter-created Project starts with no Documents and the
-                // Agent surface has no separate create operation, so the first
-                // draft_revision of an unknown Document id creates the Document.
-                None if document_action == "draft_revision"
-                    && payload
-                        .get("base_revision_id")
-                        .map(Value::is_null)
-                        .unwrap_or(true) =>
-                {
-                    if !db::validate_uuid_v4(&document_id) {
-                        return Err(ServiceError::invalid_operation(
-                            "Project Document id must be a new UUID v4",
-                        ));
-                    }
-                    let now = now_rfc3339();
-                    sqlx::query(
-                        "INSERT INTO project_document (
-                        id, project_id, kind, title, lifecycle, approval_policy,
-                        current_draft_revision_id, current_approved_revision_id,
-                        version, created_at, updated_at
-                     ) VALUES (?, ?, ?, ?, 'draft', 'user_or_project_agent', NULL, NULL, 1, ?, ?)",
-                    )
-                    .bind(&document_id)
-                    .bind(project_id)
-                    .bind(&kind_text)
-                    .bind(&title)
-                    .bind(&now)
-                    .bind(&now)
-                    .execute(self.db.pool())
-                    .await?;
-                    ProjectOrchestrationRepo::get_project_document(&*self.db, &document_id)
-                        .await?
-                        .ok_or_else(|| {
-                            ServiceError::not_found("project_document", document_id.clone())
-                        })?
-                }
-                None => {
-                    return Err(ServiceError::not_found(
-                        "project_document",
-                        document_id.clone(),
-                    ));
-                }
-            };
+        let base_revision_id_present = payload
+            .get("base_revision_id")
+            .map(|value| !value.is_null())
+            .unwrap_or(false);
+        let existing =
+            ProjectOrchestrationRepo::get_project_document(&*self.db, &requested_document_id)
+                .await?;
+        let document = match existing {
+            Some(document) => document,
+            // A Charter-created Project starts with no Documents and the
+            // Agent surface has no separate create operation, so the first
+            // draft_revision of an unknown Document id creates the Document.
+            // The agent-supplied id is a placeholder only -- it is never
+            // trusted as a primary key -- so the real id is minted here
+            // (matching the Charter precedent) and returned in the result
+            // JSON for the model to use on follow-up actions.  Shell,
+            // revision, and draft pointer are persisted atomically so a
+            // failure past this point can never leave an orphan Document
+            // with no revisions.
+            None if document_action == "draft_revision" && !base_revision_id_present => {
+                let content = parse_document_content(
+                    kind,
+                    payload.get("content").ok_or_else(|| {
+                        ServiceError::invalid_operation("Project Document content is required")
+                    })?,
+                )?;
+                let document_id = new_uuid_v4();
+                let rendered_view = render_project_document(&title, kind, &content);
+                let now = now_rfc3339();
+                let revision = ProjectOrchestrationRepo::create_project_document_atomically(
+                    &*self.db,
+                    CreateProjectDocumentAtomically {
+                        document: CreateProjectDocument {
+                            id: document_id.clone(),
+                            project_id: project_id.to_owned(),
+                            kind: kind_text,
+                            title,
+                            approval_policy: "user_or_project_agent".to_owned(),
+                            created_at: now.clone(),
+                            updated_at: now.clone(),
+                        },
+                        revision: CreateProjectDocumentRevision {
+                            id: new_uuid_v4(),
+                            document_id: document_id.clone(),
+                            expected_document_version: 1,
+                            base_revision: 0,
+                            base_revision_id: None,
+                            lifecycle: "draft".to_owned(),
+                            schema_version: PROJECT_DOCUMENT_SCHEMA_VERSION.to_owned(),
+                            render_version: PROJECT_DOCUMENT_RENDER_VERSION.to_owned(),
+                            content_json: crate::render_project_document_json(&content),
+                            rendered_view: rendered_view.clone(),
+                            change_summary: "Project Agent authored a typed document revision"
+                                .to_owned(),
+                            author_type: "agent".to_owned(),
+                            author_id: Some(action.actor_identity_id.clone()),
+                            source_refs_json: "[]".to_owned(),
+                            content_digest: document_content_digest(&content),
+                            rendered_digest: document_render_digest(
+                                PROJECT_DOCUMENT_RENDER_VERSION,
+                                &rendered_view,
+                            ),
+                            created_at: now,
+                        },
+                    },
+                )
+                .await?;
+                return Ok(json!({
+                    "operation": PROJECT_DOCUMENT_OPERATION,
+                    "project_id": project_id,
+                    "document_id": document_id,
+                    "revision_id": revision.id,
+                    "revision": revision.revision,
+                    "lifecycle": revision.lifecycle,
+                    "domain_committed": true,
+                    "requires_user_authorization": false,
+                }));
+            }
+            None => {
+                return Err(ServiceError::not_found(
+                    "project_document",
+                    requested_document_id,
+                ));
+            }
+        };
         if document.project_id != project_id {
             return Err(ServiceError::invalid_operation(
                 "Project Document action crosses Project scope",
@@ -545,7 +592,7 @@ impl ProjectOrchestrationActionService {
             let base = ProjectOrchestrationRepo::get_project_document_revision(&*self.db, base_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("project_document_revision", base_id))?;
-            if base.document_id != document_id {
+            if base.document_id != document.id {
                 return Err(ServiceError::invalid_operation(
                     "Project Document base revision crosses Document scope",
                 ));
@@ -563,7 +610,7 @@ impl ProjectOrchestrationActionService {
             &*self.db,
             CreateProjectDocumentRevision {
                 id: new_uuid_v4(),
-                document_id: document_id.clone(),
+                document_id: document.id.clone(),
                 expected_document_version: integer(payload, "expected_document_version")?,
                 base_revision,
                 base_revision_id,
@@ -588,7 +635,7 @@ impl ProjectOrchestrationActionService {
         Ok(json!({
             "operation": PROJECT_DOCUMENT_OPERATION,
             "project_id": project_id,
-            "document_id": document_id,
+            "document_id": document.id,
             "revision_id": revision.id,
             "revision": revision.revision,
             "lifecycle": revision.lifecycle,
@@ -1268,7 +1315,10 @@ impl ProjectOrchestrationActionService {
         project_id: &str,
         payload: &Value,
     ) -> Result<Value> {
-        let baseline_id = string(payload, "baseline_id")?;
+        // A baseline shell id is server-minted, never taken from the agent
+        // payload: omit baseline_id to draft a new baseline, name an existing
+        // one to revise it.
+        let requested_baseline_id = optional_nonempty_string(payload, "baseline_id")?;
         let operation = string(payload, "action")?;
         if !matches!(
             operation.as_str(),
@@ -1276,6 +1326,12 @@ impl ProjectOrchestrationActionService {
         ) {
             return Err(ServiceError::invalid_operation(
                 "Project Agent may draft or propose a baseline; approval and activation are user-only",
+            ));
+        }
+        if operation != "draft_revision" && requested_baseline_id.is_none() {
+            return Err(ServiceError::invalid_operation(
+                "baseline_id naming an existing execution baseline is required for this action; \
+                 read the Project current state to find it",
             ));
         }
         if operation == "propose_approval" {
@@ -1541,16 +1597,23 @@ impl ProjectOrchestrationActionService {
             "source_action_id": action.id.clone(),
         });
         let now = now_rfc3339();
-        let mut tx = self.db.pool().begin().await?;
-        let baseline = sqlx::query(
-            "SELECT project_id, lifecycle, version, current_revision_id
-             FROM project_execution_baseline WHERE id = ?",
-        )
-        .bind(&baseline_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let (baseline_lifecycle, baseline_version, current_revision_id) =
-            if let Some(row) = baseline {
+        let mut tx = db::begin_immediate(self.db.pool()).await?;
+        let (baseline_id, baseline_lifecycle, baseline_version, current_revision_id) =
+            if let Some(baseline_id) = requested_baseline_id {
+                let row = sqlx::query(
+                    "SELECT project_id, lifecycle, version, current_revision_id
+                     FROM project_execution_baseline WHERE id = ?",
+                )
+                .bind(&baseline_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "unknown baseline_id: omit baseline_id to draft a new execution \
+                         baseline (its id is server-minted), or name an existing baseline \
+                         from the Project current state",
+                    )
+                })?;
                 let owner: String = row.try_get("project_id")?;
                 if owner != project_id {
                     return Err(ServiceError::invalid_operation(
@@ -1558,11 +1621,13 @@ impl ProjectOrchestrationActionService {
                     ));
                 }
                 (
+                    baseline_id,
                     row.try_get::<String, _>("lifecycle")?,
                     row.try_get::<i64, _>("version")?,
                     row.try_get::<Option<String>, _>("current_revision_id")?,
                 )
             } else {
+                let baseline_id = new_uuid_v4();
                 sqlx::query(
                     "INSERT INTO project_execution_baseline
                  (id, project_id, lifecycle, version, created_at, updated_at)
@@ -1574,7 +1639,7 @@ impl ProjectOrchestrationActionService {
                 .bind(&now)
                 .execute(&mut *tx)
                 .await?;
-                ("draft".to_owned(), 1, None)
+                (baseline_id, "draft".to_owned(), 1, None)
             };
         let expected_baseline_version = payload
             .get("expected_baseline_version")
@@ -1750,7 +1815,12 @@ impl ProjectOrchestrationActionService {
         }
 
         let content: MilestoneDefinitionContent = from_value(payload, "content")?;
-        let (milestone_id, expected_version, base_revision_id, base_revision) =
+        // Bootstrap holds the shell input only when this is a "define" (first
+        // definition) proposal.  The shell and its first revision are then
+        // persisted together atomically, so a failure past this point can
+        // never leave an orphan Milestone with no revisions.  A milestone id
+        // is always server-minted, never taken from the agent payload.
+        let (milestone_id, expected_version, base_revision_id, base_revision, bootstrap) =
             if operation == "define" {
                 let project_version = project_version(&self.db, project_id).await?;
                 let sequence: i64 = sqlx::query_scalar(
@@ -1760,23 +1830,21 @@ impl ProjectOrchestrationActionService {
                 .bind(project_id)
                 .fetch_one(self.db.pool())
                 .await?;
-                let milestone = ProjectOrchestrationRepo::create_project_milestone(
-                    &*self.db,
-                    CreateProjectMilestone {
-                        id: new_uuid_v4(),
-                        project_id: project_id.to_owned(),
-                        expected_project_version: project_version,
-                        milestone_sequence: sequence,
-                        milestone_key: crate::milestone_identity(sequence)
-                            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-                        display_label: optional_string(payload, "display_label")
-                            .or_else(|| Some(content.name.clone())),
-                        created_at: now_rfc3339(),
-                        updated_at: now_rfc3339(),
-                    },
-                )
-                .await?;
-                (milestone.id, 1, None, 0)
+                let milestone_id = new_uuid_v4();
+                let now = now_rfc3339();
+                let milestone = CreateProjectMilestone {
+                    id: milestone_id.clone(),
+                    project_id: project_id.to_owned(),
+                    expected_project_version: project_version,
+                    milestone_sequence: sequence,
+                    milestone_key: crate::milestone_identity(sequence)
+                        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+                    display_label: optional_string(payload, "display_label")
+                        .or_else(|| Some(content.name.clone())),
+                    created_at: now.clone(),
+                    updated_at: now,
+                };
+                (milestone_id, 1, None, 0, Some(milestone))
             } else {
                 let milestone_id = string(payload, "milestone_id")?;
                 let milestone =
@@ -1807,65 +1875,73 @@ impl ProjectOrchestrationActionService {
                     integer(payload, "expected_milestone_version")?,
                     Some(base.id.clone()),
                     base.revision,
+                    None,
                 )
             };
 
         let canonical = canonical_json(&content)
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-        let revision = ProjectOrchestrationRepo::create_project_milestone_revision(
-            &*self.db,
-            CreateProjectMilestoneRevision {
-                id: new_uuid_v4(),
-                milestone_id: milestone_id.clone(),
-                expected_milestone_version: expected_version,
-                base_revision,
-                base_revision_id,
-                lifecycle: if operation == "define" {
-                    "draft".to_owned()
-                } else {
-                    "proposed".to_owned()
-                },
-                display_label: Some(content.name.clone()),
-                outcome: content.outcome.clone(),
-                included_scope_json: serde_json::to_string(&content.included_scope)
-                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-                excluded_scope_json: serde_json::to_string(&content.excluded_scope)
-                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-                charter_revision_id: content
-                    .charter_revision
-                    .as_ref()
-                    .map(|reference| reference.revision_id.clone()),
-                document_revisions_json: serde_json::to_string(&content.document_revisions)
-                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-                task_selection_json: serde_json::to_string(&content.task_ids)
-                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-                dependencies_json: serde_json::to_string(&content.dependencies)
-                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-                risks_json: serde_json::to_string(&content.risks)
-                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-                acceptance_checks_json: serde_json::to_string(&content.acceptance_checks)
-                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-                evidence_requirements_json: serde_json::to_string(&content.evidence_requirements)
-                    .map_err(|error| {
-                    ServiceError::invalid_operation(error.to_string())
-                })?,
-                known_issues_json: serde_json::to_string(&content.known_issues)
-                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-                change_summary: "Project Agent authored a typed milestone definition".to_owned(),
-                schema_version: MILESTONE_DEFINITION_SCHEMA.to_owned(),
-                render_version: MILESTONE_RENDER_SCHEMA.to_owned(),
-                rendered_view: canonical.clone(),
-                content_digest: canonical_digest_with_schema(MILESTONE_DEFINITION_SCHEMA, &content)
-                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-                rendered_digest: canonical_digest_with_schema(MILESTONE_RENDER_SCHEMA, &canonical)
-                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-                author_type: "agent".to_owned(),
-                author_id: Some(action.actor_identity_id.clone()),
-                source_refs_json: "[]".to_owned(),
-                created_at: now_rfc3339(),
+        let revision_input = CreateProjectMilestoneRevision {
+            id: new_uuid_v4(),
+            milestone_id: milestone_id.clone(),
+            expected_milestone_version: expected_version,
+            base_revision,
+            base_revision_id,
+            lifecycle: if operation == "define" {
+                "draft".to_owned()
+            } else {
+                "proposed".to_owned()
             },
-        )
-        .await?;
+            display_label: Some(content.name.clone()),
+            outcome: content.outcome.clone(),
+            included_scope_json: serde_json::to_string(&content.included_scope)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+            excluded_scope_json: serde_json::to_string(&content.excluded_scope)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+            charter_revision_id: content
+                .charter_revision
+                .as_ref()
+                .map(|reference| reference.revision_id.clone()),
+            document_revisions_json: serde_json::to_string(&content.document_revisions)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+            task_selection_json: serde_json::to_string(&content.task_ids)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+            dependencies_json: serde_json::to_string(&content.dependencies)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+            risks_json: serde_json::to_string(&content.risks)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+            acceptance_checks_json: serde_json::to_string(&content.acceptance_checks)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+            evidence_requirements_json: serde_json::to_string(&content.evidence_requirements)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+            known_issues_json: serde_json::to_string(&content.known_issues)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+            change_summary: "Project Agent authored a typed milestone definition".to_owned(),
+            schema_version: MILESTONE_DEFINITION_SCHEMA.to_owned(),
+            render_version: MILESTONE_RENDER_SCHEMA.to_owned(),
+            rendered_view: canonical.clone(),
+            content_digest: canonical_digest_with_schema(MILESTONE_DEFINITION_SCHEMA, &content)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+            rendered_digest: canonical_digest_with_schema(MILESTONE_RENDER_SCHEMA, &canonical)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+            author_type: "agent".to_owned(),
+            author_id: Some(action.actor_identity_id.clone()),
+            source_refs_json: "[]".to_owned(),
+            created_at: now_rfc3339(),
+        };
+        let revision = if let Some(milestone) = bootstrap {
+            ProjectOrchestrationRepo::create_project_milestone_atomically(
+                &*self.db,
+                CreateProjectMilestoneAtomically {
+                    milestone,
+                    revision: revision_input,
+                },
+            )
+            .await?
+        } else {
+            ProjectOrchestrationRepo::create_project_milestone_revision(&*self.db, revision_input)
+                .await?
+        };
         Ok(json!({
             "operation": PROJECT_MILESTONE_OPERATION,
             "project_id": project_id,
@@ -2549,7 +2625,6 @@ mod tests {
         let charter_revision_id = new_uuid_v4();
         let milestone_id = new_uuid_v4();
         let milestone_definition_revision_id = new_uuid_v4();
-        let baseline_id = new_uuid_v4();
         let action_id = new_uuid_v4();
 
         sqlx::query(
@@ -2695,9 +2770,9 @@ mod tests {
             serde_json::to_value(&content.release_policy).expect("release policy JSON");
         let expected_adaptive_envelope =
             serde_json::to_value(&content.adaptive_envelope).expect("adaptive envelope JSON");
+        // No baseline_id: drafting a new baseline must server-mint the shell id.
         let payload = json!({
             "action": "draft_revision",
-            "baseline_id": baseline_id,
             "content": content,
         });
         let action = AgentAction {
@@ -2728,6 +2803,11 @@ mod tests {
             .materialize_execution_baseline(&action, &project_id, &payload)
             .await
             .expect("Project action baseline materializes on fresh V076 schema");
+        let minted_baseline_id = result
+            .get("baseline_id")
+            .and_then(Value::as_str)
+            .expect("baseline id");
+        uuid::Uuid::parse_str(minted_baseline_id).expect("baseline id is a server-minted UUID");
         let revision_id = result
             .get("revision_id")
             .and_then(Value::as_str)

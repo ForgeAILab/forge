@@ -1204,9 +1204,6 @@ pub struct ExecutionBaselineResponse {
 #[ts(export)]
 pub struct CreateExecutionBaselineRequest {
     pub mutation: MutationEnvelope,
-    /// Client-selected only for idempotent proposal retries; it is still
-    /// treated as an opaque database identifier and never as authority.
-    pub baseline_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]

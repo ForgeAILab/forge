@@ -44,6 +44,17 @@ pub fn is_known_action(name: &str) -> bool {
     )
 }
 
+/// Dispatch-style actions are the hooks that start (or hand off) role work.
+/// The engine gives their failures special treatment when they gate entry into
+/// an `active` state: a failed dispatch means no execution exists, so the task
+/// must not be left looking in-flight.
+pub fn is_dispatch_action(name: &str) -> bool {
+    matches!(
+        name,
+        "dispatch_role_agent" | "dispatch_fix_agent" | "dispatch_executor"
+    )
+}
+
 pub fn resolve_action(name: &str) -> Result<Box<dyn HookAction>, ServiceError> {
     let action: Box<dyn HookAction> = match name {
         "run_ci_steps" => Box::new(RunCiSteps),

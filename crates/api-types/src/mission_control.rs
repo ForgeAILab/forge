@@ -21,6 +21,7 @@ pub enum AttentionCategory {
     RetryExhausted,
     ReviewReady,
     ReviewRisk,
+    ExecutionFailed,
     RuntimeOffline,
     BudgetThreshold,
     CommitmentOverdue,

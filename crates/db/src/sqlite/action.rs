@@ -118,7 +118,7 @@ impl AgentActionRepo for SqliteDb {
         &self,
         input: CreateAgentActionApproval,
     ) -> Result<AgentActionApproval> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let action = sqlx::query("SELECT * FROM agent_action WHERE id = ?")
             .bind(&input.action_id)
             .fetch_optional(&mut *transaction)
@@ -203,7 +203,7 @@ impl AgentActionRepo for SqliteDb {
         &self,
         input: CreateAgentActionExecution,
     ) -> Result<AgentActionExecution> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         if let Some(existing) = sqlx::query(
             "SELECT * FROM agent_action_execution
              WHERE action_id = ? AND idempotency_key = ?",

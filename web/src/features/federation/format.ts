@@ -1,6 +1,15 @@
 import type { AgentProviderCapability, ProviderEntryResponse, ProviderRuntimeCapability } from '@/types/generated'
 
-/** Tool ceiling applied to embedded agents/profiles created from this page. */
+/**
+ * Tool ceiling applied to embedded agents/profiles created from this page.
+ *
+ * This is the outermost bound on what an agent may ever be granted, not an
+ * effective grant: the server intersects it with the scope catalog and the
+ * per-Project binding ceiling before every turn. Omitting an entry here
+ * therefore removes the capability everywhere — an agent without
+ * `propose_project` can never adopt a Charter or touch Project orchestration,
+ * no matter how its bindings are configured.
+ */
 export const DEFAULT_CEILING = {
   allowed: [
     'read_account',
@@ -9,8 +18,15 @@ export const DEFAULT_CEILING = {
     'read_task',
     'read_memory',
     'propose_task',
+    'propose_discovery',
+    'propose_project',
+    'propose_handoff',
     'propose_message',
     'propose_review',
+    'propose_commitment',
+    'propose_memory',
+    'propose_decision',
+    'propose_session',
     'task_read',
     'task_write',
   ],
@@ -114,6 +130,9 @@ export const DEFAULT_PROJECT_PERMISSION_CEILING = {
     'read_task',
     'read_memory',
     'propose_task',
+    // Charter adoption on a Project that predates an approved Charter runs
+    // through the typed Project orchestration surface, which this gates.
+    'propose_project',
     'propose_message',
     'propose_review',
     'propose_commitment',

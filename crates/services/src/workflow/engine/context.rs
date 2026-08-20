@@ -1,4 +1,4 @@
-use db::{ExecutionRepo, PageRequest, ReviewRepo, SortBy, SortOrder};
+use db::{ExecutionRepo, ExecutionStatus, PageRequest, ReviewRepo, SortBy, SortOrder};
 
 pub(super) async fn latest_review(
     db: &db::SqliteDb,
@@ -27,6 +27,28 @@ pub(super) async fn latest_execution_context(
     )
     .await?;
     Ok(page.items.into_iter().next())
+}
+
+/// Whether the task currently has any running execution. Used by the
+/// dispatch-failure fallback: a task may only be rolled back out of an active
+/// state when no execution is actually driving it.
+pub(super) async fn has_running_execution(db: &db::SqliteDb, task_id: &str) -> crate::Result<bool> {
+    let page = ExecutionRepo::list_by_task(
+        db,
+        task_id,
+        PageRequest {
+            cursor: None,
+            limit: 100,
+            include_total: false,
+            sort_by: SortBy::CreatedAt,
+            sort_order: SortOrder::Desc,
+        },
+    )
+    .await?;
+    Ok(page
+        .items
+        .iter()
+        .any(|execution| execution.status == ExecutionStatus::Running))
 }
 
 pub(super) async fn latest_executor_context(

@@ -184,7 +184,7 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
             "project_mode": "compact",
             "selected_project_agent_identity_id": project_identity,
             "selected_project_agent_profile_revision_id": project_profile,
-            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@1",
+            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@2",
             "selected_project_agent_policy_digest": project_policy_digest(
                 &project_agent["profile"]["tool_policy"]
             )
@@ -493,8 +493,7 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
     .await;
     let task_id = required_string(&executed, &["task", "id"]);
     assert_eq!(
-        executed["task"]["task_state_config"]["review"]["ci_steps"][0],
-        "python3 -m unittest -v",
+        executed["task"]["task_state_config"]["review"]["ci_steps"][0], "python3 -m unittest -v",
         "typed Task proposals must inherit the Project review policy just like direct Task creation"
     );
     assert_eq!(
@@ -577,7 +576,6 @@ async fn create_active_execution_baseline(
     let project_version = project["version"]
         .as_i64()
         .expect("baseline Project version");
-    let baseline_id = "revised-acceptance-baseline";
     let proposed = request_json(
         app,
         Method::POST,
@@ -594,12 +592,15 @@ async fn create_active_execution_baseline(
                     "project.execution_baseline.propose",
                     "revised-acceptance-baseline-propose-event"
                 )
-            },
-            "baseline_id": baseline_id
+            }
         }),
         &[StatusCode::CREATED, StatusCode::OK],
     )
     .await;
+    // The baseline shell id is server-minted; clients read it back from the
+    // proposal response.
+    let baseline_id = required_string(&proposed, &["baseline", "id"]);
+    let baseline_id = baseline_id.as_str();
     let baseline_version = proposed["baseline"]["version"]
         .as_i64()
         .expect("proposed baseline version");
@@ -872,7 +873,7 @@ fn user_authorization(action: &str, event_id: &str) -> Value {
 fn user_provenance(summary: &str) -> Value {
     json!({
         "author": {"kind": "user", "id": "test-user-id"},
-        "operating_skill_revision": "forge.project.orchestration/v1@1",
+        "operating_skill_revision": "forge.project.orchestration/v1@2",
         "source_refs": [],
         "change_summary": summary
     })

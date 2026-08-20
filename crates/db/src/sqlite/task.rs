@@ -4,7 +4,7 @@ use std::collections::HashSet;
 #[async_trait]
 impl TaskRepo for SqliteDb {
     async fn create(&self, input: CreateTask) -> Result<Task> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let task = TaskRepo::create_in_tx(self, &mut transaction, input).await?;
         transaction.commit().await?;
         Ok(task)
@@ -236,7 +236,7 @@ impl TaskRepo for SqliteDb {
         ordered_ids: &[String],
         updated_at: &str,
     ) -> Result<()> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         if ordered_ids.iter().collect::<HashSet<_>>().len() != ordered_ids.len() {
             return Err(DbError::InvalidTransition);
         }
@@ -623,7 +623,7 @@ impl TaskRepo for SqliteDb {
     }
 
     async fn update_status(&self, input: UpdateTaskStatus) -> Result<Task> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(&input.id)
             .fetch_optional(&mut *transaction)

@@ -91,7 +91,7 @@ impl AgentCommitmentRepo for SqliteDb {
         let cancellation_reason = input
             .cancellation_reason
             .unwrap_or_else(|| current.cancellation_reason.clone());
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let result = sqlx::query(
             "UPDATE agent_commitment SET
                 status = ?, due_at = ?, description = ?, blocked_reason = ?,
@@ -160,7 +160,7 @@ impl AgentCommitmentRepo for SqliteDb {
             return Err(DbError::InvalidTransition);
         }
 
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         insert_commitment_evidence(&mut transaction, &input.evidence).await?;
         let result = sqlx::query(
             "UPDATE agent_commitment SET status = 'completed', completed_at = ?,
@@ -218,7 +218,7 @@ impl AgentCommitmentRepo for SqliteDb {
             }
             return Err(DbError::VersionConflict);
         }
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         sqlx::query(
             "INSERT INTO agent_commitment_transfer (
                 id, commitment_id, from_identity_id, to_identity_id, reason,
@@ -276,7 +276,7 @@ impl AgentCommitmentRepo for SqliteDb {
         &self,
         input: CreateAgentCommitmentEvidence,
     ) -> Result<AgentCommitmentEvidence> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         insert_commitment_evidence(&mut transaction, &input).await?;
         transaction.commit().await?;
         self.get_commitment_evidence_by_dedupe(&input.commitment_id, &input.dedupe_key)

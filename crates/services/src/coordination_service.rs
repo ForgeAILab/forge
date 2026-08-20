@@ -988,6 +988,12 @@ impl AgentActionService {
     /// the proposal names no plan item, so baseline binding could never
     /// validate — the proposal stays a pre-baseline plan and
     /// `prepare_task_governance` applies the charter-only path.
+    ///
+    /// Baseline activation runs the same derivation for Tasks that were
+    /// proposed before the baseline existed:
+    /// `db::promote_baseline_task_governance_in_tx` re-binds matching
+    /// preplanned plan-item Tasks inside the activation transaction. Keep the
+    /// two in sync when this envelope shape changes.
     async fn derive_active_baseline_governance(
         &self,
         project_id: &str,

@@ -2,6 +2,7 @@ import type { LogEntry } from '@/types/generated'
 
 export type LogFilterKind =
   | 'assistant'
+  | 'thinking'
   | 'user'
   | 'tool_call'
   | 'tool_result'

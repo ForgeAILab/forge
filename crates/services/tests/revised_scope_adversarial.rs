@@ -9,7 +9,8 @@ use db::{
 use forge_agent_host::{CanonicalScope, CanonicalScopeType, ForgeToolProvider, WorkspaceAccess};
 use serde_json::json;
 use services::{
-    AgentChatService, CoordinationToolProvider, SendAgentChatMessageInput, SetMainAgentBindingInput,
+    AgentChatService, CoordinationToolProvider, SendAgentChatMessageInput,
+    SetMainAgentBindingInput, TaskService,
 };
 
 async fn database() -> Arc<SqliteDb> {
@@ -107,6 +108,178 @@ async fn attach_approved_charter(db: &SqliteDb, project_id: &str) {
     .execute(db.pool())
     .await
     .expect("approved Charter attaches to Project");
+}
+
+fn coordination_provider(db: &Arc<SqliteDb>) -> CoordinationToolProvider {
+    let provider = CoordinationToolProvider::new(Arc::clone(db));
+    provider.set_task_service(Arc::new(TaskService::new(
+        Arc::clone(db),
+        Arc::new(events::EventBus::new(16)),
+    )));
+    provider
+}
+
+async fn attach_primary_repo(db: &SqliteDb, project_id: &str) {
+    let now = now_rfc3339();
+    let repo_id = format!("{project_id}-repo");
+    sqlx::query(
+        "INSERT INTO repo (id, project_id, name, remote_url, local_path, work_mode,
+                           default_branch, created_at, updated_at)
+         VALUES (?, ?, 'primary', '/tmp/forge-test-repo', '/tmp/forge-test-repo',
+                 'direct_merge', 'main', ?, ?)",
+    )
+    .bind(&repo_id)
+    .bind(project_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("repo creates");
+    sqlx::query("UPDATE project SET primary_repo_id = ?, updated_at = ? WHERE id = ?")
+        .bind(&repo_id)
+        .bind(&now)
+        .bind(project_id)
+        .execute(db.pool())
+        .await
+        .expect("primary repo attaches");
+}
+
+/// Attach an active, user-approved execution baseline naming `plan_item_ids`
+/// and one primary milestone, mirroring the server-side activation shape.
+async fn attach_active_baseline(db: &SqliteDb, project_id: &str, plan_item_ids: &[&str]) {
+    let now = now_rfc3339();
+    let milestone_id = format!("{project_id}-milestone-1");
+    let milestone_revision_id = format!("{milestone_id}-revision-1");
+    sqlx::query(
+        "INSERT INTO project_milestone (id, project_id, milestone_sequence, milestone_key,
+                                        created_at, updated_at)
+         VALUES (?, ?, 1, 'M001', ?, ?)",
+    )
+    .bind(&milestone_id)
+    .bind(project_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("milestone creates");
+    sqlx::query(
+        "INSERT INTO project_milestone_revision (
+             id, milestone_id, revision, base_revision, lifecycle, outcome,
+             schema_version, render_version, rendered_view, content_digest,
+             rendered_digest, author_type, created_at
+         ) VALUES (?, ?, 1, 0, 'approved', 'milestone outcome',
+                   'forge.project-milestone/v1', 'forge.project-milestone-render/v1',
+                   '# Milestone', 'milestone-content-digest', 'milestone-render-digest',
+                   'user', ?)",
+    )
+    .bind(&milestone_revision_id)
+    .bind(&milestone_id)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("milestone revision creates");
+    let baseline_id = format!("{project_id}-baseline");
+    let revision_id = format!("{baseline_id}-revision-1");
+    sqlx::query(
+        "INSERT INTO project_execution_baseline (id, project_id, lifecycle, version,
+                                                 created_at, updated_at)
+         VALUES (?, ?, 'draft', 1, ?, ?)",
+    )
+    .bind(&baseline_id)
+    .bind(project_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("baseline creates");
+    sqlx::query(
+        "INSERT INTO project_execution_baseline_revision (
+             id, baseline_id, revision, base_revision, lifecycle, charter_revision_id,
+             plan_items_json, milestone_ids_json, milestone_definition_revision_ids_json,
+             primary_milestone_id, release_policy_revision, release_policy_digest,
+             schema_version, render_version, rendered_view, content_digest,
+             rendered_digest, created_at
+         ) VALUES (?, ?, 1, 0, 'approved', ?, ?, ?, ?, ?, 'policy-1', 'policy-digest',
+                   'forge.execution-baseline/v1', 'forge.execution-baseline-render/v1',
+                   '# Baseline', 'baseline-content-digest', 'baseline-render-digest', ?)",
+    )
+    .bind(&revision_id)
+    .bind(&baseline_id)
+    .bind(format!("{project_id}-charter-revision-1"))
+    .bind(serde_json::to_string(plan_item_ids).expect("plan item ids serialize"))
+    .bind(json!([milestone_id]).to_string())
+    .bind(json!([milestone_revision_id]).to_string())
+    .bind(&milestone_id)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("baseline revision creates");
+    sqlx::query(
+        "UPDATE project_execution_baseline
+         SET current_revision_id = ?, lifecycle = 'active', version = 2, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&revision_id)
+    .bind(&now)
+    .bind(&baseline_id)
+    .execute(db.pool())
+    .await
+    .expect("baseline activates");
+    sqlx::query(
+        "INSERT INTO project_execution_baseline_approval (
+             id, baseline_id, revision_id, expected_project_version, principal_type,
+             principal_id, authorization_basis, authorization_action, explicit_event,
+             authorization_occurred_at, content_digest, rendered_digest, lifecycle,
+             idempotency_key, created_at, updated_at
+         ) VALUES (?, ?, ?, 1, 'user', 'user-1', 'test fixture',
+                   'project.execution_baseline.approve', 'user clicked approve', ?,
+                   'baseline-content-digest', 'baseline-render-digest', 'active', ?, ?, ?)",
+    )
+    .bind(new_uuid_v4())
+    .bind(&baseline_id)
+    .bind(&revision_id)
+    .bind(&now)
+    .bind(format!("{baseline_id}-approval"))
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("baseline approval receipt creates");
+}
+
+/// Bind an existing Task to a baseline plan item the way an executed
+/// governed proposal would, then force the given terminal/lifecycle status.
+async fn bind_task_to_plan_item(
+    db: &SqliteDb,
+    project_id: &str,
+    task_id: &str,
+    plan_item_id: &str,
+    status: &str,
+) {
+    let now = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO project_task_governance (
+             task_id, project_id, charter_revision_id, baseline_id, baseline_revision_id,
+             plan_item_id, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(task_id)
+    .bind(project_id)
+    .bind(format!("{project_id}-charter-revision-1"))
+    .bind(format!("{project_id}-baseline"))
+    .bind(format!("{project_id}-baseline-revision-1"))
+    .bind(plan_item_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("task governance binds");
+    sqlx::query("UPDATE task SET status = ? WHERE id = ?")
+        .bind(status)
+        .bind(task_id)
+        .execute(db.pool())
+        .await
+        .expect("task status updates");
 }
 
 async fn main_identity(db: &Arc<SqliteDb>, identity_id: &str) -> String {
@@ -488,7 +661,7 @@ async fn project_proposal_target_is_derived_from_scope() {
     project(&db, "project-b").await;
     attach_approved_charter(&db, "project-a").await;
     identity_with_project_permission(&db, "project-agent-a", "project-a", true).await;
-    let provider = CoordinationToolProvider::new(Arc::clone(&db));
+    let provider = coordination_provider(&db);
     let scope = CanonicalScope {
         scope_type: CanonicalScopeType::Project,
         scope_id: "project-a".to_owned(),
@@ -506,18 +679,250 @@ async fn project_proposal_target_is_derived_from_scope() {
             }),
         )
         .await
-        .expect("proposal is audited");
+        .expect("proposal is audited and executed");
     assert_eq!(action["scope_type"], "project");
     assert_eq!(action["scope_id"], "project-a");
     assert_eq!(action["target_type"], "project");
     assert_eq!(action["target_id"], "project-a");
+    // An admitted proposal materializes inline through the normal
+    // TaskService path; the Task lands in the scope-derived Project, never
+    // in a model-named one.
+    assert_eq!(action["status"], "executed");
+    assert_eq!(action["materialized"], true);
+    let task_id = action["domain_result"]["task_id"]
+        .as_str()
+        .expect("executed proposal reports its Task id")
+        .to_owned();
+    let task_project: String = sqlx::query_scalar("SELECT project_id FROM task WHERE id = ?")
+        .bind(&task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("materialized task row");
+    assert_eq!(task_project, "project-a");
     let task_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task")
         .fetch_one(db.pool())
         .await
         .expect("task count");
     assert_eq!(
-        task_count, 0,
-        "a proposal envelope is not an authoritative Task mutation"
+        task_count, 1,
+        "an admitted proposal materializes exactly one Task through the TaskService path"
+    );
+    // Without an active execution baseline the Task is a charter-bound plan
+    // and must not gain execution authority from the proposal envelope.
+    let runnable: i64 =
+        sqlx::query_scalar("SELECT runnable FROM project_task_governance WHERE task_id = ?")
+            .bind(&task_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("governance row");
+    assert_eq!(runnable, 0, "a pre-baseline Task must not be runnable");
+}
+
+#[tokio::test]
+async fn implementation_proposal_without_plan_item_is_rejected_once_baseline_is_active() {
+    let db = database().await;
+    project(&db, "project-a").await;
+    attach_approved_charter(&db, "project-a").await;
+    attach_primary_repo(&db, "project-a").await;
+    attach_active_baseline(&db, "project-a", &["pi-1", "pi-2"]).await;
+    identity_with_project_permission(&db, "project-agent-a", "project-a", true).await;
+    let provider = coordination_provider(&db);
+    let scope = CanonicalScope {
+        scope_type: CanonicalScopeType::Project,
+        scope_id: "project-a".to_owned(),
+        workspace_access: WorkspaceAccess::Deny,
+    };
+    let error = provider
+        .propose(
+            "project-agent-a",
+            &scope,
+            "task.propose",
+            json!({
+                "payload": {"title":"implementation without traceability"},
+                "dedupe_key":"baseline-missing-plan-item",
+                "correlation_id":"baseline-missing-plan-item-correlation"
+            }),
+        )
+        .await
+        .expect_err("an implementation proposal without plan_item_id must fail loudly")
+        .to_string();
+    assert!(
+        error.contains("plan_item_id"),
+        "error names the missing field: {error}"
+    );
+    assert!(
+        error.contains("pi-1") && error.contains("pi-2"),
+        "error lists the valid plan item ids: {error}"
+    );
+    let counts: (i64, i64) = (
+        sqlx::query_scalar("SELECT COUNT(*) FROM task")
+            .fetch_one(db.pool())
+            .await
+            .expect("task count"),
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_action")
+            .fetch_one(db.pool())
+            .await
+            .expect("action count"),
+    );
+    assert_eq!(
+        counts,
+        (0, 0),
+        "a rejected proposal must not leave a silent unrunnable Task or a stranded action"
+    );
+}
+
+#[tokio::test]
+async fn implementation_proposal_with_unknown_plan_item_is_rejected() {
+    let db = database().await;
+    project(&db, "project-a").await;
+    attach_approved_charter(&db, "project-a").await;
+    attach_primary_repo(&db, "project-a").await;
+    attach_active_baseline(&db, "project-a", &["pi-1"]).await;
+    identity_with_project_permission(&db, "project-agent-a", "project-a", true).await;
+    let provider = coordination_provider(&db);
+    let scope = CanonicalScope {
+        scope_type: CanonicalScopeType::Project,
+        scope_id: "project-a".to_owned(),
+        workspace_access: WorkspaceAccess::Deny,
+    };
+    let error = provider
+        .propose(
+            "project-agent-a",
+            &scope,
+            "task.propose",
+            json!({
+                "payload": {"title":"forged plan item", "plan_item_id":"pi-99"},
+                "dedupe_key":"baseline-unknown-plan-item",
+                "correlation_id":"baseline-unknown-plan-item-correlation"
+            }),
+        )
+        .await
+        .expect_err("a plan item outside the active baseline must be rejected")
+        .to_string();
+    assert!(
+        error.contains("pi-99") && error.contains("pi-1"),
+        "error names the bogus id and the valid ids: {error}"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_plan_item_proposal_is_rejected_naming_the_existing_task() {
+    let db = database().await;
+    project(&db, "project-a").await;
+    attach_approved_charter(&db, "project-a").await;
+    attach_primary_repo(&db, "project-a").await;
+    attach_active_baseline(&db, "project-a", &["pi-5"]).await;
+    identity_with_project_permission(&db, "project-agent-a", "project-a", true).await;
+    TaskRepo::create(db.as_ref(), task("task-done", "project-a", "shipped work"))
+        .await
+        .expect("existing task");
+    bind_task_to_plan_item(&db, "project-a", "task-done", "pi-5", "done").await;
+    let provider = coordination_provider(&db);
+    let scope = CanonicalScope {
+        scope_type: CanonicalScopeType::Project,
+        scope_id: "project-a".to_owned(),
+        workspace_access: WorkspaceAccess::Deny,
+    };
+    let error = provider
+        .propose(
+            "project-agent-a",
+            &scope,
+            "task.propose",
+            json!({
+                "payload": {"title":"re-proposed done work", "plan_item_id":"pi-5"},
+                "dedupe_key":"baseline-duplicate-plan-item",
+                "correlation_id":"baseline-duplicate-plan-item-correlation"
+            }),
+        )
+        .await
+        .expect_err("a plan item with a done Task must not accept a second Task")
+        .to_string();
+    assert!(
+        error.contains("task-done") && error.contains("done"),
+        "error names the existing task and its status: {error}"
+    );
+    let task_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task")
+        .fetch_one(db.pool())
+        .await
+        .expect("task count");
+    assert_eq!(task_count, 1, "no duplicate Task materializes");
+}
+
+#[tokio::test]
+async fn planning_proposal_and_cancelled_plan_items_stay_proposable() {
+    let db = database().await;
+    project(&db, "project-a").await;
+    attach_approved_charter(&db, "project-a").await;
+    attach_primary_repo(&db, "project-a").await;
+    attach_active_baseline(&db, "project-a", &["pi-1", "pi-2"]).await;
+    identity_with_project_permission(&db, "project-agent-a", "project-a", true).await;
+    let provider = coordination_provider(&db);
+    let scope = CanonicalScope {
+        scope_type: CanonicalScopeType::Project,
+        scope_id: "project-a".to_owned(),
+        workspace_access: WorkspaceAccess::Deny,
+    };
+    // A planning Task carries no baseline binding by design and must stay
+    // proposable without a plan item even when a baseline is active.
+    let planning = provider
+        .propose(
+            "project-agent-a",
+            &scope,
+            "task.propose",
+            json!({
+                "payload": {"title":"investigate options", "task_type":"planning_task"},
+                "dedupe_key":"baseline-planning-task",
+                "correlation_id":"baseline-planning-task-correlation"
+            }),
+        )
+        .await
+        .expect("planning tasks need no plan item");
+    assert_eq!(planning["status"], "executed");
+    // A cancelled Task releases its plan item: proposing it again is the
+    // legitimate replacement path and must produce a runnable, fully
+    // baseline-bound Task.
+    TaskRepo::create(
+        db.as_ref(),
+        task("task-cancelled", "project-a", "abandoned attempt"),
+    )
+    .await
+    .expect("cancelled task");
+    bind_task_to_plan_item(&db, "project-a", "task-cancelled", "pi-2", "cancelled").await;
+    let replacement = provider
+        .propose(
+            "project-agent-a",
+            &scope,
+            "task.propose",
+            json!({
+                "payload": {"title":"implement pi-2", "plan_item_id":"pi-2"},
+                "dedupe_key":"baseline-replacement-task",
+                "correlation_id":"baseline-replacement-task-correlation"
+            }),
+        )
+        .await
+        .expect("a cancelled Task must not block its plan item");
+    assert_eq!(replacement["status"], "executed");
+    let task_id = replacement["domain_result"]["task_id"]
+        .as_str()
+        .expect("replacement task id")
+        .to_owned();
+    let (plan_item_id, runnable): (Option<String>, i64) = {
+        let row = sqlx::query(
+            "SELECT plan_item_id, runnable FROM project_task_governance WHERE task_id = ?",
+        )
+        .bind(&task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("replacement governance row");
+        (
+            sqlx::Row::get(&row, "plan_item_id"),
+            sqlx::Row::get(&row, "runnable"),
+        )
+    };
+    assert_eq!(plan_item_id.as_deref(), Some("pi-2"));
+    assert_eq!(
+        runnable, 1,
+        "a governed proposal against the active approved baseline is runnable"
     );
 }
 

@@ -76,6 +76,29 @@ const MAX_HANDOFF_BOUNDED_CHARS: usize = 12_000;
 // Charter domain route; no caller-authored permission string is trusted.
 const PROJECT_SETUP_PERMISSION_CEILING: &str =
     "read_project,read_agent_chat,read_memory,propose_message,propose_project";
+
+/// True when a stored permission ceiling admits no operation — either blank or
+/// a JSON value carrying no permission entries, such as `{}` or `[]`.
+fn ceiling_grants_nothing(ceiling: &str) -> bool {
+    let trimmed = ceiling.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        // A non-JSON ceiling is the comma-separated form, which grants
+        // whatever names it lists.
+        return false;
+    };
+    let entries = match &value {
+        serde_json::Value::Array(values) => Some(values),
+        serde_json::Value::Object(map) => map
+            .get("permissions")
+            .or_else(|| map.get("allowed"))
+            .and_then(serde_json::Value::as_array),
+        _ => None,
+    };
+    entries.is_none_or(|values| !values.iter().any(serde_json::Value::is_string))
+}
 const REQUIRED_HANDOFF_REDACTION_CATEGORIES: [&str; 6] = [
     "full_main_chat_history",
     "hidden_memory_bodies",
@@ -951,7 +974,10 @@ impl FederatedAgentChatTurnRunner {
         let project = ProjectRepo::get_by_id(&*self.db, project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
-        if binding.permission_ceiling_json.trim().is_empty() {
+        // A ceiling of `{}` is textually present but grants nothing, which
+        // would hand the model a turn with no tools bound — the agent then
+        // narrates work it cannot perform instead of failing. Reject it here.
+        if ceiling_grants_nothing(&binding.permission_ceiling_json) {
             return Err(ServiceError::invalid_operation(
                 "Project Agent binding has no permission ceiling",
             ));
@@ -2802,7 +2828,7 @@ impl AgentChatTurnWorker {
     async fn claim_one(&self) -> Result<Option<AgentChatTurnJob>> {
         let now = now_rfc3339();
         let leased_until = lease_deadline();
-        let mut transaction = self.db.pool().begin().await?;
+        let mut transaction = db::begin_immediate(self.db.pool()).await?;
         let id = sqlx::query_scalar::<_, String>(
             "WITH candidate AS (
                  SELECT job.id

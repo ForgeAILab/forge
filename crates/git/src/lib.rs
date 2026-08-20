@@ -136,10 +136,17 @@ pub async fn is_worktree_clean(worktree_path: &Path) -> Result<bool> {
 /// List uncommitted worktree changes using git porcelain output.
 pub async fn status_porcelain(worktree_path: &Path) -> Result<Vec<String>> {
     let output = run_git(worktree_path, &["status", "--porcelain"]).await?;
+    // run_git trims stdout, so the first line may have lost the leading
+    // space of its two-character status code; split on the first space
+    // after the code instead of assuming a fixed offset.
     Ok(output
         .lines()
-        .map(|line| line.get(3..).unwrap_or(line).trim().to_owned())
-        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let line = line.trim_start();
+            line.split_once(' ')
+                .map(|(_, path)| path.trim().to_owned())
+                .filter(|path| !path.is_empty())
+        })
         .collect())
 }
 

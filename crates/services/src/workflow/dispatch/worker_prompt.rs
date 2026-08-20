@@ -60,6 +60,7 @@ Worker boundary:
 - Own planning, implementation, self-validation, and routine repair for this task in the task worktree.
 - Inspect the task contract, repository, existing plan, comments, and prior evidence before acting.
 - Keep the plan updated as understanding changes, keep scope tight, and commit completed changes.
+- Before finishing, run `git add -A && git commit` in the worktree with a message naming the task; the merge gate rejects uncommitted worktrees, so an uncommitted result is an incomplete task.
 - When a safe decision cannot be inferred, stop and ask one structured question instead of guessing.
 - Red flags: unrelated refactors, skipped verification, hidden failures, or completion claims without evidence.";
 

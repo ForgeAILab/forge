@@ -16,7 +16,9 @@ use tracing::Instrument;
 use workspace::RepoCacheLockManager;
 
 use self::{
-    context::{latest_execution_context, latest_executor_context, latest_review},
+    context::{
+        has_running_execution, latest_execution_context, latest_executor_context, latest_review,
+    },
     hooks::{
         effective_after_enter_hooks, elapsed_ms, hook_audience_matches, hook_result_entry,
         log_hook_result, log_hook_skipped_by_audience, log_hook_start, merged_state_config,
@@ -36,6 +38,127 @@ mod context;
 mod hooks;
 #[cfg(test)]
 mod tests;
+
+/// `error_annotation` type recorded when a dispatch hook fails entering an
+/// active state. The task dispatcher treats it as blocking, so a task whose
+/// dispatch deterministically fails (e.g. governance says it is not runnable)
+/// is parked instead of rescheduled in a loop.
+pub(crate) const DISPATCH_FAILED_ANNOTATION: &str = "dispatch_failed";
+
+fn dispatch_failed_annotation_json(state: &str, message: &str) -> String {
+    serde_json::json!({
+        "type": DISPATCH_FAILED_ANNOTATION,
+        "message": message,
+        "state": state,
+        "detected_at": now_rfc3339(),
+        "recovery_actions": ["reexecute", "reset_to_initial", "cancel_task"],
+    })
+    .to_string()
+}
+
+pub(crate) fn is_dispatch_failed_annotation(raw_annotation: Option<&str>) -> bool {
+    raw_annotation
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|annotation| {
+            annotation
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|kind| kind == DISPATCH_FAILED_ANNOTATION)
+}
+
+/// Persist a `dispatch_failed` error annotation on the task, retrying version
+/// conflicts. Shared by the engine's dispatch-failure fallback and the task
+/// dispatcher's governance parking.
+pub(crate) async fn annotate_dispatch_failure(
+    db: &db::SqliteDb,
+    task_id: &str,
+    state: &str,
+    message: &str,
+) -> db::Result<()> {
+    let annotation = dispatch_failed_annotation_json(state, message);
+    let mut current = TaskRepo::get_by_id(db, task_id, false)
+        .await?
+        .ok_or(db::DbError::NotFound)?;
+    for attempt in 0..3 {
+        match TaskRepo::update(
+            db,
+            UpdateTask {
+                id: current.id.clone(),
+                expected_version: current.version,
+                title: None,
+                description: None,
+                priority: None,
+                merge_config: None,
+                plan: None,
+                error_annotation: Some(Some(annotation.clone())),
+                blocked_json: None,
+                failed_json: None,
+                task_state_config: None,
+                parent_task_id: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        {
+            Ok(_) => return Ok(()),
+            Err(db::DbError::VersionConflict) if attempt < 2 => {
+                current = TaskRepo::get_by_id(db, task_id, false)
+                    .await?
+                    .ok_or(db::DbError::NotFound)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Clear a `dispatch_failed` error annotation (and only that annotation type)
+/// once a dispatch succeeds again, so the task dispatcher resumes scheduling
+/// and recovery for the task.
+pub(crate) async fn clear_dispatch_failure_annotation(
+    db: &db::SqliteDb,
+    task_id: &str,
+) -> db::Result<()> {
+    let mut current = TaskRepo::get_by_id(db, task_id, false)
+        .await?
+        .ok_or(db::DbError::NotFound)?;
+    for attempt in 0..3 {
+        if !is_dispatch_failed_annotation(current.error_annotation.as_deref()) {
+            return Ok(());
+        }
+        match TaskRepo::update(
+            db,
+            UpdateTask {
+                id: current.id.clone(),
+                expected_version: current.version,
+                title: None,
+                description: None,
+                priority: None,
+                merge_config: None,
+                plan: None,
+                error_annotation: Some(None),
+                blocked_json: None,
+                failed_json: None,
+                task_state_config: None,
+                parent_task_id: None,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        {
+            Ok(_) => return Ok(()),
+            Err(db::DbError::VersionConflict) if attempt < 2 => {
+                current = TaskRepo::get_by_id(db, task_id, false)
+                    .await?
+                    .ok_or(db::DbError::NotFound)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
 
 pub struct WorkflowEngine {
     pub db: Arc<db::SqliteDb>,
@@ -832,6 +955,10 @@ impl WorkflowEngine {
 
             let mut hook_results = Vec::new();
             let mut cascade: Option<(String, String)> = None;
+            // Set when a failed dispatch hook rolls the task back to the
+            // workflow's initial state: the rollback must not be blocked by
+            // the active state's exit guards (reset_to_initial idiom).
+            let mut cascade_skip_before_exit = false;
             let mut before_enter_rejection_cascade = false;
             let mut skip_target_enter_hooks = false;
             let has_blocking_before_enter = to_state
@@ -1062,7 +1189,7 @@ impl WorkflowEngine {
                         ),
                     }
                 } else {
-                    let mut transaction = self.db.pool().begin().await?;
+                    let mut transaction = db::begin_immediate(self.db.pool()).await?;
                     let update = query(
                         "UPDATE task\n                 SET status = ?, version = version + 1, updated_at = ?, blocked_json = NULL, entry_barrier_json = ?\n                 WHERE id = ? AND version = ? AND deleted_at IS NULL",
                     )
@@ -1517,6 +1644,27 @@ impl WorkflowEngine {
                             0,
                         );
                         hook_results.push(hook_result_entry(&hook.action, "on_enter", &result, 0));
+                        // The deferred dispatch is executed later by the task
+                        // dispatcher, which skips tasks carrying a
+                        // dispatch_failed annotation — the user's drag is an
+                        // explicit restart, so drop the stale annotation now.
+                        if is_dispatch_failed_annotation(task.error_annotation.as_deref()) {
+                            if let Err(error) =
+                                clear_dispatch_failure_annotation(&self.db, &task_id).await
+                            {
+                                tracing::warn!(
+                                    task_id = %task.id,
+                                    %error,
+                                    "failed to clear dispatch failure annotation before deferred dispatch"
+                                );
+                            } else {
+                                task = TaskRepo::get_by_id(&*self.db, &task_id, false)
+                                    .await?
+                                    .ok_or_else(|| {
+                                        ServiceError::not_found("task", task_id.clone())
+                                    })?;
+                            }
+                        }
                         continue;
                     }
 
@@ -1567,9 +1715,57 @@ impl WorkflowEngine {
                                     from_state: current_status.clone(),
                                     to_state: target_state.clone(),
                                     action: hook.action.clone(),
-                                    error,
+                                    error: error.clone(),
                                 },
                             });
+
+                            // A failed dispatch entering an active state means
+                            // no execution is driving the task; left alone it
+                            // would sit there looking in-flight forever. Roll
+                            // it back to the workflow's initial state and
+                            // record the dispatch error on the task.
+                            if to_state.kind == StateKind::Active
+                                && registry::is_dispatch_action(&hook.action)
+                            {
+                                let fallback = workflow
+                                    .states
+                                    .iter()
+                                    .find(|state| state.kind == StateKind::Initial)
+                                    .map(|state| state.name.clone());
+                                if let Some(fallback) = fallback {
+                                    if !has_running_execution(&self.db, &task.id).await? {
+                                        if let Err(annotate_error) = annotate_dispatch_failure(
+                                            &self.db,
+                                            &task.id,
+                                            &target_state,
+                                            &error,
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(
+                                                task_id = %task.id,
+                                                %annotate_error,
+                                                "failed to record dispatch failure annotation"
+                                            );
+                                        }
+                                        tracing::warn!(
+                                            task_id = %task.id,
+                                            state = %target_state,
+                                            fallback = %fallback,
+                                            %error,
+                                            "dispatch failed entering active state; rolling task back"
+                                        );
+                                        cascade = Some((
+                                            fallback,
+                                            format!(
+                                                "dispatch failed entering {target_state}: {error}"
+                                            ),
+                                        ));
+                                        cascade_skip_before_exit = true;
+                                        break;
+                                    }
+                                }
+                            }
                         }
                         HookResult::Cascade {
                             to,
@@ -1578,7 +1774,33 @@ impl WorkflowEngine {
                             cascade = Some((to, cascade_reason));
                             break;
                         }
-                        HookResult::Ok | HookResult::Skipped { .. } => {}
+                        HookResult::Ok => {
+                            // A dispatch that succeeds again invalidates any
+                            // stale dispatch_failed annotation, un-parking the
+                            // task for the task dispatcher.
+                            if registry::is_dispatch_action(&hook.action)
+                                && is_dispatch_failed_annotation(
+                                    task.error_annotation.as_deref(),
+                                )
+                            {
+                                if let Err(error) =
+                                    clear_dispatch_failure_annotation(&self.db, &task_id).await
+                                {
+                                    tracing::warn!(
+                                        task_id = %task.id,
+                                        %error,
+                                        "failed to clear dispatch failure annotation after successful dispatch"
+                                    );
+                                } else {
+                                    task = TaskRepo::get_by_id(&*self.db, &task_id, false)
+                                        .await?
+                                        .ok_or_else(|| {
+                                            ServiceError::not_found("task", task_id.clone())
+                                        })?;
+                                }
+                            }
+                        }
+                        HookResult::Skipped { .. } => {}
                     }
                 }
             }
@@ -1748,6 +1970,7 @@ impl WorkflowEngine {
                         cascade_to = %cascade_to,
                         cascade_reason = %cascade_reason,
                         cascade_rejection = cascade_rejection,
+                        cascade_skip_before_exit = cascade_skip_before_exit,
                         depth = depth,
                         next_depth = depth + 1,
                         "workflow executing cascade transition"
@@ -1761,7 +1984,7 @@ impl WorkflowEngine {
                             Actor::system(api_types::SystemComponent::Workflow),
                             cascade_reason,
                             cascade_rejection,
-                            false,
+                            cascade_skip_before_exit,
                             None,
                             None,
                             depth + 1,

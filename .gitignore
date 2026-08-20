@@ -57,3 +57,6 @@ crates/api-types/bindings/ProjectHook*.ts
 # Editor/agent tool state
 .cursor/
 .omo/
+
+# Local sibling override for coordinated Agent Runtime development.
+/.cargo/

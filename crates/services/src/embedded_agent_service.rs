@@ -1299,7 +1299,7 @@ impl EmbeddedAgentService {
                 // same write-capable scope a `worker`. Resolve the durable
                 // assignment here without granting anything to an unassigned
                 // identity; reviewers remain an exact role match.
-                let _assignment = TaskRoleAssignmentRepo::list_by_task(&*self.db, task_id)
+                let assignment = TaskRoleAssignmentRepo::list_by_task(&*self.db, task_id)
                     .await?
                     .into_iter()
                     .find(|assignment| {
@@ -1312,12 +1312,20 @@ impl EmbeddedAgentService {
                     .ok_or_else(|| {
                         ServiceError::not_found("task_role_assignment", task_id.clone())
                     })?;
-                let access = match role.as_str() {
-                    // Reviewer and planner sessions never receive worktree
-                    // write authority; planners author plans through Task
-                    // metadata/native tools only.
-                    "reviewer" | "planner" => WorkspaceAccess::TaskRead,
-                    _ => WorkspaceAccess::TaskWrite,
+                // Reviewer and planner sessions never receive worktree write
+                // authority; planners author plans through Task metadata and
+                // native tools only. Planning/discovery Tasks are read-only
+                // for every role — the execution snapshot marks their
+                // worktree read-only, so the session binding must match or a
+                // coder-role dispatch on a planning record binds TaskWrite
+                // while the turn requests TaskRead and authority validation
+                // rejects the turn.
+                let access = if matches!(role.as_str(), "reviewer" | "planner")
+                    || matches!(task.task_type.as_str(), "planning_task" | "discovery")
+                {
+                    WorkspaceAccess::TaskRead
+                } else {
+                    WorkspaceAccess::TaskWrite
                 };
                 // A role-table preassignment is not itself a workspace grant.
                 // The workflow must have admitted the task and a live
@@ -1350,9 +1358,17 @@ impl EmbeddedAgentService {
                             ),
                         }
                 });
+                // The durable claim marker is either the Task-level assignee
+                // (interactive claim path) or the role-table assignment the
+                // claim/dispatch transaction wrote (dispatcher-initiated
+                // initial role dispatch never sets the Task assignee). Both
+                // are server-written records; requiring the Task assignee
+                // alone made every dispatcher-initiated embedded worker
+                // dispatch fail authorization.
                 let claim_admitted = role != "worker"
                     || (task.assignee_type.as_deref() == Some("agent")
-                        && task.assignee_id.as_deref() == Some(identity.id.as_str()));
+                        && task.assignee_id.as_deref() == Some(identity.id.as_str()))
+                    || assignment.assignee_id.as_deref() == Some(identity.id.as_str());
                 if !claim_admitted || !active_execution {
                     // The Running execution row is re-queried here instead of
                     // being threaded from the caller, so a stop/terminalize

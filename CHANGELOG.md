@@ -8,6 +8,199 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- A Project Agent created through the UI can actually orchestrate a Project.
+  Four independent gates each produced a silently toolless agent, which then
+  narrated fake success ("the baseline and tasks are ready") while the
+  database held zero charters and zero tasks:
+  - The Agent Chat content guard rejected any message containing `sk-` as a
+    bare substring, so ordinary Project prose — `Task-1`, `task-by-task`,
+    `risk-free`, `disk-based` — failed the turn with "protected values cannot
+    be stored in Agent Chat content". The `sk-` marker now has to open a word
+    and be followed by a key-length token, and `api key` only marks a secret
+    when an assignment (`=`/`:`) carries a value after it, so `REST API. Key
+    endpoints` passes.
+  - The new-agent wizard's `DEFAULT_CEILING` omitted `propose_project` and six
+    other scopes that seeded agents already had, so no agent created through
+    the UI could ever be granted Project orchestration — the ceiling is the
+    outermost bound, so an omission there cannot be restored by any binding.
+  - Saving a Project Agent binding wrote an empty permission ceiling.
+    Placeholder bindings report `permission_ceiling: {}`, which is present but
+    grants nothing, so `?? DEFAULT_PROJECT_PERMISSION_CEILING` never fired.
+    The panel falls back on an empty allowed list, and the turn worker now
+    rejects a nothing-granting ceiling loudly instead of running a turn with
+    no tools bound.
+  - `project.charter.adoption` required the agent to reproduce
+    `rendered_view`/`render_version` byte-for-byte from the Rust renderer,
+    with no draft operation on the Project surface to read the canonical value
+    from. Adoption now matches the Main Charter contract at all three
+    enforcement points: a supplied render is verified, an omitted one is
+    rendered server-side.
+
+### Breaking
+
+- Project Agent typed actions no longer trust an agent-supplied id when
+  creating a Project Document (`project.document` with a `draft_revision`
+  targeting an unrecognized `document_id`). The id is now minted
+  server-side with `new_uuid_v4()`, matching the existing Charter
+  precedent, and the real `document_id` is returned in the action result
+  JSON for the model to use on follow-up actions. Anything that assumed
+  its proposed `document_id` became the persisted primary key must read
+  the id back from the result instead.
+- Execution-baseline ids are server-minted everywhere. The REST propose
+  route `POST /projects/{id}/execution-baselines` no longer accepts a
+  `baseline_id` field (`CreateExecutionBaselineRequest` rejects it with
+  HTTP 400), and the Project Agent `project.execution_baseline` action
+  treats `baseline_id` as a reference to an existing baseline only: omit
+  it on `draft_revision` to create a new baseline (the minted id comes
+  back in the result), and `revise`/`propose_approval` require an id that
+  already exists. A live run had the model inventing a mutated project id
+  as the baseline primary key.
+- `task.propose` no longer silently creates unrunnable implementation
+  Tasks. When a project is repository-backed and has an active execution
+  baseline, proposing a `task`/`sub_task` without a `plan_item_id` — or
+  with one the active baseline doesn't contain — is rejected with an
+  error listing the valid plan item ids. Proposals naming a plan item
+  that already has a non-cancelled Task are rejected with the existing
+  task id and status (duplicate work is proposed against the existing
+  Task instead). Planning/discovery proposals are unaffected.
+- A failed role dispatch entering an active workflow state no longer
+  strands the Task there looking in-flight. The engine rolls the Task
+  back to the workflow's initial state, records a `dispatch_failed`
+  error annotation with the dispatch error, and the task dispatcher
+  parks annotated Tasks instead of rescheduling them every tick. A
+  successful dispatch clears the annotation, so approving the missing
+  baseline un-parks the work naturally.
+
+### Added
+
+- Embedded (native) Task executions now stream turn events into the standard
+  JSONL log: tool calls (`tool_call`/`tool_result`), reasoning (`thinking`,
+  a new `LogKind`), and assistant deltas. Execution history for embedded
+  agents shows the full turn instead of only the final message, and the
+  execution-detail filter/raw viewers understand the new `thinking` kind.
+- The Project Agent Chat pins an execution-baseline approval card when the
+  agent proposes a revision: review the exact rendered baseline in a dialog
+  and approve + activate it with one action, writing the normal durable
+  approval receipt through the existing REST contract.
+
+### Fixed
+
+- Activating an execution baseline now back-fills governance for
+  preplanned Tasks: non-terminal Tasks whose governance names a plan item
+  in the activated revision are re-bound to it (charter revision,
+  baseline, milestone, provenance) and become runnable, matching what
+  `task.propose` derives for Tasks proposed after activation. Previously
+  only rows already bound to the exact activated revision were flipped,
+  leaving anything proposed pre-baseline permanently unrunnable.
+- Activating an execution baseline sets the project's primary-milestone
+  pointer when it is missing, using the manifest's primary (or only)
+  milestone with the same validity checks as
+  `project.milestone.primary.set`. A missing pointer hard-failed every
+  agent turn admission ("Project with active milestones has no explicit
+  primary milestone").
+- `forge_scope_propose` declares its `task.propose` payload fields in the
+  tool schema (`title`, `task_type`, `plan_item_id`, `milestone_id`, …).
+  The payload was previously an opaque object, so schema-driven models
+  never discovered `plan_item_id` and every proposal landed ungoverned.
+- Server restarts reap stale embedded-agent sessions: startup recovery
+  suspends native-backend sessions left in a non-terminal status
+  (`starting`/`ready`/`running`/`degraded`) so they stop claiming a
+  healthy runtime that did not survive the process. Conversation/LCM
+  continuity is unaffected — a fresh session in the same scope resumes
+  the same timeline; CLI-backend sessions are untouched.
+- Milestone readiness evaluation no longer 500s: its Task/repository
+  context queries referenced columns that don't exist (`task.type`,
+  `repo.kind`, review CI columns from an older schema draft), failing
+  every `POST /projects/{id}/milestones/{milestone_id}/readiness` on a
+  repository-backed project.
+- The heartbeat stall monitor no longer kills healthy embedded executions.
+  Native turn events (tool calls, reasoning, text) now bump the execution's
+  `last_activity_at` (throttled), and dispatches queued behind a busy agent
+  heartbeat while they wait — previously embedded executions never reported
+  activity after launch, so any turn or queue-wait longer than the stall
+  window was culled as "Execution stalled: no activity".
+- The Attention projection no longer wedges permanently on a dedupe-key
+  conflict. `agent.wake.admitted` dedupe keys now include the triggering
+  event id (re-admitting the same incident after lease expiry is a new
+  admission, not a conflicting replay), and the projection loop quarantines
+  semantic-conflict poison events instead of retrying them forever with the
+  cursor stuck — a live run had every wake silently blocked for this.
+- Dispatcher-initiated embedded worker executions no longer fail session
+  authorization with "no Running worker execution for this identity". The
+  durable task-role assignment now admits the write-capable session
+  alongside the live execution check; requiring the Task-level assignee
+  alone rejected every auto-dispatch (only interactive claims set it).
+- Planning/discovery Tasks can actually execute on the embedded backend.
+  Their workflow dispatches the write-capable coder role but the execution
+  snapshot is server-marked read-only, which previously failed twice: the
+  session binding granted TaskWrite from the role alone ("native turn scope
+  does not match the server-issued session binding"), and the typed-tool
+  composition had no mapping for a read-only worker ("Task workspace access
+  is not valid for role `worker`"). Session authorization now derives
+  read-only access from the Task type, a read-only worker composes the
+  planner toolset, and migration `V085` downgrades context scopes the old
+  bug persisted with write access (read-only is strictly narrower).
+- Project Document creation is atomic: the Document shell, its first
+  revision, and the `current_draft_revision_id` pointer are now written
+  in one transaction (`ProjectOrchestrationRepo::create_project_document_atomically`).
+  Previously the shell was inserted immediately and the first revision was
+  created in a separate step after content parsing, so a mid-flow failure
+  (or a retry with a fresh placeholder id) could leave an orphan Document
+  shell with no revision and a `NULL current_draft_revision_id` — observed
+  in a live run as four rows for one logical document, two of them
+  orphans.
+- Project Milestone creation is atomic: the Milestone shell and its first
+  definition revision are now written in one transaction
+  (`ProjectOrchestrationRepo::create_project_milestone_atomically`).
+  Previously the two inserts were separate calls, so a failure between
+  them could leave an orphan Milestone shell with no revision. A first
+  ("define") revision still lands in `draft` lifecycle and intentionally
+  leaves `current_definition_revision_id` unset until a later action
+  promotes it — the `project_milestone_pointer_guard_update` trigger only
+  accepts a `proposed`/`approved` target — so this is expected, not a bug.
+- `GET /api/v1/projects/{id}/milestones` no longer hard-fails the entire
+  list when one Milestone has a `NULL current_definition_revision_id`
+  (the normal mid-flow state described above). The projection now falls
+  back to that Milestone's latest definition revision, of any lifecycle;
+  a Milestone with no definition revision at all (which atomic creation
+  should make impossible) is skipped with a `tracing::warn!` instead of
+  failing every other Milestone in the response.
+- Genesis Charter creation no longer trusts the agent-supplied
+  `charter_id`: the first Charter shell's primary key is minted
+  server-side and returned in the action result (a live Gemini run
+  persisted the placeholder `11111111-1111-1111-1111-111111111111` as a
+  primary key, which would collide with the next Genesis session).
+- SQLite write transactions now open with `BEGIN IMMEDIATE`
+  (`db::begin_immediate`, all 125 former `pool().begin()` sites). Deferred
+  transactions that upgraded to writes failed instantly with
+  `SQLITE_BUSY_SNAPSHOT` regardless of `busy_timeout`, surfacing as
+  `LCM store backend failed` turn failures under concurrent load. The LCM
+  and protected stores also log the underlying database error before
+  mapping it to their opaque store-failure variants.
+- Typed tool errors reaching the model now carry the server's actual
+  rejection message (`AgentHostError::Runtime` passthrough) instead of a
+  generic "Forge tool provider failed", and the execution-baseline
+  release-policy schema error names the expected schema string. Models
+  can now self-correct instead of retrying blind.
+- A merge attempt against a dirty worktree now routes the task to
+  `merge_failed` (the merging gate's defined reject edge) instead of
+  cascading toward `review`, an edge the default workflow does not
+  define — tasks used to wedge in `merging` forever.
+- `git::status_porcelain` no longer chops the first character of the
+  first path (`run_git` trims stdout, which ate the leading space of the
+  two-character status code; errors reported files like `EADME.md`).
+- Worker prompts now state explicitly that the worktree must be committed
+  (`git add -A && git commit`) before finishing, because the merge gate
+  rejects uncommitted worktrees.
+- Mission Control no longer returns a blank feed: `execution_failed`
+  attention rows (written by the projector) were unmappable on the read
+  side and one such row failed the entire `GET /api/v1/mission-control`
+  response. `AttentionCategory` gains `execution_failed`, and the list
+  endpoint skips (with a warning) any projection row it cannot map
+  instead of failing the page.
+
+### Fixed
+
 - Native (embedded) agents can execute the `planner` role. The embedded
   Task executor only admitted worker/coder/reviewer, so every genesis
   project whose workflow has a planning state hard-failed with "embedded

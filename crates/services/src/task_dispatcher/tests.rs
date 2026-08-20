@@ -1291,6 +1291,77 @@ async fn dispatcher_skips_active_task_with_blocking_annotation() {
 }
 
 #[tokio::test]
+async fn dispatcher_skips_todo_task_with_dispatch_failed_annotation() {
+    // A task parked in todo after a deterministic dispatch failure (e.g.
+    // governance says it is not runnable) must not be rescheduled until a
+    // user restarts it — otherwise the dispatcher loops todo -> ... -> todo.
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let task = seed_task(&db, &project_id, &repo_id, "parked", "todo", 0).await;
+    assign_role(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        &agent_id,
+    )
+    .await;
+    let annotation = serde_json::json!({
+        "type": "dispatch_failed",
+        "message": "repository Task is not runnable: an active user-approved execution baseline with matching traceability is required",
+        "state": "in_progress",
+        "detected_at": now_rfc3339(),
+        "recovery_actions": ["reexecute", "reset_to_initial", "cancel_task"],
+    })
+    .to_string();
+    TaskRepo::update(
+        &*db,
+        UpdateTask {
+            id: task.id.clone(),
+            expected_version: task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(Some(annotation)),
+            blocked_json: None,
+            failed_json: None,
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("task annotation updates");
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+
+    assert_eq!(dispatched, 0);
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert_eq!(current.status, "todo", "parked task stays in todo");
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(
+            &*db,
+            &task.id,
+            crate::workflow::default_roles::CODER
+        )
+        .await
+        .expect("execution count loads"),
+        0
+    );
+    assert!(tokio::time::timeout(Duration::from_millis(100), rx.recv())
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn dispatcher_skips_reviewer_until_configured_ci_has_finished() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");

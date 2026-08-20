@@ -288,6 +288,25 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
                     }
                     match &event.payload {
                         RuntimeEvent::TextDelta { text, .. } => sink.text_delta(text).await,
+                        RuntimeEvent::ReasoningDelta { text, redacted, .. } => {
+                            sink.reasoning_delta(text, *redacted).await;
+                        }
+                        RuntimeEvent::ToolCallRequested {
+                            call,
+                            name,
+                            argument_keys,
+                            ..
+                        } => {
+                            sink.tool_call_started(call.as_str(), name, argument_keys)
+                                .await;
+                        }
+                        RuntimeEvent::ToolCallCompleted {
+                            call,
+                            name,
+                            is_error,
+                        } => {
+                            sink.tool_call_finished(call.as_str(), name, *is_error).await;
+                        }
                         RuntimeEvent::Error { error } => {
                             last_turn_error = Some(error.to_string());
                         }

@@ -3,7 +3,7 @@ use super::*;
 #[async_trait]
 impl DomainEventRepo for SqliteDb {
     async fn append_event(&self, input: CreateDomainEvent) -> Result<DomainEvent> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let event = self.append_event_in_tx(&mut transaction, &input).await?;
         transaction.commit().await?;
         Ok(event)
@@ -130,7 +130,7 @@ impl DomainEventRepo for SqliteDb {
     }
 
     async fn claim_event_batch(&self, input: ClaimDomainEvents) -> Result<Vec<DomainEvent>> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         sqlx::query(
             "INSERT INTO event_consumer_cursor (
                 consumer_name, last_sequence, version, updated_at
@@ -245,7 +245,7 @@ impl DomainEventRepo for SqliteDb {
     }
 
     async fn complete_claimed_event(&self, input: CompleteDomainEvent) -> Result<bool> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let cursor = sqlx::query_scalar::<_, i64>(
             "SELECT last_sequence FROM event_consumer_cursor WHERE consumer_name = ?",
         )

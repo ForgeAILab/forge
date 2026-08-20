@@ -166,6 +166,11 @@ impl TaskToolRole {
             (WorkspaceAccess::TaskWrite, Some("worker" | "coder")) => Ok(Self::Worker),
             (WorkspaceAccess::TaskRead, Some("reviewer")) => Ok(Self::Reviewer),
             (WorkspaceAccess::TaskRead, Some("planner")) => Ok(Self::Planner),
+            // A write-capable role bound to a server-issued read-only Task
+            // workspace (planning/discovery records dispatch their workflow's
+            // coder role but never receive write authority) composes the
+            // read-only planner toolset instead of being rejected.
+            (WorkspaceAccess::TaskRead, Some("worker" | "coder")) => Ok(Self::Planner),
             (WorkspaceAccess::TaskWrite, Some(other))
             | (WorkspaceAccess::TaskRead, Some(other)) => Err(AgentHostError::Authority(format!(
                 "Task workspace access is not valid for role `{other}`"
@@ -1105,10 +1110,14 @@ fn orchestration_payload_schema(operation: &str) -> Value {
                 "project_mode":{"type":"string","enum":["compact","standard"]},
                 "maturity":{"type":"string","enum":["prototype","mvp","production","critical"]},
                 "content":charter_content_schema(),
-                "rendered_view":{"type":"string","minLength":1},
-                "render_version":{"type":"string","minLength":1},
+                "rendered_view":{"type":"string","minLength":1,"description":"Omit. The server renders the canonical view from content; provide only to round-trip an exact server-rendered value."},
+                "render_version":{"type":"string","minLength":1,"description":"Omit. The server stamps its own render version; provide only to round-trip an exact server value."},
                 "provenance":revision_provenance_schema()
             }),
+            // `rendered_view`/`render_version` stay optional for the same
+            // reason as the Main Charter draft: the render is derived from
+            // `content`, and a model cannot reproduce the server renderer
+            // byte-for-byte.
             &[
                 "action",
                 "charter_id",
@@ -1116,8 +1125,6 @@ fn orchestration_payload_schema(operation: &str) -> Value {
                 "project_mode",
                 "maturity",
                 "content",
-                "rendered_view",
-                "render_version",
                 "provenance",
             ],
             "Setup-only Project Agent adoption Charter draft. The bound Project may have no current Charter; this creates an unapproved candidate only and cannot approve, attach, apply, or authorize execution.",
@@ -1216,9 +1223,9 @@ fn orchestration_payload_schema(operation: &str) -> Value {
         PROJECT_EXECUTION_BASELINE_OPERATION => described_object_schema(
             json!({
                 "action":{"enum":["draft_revision","revise","propose_approval"]},
-                "baseline_id":{"type":"string","minLength":1},
+                "baseline_id":{"type":["string","null"],"minLength":1,"description":"Omit when drafting a new execution baseline — the server mints the id and returns it. Required for revise/propose_approval: the id of an existing baseline from the Project current state."},
                 "base_revision_id":string_or_null_schema(),
-                "expected_baseline_version":{"type":"integer","minimum":1},
+                "expected_baseline_version":{"type":"integer","minimum":1,"description":"The baseline's current version from the Project current state; use 1 when drafting a new baseline."},
                 "charter_revision_id":{"type":"string","minLength":1},
                 "content":execution_baseline_content_schema(),
                 "schema_version":{"type":"string","minLength":1},
@@ -1230,7 +1237,6 @@ fn orchestration_payload_schema(operation: &str) -> Value {
             }),
             &[
                 "action",
-                "baseline_id",
                 "expected_baseline_version",
                 "charter_revision_id",
                 "content",
@@ -1241,7 +1247,7 @@ fn orchestration_payload_schema(operation: &str) -> Value {
                 "render_digest",
                 "provenance",
             ],
-            "Project Agent may draft or propose an execution baseline revision inside the active Project. Approval and activation are user-only and never exposed here.",
+            "Project Agent may draft or propose an execution baseline revision inside the active Project. Omit baseline_id to draft a new baseline (the server mints its id); name an existing baseline_id to revise or propose approval. Approval and activation are user-only and never exposed here.",
         ),
         PROJECT_MILESTONE_OPERATION => object_schema(
             json!({"action":{"enum":["define","revise","set_primary"]},"milestone_id":string_or_null_schema(),"display_label":string_or_null_schema(),"expected_milestone_version":{"type":"integer","minimum":1},"primary_milestone_id":string_or_null_schema(),"content":{"type":"object","properties":{"name":{"type":"string","minLength":1},"outcome":{"type":"string","minLength":1},"included_scope":string_array_schema(),"excluded_scope":string_array_schema(),"charter_revision":{"oneOf":[artifact_ref_schema(),{"type":"null"}]},"document_revisions":{"type":"array","items":artifact_ref_schema()},"task_ids":string_array_schema(),"dependencies":string_array_schema(),"risks":{"type":"array","items":charter_risk_schema()},"acceptance_checks":{"type":"array"},"evidence_requirements":{"type":"array"},"known_issues":string_array_schema(),"target_date":string_or_null_schema()},"additionalProperties":false}}),
@@ -1390,8 +1396,10 @@ fn coordination_payload_guidance(operations: &BTreeSet<String>) -> String {
             "title (required); description (outcome plus acceptance criteria); ",
             "priority (integer, higher runs sooner); ",
             "task_type (\"task\" implementation default, \"planning_task\", or \"discovery\"); ",
-            "plan_item_id (required for implementation Tasks once an execution baseline is ",
-            "active — the stable plan-item id from that baseline, for example \"pi-2\"); ",
+            "plan_item_id (REQUIRED for implementation Tasks once an execution baseline is ",
+            "active — the stable plan-item id from that baseline, for example \"pi-2\"; ",
+            "proposals missing it, naming an id outside the active baseline, or naming a ",
+            "plan item that already has a non-cancelled Task are rejected); ",
             "milestone_id (optional, defaults to the active baseline's primary milestone); ",
             "capability_class (when supplied it must be one of the server-approved profiles: ",
             "\"repository_read\", \"repository_write\", \"read_only\", \"discovery_read\", ",
@@ -1409,6 +1417,62 @@ fn coordination_payload_guidance(operations: &BTreeSet<String>) -> String {
             lines.join("\n- ")
         )
     }
+}
+
+/// Declared payload properties for the generic coordination proposal
+/// surface. Several provider function-calling APIs (notably Gemini) surface
+/// only declared properties to the model, so the `task.propose` field
+/// contract — most importantly `plan_item_id`, which governs whether the
+/// created Task can ever run — must be visible as real schema properties,
+/// not only as description prose. The payload deliberately keeps
+/// `additionalProperties` open because every admitted operation shares this
+/// one envelope; each description names its owning operation.
+fn coordination_payload_properties(operations: &BTreeSet<String>) -> Option<Value> {
+    if !operations.contains("task.propose") {
+        return None;
+    }
+    Some(json!({
+        "title": {
+            "type": ["string", "null"],
+            "description": "task.propose: required Task title."
+        },
+        "description": {
+            "type": ["string", "null"],
+            "description": "task.propose: outcome plus acceptance criteria."
+        },
+        "priority": {
+            "type": ["integer", "null"],
+            "description": "task.propose: integer; higher runs sooner."
+        },
+        "task_type": {
+            "type": ["string", "null"],
+            "description": "task.propose: \"task\" (implementation default), \"planning_task\", or \"discovery\"."
+        },
+        "plan_item_id": {
+            "type": ["string", "null"],
+            "description": concat!(
+                "task.propose: REQUIRED for implementation Tasks (task_type \"task\") ",
+                "whenever the Project has an active user-approved execution baseline — ",
+                "a proposal without it is rejected because the Task could never become ",
+                "runnable. Use the stable plan-item id from that active baseline (for ",
+                "example \"pi-2\"); valid ids are the baseline's plan_item_ids, visible ",
+                "in the Project current-state read. Each plan item admits exactly one ",
+                "non-cancelled Task — never re-propose a plan item that already has one."
+            )
+        },
+        "milestone_id": {
+            "type": ["string", "null"],
+            "description": "task.propose: optional; defaults to the active baseline's primary milestone."
+        },
+        "capability_class": {
+            "type": ["string", "null"],
+            "description": "task.propose: optional server-approved capability profile (e.g. \"repository_write\", \"repository_read\")."
+        },
+        "risk_class": {
+            "type": ["string", "null"],
+            "description": "task.propose: optional; only when the baseline declares allowed risk classes."
+        }
+    }))
 }
 
 // The declared envelope is a plain `type: object` schema: several provider
@@ -1984,6 +2048,9 @@ impl ForgeScopeProposeTool {
             if !guidance.is_empty() {
                 payload_property["description"] = json!(guidance);
             }
+            if let Some(properties) = coordination_payload_properties(&self.operations) {
+                payload_property["properties"] = properties;
+            }
             json!({
                 "type": "object",
                 "required": ["operation", "payload", "dedupe_key", "correlation_id"],
@@ -2038,7 +2105,9 @@ impl Tool for ForgeScopeProposeTool {
                 "Forge proposal operation is outside this scope",
             ));
         }
-        if operation == MAIN_CHARTER_DRAFT_OPERATION {
+        if operation == MAIN_CHARTER_DRAFT_OPERATION
+            || operation == PROJECT_CHARTER_ADOPTION_OPERATION
+        {
             // The server renders the canonical Charter view itself; a
             // model-supplied render can never match it byte-for-byte, so
             // these server-owned fields are dropped rather than compared.
@@ -2762,9 +2831,13 @@ fn host_error_to_runtime(error: AgentHostError) -> RuntimeError {
         AgentHostError::VersionConflict => {
             RuntimeError::tool("Forge runtime resource changed; retry with the current version")
         }
-        AgentHostError::Runtime(_) | AgentHostError::ProtectedPersistence => {
-            RuntimeError::tool("Forge tool provider failed")
+        // Runtime carries operational feedback (validation conflicts, policy
+        // rejections) the model needs verbatim to self-correct; only the
+        // protected-persistence path stays opaque.
+        AgentHostError::Runtime(message) => {
+            RuntimeError::tool(format!("Forge tool provider failed: {message}"))
         }
+        AgentHostError::ProtectedPersistence => RuntimeError::tool("Forge tool provider failed"),
     }
 }
 
@@ -3347,6 +3420,16 @@ mod tests {
                 .expect("adoption description")
                 .contains("no current Charter")
         );
+        for optional_render_field in ["rendered_view", "render_version"] {
+            assert!(
+                !payload["required"]
+                    .as_array()
+                    .expect("adoption required fields")
+                    .iter()
+                    .any(|value| value == optional_render_field),
+                "{optional_render_field} must stay optional: models cannot reproduce the server renderer",
+            );
+        }
         assert!(!operations.iter().any(|value| {
             value == PROJECT_DOCUMENT_OPERATION
                 || value == PROJECT_MILESTONE_OPERATION

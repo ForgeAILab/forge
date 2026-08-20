@@ -28,6 +28,15 @@ use tokio::sync::Mutex;
 const OAUTH_REFRESH_SKEW_MS: u64 = 30_000;
 const MAX_PROVIDER_CREDENTIAL_RESPONSE_BYTES: usize = 1024 * 1024;
 
+/// Logs a swallowed sqlx error before mapping it to the given fallback.
+/// Mirrors the diagnosability fix in `lcm.rs`: a bare `.map_err(|_| ...)`
+/// discarded the cause, making a SQLite busy/busy-snapshot failure
+/// indistinguishable from any other store error in the logs.
+fn log_store_error<E>(error: impl std::fmt::Display, fallback: E) -> E {
+    tracing::warn!(error = %error, "protected store operation failed");
+    fallback
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialRevocationOutcome {
     NotSupported,
@@ -485,12 +494,9 @@ impl SqliteProtectedRuntimeStore {
         let (ciphertext, nonce) = self
             .seal(secret.expose().as_bytes())
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        let mut transaction = self
-            .db
-            .pool()
-            .begin()
+        let mut transaction = db::begin_immediate(self.db.pool())
             .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         sqlx::query(
             "INSERT INTO credential_handle (
                 id, owner_user_id, provider, label, status,
@@ -505,7 +511,7 @@ impl SqliteProtectedRuntimeStore {
         .bind(now)
         .execute(&mut *transaction)
         .await
-        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         sqlx::query(
             "INSERT INTO protected_credential_secret (
                 handle_id, ciphertext, nonce, key_revision, created_at, updated_at
@@ -519,11 +525,11 @@ impl SqliteProtectedRuntimeStore {
         .bind(now)
         .execute(&mut *transaction)
         .await
-        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         transaction
             .commit()
             .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         Ok(CredentialHandle {
             id: id.to_owned(),
             owner_user_id: owner_user_id.to_owned(),
@@ -578,12 +584,9 @@ impl SqliteProtectedRuntimeStore {
         let (ciphertext, nonce) = self
             .seal(&plaintext)
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        let mut transaction = self
-            .db
-            .pool()
-            .begin()
+        let mut transaction = db::begin_immediate(self.db.pool())
             .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         sqlx::query(
             "INSERT INTO credential_handle (
                 id, owner_user_id, provider, label, status,
@@ -599,7 +602,7 @@ impl SqliteProtectedRuntimeStore {
         .bind(input.now)
         .execute(&mut *transaction)
         .await
-        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         sqlx::query(
             "INSERT INTO protected_credential_secret (
                 handle_id, ciphertext, nonce, key_revision, created_at, updated_at
@@ -613,11 +616,11 @@ impl SqliteProtectedRuntimeStore {
         .bind(input.now)
         .execute(&mut *transaction)
         .await
-        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         transaction
             .commit()
             .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         Ok(CredentialHandle {
             id: input.id.to_owned(),
             owner_user_id: input.owner_user_id.to_owned(),
@@ -825,12 +828,9 @@ impl SqliteProtectedRuntimeStore {
             .seal(&plaintext)
             .map_err(|_| ProviderCredentialError::RefreshFailed)?;
         let now = db::now_rfc3339();
-        let mut transaction = self
-            .db
-            .pool()
-            .begin()
+        let mut transaction = db::begin_immediate(self.db.pool())
             .await
-            .map_err(|_| ProviderCredentialError::RefreshFailed)?;
+            .map_err(|error| log_store_error(error, ProviderCredentialError::RefreshFailed))?;
         let result = sqlx::query(
             "UPDATE credential_handle
              SET version = version + 1, status = 'configured', updated_at = ?
@@ -843,12 +843,12 @@ impl SqliteProtectedRuntimeStore {
         .bind(expected_version)
         .execute(&mut *transaction)
         .await
-        .map_err(|_| ProviderCredentialError::RefreshFailed)?;
+        .map_err(|error| log_store_error(error, ProviderCredentialError::RefreshFailed))?;
         if result.rows_affected() == 0 {
             transaction
                 .rollback()
                 .await
-                .map_err(|_| ProviderCredentialError::RefreshFailed)?;
+                .map_err(|error| log_store_error(error, ProviderCredentialError::RefreshFailed))?;
             return Err(ProviderCredentialError::RefreshFailed);
         }
         sqlx::query(
@@ -863,11 +863,11 @@ impl SqliteProtectedRuntimeStore {
         .bind(handle_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|_| ProviderCredentialError::RefreshFailed)?;
+        .map_err(|error| log_store_error(error, ProviderCredentialError::RefreshFailed))?;
         transaction
             .commit()
             .await
-            .map_err(|_| ProviderCredentialError::RefreshFailed)?;
+            .map_err(|error| log_store_error(error, ProviderCredentialError::RefreshFailed))?;
         Ok(expected_version + 1)
     }
 
@@ -880,12 +880,9 @@ impl SqliteProtectedRuntimeStore {
         let remote_bundle = self
             .remote_revocation_bundle(handle_id, owner_user_id)
             .await;
-        let mut transaction = self
-            .db
-            .pool()
-            .begin()
+        let mut transaction = db::begin_immediate(self.db.pool())
             .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         let result = sqlx::query(
             "UPDATE credential_handle
              SET status = 'revoked', version = version + 1, updated_at = ?
@@ -896,7 +893,7 @@ impl SqliteProtectedRuntimeStore {
         .bind(owner_user_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         if result.rows_affected() == 0 {
             return Err(crate::AgentHostError::CredentialNotFound);
         }
@@ -904,12 +901,12 @@ impl SqliteProtectedRuntimeStore {
             .bind(handle_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         mark_credential_dependents_unavailable(&mut transaction, handle_id, now).await?;
         transaction
             .commit()
             .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         Ok(self.best_effort_remote_revocation(remote_bundle).await)
     }
 
@@ -923,12 +920,9 @@ impl SqliteProtectedRuntimeStore {
         let remote_bundle = self
             .remote_revocation_bundle(handle_id, owner_user_id)
             .await;
-        let mut transaction = self
-            .db
-            .pool()
-            .begin()
+        let mut transaction = db::begin_immediate(self.db.pool())
             .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         let result = sqlx::query(
             "UPDATE credential_handle
              SET status = 'revoked', version = version + 1, updated_at = ?
@@ -940,7 +934,7 @@ impl SqliteProtectedRuntimeStore {
         .bind(expected_version)
         .execute(&mut *transaction)
         .await
-        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         if result.rows_affected() == 0 {
             return Err(crate::AgentHostError::VersionConflict);
         }
@@ -948,12 +942,12 @@ impl SqliteProtectedRuntimeStore {
             .bind(handle_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         mark_credential_dependents_unavailable(&mut transaction, handle_id, now).await?;
         transaction
             .commit()
             .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         Ok(self.best_effort_remote_revocation(remote_bundle).await)
     }
 

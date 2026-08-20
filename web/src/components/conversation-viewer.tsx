@@ -20,6 +20,7 @@ import {
   ChatShellOutput,
   ChatSkeleton,
   ChatSystemMessage,
+  ChatThinking,
   ChatToolCall,
   ChatUserMessage,
   type ChatEntry,
@@ -57,6 +58,8 @@ const ChatEntryRenderer = memo(
     switch (entry.kind) {
       case 'assistant':
         return <ChatAssistantMessage entry={entry} />
+      case 'thinking':
+        return <ChatThinking entry={entry} />
       case 'user':
         return <ChatUserMessage entry={entry} />
       case 'system':

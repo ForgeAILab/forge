@@ -59,6 +59,23 @@ impl TaskDispatcher {
                 Err(ServiceError::Db(DbError::VersionConflict)) => {
                     tracing::debug!(task_id = %task.id, "task dispatcher initial transition lost version race");
                 }
+                Err(error) if helpers::is_not_runnable_error(&error) => {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        %error,
+                        "task is not runnable under governance; parking until a user restarts it"
+                    );
+                    if let Err(annotate_error) = crate::workflow::engine::annotate_dispatch_failure(
+                        &self.db,
+                        &task.id,
+                        task.status.as_str(),
+                        &error.to_string(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(task_id = %task.id, %annotate_error, "failed to annotate not-runnable task");
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(task_id = %task.id, %error, "task dispatcher initial dispatch failed");
                 }

@@ -4146,7 +4146,9 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
     .await;
     assert!(matches!(bad_update, Err(DbError::VersionConflict)));
 
-    let mut tx = db.pool().begin().await.expect("transaction starts");
+    let mut tx = crate::begin_immediate(db.pool())
+        .await
+        .expect("transaction starts");
     let claimed = TaskRepo::claim(
         &db,
         &mut tx,
@@ -4391,7 +4393,9 @@ async fn task_claim_rejects_active_entry_barrier() {
     .await
     .expect("barrier sets");
 
-    let mut tx = db.pool().begin().await.expect("transaction starts");
+    let mut tx = crate::begin_immediate(db.pool())
+        .await
+        .expect("transaction starts");
     let result = TaskRepo::claim(
         &db,
         &mut tx,
@@ -4598,7 +4602,9 @@ async fn test_dependency_gate_blocks_non_context_holder() {
         .await
         .expect("dependency adds");
 
-    let mut tx = db.pool().begin().await.expect("transaction starts");
+    let mut tx = crate::begin_immediate(db.pool())
+        .await
+        .expect("transaction starts");
     let result = TaskRepo::claim(
         &db,
         &mut tx,
@@ -5468,7 +5474,9 @@ async fn domain_event_append_in_tx_rolls_back_with_the_mutation() {
         payload_json: "{}".to_owned(),
         created_at: "2026-08-12T20:00:00Z".to_owned(),
     };
-    let mut transaction = db.pool().begin().await.expect("transaction begins");
+    let mut transaction = crate::begin_immediate(db.pool())
+        .await
+        .expect("transaction begins");
     DomainEventRepo::append_event_in_tx(&db, &mut transaction, &event)
         .await
         .expect("event appends inside transaction");
@@ -5715,7 +5723,9 @@ async fn stale_execution_baseline_cannot_mint_a_running_execution_after_read_gat
         .await
         .expect("task reads")
         .expect("task exists");
-    let mut claim_transaction = db.pool().begin().await.expect("claim transaction begins");
+    let mut claim_transaction = crate::begin_immediate(db.pool())
+        .await
+        .expect("claim transaction begins");
     let claim = TaskRepo::claim(
         &db,
         &mut claim_transaction,

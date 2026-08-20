@@ -10,7 +10,7 @@ const DEFAULT_CLI_SCOPE_PERMISSIONS: &str = r#"{"permissions":["read_account","r
 impl AgentRepo for SqliteDb {
     async fn create(&self, input: CreateAgent) -> Result<Agent> {
         let profile_id = crate::new_uuid_v4();
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
 
         if input.is_default {
             clear_default_for_executor(&mut transaction, &input.executor_type, Some(&input.id))
@@ -93,7 +93,7 @@ impl AgentRepo for SqliteDb {
                 "profile identity must match the new identity".to_owned(),
             ));
         }
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         if identity.is_default {
             clear_default_for_executor(
                 &mut transaction,
@@ -296,7 +296,7 @@ impl AgentRepo for SqliteDb {
             agent.paused = paused;
         }
 
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         if agent.is_default {
             clear_default_for_executor(&mut transaction, &agent.executor_type, Some(&agent.id))
                 .await?;
@@ -499,7 +499,7 @@ impl AgentRepo for SqliteDb {
 #[async_trait]
 impl AgentProfileRepo for SqliteDb {
     async fn create_profile(&self, input: CreateAgentProfile) -> Result<AgentProfile> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         insert_profile(&mut transaction, &input).await?;
         transaction.commit().await?;
         AgentProfileRepo::get_profile(self, &input.id)
@@ -515,7 +515,7 @@ impl AgentProfileRepo for SqliteDb {
         if profile.id != selection.profile_id || profile.identity_id != selection.identity_id {
             return Err(DbError::VersionConflict);
         }
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         insert_profile(&mut transaction, &profile).await?;
         let selected = sqlx::query(
             "UPDATE agent_identity

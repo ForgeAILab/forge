@@ -56,11 +56,22 @@ impl MilestoneRuntime {
     }
 
     /// List only milestones belonging to the requested Project.
+    ///
+    /// A milestone can legitimately have `current_definition_revision_id ==
+    /// NULL` mid-flow (a "define" proposal's first revision stays `draft`
+    /// until promoted, and the pointer trigger only accepts a
+    /// `proposed`/`approved` target).  Failing the whole list on one such row
+    /// would hide every other milestone in the Project, so this falls back to
+    /// each unset milestone's latest definition revision instead.
     pub async fn list(&self, project_id: &str) -> crate::Result<Vec<ProjectMilestone>> {
         let rows = ProjectOrchestrationRepo::list_project_milestones(&*self.db, project_id).await?;
-        rows.into_iter()
-            .map(project_milestone_from_record)
-            .collect()
+        let mut milestones = Vec::with_capacity(rows.len());
+        for record in rows {
+            if let Some(milestone) = self.project_milestone_projection(record).await? {
+                milestones.push(milestone);
+            }
+        }
+        Ok(milestones)
     }
 
     /// Load one milestone after checking its Project scope at the query
@@ -79,7 +90,37 @@ impl MilestoneRuntime {
         if row.project_id != project_id {
             return Ok(None);
         }
-        Ok(Some(project_milestone_from_record(row)?))
+        self.project_milestone_projection(row).await
+    }
+
+    /// Project a milestone record into its public API shape, tolerating an
+    /// unset `current_definition_revision_id` pointer (see `list` above) by
+    /// falling back to the latest definition revision of any lifecycle.
+    /// Returns `None` only when the milestone has no definition revision at
+    /// all -- which atomic milestone creation should make impossible -- so
+    /// that one corrupt row is skipped instead of failing every caller.
+    async fn project_milestone_projection(
+        &self,
+        record: ProjectMilestoneRecord,
+    ) -> crate::Result<Option<ProjectMilestone>> {
+        if record.current_definition_revision_id.is_some() {
+            return project_milestone_from_record(record).map(Some);
+        }
+        let revisions =
+            ProjectOrchestrationRepo::list_project_milestone_revisions(&*self.db, &record.id)
+                .await?;
+        let Some(latest_id) = revisions
+            .into_iter()
+            .max_by_key(|revision| revision.revision)
+            .map(|revision| revision.id)
+        else {
+            tracing::warn!(
+                milestone_id = %record.id,
+                "milestone has no definition revision; skipping from projection"
+            );
+            return Ok(None);
+        };
+        project_milestone_from_record_with_definition(record, latest_id).map(Some)
     }
 
     /// Return a current definition revision only when it belongs to the
@@ -187,7 +228,7 @@ impl MilestoneRuntime {
         // SQLite's write transaction is opened before any source reload; this
         // prevents a check/evidence/baseline mutation from being observed
         // after the candidate was computed but before the lifecycle CAS.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = db::begin_immediate(self.db.pool()).await?;
         if let Some(existing) = sqlx::query(
             "SELECT * FROM project_readiness_snapshot
              WHERE project_id = ? AND idempotency_key = ?",
@@ -515,7 +556,7 @@ impl MilestoneRuntime {
         // compare-and-swap lock for this transaction. Every source reload and
         // the manifest/pins/lifecycle/event commit below happens while this
         // lock is held.
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = db::begin_immediate(self.db.pool()).await?;
         let locked = sqlx::query(
             "UPDATE project_milestone SET version = version
              WHERE id = ? AND project_id = ? AND version = ?",
@@ -1121,7 +1162,7 @@ impl MilestoneRuntime {
             return Ok(());
         }
 
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = db::begin_immediate(self.db.pool()).await?;
         let locked = sqlx::query(
             "UPDATE project SET version = version
              WHERE id = ? AND version = ?",
@@ -1486,7 +1527,7 @@ impl MilestoneRuntime {
         project_id: &str,
         mut definition: MilestoneDefinitionRevision,
     ) -> crate::Result<MilestoneDefinitionRevision> {
-        let mut tx = self.db.pool().begin().await?;
+        let mut tx = db::begin_immediate(self.db.pool()).await?;
         self.hydrate_charter_in_tx(&mut tx, project_id, &mut definition)
             .await?;
         tx.commit().await?;
@@ -2175,7 +2216,7 @@ impl MilestoneRuntime {
         let mut tasks = Vec::with_capacity(selected_task_ids.len());
         for task_id in selected_task_ids {
             let row = sqlx::query(
-                "SELECT version, type, status, deleted_at, updated_at
+                "SELECT version, task_type, status, deleted_at, updated_at
                  FROM task WHERE id = ? AND project_id = ?",
             )
             .bind(task_id)
@@ -2187,7 +2228,7 @@ impl MilestoneRuntime {
             })?;
             let deleted_at: Option<String> = row.try_get("deleted_at")?;
             let version: i64 = row.try_get("version")?;
-            let task_type: String = row.try_get("type")?;
+            let task_type: String = row.try_get("task_type")?;
             let task_status: String = row.try_get("status")?;
             let observed_at: String = row.try_get("updated_at")?;
             if version <= 0
@@ -2280,13 +2321,14 @@ impl MilestoneRuntime {
         let mut context = Vec::new();
         for task in tasks {
             let rows = sqlx::query(
-                "SELECT t.repo_id, repo.name AS repository_name, repo.kind AS repository_kind,
+                "SELECT t.repo_id, repo.name AS repository_name, repo.work_mode AS repository_kind,
                         repo.remote_url, repo.default_branch,
                         e.id AS execution_id, e.status AS execution_status, e.role AS execution_role,
                         e.before_sha, e.after_sha, e.summary AS execution_summary,
                         e.created_at AS execution_created_at, e.updated_at AS execution_updated_at,
                         r.id AS review_id, r.status AS review_status,
-                        r.ci_results, r.audit_result, r.human_decision,
+                        r.step_results_json AS ci_results, NULL AS audit_result,
+                        NULL AS human_decision,
                         r.created_at AS review_created_at, r.updated_at AS review_updated_at
                  FROM task t
                  JOIN repo ON repo.id = t.repo_id AND repo.project_id = t.project_id
@@ -3647,7 +3689,27 @@ fn project_milestone_from_record(
     record: ProjectMilestoneRecord,
 ) -> crate::Result<ProjectMilestone> {
     let milestone_id = record.id.clone();
-    if milestone_id.trim().is_empty()
+    let definition_revision_id =
+        record
+            .current_definition_revision_id
+            .clone()
+            .ok_or_else(|| crate::ServiceError::InvalidOperation {
+                message: format!(
+                    "milestone {} has no current definition revision",
+                    milestone_id
+                ),
+            })?;
+    project_milestone_from_record_with_definition(record, definition_revision_id)
+}
+
+/// Shared projection body, taking the definition revision id explicitly so
+/// callers can supply a fallback (see `MilestoneRuntime::list`) instead of
+/// requiring `current_definition_revision_id` to be set.
+fn project_milestone_from_record_with_definition(
+    record: ProjectMilestoneRecord,
+    definition_revision_id: String,
+) -> crate::Result<ProjectMilestone> {
+    if record.id.trim().is_empty()
         || record.project_id.trim().is_empty()
         || record.milestone_key.trim().is_empty()
         || record.milestone_sequence <= 0
@@ -3667,15 +3729,7 @@ fn project_milestone_from_record(
         milestone_sequence: record.milestone_sequence,
         canonical_id: record.milestone_key,
         display_label: record.display_label.clone(),
-        definition_revision_id: record
-            .current_definition_revision_id
-            .clone()
-            .ok_or_else(|| crate::ServiceError::InvalidOperation {
-                message: format!(
-                    "milestone {} has no current definition revision",
-                    milestone_id
-                ),
-            })?,
+        definition_revision_id,
         lifecycle,
         projection_reasons,
         version: record.version,

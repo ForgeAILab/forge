@@ -473,7 +473,7 @@ impl OAuthService {
             .await?
             .ok_or_else(|| OAuthError::InvalidGrant("user_missing".into()))?;
 
-        let mut transaction = self.db.pool().begin().await?;
+        let mut transaction = db::begin_immediate(self.db.pool()).await?;
         let claimed = OAuthRefreshTokenRepo::claim_refresh_token_for_rotation(
             &*self.db,
             &mut transaction,

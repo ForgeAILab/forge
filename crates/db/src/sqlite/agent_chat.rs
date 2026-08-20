@@ -76,7 +76,7 @@ impl AccountMainAgentBindingRepo for SqliteDb {
         &self,
         input: ReplaceAccountMainAgentBinding,
     ) -> Result<AccountMainAgentBinding> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let current = sqlx::query(
             "UPDATE account_main_agent_binding
              SET state = 'replaced', replaced_by_binding_id = NULL,
@@ -207,7 +207,7 @@ impl ProjectAgentBindingRepo for SqliteDb {
         &self,
         input: ReplaceProjectAgentBinding,
     ) -> Result<ProjectAgentBinding> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let current = sqlx::query(
             "UPDATE project_agent_binding
              SET state = 'replaced', replaced_by_binding_id = NULL,
@@ -472,7 +472,7 @@ impl AgentChatMessageRepo for SqliteDb {
         &self,
         input: CreateAgentChatMessage,
     ) -> Result<AgentChatMessage> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         // The message id is the idempotency key: a replay with the same id
         // returns the stored row without consuming another sequence.
         if let Some(existing) = sqlx::query("SELECT * FROM agent_chat_message WHERE id = ?")
@@ -683,7 +683,7 @@ impl AgentChatTransactionRepo for SqliteDb {
                 "chat turn message and job scope must match".to_owned(),
             ));
         }
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         if let Some(existing) =
             sqlx::query("SELECT * FROM agent_chat_turn_job WHERE dedupe_key = ?")
                 .bind(&input.turn.dedupe_key)
@@ -797,7 +797,7 @@ impl AgentChatTransactionRepo for SqliteDb {
         &self,
         input: CompleteAgentChatTurn,
     ) -> Result<CompletedAgentChatTurn> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let current_row = sqlx::query("SELECT * FROM agent_chat_turn_job WHERE id = ?")
             .bind(&input.turn_job_id)
             .fetch_optional(&mut *transaction)
@@ -931,7 +931,7 @@ impl AgentChatTransactionRepo for SqliteDb {
     }
 
     async fn fail_agent_chat_turn(&self, input: FailAgentChatTurn) -> Result<AgentChatTurnJob> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let error_code = bounded_event_text(&input.error_code, 128);
         let error_message = bounded_event_text(&input.error_message, 2048);
         let updated = sqlx::query(
@@ -967,7 +967,7 @@ impl AgentChatTransactionRepo for SqliteDb {
     }
 
     async fn park_agent_chat_turn(&self, input: ParkAgentChatTurn) -> Result<AgentChatTurnJob> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let updated = sqlx::query(
             "UPDATE agent_chat_turn_job
              SET status = 'awaiting_input', pending_interaction_id = ?,
@@ -999,7 +999,7 @@ impl AgentChatTransactionRepo for SqliteDb {
     }
 
     async fn cancel_agent_chat_turn(&self, input: CancelAgentChatTurn) -> Result<AgentChatTurnJob> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let dedupe_key = format!(
             "agent-chat-turn-cancel:{}:{}",
             input.turn_job_id, input.idempotency_key
@@ -1111,7 +1111,7 @@ impl AgentChatTransactionRepo for SqliteDb {
                 "handoff source/target and turn scope must match".to_owned(),
             ));
         }
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         if let Some(existing_row) = sqlx::query("SELECT * FROM agent_handoff WHERE dedupe_key = ?")
             .bind(&input.handoff.dedupe_key)
             .fetch_optional(&mut *transaction)

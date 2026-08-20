@@ -4,10 +4,10 @@ use crate::{
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use db::{
-    now_rfc3339, Agent, AgentListQuery, AgentRepo, AgentStatus, Daemon, DaemonRepo, Execution,
-    ExecutionRepo, ExecutionStatus, PageRequest, Project, ProjectRepo, ResumePolicy, SortBy,
-    SortOrder, SqliteDb, StopReason, Task, TaskListQuery, TaskRepo, UpdateAgent, UpdateExecution,
-    UpdateTaskStatus, WorkspaceLeaseRepo,
+    now_rfc3339, Agent, AgentListQuery, AgentRepo, AgentSessionRepo, AgentStatus, Daemon,
+    DaemonRepo, Execution, ExecutionRepo, ExecutionStatus, PageRequest, Project, ProjectRepo,
+    ResumePolicy, SortBy, SortOrder, SqliteDb, StopReason, Task, TaskListQuery, TaskRepo,
+    UpdateAgent, UpdateExecution, UpdateTaskStatus, WorkspaceLeaseRepo,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::TaskExecutor;
@@ -44,6 +44,21 @@ impl CrashRecovery {
         // pass below then sees the still-running attempt and requeues/blocks
         // it through the normal crash-recovery state machine.
         expire_workspace_leases(&self.db, &self.event_bus, None, None, false).await?;
+
+        // Native (in-process) runtime sessions cannot survive a restart, so
+        // any 'starting'/'ready'/'running'/'degraded' native session left by
+        // a previous process lies about liveness. Suspend them: the reuse
+        // path (get_active_agent_session) then re-establishes a fresh session
+        // on next use, and conversation continuity is preserved because the
+        // LCM timeline is keyed by identity + scope, not the runtime id.
+        let suspended_sessions =
+            AgentSessionRepo::suspend_stale_native_sessions(&*self.db, &now_rfc3339()).await?;
+        if suspended_sessions > 0 {
+            tracing::info!(
+                suspended_sessions,
+                "suspended stale native agent sessions from previous process"
+            );
+        }
         let tasks = self.list_in_progress_tasks(None).await?;
         let mut recovered = 0;
 
@@ -1368,9 +1383,11 @@ mod tests {
         TaskService,
     };
     use db::{
-        create_sqlite_pool, new_uuid_v4, run_migrations, CreateAgent, CreateExecution,
-        CreateProject, CreateRepo, CreateTask, CreateTaskRoleAssignment, DaemonRepo, DaemonStatus,
-        RepoRepo, TaskRoleAssignmentRepo, TaskStatus, UpdateProject, UpsertDaemon,
+        create_sqlite_pool, new_uuid_v4, run_migrations, AgentContextScopeRepo, AgentProfileRepo,
+        AgentSession, CreateAgent, CreateAgentContextScope, CreateAgentProfile, CreateAgentSession,
+        CreateExecution, CreateProject, CreateRepo, CreateTask, CreateTaskRoleAssignment,
+        DaemonRepo, DaemonStatus, RepoRepo, TaskRoleAssignmentRepo, TaskStatus, UpdateProject,
+        UpsertDaemon,
     };
     use executors::{ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError};
     use serde_json::Value;
@@ -1628,6 +1645,188 @@ mod tests {
         )
         .await
         .expect("execution creates")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_agent_session(
+        db: &SqliteDb,
+        identity_id: &str,
+        profile_id: &str,
+        backend_kind: &str,
+        scope_tag: &str,
+        status: &str,
+        connection_status: &str,
+    ) -> AgentSession {
+        let now = now_rfc3339();
+        let scope = AgentContextScopeRepo::create_context_scope(
+            db,
+            CreateAgentContextScope {
+                id: new_uuid_v4(),
+                identity_id: identity_id.to_owned(),
+                scope_type: "account".to_owned(),
+                scope_id: scope_tag.to_owned(),
+                project_id: None,
+                task_id: None,
+                task_role: None,
+                workspace_access: "deny".to_owned(),
+                authority_json: "{}".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("context scope creates");
+        AgentSessionRepo::create_agent_session(
+            db,
+            CreateAgentSession {
+                id: new_uuid_v4(),
+                identity_id: identity_id.to_owned(),
+                profile_id: profile_id.to_owned(),
+                context_scope_id: scope.id,
+                backend_kind: backend_kind.to_owned(),
+                runtime_session_id: Some(new_uuid_v4()),
+                status: status.to_owned(),
+                capabilities_json: "{}".to_owned(),
+                connection_status: connection_status.to_owned(),
+                predecessor_session_id: None,
+                last_activity_at: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("agent session creates")
+    }
+
+    async fn load_session(db: &SqliteDb, id: &str) -> AgentSession {
+        AgentSessionRepo::get_agent_session(db, id)
+            .await
+            .expect("session loads")
+            .expect("session exists")
+    }
+
+    #[tokio::test]
+    async fn crash_recovery_suspends_stale_native_sessions() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let agent = seed_agent(&db, AgentStatus::Idle, None).await;
+        let now = now_rfc3339();
+        let native_profile = AgentProfileRepo::create_profile(
+            &*db,
+            CreateAgentProfile {
+                id: new_uuid_v4(),
+                identity_id: agent.id.clone(),
+                backend_kind: "native".to_owned(),
+                executor_type: "embedded".to_owned(),
+                provider: None,
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "[]".to_owned(),
+                tool_policy_json: "{}".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: None,
+                daemon_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("native profile creates");
+
+        let stale_ready = seed_agent_session(
+            &db,
+            &agent.id,
+            &native_profile.id,
+            "native",
+            "scope-ready",
+            "ready",
+            "healthy",
+        )
+        .await;
+        let stale_running = seed_agent_session(
+            &db,
+            &agent.id,
+            &native_profile.id,
+            "native",
+            "scope-running",
+            "running",
+            "healthy",
+        )
+        .await;
+        let cancelled = seed_agent_session(
+            &db,
+            &agent.id,
+            &native_profile.id,
+            "native",
+            "scope-cancelled",
+            "cancelled",
+            "healthy",
+        )
+        .await;
+        let replaced = seed_agent_session(
+            &db,
+            &agent.id,
+            &native_profile.id,
+            "native",
+            "scope-replaced",
+            "replaced",
+            "healthy",
+        )
+        .await;
+        let cli_ready = seed_agent_session(
+            &db,
+            &agent.id,
+            &agent.profile_id,
+            "cli",
+            "scope-cli",
+            "ready",
+            "healthy",
+        )
+        .await;
+
+        CrashRecovery::new(Arc::clone(&db), event_bus)
+            .run_recovery()
+            .await
+            .expect("recovery runs");
+
+        // Stale native sessions in non-terminal statuses are suspended with
+        // an unverified connection, and the version bump preserves the
+        // optimistic-concurrency contract.
+        let ready_after = load_session(&db, &stale_ready.id).await;
+        assert_eq!(ready_after.status, "suspended");
+        assert_eq!(ready_after.connection_status, "unknown");
+        assert_eq!(ready_after.version, stale_ready.version + 1);
+        let running_after = load_session(&db, &stale_running.id).await;
+        assert_eq!(running_after.status, "suspended");
+        assert_eq!(running_after.connection_status, "unknown");
+        assert_eq!(running_after.version, stale_running.version + 1);
+
+        // The suspended session vacates the active-scope slot so the reuse
+        // path re-establishes a fresh session on next use.
+        assert!(AgentSessionRepo::get_active_agent_session(
+            &*db,
+            &agent.id,
+            &ready_after.context_scope_id
+        )
+        .await
+        .expect("active session query runs")
+        .is_none());
+
+        // Terminal native sessions and external-backend sessions are left
+        // untouched.
+        let cancelled_after = load_session(&db, &cancelled.id).await;
+        assert_eq!(cancelled_after.status, "cancelled");
+        assert_eq!(cancelled_after.connection_status, "healthy");
+        assert_eq!(cancelled_after.version, cancelled.version);
+        let replaced_after = load_session(&db, &replaced.id).await;
+        assert_eq!(replaced_after.status, "replaced");
+        assert_eq!(replaced_after.version, replaced.version);
+        let cli_after = load_session(&db, &cli_ready.id).await;
+        assert_eq!(cli_after.status, "ready");
+        assert_eq!(cli_after.connection_status, "healthy");
+        assert_eq!(cli_after.version, cli_ready.version);
     }
 
     #[tokio::test]

@@ -18,6 +18,12 @@ export type ChatAssistantEntry = ChatEntryBase & {
   isStreaming?: boolean
 }
 
+export type ChatThinkingEntry = ChatEntryBase & {
+  kind: 'thinking'
+  text: string
+  isStreaming?: boolean
+}
+
 export type ChatUserEntry = ChatEntryBase & {
   kind: 'user'
   text: string
@@ -100,6 +106,7 @@ export type ChatDividerEntry = ChatEntryBase & {
 
 export type ChatEntry =
   | ChatAssistantEntry
+  | ChatThinkingEntry
   | ChatUserEntry
   | ChatSystemEntry
   | ChatErrorEntry

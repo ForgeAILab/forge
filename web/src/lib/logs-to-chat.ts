@@ -6,6 +6,9 @@ type PayloadRecord = Record<string, unknown>
 type AssistantEntry = Extract<ChatEntry, { kind: 'assistant' }> & {
   isStreaming?: boolean
 }
+type ThinkingEntry = Extract<ChatEntry, { kind: 'thinking' }> & {
+  isStreaming?: boolean
+}
 type ToolCallEntry = Extract<ChatEntry, { kind: 'tool_call' }>
 type ShellOutputEntry = Extract<ChatEntry, { kind: 'shell_output' }>
 type FileEditEntry = Extract<ChatEntry, { kind: 'file_edit' }>
@@ -37,6 +40,7 @@ export function logsToChatEntries(logs: LogEntry[], opts?: LogsToChatOptions): C
   let activeAssistant: AssistantEntry | undefined
   let activeAssistantMessageKey: string | undefined
   let activeShellOutput: ShellOutputEntry | undefined
+  let activeThinking: ThinkingEntry | undefined
 
   if (syntheticUserPrompt) {
     entries.push({
@@ -69,6 +73,11 @@ export function logsToChatEntries(logs: LogEntry[], opts?: LogsToChatOptions): C
 
     if (kind !== 'assistant_delta' && kind !== 'assistant') {
       finalizeAssistant()
+    }
+
+    if (kind !== 'thinking' && activeThinking) {
+      delete activeThinking.isStreaming
+      activeThinking = undefined
     }
 
     if (kind !== 'stdout' && kind !== 'stderr' && kind !== 'shell_command') {
@@ -113,6 +122,19 @@ export function logsToChatEntries(logs: LogEntry[], opts?: LogsToChatOptions): C
         }
         activeAssistant.text += payloadText(payload)
         activeAssistant.isStreaming = true
+        break
+      }
+      case 'thinking': {
+        if (!activeThinking) {
+          activeThinking = {
+            ...entryBase(log),
+            kind: 'thinking',
+            text: '',
+          }
+          entries.push(activeThinking)
+        }
+        activeThinking.text += payloadText(payload)
+        activeThinking.isStreaming = true
         break
       }
       case 'user':

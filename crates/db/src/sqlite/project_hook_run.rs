@@ -47,7 +47,7 @@ impl ProjectHookRunRepo for SqliteDb {
         max_active_runs: i64,
         skip_reason: &str,
     ) -> Result<Option<ProjectHookRun>> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let sql = format!(
             "INSERT INTO project_hook_run ({PROJECT_HOOK_RUN_COLUMNS}) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \

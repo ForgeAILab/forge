@@ -591,6 +591,7 @@ impl TaskExecutor for EmbeddedTaskExecutor {
             &ctx.logs_path,
             &ctx.execution_id,
             ctx.log_sender.clone(),
+            Arc::clone(&self.db),
         ));
         let result = self
             .run_native_turn(
@@ -619,9 +620,20 @@ impl TaskExecutor for EmbeddedTaskExecutor {
 }
 
 /// Log sink preserving the standard Forge JSONL/event stream contract.
+///
+/// Every event also feeds the execution's `last_activity_at` heartbeat
+/// (throttled), the same liveness signal the CLI daemon path reports through
+/// its event notifications. Without it the stall monitor cannot distinguish a
+/// busy native turn from a hung one and kills any turn longer than the stall
+/// window.
 struct NativeTaskLogSink {
     writer: Mutex<LogWriter>,
+    db: Arc<SqliteDb>,
+    execution_id: String,
+    last_activity_bump: std::sync::Mutex<Option<std::time::Instant>>,
 }
+
+const ACTIVITY_BUMP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl std::fmt::Debug for NativeTaskLogSink {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -636,6 +648,7 @@ impl NativeTaskLogSink {
         path: &str,
         execution_id: &str,
         sender: Option<tokio::sync::mpsc::UnboundedSender<executors::LogEntry>>,
+        db: Arc<SqliteDb>,
     ) -> Self {
         let mut writer = LogWriter::new(path, execution_id.to_owned(), 10 * 1024 * 1024);
         if let Some(sender) = sender {
@@ -643,6 +656,9 @@ impl NativeTaskLogSink {
         }
         Self {
             writer: Mutex::new(writer),
+            db,
+            execution_id: execution_id.to_owned(),
+            last_activity_bump: std::sync::Mutex::new(None),
         }
     }
 
@@ -653,6 +669,55 @@ impl NativeTaskLogSink {
             .write(kind, LogStream::Main, payload)
             .await
     }
+
+    async fn record_activity(&self) {
+        let due = {
+            let mut last = match self.last_activity_bump.lock() {
+                Ok(last) => last,
+                Err(_) => return,
+            };
+            match *last {
+                Some(at) if at.elapsed() < ACTIVITY_BUMP_INTERVAL => false,
+                _ => {
+                    *last = Some(std::time::Instant::now());
+                    true
+                }
+            }
+        };
+        if !due {
+            return;
+        }
+        let now = db::now_rfc3339();
+        if let Err(error) = ExecutionRepo::update(
+            &*self.db,
+            db::UpdateExecution {
+                id: self.execution_id.clone(),
+                status: None,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: Some(Some(now.clone())),
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                updated_at: now,
+            },
+        )
+        .await
+        {
+            tracing::debug!(
+                execution_id = %self.execution_id,
+                %error,
+                "failed to record native execution activity"
+            );
+        }
+    }
 }
 
 #[async_trait]
@@ -661,6 +726,45 @@ impl TurnEventSink for NativeTaskLogSink {
         let _ = self
             .write(LogKind::AssistantDelta, serde_json::json!({"text": text}))
             .await;
+        self.record_activity().await;
+    }
+
+    async fn reasoning_delta(&self, text: &str, redacted: bool) {
+        if !redacted {
+            let _ = self
+                .write(LogKind::Thinking, serde_json::json!({"text": text}))
+                .await;
+        }
+        self.record_activity().await;
+    }
+
+    async fn tool_call_started(&self, call_id: &str, name: &str, argument_keys: &[String]) {
+        let _ = self
+            .write(
+                LogKind::ToolCall,
+                serde_json::json!({
+                    "call_id": call_id,
+                    "name": name,
+                    "argument_keys": argument_keys,
+                }),
+            )
+            .await;
+        self.record_activity().await;
+    }
+
+    async fn tool_call_finished(&self, call_id: &str, name: &str, is_error: bool) {
+        let _ = self
+            .write(
+                LogKind::ToolResult,
+                serde_json::json!({
+                    "call_id": call_id,
+                    "name": name,
+                    "is_error": is_error,
+                    "success": !is_error,
+                }),
+            )
+            .await;
+        self.record_activity().await;
     }
 }
 

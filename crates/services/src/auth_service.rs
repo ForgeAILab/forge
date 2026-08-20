@@ -339,7 +339,7 @@ impl AuthService {
         }
 
         let pool = self.db.pool();
-        let mut tx = pool.begin().await?;
+        let mut tx = db::begin_immediate(pool).await?;
 
         // Double-check inside the transaction to handle concurrent first registrations.
         let already_done: bool = sqlx::query_scalar::<_, i64>(

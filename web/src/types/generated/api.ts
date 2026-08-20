@@ -1391,6 +1391,7 @@ export interface LogEntry {
     | 'tool_result'
     | 'assistant'
     | 'assistant_delta'
+    | 'thinking'
     | 'user'
     | 'system'
     | 'file_change'

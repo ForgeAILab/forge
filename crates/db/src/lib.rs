@@ -14,7 +14,7 @@ mod task_metadata;
 mod tests;
 mod time;
 
-pub use connection::create_sqlite_pool;
+pub use connection::{begin_immediate, create_sqlite_pool};
 pub use error::{DbError, Result};
 pub use ids::{new_uuid_v4, validate_uuid_v4};
 pub use migration::{run_migrations, run_migrations_from};

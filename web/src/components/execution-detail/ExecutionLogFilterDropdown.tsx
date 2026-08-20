@@ -7,6 +7,7 @@ import type { LogFilterKind } from '@/lib/log-filter'
 
 export const visibleLogKinds: LogFilterKind[] = [
   'assistant',
+  'thinking',
   'user',
   'tool_call',
   'tool_result',
@@ -22,6 +23,7 @@ export const visibleLogKinds: LogFilterKind[] = [
 
 export const logKindLabels: Record<LogFilterKind, string> = {
   assistant: 'Assistant',
+  thinking: 'Thinking',
   user: 'User',
   tool_call: 'Tool Calls',
   tool_result: 'Tool Results',

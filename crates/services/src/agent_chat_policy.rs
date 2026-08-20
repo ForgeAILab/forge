@@ -120,6 +120,47 @@ pub(crate) fn guard_runtime_content(content: &str) -> Result<GuardedAgentChatCon
     guard_content(content, false)
 }
 
+/// Shortest token after `sk-` that can plausibly be a key rather than a typo.
+const MIN_SECRET_TOKEN_LEN: usize = 4;
+
+/// `api key` marks a protected value only when an assignment carries a value
+/// after it. Collapsing the whole message to alphanumerics instead makes
+/// ordinary prose — `REST API. Key endpoints`, `api key rotation` — look like a
+/// credential, which blocks the Agent Chat turn that contains it.
+fn has_api_key_assignment(lower: &str) -> bool {
+    lower.match_indices("api").any(|(index, _)| {
+        let after_marker = &lower[index + "api".len()..];
+        let separators = after_marker
+            .chars()
+            .take_while(|character| matches!(character, ' ' | '_' | '-'))
+            .count();
+        let Some(after_key) = after_marker[separators..].strip_prefix("key") else {
+            return false;
+        };
+        let assignment = after_key.trim_start();
+        assignment
+            .strip_prefix('=')
+            .or_else(|| assignment.strip_prefix(':'))
+            .is_some_and(|value| !value.trim().is_empty())
+    })
+}
+
+/// `sk-` marks an OpenAI-shaped key only when it opens a word. A bare substring
+/// match also fires inside `task-1`, `risk-free` and `disk-based` — words a
+/// Project Agent writes constantly — because there the `sk-` follows a letter.
+fn has_openai_key_marker(lower: &str) -> bool {
+    lower.match_indices("sk-").any(|(index, _)| {
+        let opens_word = index == 0 || !lower.as_bytes()[index - 1].is_ascii_alphanumeric();
+        let token_len = lower[index + "sk-".len()..]
+            .chars()
+            .take_while(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            })
+            .count();
+        opens_word && token_len >= MIN_SECRET_TOKEN_LEN
+    })
+}
+
 fn guard_content(content: &str, reject_empty: bool) -> Result<GuardedAgentChatContent> {
     let trimmed = content.trim();
     if reject_empty && trimmed.is_empty() {
@@ -142,8 +183,8 @@ fn guard_content(content: &str, reject_empty: bool) -> Result<GuardedAgentChatCo
         && (lower.contains("private key") || lower.contains("openssh"));
     if has_bearer_marker
         || compact.contains("bearer")
-        || compact.contains("apikey")
-        || lower.contains("sk-")
+        || has_api_key_assignment(&lower)
+        || has_openai_key_marker(&lower)
         || has_github_token_marker
         || has_pem_marker
     {
@@ -306,6 +347,30 @@ mod tests {
             "api_key=super-secret",
             "ghp_0123456789abcdef",
             "-----BEGIN OPENSSH PRIVATE KEY-----",
+        ] {
+            assert!(guard_agent_chat_content(content).is_err(), "{content}");
+        }
+    }
+
+    #[test]
+    fn content_guard_admits_task_prose_that_looks_like_a_key_prefix() {
+        for content in [
+            "Task-1: Backend & Storage (server.py)",
+            "I will work through this task-by-task",
+            "risk-free rollout after the disk-based cache lands",
+            "the REST/JSON API. Key endpoints are listed below",
+            "api key rotation is out of scope for this milestone",
+        ] {
+            assert!(guard_agent_chat_content(content).is_ok(), "{content}");
+        }
+    }
+
+    #[test]
+    fn content_guard_still_rejects_key_shaped_values() {
+        for content in [
+            "sk-proj-0123456789abcdefghij",
+            "use sk-ant-api03-0123456789abcdef for the call",
+            "sk-placeholder-key",
         ] {
             assert!(guard_agent_chat_content(content).is_err(), "{content}");
         }

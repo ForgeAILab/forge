@@ -160,7 +160,7 @@ async fn apply_migration_sql(pool: &SqlitePool, migration: &Migration, sql: &str
             .execute(&mut *connection)
             .await?;
     } else {
-        let mut transaction = pool.begin().await?;
+        let mut transaction = crate::begin_immediate(pool).await?;
 
         sqlx::raw_sql(sql).execute(&mut *transaction).await?;
         sqlx::query("INSERT INTO _migration (version, name, applied_at) VALUES (?, ?, ?)")

@@ -365,7 +365,7 @@ impl SqliteLcmStore {
             .bind(&self.timeline.id)
             .fetch_one(self.db.pool())
             .await
-            .map_err(|_| LcmError::StoreFailure)?
+            .map_err(store_failure)?
             .unwrap_or(0);
             let next_sequence = u64::try_from(next_sequence).map_err(|_| LcmError::StoreFailure)?;
             records
@@ -433,30 +433,16 @@ impl SqliteLcmStore {
             .bind(entry_id.as_str())
             .fetch_optional(self.db.pool())
             .await
-            .map_err(|_| LcmError::StoreFailure)?
+            .map_err(store_failure)?
             .ok_or(LcmError::IdempotencyConflict)?;
             let record = AgentLcmEntryRecord {
-                timeline_id: row
-                    .try_get("timeline_id")
-                    .map_err(|_| LcmError::StoreFailure)?,
-                entry_id: row
-                    .try_get("entry_id")
-                    .map_err(|_| LcmError::StoreFailure)?,
-                sequence: row
-                    .try_get("sequence")
-                    .map_err(|_| LcmError::StoreFailure)?,
-                content_json: row
-                    .try_get("content_json")
-                    .map_err(|_| LcmError::StoreFailure)?,
-                content_fingerprint: row
-                    .try_get("content_fingerprint")
-                    .map_err(|_| LcmError::StoreFailure)?,
-                source_json: row
-                    .try_get("source_json")
-                    .map_err(|_| LcmError::StoreFailure)?,
-                created_at: row
-                    .try_get("created_at")
-                    .map_err(|_| LcmError::StoreFailure)?,
+                timeline_id: row.try_get("timeline_id").map_err(store_failure)?,
+                entry_id: row.try_get("entry_id").map_err(store_failure)?,
+                sequence: row.try_get("sequence").map_err(store_failure)?,
+                content_json: row.try_get("content_json").map_err(store_failure)?,
+                content_fingerprint: row.try_get("content_fingerprint").map_err(store_failure)?,
+                source_json: row.try_get("source_json").map_err(store_failure)?,
+                created_at: row.try_get("created_at").map_err(store_failure)?,
             };
             entries.push(entry_from_record(record)?);
         }
@@ -483,14 +469,14 @@ impl SqliteLcmStore {
         .bind(chat_id)
         .fetch_all(self.db.pool())
         .await
-        .map_err(|_| LcmError::StoreFailure)?;
+        .map_err(store_failure)?;
         let admitted = sqlx::query_scalar::<_, String>(
             "SELECT entry_id FROM agent_lcm_entry WHERE timeline_id = ?",
         )
         .bind(&self.timeline.id)
         .fetch_all(self.db.pool())
         .await
-        .map_err(|_| LcmError::StoreFailure)?
+        .map_err(store_failure)?
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
         let next_sequence = sqlx::query_scalar::<_, Option<i64>>(
@@ -499,21 +485,17 @@ impl SqliteLcmStore {
         .bind(&self.timeline.id)
         .fetch_one(self.db.pool())
         .await
-        .map_err(|_| LcmError::StoreFailure)?
+        .map_err(store_failure)?
         .unwrap_or(0);
         let mut missing = Vec::new();
         for row in rows {
-            let id: String = row.try_get("id").map_err(|_| LcmError::StoreFailure)?;
+            let id: String = row.try_get("id").map_err(store_failure)?;
             if admitted.contains(&id) {
                 continue;
             }
-            let author_type: String = row
-                .try_get("author_type")
-                .map_err(|_| LcmError::StoreFailure)?;
-            let content: String = row.try_get("content").map_err(|_| LcmError::StoreFailure)?;
-            let sensitivity: String = row
-                .try_get("sensitivity")
-                .map_err(|_| LcmError::StoreFailure)?;
+            let author_type: String = row.try_get("author_type").map_err(store_failure)?;
+            let content: String = row.try_get("content").map_err(store_failure)?;
+            let sensitivity: String = row.try_get("sensitivity").map_err(store_failure)?;
             let role = match author_type.as_str() {
                 "user" => agent_runtime::core::content::Role::User,
                 "agent" => agent_runtime::core::content::Role::Assistant,
@@ -765,7 +747,7 @@ impl LcmWriter for SqliteLcmStore {
         .bind(&self.timeline.id)
         .fetch_one(self.db.pool())
         .await
-        .map_err(|_| LcmError::StoreFailure)?
+        .map_err(store_failure)?
         .map(|value| value.saturating_add(1))
         .unwrap_or(0);
         if let Some(first) = request.entries.first() {
@@ -1239,8 +1221,20 @@ fn map_db_error(error: DbError) -> LcmError {
         DbError::Check(_) => LcmError::Invalid {
             reason: "invalid LCM persistence record".to_owned(),
         },
-        _ => LcmError::StoreFailure,
+        other => {
+            tracing::warn!(error = %other, "LCM store operation failed");
+            LcmError::StoreFailure
+        }
     }
+}
+
+/// Logs a swallowed sqlx error before collapsing it to `StoreFailure`. A bare
+/// `.map_err(|_| LcmError::StoreFailure)` used to discard the cause, which
+/// made a SQLite busy/busy-snapshot failure indistinguishable from any other
+/// store error in the logs.
+fn store_failure(error: impl std::fmt::Display) -> LcmError {
+    tracing::warn!(error = %error, "LCM store operation failed");
+    LcmError::StoreFailure
 }
 
 fn parse_sequence_gap(message: &str) -> LcmError {

@@ -5,7 +5,7 @@ use sqlx::{Row, Sqlite, Transaction};
 impl TaskService {
     pub async fn on_agent_deleted(&self, agent_id: &str) -> Result<()> {
         validate_required("agent_id", agent_id)?;
-        let mut transaction = self.db.pool().begin().await?;
+        let mut transaction = db::begin_immediate(self.db.pool()).await?;
         let events = self
             .on_agent_deleted_in_tx(&mut transaction, agent_id)
             .await?;

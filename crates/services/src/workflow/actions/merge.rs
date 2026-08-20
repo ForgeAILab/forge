@@ -128,10 +128,9 @@ impl HookAction for RunMerge {
                         reason: error.to_string(),
                     };
                 }
-                HookResult::Cascade {
-                    to: default_states::REVIEW.to_string(),
-                    reason: details,
-                }
+                // The merging gate's only defined reject edge is merge_failed;
+                // cascading to review wedges the task in merging forever.
+                merge_failure_result(ctx, &task, details).await
             }
             Ok(MergeOutcome::TargetDirty { files }) => {
                 let details = if files.is_empty() {

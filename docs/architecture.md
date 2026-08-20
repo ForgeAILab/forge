@@ -711,6 +711,22 @@ defined states.
 6. If an `after_enter` hook returns `HookResult::Cascade`, recursively
    transition with `triggered_by = "system"`; cascade depth is limited to 3.
 
+**Dispatch failure entering an active state:** when a dispatch hook
+(`dispatch_role_agent` / `dispatch_fix_agent` / `dispatch_executor`) fails
+`on_enter` of an `active` state and the task has no running execution, the
+engine does not leave the task there looking in-flight. It records the
+dispatch error on `task.error_annotation` (type `dispatch_failed`) and
+cascades the task back to the workflow's initial state, skipping the active
+state's exit guards (the `reset_to_initial` allowance). Both the failed hook
+and the rollback transition land in `transition_log`. The task dispatcher
+treats a `dispatch_failed` annotation as blocking, so a task whose dispatch
+deterministically fails — e.g. governance rejects it because no active
+user-approved execution baseline exists — is parked in the initial state with
+a visible reason instead of being rescheduled every tick; the dispatcher also
+writes this annotation itself when a scheduling/recovery attempt fails with a
+"not runnable" governance error. A later successful dispatch (or a board drag
+that defers dispatch) clears the annotation.
+
 Board moves use the same engine through `TaskService::move_task` and its board
 persistence seam. A project owns a monotonic `board_revision`, advanced by
 database triggers for board-affecting task inserts, deletes, status/position

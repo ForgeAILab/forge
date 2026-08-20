@@ -4,7 +4,7 @@ use crate::AgentExecutionStats;
 #[async_trait]
 impl ExecutionRepo for SqliteDb {
     async fn create(&self, input: CreateExecution) -> Result<Execution> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let execution = Self::create_execution_in_tx(&mut transaction, &input).await?;
         transaction.commit().await?;
         Ok(execution)
@@ -273,7 +273,7 @@ impl ExecutionRepo for SqliteDb {
         }
         query.push("updated_at = ").push_bind(&input.updated_at);
         query.push(" WHERE id = ").push_bind(&input.id);
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         query.build().execute(&mut *transaction).await?;
         let updated = sqlx::query("SELECT * FROM execution WHERE id = ?")
             .bind(&input.id)

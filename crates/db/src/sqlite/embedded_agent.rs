@@ -233,7 +233,7 @@ impl AgentContextScopeRepo for SqliteDb {
 #[async_trait]
 impl AgentSessionRepo for SqliteDb {
     async fn create_agent_session(&self, input: CreateAgentSession) -> Result<AgentSession> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         insert_agent_session(&mut transaction, &input).await?;
         transaction.commit().await?;
         self.get_agent_session(&input.id)
@@ -325,7 +325,7 @@ impl AgentSessionRepo for SqliteDb {
     }
 
     async fn rotate_agent_session(&self, input: RotateAgentSession) -> Result<AgentSession> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         let result = sqlx::query(
             "UPDATE agent_session
              SET status = 'replaced', version = version + 1, updated_at = ?
@@ -364,6 +364,25 @@ impl AgentSessionRepo for SqliteDb {
         self.get_agent_session(&input.replacement.id)
             .await?
             .ok_or(DbError::NotFound)
+    }
+
+    async fn suspend_stale_native_sessions(&self, updated_at: &str) -> Result<u64> {
+        // Startup-time bulk sweep. Every affected row still bumps `version`
+        // so any in-flight optimistic writer (`WHERE version = ?`) conflicts
+        // instead of silently reviving a suspended session.
+        let result = sqlx::query(
+            "UPDATE agent_session
+             SET status = 'suspended',
+                 connection_status = 'unknown',
+                 version = version + 1,
+                 updated_at = ?
+             WHERE backend_kind = 'native'
+               AND status IN ('starting', 'ready', 'running', 'degraded')",
+        )
+        .bind(updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 }
 

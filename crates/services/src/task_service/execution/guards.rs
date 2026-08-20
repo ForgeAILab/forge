@@ -51,6 +51,39 @@ impl TaskService {
                 effective_status = %status,
                 "waiting to dispatch execution"
             );
+            // Queue-waiting is supervised liveness, not a stall: this loop is
+            // the heartbeat. If the process dies mid-wait the bumps stop and
+            // the stall monitor reclaims the execution normally.
+            let now = now_rfc3339();
+            if let Err(error) = ExecutionRepo::update(
+                &*self.db,
+                db::UpdateExecution {
+                    id: execution.id.clone(),
+                    status: None,
+                    stop_reason: None,
+                    stopped_by: None,
+                    resume_policy: None,
+                    stopped_at: None,
+                    agent_session_id: None,
+                    agent_message_id: None,
+                    last_activity_at: Some(Some(now.clone())),
+                    summary: None,
+                    logs_path: None,
+                    before_sha: None,
+                    after_sha: None,
+                    error: None,
+                    executor_config_snapshot_json: None,
+                    updated_at: now,
+                },
+            )
+            .await
+            {
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    %error,
+                    "failed to record queued-dispatch activity"
+                );
+            }
             // V1 keeps the wait inside the existing execution task instead of adding
             // a scheduler queue; queued work remains Running and resumes on recovery.
             tokio::time::sleep(DISPATCH_STATUS_POLL_INTERVAL).await;

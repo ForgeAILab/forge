@@ -123,7 +123,9 @@ impl TaskService {
             None => None,
         };
         let agent_id = agent.as_ref().map(|agent| agent.id.clone());
-        let mut transaction = self.db.pool().begin().await.map_err(DbError::from)?;
+        let mut transaction = db::begin_immediate(self.db.pool())
+            .await
+            .map_err(DbError::from)?;
         let claimed = TaskRepo::claim(
             &*self.db,
             &mut transaction,

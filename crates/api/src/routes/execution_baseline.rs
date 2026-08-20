@@ -95,13 +95,12 @@ pub async fn create_execution_baseline(
     let actor_type = "user";
     let actor_id = user.user_id.clone();
     validate_idempotency_key(&request.mutation.idempotency_key)?;
-    if request.baseline_id.trim().is_empty() {
-        return Err(ApiError::bad_request("baseline_id is required"));
-    }
 
+    // The shell primary key is server-minted (matching the Charter
+    // precedent): clients and agents never supply a baseline id, so the
+    // replay identity below deliberately excludes it.
     let input = json!({
         "project_id": project_id,
-        "baseline_id": request.baseline_id,
         "expected_project_version": request.mutation.expected_version,
         "authorization": request.mutation.authorization,
     });
@@ -128,7 +127,7 @@ pub async fn create_execution_baseline(
         ));
     }
     let now = now_rfc3339();
-    let mut tx = state.db.pool().begin().await?;
+    let mut tx = db::begin_immediate(state.db.pool()).await?;
     let current_version: i64 = sqlx::query_scalar("SELECT version FROM project WHERE id = ?")
         .bind(&project_id)
         .fetch_one(&mut *tx)
@@ -139,27 +138,18 @@ pub async fn create_execution_baseline(
             "the Project changed before the execution baseline was proposed",
         ));
     }
+    let baseline_id = new_uuid_v4();
     sqlx::query(
         "INSERT INTO project_execution_baseline
              (id, project_id, current_revision_id, lifecycle, version, created_at, updated_at)
          VALUES (?, ?, NULL, 'draft', 1, ?, ?)",
     )
-    .bind(&request.baseline_id)
+    .bind(&baseline_id)
     .bind(&project_id)
     .bind(&now)
     .bind(&now)
     .execute(&mut *tx)
-    .await
-    .map_err(|error| {
-        if error.to_string().to_ascii_lowercase().contains("unique") {
-            ApiError::conflict_with_code(
-                "idempotency_conflict",
-                "baseline_id is unavailable; retry the proposal with a new identifier",
-            )
-        } else {
-            error.into()
-        }
-    })?;
+    .await?;
     let advanced = sqlx::query(
         "UPDATE project SET version = version + 1, updated_at = ?
          WHERE id = ? AND version = ?",
@@ -179,7 +169,7 @@ pub async fn create_execution_baseline(
         &mut tx,
         "project.execution_baseline.proposed",
         "execution_baseline",
-        &request.baseline_id,
+        &baseline_id,
         actor_type,
         Some(&actor_id),
         &project_id,
@@ -187,7 +177,7 @@ pub async fn create_execution_baseline(
         &event_key("create", &request.mutation.idempotency_key),
         json!({
             "input": input,
-            "result": {"baseline_id": request.baseline_id},
+            "result": {"baseline_id": baseline_id},
         }),
         &now,
     )
@@ -196,7 +186,7 @@ pub async fn create_execution_baseline(
 
     Ok((
         StatusCode::CREATED,
-        Json(load_response(&state, &project_id, &request.baseline_id).await?),
+        Json(load_response(&state, &project_id, &baseline_id).await?),
     ))
 }
 
@@ -349,7 +339,7 @@ pub async fn save_execution_baseline_revision(
     })?;
     let now = now_rfc3339();
     let revision_id = new_uuid_v4();
-    let mut tx = state.db.pool().begin().await?;
+    let mut tx = db::begin_immediate(state.db.pool()).await?;
     let tx_baseline = sqlx::query(
         "SELECT project_id, lifecycle, version, current_revision_id
          FROM project_execution_baseline WHERE id = ?",
@@ -573,7 +563,7 @@ pub async fn approve_execution_baseline(
         ));
     }
 
-    let mut tx = state.db.pool().begin().await?;
+    let mut tx = db::begin_immediate(state.db.pool()).await?;
     let baseline = sqlx::query(
         "SELECT project_id, version, lifecycle FROM project_execution_baseline WHERE id = ?",
     )
@@ -830,7 +820,7 @@ pub async fn activate_execution_baseline(
     }
 
     let now = now_rfc3339();
-    let mut tx = state.db.pool().begin().await?;
+    let mut tx = db::begin_immediate(state.db.pool()).await?;
     let approval = sqlx::query(
         "SELECT a.baseline_id, a.revision_id, a.expected_project_version,
                 a.principal_type, a.principal_id, a.content_digest,
@@ -1001,10 +991,33 @@ pub async fn activate_execution_baseline(
     .bind(&request.revision_id)
     .execute(&mut *tx)
     .await?;
+    // An activated baseline names the Project's primary milestone (or covers
+    // exactly one). A Project with active milestones but no explicit primary
+    // pointer refuses every agent-turn admission, so activation fills a NULL
+    // pointer here with the same validity predicate the explicit
+    // `project.milestone.primary.set` operation applies: the milestone must
+    // be this Project's and active. An existing pointer is never overridden.
+    let manifest_primary_milestone_id = persisted_manifest
+        .content
+        .primary_milestone_id
+        .clone()
+        .or_else(
+            || match persisted_manifest.content.milestone_ids.as_slice() {
+                [only] => Some(only.clone()),
+                _ => None,
+            },
+        );
     let project_update = sqlx::query(
-        "UPDATE project SET version = version + 1, updated_at = ?
+        "UPDATE project
+         SET primary_milestone_id = COALESCE(
+                 primary_milestone_id,
+                 (SELECT id FROM project_milestone
+                  WHERE id = ? AND project_id = ? AND lifecycle = 'active')),
+             version = version + 1, updated_at = ?
          WHERE id = ? AND version = ?",
     )
+    .bind(manifest_primary_milestone_id.as_deref())
+    .bind(&project_id)
     .bind(&now)
     .bind(&project_id)
     .bind(request.mutation.expected_version)
@@ -1019,46 +1032,16 @@ pub async fn activate_execution_baseline(
     // This promotion is deliberately in the same transaction as the
     // authoritative baseline/project transition.  It is repairable by the
     // gate even if a future migration adds another derived projection.
-    sqlx::query(
-        "UPDATE project_task_governance
-         SET runnable = 1, version = version + 1, updated_at = ?
-         WHERE project_id = ? AND baseline_id = ? AND baseline_revision_id = ?
-           AND runnable = 0
-           AND EXISTS (
-               SELECT 1 FROM project p
-               JOIN project_execution_baseline b ON b.project_id = p.id
-               JOIN project_execution_baseline_revision r
-                 ON r.id = b.current_revision_id AND r.baseline_id = b.id
-               WHERE b.id = ? AND b.project_id = ? AND b.lifecycle = 'active'
-                 AND b.current_revision_id = ? AND r.lifecycle = 'approved'
-                 AND p.charter_status = 'charter_backed'
-                 AND p.charter_setup_required = 0
-                 AND p.current_charter_revision_id = r.charter_revision_id
-           )
-           AND EXISTS (
-               SELECT 1 FROM project_execution_baseline_approval a
-               WHERE a.baseline_id = ? AND a.revision_id = ?
-                 AND a.principal_type = 'user'
-                 AND a.authorization_action = 'project.execution_baseline.approve'
-                 AND length(trim(a.authorization_basis)) > 0
-                 AND length(trim(a.authorization_occurred_at)) > 0
-                 AND length(trim(a.explicit_event)) > 0
-                 AND a.content_digest = ? AND a.rendered_digest = ?
-                 AND a.lifecycle = 'active'
-           )",
+    // Besides flipping rows already bound to this exact revision, the shared
+    // pass re-binds preplanned Tasks whose plan item the activated baseline
+    // covers, so work proposed before activation becomes runnable too.
+    db::promote_baseline_task_governance_in_tx(
+        &mut tx,
+        &project_id,
+        &baseline_id,
+        &request.revision_id,
+        &now,
     )
-    .bind(&now)
-    .bind(&project_id)
-    .bind(&baseline_id)
-    .bind(&request.revision_id)
-    .bind(&baseline_id)
-    .bind(&project_id)
-    .bind(&request.revision_id)
-    .bind(&baseline_id)
-    .bind(&request.revision_id)
-    .bind(&request.content_digest)
-    .bind(&request.render_digest)
-    .execute(&mut *tx)
     .await?;
     let consumed = sqlx::query(
         "UPDATE project_execution_baseline_approval SET lifecycle = 'consumed', updated_at = ?

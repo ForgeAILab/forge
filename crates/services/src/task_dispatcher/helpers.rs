@@ -16,6 +16,16 @@ pub(super) fn is_io_or_workspace_error(error: &ServiceError) -> bool {
     }
 }
 
+/// Governance admission rejections (`ensure_task_runnable`) are deterministic:
+/// retrying the dispatch cannot succeed until a user approves an execution
+/// baseline. The dispatcher parks such tasks instead of rescheduling them.
+pub(super) fn is_not_runnable_error(error: &ServiceError) -> bool {
+    matches!(
+        error,
+        ServiceError::InvalidOperation { message } if message.contains("is not runnable")
+    )
+}
+
 pub(super) fn has_blocking_annotation(task: &db::Task) -> bool {
     let Some(raw_annotation) = task.error_annotation.as_deref() else {
         return false;
@@ -36,6 +46,7 @@ pub(super) fn has_blocking_annotation(task: &db::Task) -> bool {
             | "max_turns_exceeded"
             | "before_work_hook_failed"
             | "before_work_hook_timeout"
+            | crate::workflow::engine::DISPATCH_FAILED_ANNOTATION
     )
 }
 

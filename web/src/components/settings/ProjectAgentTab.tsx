@@ -50,7 +50,14 @@ export function ProjectAgentTab({
   const bindingMissing = bindingQuery.error instanceof ApiError && bindingQuery.error.status === 404
   const agents = agentsQuery.data?.items ?? []
   const selectedAgent = agents.find((agent) => agent.id === identityId)
-  const permissionCeiling = bindingQuery.data?.permission_ceiling ?? DEFAULT_PROJECT_PERMISSION_CEILING
+  // A Project that has not been through Product Genesis carries a placeholder
+  // binding whose ceiling is `{}`. That is present but grants nothing, so `??`
+  // would save an empty ceiling and leave the Project Agent with no tools.
+  const storedCeiling = bindingQuery.data?.permission_ceiling
+  const permissionCeiling: Record<string, unknown> =
+    storedCeiling && policyValues(storedCeiling).length > 0
+      ? storedCeiling
+      : DEFAULT_PROJECT_PERMISSION_CEILING
 
   useEffect(() => {
     const binding = bindingQuery.data

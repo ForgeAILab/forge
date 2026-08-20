@@ -80,10 +80,10 @@ database for historical provenance.
 | DELETE | `/api/v1/projects/{id}/milestones/{milestone_id}/evidence/{evidence_id}` | Remove a milestone evidence attachment (release pins remain immutable) |
 | GET    | `/api/v1/projects/{id}/overview` | Read the derived Project Overview projection |
 | GET    | `/api/v1/projects/{id}/execution-baseline` | Read the Project's current execution-baseline proposal/approval projection |
-| POST   | `/api/v1/projects/{id}/execution-baseline` | Propose one Project execution-baseline shell |
+| POST   | `/api/v1/projects/{id}/execution-baseline` | Propose one Project execution-baseline shell; the `baseline_id` is server-minted and returned in the response (the request body carries only the mutation envelope) |
 | POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions` | Append an exact, digest-bound execution-baseline revision |
 | POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions/{revision_id}/approve` | Record the exact authenticated user's baseline approval receipt |
-| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/activate` | Activate the exact user-approved baseline and promote matching preplanned Tasks |
+| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/activate` | Activate the exact user-approved baseline and promote matching preplanned Tasks: rows bound to the activated revision flip runnable, non-terminal Tasks naming a covered plan item are re-bound to it, and a missing Project primary-milestone pointer is set from the baseline's primary (or only) active milestone |
 | GET    | `/api/v1/projects/{id}/memory/search` | Search project memory |
 | GET    | `/api/v1/memory/{id}` | Get memory item |
 | POST   | `/api/v1/memory/{id}/publish` | Explicitly publish an owned private assertion into an authorized scope |

@@ -159,7 +159,7 @@ impl AgentLcmRepo for SqliteDb {
         &self,
         input: AppendAgentLcmEntries,
     ) -> Result<AgentLcmMutationResult> {
-        let mut transaction = self.pool().begin().await?;
+        let mut transaction = crate::begin_immediate(self.pool()).await?;
         if let Some(existing) = existing_operation(
             &mut transaction,
             &input.timeline_id,
@@ -279,7 +279,7 @@ impl AgentLcmRepo for SqliteDb {
         from_sequence: i64,
         updated_at: &str,
     ) -> Result<AgentLcmTruncation> {
-        let mut transaction = self.pool().begin().await?;
+        let mut transaction = crate::begin_immediate(self.pool()).await?;
         let current = timeline_revision(&mut transaction, timeline_id).await?;
         let node_reaches_span: bool = sqlx::query_scalar(
             "SELECT EXISTS(
@@ -321,7 +321,7 @@ impl AgentLcmRepo for SqliteDb {
     }
 
     async fn commit_lcm_leaf(&self, input: CommitAgentLcmLeaf) -> Result<AgentLcmMutationResult> {
-        let mut transaction = self.pool().begin().await?;
+        let mut transaction = crate::begin_immediate(self.pool()).await?;
         if let Some(existing) = existing_operation(
             &mut transaction,
             &input.timeline_id,
@@ -423,7 +423,7 @@ impl AgentLcmRepo for SqliteDb {
         &self,
         input: CommitAgentLcmCondensation,
     ) -> Result<AgentLcmMutationResult> {
-        let mut transaction = self.pool().begin().await?;
+        let mut transaction = crate::begin_immediate(self.pool()).await?;
         if let Some(existing) = existing_operation(
             &mut transaction,
             &input.timeline_id,

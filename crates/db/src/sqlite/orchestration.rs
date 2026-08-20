@@ -710,7 +710,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         &self,
         input: CreateProjectCharter,
     ) -> Result<ProjectCharterRecord> {
-        let mut tx = self.pool().begin().await?;
+        let mut tx = crate::begin_immediate(self.pool()).await?;
         if let Some(genesis_session_id) = input.genesis_session_id.as_deref() {
             let genesis = sqlx::query(
                 "SELECT account_id, lifecycle, version
@@ -806,7 +806,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         &self,
         input: CreateProjectCharterRevision,
     ) -> Result<ProjectCharterRevisionRecord> {
-        let mut transaction = self.pool().begin().await?;
+        let mut transaction = crate::begin_immediate(self.pool()).await?;
         let charter = sqlx::query(
             "SELECT account_id, version, current_draft_revision_id
              FROM project_charter WHERE id = ?",
@@ -973,7 +973,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
 
-        let mut transaction = self.pool().begin().await?;
+        let mut transaction = crate::begin_immediate(self.pool()).await?;
         if let Some(project_id) = input.project_id.as_deref() {
             let project = sqlx::query("SELECT id, owner_id FROM project WHERE id = ?")
                 .bind(project_id)
@@ -1317,7 +1317,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         if !valid_authorization_timestamp(&input.authorization_occurred_at) {
             return Err(DbError::VersionConflict);
         }
-        let mut transaction = self.pool().begin().await?;
+        let mut transaction = crate::begin_immediate(self.pool()).await?;
         let charter_scope =
             sqlx::query("SELECT account_id, project_id FROM project_charter WHERE id = ?")
                 .bind(&input.charter_id)
@@ -1740,7 +1740,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         &self,
         input: CreateProjectDocumentRevision,
     ) -> Result<ProjectDocumentRevisionRecord> {
-        let mut tx = self.pool().begin().await?;
+        let mut tx = crate::begin_immediate(self.pool()).await?;
         let document = sqlx::query(
             "SELECT project_id, version, current_draft_revision_id
              FROM project_document WHERE id = ?",
@@ -1867,6 +1867,115 @@ impl ProjectOrchestrationRepo for SqliteDb {
         map_document_revision(row)
     }
 
+    async fn create_project_document_atomically(
+        &self,
+        input: CreateProjectDocumentAtomically,
+    ) -> Result<ProjectDocumentRevisionRecord> {
+        if input.document.id != input.revision.document_id
+            || input.revision.expected_document_version != 1
+            || input.revision.base_revision != 0
+            || input.revision.base_revision_id.is_some()
+        {
+            return Err(DbError::VersionConflict);
+        }
+
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        sqlx::query(
+            "INSERT INTO project_document (
+                id, project_id, kind, title, lifecycle, approval_policy,
+                current_draft_revision_id, current_approved_revision_id,
+                version, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, 'draft', ?, NULL, NULL, 1, ?, ?)",
+        )
+        .bind(&input.document.id)
+        .bind(&input.document.project_id)
+        .bind(&input.document.kind)
+        .bind(&input.document.title)
+        .bind(&input.document.approval_policy)
+        .bind(&input.document.created_at)
+        .bind(&input.document.updated_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(orchestration_write_error)?;
+        sqlx::query(
+            "INSERT INTO project_document_revision (
+                id, document_id, revision, base_revision, base_revision_id, lifecycle,
+                schema_version, render_version, content_json, rendered_view,
+                change_summary, author_type, author_id, source_refs_json,
+                content_digest, rendered_digest, created_at
+             ) VALUES (?, ?, 1, 0, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&input.revision.id)
+        .bind(&input.revision.document_id)
+        .bind(&input.revision.lifecycle)
+        .bind(&input.revision.schema_version)
+        .bind(&input.revision.render_version)
+        .bind(&input.revision.content_json)
+        .bind(&input.revision.rendered_view)
+        .bind(&input.revision.change_summary)
+        .bind(&input.revision.author_type)
+        .bind(input.revision.author_id.as_deref())
+        .bind(&input.revision.source_refs_json)
+        .bind(&input.revision.content_digest)
+        .bind(&input.revision.rendered_digest)
+        .bind(&input.revision.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(orchestration_write_error)?;
+        let updated = sqlx::query(
+            "UPDATE project_document
+             SET current_draft_revision_id = ?, version = version + 1, updated_at = ?
+             WHERE id = ? AND version = 1",
+        )
+        .bind(&input.revision.id)
+        .bind(&input.revision.created_at)
+        .bind(&input.document.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(orchestration_write_error)?;
+        if updated.rows_affected() != 1 {
+            return Err(DbError::VersionConflict);
+        }
+        DomainEventRepo::append_event_in_tx(
+            self,
+            &mut tx,
+            &CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "project.document.revision_created".to_owned(),
+                entity_type: "project_document_revision".to_owned(),
+                entity_id: input.revision.id.clone(),
+                actor_type: input.revision.author_type.clone(),
+                actor_id: input.revision.author_id.clone(),
+                scope_type: "project".to_owned(),
+                scope_id: input.document.project_id.clone(),
+                correlation_id: input.revision.id.clone(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: Some(format!(
+                    "project-document-revision-created:{}",
+                    input.revision.id
+                )),
+                payload_json: serde_json::json!({
+                    "document_id": input.revision.document_id.clone(),
+                    "revision_id": input.revision.id.clone(),
+                    "revision": 1,
+                    "lifecycle": input.revision.lifecycle.clone(),
+                    "content_digest": input.revision.content_digest.clone(),
+                    "rendered_digest": input.revision.rendered_digest.clone(),
+                })
+                .to_string(),
+                created_at: input.revision.created_at.clone(),
+            },
+        )
+        .await?;
+        let row = sqlx::query("SELECT * FROM project_document_revision WHERE id = ?")
+            .bind(&input.revision.id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        map_document_revision(row)
+    }
+
     async fn get_project_document_revision(
         &self,
         id: &str,
@@ -1909,7 +2018,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         {
             return Err(DbError::VersionConflict);
         }
-        let mut tx = self.pool().begin().await?;
+        let mut tx = crate::begin_immediate(self.pool()).await?;
         if let Some(existing) =
             sqlx::query("SELECT * FROM project_document_approval WHERE idempotency_key = ?")
                 .bind(&input.idempotency_key)
@@ -2066,7 +2175,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         &self,
         input: CreateProjectDecisionCandidate,
     ) -> Result<ProjectDecisionCandidateRecord> {
-        let mut tx = self.pool().begin().await?;
+        let mut tx = crate::begin_immediate(self.pool()).await?;
         let project = sqlx::query("SELECT version FROM project WHERE id = ?")
             .bind(&input.project_id)
             .fetch_optional(&mut *tx)
@@ -2197,7 +2306,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         {
             return Err(DbError::VersionConflict);
         }
-        let mut tx = self.pool().begin().await?;
+        let mut tx = crate::begin_immediate(self.pool()).await?;
         let project = sqlx::query("SELECT version FROM project WHERE id = ?")
             .bind(&input.project_id)
             .fetch_optional(&mut *tx)
@@ -2329,20 +2438,24 @@ impl ProjectOrchestrationRepo for SqliteDb {
         &self,
         input: CreateProjectExecutionBaseline,
     ) -> Result<ProjectExecutionBaselineRecord> {
+        // The shell primary key is server-minted (matching the Charter
+        // precedent): agent payloads routinely fabricate identifiers, so a
+        // caller-supplied id is never trusted as a primary key.
+        let id = new_uuid_v4();
         sqlx::query(
             "INSERT INTO project_execution_baseline (
                 id, project_id, current_revision_id, lifecycle, version,
                 created_at, updated_at
              ) VALUES (?, ?, NULL, 'draft', 1, ?, ?)",
         )
-        .bind(&input.id)
+        .bind(&id)
         .bind(&input.project_id)
         .bind(&input.created_at)
         .bind(&input.updated_at)
         .execute(self.pool())
         .await
         .map_err(check_error)?;
-        self.get_project_execution_baseline(&input.id)
+        self.get_project_execution_baseline(&id)
             .await?
             .ok_or(DbError::NotFound)
     }
@@ -2364,7 +2477,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         &self,
         input: CreateProjectExecutionBaselineRevision,
     ) -> Result<ProjectExecutionBaselineRevisionRecord> {
-        let mut tx = self.pool().begin().await?;
+        let mut tx = crate::begin_immediate(self.pool()).await?;
         let baseline = sqlx::query(
             "SELECT version, current_revision_id
              FROM project_execution_baseline WHERE id = ?",
@@ -2509,7 +2622,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         {
             return Err(DbError::VersionConflict);
         }
-        let mut tx = self.pool().begin().await?;
+        let mut tx = crate::begin_immediate(self.pool()).await?;
         if let Some(existing) = sqlx::query(
             "SELECT * FROM project_execution_baseline_approval
              WHERE idempotency_key = ?",
@@ -2650,7 +2763,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         &self,
         input: ActivateProjectExecutionBaseline,
     ) -> Result<ProjectExecutionBaselineRecord> {
-        let mut tx = self.pool().begin().await?;
+        let mut tx = crate::begin_immediate(self.pool()).await?;
         let approval = sqlx::query(
             "SELECT a.baseline_id, a.revision_id, a.content_digest,
                     a.rendered_digest, a.lifecycle, b.version, b.project_id
@@ -2838,6 +2951,17 @@ impl ProjectOrchestrationRepo for SqliteDb {
         if project_update.rows_affected() != 1 {
             return Err(DbError::VersionConflict);
         }
+        // Promote matching preplanned Tasks in the same transaction: flip
+        // rows already bound to this exact revision and re-bind non-terminal
+        // Tasks whose plan item this baseline covers.
+        crate::promote_baseline_task_governance_in_tx(
+            &mut tx,
+            &project_id,
+            &baseline_id,
+            &revision_id,
+            &input.updated_at,
+        )
+        .await?;
         let consumed = sqlx::query(
             "UPDATE project_execution_baseline_approval
              SET lifecycle = 'consumed', updated_at = ?
@@ -2863,7 +2987,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         &self,
         input: CreateProjectMilestone,
     ) -> Result<ProjectMilestoneRecord> {
-        let mut tx = self.pool().begin().await?;
+        let mut tx = crate::begin_immediate(self.pool()).await?;
         let project = sqlx::query("SELECT version FROM project WHERE id = ?")
             .bind(&input.project_id)
             .fetch_optional(&mut *tx)
@@ -2941,7 +3065,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         &self,
         input: CreateProjectMilestoneRevision,
     ) -> Result<ProjectMilestoneRevisionRecord> {
-        let mut tx = self.pool().begin().await?;
+        let mut tx = crate::begin_immediate(self.pool()).await?;
         let milestone = sqlx::query(
             "SELECT version, current_definition_revision_id
              FROM project_milestone WHERE id = ?",
@@ -3069,6 +3193,138 @@ impl ProjectOrchestrationRepo for SqliteDb {
         map_milestone_revision(row)
     }
 
+    async fn create_project_milestone_atomically(
+        &self,
+        input: CreateProjectMilestoneAtomically,
+    ) -> Result<ProjectMilestoneRevisionRecord> {
+        if input.milestone.id != input.revision.milestone_id
+            || input.revision.expected_milestone_version != 1
+            || input.revision.base_revision != 0
+            || input.revision.base_revision_id.is_some()
+        {
+            return Err(DbError::VersionConflict);
+        }
+
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        let project = sqlx::query("SELECT version FROM project WHERE id = ?")
+            .bind(&input.milestone.project_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        let project_version: i64 = project.try_get("version")?;
+        if project_version != input.milestone.expected_project_version {
+            return Err(DbError::VersionConflict);
+        }
+        sqlx::query(
+            "INSERT INTO project_milestone (
+                id, project_id, milestone_sequence, milestone_key, display_label,
+                lifecycle, blocker_reason_json, stale_reason_json,
+                reconciliation_reason_json, version, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, 'planned', '[]', '[]', '[]', 1, ?, ?)",
+        )
+        .bind(&input.milestone.id)
+        .bind(&input.milestone.project_id)
+        .bind(input.milestone.milestone_sequence)
+        .bind(&input.milestone.milestone_key)
+        .bind(input.milestone.display_label.as_deref())
+        .bind(&input.milestone.created_at)
+        .bind(&input.milestone.updated_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(check_error)?;
+        let advanced = sqlx::query(
+            "UPDATE project SET version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ?",
+        )
+        .bind(&input.milestone.updated_at)
+        .bind(&input.milestone.project_id)
+        .bind(input.milestone.expected_project_version)
+        .execute(&mut *tx)
+        .await
+        .map_err(check_error)?;
+        if advanced.rows_affected() != 1 {
+            return Err(DbError::VersionConflict);
+        }
+        sqlx::query(
+            "INSERT INTO project_milestone_revision (
+                id, milestone_id, revision, base_revision, base_revision_id, lifecycle,
+                display_label, outcome, included_scope_json, excluded_scope_json,
+                charter_revision_id, document_revisions_json, task_selection_json,
+                dependencies_json, risks_json, acceptance_checks_json,
+                evidence_requirements_json, known_issues_json, change_summary,
+                schema_version, render_version, rendered_view, content_digest,
+                rendered_digest,
+                author_type, author_id, source_refs_json, created_at
+             ) VALUES (?, ?, 1, 0, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&input.revision.id)
+        .bind(&input.revision.milestone_id)
+        .bind(&input.revision.lifecycle)
+        .bind(input.revision.display_label.as_deref())
+        .bind(&input.revision.outcome)
+        .bind(&input.revision.included_scope_json)
+        .bind(&input.revision.excluded_scope_json)
+        .bind(input.revision.charter_revision_id.as_deref())
+        .bind(&input.revision.document_revisions_json)
+        .bind(&input.revision.task_selection_json)
+        .bind(&input.revision.dependencies_json)
+        .bind(&input.revision.risks_json)
+        .bind(&input.revision.acceptance_checks_json)
+        .bind(&input.revision.evidence_requirements_json)
+        .bind(&input.revision.known_issues_json)
+        .bind(&input.revision.change_summary)
+        .bind(&input.revision.schema_version)
+        .bind(&input.revision.render_version)
+        .bind(&input.revision.rendered_view)
+        .bind(&input.revision.content_digest)
+        .bind(&input.revision.rendered_digest)
+        .bind(&input.revision.author_type)
+        .bind(input.revision.author_id.as_deref())
+        .bind(&input.revision.source_refs_json)
+        .bind(&input.revision.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(check_error)?;
+        // The pointer trigger only accepts a 'proposed'/'approved' target, so
+        // a 'draft' first revision must skip the pointer update here exactly
+        // like `create_project_milestone_revision` does -- the pointer is
+        // promoted by a later revision, not by this creation.
+        let advanced = if input.revision.lifecycle == "draft" {
+            sqlx::query(
+                "UPDATE project_milestone
+                 SET version = version + 1, updated_at = ?
+                 WHERE id = ? AND version = 1",
+            )
+            .bind(&input.revision.created_at)
+            .bind(&input.milestone.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(check_error)?
+        } else {
+            sqlx::query(
+                "UPDATE project_milestone
+                 SET current_definition_revision_id = ?, version = version + 1,
+                     updated_at = ?
+                 WHERE id = ? AND version = 1",
+            )
+            .bind(&input.revision.id)
+            .bind(&input.revision.created_at)
+            .bind(&input.milestone.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(check_error)?
+        };
+        if advanced.rows_affected() != 1 {
+            return Err(DbError::VersionConflict);
+        }
+        let row = sqlx::query("SELECT * FROM project_milestone_revision WHERE id = ?")
+            .bind(&input.revision.id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        map_milestone_revision(row)
+    }
+
     async fn get_project_milestone_revision(
         &self,
         id: &str,
@@ -3102,7 +3358,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         &self,
         input: CreateProjectMilestoneCheck,
     ) -> Result<ProjectMilestoneCheckRecord> {
-        let mut tx = self.pool().begin().await?;
+        let mut tx = crate::begin_immediate(self.pool()).await?;
         let milestone = sqlx::query(
             "SELECT version FROM project_milestone
              WHERE id = ? AND project_id = ?",
@@ -3184,7 +3440,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         {
             return Err(DbError::VersionConflict);
         }
-        let mut tx = self.pool().begin().await?;
+        let mut tx = crate::begin_immediate(self.pool()).await?;
         if let Some(existing) =
             sqlx::query("SELECT * FROM project_milestone_check_result WHERE idempotency_key = ?")
                 .bind(&input.idempotency_key)
@@ -3303,7 +3559,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         {
             return Err(DbError::VersionConflict);
         }
-        let mut tx = self.pool().begin().await?;
+        let mut tx = crate::begin_immediate(self.pool()).await?;
         if let Some(existing) =
             sqlx::query("SELECT * FROM project_readiness_snapshot WHERE idempotency_key = ?")
                 .bind(&input.idempotency_key)
@@ -3493,7 +3749,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         {
             return Err(DbError::VersionConflict);
         }
-        let mut tx = self.pool().begin().await?;
+        let mut tx = crate::begin_immediate(self.pool()).await?;
         if let Some(existing) =
             sqlx::query("SELECT * FROM project_release WHERE idempotency_key = ?")
                 .bind(&input.idempotency_key)
@@ -3784,7 +4040,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         &self,
         input: CreateProjectFromCharterApproval,
     ) -> Result<CreatedProjectFromCharterApproval> {
-        let mut tx = self.pool().begin().await?;
+        let mut tx = crate::begin_immediate(self.pool()).await?;
 
         // The create authorization is a second, explicit user action. Keep it
         // separate from the approval receipt and validate it again at the DB
@@ -4877,7 +5133,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         {
             return Err(DbError::VersionConflict);
         }
-        let mut tx = self.pool().begin().await?;
+        let mut tx = crate::begin_immediate(self.pool()).await?;
         if let Some(existing) =
             sqlx::query("SELECT * FROM project_canonical_conflict WHERE idempotency_key = ?")
                 .bind(&input.idempotency_key)
@@ -4987,7 +5243,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         &self,
         input: CreateProjectReconciliation,
     ) -> Result<ProjectReconciliationRecord> {
-        let mut tx = self.pool().begin().await?;
+        let mut tx = crate::begin_immediate(self.pool()).await?;
         let row = sqlx::query(
             "INSERT INTO project_reconciliation_record (
                 id, project_id, conflict_id, record_type, record_id,
@@ -5052,7 +5308,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         &self,
         input: ResolveProjectReconciliation,
     ) -> Result<ProjectReconciliationRecord> {
-        let mut tx = self.pool().begin().await?;
+        let mut tx = crate::begin_immediate(self.pool()).await?;
         if !matches!(
             input.action.as_str(),
             "retained" | "revised" | "cancelled" | "superseded" | "invalidated"

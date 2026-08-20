@@ -723,7 +723,10 @@ async fn effect_failure_log_policy_continues() {
                 StateKind::Active,
                 Some(default_roles::CODER),
                 StateHooks {
-                    on_enter: vec![hook("dispatch_role_agent", FailurePolicy::Log)],
+                    // A non-dispatch effect: Log-policy failures never move
+                    // the task. (A failed *dispatch* entering an active state
+                    // rolls the task back — covered separately below.)
+                    on_enter: vec![hook("notify_role_holder", FailurePolicy::Log)],
                     ..StateHooks::default()
                 },
             ),
@@ -752,10 +755,162 @@ async fn effect_failure_log_policy_continues() {
     assert_eq!(result.task.status.to_string(), default_states::IN_PROGRESS);
     let results = hook_results(&db, task_id).await;
     assert!(results.iter().any(|entry| {
-        entry.action == "dispatch_role_agent"
+        entry.action == "notify_role_holder"
             && entry.phase == "on_enter"
             && entry.outcome == "failed"
     }));
+}
+
+#[tokio::test]
+async fn dispatch_failure_entering_active_state_rolls_task_back_to_initial() {
+    // Incident repro: a task without an approved execution baseline was
+    // scheduled by the dispatcher, planning was skipped (no planner), and the
+    // coder dispatch failed on entering in_progress — yet the task stayed in
+    // in_progress with zero executions, looking in-flight forever.
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let task_id = "task-dispatch-failure-rollback";
+    seed_project_repo_and_task(&db, task_id, default_states::TODO).await;
+    // A coder assignment whose agent is gone makes dispatch_role_agent FAIL
+    // (not skip) when the task enters in_progress.
+    assign_agent_role_without_agent(&db, task_id, default_roles::CODER).await;
+    let workflow = default_workflow::default_workflow();
+    let current_task = TaskRepo::get_by_id(&*db, task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+
+    let result = engine(Arc::clone(&db), event_bus)
+        .transition(
+            task_id,
+            default_states::PLANNING,
+            current_task.version,
+            &workflow,
+            &api_types::Actor::system(api_types::SystemComponent::TaskDispatcher),
+            "scheduled by task dispatcher",
+            false,
+        )
+        .await
+        .expect("transition succeeds");
+
+    assert!(result.cascaded);
+    assert_eq!(
+        result.task.status.to_string(),
+        default_states::TODO,
+        "a failed dispatch must not leave the task in the working state"
+    );
+
+    let task = TaskRepo::get_by_id(&*db, task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert_eq!(task.status.to_string(), default_states::TODO);
+    let annotation = task
+        .error_annotation
+        .expect("dispatch failure is annotated on the task");
+    let annotation: serde_json::Value =
+        serde_json::from_str(&annotation).expect("annotation is json");
+    assert_eq!(annotation["type"], "dispatch_failed");
+    assert!(
+        annotation["message"]
+            .as_str()
+            .expect("annotation message is a string")
+            .contains("invalid coder role assignment"),
+        "annotation carries the dispatch error: {annotation}"
+    );
+
+    let logs = TransitionLogRepo::list_by_task(&*db, task_id)
+        .await
+        .expect("transition logs list");
+    let enter = logs
+        .iter()
+        .find(|entry| entry.to_state == default_states::IN_PROGRESS)
+        .expect("planning -> in_progress transition is logged");
+    let entries: Vec<HookResultEntry> = serde_json::from_str(
+        enter
+            .hook_results_json
+            .as_deref()
+            .expect("hook results are written"),
+    )
+    .expect("hook results deserialize");
+    assert!(
+        entries.iter().any(|entry| {
+            entry.action == "dispatch_role_agent"
+                && entry.phase == "on_enter"
+                && entry.outcome == "failed"
+        }),
+        "failed dispatch hook is recorded: {entries:?}"
+    );
+    let rollback = logs
+        .iter()
+        .find(|entry| {
+            entry.from_state == default_states::IN_PROGRESS
+                && entry.to_state == default_states::TODO
+        })
+        .expect("in_progress -> todo rollback transition is logged");
+    assert!(
+        rollback
+            .trigger_reason
+            .starts_with("dispatch failed entering in_progress"),
+        "rollback records the dispatch failure: {}",
+        rollback.trigger_reason
+    );
+    assert_eq!(
+        rollback.triggered_by,
+        api_types::Actor::system(api_types::SystemComponent::Workflow).display()
+    );
+}
+
+#[tokio::test]
+async fn successful_dispatch_clears_stale_dispatch_failure_annotation() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let task_id = "task-dispatch-annotation-clears";
+    seed_project_repo_and_task(&db, task_id, default_states::TODO).await;
+    // A user-held coder role makes dispatch_role_agent return Ok
+    // (task.awaiting_human) without needing a task executor.
+    assign_user_role(&db, task_id, default_roles::CODER).await;
+    sqlx::query("UPDATE task SET error_annotation = ? WHERE id = ?")
+        .bind(
+            json!({
+                "type": "dispatch_failed",
+                "message": "repository Task is not runnable",
+            })
+            .to_string(),
+        )
+        .bind(task_id)
+        .execute(db.pool())
+        .await
+        .expect("stale dispatch failure annotation seeds");
+    let workflow = default_workflow::default_workflow();
+    let current_task = TaskRepo::get_by_id(&*db, task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+
+    let result = engine(Arc::clone(&db), event_bus)
+        .transition(
+            task_id,
+            default_states::IN_PROGRESS,
+            current_task.version,
+            &workflow,
+            &api_types::Actor::user(api_types::UserActionSource::Test),
+            "restart work after baseline approval",
+            false,
+        )
+        .await
+        .expect("transition succeeds");
+
+    assert_eq!(result.task.status.to_string(), default_states::IN_PROGRESS);
+    let task = TaskRepo::get_by_id(&*db, task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert_eq!(task.status.to_string(), default_states::IN_PROGRESS);
+    assert_eq!(
+        task.error_annotation, None,
+        "successful dispatch clears the stale dispatch_failed annotation"
+    );
 }
 
 #[tokio::test]

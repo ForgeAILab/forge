@@ -145,7 +145,7 @@ pub async fn create_milestone(
     // The project row is locked before deriving the Project-local sequence.
     // This makes MAX(sequence)+1 and the milestone/revision/event writes one
     // authoritative mutation rather than three independently committed ones.
-    let mut tx = state.db.pool().begin().await?;
+    let mut tx = db::begin_immediate(state.db.pool()).await?;
     let locked = sqlx::query("UPDATE project SET version = version WHERE id = ? AND version = ?")
         .bind(&project_id)
         .bind(request.mutation.expected_version)
@@ -446,7 +446,7 @@ pub async fn transition_milestone_revision(
             })?;
         return Ok(Json(revision));
     }
-    let mut tx = state.db.pool().begin().await?;
+    let mut tx = db::begin_immediate(state.db.pool()).await?;
     let locked = sqlx::query(
         "UPDATE project_milestone SET version = version
          WHERE id = ? AND project_id = ? AND version = ?",
@@ -688,7 +688,7 @@ pub async fn save_milestone_revision(
             })?;
         return Ok((axum::http::StatusCode::OK, Json(revision)));
     }
-    let mut tx = state.db.pool().begin().await?;
+    let mut tx = db::begin_immediate(state.db.pool()).await?;
     let locked = sqlx::query(
         "UPDATE project_milestone SET version = version
          WHERE id = ? AND project_id = ? AND version = ?",
@@ -901,12 +901,13 @@ pub async fn list_milestones_with_query(
     let mut items = Vec::with_capacity(rows.len().min(limit as usize));
     for row in rows.into_iter().take(limit as usize) {
         let milestone_id: String = row.try_get("id")?;
-        let milestone = runtime
-            .get(&project_id, &milestone_id)
-            .await
-            .map_err(ApiError::from)?
-            .ok_or_else(|| ApiError::not_found("milestone", milestone_id))?;
-        items.push(milestone);
+        // `get` already tolerates an unset definition pointer by falling
+        // back to the latest revision; a `None` here means the milestone has
+        // no revision at all, which `MilestoneRuntime` already warned about.
+        // Skip it rather than failing the whole page for one corrupt row.
+        if let Some(milestone) = runtime.get(&project_id, &milestone_id).await? {
+            items.push(milestone);
+        }
     }
     let next_cursor = items
         .last()
@@ -985,7 +986,7 @@ pub async fn transition_milestone(
             .ok_or_else(|| ApiError::not_found("milestone", milestone_id.clone()))?;
         return Ok(Json(milestone));
     }
-    let mut tx = state.db.pool().begin().await?;
+    let mut tx = db::begin_immediate(state.db.pool()).await?;
     let locked = sqlx::query(
         "UPDATE project_milestone SET version = version
          WHERE id = ? AND project_id = ? AND version = ?",
@@ -1235,7 +1236,7 @@ pub async fn record_milestone_check(
             "manual check result must be pass, fail, blocked, stale, or unavailable",
         ));
     }
-    let mut tx = state.db.pool().begin().await?;
+    let mut tx = db::begin_immediate(state.db.pool()).await?;
     let check = sqlx::query(
         "SELECT c.version, c.definition_revision_id, c.source_kind,
                 m.current_definition_revision_id, r.author_id
@@ -1713,7 +1714,7 @@ pub async fn waive_milestone_check(
             "check_id must match the path and waiver reason is required",
         ));
     }
-    let mut tx = state.db.pool().begin().await?;
+    let mut tx = db::begin_immediate(state.db.pool()).await?;
     let check_row = sqlx::query(
         "SELECT c.version, m.current_definition_revision_id, r.author_id
          FROM project_milestone_check c

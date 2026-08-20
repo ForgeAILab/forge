@@ -14,7 +14,7 @@ const MAIN_IDENTITY_ID: &str = "orchestration-main-identity";
 const MAIN_PROFILE_ID: &str = "orchestration-main-profile";
 const PROJECT_AGENT_IDENTITY_ID: &str = "orchestration-project-identity";
 const PROJECT_AGENT_PROFILE_ID: &str = "orchestration-project-profile";
-const PROJECT_SKILL_REVISION_ID: &str = "forge.project.orchestration/v1@1";
+const PROJECT_SKILL_KEY: &str = "forge.project.orchestration/v1";
 const PROJECT_POLICY_REVISION: &str = "policy@1";
 const PROJECT_POLICY_DIGEST: &str =
     "289884035ab841815b521543c9b203dfb06e9a5c2bd787aeb0ce51936586d44e";
@@ -30,6 +30,29 @@ fn digest(value: &str) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// Resolve the current active Project operating-skill revision the same way
+/// the approval route does: the approval contract requires the selected
+/// revision to be the skill's *current* revision, which migrations may
+/// advance (e.g. V084 repointed `forge.project.orchestration/v1` to `@2`).
+async fn project_skill_revision_id(db: &SqliteDb) -> String {
+    sqlx::query_scalar(
+        "SELECT revision.id
+         FROM operating_skill AS skill
+         JOIN operating_skill_revision AS revision
+           ON revision.id = skill.current_revision_id
+          AND revision.operating_skill_id = skill.id
+          AND revision.skill_key = skill.skill_key
+         WHERE skill.skill_key = ?
+           AND skill.lifecycle = 'active'
+           AND skill.current_revision_id IS NOT NULL
+         LIMIT 1",
+    )
+    .bind(PROJECT_SKILL_KEY)
+    .fetch_one(db.pool())
+    .await
+    .expect("current Project operating skill revision")
 }
 
 async fn fixture() -> (SqliteDb, String, String, String) {
@@ -213,6 +236,7 @@ async fn approval_fixture(db: &SqliteDb, genesis_id: &str, now: &str) -> (String
     .await
     .expect("Charter revision");
     let approval_id = "orchestration-approval";
+    let skill_revision_id = project_skill_revision_id(db).await;
     ProjectOrchestrationRepo::approve_project_charter(
         db,
         db::ApproveProjectCharter {
@@ -228,7 +252,7 @@ async fn approval_fixture(db: &SqliteDb, genesis_id: &str, now: &str) -> (String
             approved_project_mode: "compact".to_owned(),
             selected_identity_id: Some(PROJECT_AGENT_IDENTITY_ID.to_owned()),
             selected_profile_id: Some(PROJECT_AGENT_PROFILE_ID.to_owned()),
-            selected_operating_skill_revision_id: Some(PROJECT_SKILL_REVISION_ID.to_owned()),
+            selected_operating_skill_revision_id: Some(skill_revision_id),
             selected_policy_revision: Some(PROJECT_POLICY_REVISION.to_owned()),
             selected_policy_digest: Some(PROJECT_POLICY_DIGEST.to_owned()),
             approving_principal_type: "user".to_owned(),
@@ -577,7 +601,6 @@ async fn compact_milestone_activates_only_with_approved_baseline() {
     let baseline = ProjectOrchestrationRepo::create_project_execution_baseline(
         &db,
         CreateProjectExecutionBaseline {
-            id: "baseline-1".to_owned(),
             project_id: created.project.id.clone(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -702,6 +725,7 @@ async fn charter_approval_replay_ignores_transport_row_ids_but_rejects_changed_t
 ) {
     let (db, genesis_id, _main_chat_id, now) = fixture().await;
     let (charter_id, revision_id) = approval_fixture(&db, &genesis_id, &now).await;
+    let skill_revision_id = project_skill_revision_id(&db).await;
     let replay = ProjectOrchestrationRepo::approve_project_charter(
         &db,
         db::ApproveProjectCharter {
@@ -719,7 +743,7 @@ async fn charter_approval_replay_ignores_transport_row_ids_but_rejects_changed_t
             approved_project_mode: "compact".to_owned(),
             selected_identity_id: Some(PROJECT_AGENT_IDENTITY_ID.to_owned()),
             selected_profile_id: Some(PROJECT_AGENT_PROFILE_ID.to_owned()),
-            selected_operating_skill_revision_id: Some(PROJECT_SKILL_REVISION_ID.to_owned()),
+            selected_operating_skill_revision_id: Some(skill_revision_id.clone()),
             selected_policy_revision: Some(PROJECT_POLICY_REVISION.to_owned()),
             selected_policy_digest: Some(PROJECT_POLICY_DIGEST.to_owned()),
             approving_principal_type: "user".to_owned(),
@@ -769,7 +793,7 @@ async fn charter_approval_replay_ignores_transport_row_ids_but_rejects_changed_t
         approved_project_mode: "compact".to_owned(),
         selected_identity_id: Some(PROJECT_AGENT_IDENTITY_ID.to_owned()),
         selected_profile_id: Some(PROJECT_AGENT_PROFILE_ID.to_owned()),
-        selected_operating_skill_revision_id: Some(PROJECT_SKILL_REVISION_ID.to_owned()),
+        selected_operating_skill_revision_id: Some(skill_revision_id),
         selected_policy_revision: Some(PROJECT_POLICY_REVISION.to_owned()),
         selected_policy_digest: Some(PROJECT_POLICY_DIGEST.to_owned()),
         approving_principal_type: "user".to_owned(),

@@ -2,9 +2,9 @@
 //!
 //! This adapter deliberately exposes only read projections and proposal
 //! envelopes.  It never calls Task mutation/workflow methods directly; an
-//! admitted `task.propose` remains an `AgentAction` until the existing
-//! coordination/Task services perform their normal policy and execution
-//! steps.
+//! admitted `task.propose` becomes an `AgentAction` and is executed through
+//! the existing coordination/Task services' normal policy and execution
+//! steps (inline when a `TaskService` is attached).
 
 use std::{
     collections::BTreeSet,
@@ -850,6 +850,8 @@ impl CoordinationToolProvider {
             ),
             "task.propose" if scope.scope_type == CanonicalScopeType::Project => {
                 self.require_project_charter_backed(&scope.scope_id).await?;
+                self.validate_task_proposal_binding(&scope.scope_id, &payload)
+                    .await?;
                 (
                     "propose_task",
                     Some("project".to_owned()),
@@ -861,6 +863,8 @@ impl CoordinationToolProvider {
                     AgentHostError::Authority("Project Agent Chat has no owning Project".to_owned())
                 })?;
                 self.require_project_charter_backed(project_id).await?;
+                self.validate_task_proposal_binding(project_id, &payload)
+                    .await?;
                 (
                     "propose_task",
                     Some("project".to_owned()),
@@ -1336,6 +1340,123 @@ impl CoordinationToolProvider {
         Ok(())
     }
 
+    /// Reject a Task proposal the server could only downgrade or duplicate.
+    ///
+    /// Once a Project has an active user-approved execution baseline, an
+    /// implementation Task (task_type `task`/`sub_task`) on a
+    /// repository-backed Project becomes runnable only when it names a plan
+    /// item from that exact baseline. A proposal without one used to be
+    /// admitted silently as a never-runnable plan and stranded at dispatch;
+    /// it is rejected here instead, before an `AgentAction` row exists, with
+    /// the valid plan-item ids in the error. A plan item that already
+    /// carries a non-cancelled Task (any state, `done` included) never
+    /// admits a second one — the error names the existing Task so the agent
+    /// can act on it. Planning/discovery Tasks stay proposable without a
+    /// plan item: they are read-only by construction and never need the
+    /// baseline binding. Errors return to the model verbatim in-turn.
+    async fn validate_task_proposal_binding(
+        &self,
+        project_id: &str,
+        payload: &Value,
+    ) -> Result<(), AgentHostError> {
+        let task_type = payload
+            .get("task_type")
+            .and_then(Value::as_str)
+            .unwrap_or("task");
+        // Agent proposals normally carry the flat shortcut field, but the
+        // payload contract also admits a full `governance` envelope; honor
+        // the plan item wherever it was named.
+        let plan_item_id = payload
+            .get("plan_item_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .or_else(|| {
+                payload
+                    .get("governance")
+                    .and_then(|governance| governance.get("plan_item_id"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+            });
+        let repository_backed = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT primary_repo_id FROM project WHERE id = ? LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(|_| AgentHostError::ProtectedPersistence)?
+        .flatten()
+        .is_some();
+        let active_plan_items: Option<Vec<String>> = sqlx::query_scalar::<_, String>(
+            "SELECT r.plan_items_json
+             FROM project_execution_baseline AS b
+             JOIN project_execution_baseline_revision AS r
+               ON r.id = b.current_revision_id AND r.baseline_id = b.id
+             WHERE b.project_id = ? AND b.lifecycle = 'active'
+               AND r.lifecycle = 'approved'
+             ORDER BY b.updated_at DESC, b.id DESC LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(|_| AgentHostError::ProtectedPersistence)?
+        .map(|json| baseline_plan_item_ids(&json));
+        let implementation = repository_backed && matches!(task_type, "task" | "sub_task");
+        if let Some(plan_items) = active_plan_items.as_deref().filter(|_| implementation) {
+            match plan_item_id {
+                None => {
+                    return Err(AgentHostError::Authority(format!(
+                        "task.propose rejected: this Project has an active execution baseline, \
+                         so implementation Tasks (task_type \"task\") must include plan_item_id \
+                         — without it the Task can never become runnable. Valid plan_item_ids: \
+                         [{}]. Propose the Task again with the plan item it implements, or use \
+                         task_type \"planning_task\"/\"discovery\" for ungoverned read-only work.",
+                        plan_items.join(", "),
+                    )));
+                }
+                Some(candidate) if !plan_items.iter().any(|id| id == candidate) => {
+                    return Err(AgentHostError::Authority(format!(
+                        "task.propose rejected: plan_item_id \"{candidate}\" is not present in \
+                         the Project's active execution baseline. Valid plan_item_ids: [{}].",
+                        plan_items.join(", "),
+                    )));
+                }
+                _ => {}
+            }
+        }
+        if let Some(plan_item_id) = plan_item_id {
+            let existing = sqlx::query(
+                "SELECT g.task_id, t.status
+                 FROM project_task_governance AS g
+                 JOIN task AS t ON t.id = g.task_id
+                 WHERE g.project_id = ? AND g.plan_item_id = ?
+                   AND t.status <> 'cancelled'
+                 ORDER BY g.created_at ASC LIMIT 1",
+            )
+            .bind(project_id)
+            .bind(plan_item_id)
+            .fetch_optional(self.db.pool())
+            .await
+            .map_err(|_| AgentHostError::ProtectedPersistence)?;
+            if let Some(existing) = existing {
+                let task_id: String = existing
+                    .try_get("task_id")
+                    .map_err(|_| AgentHostError::ProtectedPersistence)?;
+                let status: String = existing
+                    .try_get("status")
+                    .map_err(|_| AgentHostError::ProtectedPersistence)?;
+                return Err(AgentHostError::Authority(format!(
+                    "task.propose rejected: plan item \"{plan_item_id}\" is already bound to \
+                     Task {task_id} (status: {status}). Do not propose a duplicate — read that \
+                     Task and act on it instead (wait for it, address its failure, or have it \
+                     cancelled before replacing it).",
+                )));
+            }
+        }
+        Ok(())
+    }
+
     async fn require_project_charter_backed(&self, project_id: &str) -> Result<(), AgentHostError> {
         let state = sqlx::query(
             "SELECT charter_status, charter_setup_required,
@@ -1728,6 +1849,30 @@ fn required_argument(arguments: &Value, field: &str) -> Result<String, AgentHost
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
         .ok_or_else(|| AgentHostError::Authority(format!("{field} is required")))
+}
+
+/// Plan-item ids named by a baseline revision's `plan_items_json` column.
+/// The authoring surface persists a flat id array, but object entries with
+/// an `id` field are accepted for robustness (they match the shape
+/// `json_contains_identifier` admits in Task governance validation).
+fn baseline_plan_item_ids(plan_items_json: &str) -> Vec<String> {
+    serde_json::from_str::<Value>(plan_items_json)
+        .ok()
+        .and_then(|value| match value {
+            Value::Array(items) => Some(items),
+            _ => None,
+        })
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| match item {
+                    Value::String(id) => Some(id.clone()),
+                    Value::Object(map) => map.get("id").and_then(Value::as_str).map(str::to_owned),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn payload_object(payload: &Value) -> Result<&Map<String, Value>, AgentHostError> {
@@ -2609,9 +2754,10 @@ fn validate_execution_baseline_release_policy_payload(value: &Value) -> Result<(
     )?;
     let schema = required_payload_string(policy, "schema_version")?;
     if schema != "forge.execution-baseline-release-policy/v1" {
-        return Err(AgentHostError::Authority(
-            "release_policy.schema_version is not the current Forge schema".to_owned(),
-        ));
+        return Err(AgentHostError::Authority(format!(
+            "release_policy.schema_version {schema:?} is not the current Forge schema; \
+             use \"forge.execution-baseline-release-policy/v1\""
+        )));
     }
     required_payload_string(policy, "revision")?;
     for field in [
@@ -2877,8 +3023,11 @@ fn validate_orchestration_payload(operation: &str, payload: &Value) -> Result<()
                 &["prototype", "mvp", "production", "critical"],
             )?;
             validate_charter_content_payload(required_payload_value(object, "content")?)?;
-            required_payload_string(object, "rendered_view")?;
-            required_payload_string(object, "render_version")?;
+            // Server-rendered, like the Main Charter draft path: a model
+            // cannot reproduce the renderer byte-for-byte, so these are
+            // accepted only as an optional round-trip of a server value.
+            optional_payload_string(object, "rendered_view")?;
+            optional_payload_string(object, "render_version")?;
             validate_revision_provenance_payload(required_payload_value(object, "provenance")?)?;
         }
         PROJECT_DOCUMENT_OPERATION => {

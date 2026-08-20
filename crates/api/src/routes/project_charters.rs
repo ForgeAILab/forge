@@ -751,7 +751,7 @@ async fn approve_existing_project_charter(
     let expected_project_version = request.expected_project_version.ok_or_else(|| {
         ApiError::bad_request("expected_project_version is required for a Project Charter approval")
     })?;
-    let mut tx = state.db.pool().begin().await?;
+    let mut tx = db::begin_immediate(state.db.pool()).await?;
     let approval_id = new_uuid_v4();
     let approval_type = if project.charter_status == "charter_backed" {
         "charter_amendment"

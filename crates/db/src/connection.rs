@@ -1,7 +1,7 @@
 use crate::Result;
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-    SqlitePool,
+    Sqlite, SqlitePool, Transaction,
 };
 use std::{str::FromStr, time::Duration};
 
@@ -34,4 +34,18 @@ pub async fn create_sqlite_pool(database_url: &str) -> Result<SqlitePool> {
         .await?;
 
     Ok(pool)
+}
+
+/// Begins a write transaction with `BEGIN IMMEDIATE`, acquiring the SQLite
+/// write lock up front. A plain (deferred) `BEGIN` only upgrades to a write
+/// lock lazily, on the first write statement — and that upgrade does not
+/// honor `busy_timeout`, so under contention it fails instantly with
+/// SQLITE_BUSY_SNAPSHOT instead of retrying. Use this for any transaction
+/// that performs writes.
+///
+/// Returns `sqlx::Result` (not `crate::Result`) so it is a drop-in
+/// replacement for `pool.begin()` at every call site, including outside the
+/// `db` crate, without changing error-conversion paths.
+pub async fn begin_immediate(pool: &SqlitePool) -> sqlx::Result<Transaction<'static, Sqlite>> {
+    pool.begin_with("BEGIN IMMEDIATE").await
 }
