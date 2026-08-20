@@ -365,25 +365,42 @@ impl ProjectOrchestrationActionService {
         let requested_charter_version = integer(payload, "expected_charter_version")?;
         let (expected_charter_version, charter_mode, charter_maturity) = match charter.as_ref() {
             Some(charter) => {
+                // Every conflict here names the value that would satisfy it. The
+                // Project surface has no operation that reads a Charter, so a
+                // model that is only told "the version is wrong" has nowhere to
+                // look it up: a live run alternated between these two errors
+                // eight times and gave up without writing a revision.
                 let expected = if requested_charter_version == 0 {
                     if charter.version != 1 || charter.current_draft_revision_id.is_some() {
-                        return Err(ServiceError::conflict(
-                            "a Project Charter adoption draft already exists; send its current version",
-                        ));
+                        return Err(ServiceError::conflict(format!(
+                            "a Project Charter adoption draft already exists; \
+                             send expected_charter_version = {} \
+                             (and base_revision_id = {} to revise that draft)",
+                            charter.version,
+                            charter
+                                .current_draft_revision_id
+                                .as_deref()
+                                .unwrap_or("<none>"),
+                        )));
                     }
                     charter.version
                 } else {
                     requested_charter_version
                 };
                 if charter.version != expected {
-                    return Err(ServiceError::conflict(
-                        "the Project Charter changed before adoption was materialized",
-                    ));
+                    return Err(ServiceError::conflict(format!(
+                        "the Project Charter changed before adoption was materialized; \
+                         expected_charter_version = {} was sent but the Charter is at \
+                         version {}. Send {} and retry.",
+                        expected, charter.version, charter.version,
+                    )));
                 }
                 if charter.project_mode != project_mode || charter.maturity != maturity {
-                    return Err(ServiceError::conflict(
-                        "Project Charter mode and maturity are immutable after draft creation",
-                    ));
+                    return Err(ServiceError::conflict(format!(
+                        "Project Charter mode and maturity are immutable after draft \
+                         creation; this Charter is project_mode = {}, maturity = {}",
+                        charter.project_mode, charter.maturity,
+                    )));
                 }
                 (
                     expected,
@@ -2760,6 +2777,87 @@ mod tests {
             .await
             .expect("placeholder count")
                 == 0
+        );
+    }
+
+    #[tokio::test]
+    async fn adoption_version_conflict_names_the_version_to_send() {
+        let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
+        run_migrations(&pool).await.expect("schema");
+        let db = SqliteDb::new(pool);
+        let project_id = setup_adoption_project(&db).await;
+        let service = ProjectOrchestrationActionService::new(Arc::new(db.clone()));
+        let content = adoption_charter_content_fixture();
+        let first = json!({
+            "action": "draft_revision",
+            "expected_charter_version": 0,
+            "project_mode": "compact",
+            "maturity": "mvp",
+            "content": content,
+            "provenance": {
+                "author": { "kind": "agent", "id": "project-agent" },
+                "change_summary": "Adopt",
+                "source_refs": []
+            }
+        });
+        let created = service
+            .materialize_charter_adoption(
+                &adoption_action(&project_id, &first, "adoption-1"),
+                &project_id,
+                &first,
+            )
+            .await
+            .expect("first adoption draft");
+        let charter_version = created["charter_version"]
+            .as_i64()
+            .expect("charter version");
+
+        // A model that repeats `0` must be told the version to send, not just
+        // that the one it sent is wrong: nothing on the Project surface reads a
+        // Charter, so an unnamed version is a dead end.
+        let repeat_zero = service
+            .materialize_charter_adoption(
+                &adoption_action(&project_id, &first, "adoption-2"),
+                &project_id,
+                &first,
+            )
+            .await
+            .expect_err("a second draft at version 0 conflicts");
+        let message = repeat_zero.to_string();
+        assert!(
+            message.contains(&format!("expected_charter_version = {charter_version}")),
+            "{message}"
+        );
+        assert!(
+            message.contains(created["revision_id"].as_str().expect("revision id")),
+            "{message}"
+        );
+
+        let stale = json!({
+            "action": "draft_revision",
+            "expected_charter_version": charter_version + 7,
+            "project_mode": "compact",
+            "maturity": "mvp",
+            "content": content,
+            "provenance": {
+                "author": { "kind": "agent", "id": "project-agent" },
+                "change_summary": "Revise",
+                "source_refs": []
+            }
+        });
+        let stale_error = service
+            .materialize_charter_adoption(
+                &adoption_action(&project_id, &stale, "adoption-3"),
+                &project_id,
+                &stale,
+            )
+            .await
+            .expect_err("a stale version conflicts");
+        assert!(
+            stale_error
+                .to_string()
+                .contains(&format!("version {charter_version}")),
+            "{stale_error}"
         );
     }
 

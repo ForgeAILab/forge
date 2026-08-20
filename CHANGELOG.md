@@ -8,6 +8,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- `project.charter.adoption` version conflicts name the value that would
+  satisfy them. Nothing on the Project surface reads a Charter, so a model
+  told only that its `expected_charter_version` is wrong has nowhere to look
+  the right one up: a live run alternated between "a Project Charter adoption
+  draft already exists" and "the Project Charter changed before adoption was
+  materialized" eight times and gave up without writing a revision. Both
+  conflicts now carry the current Charter version (and the draft revision id
+  to base on), the immutability conflict names the Charter's actual mode and
+  maturity, and the tool schema documents where `expected_charter_version`
+  comes from.
+
+### Fixed
+
 - A Project Agent no longer reports an unapprovable adoption Charter as done.
   `project.charter.adoption` committed the revision and returned success
   without the readiness verdict the user's approval is judged against, so a

@@ -1106,7 +1106,7 @@ fn orchestration_payload_schema(operation: &str) -> Value {
                 "action":{"const":"draft_revision"},
                 "charter_id":{"type":"string","minLength":1,"description":"Omit to start the Project's adoption Charter. The server mints the id and returns it; supply it only to revise the Charter it already returned."},
                 "base_revision_id":string_or_null_schema(),
-                "expected_charter_version":{"type":"integer","minimum":0},
+                "expected_charter_version":{"type":"integer","minimum":0,"description":"0 to start the Project's adoption Charter. To revise an existing draft, send the charter_version returned by your previous action result; a conflict names the value to send."},
                 "project_mode":{"type":"string","enum":["compact","standard"]},
                 "maturity":{"type":"string","enum":["prototype","mvp","production","critical"]},
                 "content":charter_content_schema(),
