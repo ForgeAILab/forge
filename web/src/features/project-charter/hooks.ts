@@ -1,8 +1,8 @@
 import { useCallback, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import { ApiError } from '@/api/client'
 import { useProjectQuery } from '@/api/hooks'
+import { getApiErrorCode, getApiErrorMessage, isApiStatus } from '@/lib/api-error'
 import { useAuthStore } from '@/stores/auth'
 import type { ProductAgentSelection } from '@/types/generated/bindings/ProductAgentSelection'
 import type { ProjectCharter } from '@/types/generated/bindings/ProjectCharter'
@@ -12,7 +12,9 @@ import type { ProjectCharterRevision } from '@/types/generated/bindings/ProjectC
 import { approveProjectCharterRevision, getProjectCharter } from './api'
 import type { AuthorizationProvenance } from './types'
 
-const APPROVAL_ACTION = 'project.charter.approval'
+// Must match `APPROVAL_ACTION` in crates/api/src/routes/project_charters.rs;
+// the server rejects a mismatch as an invalid authorization event (403).
+const APPROVAL_ACTION = 'project_charter.approval'
 
 export const projectCharterQueryKey = (projectId: string) =>
   ['projects', projectId, 'charter'] as const
@@ -40,16 +42,21 @@ function createAuthorization(): AuthorizationProvenance {
   } as AuthorizationProvenance
 }
 
+/**
+ * A rejected approval always has a specific server-side reason — which
+ * readiness gap, which stale version — and hiding it behind a generic
+ * "something changed" line sends the reader looking in the wrong place. Only
+ * the genuine optimistic-concurrency conflict gets prose of its own, because
+ * there the useful instruction (re-review the refreshed revision) is not in
+ * the server's message.
+ */
 export function projectCharterApprovalError(cause: unknown): string {
-  if (cause instanceof ApiError) {
-    if (cause.status === 409 || cause.status === 412) {
-      return 'The Charter or Project changed while this approval was open. Review the refreshed revision and approve again.'
-    }
-    if (cause.status === 403) return 'This action is not authorized for the current account.'
-    if (cause.status === 503) return 'Forge is not reachable right now. Try again in a moment.'
-    return cause.message
+  if (isApiStatus(cause, 503)) return 'Forge is not reachable right now. Try again in a moment.'
+  const code = getApiErrorCode(cause)
+  if ((isApiStatus(cause, 409) || isApiStatus(cause, 412)) && code === 'version_conflict') {
+    return 'The Charter or Project changed while this approval was open. Review the refreshed revision and approve again.'
   }
-  return cause instanceof Error ? cause.message : 'The Charter revision could not be approved.'
+  return getApiErrorMessage(cause, 'The Charter revision could not be approved.')
 }
 
 export type ProjectCharterApprovalState = {
@@ -100,12 +107,20 @@ export function useProjectCharterApproval(projectId: string): ProjectCharterAppr
     return draft.lifecycle === 'draft' || draft.lifecycle === 'proposed' ? draft : null
   }, [charterData])
 
+  // The server refuses to approve a revision whose readiness is blocked, and
+  // it already computed exactly which sections are missing. Show that before
+  // the click instead of letting the user discover it as a rejection.
   const blockedReason = useMemo(() => {
     if (!revision || !charter) return null
     if (!agent) return 'No eligible Project Agent is bound — pick one in Agent Settings first.'
-    if (!projectQuery.data) return null
+    const gaps = (revision.readiness?.gaps ?? []).filter((gap) => gap.blocking)
+    if (revision.readiness?.status === 'blocked' && gaps.length > 0) {
+      return `This revision is not ready to approve. Ask the Project Agent to fill in: ${gaps
+        .map((gap) => gap.message)
+        .join(' ')}`
+    }
     return null
-  }, [revision, charter, agent, projectQuery.data])
+  }, [revision, charter, agent])
 
   const mutation = useMutation({
     mutationFn: async () => {

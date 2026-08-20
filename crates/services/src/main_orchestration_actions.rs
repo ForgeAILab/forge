@@ -921,7 +921,7 @@ fn source_refs_with_action(source_refs: &[ProvenanceRef], action_id: &str) -> Re
     })
 }
 
-fn parse_project_mode(value: &str) -> Result<ProjectMode> {
+pub(crate) fn parse_project_mode(value: &str) -> Result<ProjectMode> {
     match value {
         "compact" => Ok(ProjectMode::Compact),
         "standard" => Ok(ProjectMode::Standard),
@@ -931,7 +931,7 @@ fn parse_project_mode(value: &str) -> Result<ProjectMode> {
     }
 }
 
-fn parse_maturity(value: &str) -> Result<ProductMaturity> {
+pub(crate) fn parse_maturity(value: &str) -> Result<ProductMaturity> {
     match value {
         "prototype" => Ok(ProductMaturity::Prototype),
         "mvp" => Ok(ProductMaturity::Mvp),

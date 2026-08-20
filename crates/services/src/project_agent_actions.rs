@@ -472,6 +472,18 @@ impl ProjectOrchestrationActionService {
                 .bind(&charter_id)
                 .fetch_one(self.db.pool())
                 .await?;
+        // A committed revision is not necessarily an approvable one: the user
+        // cannot approve a revision whose readiness is blocked. Returning the
+        // verdict here — as the Main Charter draft already does — is what lets
+        // the model fill the gaps instead of reporting the Charter as done and
+        // leaving the user with a draft nothing will accept.
+        let readiness = crate::evaluate_project_charter_readiness(
+            &content,
+            crate::main_orchestration_actions::parse_project_mode(&charter_mode)?,
+            crate::main_orchestration_actions::parse_maturity(&charter_maturity)?,
+            crate::CHARTER_READINESS_POLICY_VERSION,
+            &revision.created_at,
+        );
         Ok(json!({
             "operation": PROJECT_CHARTER_ADOPTION_OPERATION,
             "project_id": project_id,
@@ -480,6 +492,7 @@ impl ProjectOrchestrationActionService {
             "revision_id": revision.id,
             "revision": revision.revision,
             "lifecycle": revision.lifecycle,
+            "readiness": readiness,
             "domain_committed": true,
             "requires_user_authorization": true,
         }))
@@ -2729,6 +2742,9 @@ mod tests {
 
         let charter_id = result["charter_id"].as_str().expect("charter id");
         assert_ne!(charter_id, "charter-notejot-001");
+        // The verdict the user's approval will be judged against travels back
+        // with the result, so the model can close the gaps in the same turn.
+        assert!(result["readiness"]["status"].is_string());
         let stored: String =
             sqlx::query_scalar("SELECT id FROM project_charter WHERE project_id = ?")
                 .bind(&project_id)

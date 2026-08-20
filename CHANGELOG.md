@@ -6,6 +6,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Fixed
+
+- A Project Agent no longer reports an unapprovable adoption Charter as done.
+  `project.charter.adoption` committed the revision and returned success
+  without the readiness verdict the user's approval is judged against, so a
+  Charter with unfilled required sections looked finished to the model and
+  was rejected only when the user tried to approve it. The action result now
+  carries `readiness` (status plus blocking gaps), matching what the Main
+  Charter draft already returned.
+- The Charter approval surfaces say why an approval cannot proceed. Blocking
+  readiness gaps are shown — and the button disabled — before the click, and
+  a rejection reports the server's own reason instead of a blanket "the
+  Charter or Project changed", which was wrong for every rejection that was
+  not an optimistic-concurrency conflict.
+
 ### Added
 
 - A Project Agent's adoption Charter can be approved from the UI. The agent

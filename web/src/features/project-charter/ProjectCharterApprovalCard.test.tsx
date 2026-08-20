@@ -131,10 +131,35 @@ describe('ProjectCharterApprovalCard', () => {
     expect(body.selected_project_agent_identity_id).toBe('identity-1')
   })
 
-  it('surfaces a conflict as a retryable message instead of failing silently', async () => {
+  it('signs the approval with the action string the server expects', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path.endsWith('/approve')) return { id: 'approval-1', state: 'active' }
+      return charterResponse
+    })
+
+    renderCard(<ProjectCharterApprovalCard projectId="project-1" />)
+    const button = await screen.findByRole('button', { name: 'Approve Charter' })
+    button.click()
+
+    await waitFor(() => {
+      const call = vi
+        .mocked(apiFetch)
+        .mock.calls.find(([path]) => String(path).endsWith('/approve'))
+      expect(call).toBeTruthy()
+      const body = JSON.parse(String((call?.[1] as { body: string }).body))
+      // Mirrors APPROVAL_ACTION in crates/api/src/routes/project_charters.rs;
+      // a mismatch is rejected as an invalid authorization event (403).
+      expect(body.mutation.authorization.action).toBe('project_charter.approval')
+      expect(body.mutation.authorization.principal).toMatchObject({ kind: 'user', id: 'user-1' })
+    })
+  })
+
+  it('surfaces a version conflict as a retryable message', async () => {
     const { ApiError } = await import('@/api/client')
     vi.mocked(apiFetch).mockImplementation(async (path: string) => {
-      if (path.endsWith('/approve')) throw new ApiError('stale', 409)
+      if (path.endsWith('/approve')) {
+        throw new ApiError(JSON.stringify({ code: 'version_conflict', message: 'stale' }), 409)
+      }
       return charterResponse
     })
 
@@ -146,5 +171,63 @@ describe('ProjectCharterApprovalCard', () => {
       'textContent',
       expect.stringContaining('changed while this approval was open'),
     )
+  })
+
+  it('reports the server reason for a rejection instead of a generic conflict', async () => {
+    const { ApiError } = await import('@/api/client')
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path.endsWith('/approve')) {
+        throw new ApiError(
+          JSON.stringify({
+            code: 'charter_approval_conflict',
+            message: 'Charter revision is not ready: people_missing',
+          }),
+          409,
+        )
+      }
+      return charterResponse
+    })
+
+    renderCard(<ProjectCharterApprovalCard projectId="project-1" />)
+    const button = await screen.findByRole('button', { name: 'Approve Charter' })
+    button.click()
+
+    expect(await screen.findByRole('alert')).toHaveProperty(
+      'textContent',
+      expect.stringContaining('people_missing'),
+    )
+  })
+
+  it('blocks approval up front when the revision readiness is blocked', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({
+      ...charterResponse,
+      current_draft_revision: {
+        ...draftRevision,
+        readiness: {
+          status: 'blocked',
+          project_mode: 'compact',
+          maturity: 'mvp',
+          gaps: [
+            {
+              kind: 'missing_content',
+              code: 'people_missing',
+              message: 'At least one target user or beneficiary is required.',
+              blocking: true,
+              section: 'problem_and_people',
+              knowledge_item_id: null,
+            },
+          ],
+        },
+      },
+    })
+
+    renderCard(<ProjectCharterApprovalCard projectId="project-1" />)
+
+    const button = await screen.findByRole('button', { name: 'Approve Charter' })
+    expect(button.hasAttribute('disabled')).toBe(true)
+    expect(screen.getByRole('status').textContent).toContain(
+      'At least one target user or beneficiary is required.',
+    )
+    expect(vi.mocked(apiFetch).mock.calls.some(([p]) => String(p).endsWith('/approve'))).toBe(false)
   })
 })
