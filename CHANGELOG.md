@@ -63,8 +63,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   rides in the query string and is fixed for the life of a connection — past
   its expiry every reconnect re-sent the same dead token and the stream stayed
   down, which is what left "Thinking…" spinners pinned after a turn had
-  already finished. Reconnects now re-read the store and refresh a stale token
-  before dialing back in.
+  already finished. Reconnects now re-read the auth store, so a token
+  refreshed by REST traffic is picked up. The stream deliberately does not
+  refresh tokens itself: refresh tokens are single-use and deleted on
+  redemption, so a second caller is another chance to burn one and end the
+  session.
 
 ### Fixed
 
