@@ -3013,7 +3013,9 @@ fn validate_orchestration_payload(operation: &str, payload: &Value) -> Result<()
                     "project.charter.adoption action must be draft_revision".to_owned(),
                 ));
             }
-            required_payload_string(object, "charter_id")?;
+            // A reference to the Project's existing adoption Charter, not the
+            // id it will be stored under: omit it to start one.
+            optional_payload_string(object, "charter_id")?;
             optional_payload_string(object, "base_revision_id")?;
             required_payload_nonnegative_integer(object, "expected_charter_version")?;
             validate_enum_payload(object, "project_mode", &["compact", "standard"])?;

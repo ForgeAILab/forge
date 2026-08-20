@@ -1104,7 +1104,7 @@ fn orchestration_payload_schema(operation: &str) -> Value {
         PROJECT_CHARTER_ADOPTION_OPERATION => described_object_schema(
             json!({
                 "action":{"const":"draft_revision"},
-                "charter_id":{"type":"string","minLength":1},
+                "charter_id":{"type":"string","minLength":1,"description":"Omit to start the Project's adoption Charter. The server mints the id and returns it; supply it only to revise the Charter it already returned."},
                 "base_revision_id":string_or_null_schema(),
                 "expected_charter_version":{"type":"integer","minimum":0},
                 "project_mode":{"type":"string","enum":["compact","standard"]},
@@ -1120,7 +1120,6 @@ fn orchestration_payload_schema(operation: &str) -> Value {
             // byte-for-byte.
             &[
                 "action",
-                "charter_id",
                 "expected_charter_version",
                 "project_mode",
                 "maturity",

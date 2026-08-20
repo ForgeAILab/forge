@@ -6,6 +6,25 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Breaking
+
+- `project.charter.adoption` treats `charter_id` as a reference, not as the id
+  to store under. The field is now optional: omit it to start the Project's
+  adoption Charter and read the server-minted id back from the action result
+  (which also gained `charter_version` for the follow-up `expected_charter_version`),
+  or pass the id the server already returned to revise it. Naming another
+  Project's Charter is still a scope error. A live run had the model coining
+  `charter-notejot-001` and that slug became the row's primary key.
+
+### Fixed
+
+- A Project Agent can revise its adoption Charter draft. Every revision after
+  the first failed with a bare `VersionConflict`: the handler routed all
+  drafts on a setup Project through the shell-plus-first-revision atomic
+  path, which rejects any `expected_charter_version` but 1. Whether the
+  Charter shell exists now decides the path, so review feedback can be
+  applied before approval instead of only after it.
+
 ### Fixed
 
 - A Project Agent created through the UI can actually orchestrate a Project.

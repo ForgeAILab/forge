@@ -256,7 +256,11 @@ impl ProjectOrchestrationActionService {
         project_id: &str,
         payload: &Value,
     ) -> Result<Value> {
-        let charter_id = string(payload, "charter_id")?;
+        // `charter_id` is a reference, never a primary key: a live run had the
+        // model coining `charter-<project>-001` and that slug became the row's
+        // id. The Project owns at most one adoption Charter, so resolve it by
+        // Project scope and mint the id when there is none yet -- matching the
+        // Genesis Charter precedent. The real id comes back in the result JSON.
         let project = sqlx::query(
             "SELECT owner_id, charter_status, charter_setup_required,
                     current_charter_id, current_charter_revision_id
@@ -282,16 +286,26 @@ impl ProjectOrchestrationActionService {
                 )
             })?
         };
-        let charter = ProjectOrchestrationRepo::get_project_charter(&*self.db, &charter_id).await?;
-        if let Some(charter) = &charter {
-            if charter.project_id.as_deref() != Some(project_id)
-                || charter.genesis_session_id.is_some()
+        let charter =
+            ProjectOrchestrationRepo::get_project_adoption_charter(&*self.db, project_id).await?;
+        if let Some(referenced_id) = payload.get("charter_id").and_then(Value::as_str) {
+            // A reference to some other Project's Charter is a scope error, not
+            // a placeholder: reject it rather than silently retargeting.
+            if charter
+                .as_ref()
+                .is_none_or(|charter| charter.id != referenced_id)
+                && ProjectOrchestrationRepo::get_project_charter(&*self.db, referenced_id)
+                    .await?
+                    .is_some()
             {
                 return Err(ServiceError::invalid_operation(
                     "Charter adoption crosses Project scope",
                 ));
             }
         }
+        let charter_id = charter
+            .as_ref()
+            .map_or_else(new_uuid_v4, |charter| charter.id.clone());
         let current_charter_id: Option<String> = project.try_get("current_charter_id")?;
         let current_charter_revision_id: Option<String> =
             project.try_get("current_charter_revision_id")?;
@@ -411,7 +425,12 @@ impl ProjectOrchestrationActionService {
             rendered_digest: render.render_digest,
             created_at: now_rfc3339(),
         };
-        let revision = if !is_setup_project {
+        // The atomic path exists to write a Charter shell and its first revision
+        // together, and it only accepts a first revision. Choosing it whenever
+        // the Project is still in setup made every *revision* of an adoption
+        // draft fail with a bare version conflict, so the agent could never act
+        // on review feedback before approval. The shell is what decides.
+        let revision = if charter.is_some() {
             ProjectOrchestrationRepo::create_project_charter_revision(&*self.db, revision_input)
                 .await?
         } else {
@@ -445,10 +464,19 @@ impl ProjectOrchestrationActionService {
             )
             .await?
         };
+        // Revising the draft needs the Charter's post-write version. Without it
+        // the model can only guess, and a wrong guess is a bare optimistic-
+        // concurrency conflict it cannot recover from.
+        let charter_version: i64 =
+            sqlx::query_scalar("SELECT version FROM project_charter WHERE id = ?")
+                .bind(&charter_id)
+                .fetch_one(self.db.pool())
+                .await?;
         Ok(json!({
             "operation": PROJECT_CHARTER_ADOPTION_OPERATION,
             "project_id": project_id,
             "charter_id": charter_id,
+            "charter_version": charter_version,
             "revision_id": revision.id,
             "revision": revision.revision,
             "lifecycle": revision.lifecycle,
@@ -2546,6 +2574,253 @@ mod tests {
             rollback_and_recovery: Vec::new(),
             exclusions: Vec::new(),
         }
+    }
+
+    fn adoption_charter_content_fixture() -> Value {
+        json!({
+            "identity": {
+                "working_name": "NoteJot",
+                "slug_proposal": "notejot",
+                "one_line_vision": "Keep an existing Project intent durable and auditable.",
+                "maturity": "mvp",
+                "lifecycle_intent": "validate the smallest useful workflow",
+                "project_type": "product",
+                "value_proposition": "Preserve exact approved project intent."
+            },
+            "problem_and_people": {
+                "problem_or_opportunity": "Existing Project intent is scattered across mutable history.",
+                "target_users": ["Forge builders"],
+                "beneficiaries": ["Project collaborators"],
+                "jobs_pains_opportunity": ["Keep one bounded source of truth."],
+                "current_alternatives": ["Unversioned chat notes"],
+                "stakeholders": ["Project owner"],
+                "excluded_audiences": ["Unrelated projects"]
+            },
+            "core_experience": {
+                "primary_outcome": "A Project Agent can continue from the approved Charter.",
+                "core_loop": "discover, approve, hand off, validate",
+                "principal_journeys": ["Owner approves then Project Agent executes."]
+            },
+            "scope": {
+                "must_have_outcomes": ["Persist the approved Project outcome."],
+                "required_deliverables": ["One durable Project Chat."],
+                "later_possibilities": ["Expand Project-local execution."],
+                "explicit_non_goals": ["Managing unrelated Projects"]
+            },
+            "success": {
+                "qualitative_outcome": "Project intent remains verifiable.",
+                "success_signals": ["Agent starts without restating intent."],
+                "acceptance_statements": ["A replay does not create a second Project."],
+                "required_evidence": ["Database assertions."],
+                "non_claims": ["This does not prove implementation quality."]
+            },
+            "constraints_and_risks": {
+                "product": ["Single Project local-first operation."],
+                "time_and_budget": ["One bounded iteration."],
+                "technology": ["SQLite and the existing Forge API."],
+                "data": ["Do not copy hidden chat history."],
+                "integrations": [],
+                "security_privacy_compliance": ["Require explicit user approval."],
+                "accessibility": [],
+                "operations": [],
+                "migration": [],
+                "launch": [],
+                "agent_authority": ["Project Agent remains Project-scoped."],
+                "risks": []
+            },
+            "knowledge_ledger": { "items": [] },
+            "handoff_note": {
+                "recommended_first_action": "Create the first Project-local execution plan.",
+                "bounded_summary": "Start from the approved Project outcome.",
+                "unresolved_item_ids": []
+            }
+        })
+    }
+
+    fn adoption_action(project_id: &str, payload: &Value, dedupe_key: &str) -> AgentAction {
+        let now = now_rfc3339();
+        AgentAction {
+            id: new_uuid_v4(),
+            actor_identity_id: new_uuid_v4(),
+            scope_type: "project".to_owned(),
+            scope_id: project_id.to_owned(),
+            operation: PROJECT_CHARTER_ADOPTION_OPERATION.to_owned(),
+            payload_json: payload.to_string(),
+            payload_hash: "payload-hash".to_owned(),
+            dedupe_key: dedupe_key.to_owned(),
+            correlation_id: new_uuid_v4(),
+            causation_id: None,
+            causation_depth: 0,
+            requested_permission: "propose_project".to_owned(),
+            policy_result: AgentActionPolicyResult::Allowed,
+            policy_reason: None,
+            status: AgentActionStatus::Proposed,
+            target_type: Some("project".to_owned()),
+            target_id: Some(project_id.to_owned()),
+            outcome_json: None,
+            version: 1,
+            created_at: now.clone(),
+            updated_at: now,
+        }
+    }
+
+    async fn setup_adoption_project(db: &SqliteDb) -> String {
+        let now = now_rfc3339();
+        let user_id = new_uuid_v4();
+        let project_id = new_uuid_v4();
+        sqlx::query(
+            "INSERT INTO user (id, email, password_hash, display_name, created_at, updated_at)
+             VALUES (?, ?, 'test', 'Adoption User', ?, ?)",
+        )
+        .bind(&user_id)
+        .bind(format!("{user_id}@example.test"))
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("user");
+        ProjectRepo::create(
+            db,
+            CreateProject {
+                id: project_id.clone(),
+                name: "Adoption project".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: Some(user_id),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("project");
+        project_id
+    }
+
+    #[tokio::test]
+    async fn adoption_charter_id_is_server_minted_not_the_agent_placeholder() {
+        let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
+        run_migrations(&pool).await.expect("schema");
+        let db = SqliteDb::new(pool);
+        let project_id = setup_adoption_project(&db).await;
+        let service = ProjectOrchestrationActionService::new(Arc::new(db.clone()));
+
+        let payload = json!({
+            "action": "draft_revision",
+            "charter_id": "charter-notejot-001",
+            "expected_charter_version": 0,
+            "project_mode": "compact",
+            "maturity": "mvp",
+            "content": adoption_charter_content_fixture(),
+            "provenance": {
+                "author": { "kind": "agent", "id": "project-agent" },
+                "change_summary": "Adopt the existing Project",
+                "source_refs": []
+            }
+        });
+        let result = service
+            .materialize_charter_adoption(
+                &adoption_action(&project_id, &payload, "adoption-1"),
+                &project_id,
+                &payload,
+            )
+            .await
+            .expect("adoption draft materializes");
+
+        let charter_id = result["charter_id"].as_str().expect("charter id");
+        assert_ne!(charter_id, "charter-notejot-001");
+        let stored: String =
+            sqlx::query_scalar("SELECT id FROM project_charter WHERE project_id = ?")
+                .bind(&project_id)
+                .fetch_one(db.pool())
+                .await
+                .expect("adoption charter row");
+        assert_eq!(stored, charter_id);
+        assert!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM project_charter WHERE id = 'charter-notejot-001'"
+            )
+            .fetch_one(db.pool())
+            .await
+            .expect("placeholder count")
+                == 0
+        );
+    }
+
+    #[tokio::test]
+    async fn adoption_draft_can_be_revised_before_approval() {
+        let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
+        run_migrations(&pool).await.expect("schema");
+        let db = SqliteDb::new(pool);
+        let project_id = setup_adoption_project(&db).await;
+        let service = ProjectOrchestrationActionService::new(Arc::new(db.clone()));
+        let content = adoption_charter_content_fixture();
+
+        let first = json!({
+            "action": "draft_revision",
+            "charter_id": "charter-notejot-001",
+            "expected_charter_version": 0,
+            "project_mode": "compact",
+            "maturity": "mvp",
+            "content": content,
+            "provenance": {
+                "author": { "kind": "agent", "id": "project-agent" },
+                "change_summary": "Adopt",
+                "source_refs": []
+            }
+        });
+        let created = service
+            .materialize_charter_adoption(
+                &adoption_action(&project_id, &first, "adoption-1"),
+                &project_id,
+                &first,
+            )
+            .await
+            .expect("first adoption draft");
+        let charter_id = created["charter_id"]
+            .as_str()
+            .expect("charter id")
+            .to_owned();
+        let charter_version = created["charter_version"]
+            .as_i64()
+            .expect("charter version");
+        let base_revision_id = created["revision_id"]
+            .as_str()
+            .expect("revision id")
+            .to_owned();
+
+        // The model repeats its own placeholder instead of the returned id.
+        let second = json!({
+            "action": "draft_revision",
+            "charter_id": "charter-notejot-001",
+            "base_revision_id": base_revision_id,
+            "expected_charter_version": charter_version,
+            "project_mode": "compact",
+            "maturity": "mvp",
+            "content": content,
+            "provenance": {
+                "author": { "kind": "agent", "id": "project-agent" },
+                "change_summary": "Revise",
+                "source_refs": []
+            }
+        });
+        let revised = service
+            .materialize_charter_adoption(
+                &adoption_action(&project_id, &second, "adoption-2"),
+                &project_id,
+                &second,
+            )
+            .await
+            .expect("second adoption draft targets the same Charter");
+        assert_eq!(revised["charter_id"].as_str(), Some(charter_id.as_str()));
+        assert_eq!(revised["revision"].as_i64(), Some(2));
+        let charters: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM project_charter WHERE project_id = ?")
+                .bind(&project_id)
+                .fetch_one(db.pool())
+                .await
+                .expect("charter count");
+        assert_eq!(charters, 1);
     }
 
     #[tokio::test]

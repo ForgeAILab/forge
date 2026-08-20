@@ -1036,6 +1036,13 @@ pub struct CreatedProjectFromCharterApproval {
 #[async_trait]
 pub trait ProjectOrchestrationRepo: Send + Sync {
     async fn get_project_charter(&self, id: &str) -> Result<Option<ProjectCharterRecord>>;
+    /// The adoption Charter a Project already owns, if any. A Project holds at
+    /// most one Charter (`idx_project_charter_project`), so this resolves the
+    /// real primary key without trusting an id an agent proposed.
+    async fn get_project_adoption_charter(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<ProjectCharterRecord>>;
     async fn get_project_charter_for_account(
         &self,
         id: &str,

@@ -692,6 +692,20 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .await
     }
 
+    async fn get_project_adoption_charter(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<ProjectCharterRecord>> {
+        select_one(
+            "SELECT * FROM project_charter
+             WHERE project_id = ? AND genesis_session_id IS NULL",
+            self.pool(),
+            project_id,
+            map_charter,
+        )
+        .await
+    }
+
     async fn get_project_charter_for_account(
         &self,
         id: &str,
