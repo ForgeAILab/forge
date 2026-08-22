@@ -28,8 +28,10 @@ vi.mock('@tanstack/react-router', () => ({
   },
 }))
 
+const releaseMutation = vi.hoisted(() => vi.fn())
 vi.mock('@/api/hooks', () => ({
   useProjectOverviewQuery: vi.fn(),
+  useReleaseProjectMilestone: releaseMutation,
   useProjectQuery: vi.fn(() => ({ data: undefined, isLoading: false })),
 }))
 
@@ -145,6 +147,7 @@ const activeMilestone = {
   task_counts: counts,
   check_summary: checkSummary,
   latest_readiness: null,
+  readiness_freshness: null,
   evidence: [],
 }
 
@@ -159,6 +162,7 @@ const overview: ProjectOverview = {
   task_counts: counts,
   check_summary: checkSummary,
   unresolved_decision_ids: ['decision-1'],
+  decisions: [],
   risks: [
     {
       id: 'risk-1',
@@ -173,15 +177,29 @@ const overview: ProjectOverview = {
     {
       document_id: 'document-1',
       kind: 'delivery_brief',
-      current_revision_id: 'document-revision-1',
-      current_digest: 'document-digest',
-      stale: false,
+      approved_revision_id: 'document-revision-1',
+      approved_digest: 'document-digest',
+      working_revision_id: null,
+      working_digest: null,
+      working_lifecycle: null,
+      status: 'current',
       reason: null,
     },
   ],
   evidence: [],
   releases: [],
-  next_action: 'Resolve the failed acceptance check.',
+  next_action: {
+    code: 'validation_failure_remediation',
+    required_principal: 'worker',
+    target_type: 'project',
+    target_id: 'project-1',
+    title: 'Resolve the failed acceptance check.',
+    explanation: 'A required acceptance check failed and needs a new authoritative result.',
+    action_kind: 'validation',
+    route_or_operation: 'project.milestone.check.evaluate',
+    blocking: true,
+    expected_version: null,
+  },
   projection_state: 'current',
   source_event_watermark: 'event-123',
   generated_at: '2026-08-13T10:00:00Z',
@@ -195,6 +213,9 @@ const videoEvidence = {
   source_task_id: 'task-1',
   source_run_id: 'run-1',
   source_validation_id: null,
+  source_task_version: null,
+  source_context_digest: null,
+  source_definition_revision_id: null,
   milestone_id: 'milestone-1',
   acceptance_check_ids: ['check-1'],
   caption: 'Project walkthrough',
@@ -266,6 +287,11 @@ function mockQuery(value: Partial<ReturnType<typeof useProjectOverviewQuery>>) {
 describe('ProjectOverviewPage', () => {
   beforeEach(() => {
     mockQuery({})
+    releaseMutation.mockReturnValue({
+      isPending: false,
+      mutateAsync: vi.fn(),
+      reset: vi.fn(),
+    })
     mediaFetch.mockReset()
     mediaFetch.mockResolvedValue(new Blob(['evidence'], { type: 'video/mp4' }))
     Object.defineProperty(URL, 'createObjectURL', {
@@ -307,7 +333,18 @@ describe('ProjectOverviewPage', () => {
         ...overview,
         charter_state: 'charter_setup_required',
         active_milestones: [],
-        next_action: 'Ask the Project Agent to prepare an adoption Charter.',
+        next_action: {
+          code: 'charter_adoption',
+          required_principal: 'user',
+          target_type: 'project',
+          target_id: 'project-1',
+          title: 'Ask the Project Agent to prepare an adoption Charter.',
+          explanation: 'An approved Charter is required before Project work can be governed.',
+          action_kind: 'approval',
+          route_or_operation: 'project.charter.adoption',
+          blocking: true,
+          expected_version: 1n,
+        },
       },
     })
 

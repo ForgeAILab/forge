@@ -7,16 +7,18 @@
 
 use api_types::{
     ApplyProductGenesisGuidedSetupRequest, CancelProductGenesisRequest,
-    ProductGenesisActiveResponse, ProductGenesisStartResponse, ProductMaturity,
-    StartProductGenesisRequest,
+    ProductGenesisActiveResponse, ProductGenesisStartResponse, StartProductGenesisRequest,
 };
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     Json,
 };
-use db::AccountMainAgentBindingRepo;
-use services::{GenesisPromptContext, ProductGenesisService, SendAgentChatMessageInput};
+use db::new_uuid_v4;
+use services::{
+    MainGenesisCommandService, MainGenesisStartCommandInput, MainGenesisStartPrincipal,
+    MainGenesisStartRequest, ProductGenesisService,
+};
 
 use crate::{
     errors::{ApiError, ApiResult},
@@ -30,80 +32,30 @@ pub async fn start_product_genesis(
     user: AuthenticatedUser,
     Json(request): Json<StartProductGenesisRequest>,
 ) -> ApiResult<(StatusCode, Json<ProductGenesisStartResponse>)> {
-    let genesis = ProductGenesisService::for_sqlite(state.db.clone());
-    let main_chat_id =
-        if AccountMainAgentBindingRepo::get_active_main_binding(&*state.db, &user.user_id)
-            .await?
-            .is_some()
-        {
-            Some(
-                state
-                    .agent_chat_service
-                    .ensure_main_chat(&user.user_id)
-                    .await?
-                    .id,
-            )
-        } else {
-            // Passing None intentionally produces the explicit setup-required
-            // result without creating a Genesis row or admitting a turn.
-            None
-        };
-    let maturity = request.maturity.unwrap_or(ProductMaturity::Mvp);
-    let initial_idea = request.initial_idea.clone();
-    let start = genesis
-        .start(
-            &user.user_id,
-            main_chat_id.as_deref(),
-            maturity,
-            initial_idea.clone(),
-            request.preferred_project_agent_identity_id,
-            GenesisPromptContext {
-                initial_idea,
-                ..GenesisPromptContext::default()
+    let start = MainGenesisCommandService::new(state.db.clone())
+        .start(MainGenesisStartCommandInput {
+            principal: MainGenesisStartPrincipal::User {
+                user_id: user.user_id,
             },
-        )
-        .await?;
-
-    // The visible typed turn is admitted through the same Main Chat service
-    // as every other user message.  The protocol text is bounded and already
-    // guarded by the regular message admission path; no second chat/thread is
-    // created.  If admission fails, cancel the just-created lifecycle so a
-    // durable session cannot claim that a turn was admitted.
-    let admitted = match state
-        .agent_chat_service
-        .send_message(SendAgentChatMessageInput {
-            actor_user_id: user.user_id.clone(),
-            chat_id: start.session.main_chat_id.clone(),
-            content: start.prompt,
-            dedupe_key: Some(format!("product-genesis:{}", start.session.id)),
+            request: MainGenesisStartRequest {
+                maturity: request.maturity,
+                initial_idea: request.initial_idea,
+                preferred_project_agent_identity_id: request.preferred_project_agent_identity_id,
+            },
+            idempotency_key: request.idempotency_key,
+            correlation_id: new_uuid_v4(),
+            causation_id: None,
+            causation_depth: 0,
+            policy_result: "allowed".to_owned(),
+            requested_permission: "propose_discovery".to_owned(),
         })
-        .await
-    {
-        Ok(admitted) => admitted,
-        Err(error) => {
-            let _ = genesis
-                .cancel(
-                    &start.session.id,
-                    start.session.version,
-                    Some("Main Chat turn admission failed".to_owned()),
-                )
-                .await;
-            return Err(error.into());
-        }
-    };
-    let session = genesis
-        .record_source_message(
-            &start.session.id,
-            start.session.version,
-            &admitted.message.id,
-        )
         .await?;
     Ok((
         StatusCode::CREATED,
         Json(ProductGenesisStartResponse {
-            main_chat_id: session.main_chat_id.clone(),
-            session,
-            admitted_turn_id: Some(admitted.turn_job.id),
+            main_chat_id: start.main_chat_id,
+            session: start.session,
+            admitted_turn_id: Some(start.admitted_turn_id),
         }),
     ))
 }

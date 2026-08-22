@@ -181,7 +181,7 @@ fn authorization(operation: &str, key: &str) -> ProjectCommandAuthorization {
         authorization_event_id: format!("authorization-{key}"),
         authorization_basis: "explicit user authorization".to_owned(),
         authorization_action: operation.to_owned(),
-        authorization_occurred_at: NOW.to_owned(),
+        authorization_occurred_at: db::now_rfc3339(),
         authorization_json: serde_json::json!({"operation": operation, "key": key}).to_string(),
     }
 }

@@ -15,9 +15,9 @@ use api_types::{
     ExecutionBaselineReleasePolicy, MilestoneAcceptanceCheck, MilestoneDefinitionContent,
     MilestoneDefinitionLifecycle, MilestoneDefinitionRevision, MilestoneLifecycle,
     MilestoneProjectionReason, MilestoneProjectionReasonKind, PrincipalKind, PrincipalRef,
-    ProjectMilestone, ProjectRelease, ReadinessInput, ReadinessReason, ReadinessResult,
-    ReadinessSnapshot, ReleaseDecisionReference, ReleaseSnapshot, ReleaseTaskReference,
-    ReleaseValidationReference, RevisionProvenance, ValidationResult,
+    ProjectMilestone, ProjectRelease, ReadinessFreshness, ReadinessFreshnessStatus, ReadinessInput,
+    ReadinessReason, ReadinessResult, ReadinessSnapshot, ReleaseDecisionReference, ReleaseSnapshot,
+    ReleaseTaskReference, ReleaseValidationReference, RevisionProvenance, ValidationResult,
 };
 use chrono::{DateTime, Utc};
 use db::{
@@ -43,6 +43,19 @@ const MAX_AUTHORIZATION_CLOCK_SKEW_SECONDS: i64 = 48 * 60 * 60;
 const MAX_AUTHORIZATION_TIMESTAMP_LEN: usize = 64;
 const EVIDENCE_ATTACH_AUTHORIZATION_ACTION: &str = "project.evidence.attach";
 const CHECK_RESULT_AUTHORIZATION_ACTION: &str = "project.milestone.check.record";
+
+/// The exact read-side recomputation shared by release and the Overview
+/// freshness overlay.  The immutable readiness row is never rewritten; this
+/// value is only a transaction-local comparison against current governed
+/// inputs.
+struct ReadinessRecheck {
+    milestone: ProjectMilestoneRecord,
+    definition: MilestoneDefinitionRevision,
+    candidate_snapshot: ReadinessSnapshot,
+    recomputed: ReadinessEvaluation,
+    evidence: Vec<EvidenceAttachment>,
+    task_states: Vec<ReadinessTaskState>,
+}
 
 #[derive(Debug, Clone)]
 pub struct MilestoneRuntime {
@@ -725,10 +738,6 @@ impl MilestoneRuntime {
             return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
         }
 
-        let milestone = self
-            .get_record_in_tx(&mut tx, project_id, milestone_id)
-            .await?
-            .ok_or_else(|| crate::ServiceError::not_found("milestone", milestone_id))?;
         let candidate = self
             .readiness_by_id_in_tx(&mut tx, project_id, readiness_snapshot_id)
             .await?
@@ -738,73 +747,26 @@ impl MilestoneRuntime {
         if candidate.milestone_id != milestone_id || candidate.project_id != project_id {
             return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
         }
-        let expected_revision_id = milestone
-            .current_definition_revision_id
-            .clone()
-            .ok_or_else(|| crate::ServiceError::InvalidOperation {
-                message: "milestone has no current definition revision".to_owned(),
-            })?;
-        let definition_record = self
-            .definition_record_in_tx(&mut tx, project_id, milestone_id, &expected_revision_id)
-            .await?
-            .ok_or_else(|| {
-                crate::ServiceError::not_found(
-                    "milestone_definition_revision",
-                    expected_revision_id.clone(),
-                )
-            })?;
-        let mut definition = definition_from_record(definition_record, project_id)?;
-        self.hydrate_charter_in_tx(&mut tx, project_id, &mut definition)
+        let recheck = self
+            .recheck_readiness_in_tx(&mut tx, project_id, milestone_id, candidate)
             .await?;
-        if candidate.definition_revision_id != expected_revision_id {
+        let ReadinessRecheck {
+            milestone,
+            definition,
+            candidate_snapshot,
+            recomputed,
+            evidence,
+            task_states,
+        } = recheck;
+        if !readiness_inputs_match(&candidate_snapshot, &recomputed) {
             return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
         }
-        let baseline_id = candidate.baseline_id.clone();
-        let baseline_revision_id = candidate.baseline_revision_id.clone();
-        let release_policy_revision = candidate.release_policy_revision.clone();
-        let (baseline_digest, stored_policy_revision, release_policy_digest) = self
-            .baseline_inputs_in_tx(
-                &mut tx,
-                project_id,
-                &baseline_id,
-                &baseline_revision_id,
-                &release_policy_revision,
-            )
-            .await?;
-        if stored_policy_revision != release_policy_revision
-            || baseline_digest != candidate.baseline_digest
-            || release_policy_digest != candidate.release_policy_digest
-        {
-            return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
-        }
-        let check_results = self
-            .check_results_in_tx(
-                &mut tx,
-                project_id,
-                milestone_id,
-                &expected_revision_id,
-                definition
-                    .content
-                    .charter_revision
-                    .as_ref()
-                    .map(|charter| charter.revision_id.as_str()),
-                &baseline_revision_id,
-                &release_policy_revision,
-                &release_policy_digest,
-            )
-            .await?;
-        let evidence = self
-            .evidence_in_tx(&mut tx, project_id, milestone_id)
-            .await?;
-        let waiver_ids = self
-            .waiver_ids_in_tx(&mut tx, project_id, milestone_id)
-            .await?;
         let included_decisions = self
             .effective_decision_references_in_tx(
                 &mut tx,
                 project_id,
                 milestone_id,
-                &baseline_revision_id,
+                &candidate_snapshot.baseline_revision_id,
                 definition
                     .content
                     .charter_revision
@@ -812,104 +774,16 @@ impl MilestoneRuntime {
                     .map(|charter| charter.revision_id.as_str()),
             )
             .await?;
-        let (task_states, document_states) = self
-            .source_states_in_tx(&mut tx, project_id, milestone_id, &definition)
-            .await?;
-        let commit_build_check_context = self
-            .commit_build_check_context_in_tx(&mut tx, project_id, &task_states)
-            .await?;
         let pin_metadata = self
             .release_pin_metadata_in_tx(&mut tx, project_id, milestone_id, &evidence)
             .await?;
-        let mut input_manifest = self
-            .input_manifest_in_tx(
-                &mut tx,
-                project_id,
-                milestone_id,
-                &expected_revision_id,
-                definition.content.charter_revision.as_ref(),
-                &baseline_id,
-                &baseline_revision_id,
-                &baseline_digest,
-                &release_policy_revision,
-                &release_policy_digest,
-                &check_results,
-                &evidence,
-                &waiver_ids,
-                &task_states,
-                &document_states,
-                &commit_build_check_context,
-            )
-            .await?;
-        let candidate_snapshot = readiness_from_record(candidate.clone())?;
-        // Readiness itself advances the mutable milestone instance version
-        // when it records the candidate. The candidate digest certifies the
-        // pre-evaluation version; release accepts exactly that one expected
-        // transition and rejects any additional source mutation.
-        if let Some(milestone_input) = input_manifest
-            .iter_mut()
-            .find(|input| input.source_kind == "milestone")
-        {
-            let candidate_milestone_input = candidate_snapshot
-                .input_manifest
-                .iter()
-                .find(|input| input.source_kind == "milestone")
-                .ok_or_else(|| crate::ServiceError::InvalidOperation {
-                    message: "readiness snapshot is missing its milestone source manifest"
-                        .to_owned(),
-                })?;
-            // Readiness itself is the sole permitted mutation between the
-            // candidate and release: it advances the milestone one version
-            // and projects `ready_for_release`. The exact version step and
-            // current definition are checked below, so normalize only this
-            // self-authored manifest entry back to the candidate identity.
-            milestone_input.source_version = candidate.expected_milestone_version;
-            milestone_input.source_digest = candidate_milestone_input.source_digest.clone();
-            milestone_input.observed_at = candidate_milestone_input.observed_at.clone();
-        }
-        let recomputed = evaluate_readiness(ReadinessEvaluationInput {
-            milestone: ProjectMilestone {
-                version: candidate.expected_milestone_version,
-                ..project_milestone_from_record(milestone.clone())?
-            },
-            definition: definition.clone(),
-            baseline_id,
-            baseline_revision_id,
-            baseline_digest,
-            release_policy_revision,
-            release_policy_digest,
-            source_event_watermark: self.source_watermark_in_tx(&mut tx, project_id).await?,
-            computing_policy_revision: COMPUTING_POLICY_REVISION.to_owned(),
-            input_manifest,
-            check_results,
-            evidence: evidence.clone(),
-            waiver_ids,
-            task_states: task_states.clone(),
-            document_states: document_states.clone(),
-            commit_build_check_context,
-            authorization: authorization_from_readiness_record(&candidate)?,
-        })
-        .map_err(map_orchestration_error)?;
         let release_revision = self.release_revision_in_tx(&mut tx, milestone_id).await?;
         let project_agent = self
             .project_agent_principal_in_tx(&mut tx, project_id)
             .await?;
-        if candidate_snapshot.input_manifest != recomputed.ordered_input_manifest
-            || candidate_snapshot.source_event_watermark != recomputed.source_event_watermark
-            || candidate_snapshot.result != recomputed.result
-            || candidate_snapshot.reasons != recomputed.reasons
-            || candidate_snapshot.check_results != recomputed.ordered_check_results
-            || candidate_snapshot.waiver_ids != recomputed.waiver_ids
-            || candidate_snapshot.evidence_attachment_ids != recomputed.evidence_attachment_ids
-            || candidate_snapshot.commit_build_check_context
-                != recomputed.commit_build_check_context
-            || candidate_snapshot.computing_policy_revision != recomputed.computing_policy_revision
-        {
-            return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
-        }
         let verified = verify_release_candidate(
             &project_milestone_from_record(milestone.clone())?,
-            &readiness_from_record(candidate.clone())?,
+            &candidate_snapshot,
             &recomputed,
             readiness_snapshot_id,
             readiness_digest,
@@ -921,7 +795,7 @@ impl MilestoneRuntime {
         if milestone.version != expected_milestone_version {
             return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
         }
-        if milestone.version != candidate.expected_milestone_version + 1 {
+        if milestone.version != candidate_snapshot.expected_milestone_version + 1 {
             return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
         }
 
@@ -993,7 +867,8 @@ impl MilestoneRuntime {
         .ok_or(db::DbError::NotFound)?;
         if current_candidate.readiness_digest != readiness_digest
             || current_candidate.readiness_digest != verified.readiness_digest
-            || current_candidate.definition_revision_id != expected_revision_id
+            || current_candidate.definition_revision_id
+                != candidate_snapshot.milestone_definition_revision_id
             || current_candidate.baseline_id != candidate_snapshot.baseline_id
             || current_candidate.baseline_revision_id != candidate_snapshot.baseline_revision_id
             || current_candidate.baseline_digest != candidate_snapshot.baseline_digest
@@ -1433,6 +1308,122 @@ impl MilestoneRuntime {
         Ok(Some(readiness_from_record(readiness_record_from_row(
             row,
         )?)?))
+    }
+
+    /// Recompute the current governed inputs for one immutable readiness
+    /// snapshot without changing any persisted state.  This is deliberately
+    /// the same recheck used by release: a live Overview must not infer
+    /// freshness from the broad Project event stream, because attention
+    /// events and readiness audit events do not change release authority.
+    pub async fn readiness_freshness(
+        &self,
+        project_id: &str,
+        milestone_id: &str,
+        snapshot_id: &str,
+    ) -> crate::Result<ReadinessFreshness> {
+        let mut tx = self.db.pool().begin().await?;
+        let Some(record) = self
+            .readiness_by_id_in_tx(&mut tx, project_id, snapshot_id)
+            .await?
+        else {
+            tx.commit().await?;
+            return Ok(ReadinessFreshness {
+                status: ReadinessFreshnessStatus::Unavailable,
+                reason: Some("The immutable readiness snapshot is unavailable.".to_owned()),
+                snapshot_source_event_watermark: None,
+                current_source_event_watermark: None,
+            });
+        };
+        if record.milestone_id != milestone_id {
+            tx.commit().await?;
+            return Ok(ReadinessFreshness {
+                status: ReadinessFreshnessStatus::Unavailable,
+                reason: Some(
+                    "The readiness snapshot does not belong to this milestone.".to_owned(),
+                ),
+                snapshot_source_event_watermark: None,
+                current_source_event_watermark: None,
+            });
+        }
+
+        let candidate = readiness_from_record(record.clone())?;
+        let snapshot_watermark = Some(candidate.source_event_watermark.clone());
+        let current_watermark = Some(self.source_watermark_in_tx(&mut tx, project_id).await?);
+        let recheck = self
+            .recheck_readiness_in_tx(&mut tx, project_id, milestone_id, record)
+            .await;
+
+        let (status, reason) = match recheck {
+            Ok(recheck) => {
+                let expected_current_version = candidate.expected_milestone_version.checked_add(1);
+                // The direct runtime evaluator records a released correction
+                // with its normal one-step CAS, while the command composite
+                // intentionally leaves a terminal released milestone version
+                // unchanged for an observational correction. Accept exactly
+                // those two representations; active/ready candidates still
+                // require the one readiness transition.
+                let version_matches = if recheck.milestone.lifecycle == "released" {
+                    recheck.milestone.version == candidate.expected_milestone_version
+                        || expected_current_version
+                            .is_some_and(|version| recheck.milestone.version == version)
+                } else {
+                    expected_current_version
+                        .is_some_and(|version| recheck.milestone.version == version)
+                };
+                let inputs_match = readiness_inputs_match(
+                    &recheck.candidate_snapshot,
+                    &recheck.recomputed,
+                );
+                if version_matches && inputs_match {
+                    (ReadinessFreshnessStatus::Current, None)
+                } else if !version_matches {
+                    (
+                        ReadinessFreshnessStatus::Stale,
+                        Some(
+                            "The milestone changed beyond the one readiness transition represented by this snapshot."
+                                .to_owned(),
+                        ),
+                    )
+                } else {
+                    (
+                        ReadinessFreshnessStatus::Stale,
+                        Some(
+                            "One or more governed readiness inputs changed after this immutable snapshot was computed."
+                                .to_owned(),
+                        ),
+                    )
+                }
+            }
+            Err(crate::ServiceError::Db(db::DbError::VersionConflict)) => (
+                ReadinessFreshnessStatus::Stale,
+                Some(
+                    "One or more governed readiness inputs no longer match this immutable snapshot."
+                        .to_owned(),
+                ),
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    project_id,
+                    milestone_id,
+                    snapshot_id,
+                    error = %error,
+                    "readiness freshness recomputation unavailable"
+                );
+                (
+                    ReadinessFreshnessStatus::Unavailable,
+                    Some("The current readiness inputs could not be rechecked.".to_owned()),
+                )
+            }
+        };
+        tx.commit().await?;
+        Ok(ReadinessFreshness {
+            status,
+            reason,
+            // These values are diagnostic only.  Freshness is determined by
+            // the exact input comparison above, never by watermark equality.
+            snapshot_source_event_watermark: snapshot_watermark,
+            current_source_event_watermark: current_watermark,
+        })
     }
 
     pub async fn list_readiness(
@@ -2546,6 +2537,173 @@ impl MilestoneRuntime {
         Ok(context)
     }
 
+    /// Recompute the exact current readiness inputs for a persisted candidate.
+    /// The candidate's expected milestone version is retained for the pure
+    /// evaluator because recording readiness is the one permitted transition
+    /// between candidate creation and the live milestone row.  This mirrors
+    /// the release verification path; callers decide whether to persist or
+    /// merely compare the result.
+    async fn recheck_readiness_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        project_id: &str,
+        milestone_id: &str,
+        candidate: ProjectReadinessSnapshotRecord,
+    ) -> crate::Result<ReadinessRecheck> {
+        let milestone = self
+            .get_record_in_tx(tx, project_id, milestone_id)
+            .await?
+            .ok_or_else(|| crate::ServiceError::not_found("milestone", milestone_id))?;
+        if candidate.milestone_id != milestone_id || candidate.project_id != project_id {
+            return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
+        }
+        let expected_revision_id = milestone
+            .current_definition_revision_id
+            .clone()
+            .ok_or_else(|| crate::ServiceError::InvalidOperation {
+                message: "milestone has no current definition revision".to_owned(),
+            })?;
+        let definition_record = self
+            .definition_record_in_tx(tx, project_id, milestone_id, &expected_revision_id)
+            .await?
+            .ok_or_else(|| {
+                crate::ServiceError::not_found(
+                    "milestone_definition_revision",
+                    expected_revision_id.clone(),
+                )
+            })?;
+        let mut definition = definition_from_record(definition_record, project_id)?;
+        self.hydrate_charter_in_tx(tx, project_id, &mut definition)
+            .await?;
+        if candidate.definition_revision_id != expected_revision_id {
+            return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
+        }
+
+        let baseline_id = candidate.baseline_id.clone();
+        let baseline_revision_id = candidate.baseline_revision_id.clone();
+        let release_policy_revision = candidate.release_policy_revision.clone();
+        let (baseline_digest, stored_policy_revision, release_policy_digest) = self
+            .baseline_inputs_in_tx(
+                tx,
+                project_id,
+                &baseline_id,
+                &baseline_revision_id,
+                &release_policy_revision,
+            )
+            .await?;
+        if stored_policy_revision != release_policy_revision
+            || baseline_digest != candidate.baseline_digest
+            || release_policy_digest != candidate.release_policy_digest
+        {
+            return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
+        }
+
+        let check_results = self
+            .check_results_in_tx(
+                tx,
+                project_id,
+                milestone_id,
+                &expected_revision_id,
+                definition
+                    .content
+                    .charter_revision
+                    .as_ref()
+                    .map(|charter| charter.revision_id.as_str()),
+                &baseline_revision_id,
+                &release_policy_revision,
+                &release_policy_digest,
+            )
+            .await?;
+        let evidence = self.evidence_in_tx(tx, project_id, milestone_id).await?;
+        let waiver_ids = self.waiver_ids_in_tx(tx, project_id, milestone_id).await?;
+        let (task_states, document_states) = self
+            .source_states_in_tx(tx, project_id, milestone_id, &definition)
+            .await?;
+        let commit_build_check_context = self
+            .commit_build_check_context_in_tx(tx, project_id, &task_states)
+            .await?;
+        let mut input_manifest = self
+            .input_manifest_in_tx(
+                tx,
+                project_id,
+                milestone_id,
+                &expected_revision_id,
+                definition.content.charter_revision.as_ref(),
+                &baseline_id,
+                &baseline_revision_id,
+                &baseline_digest,
+                &release_policy_revision,
+                &release_policy_digest,
+                &check_results,
+                &evidence,
+                &waiver_ids,
+                &task_states,
+                &document_states,
+                &commit_build_check_context,
+            )
+            .await?;
+        let candidate_expected_milestone_version = candidate.expected_milestone_version;
+        let candidate_snapshot = readiness_from_record(candidate)?;
+
+        // Evaluating readiness itself advances the mutable milestone one
+        // version and (for a ready result) changes active -> ready_for_release.
+        // Normalize only the self-authored milestone source entry back to the
+        // immutable candidate identity.  This is also correct for a released
+        // correction: released rows remain terminal while their observational
+        // readiness candidate is recomputed against the same one-step version.
+        if let Some(milestone_input) = input_manifest
+            .iter_mut()
+            .find(|input| input.source_kind == "milestone")
+        {
+            let candidate_milestone_input = candidate_snapshot
+                .input_manifest
+                .iter()
+                .find(|input| input.source_kind == "milestone")
+                .ok_or_else(|| crate::ServiceError::InvalidOperation {
+                    message: "readiness snapshot is missing its milestone source manifest"
+                        .to_owned(),
+                })?;
+            milestone_input.source_version = candidate_expected_milestone_version;
+            milestone_input.source_digest = candidate_milestone_input.source_digest.clone();
+            milestone_input.observed_at = candidate_milestone_input.observed_at.clone();
+        }
+        let recomputed = evaluate_readiness(ReadinessEvaluationInput {
+            milestone: ProjectMilestone {
+                version: candidate_expected_milestone_version,
+                ..project_milestone_from_record(milestone.clone())?
+            },
+            definition: definition.clone(),
+            baseline_id,
+            baseline_revision_id,
+            baseline_digest,
+            release_policy_revision,
+            release_policy_digest,
+            // Preserve the candidate's immutable diagnostic watermark while
+            // recomputing its governed inputs.  The current watermark is
+            // returned separately by `readiness_freshness`; using it here
+            // would make the digest/release token depend on unrelated events.
+            source_event_watermark: candidate_snapshot.source_event_watermark.clone(),
+            computing_policy_revision: COMPUTING_POLICY_REVISION.to_owned(),
+            input_manifest,
+            check_results,
+            evidence: evidence.clone(),
+            waiver_ids,
+            task_states: task_states.clone(),
+            document_states: document_states.clone(),
+            commit_build_check_context,
+            authorization: candidate_snapshot.authorization.clone(),
+        })
+        .map_err(map_orchestration_error)?;
+        Ok(ReadinessRecheck {
+            milestone,
+            definition,
+            candidate_snapshot,
+            recomputed,
+            evidence,
+            task_states,
+        })
+    }
+
     async fn source_watermark_in_tx(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
@@ -2554,7 +2712,10 @@ impl MilestoneRuntime {
         let event_id: Option<String> = sqlx::query_scalar(
             "SELECT id FROM domain_event
              WHERE scope_type = 'project' AND scope_id = ?
-               AND event_type != 'milestone.readiness.evaluated'
+               AND event_type NOT IN (
+                   'milestone.readiness.evaluated',
+                   'project_release.candidate_requested'
+               )
              ORDER BY sequence DESC LIMIT 1",
         )
         .bind(project_id)
@@ -3355,6 +3516,9 @@ fn evidence_from_rows(
                 source_task_id: row.try_get("source_task_id")?,
                 source_run_id: row.try_get("source_execution_id")?,
                 source_validation_id: row.try_get("source_validation_id")?,
+                source_task_version: row.try_get("source_task_version")?,
+                source_context_digest: row.try_get("source_context_digest")?,
+                source_definition_revision_id: row.try_get("source_definition_revision_id")?,
                 milestone_id: row.try_get("milestone_id")?,
                 acceptance_check_ids: parse_json_required(
                     &row.try_get::<String, _>("acceptance_check_ids_json")?,
@@ -4183,23 +4347,30 @@ fn readiness_from_record(
     })
 }
 
-fn authorization_from_readiness_record(
-    record: &ProjectReadinessSnapshotRecord,
-) -> crate::Result<AuthorizationProvenance> {
-    let principal = PrincipalRef {
-        kind: principal_kind(&record.principal_type)?,
-        id: record.principal_id.clone(),
-        display_name: None,
-    };
-    let authorization = AuthorizationProvenance {
-        principal,
-        authorization_basis: record.authorization_basis.clone(),
-        action: record.authorization_action.clone(),
-        event_id: record.explicit_event.clone(),
-        occurred_at: record.authorization_occurred_at.clone(),
-    };
-    validate_persisted_authorization(&authorization, "project.milestone.readiness")?;
-    Ok(authorization)
+/// Compare only the governed readiness inputs and deterministic result.  The
+/// source event watermark and computed digest are intentionally excluded: the
+/// former is diagnostic metadata and the latter includes that metadata, so
+/// either would make an unrelated Project event falsely invalidate a snapshot.
+fn readiness_inputs_match(candidate: &ReadinessSnapshot, recomputed: &ReadinessEvaluation) -> bool {
+    candidate.expected_milestone_version == recomputed.expected_milestone_version
+        && candidate.milestone_definition_revision_id == recomputed.milestone_definition_revision_id
+        && candidate.baseline_id == recomputed.baseline_id
+        && candidate.baseline_revision_id == recomputed.baseline_revision_id
+        && candidate.baseline_digest == recomputed.baseline_digest
+        && candidate.release_policy_revision == recomputed.release_policy_revision
+        && candidate.release_policy_digest == recomputed.release_policy_digest
+        && candidate.input_manifest == recomputed.ordered_input_manifest
+        && candidate.result == recomputed.result
+        && candidate.reasons == recomputed.reasons
+        && candidate.check_results == recomputed.ordered_check_results
+        && candidate.waiver_ids == recomputed.waiver_ids
+        && candidate.evidence_attachment_ids == recomputed.evidence_attachment_ids
+        && candidate.evidence_digests == recomputed.evidence_digests
+        && candidate.evidence_availability == recomputed.evidence_availability
+        && candidate.commit_build_check_context == recomputed.commit_build_check_context
+        && candidate.computing_policy_revision == recomputed.computing_policy_revision
+        && candidate.requesting_principal == recomputed.requesting_principal
+        && candidate.authorization == recomputed.authorization
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]

@@ -26,7 +26,7 @@ use forge_agent_host::{
     FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL, FORGE_PROJECT_ORCHESTRATION_READ_TOOL,
     MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
     MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READINESS_OPERATION, MAIN_CHARTER_READ_OPERATION,
-    MAIN_PROJECT_CREATE_OPERATION, MIGRATED_OPERATION_CONTRACTS,
+    MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION, MIGRATED_OPERATION_CONTRACTS,
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
     PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION,
     PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
@@ -421,6 +421,18 @@ fn main_draft_arguments(key: &str) -> Value {
     })
 }
 
+fn genesis_start_arguments(key: &str) -> Value {
+    json!({
+        "operation": MAIN_GENESIS_START_OPERATION,
+        "payload": {
+            "action": "start",
+            "maturity": "mvp"
+        },
+        "dedupe_key": key,
+        "correlation_id": format!("correlation-{key}")
+    })
+}
+
 fn document_arguments(key: &str, title: &str, document_id: &str) -> Value {
     json!({
         "operation": PROJECT_DOCUMENT_OPERATION,
@@ -686,6 +698,10 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
     }
 
     let main_proposals = [
+        (
+            MAIN_GENESIS_START_OPERATION,
+            genesis_start_arguments("matrix-genesis-start"),
+        ),
         (
             MAIN_CHARTER_DRAFT_OPERATION,
             main_draft_arguments("matrix-main-draft"),

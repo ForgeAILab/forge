@@ -171,7 +171,7 @@ database for historical provenance.
 | POST   | `/api/v1/agent-sessions/{session_id}/interactions/{interaction_id}/cancel` | Cancel a protected interaction with an optimistic version |
 | GET    | `/api/v1/account/main-agent` | `V071+` — Get the account's single Main Agent binding |
 | PUT    | `/api/v1/account/main-agent` | `V071+` — Create or replace the account's Main Agent binding with optimistic concurrency. The request names only the agent (`identity_id`); the binding follows that agent's current settings |
-| POST   | `/api/v1/account/main-agent/product-genesis` | `V072+` — Start one typed Product Genesis session in the existing Main Chat and admit its first finite turn |
+| POST   | `/api/v1/account/main-agent/product-genesis` | `V072+` — Start one typed Product Genesis session in the existing Main Chat through the receipt-backed `genesis.start` command; requires a fresh `idempotency_key` and atomically admits its first finite turn |
 | GET    | `/api/v1/account/main-agent/product-genesis/active` | `V072+` — Return the authenticated account's active Genesis session, if any |
 | GET    | `/api/v1/account/main-agent/product-genesis/{session_id}` | `V072+` — Read one Genesis session owned by the authenticated account, including lifecycle, source references, and optimistic version |
 | POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/cancel` | `V072+` — Cancel an active Genesis session with `expected_version` and an optional reason |
@@ -297,11 +297,41 @@ ordinary API responses, logs, Agent Chats, memory, manifests, or domain events.
 ### Product Genesis
 
 Product Genesis is a durable typed discovery lifecycle over the existing
-account Main Agent Chat. Starting it never creates a Conversation, Room, thread,
-or chat-switcher entry. The server derives the Main Chat from the authenticated
-account's active binding, stores the prompt revision/maturity/source references
-with optimistic `version`, and admits the first discovery turn through the
-ordinary Agent Chat message service. The rendered prompt is also stored as an
+account Main Agent Chat. Clear natural-language intent to begin a new Project is
+recognized by the server-owned Main baseline skill and invokes the typed native
+`genesis.start` command; `/start-product <idea>` remains an optional explicit
+web shortcut. Ambiguous new-versus-existing Project intent produces one concise
+clarifying question. Ordinary portfolio questions and work on an existing
+Project stay in the baseline flow. The browser never classifies message text or
+silently converts an ordinary message into a start mutation.
+
+Starting discovery never creates a Conversation, Room, Project, thread, or
+chat-switcher entry. REST clients send `initial_idea`, optional `maturity` and
+preferred Project Agent identity, plus a required non-empty `idempotency_key`:
+
+```json
+{
+  "initial_idea": "Help me start a Project for release-note automation",
+  "maturity": "mvp",
+  "preferred_project_agent_identity_id": null,
+  "idempotency_key": "genesis-start-018f..."
+}
+```
+
+REST and native starts use one command service. The server derives the account,
+Main Chat, and (for native calls) currently leased source turn/message; it then
+commits the session, immutable instruction/source provenance, durable command
+receipt and event, and discovery-turn admission in one transaction. An exact
+retry returns the frozen receipt. Reusing the key for altered input returns
+`idempotency_conflict`; starting while another session is active returns
+`active_session_conflict`; missing Main setup returns `setup_required`. A failed
+transaction creates none of the session, receipt, event, or continuation.
+
+The successful native command is a turn control transfer: Forge stops the
+originating baseline provider loop, writes no duplicate assistant response for
+that turn, and admits exactly one causally linked discovery continuation against
+the existing visible user message. The REST shortcut creates one visible user
+message and one discovery turn. The rendered prompt is also stored as an
 immutable `agent_chat_instruction_revision` linked to the Genesis session; the
 turn runner overlays it only while the session is `discovering` or
 `ready_for_project`. The active skill is the server-owned
@@ -448,6 +478,18 @@ access, an explicit user authorization action (`project.media.redact` or
 `project.media.purge`), the asset `expected_version`, an idempotency key, and a
 non-empty reason no longer than 4096 bytes. Each returns the resulting
 `MediaAsset` metadata; the route never accepts a storage key or bytes.
+
+Required release-gating evidence is also context-bound. New attachments expose
+the observed `source_task_version`, `source_context_digest`, and
+`source_definition_revision_id` alongside the existing Task, execution, and
+validation identifiers. Forge derives those pins inside the attachment
+transaction and rechecks them during readiness; a legacy attachment without
+the required pins is reported as `evidence_context_missing`, while a pinned
+attachment whose Task, run, validation, definition, or build/commit context
+changed is reported as `evidence_context_stale`. Neither can make a candidate
+ready. The attachment remains inspectable so users can capture a replacement
+without rewriting evidence history.
+
 The JSON body is `ProjectMediaTombstoneRequest`:
 
 ```json
@@ -613,6 +655,15 @@ until their authorized executor commits the domain command. Exact direct
 replays return the frozen receipt result even if mutable binding or Profile
 policy changes after the first commit; a receipt miss is reauthorized before
 mutation.
+
+The Main-only native `genesis.start` operation is a direct typed proposal under
+the account/Main Chat scope and requires `propose_discovery`. Its payload is
+closed: `action` must be `"start"`, with optional `maturity` and
+`preferred_project_agent_identity_id`. It deliberately accepts no account,
+chat, source-message, source-turn, or initial-idea authority; Forge derives those
+from the leased Main turn. The operation is absent from Project Agent, Worker,
+and reviewer catalogs. Starting discovery is not Charter approval and does not
+create a Project.
 
 Project Agent execution-baseline proposals use the typed
 `project.execution_baseline` operation. Every payload supplies canonical
@@ -1549,6 +1600,74 @@ the bytes. Both routes use the asset version and idempotency key for CAS and
 replay; a mismatched replay or stale version returns the standard typed
 conflict. Neither route rewrites an immutable release manifest.
 
+### Project Overview
+
+`GET /api/v1/projects/{id}/overview` returns a query-time projection over the
+authorized Project's canonical records. It includes the current approved
+Charter, active milestone/outcome projections, Task and acceptance-check
+counts, effective Decision records, separate pending Decision candidate IDs,
+Charter risks, document freshness, evidence, readiness, and immutable release
+history. The response's
+`projection_state` distinguishes `current`, `loading`, `stale`, `error`, and
+`permission_denied`; clients must not turn a stale or error projection into a
+green release state.
+
+`document_freshness` includes every Project Document. Each entry identifies
+the approved revision/digest that remains the governing Project truth and,
+when present, the newer working draft/proposed revision/digest. The generated
+`DocumentFreshnessStatus` is one of `current`, `changes_pending`, `stale`,
+`reconciliation_required`, or `unavailable`. A newer working revision or a
+draft-only Document is reported as pending changes; it does not replace an
+approved revision in the Overview and does not by itself make the whole
+Project stale. An approved pointer with no complete target, an incompatible
+revision, or a governing-source mismatch is reported as
+stale/reconciliation-required.
+
+`decisions` contains effective Decision Log records with their question,
+context, selected outcome, alternatives, rationale, principal, decision class,
+affected records, and effective state. Draft/proposed editor records never
+appear in that collection; their IDs remain separate in
+`unresolved_decision_ids` until explicit approval creates effective truth.
+
+`next_action` is a typed action (or `null`), not a sentence that clients must
+parse. Its fields identify the action `code`, `required_principal`,
+`target_type`, `target_id`, `title`, `explanation`, `action_kind`,
+`route_or_operation`, `blocking`, and optional `expected_version`. The server
+resolves one action using this order: Charter adoption/setup; conflicts and
+reconciliation; Worker/reviewer/repository execution setup; baseline draft or
+user approval; blocked/failed Task remediation; missing or stale validation;
+missing or stale evidence; readiness evaluation; exact user release; then
+definition of the next milestone. The client follows the typed route or
+operation and sends the expected version; it must not infer a mutation from
+Task counts, a readiness badge, or free-form copy.
+
+Readiness shown inside the Overview is current only when the displayed
+snapshot's exact input manifest still matches the current milestone
+definition, baseline and policy, acceptance-check definitions/results,
+approved Documents, waivers, evidence source context, and bounded
+build/commit references. An evidence attachment is release-gating evidence
+only when its provenance binds the source Task revision, execution/run (when
+applicable), validation result/digest, check-definition revision, and build or
+commit context used by the check. Availability or an acceptance-check link
+alone is insufficient; absent or mismatched context is stale/unusable and
+cannot satisfy readiness. A readiness evaluation or Project Agent release
+recommendation does not pin evidence.
+
+The Project Agent may submit a release recommendation containing the exact
+ready `ReadinessSnapshot` id, digest, milestone version, inputs, known issues,
+and missing/waived checks. This creates a visible human-attention record only;
+it neither approves nor releases the milestone and its event does not change
+the readiness source watermark. Only an authorized user may call
+`POST /api/v1/projects/{id}/milestones/{milestone_id}/release` with
+`readiness_snapshot_id`, `readiness_digest`, the milestone
+`mutation.expected_version`, and an idempotency key. Forge re-authorizes the
+user, reloads and recomputes every covered source in the same transaction, and
+on an exact match atomically creates the immutable `Mxxx-rN` release manifest,
+release-scoped evidence pins, lifecycle transition, and events. It creates no
+second readiness snapshot. A version/digest mismatch leaves the milestone
+unreleased and returns a typed conflict; an exact retry returns the original
+release.
+
 ### SSE events
 
 `GET /api/v1/events` streams typed `EventBus` events. Orchestration and media
@@ -1562,6 +1681,8 @@ envelope when mirrored, with `event_type`, `entity_id`, and `timestamp`.
 
 | Event | Context payload |
 |-------|-----------------|
+| `product_genesis.started` | `{ "operation": "genesis.start", "session_id": "...", "main_chat_id": "...", "source_message_id": "...", "source_turn_id": "...|null", "admitted_turn_id": "..." }` |
+| `agent_chat.turn.control_transferred` | `{ "operation": "genesis.start", "source_turn_id": "...", "continuation_turn_id": "...", "session_id": "..." }` |
 | `project_charter.revision_created` | `{ "charter_id": "...", "revision_id": "...", "revision": 2, "content_digest": "...", "rendered_digest": "..." }` |
 | `project_charter.approved` | `{ "charter_id": "...", "revision_id": "...", "approval_id": "...", "content_digest": "...", "rendered_digest": "..." }` |
 | `project.charter.approved` | `{ "charter_id": "...", "revision_id": "...", "approval_id": "...", "content_digest": "...", "rendered_digest": "..." }` |
@@ -1584,6 +1705,8 @@ envelope when mirrored, with `event_type`, `entity_id`, and `timestamp`.
 | `project.media.purged` | `{ "project_id": "...", "asset_id": "...", "target_availability": "purged", "expected_version": 3, "mutation_fingerprint": "...", "authorization_event_id": "..." }` |
 | `project.evidence.attached` | `{ "project_id": "...", "milestone_id": "...", "asset_id": "...", "evidence_id": "..." }` |
 | `project.evidence.removed` | `{ "project_id": "...", "milestone_id": "...", "evidence_id": "..." }` |
+| `milestone.readiness.evaluated` | `{ "project_id": "...", "milestone_id": "...", "readiness_snapshot_id": "...", "readiness_digest": "...", "result": "ready|blocked|failed|stale" }` |
+| `project_release.candidate_requested` | `{ "project_id": "...", "milestone_id": "...", "readiness_snapshot_id": "...", "readiness_digest": "..." }`; attention-only projection, excluded from readiness source freshness |
 | `milestone.released` | `{ "release_id": "...", "release_identity": "M001-r1", "readiness_snapshot_id": "...", "readiness_digest": "...", "snapshot_digest": "..." }` |
 
 ### Markdown evidence patterns
@@ -1693,6 +1816,7 @@ records when the operation produced them.
 | `version_conflict` | An authorized mutable version or base revision is stale. |
 | `digest_conflict` | The submitted content/render digest does not match the authorized candidate. |
 | `idempotency_conflict` | The idempotency key is already bound to a different request. |
+| `active_session_conflict` | Product Genesis already has an active session for this account/Main Chat. |
 | `policy_denied` | The operation is not admitted for the authenticated scope. |
 | `not_found` | The authorized resource is unavailable. |
 | `transient_failure` | The operation may succeed after the bounded retry guidance is followed. |

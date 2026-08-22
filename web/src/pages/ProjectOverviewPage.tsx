@@ -1,6 +1,6 @@
 import { Link } from '@tanstack/react-router'
 import type { ReactNode } from 'react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   ArrowClockwise,
   ArrowUpRight,
@@ -18,13 +18,22 @@ import {
   XCircle,
 } from '@phosphor-icons/react'
 import { apiFetchBlob } from '@/api/client'
-import { useProjectOverviewQuery } from '@/api/hooks'
+import { useProjectOverviewQuery, useReleaseProjectMilestone } from '@/api/hooks'
 import { ConflictDetails } from '@/components/conflict-details'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { ProjectCharterAdoptionBanner } from '@/features/project-charter/ProjectCharterAdoptionBanner'
 import { ProjectExecutionSetupPanel } from '@/features/project-execution/ProjectExecutionSetupPanel'
-import { isApiStatus } from '@/lib/api-error'
+import { getApiErrorCode, getApiErrorMessage, isApiStatus } from '@/lib/api-error'
+import { useAuthStore } from '@/stores/auth'
 import type {
   AcceptanceCheckSummary,
   CharterRisk,
@@ -33,12 +42,21 @@ import type {
   EvidenceAvailability,
   OverviewProjectionState,
   ProjectMilestoneOverview,
+  ProjectNextAction,
   ProjectOverview,
   ProjectRelease,
   TaskProgressCounts,
 } from '@/types/generated'
+import type { AuthorizationProvenance } from '@/types/generated/bindings/AuthorizationProvenance'
 
 type CountValue = number | bigint
+
+const EVIDENCE_AVAILABILITY_COPY: Record<EvidenceAvailability, string> = {
+  available: 'Available proof',
+  quarantined: 'Pending review',
+  redacted: 'Redacted derivative',
+  purged: 'Evidence unavailable',
+}
 
 function count(value: CountValue | undefined): number {
   return typeof value === 'bigint' ? Number(value) : (value ?? 0)
@@ -62,6 +80,41 @@ function shortId(value: string | null | undefined): string {
   return value.length > 16 ? `${value.slice(0, 8)}…${value.slice(-6)}` : value
 }
 
+function numberValue(value: number | bigint | null | undefined): number | null {
+  if (value === null || value === undefined) return null
+  const number = typeof value === 'bigint' ? Number(value) : value
+  return Number.isFinite(number) ? number : null
+}
+
+function newIdempotencyKey(prefix: string): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+function createUserAuthorization(action: string): AuthorizationProvenance {
+  const user = useAuthStore.getState().user
+  if (!user) throw new Error('Sign in again before releasing this milestone.')
+  return {
+    principal: { kind: 'user', id: user.id, display_name: user.display_name ?? null },
+    authorization_basis: 'interactive_user_release',
+    action,
+    event_id: newIdempotencyKey(action),
+    occurred_at: new Date().toISOString(),
+  }
+}
+
+type ReleaseCandidate = {
+  milestoneId: string
+  canonicalId: string
+  label: string
+  snapshotId: string
+  digest: string
+  expectedMilestoneVersion: number
+  readinessExpectedMilestoneVersion: number
+}
+
 function formatDuration(value: number | null): string {
   if (value === null || !Number.isFinite(value)) return 'Duration pending'
   const seconds = Math.max(0, Math.round(value))
@@ -73,10 +126,22 @@ function statusClass(status: string): string {
   if (['released', 'pass', 'current', 'approved', 'available'].includes(status)) {
     return 'border-success/30 bg-success/10 text-success'
   }
-  if (['stale', 'waived', 'quarantined', 'ready_for_release'].includes(status)) {
+  if (
+    [
+      'stale',
+      'changes_pending',
+      'reconciliation_required',
+      'superseded',
+      'waived',
+      'quarantined',
+      'ready_for_release',
+    ].includes(status)
+  ) {
     return 'border-warning/40 bg-warning/10 text-foreground'
   }
-  if (['failed', 'fail', 'blocked', 'purged', 'redacted', 'error'].includes(status)) {
+  if (
+    ['failed', 'fail', 'blocked', 'invalidated', 'purged', 'redacted', 'error'].includes(status)
+  ) {
     return 'border-destructive/30 bg-destructive/10 text-destructive'
   }
   return 'border-border-subtle bg-muted text-muted-foreground'
@@ -191,7 +256,23 @@ function CheckSummary({ summary }: { summary: AcceptanceCheckSummary }) {
   )
 }
 
-function OutcomeCard({ item, primary }: { item: ProjectMilestoneOverview; primary: boolean }) {
+function OutcomeCard({
+  item,
+  primary,
+  projectionState,
+  hasUser,
+  releasePending,
+  releaseError,
+  onReviewRelease,
+}: {
+  item: ProjectMilestoneOverview
+  primary: boolean
+  projectionState: OverviewProjectionState
+  hasUser: boolean
+  releasePending: boolean
+  releaseError: string | null
+  onReviewRelease: (candidate: ReleaseCandidate) => void
+}) {
   const content = item.definition.content
   const availableEvidenceCount = item.evidence.filter(
     (evidence) => evidence.availability === 'available',
@@ -202,6 +283,28 @@ function OutcomeCard({ item, primary }: { item: ProjectMilestoneOverview; primar
       `${reason.kind} ${reason.code}`.toLowerCase().includes(term),
     ),
   )
+  const readiness = item.latest_readiness
+  const freshness = item.readiness_freshness
+  const readinessId = readiness?.id ?? null
+  const readinessDigest = readiness?.readiness_digest ?? null
+  const expectedMilestoneVersion = numberValue(item.milestone.version)
+  const readinessExpectedMilestoneVersion = numberValue(readiness?.expected_milestone_version)
+  const readinessIsFresh = readiness?.result === 'ready' && freshness?.status === 'current'
+  const releaseCandidate =
+    readinessId &&
+    readinessDigest &&
+    expectedMilestoneVersion !== null &&
+    readinessExpectedMilestoneVersion !== null
+      ? {
+          milestoneId: item.milestone.id,
+          canonicalId: item.milestone.canonical_id,
+          label: item.milestone.display_label ?? content.name,
+          snapshotId: readinessId,
+          digest: readinessDigest,
+          expectedMilestoneVersion,
+          readinessExpectedMilestoneVersion,
+        }
+      : null
 
   return (
     <article className="min-w-0 rounded-lg border border-border-subtle bg-background p-4">
@@ -243,6 +346,104 @@ function OutcomeCard({ item, primary }: { item: ProjectMilestoneOverview; primar
               </ul>
             </div>
           </div>
+        </div>
+      ) : null}
+
+      {readiness ? (
+        <div className="mt-4 rounded-md border border-border-subtle bg-muted/30 p-3">
+          <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
+            <div className="min-w-0">
+              <p className="text-xs font-semibold text-foreground">Readiness candidate</p>
+              <p className="mt-1 break-words text-xs text-muted-foreground">
+                This is an immutable candidate for review. It does not release the milestone by
+                itself.
+              </p>
+            </div>
+            {releaseCandidate ? (
+              <Button
+                type="button"
+                size="sm"
+                disabled={
+                  releasePending ||
+                  !hasUser ||
+                  !readinessIsFresh ||
+                  projectionState !== 'current' ||
+                  item.milestone.lifecycle === 'released'
+                }
+                aria-busy={releasePending}
+                onClick={() => onReviewRelease(releaseCandidate)}
+                aria-label={`Review exact release snapshot for ${item.milestone.canonical_id}`}
+              >
+                {releasePending
+                  ? 'Releasing exact snapshot…'
+                  : item.milestone.lifecycle === 'released'
+                    ? 'Already released'
+                    : !hasUser
+                      ? 'Sign in to release'
+                      : projectionState !== 'current' || !readinessIsFresh
+                        ? 'Refresh before release'
+                        : 'Release exact snapshot'}
+              </Button>
+            ) : null}
+          </div>
+          <dl className="mt-3 grid min-w-0 gap-2 border-t border-border-subtle pt-3 text-xs sm:grid-cols-3">
+            <div className="min-w-0">
+              <dt className="text-muted-foreground">Snapshot</dt>
+              <dd
+                className="break-all font-mono text-micro text-foreground"
+                title={readinessId ?? undefined}
+              >
+                {shortId(readinessId)}
+              </dd>
+            </div>
+            <div className="min-w-0">
+              <dt className="text-muted-foreground">Digest</dt>
+              <dd
+                className="break-all font-mono text-micro text-foreground"
+                title={readinessDigest ?? undefined}
+              >
+                {shortId(readinessDigest)}
+              </dd>
+            </div>
+            <div className="min-w-0">
+              <dt className="text-muted-foreground">Release CAS</dt>
+              <dd className="font-mono text-micro text-foreground">
+                {expectedMilestoneVersion === null
+                  ? 'Not recorded'
+                  : `v${expectedMilestoneVersion}`}
+              </dd>
+            </div>
+            <div className="min-w-0 sm:col-span-3">
+              <dt className="text-muted-foreground">Readiness captured against</dt>
+              <dd className="font-mono text-micro text-muted-foreground">
+                {readinessExpectedMilestoneVersion === null
+                  ? 'Not recorded'
+                  : `milestone v${readinessExpectedMilestoneVersion}`}
+              </dd>
+            </div>
+          </dl>
+          {!hasUser ? (
+            <p className="mt-2 text-xs text-warning" role="status">
+              Sign in again before releasing this exact snapshot.
+            </p>
+          ) : !readinessIsFresh ? (
+            <p className="mt-2 text-xs text-warning" role="status">
+              {freshness?.reason ??
+                (freshness
+                  ? `This candidate is ${humanize(freshness.status)}; refresh readiness before releasing.`
+                  : 'Readiness freshness is unavailable; refresh the Overview before releasing.')}
+            </p>
+          ) : projectionState !== 'current' ? (
+            <p className="mt-2 text-xs text-warning" role="status">
+              The Overview projection is not current. Refresh it before releasing this exact
+              snapshot.
+            </p>
+          ) : null}
+          {releaseError ? (
+            <p className="mt-2 break-words text-xs leading-5 text-destructive" role="alert">
+              {releaseError}
+            </p>
+          ) : null}
         </div>
       ) : null}
 
@@ -316,7 +517,7 @@ function DocumentFreshnessPanel({ documents }: { documents: DocumentFreshness[] 
   return (
     <SectionCard title="Document freshness" eyebrow="Canonical Project Documents">
       {documents.length === 0 ? (
-        <EmptyInline text="No optional Project Documents are recorded yet. Compact Projects may begin with a Delivery Brief only." />
+        <EmptyInline text="No Project Documents are recorded yet. The Project Agent can propose a bounded document when the outcome needs one." />
       ) : (
         <ul className="divide-y divide-border-subtle">
           {documents.map((document) => (
@@ -328,12 +529,25 @@ function DocumentFreshnessPanel({ documents }: { documents: DocumentFreshness[] 
                     <p className="break-words text-sm font-medium text-foreground">
                       {humanize(document.kind)}
                     </p>
-                    <StatusLabel status={document.stale ? 'stale' : 'current'} />
+                    <StatusLabel status={document.status} />
                   </div>
-                  <p className="mt-1 break-all font-mono text-micro text-muted-foreground">
-                    revision {shortId(document.current_revision_id)} · digest{' '}
-                    {shortId(document.current_digest)}
-                  </p>
+                  {document.approved_revision_id ? (
+                    <p className="mt-1 break-all font-mono text-micro text-muted-foreground">
+                      approved revision {shortId(document.approved_revision_id)} · digest{' '}
+                      {shortId(document.approved_digest)}
+                    </p>
+                  ) : (
+                    <p className="mt-1 text-xs text-muted-foreground">No approved revision yet.</p>
+                  )}
+                  {document.working_revision_id ? (
+                    <p className="mt-1 break-all font-mono text-micro text-warning">
+                      working {document.working_lifecycle ?? 'revision'}{' '}
+                      {shortId(document.working_revision_id)}
+                      {document.working_digest
+                        ? ` · digest ${shortId(document.working_digest)}`
+                        : ''}
+                    </p>
+                  ) : null}
                   {document.reason ? (
                     <p className="mt-1 break-words text-xs text-warning">{document.reason}</p>
                   ) : null}
@@ -348,13 +562,14 @@ function DocumentFreshnessPanel({ documents }: { documents: DocumentFreshness[] 
 }
 
 function DecisionsAndRisks({ overview }: { overview: ProjectOverview }) {
+  const decisions = overview.decisions
   return (
     <SectionCard title="Decisions & risks" eyebrow="Authority Ledger">
       <div className="space-y-4">
         <div>
-          <p className="text-xs font-medium text-muted-foreground">Unresolved decisions</p>
+          <p className="text-xs font-medium text-muted-foreground">Pending proposals</p>
           {overview.unresolved_decision_ids.length === 0 ? (
-            <EmptyInline text="No unresolved decisions are recorded." />
+            <EmptyInline text="No pending decision proposals are recorded." />
           ) : (
             <ul className="mt-2 space-y-2">
               {overview.unresolved_decision_ids.map((id) => (
@@ -363,14 +578,79 @@ function DecisionsAndRisks({ overview }: { overview: ProjectOverview }) {
                   className="flex min-w-0 items-start gap-2 rounded-md border border-warning/30 bg-warning/5 px-3 py-2"
                 >
                   <Info size={15} className="mt-0.5 shrink-0 text-warning" aria-hidden />
-                  <span className="min-w-0 break-all font-mono text-xs text-foreground">{id}</span>
+                  <span className="min-w-0 break-all font-mono text-xs text-foreground">
+                    <span className="text-muted-foreground">Pending proposal </span>
+                    {id}
+                  </span>
                 </li>
               ))}
             </ul>
           )}
         </div>
         <div className="border-t border-border-subtle pt-4">
-          <p className="text-xs font-medium text-muted-foreground">Active risks</p>
+          <p className="text-xs font-medium text-muted-foreground">Decision log</p>
+          {decisions.length === 0 ? (
+            <EmptyInline text="No effective decisions are recorded in the current authority ledger." />
+          ) : (
+            <ul className="mt-2 space-y-2">
+              {decisions.map((decision) => {
+                // Keep the affected authority references bounded and typed; the full records remain
+                // available from their canonical views.
+                const affected = [
+                  ...decision.affected_artifact_refs.map(
+                    (ref) => `artifact ${shortId(ref.artifact_id)}`,
+                  ),
+                  ...decision.affected_task_ids.map((id) => `task ${shortId(id)}`),
+                  ...decision.affected_milestone_ids.map((id) => `milestone ${shortId(id)}`),
+                ]
+                return (
+                  <li
+                    key={decision.id}
+                    className="min-w-0 rounded-md border border-border-subtle bg-muted/30 px-3 py-2"
+                  >
+                    <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
+                      <p className="break-words text-sm text-foreground">{decision.question}</p>
+                      <StatusLabel status={decision.state} />
+                    </div>
+                    {decision.context ? (
+                      <p className="mt-1 break-words text-xs leading-5 text-muted-foreground">
+                        Context: <span className="text-foreground">{decision.context}</span>
+                      </p>
+                    ) : null}
+                    {decision.options.length > 0 ? (
+                      <p className="mt-1 break-words text-xs leading-5 text-muted-foreground">
+                        Alternatives: {decision.options.join(' · ')}
+                      </p>
+                    ) : null}
+                    <p className="mt-1 break-words text-xs text-muted-foreground">
+                      Outcome: <span className="text-foreground">{decision.selected_outcome}</span>
+                    </p>
+                    <p className="mt-1 break-words text-xs leading-5 text-muted-foreground">
+                      Rationale: <span className="text-foreground">{decision.rationale}</span>
+                    </p>
+                    <p className="mt-1 break-all font-mono text-micro text-muted-foreground">
+                      Principal:{' '}
+                      <span className="text-foreground">
+                        {decision.decision_maker.display_name ?? decision.decision_maker.id}
+                      </span>{' '}
+                      · Class: {humanize(decision.decision_class)}
+                    </p>
+                    <p className="mt-1 break-all font-mono text-micro text-muted-foreground">
+                      Decision ID {shortId(decision.id)}
+                    </p>
+                    {affected.length > 0 ? (
+                      <p className="mt-1 break-all font-mono text-micro text-muted-foreground">
+                        Affected: {affected.join(' · ')}
+                      </p>
+                    ) : null}
+                  </li>
+                )
+              })}
+            </ul>
+          )}
+        </div>
+        <div className="border-t border-border-subtle pt-4">
+          <p className="text-xs font-medium text-muted-foreground">Charter risks</p>
           {overview.risks.length === 0 ? (
             <EmptyInline text="No active risk is recorded in the current Charter projection." />
           ) : (
@@ -457,12 +737,6 @@ function EvidenceTile({ projectId, item }: { projectId: string; item: EvidenceAt
   const isVideo = item.kind === 'walkthrough_video'
   const hasVisualPreview = item.kind === 'screenshot' || isVideo
   const mediaPath = `/projects/${projectId}/media/${encodeURIComponent(item.asset_id)}`
-  const availabilityCopy: Record<EvidenceAvailability, string> = {
-    available: 'Available proof',
-    quarantined: 'Pending review',
-    redacted: 'Redacted derivative',
-    purged: 'Evidence unavailable',
-  }
   const icon = isVideo ? (
     <FilmStrip size={24} aria-hidden />
   ) : item.kind === 'screenshot' ? (
@@ -566,7 +840,7 @@ function EvidenceTile({ projectId, item }: { projectId: string; item: EvidenceAt
             {icon}
             <p className="text-xs font-medium">
               {item.availability !== 'available'
-                ? availabilityCopy[item.availability]
+                ? EVIDENCE_AVAILABILITY_COPY[item.availability]
                 : isVideo
                   ? 'Video poster'
                   : item.kind === 'screenshot'
@@ -653,7 +927,7 @@ function EvidenceTile({ projectId, item }: { projectId: string; item: EvidenceAt
             </>
           ) : (
             <span className="text-xs text-muted-foreground">
-              {availabilityCopy[item.availability]}
+              {EVIDENCE_AVAILABILITY_COPY[item.availability]}
             </span>
           )}
         </div>
@@ -886,31 +1160,211 @@ function NextActionCard({
   nextAction,
 }: {
   projectId: string
-  nextAction: string | null
+  nextAction: ProjectNextAction | null
 }) {
+  const action = nextAction
+  const isReleaseAction = action?.action_kind === 'release'
   return (
     <SectionCard title="Next action" eyebrow="User decision / action">
       <div className="flex min-w-0 items-start gap-3 rounded-md border border-ember-border bg-ember-surface p-3">
         <Clock size={18} className="mt-0.5 shrink-0 text-primary" aria-hidden />
         <div className="min-w-0">
           <p className="break-words text-sm font-medium text-foreground">
-            {nextAction ?? 'No next action recorded'}
+            {action?.title ?? 'No next action recorded'}
           </p>
-          <Link
-            to="/projects/$projectId/chat"
-            params={{ projectId }}
-            className="mt-3 inline-flex items-center gap-1 text-xs font-semibold text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            Continue with Project Agent <ArrowUpRight size={13} aria-hidden />
-          </Link>
+          {action ? (
+            <p className="mt-1 break-words text-xs leading-5 text-muted-foreground">
+              {action.explanation}
+            </p>
+          ) : null}
+          {action ? (
+            <p className="mt-2 break-all font-mono text-micro text-muted-foreground">
+              code {action.code} · {action.target_type} {shortId(action.target_id)}
+            </p>
+          ) : null}
+          {action ? (
+            <p className="mt-2 break-all font-mono text-micro text-muted-foreground">
+              principal {action.required_principal}
+              {action.expected_version !== null
+                ? ` · expected version v${numberValue(action.expected_version) ?? '—'}`
+                : null}
+            </p>
+          ) : null}
+          {action ? (
+            <p className="mt-2 break-all font-mono text-micro text-muted-foreground">
+              operation {action.route_or_operation}
+            </p>
+          ) : null}
+          {action ? (
+            <p className="mt-2 text-micro font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+              {action.blocking ? 'Blocking action' : 'Recommended next action'}
+            </p>
+          ) : null}
+          {isReleaseAction ? (
+            <a
+              href="#readiness"
+              className="mt-3 inline-flex items-center gap-1 text-xs font-semibold text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              Review release readiness <ArrowUpRight size={13} aria-hidden />
+            </a>
+          ) : (
+            <Link
+              to="/projects/$projectId/chat"
+              params={{ projectId }}
+              className="mt-3 inline-flex items-center gap-1 text-xs font-semibold text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              Continue with Project Agent <ArrowUpRight size={13} aria-hidden />
+            </Link>
+          )}
         </div>
       </div>
     </SectionCard>
   )
 }
 
+function ReleaseReviewDialog({
+  candidate,
+  open,
+  hasUser,
+  isPending,
+  error,
+  onOpenChange,
+  onConfirm,
+}: {
+  candidate: ReleaseCandidate | null
+  open: boolean
+  hasUser: boolean
+  isPending: boolean
+  error: string | null
+  onOpenChange: (open: boolean) => void
+  onConfirm: () => void
+}) {
+  if (!candidate) return null
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange} ariaLabel="Review milestone release">
+      <DialogContent className="max-w-xl">
+        <DialogHeader>
+          <DialogTitle>Review release · {candidate.canonicalId}</DialogTitle>
+          <DialogDescription>
+            Confirm the exact readiness snapshot Forge will record as immutable release truth. Forge
+            never releases from a readiness result automatically.
+          </DialogDescription>
+        </DialogHeader>
+        <dl className="mt-5 grid gap-3 rounded-md border border-border-subtle bg-muted/30 p-3 text-xs sm:grid-cols-2">
+          <div className="min-w-0">
+            <dt className="text-muted-foreground">Outcome</dt>
+            <dd className="mt-1 break-words font-medium text-foreground">{candidate.label}</dd>
+          </div>
+          <div className="min-w-0">
+            <dt className="text-muted-foreground">Release milestone version</dt>
+            <dd className="mt-1 font-mono text-micro text-foreground">
+              v{candidate.expectedMilestoneVersion}
+            </dd>
+          </div>
+          <div className="min-w-0 sm:col-span-2">
+            <dt className="text-muted-foreground">Readiness snapshot ID</dt>
+            <dd className="mt-1 break-all font-mono text-micro text-foreground">
+              {candidate.snapshotId}
+            </dd>
+          </div>
+          <div className="min-w-0 sm:col-span-2">
+            <dt className="text-muted-foreground">Readiness digest</dt>
+            <dd className="mt-1 break-all font-mono text-micro text-foreground">
+              {candidate.digest}
+            </dd>
+          </div>
+          <div className="min-w-0 sm:col-span-2">
+            <dt className="text-muted-foreground">Readiness captured against</dt>
+            <dd className="mt-1 font-mono text-micro text-muted-foreground">
+              milestone v{candidate.readinessExpectedMilestoneVersion}
+            </dd>
+          </div>
+        </dl>
+        {!hasUser ? (
+          <p className="mt-3 text-xs text-warning" role="status">
+            Sign in again before releasing this milestone. The server accepts only an authorization
+            receipt for the current user.
+          </p>
+        ) : null}
+        {error ? (
+          <p className="mt-3 break-words text-xs leading-5 text-destructive" role="alert">
+            {error}
+          </p>
+        ) : null}
+        <DialogFooter className="mt-5 gap-2">
+          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={isPending}>
+            Cancel
+          </Button>
+          <Button disabled={!hasUser || isPending} onClick={onConfirm}>
+            {isPending ? 'Releasing exact snapshot…' : 'Confirm release'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 export function ProjectOverviewPage({ projectId }: { projectId: string }) {
   const overviewQuery = useProjectOverviewQuery(projectId)
+  const releaseMutation = useReleaseProjectMilestone()
+  const hasUser = Boolean(useAuthStore((state) => state.user))
+  const releaseAttemptRef = useRef<{
+    fingerprint: string
+    key: string
+    authorization: AuthorizationProvenance
+  } | null>(null)
+  const [releaseCandidate, setReleaseCandidate] = useState<ReleaseCandidate | null>(null)
+  const [releaseError, setReleaseError] = useState<string | null>(null)
+  const [releaseNotice, setReleaseNotice] = useState<string | null>(null)
+
+  function reviewRelease(candidate: ReleaseCandidate) {
+    setReleaseError(null)
+    setReleaseNotice(null)
+    releaseMutation.reset?.()
+    setReleaseCandidate(candidate)
+  }
+
+  async function executeRelease(candidate: ReleaseCandidate) {
+    setReleaseError(null)
+    try {
+      const principalId = useAuthStore.getState().user?.id ?? 'anonymous'
+      const fingerprint = `${principalId}:${candidate.milestoneId}:${candidate.snapshotId}:${candidate.digest}:${candidate.expectedMilestoneVersion}`
+      const attempt =
+        releaseAttemptRef.current?.fingerprint === fingerprint
+          ? releaseAttemptRef.current
+          : {
+              fingerprint,
+              key: newIdempotencyKey('project-milestone-release'),
+              authorization: createUserAuthorization('project.milestone.release'),
+            }
+      releaseAttemptRef.current = attempt
+      const release = await releaseMutation.mutateAsync({
+        projectId,
+        milestoneId: candidate.milestoneId,
+        expectedMilestoneVersion: candidate.expectedMilestoneVersion,
+        readinessSnapshotId: candidate.snapshotId,
+        readinessDigest: candidate.digest,
+        idempotencyKey: attempt.key,
+        authorization: attempt.authorization,
+      })
+      releaseAttemptRef.current = null
+      setReleaseCandidate(null)
+      setReleaseNotice(
+        `Release recorded: ${release.snapshot.release_identity} is now immutable release truth.`,
+      )
+    } catch (error) {
+      const code = getApiErrorCode(error)
+      setReleaseError(
+        (isApiStatus(error, 409) || isApiStatus(error, 412)) && code === 'version_conflict'
+          ? 'The milestone changed while this release was open. Refresh the Overview, review the current readiness snapshot, and try again.'
+          : getApiErrorMessage(
+              error,
+              'The release could not be recorded. Review the current readiness snapshot and try again.',
+            ),
+      )
+      void overviewQuery.refetch()
+    }
+  }
 
   if (overviewQuery.isLoading) return <LoadingState />
   if (overviewQuery.isError) {
@@ -933,6 +1387,14 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
   const primary = activeMilestones.find(
     (item) => item.milestone.id === overview.primary_milestone_id,
   )
+  const effectiveReleaseError =
+    releaseError ??
+    (releaseMutation.error
+      ? getApiErrorMessage(
+          releaseMutation.error,
+          'The release could not be recorded. Review the current readiness snapshot and try again.',
+        )
+      : null)
 
   return (
     <div className="mx-auto flex w-full max-w-[1440px] min-w-0 flex-col gap-5">
@@ -991,6 +1453,16 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
         onRetry={() => void overviewQuery.refetch()}
       />
 
+      {releaseNotice ? (
+        <div
+          className="flex min-w-0 items-start gap-2 rounded-md border border-success/30 bg-success/10 p-3 text-sm"
+          role="status"
+        >
+          <CheckCircle size={17} className="mt-0.5 shrink-0 text-success" aria-hidden />
+          <p className="break-words text-foreground">{releaseNotice}</p>
+        </div>
+      ) : null}
+
       {setupRequired ? <ProjectCharterAdoptionBanner projectId={projectId} /> : null}
 
       <ProjectExecutionSetupPanel projectId={projectId} />
@@ -1021,14 +1493,23 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
                     No active milestone is defined yet.
                   </p>
                   <p className="mt-1 break-words text-xs leading-5 text-muted-foreground">
-                    {overview.next_action ??
+                    {overview.next_action?.title ??
                       'Continue in Project Agent Chat to define the first bounded outcome and acceptance checks.'}
                   </p>
                 </div>
               ) : (
                 <div className="space-y-4">
                   {activeMilestones.map((item) => (
-                    <OutcomeCard key={item.milestone.id} item={item} primary={item === primary} />
+                    <OutcomeCard
+                      key={item.milestone.id}
+                      item={item}
+                      primary={item === primary}
+                      projectionState={overview.projection_state}
+                      hasUser={hasUser}
+                      releasePending={releaseMutation.isPending}
+                      releaseError={effectiveReleaseError}
+                      onReviewRelease={reviewRelease}
+                    />
                   ))}
                 </div>
               )}
@@ -1078,6 +1559,19 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
         <span>Watermark {shortId(overview.source_event_watermark)}</span>
         <span>Generated {formatDate(overview.generated_at)}</span>
       </footer>
+      <ReleaseReviewDialog
+        candidate={releaseCandidate}
+        open={releaseCandidate !== null}
+        hasUser={hasUser}
+        isPending={releaseMutation.isPending}
+        error={effectiveReleaseError}
+        onOpenChange={(open) => {
+          if (!open && !releaseMutation.isPending) setReleaseCandidate(null)
+        }}
+        onConfirm={() => {
+          if (releaseCandidate) void executeRelease(releaseCandidate)
+        }}
+      />
     </div>
   )
 }

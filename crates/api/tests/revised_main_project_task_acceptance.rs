@@ -138,6 +138,7 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
         "/api/v1/account/main-agent/product-genesis",
         &token,
         json!({
+            "idempotency_key": "revised-acceptance-genesis-start",
             "maturity": "mvp",
             "initial_idea": "A bounded Todo list with auditable Task delegation.",
             "preferred_project_agent_identity_id": project_identity

@@ -6,7 +6,7 @@
 //! first database reads are the Project visibility checks; only after those
 //! checks do we touch Charter, milestone, Task, evidence, or release rows.
 
-use api_types::ProjectOverview;
+use api_types::{DocumentFreshnessStatus, ProjectNextAction, ProjectOverview};
 use axum::{
     extract::{Path, State},
     Json,
@@ -15,6 +15,7 @@ use db::{ProjectMemberRepo, ProjectRepo};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use sqlx::Row;
+use std::collections::HashMap;
 
 use crate::{
     errors::{ApiError, ApiResult},
@@ -65,10 +66,11 @@ pub async fn get_project_overview(
     let check_summary = load_check_summary(&state, &project.id, None).await?;
     let (milestone_evidence, evidence_stale) = load_evidence(&state, &project.id).await?;
     stale |= evidence_stale;
-    let (document_freshness, unapproved_documents) =
+    let (document_freshness, document_projection_stale) =
         load_document_freshness(&state, &project.id).await?;
-    stale |= unapproved_documents;
+    stale |= document_projection_stale;
     let unresolved_decision_ids = load_unresolved_decisions(&state, &project.id).await?;
+    let decisions = load_decisions(&state, &project.id).await?;
     let (releases, releases_stale) = load_releases(&state, &project.id).await?;
     stale |= releases_stale;
     let watermark = load_watermark(&state, &project.id, project.project_work_epoch).await?;
@@ -98,6 +100,9 @@ pub async fn get_project_overview(
     let execution_setup = services::load_project_execution_setup(&state.db, &project.id)
         .await
         .map_err(|_| ApiError::internal("Project execution setup projection is unavailable"))?;
+    let milestone_runtime = services::MilestoneRuntime::new(state.db.clone());
+    let failed_task_count = load_failed_task_count(&state, &project.id).await?;
+    let reconciliation_required = load_reconciliation_required(&state, &project.id).await?;
 
     let mut milestone_overviews = Vec::with_capacity(active_milestones.len());
     for (milestone, definition) in active_milestones {
@@ -112,7 +117,7 @@ pub async fn get_project_overview(
             .get("definition_revision_id")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let (latest_readiness, readiness_stale) = load_latest_readiness(
+        let (latest_readiness, mut readiness_stale) = load_latest_readiness(
             &state,
             &project.id,
             &milestone_id,
@@ -120,6 +125,24 @@ pub async fn get_project_overview(
             &milestone_evidence,
         )
         .await?;
+        let readiness_freshness = if let Some(snapshot) = latest_readiness.as_ref() {
+            let snapshot_id = snapshot
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ApiError::internal("Readiness snapshot id is missing"))?;
+            let freshness = milestone_runtime
+                .readiness_freshness(&project.id, &milestone_id, snapshot_id)
+                .await
+                .map_err(|_| {
+                    ApiError::internal("Readiness freshness is temporarily unavailable")
+                })?;
+            readiness_stale |= freshness.status != api_types::ReadinessFreshnessStatus::Current;
+            Some(serde_json::to_value(freshness).map_err(|_| {
+                ApiError::internal("Readiness freshness projection is temporarily unavailable")
+            })?)
+        } else {
+            None
+        };
         stale |= readiness_stale;
         let evidence = milestone_evidence
             .iter()
@@ -137,17 +160,28 @@ pub async fn get_project_overview(
             "task_counts": counts,
             "check_summary": checks,
             "latest_readiness": latest_readiness,
+            "readiness_freshness": readiness_freshness,
             "evidence": evidence,
         }));
     }
 
     let projection_state = if stale { "stale" } else { "current" };
-    let next_action = next_action(
-        project.charter_setup_required,
-        milestone_overviews.is_empty(),
-        &check_summary,
+    let next_action = next_action(NextActionContext {
+        project_id: &project.id,
+        project_version: project.version,
+        charter_setup_required: project.charter_setup_required,
+        no_milestones: milestone_overviews.is_empty(),
+        execution_setup: &execution_setup,
+        milestones: &milestone_overviews,
+        documents: &document_freshness,
+        releases: &releases,
+        unresolved_decision_ids: &unresolved_decision_ids,
+        task_counts: &task_counts,
+        failed_task_count,
+        checks: &check_summary,
+        reconciliation_required,
         stale,
-    );
+    });
     let generated_at = db::now_rfc3339();
 
     let overview = serde_json::from_value::<ProjectOverview>(json!({
@@ -161,6 +195,7 @@ pub async fn get_project_overview(
         "task_counts": task_counts,
         "check_summary": check_summary,
         "unresolved_decision_ids": unresolved_decision_ids,
+        "decisions": decisions,
         "risks": current_charter
             .as_ref()
             .and_then(|value| value.pointer("/content/constraints_and_risks/risks"))
@@ -610,10 +645,18 @@ async fn load_document_freshness(
     let rows = sqlx::query(
         "SELECT d.id, d.kind, d.lifecycle AS document_lifecycle,
                 d.current_draft_revision_id,
-                d.current_approved_revision_id, r.content_digest, r.lifecycle
+                d.current_approved_revision_id,
+                approved.content_digest AS approved_digest,
+                approved.lifecycle AS approved_lifecycle,
+                working.content_digest AS working_digest,
+                working.lifecycle AS working_lifecycle
          FROM project_document d
-         LEFT JOIN project_document_revision r
-           ON r.id = d.current_approved_revision_id
+         LEFT JOIN project_document_revision approved
+           ON approved.id = d.current_approved_revision_id
+          AND approved.document_id = d.id
+         LEFT JOIN project_document_revision working
+           ON working.id = d.current_draft_revision_id
+          AND working.document_id = d.id
          WHERE d.project_id = ?
          ORDER BY d.updated_at DESC, d.id ASC",
     )
@@ -627,58 +670,89 @@ async fn load_document_freshness(
         let approved = row
             .try_get::<Option<String>, _>("current_approved_revision_id")
             .map_err(sql_error)?;
-        let Some(current_revision_id) = approved else {
-            stale = true;
-            continue;
-        };
         let Some(kind) = document_kind(row.try_get::<String, _>("kind").map_err(sql_error)?) else {
             stale = true;
             continue;
         };
-        let Some(digest) = row
-            .try_get::<Option<String>, _>("content_digest")
-            .map_err(sql_error)?
-        else {
-            stale = true;
-            continue;
-        };
-        let revision_lifecycle = row
-            .try_get::<Option<String>, _>("lifecycle")
-            .map_err(sql_error)?;
         let document_lifecycle = row
             .try_get::<String, _>("document_lifecycle")
             .map_err(sql_error)?;
         let draft = row
             .try_get::<Option<String>, _>("current_draft_revision_id")
             .map_err(sql_error)?;
-        let is_stale = document_is_stale(
-            &document_lifecycle,
-            revision_lifecycle.as_deref(),
-            draft.as_deref(),
-            &current_revision_id,
-        );
-        stale |= is_stale;
+        let approved_digest = row
+            .try_get::<Option<String>, _>("approved_digest")
+            .map_err(sql_error)?;
+        let approved_lifecycle = row
+            .try_get::<Option<String>, _>("approved_lifecycle")
+            .map_err(sql_error)?;
+        let working_digest = row
+            .try_get::<Option<String>, _>("working_digest")
+            .map_err(sql_error)?;
+        let working_lifecycle = row
+            .try_get::<Option<String>, _>("working_lifecycle")
+            .map_err(sql_error)?;
+        let approved_is_valid = approved.as_deref().is_some_and(|id| !id.trim().is_empty())
+            && approved_digest
+                .as_deref()
+                .is_some_and(|digest| !digest.trim().is_empty())
+            && approved_lifecycle.as_deref() == Some("approved");
+        let working_is_valid = draft.as_deref().is_none_or(|id| {
+            !id.trim().is_empty()
+                && working_digest
+                    .as_deref()
+                    .is_some_and(|digest| !digest.trim().is_empty())
+                && working_lifecycle.is_some()
+        });
+        let has_unapproved_working = draft
+            .as_deref()
+            .is_some_and(|id| approved.as_deref() != Some(id));
+        let status = if !working_is_valid || document_lifecycle == "corrupt" {
+            stale = true;
+            DocumentFreshnessStatus::ReconciliationRequired
+        } else if approved_is_valid && document_lifecycle == "approved" {
+            if has_unapproved_working {
+                DocumentFreshnessStatus::ChangesPending
+            } else {
+                DocumentFreshnessStatus::Current
+            }
+        } else if draft.is_some() && working_is_valid {
+            // A draft/proposed revision is useful Project work even before the
+            // first approved revision exists. It must be shown as pending,
+            // never silently dropped as if the document did not exist.
+            DocumentFreshnessStatus::ChangesPending
+        } else {
+            stale = true;
+            DocumentFreshnessStatus::Stale
+        };
+        let reason = match status {
+            DocumentFreshnessStatus::ChangesPending => Some(
+                "A working revision is newer than the approved Project truth and awaits approval.",
+            ),
+            DocumentFreshnessStatus::Stale => Some(
+                "The document has no complete approved revision that can be used as Project truth.",
+            ),
+            DocumentFreshnessStatus::ReconciliationRequired => Some(
+                "The document pointers or revision metadata disagree and require reconciliation.",
+            ),
+            DocumentFreshnessStatus::Unavailable => {
+                Some("The document revision projection is unavailable.")
+            }
+            DocumentFreshnessStatus::Current => None,
+        };
         documents.push(json!({
             "document_id": try_get!(row, String, "id"),
             "kind": kind,
-            "current_revision_id": current_revision_id,
-            "current_digest": digest,
-            "stale": is_stale,
-            "reason": if is_stale { Some("An unapproved or non-approved revision is ahead of the current document truth.") } else { None },
+            "approved_revision_id": approved,
+            "approved_digest": approved_digest,
+            "working_revision_id": draft,
+            "working_digest": working_digest,
+            "working_lifecycle": working_lifecycle,
+            "status": status,
+            "reason": reason,
         }));
     }
     Ok((documents, stale))
-}
-
-fn document_is_stale(
-    document_lifecycle: &str,
-    revision_lifecycle: Option<&str>,
-    draft_revision_id: Option<&str>,
-    approved_revision_id: &str,
-) -> bool {
-    document_lifecycle != "approved"
-        || revision_lifecycle != Some("approved")
-        || draft_revision_id.is_some_and(|id| id != approved_revision_id)
 }
 
 async fn load_unresolved_decisions(state: &AppState, project_id: &str) -> ApiResult<Vec<String>> {
@@ -696,10 +770,116 @@ async fn load_unresolved_decisions(state: &AppState, project_id: &str) -> ApiRes
         .collect()
 }
 
+/// Load a bounded effective Decision Log projection. Candidate rows are not
+/// included here; they remain in `unresolved_decision_ids` so a draft cannot
+/// be mistaken for an authoritative decision.
+async fn load_decisions(state: &AppState, project_id: &str) -> ApiResult<Vec<Value>> {
+    let rows = sqlx::query(
+        "SELECT id, project_id, state, decision_class, question, context_json,
+                options_json, selected_outcome, rationale, principal_type,
+                principal_id, authority_basis, source_refs_json,
+                affected_records_json, supersedes_decision_id, created_at
+         FROM project_decision
+         WHERE project_id = ?
+         ORDER BY created_at DESC, id DESC
+         LIMIT 64",
+    )
+    .bind(project_id)
+    .fetch_all(state.db.pool())
+    .await
+    .map_err(sql_error)?;
+
+    let replacement_rows = sqlx::query(
+        "SELECT supersedes_decision_id, state FROM project_decision
+         WHERE project_id = ? AND supersedes_decision_id IS NOT NULL
+         ORDER BY created_at DESC, id DESC",
+    )
+    .bind(project_id)
+    .fetch_all(state.db.pool())
+    .await
+    .map_err(sql_error)?;
+    let mut replacement_state = HashMap::<String, String>::new();
+    for row in replacement_rows {
+        let Some(superseded_id) = row
+            .try_get::<Option<String>, _>("supersedes_decision_id")
+            .map_err(sql_error)?
+        else {
+            continue;
+        };
+        replacement_state.insert(superseded_id, try_get!(row, String, "state"));
+    }
+
+    let mut decisions = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id = try_get!(row, String, "id");
+        let state = effective_decision_state(
+            &try_get!(row, String, "state"),
+            replacement_state.get(&id).map(String::as_str),
+        );
+        let principal = principal_value(
+            try_get!(row, String, "principal_type").as_str(),
+            Some(try_get!(row, String, "principal_id").as_str()),
+        )
+        .ok_or_else(|| ApiError::internal("invalid persisted Decision principal"))?;
+        let affected = row_json(&row, "affected_records_json")?;
+        let affected_artifact_refs = affected
+            .get("artifact_refs")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let affected_task_ids = affected
+            .get("task_ids")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let affected_milestone_ids = affected
+            .get("milestone_ids")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let decision = json!({
+            "id": id,
+            "project_id": try_get!(row, String, "project_id"),
+            "state": state,
+            "question": try_get!(row, String, "question"),
+            "context": Some(try_get!(row, String, "context_json")),
+            "options": row_json_array(&row, "options_json")?,
+            "selected_outcome": try_get!(row, String, "selected_outcome"),
+            "rationale": try_get!(row, String, "rationale"),
+            "decision_maker": principal,
+            "decision_class": try_get!(row, String, "decision_class"),
+            "authority_basis": Some(try_get!(row, String, "authority_basis")),
+            "affected_artifact_refs": affected_artifact_refs,
+            "affected_task_ids": affected_task_ids,
+            "affected_milestone_ids": affected_milestone_ids,
+            "supersedes_id": try_get!(row, Option<String>, "supersedes_decision_id"),
+            "provenance": row_json_array(&row, "source_refs_json")?,
+            "created_at": try_get!(row, String, "created_at"),
+            "effective_at": try_get!(row, String, "created_at"),
+        });
+        // Validate the closed public contract at the projection boundary so a
+        // malformed persisted row cannot become a permissive JSON blob.
+        let _: api_types::DecisionRecord = serde_json::from_value(decision.clone())
+            .map_err(|_| ApiError::internal("invalid persisted Decision record"))?;
+        decisions.push(decision);
+    }
+    Ok(decisions)
+}
+
+fn effective_decision_state(current: &str, replacement_state: Option<&str>) -> String {
+    if current != "active" {
+        return current.to_owned();
+    }
+    match replacement_state {
+        Some("invalidated") => "invalidated".to_owned(),
+        Some(_) => "superseded".to_owned(),
+        None => "active".to_owned(),
+    }
+}
+
 async fn load_evidence(state: &AppState, project_id: &str) -> ApiResult<(Vec<Value>, bool)> {
     let rows = sqlx::query(
         "SELECT a.id, a.project_id, a.asset_id, a.task_id,
                 a.source_task_id, a.source_execution_id, a.source_validation_id,
+                a.source_task_version, a.source_context_digest,
+                a.source_definition_revision_id,
                 a.milestone_id, a.acceptance_check_ids_json, a.caption,
                 a.evidence_kind, COALESCE(a.checksum, m.checksum) AS checksum,
                 CASE WHEN m.availability != 'available' THEN m.availability
@@ -758,10 +938,17 @@ async fn load_evidence(state: &AppState, project_id: &str) -> ApiResult<(Vec<Val
             "project_id": try_get!(row, String, "project_id"),
             "asset_id": try_get!(row, String, "asset_id"),
             "task_id": try_get!(row, Option<String>, "task_id"),
-            "source_task_id": try_get!(row, Option<String>, "source_task_id"),
-            "source_run_id": try_get!(row, Option<String>, "source_execution_id"),
-            "source_validation_id": try_get!(row, Option<String>, "source_validation_id"),
-            "milestone_id": try_get!(row, Option<String>, "milestone_id"),
+        "source_task_id": try_get!(row, Option<String>, "source_task_id"),
+        "source_run_id": try_get!(row, Option<String>, "source_execution_id"),
+        "source_validation_id": try_get!(row, Option<String>, "source_validation_id"),
+        "source_task_version": try_get!(row, Option<i64>, "source_task_version"),
+        "source_context_digest": try_get!(row, Option<String>, "source_context_digest"),
+        "source_definition_revision_id": try_get!(
+            row,
+            Option<String>,
+            "source_definition_revision_id"
+        ),
+        "milestone_id": try_get!(row, Option<String>, "milestone_id"),
             "acceptance_check_ids": row_json_array_from(&row, "acceptance_check_ids_json")?,
             "caption": try_get!(row, Option<String>, "caption").unwrap_or_default(),
             "kind": kind,
@@ -821,10 +1008,6 @@ async fn load_latest_readiness(
         || release_policy_revision.trim().is_empty()
         || release_policy_digest.trim().is_empty()
         || source_event_watermark.trim().is_empty();
-    if stale {
-        return Ok((None, true));
-    }
-
     let input_manifest =
         typed_json_array::<api_types::ReadinessInput>(&row, "input_manifest_json")?;
     let reasons = typed_json_array::<api_types::ReadinessReason>(&row, "blocking_reasons_json")?;
@@ -833,8 +1016,21 @@ async fn load_latest_readiness(
     let waiver_ids = string_array_from(&row, "waiver_manifest_json")?;
     let evidence_attachment_ids =
         readiness_evidence_ids(&row_json(&row, "evidence_manifest_json")?)?;
-    let mut evidence_digests = Vec::new();
-    let mut evidence_availability = Vec::new();
+    let persisted_evidence_manifest = row_json(&row, "evidence_manifest_json")?;
+    let persisted_evidence_digests = persisted_evidence_manifest
+        .get("digests")
+        .or_else(|| persisted_evidence_manifest.get("evidence_digests"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let persisted_evidence_availability = persisted_evidence_manifest
+        .get("availability")
+        .or_else(|| persisted_evidence_manifest.get("evidence_availability"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut evidence_digests = persisted_evidence_digests;
+    let mut evidence_availability = persisted_evidence_availability;
     let mut evidence_stale = false;
     for attachment_id in evidence_attachment_ids
         .as_array()
@@ -846,19 +1042,28 @@ async fn load_latest_readiness(
             .iter()
             .find(|item| item.get("id").and_then(Value::as_str) == Some(attachment_id))
         else {
-            return Ok((None, true));
+            evidence_stale = true;
+            continue;
         };
         let Some(checksum) = attachment.get("checksum").and_then(Value::as_str) else {
-            return Ok((None, true));
+            evidence_stale = true;
+            continue;
         };
         let Some(availability) = attachment.get("availability").and_then(Value::as_str) else {
-            return Ok((None, true));
+            evidence_stale = true;
+            continue;
         };
         if availability != "available" {
             evidence_stale = true;
         }
-        evidence_digests.push(Value::String(checksum.to_owned()));
-        evidence_availability.push(Value::String(availability.to_owned()));
+        // Keep the exact persisted manifest as the immutable snapshot body;
+        // only the separate freshness overlay reflects current attachments.
+        if evidence_digests.is_empty() {
+            evidence_digests.push(Value::String(checksum.to_owned()));
+        }
+        if evidence_availability.is_empty() {
+            evidence_availability.push(Value::String(availability.to_owned()));
+        }
     }
     let commit_build_check_context = string_array_from(&row, "commit_context_json")?;
     let result = try_get!(row, String, "outcome");
@@ -1156,38 +1361,535 @@ async fn load_watermark(
     })
 }
 
-fn next_action(
+async fn load_failed_task_count(state: &AppState, project_id: &str) -> ApiResult<i64> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM task
+         WHERE project_id = ? AND deleted_at IS NULL
+           AND (lower(status) LIKE '%failed%'
+                OR lower(status) LIKE '%error%'
+                OR failed_json IS NOT NULL)",
+    )
+    .bind(project_id)
+    .fetch_one(state.db.pool())
+    .await
+    .map_err(sql_error)
+}
+
+async fn load_reconciliation_required(state: &AppState, project_id: &str) -> ApiResult<bool> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS (
+             SELECT 1 FROM project_reconciliation_record
+             WHERE project_id = ? AND state = 'required'
+         )",
+    )
+    .bind(project_id)
+    .fetch_one(state.db.pool())
+    .await
+    .map(|value| value != 0)
+    .map_err(sql_error)
+}
+
+macro_rules! project_action {
+    (
+        $code:expr,
+        $required_principal:expr,
+        $target_type:expr,
+        $target_id:expr,
+        $title:expr,
+        $explanation:expr,
+        $action_kind:expr,
+        $route_or_operation:expr,
+        $blocking:expr,
+        $expected_version:expr $(,)?
+    ) => {
+        ProjectNextAction {
+            code: $code.to_owned(),
+            required_principal: $required_principal.to_owned(),
+            target_type: $target_type.to_owned(),
+            target_id: ($target_id).into(),
+            title: $title.to_owned(),
+            explanation: $explanation.to_owned(),
+            action_kind: $action_kind.to_owned(),
+            route_or_operation: $route_or_operation.to_owned(),
+            blocking: $blocking,
+            expected_version: $expected_version,
+        }
+    };
+}
+
+struct NextActionContext<'a> {
+    project_id: &'a str,
+    project_version: i64,
     charter_setup_required: bool,
     no_milestones: bool,
-    checks: &Value,
+    execution_setup: &'a api_types::ProjectExecutionSetupResponse,
+    milestones: &'a [Value],
+    documents: &'a [Value],
+    releases: &'a [Value],
+    unresolved_decision_ids: &'a [String],
+    task_counts: &'a Value,
+    failed_task_count: i64,
+    checks: &'a Value,
+    reconciliation_required: bool,
     stale: bool,
-) -> Option<String> {
+}
+
+fn next_action(context: NextActionContext<'_>) -> Option<ProjectNextAction> {
+    let NextActionContext {
+        project_id,
+        project_version,
+        charter_setup_required,
+        no_milestones,
+        execution_setup,
+        milestones,
+        documents,
+        releases,
+        unresolved_decision_ids,
+        task_counts,
+        failed_task_count,
+        checks,
+        reconciliation_required,
+        stale,
+    } = context;
+    // This order is part of the public projection contract. More specific
+    // blockers must never be hidden behind a generic stale banner.
     if charter_setup_required {
-        return Some("Adopt an approved Project Charter before release.".to_owned());
+        return Some(project_action!(
+            "charter_adoption",
+            "user",
+            "project",
+            project_id,
+            "Adopt the Project Charter",
+            "An approved Charter is required before Project work can be governed.",
+            "approval",
+            "project.charter.adoption",
+            true,
+            Some(project_version),
+        ));
+    }
+    if reconciliation_required {
+        return Some(project_action!(
+            "reconciliation_required",
+            "user",
+            "project",
+            project_id,
+            "Resolve the Project reconciliation",
+            "A canonical conflict is waiting for an explicit user resolution.",
+            "reconciliation",
+            "project.reconciliation.resolve",
+            true,
+            Some(project_version),
+        ));
+    }
+    if let Some(milestone) = milestones.iter().find(|milestone| {
+        milestone
+            .get("milestone")
+            .and_then(|value| value.get("projection_reasons"))
+            .and_then(Value::as_array)
+            .is_some_and(|reasons| {
+                reasons.iter().any(|reason| {
+                    matches!(
+                        reason.get("kind").and_then(Value::as_str),
+                        Some("reconciliation") | Some("conflict")
+                    )
+                })
+            })
+    }) {
+        let milestone = milestone.get("milestone")?;
+        let milestone_id = milestone.get("id")?.as_str()?;
+        let version = milestone.get("version").and_then(Value::as_i64);
+        return Some(project_action!(
+            "milestone_reconciliation",
+            "user",
+            "milestone",
+            milestone_id,
+            "Reconcile the milestone",
+            "The current milestone projection contains an unresolved canonical conflict.",
+            "reconciliation",
+            "project.milestone.reconcile",
+            true,
+            version,
+        ));
+    }
+    if documents.iter().any(|document| {
+        matches!(
+            document.get("status").and_then(Value::as_str),
+            Some("stale") | Some("reconciliation_required") | Some("unavailable")
+        )
+    }) {
+        return Some(project_action!(
+            "document_reconciliation",
+            "project_agent",
+            "project",
+            project_id,
+            "Reconcile Project documents",
+            "A governing Document pointer or revision is incomplete and cannot be used as Project truth.",
+            "reconciliation",
+            "project.document.reconcile",
+            true,
+            Some(project_version),
+        ));
+    }
+
+    if execution_setup_requires_action(execution_setup) {
+        let (code, title, explanation, operation) = match execution_setup.execution_setup_state {
+            api_types::ExecutionSetupState::Provisioning => (
+                "execution_setup_provisioning",
+                "Finish execution setup",
+                "Repository and execution principals are still being provisioned.",
+                "project.execution_setup.retry",
+            ),
+            api_types::ExecutionSetupState::Failed => (
+                "execution_setup_failed",
+                "Repair execution setup",
+                "Execution setup failed and needs explicit configuration or retry.",
+                "project.execution_setup.reconcile",
+            ),
+            api_types::ExecutionSetupState::Unavailable => (
+                "execution_setup_unavailable",
+                "Refresh execution setup",
+                "The authoritative execution setup projection is unavailable.",
+                "project.execution_setup.refresh",
+            ),
+            _ => (
+                "execution_setup_required",
+                "Complete execution setup",
+                "Select the execution roles and attach a repository before running Tasks.",
+                "project.execution_setup",
+            ),
+        };
+        return Some(project_action!(
+            code,
+            "user",
+            "project",
+            project_id,
+            title,
+            explanation,
+            "setup",
+            operation,
+            true,
+            Some(execution_setup.project_version),
+        ));
+    }
+
+    match execution_setup.execution_gate {
+        api_types::ExecutionGate::BaselineApprovalRequired => {
+            return Some(project_action!(
+                "baseline_approval",
+                "user",
+                "project",
+                project_id,
+                "Approve the execution baseline",
+                "A proposed execution baseline is available but is not active until the user approves it.",
+                "approval",
+                "project.execution_baseline.approve",
+                true,
+                Some(execution_setup.project_version),
+            ));
+        }
+        api_types::ExecutionGate::PreBaselineReadOnly => {
+            return Some(project_action!(
+                "baseline_proposal",
+                "project_agent",
+                "project",
+                project_id,
+                "Prepare the execution baseline",
+                "The Project needs a bounded execution baseline before Tasks can run.",
+                "planning",
+                "project.execution_baseline.propose",
+                true,
+                Some(execution_setup.project_version),
+            ));
+        }
+        api_types::ExecutionGate::ReconciliationRequired
+        | api_types::ExecutionGate::Unavailable => {
+            return Some(project_action!(
+                "execution_gate_reconciliation",
+                "user",
+                "project",
+                project_id,
+                "Reconcile the execution gate",
+                "The execution gate cannot prove that the current baseline is runnable.",
+                "reconciliation",
+                "project.execution_gate.reconcile",
+                true,
+                Some(execution_setup.project_version),
+            ));
+        }
+        api_types::ExecutionGate::Active => {}
+    }
+
+    if value_i64(task_counts, "blocked") > 0 || failed_task_count > 0 {
+        return Some(project_action!(
+            if value_i64(task_counts, "blocked") > 0 {
+                "task_blocked_remediation"
+            } else {
+                "task_failure_remediation"
+            },
+            "project_agent",
+            "project",
+            project_id,
+            if value_i64(task_counts, "blocked") > 0 {
+                "Unblock blocked Tasks"
+            } else {
+                "Remediate failed Tasks"
+            },
+            if value_i64(task_counts, "blocked") > 0 {
+                "One or more Tasks are blocked and need an explicit dependency or scope remediation."
+            } else {
+                "One or more Tasks have failed and must be repaired or rerun before validation."
+            },
+            "remediation",
+            "task.remediate",
+            true,
+            None,
+        ));
+    }
+    if value_i64(checks, "failed") > 0 {
+        return Some(project_action!(
+            "validation_failure_remediation",
+            "worker",
+            "project",
+            project_id,
+            "Resolve failed validation",
+            "A required acceptance check failed and needs a new authoritative result.",
+            "validation",
+            "project.milestone.check.evaluate",
+            true,
+            None,
+        ));
+    }
+    if value_i64(checks, "stale") > 0
+        || value_i64(checks, "missing") > 0
+        || value_i64(checks, "unavailable") > 0
+    {
+        return Some(project_action!(
+            "validation_required",
+            "worker",
+            "project",
+            project_id,
+            "Complete required validation",
+            "Required acceptance checks are missing, stale, or unavailable.",
+            "validation",
+            "project.milestone.check.evaluate",
+            true,
+            None,
+        ));
+    }
+    if !unresolved_decision_ids.is_empty() {
+        return Some(project_action!(
+            "decision_resolution",
+            "user",
+            "decision",
+            unresolved_decision_ids[0].clone(),
+            "Resolve the open decision",
+            "A draft or proposed decision is still awaiting explicit resolution.",
+            "reconciliation",
+            "project.decision.resolve",
+            true,
+            None,
+        ));
+    }
+    if let Some(milestone) = milestones
+        .iter()
+        .find(|milestone| evidence_requires_attention(milestone))
+    {
+        let milestone = milestone.get("milestone")?;
+        let milestone_id = milestone.get("id")?.as_str()?;
+        let version = milestone.get("version").and_then(Value::as_i64);
+        return Some(project_action!(
+            "evidence_required",
+            "worker",
+            "milestone",
+            milestone_id,
+            "Attach required evidence",
+            "The milestone's evidence contract is not satisfied by available authoritative attachments.",
+            "evidence",
+            "project.milestone.evidence.attach",
+            true,
+            version,
+        ));
+    }
+
+    if let Some(milestone) = milestones.iter().find(|milestone| {
+        milestone.get("latest_readiness").is_none_or(Value::is_null)
+            || milestone
+                .get("readiness_freshness")
+                .and_then(|freshness| freshness.get("status"))
+                .and_then(Value::as_str)
+                .is_some_and(|status| status != "current")
+    }) {
+        let milestone = milestone.get("milestone")?;
+        let milestone_id = milestone.get("id")?.as_str()?;
+        let version = milestone.get("version").and_then(Value::as_i64);
+        return Some(project_action!(
+            "readiness_request",
+            "project_agent",
+            "milestone",
+            milestone_id,
+            "Request a readiness snapshot",
+            "Validation and evidence are present; compute a fresh immutable readiness snapshot.",
+            "readiness",
+            "project.milestone.readiness",
+            true,
+            version,
+        ));
+    }
+
+    if let Some(milestone) = milestones.iter().find(|milestone| {
+        milestone
+            .get("latest_readiness")
+            .and_then(|snapshot| snapshot.get("result"))
+            .and_then(Value::as_str)
+            .is_some_and(|result| result != "ready")
+            && milestone
+                .get("readiness_freshness")
+                .and_then(|freshness| freshness.get("status"))
+                .and_then(Value::as_str)
+                == Some("current")
+    }) {
+        let milestone = milestone.get("milestone")?;
+        let milestone_id = milestone.get("id")?.as_str()?;
+        let version = milestone.get("version").and_then(Value::as_i64);
+        return Some(project_action!(
+            "readiness_blocked",
+            "project_agent",
+            "milestone",
+            milestone_id,
+            "Address readiness blockers",
+            "The latest authoritative readiness snapshot is not ready for release; resolve its typed reasons and evaluate again.",
+            "readiness",
+            "project.milestone.readiness",
+            true,
+            version,
+        ));
+    }
+
+    if let Some(milestone) = milestones.iter().find(|milestone| {
+        let Some(snapshot) = milestone.get("latest_readiness") else {
+            return false;
+        };
+        snapshot.get("result").and_then(Value::as_str) == Some("ready")
+            && milestone
+                .get("readiness_freshness")
+                .and_then(|freshness| freshness.get("status"))
+                .and_then(Value::as_str)
+                == Some("current")
+            && milestone_release_missing(milestone, releases)
+    }) {
+        let milestone = milestone.get("milestone")?;
+        let milestone_id = milestone.get("id")?.as_str()?;
+        // Release CAS is against the current mutable milestone row. The
+        // immutable readiness candidate's expected version is one step behind
+        // after readiness evaluation advances the lifecycle/version.
+        let expected_version = milestone.get("version").and_then(Value::as_i64);
+        return Some(project_action!(
+            "user_release",
+            "user",
+            "milestone",
+            milestone_id,
+            "Release the ready milestone",
+            "The latest readiness snapshot is ready for the exact user-authorized release operation.",
+            "release",
+            "project.milestone.release",
+            true,
+            expected_version,
+        ));
+    }
+
+    if no_milestones {
+        return Some(project_action!(
+            "milestone_definition",
+            "project_agent",
+            "project",
+            project_id,
+            "Define the next bounded milestone",
+            "No active milestone is available; define the next bounded outcome and acceptance contract.",
+            "planning",
+            "project.milestone.define",
+            true,
+            Some(project_version),
+        ));
     }
     if stale {
-        return Some("Reconcile stale Project records before release.".to_owned());
-    }
-    if no_milestones {
-        return Some("Define the first bounded outcome and acceptance checks.".to_owned());
-    }
-    if checks
-        .get("failed")
-        .and_then(Value::as_i64)
-        .unwrap_or_default()
-        > 0
-    {
-        return Some("Resolve the failed acceptance check.".to_owned());
-    }
-    if checks
-        .get("missing")
-        .and_then(Value::as_i64)
-        .unwrap_or_default()
-        > 0
-    {
-        return Some("Define or validate the required acceptance checks.".to_owned());
+        return Some(project_action!(
+            "projection_reconciliation",
+            "project_agent",
+            "project",
+            project_id,
+            "Reconcile stale Project records",
+            "The Overview contains records that no longer prove a current authoritative projection.",
+            "reconciliation",
+            "project.projection.reconcile",
+            true,
+            Some(project_version),
+        ));
     }
     None
+}
+
+fn value_i64(value: &Value, key: &str) -> i64 {
+    value.get(key).and_then(Value::as_i64).unwrap_or_default()
+}
+
+fn execution_setup_requires_action(setup: &api_types::ProjectExecutionSetupResponse) -> bool {
+    setup.coordination_state != api_types::CoordinationState::Ready
+        || !matches!(
+            setup.execution_setup_state,
+            api_types::ExecutionSetupState::Ready
+        )
+        || !setup.setup_requirements.is_empty()
+}
+
+fn evidence_requires_attention(milestone: &Value) -> bool {
+    let Some(definition) = milestone.get("definition") else {
+        return false;
+    };
+    let requirements = definition
+        .pointer("/content/evidence_requirements")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if requirements.is_empty() {
+        return false;
+    }
+    let evidence = milestone
+        .get("evidence")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if evidence.is_empty() {
+        return true;
+    }
+    let available = evidence
+        .iter()
+        .filter(|item| item.get("availability").and_then(Value::as_str) == Some("available"));
+    let available = available.count();
+    let required_count = requirements
+        .iter()
+        .filter(|requirement| {
+            requirement
+                .get("required")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        })
+        .count();
+    // The definition and attachment schemas can evolve independently; when a
+    // requirement has no explicit id, count-based availability is the only
+    // safe projection and still fails closed.
+    available < required_count.max(1)
+}
+
+fn milestone_release_missing(milestone: &Value, releases: &[Value]) -> bool {
+    let milestone_id = milestone
+        .get("milestone")
+        .and_then(|value| value.get("id"))
+        .and_then(Value::as_str);
+    milestone_id.is_some_and(|id| {
+        !releases
+            .iter()
+            .any(|release| release.get("milestone_id").and_then(Value::as_str) == Some(id))
+    })
 }
 
 #[derive(Default)]
@@ -1396,25 +2098,4 @@ fn sql_error(error: sqlx::Error) -> ApiError {
 fn db_error(error: db::DbError) -> ApiError {
     tracing::error!(error = ?error, "Project Overview repository query failed");
     ApiError::internal("Project Overview is temporarily unavailable")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::document_is_stale;
-
-    #[test]
-    fn approved_document_without_a_newer_draft_is_fresh() {
-        assert!(!document_is_stale(
-            "approved",
-            Some("approved"),
-            Some("revision-1"),
-            "revision-1",
-        ));
-        assert!(document_is_stale(
-            "approved",
-            Some("approved"),
-            Some("revision-2"),
-            "revision-1",
-        ));
-    }
 }

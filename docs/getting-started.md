@@ -294,10 +294,20 @@ in a Task Workspace.
 ### 1. Main Chat: rough idea → exact Charter
 
 First connect a provider, create an account-owned agent, and bind it as the
-account's Main Agent in Agent Settings. In Main Chat, choose **Start a product**
-and enter the rough idea. This starts one typed Product Genesis session through
-`POST /api/v1/account/main-agent/product-genesis`; without a valid Main binding
-the server returns `setup_required` and creates no session or turn.
+account's Main Agent in Agent Settings. Then tell Main Chat naturally that you
+want to begin a new Project—for example, “Help me start a Project for release
+note automation.” The Main baseline recognizes clear new-Project intent and
+invokes the typed `genesis.start` operation. If it is unclear whether you mean a
+new Project or an existing one, the Main Agent asks one short clarifying
+question; ordinary portfolio questions remain ordinary chat.
+
+`/start-product <idea>` is still available as an explicit shortcut. It calls
+`POST /api/v1/account/main-agent/product-genesis` with a fresh
+`idempotency_key`; normal messages continue through normal Agent Chat admission,
+with no browser-side intent matching. Without a valid Main binding the server
+returns `setup_required` and creates no session or turn. Starting Product
+Genesis begins discovery only—it does not approve a Charter or create a
+Project.
 
 The `forge.main.project-discovery/v2` skill keeps discovery bounded (at most two
 consequential questions per turn) and records facts, decisions, research,

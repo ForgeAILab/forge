@@ -3,7 +3,8 @@ import type { AcceptanceCheckSummary } from "./AcceptanceCheckSummary";
 import type { EvidenceAttachment } from "./EvidenceAttachment";
 import type { MilestoneDefinitionRevision } from "./MilestoneDefinitionRevision";
 import type { ProjectMilestone } from "./ProjectMilestone";
+import type { ReadinessFreshness } from "./ReadinessFreshness";
 import type { ReadinessSnapshot } from "./ReadinessSnapshot";
 import type { TaskProgressCounts } from "./TaskProgressCounts";
 
-export type ProjectMilestoneOverview = { milestone: ProjectMilestone, definition: MilestoneDefinitionRevision, task_counts: TaskProgressCounts, check_summary: AcceptanceCheckSummary, latest_readiness: ReadinessSnapshot | null, evidence: Array<EvidenceAttachment>, };
+export type ProjectMilestoneOverview = { milestone: ProjectMilestone, definition: MilestoneDefinitionRevision, task_counts: TaskProgressCounts, check_summary: AcceptanceCheckSummary, latest_readiness: ReadinessSnapshot | null, readiness_freshness: ReadinessFreshness | null, evidence: Array<EvidenceAttachment>, };

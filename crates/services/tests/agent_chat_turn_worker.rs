@@ -3,6 +3,7 @@ use std::sync::{
     Arc, Mutex,
 };
 
+use api_types::ProductMaturity;
 use async_trait::async_trait;
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AccountMainAgentBindingRepo,
@@ -10,10 +11,12 @@ use db::{
     AgentRepo, AgentStatus, CreateAgentIdentity, CreateAgentProfile, SelectAgentProfile, SqliteDb,
     User, UserRepo,
 };
+use forge_agent_host::{CanonicalScope, CanonicalScopeType, WorkspaceAccess};
 use serde_json::json;
 use services::{
     AgentChatService, AgentChatTurnRunner, AgentChatTurnWorker, CompletedAgentChatTurn,
-    SendAgentChatMessageInput, ServiceError, SetMainAgentBindingInput,
+    MainGenesisCommandService, MainGenesisStartCommandInput, MainGenesisStartPrincipal,
+    MainGenesisStartRequest, SendAgentChatMessageInput, ServiceError, SetMainAgentBindingInput,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -142,6 +145,126 @@ impl AgentChatTurnRunner for RetryRunnerSpy {
             pending_interaction_id: None,
         })
     }
+}
+
+struct GenesisTransferRunner {
+    db: Arc<SqliteDb>,
+    chat_id: String,
+    command_committed: AtomicUsize,
+    provider_stopped: AtomicUsize,
+}
+
+#[async_trait]
+impl AgentChatTurnRunner for GenesisTransferRunner {
+    async fn run_turn(
+        &self,
+        _job: &AgentChatTurnJob,
+        cancellation: CancellationToken,
+    ) -> services::Result<CompletedAgentChatTurn> {
+        MainGenesisCommandService::new(Arc::clone(&self.db))
+            .start(MainGenesisStartCommandInput {
+                principal: MainGenesisStartPrincipal::MainAgent {
+                    identity_id: IDENTITY_ID.to_owned(),
+                    scope: CanonicalScope {
+                        scope_type: CanonicalScopeType::AgentChat,
+                        scope_id: self.chat_id.clone(),
+                        workspace_access: WorkspaceAccess::Deny,
+                    },
+                },
+                request: MainGenesisStartRequest {
+                    maturity: Some(ProductMaturity::Mvp),
+                    initial_idea: None,
+                    preferred_project_agent_identity_id: None,
+                },
+                idempotency_key: "worker-genesis-control-transfer".to_owned(),
+                correlation_id: "worker-genesis-control-transfer-correlation".to_owned(),
+                causation_id: None,
+                causation_depth: 0,
+                policy_result: "allowed".to_owned(),
+                requested_permission: "propose_discovery".to_owned(),
+            })
+            .await?;
+        self.command_committed.fetch_add(1, Ordering::SeqCst);
+        cancellation.cancelled().await;
+        self.provider_stopped.fetch_add(1, Ordering::SeqCst);
+        Err(ServiceError::Conflict(
+            "baseline provider stopped by Genesis control transfer".to_owned(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn genesis_control_transfer_stops_provider_and_commits_no_baseline_response() {
+    let db = database().await;
+    let chats = AgentChatService::new(Arc::clone(&db));
+    chats
+        .set_main_binding(SetMainAgentBindingInput {
+            actor_user_id: ACCOUNT_ID.to_owned(),
+            account_id: ACCOUNT_ID.to_owned(),
+            identity_id: IDENTITY_ID.to_owned(),
+            autonomy_policy_json: "{}".to_owned(),
+            tool_policy_revision: "genesis-control-transfer-policy".to_owned(),
+            expected_version: None,
+            replacement_reason: None,
+        })
+        .await
+        .expect("Main binding");
+    let chat = AgentChatRepo::get_main_chat(&*db, ACCOUNT_ID)
+        .await
+        .expect("Main Chat lookup")
+        .expect("Main Chat");
+    let admitted = chats
+        .send_message(SendAgentChatMessageInput {
+            actor_user_id: ACCOUNT_ID.to_owned(),
+            chat_id: chat.id.clone(),
+            content: "Start a new Project for calm incident reviews.".to_owned(),
+            dedupe_key: Some("worker-genesis-user-message".to_owned()),
+        })
+        .await
+        .expect("baseline semantic-start turn");
+    let runner = Arc::new(GenesisTransferRunner {
+        db: Arc::clone(&db),
+        chat_id: chat.id.clone(),
+        command_committed: AtomicUsize::new(0),
+        provider_stopped: AtomicUsize::new(0),
+    });
+    let worker = AgentChatTurnWorker::with_runner(
+        Arc::clone(&db),
+        runner.clone() as Arc<dyn AgentChatTurnRunner>,
+    );
+    assert_eq!(worker.run_once().await.expect("control-transfer run"), 1);
+    assert_eq!(runner.command_committed.load(Ordering::SeqCst), 1);
+    assert_eq!(runner.provider_stopped.load(Ordering::SeqCst), 1);
+
+    let source = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &admitted.turn_job.id)
+        .await
+        .expect("source turn lookup")
+        .expect("source turn");
+    assert_eq!(source.status, AgentChatTurnState::Succeeded);
+    assert!(source.response_message_id.is_none());
+    let messages: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat_message WHERE chat_id = ?")
+            .bind(&chat.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("message count");
+    assert_eq!(
+        messages, 1,
+        "only the original visible user message remains"
+    );
+    let continuation: (String, String) = sqlx::query_as(
+        "SELECT status, operating_skill_revision_id
+         FROM agent_chat_turn_job WHERE id <> ? AND triggering_message_id = ?",
+    )
+    .bind(&source.id)
+    .bind(&admitted.message.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("queued discovery continuation");
+    assert_eq!(continuation.0, "queued");
+    assert!(continuation
+        .1
+        .starts_with("forge.main.project-discovery/v2@"));
 }
 
 fn frozen_provenance(job: &AgentChatTurnJob) -> serde_json::Value {

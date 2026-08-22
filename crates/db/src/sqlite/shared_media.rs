@@ -1,6 +1,9 @@
 use super::command_finalization::finalize_command_in_tx;
 use super::*;
 use crate::{BeginProjectMediaUpload, CommandReceipt, CommandReceiptRepo, ProjectMediaUpload};
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 fn map_media_asset(row: &SqliteRow) -> Result<MediaAsset> {
     Ok(MediaAsset {
@@ -37,6 +40,9 @@ fn map_project_media_attachment(row: &SqliteRow) -> Result<ProjectMediaAttachmen
         source_task_id: row.try_get("source_task_id")?,
         source_execution_id: row.try_get("source_execution_id")?,
         source_validation_id: row.try_get("source_validation_id")?,
+        source_task_version: row.try_get("source_task_version")?,
+        source_context_digest: row.try_get("source_context_digest")?,
+        source_definition_revision_id: row.try_get("source_definition_revision_id")?,
         acceptance_check_ids_json: row.try_get("acceptance_check_ids_json")?,
         caption: row.try_get("caption")?,
         evidence_kind: row.try_get("evidence_kind")?,
@@ -70,8 +76,176 @@ fn map_project_release_media_pin(row: &SqliteRow) -> Result<ProjectReleaseMediaP
 }
 
 const MEDIA_ASSET_COLUMNS: &str = "id, project_id, legacy_task_media_id, display_filename, content_type, byte_size, storage_key, checksum, availability, gc_state, gc_candidate_at, gc_lease_owner, gc_lease_expires_at, version, deleted_at, created_at, updated_at";
-const PROJECT_MEDIA_ATTACHMENT_COLUMNS: &str = "id, project_id, asset_id, attachment_kind, task_media_id, task_id, milestone_id, milestone_check_id, source_task_id, source_execution_id, source_validation_id, acceptance_check_ids_json, caption, evidence_kind, checksum, availability, project_url, author_type, author_id, authorization_json, version, created_at, deleted_at, updated_at";
+const PROJECT_MEDIA_ATTACHMENT_COLUMNS: &str = "id, project_id, asset_id, attachment_kind, task_media_id, task_id, milestone_id, milestone_check_id, source_task_id, source_execution_id, source_validation_id, source_task_version, source_context_digest, source_definition_revision_id, acceptance_check_ids_json, caption, evidence_kind, checksum, availability, project_url, author_type, author_id, authorization_json, version, created_at, deleted_at, updated_at";
 const PROJECT_RELEASE_MEDIA_PIN_COLUMNS: &str = "id, project_id, release_id, asset_id, attachment_id, legacy_task_media_id, asset_checksum, attachment_digest, availability, pin_digest, created_at";
+const EVIDENCE_CONTEXT_DIGEST_SCHEMA: &str = "forge.milestone-readiness/v1";
+
+fn canonicalize_evidence_json(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let sorted: BTreeMap<&str, Value> = object
+                .iter()
+                .map(|(key, value)| (key.as_str(), canonicalize_evidence_json(value)))
+                .collect();
+            let mut canonical = Map::new();
+            for (key, value) in sorted {
+                canonical.insert(key.to_owned(), value);
+            }
+            Value::Object(canonical)
+        }
+        Value::Array(values) => {
+            Value::Array(values.iter().map(canonicalize_evidence_json).collect())
+        }
+        scalar => scalar.clone(),
+    }
+}
+
+fn evidence_context_digest(value: &Value) -> Result<String> {
+    let mut envelope = Map::new();
+    envelope.insert(
+        "schema_version".to_owned(),
+        Value::String(EVIDENCE_CONTEXT_DIGEST_SCHEMA.to_owned()),
+    );
+    envelope.insert("value".to_owned(), canonicalize_evidence_json(value));
+    let canonical = serde_json::to_vec(&canonicalize_evidence_json(&Value::Object(envelope)))
+        .map_err(|error| DbError::Check(format!("serialize evidence context: {error}")))?;
+    Ok(hex::encode(Sha256::digest(canonical)))
+}
+
+/// Populate the immutable context pins for a newly attached evidence row.
+/// The values are derived inside the same transaction as the attachment so a
+/// caller cannot claim a task version, execution, review, or definition it did
+/// not actually observe.  Existing rows remain NULL and are treated as stale
+/// by the readiness evaluator.
+async fn populate_evidence_context_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    attachment: &mut CreateProjectMediaAttachment,
+    current_definition_revision_id: Option<&str>,
+) -> Result<()> {
+    attachment.source_definition_revision_id = current_definition_revision_id.map(str::to_owned);
+
+    let source_task_id = attachment
+        .source_task_id
+        .as_deref()
+        .or(attachment.task_id.as_deref())
+        .map(str::to_owned);
+    if attachment.source_execution_id.is_some() && source_task_id.is_none() {
+        return Err(DbError::Check(
+            "evidence source execution requires a source Task".to_owned(),
+        ));
+    }
+
+    let Some(task_id) = source_task_id else {
+        attachment.source_task_version = None;
+        attachment.source_context_digest = None;
+        return Ok(());
+    };
+
+    let task = sqlx::query(
+        "SELECT t.project_id, t.version, t.updated_at, t.repo_id,
+                repo.name AS repository_name, repo.work_mode AS repository_kind,
+                repo.remote_url, repo.default_branch
+         FROM task t
+         LEFT JOIN repo ON repo.id = t.repo_id AND repo.project_id = t.project_id
+         WHERE t.id = ?",
+    )
+    .bind(&task_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(DbError::NotFound)?;
+    let task_project: String = task.try_get("project_id")?;
+    if task_project != attachment.project_id
+        || attachment
+            .task_id
+            .as_deref()
+            .is_some_and(|id| id != task_id)
+    {
+        return Err(DbError::Check(
+            "evidence source Task is outside the attached Project scope".to_owned(),
+        ));
+    }
+    let task_version: i64 = task.try_get("version")?;
+    if task_version < 1 {
+        return Err(DbError::Check(
+            "evidence source Task has an invalid version".to_owned(),
+        ));
+    }
+    attachment.source_task_version = Some(task_version);
+
+    let execution = if let Some(source_execution_id) = attachment.source_execution_id.as_deref() {
+        sqlx::query(
+            "SELECT id, task_id, status, role, before_sha, after_sha, summary,
+                    created_at, updated_at
+             FROM execution
+             WHERE id = ? AND task_id = ?",
+        )
+        .bind(source_execution_id)
+        .bind(&task_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+    } else {
+        sqlx::query(
+            "SELECT id, task_id, status, role, before_sha, after_sha, summary,
+                    created_at, updated_at
+             FROM execution
+             WHERE task_id = ?
+             ORDER BY updated_at DESC, id DESC LIMIT 1",
+        )
+        .bind(&task_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+    };
+    if attachment.source_execution_id.is_some() && execution.is_none() {
+        return Err(DbError::NotFound);
+    }
+
+    let execution_id = execution
+        .as_ref()
+        .map(|row| row.try_get::<String, _>("id"))
+        .transpose()?;
+    let review = if let Some(execution_id) = execution_id.as_deref() {
+        sqlx::query(
+            "SELECT id, status, step_results_json, created_at, updated_at
+             FROM review
+             WHERE execution_id = ?
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(execution_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+    } else {
+        None
+    };
+
+    let context = serde_json::json!({
+        "task_id": task_id,
+        "task_version": task_version,
+        "repository_id": task.try_get::<Option<String>, _>("repo_id")?.unwrap_or_default(),
+        "repository_name": task.try_get::<Option<String>, _>("repository_name")?.unwrap_or_default(),
+        "repository_kind": task.try_get::<Option<String>, _>("repository_kind")?.unwrap_or_default(),
+        "remote_url": task.try_get::<Option<String>, _>("remote_url")?,
+        "default_branch": task.try_get::<Option<String>, _>("default_branch")?.unwrap_or_default(),
+        "execution_id": execution.as_ref().map(|row| row.try_get::<String, _>("id")).transpose()?,
+        "execution_status": execution.as_ref().map(|row| row.try_get::<String, _>("status")).transpose()?,
+        "execution_role": execution.as_ref().map(|row| row.try_get::<String, _>("role")).transpose()?,
+        "before_sha": execution.as_ref().map(|row| row.try_get::<Option<String>, _>("before_sha")).transpose()?.flatten(),
+        "after_sha": execution.as_ref().map(|row| row.try_get::<Option<String>, _>("after_sha")).transpose()?.flatten(),
+        "execution_summary": execution.as_ref().map(|row| row.try_get::<Option<String>, _>("summary")).transpose()?.flatten(),
+        "execution_created_at": execution.as_ref().map(|row| row.try_get::<String, _>("created_at")).transpose()?,
+        "execution_updated_at": execution.as_ref().map(|row| row.try_get::<String, _>("updated_at")).transpose()?,
+        "review_id": review.as_ref().map(|row| row.try_get::<String, _>("id")).transpose()?,
+        "review_status": review.as_ref().map(|row| row.try_get::<String, _>("status")).transpose()?,
+        "ci_results": review.as_ref().map(|row| row.try_get::<String, _>("step_results_json")).transpose()?,
+        "audit_result": Value::Null,
+        "human_decision": Value::Null,
+        "review_created_at": review.as_ref().map(|row| row.try_get::<String, _>("created_at")).transpose()?,
+        "review_updated_at": review.as_ref().map(|row| row.try_get::<String, _>("updated_at")).transpose()?,
+        "observed_at": task.try_get::<String, _>("updated_at")?,
+    });
+    let canonical_context = canonicalize_evidence_json(&context);
+    attachment.source_context_digest = Some(evidence_context_digest(&canonical_context)?);
+    Ok(())
+}
 
 /// Look up a committed media tombstone receipt in an existing transaction.
 ///
@@ -1090,7 +1264,7 @@ impl SharedMediaRepo for SqliteDb {
         input: CreateProjectMediaAttachmentMutation,
     ) -> Result<ProjectMediaAttachment> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
-        let attachment = &input.attachment;
+        let mut attachment = input.attachment.clone();
         let command_receipt = input.command_receipt.as_ref();
         if command_receipt.is_none() && input.action_execution.is_some() {
             return Err(DbError::Check(
@@ -1241,12 +1415,13 @@ impl SharedMediaRepo for SqliteDb {
         let milestone_id = attachment
             .milestone_id
             .as_deref()
-            .ok_or_else(|| DbError::Check("evidence milestone is required".to_owned()))?;
+            .ok_or_else(|| DbError::Check("evidence milestone is required".to_owned()))?
+            .to_owned();
         let milestone = sqlx::query(
             "SELECT project_id, version, current_definition_revision_id
              FROM project_milestone WHERE id = ?",
         )
-        .bind(milestone_id)
+        .bind(&milestone_id)
         .fetch_optional(&mut *transaction)
         .await?
         .ok_or(DbError::NotFound)?;
@@ -1262,6 +1437,13 @@ impl SharedMediaRepo for SqliteDb {
         }
         let current_definition_revision_id: Option<String> =
             milestone.try_get("current_definition_revision_id")?;
+
+        populate_evidence_context_in_tx(
+            &mut transaction,
+            &mut attachment,
+            current_definition_revision_id.as_deref(),
+        )
+        .await?;
 
         ensure_asset_attachable(
             &mut transaction,
@@ -1429,10 +1611,11 @@ impl SharedMediaRepo for SqliteDb {
             "INSERT INTO project_media_attachment (
                 id, project_id, asset_id, attachment_kind, task_media_id, task_id,
                 milestone_id, milestone_check_id, source_task_id, source_execution_id,
-                source_validation_id, acceptance_check_ids_json, caption, evidence_kind,
+                source_validation_id, source_task_version, source_context_digest,
+                source_definition_revision_id, acceptance_check_ids_json, caption, evidence_kind,
                 checksum, availability, project_url, author_type, author_id,
                 authorization_json, version, created_at, deleted_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NULL, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NULL, ?)",
         )
         .bind(&attachment.id)
         .bind(&attachment.project_id)
@@ -1445,6 +1628,9 @@ impl SharedMediaRepo for SqliteDb {
         .bind(attachment.source_task_id.as_deref())
         .bind(attachment.source_execution_id.as_deref())
         .bind(attachment.source_validation_id.as_deref())
+        .bind(attachment.source_task_version)
+        .bind(attachment.source_context_digest.as_deref())
+        .bind(attachment.source_definition_revision_id.as_deref())
         .bind(&attachment.acceptance_check_ids_json)
         .bind(attachment.caption.as_deref())
         .bind(attachment.evidence_kind.as_deref())
@@ -1476,6 +1662,9 @@ impl SharedMediaRepo for SqliteDb {
             "asset_id": attachment.asset_id,
             "evidence_id": attachment.id,
             "checksum": attachment.checksum,
+            "source_task_version": attachment.source_task_version,
+            "source_context_digest": attachment.source_context_digest,
+            "source_definition_revision_id": attachment.source_definition_revision_id,
             "expected_milestone_version": input.expected_milestone_version,
             "authorization_event_id": input.authorization_event_id,
             "mutation_fingerprint": input.mutation_fingerprint,
@@ -1676,9 +1865,30 @@ impl SharedMediaRepo for SqliteDb {
 
     async fn create_project_media_attachment(
         &self,
-        input: CreateProjectMediaAttachment,
+        mut input: CreateProjectMediaAttachment,
     ) -> Result<ProjectMediaAttachment> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let current_definition_revision_id =
+            if let Some(milestone_id) = input.milestone_id.as_deref() {
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT current_definition_revision_id
+                 FROM project_milestone
+                 WHERE id = ? AND project_id = ?",
+                )
+                .bind(milestone_id)
+                .bind(&input.project_id)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .flatten()
+            } else {
+                None
+            };
+        populate_evidence_context_in_tx(
+            &mut transaction,
+            &mut input,
+            current_definition_revision_id.as_deref(),
+        )
+        .await?;
         ensure_asset_attachable(&mut transaction, &input.asset_id, &input.project_id).await?;
         if input.availability != "available" {
             return Err(DbError::Check(
@@ -1708,10 +1918,11 @@ impl SharedMediaRepo for SqliteDb {
             "INSERT INTO project_media_attachment (
                 id, project_id, asset_id, attachment_kind, task_media_id, task_id,
                 milestone_id, milestone_check_id, source_task_id, source_execution_id,
-                source_validation_id, acceptance_check_ids_json, caption, evidence_kind,
+                source_validation_id, source_task_version, source_context_digest,
+                source_definition_revision_id, acceptance_check_ids_json, caption, evidence_kind,
                 checksum, availability, project_url, author_type, author_id,
                 authorization_json, version, created_at, deleted_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NULL, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NULL, ?)",
         )
         .bind(&input.id)
         .bind(&input.project_id)
@@ -1724,6 +1935,9 @@ impl SharedMediaRepo for SqliteDb {
         .bind(input.source_task_id.as_deref())
         .bind(input.source_execution_id.as_deref())
         .bind(input.source_validation_id.as_deref())
+        .bind(input.source_task_version)
+        .bind(input.source_context_digest.as_deref())
+        .bind(input.source_definition_revision_id.as_deref())
         .bind(&input.acceptance_check_ids_json)
         .bind(input.caption.as_deref())
         .bind(input.evidence_kind.as_deref())

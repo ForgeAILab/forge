@@ -5,4 +5,4 @@
  * outcomes.  The model-facing adapters must branch on this value instead of
  * parsing `safe_message`.
  */
-export type OutcomeCode = "ok" | "approval_required" | "setup_required" | "version_conflict" | "digest_conflict" | "idempotency_conflict" | "policy_denied" | "not_found" | "transient_failure" | "internal_failure" | "validation_error";
+export type OutcomeCode = "ok" | "approval_required" | "setup_required" | "active_session_conflict" | "version_conflict" | "digest_conflict" | "idempotency_conflict" | "policy_denied" | "not_found" | "transient_failure" | "internal_failure" | "validation_error";

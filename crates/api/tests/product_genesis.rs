@@ -42,6 +42,7 @@ async fn product_genesis_uses_existing_main_chat_and_is_cancelable() {
         "/api/v1/account/main-agent/product-genesis",
         &token,
         json!({
+            "idempotency_key": "product-genesis-start-main",
             "maturity": "production",
             "initial_idea": "A bounded, durable product idea"
         }),
@@ -116,7 +117,10 @@ async fn product_genesis_uses_existing_main_chat_and_is_cancelable() {
         Method::POST,
         "/api/v1/account/main-agent/product-genesis",
         &token,
-        json!({ "maturity": "mvp" }),
+        json!({
+            "idempotency_key": "product-genesis-start-active-conflict",
+            "maturity": "mvp"
+        }),
         StatusCode::CONFLICT,
     )
     .await;
@@ -206,8 +210,11 @@ async fn product_genesis_requires_main_binding_and_hides_cross_account_sessions(
         Method::POST,
         "/api/v1/account/main-agent/product-genesis",
         &token,
-        json!({ "maturity": "mvp" }),
-        StatusCode::BAD_REQUEST,
+        json!({
+            "idempotency_key": "product-genesis-start-setup-required",
+            "maturity": "mvp"
+        }),
+        StatusCode::CONFLICT,
     )
     .await;
     assert!(missing.message.contains("setup is required"));
@@ -251,6 +258,7 @@ async fn product_genesis_approval_creates_one_exact_project_and_handoff() {
         "/api/v1/account/main-agent/product-genesis",
         &token,
         json!({
+            "idempotency_key": "product-genesis-start-charter-flow",
             "maturity": "mvp",
             "initial_idea": "A small, durable project that needs an exact Charter handoff",
             "preferred_project_agent_identity_id": connected.agent.id
@@ -960,13 +968,14 @@ async fn product_genesis_guided_setup_sets_maturity_once_with_optimistic_concurr
         "/api/v1/account/main-agent/product-genesis",
         &token,
         json!({
+            "idempotency_key": "product-genesis-start-guided-setup",
             "initial_idea": "An MVP product idea"
         }),
         StatusCode::CREATED,
     )
     .await;
     assert_eq!(started.session.maturity, api_types::ProductMaturity::Mvp);
-    assert_eq!(started.session.version, 2); // created at 1, source message added -> 2
+    assert_eq!(started.session.version, 1); // source provenance commits with creation
 
     // Apply guided setup with expected version
     let updated: ProductGenesisSession = common::json_request_with_bearer(

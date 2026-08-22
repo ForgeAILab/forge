@@ -187,7 +187,7 @@ fn user_authorization(correlation_id: &str, principal_id: &str) -> ProjectComman
         authorization_event_id: format!("authorization-{correlation_id}"),
         authorization_basis: "explicit authenticated user authorization".to_owned(),
         authorization_action: "project.evidence.attach".to_owned(),
-        authorization_occurred_at: NOW.to_owned(),
+        authorization_occurred_at: db::now_rfc3339(),
         authorization_json: json!({
             "principal": {"kind": "user", "id": principal_id},
             "action": "project.evidence.attach",

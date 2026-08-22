@@ -280,6 +280,9 @@ impl ProjectArtifactCommandService {
             source_task_id: command.task_id.clone(),
             source_execution_id: command.source_run_id.clone(),
             source_validation_id: command.source_validation_id.clone(),
+            source_task_version: None,
+            source_context_digest: None,
+            source_definition_revision_id: None,
             acceptance_check_ids_json: serde_json::to_string(&command.acceptance_check_ids)
                 .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
             caption: Some(command.caption.clone()),
@@ -1323,7 +1326,8 @@ async fn load_project_media_attachment(
     let row = sqlx::query(
         "SELECT id, project_id, asset_id, attachment_kind, task_media_id, task_id,
                 milestone_id, milestone_check_id, source_task_id, source_execution_id,
-                source_validation_id, acceptance_check_ids_json, caption, evidence_kind,
+                source_validation_id, source_task_version, source_context_digest,
+                source_definition_revision_id, acceptance_check_ids_json, caption, evidence_kind,
                 checksum, availability, project_url, author_type, author_id,
                 authorization_json, version, created_at, deleted_at, updated_at
          FROM project_media_attachment WHERE id = ? AND attachment_kind = 'evidence'",
@@ -1346,6 +1350,9 @@ async fn load_project_media_attachment(
                     source_task_id: row.try_get("source_task_id")?,
                     source_execution_id: row.try_get("source_execution_id")?,
                     source_validation_id: row.try_get("source_validation_id")?,
+                    source_task_version: row.try_get("source_task_version")?,
+                    source_context_digest: row.try_get("source_context_digest")?,
+                    source_definition_revision_id: row.try_get("source_definition_revision_id")?,
                     acceptance_check_ids_json: row.try_get("acceptance_check_ids_json")?,
                     caption: row.try_get("caption")?,
                     evidence_kind: row.try_get("evidence_kind")?,

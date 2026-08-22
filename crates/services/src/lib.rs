@@ -175,7 +175,8 @@ pub use external_sync::ExternalSyncService;
 pub use integration_service::IntegrationService;
 pub use main_genesis_commands::{
     MainGenesisCharterDraftRequest, MainGenesisCharterDraftResult, MainGenesisCommandService,
-    MainGenesisDraftCommandInput, MainGenesisDraftPrincipal,
+    MainGenesisDraftCommandInput, MainGenesisDraftPrincipal, MainGenesisStartCommandInput,
+    MainGenesisStartPrincipal, MainGenesisStartRequest, MainGenesisStartResult,
 };
 pub use main_orchestration_actions::{
     ExecuteMainOrchestrationActionInput, MainOrchestrationActionService,
@@ -345,6 +346,9 @@ pub enum ServiceError {
 
     #[error("conflict: {0}")]
     Conflict(String),
+
+    #[error("Product Genesis session already active: {session_id}")]
+    ProductGenesisActiveSession { session_id: String },
 
     #[error("daemon unavailable: {daemon_id}")]
     DaemonUnavailable { daemon_id: String },

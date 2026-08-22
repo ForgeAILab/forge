@@ -1488,15 +1488,26 @@ fn validate_baseline_provenance(
         "agent" => provenance.author.kind == PrincipalKind::Agent,
         _ => false,
     };
-    if provenance.author.id.trim().is_empty()
-        || provenance.author.id != authorization.principal_id
-        || !kind_matches
-        || provenance.change_summary.trim().is_empty()
+    if provenance.change_summary.trim().is_empty() {
+        return Err(ServiceError::invalid_operation(
+            "execution baseline provenance.change_summary must be a non-empty summary of this revision",
+        ));
+    }
+    // Echoing the caller's own already-authenticated principal is an input
+    // contract, not an authority secret: naming the expected value is what
+    // lets the caller correct the payload instead of retrying it unchanged.
+    if provenance.author.id.trim().is_empty() || provenance.author.id != authorization.principal_id
     {
-        return Err(ServiceError::AuthorizationDenied {
-            message: "execution baseline provenance must identify the authorized principal"
-                .to_owned(),
-        });
+        return Err(ServiceError::invalid_operation(format!(
+            "execution baseline provenance.author.id must be the authorized principal \"{}\"",
+            authorization.principal_id
+        )));
+    }
+    if !kind_matches {
+        return Err(ServiceError::invalid_operation(format!(
+            "execution baseline provenance.author.kind must be \"{}\"",
+            authorization.principal_type
+        )));
     }
     Ok(())
 }

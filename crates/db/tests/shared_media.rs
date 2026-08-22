@@ -304,7 +304,7 @@ async fn active_project_evidence_blocks_task_media_gc_until_removed() {
     let (db, project_id, task_id) = fixture().await;
     let media = upload(&db, &task_id, "asset-evidence").await;
     let now = now_rfc3339();
-    SharedMediaRepo::create_project_media_attachment(
+    let attached = SharedMediaRepo::create_project_media_attachment(
         &db,
         CreateProjectMediaAttachment {
             id: "evidence-attachment".to_owned(),
@@ -318,6 +318,9 @@ async fn active_project_evidence_blocks_task_media_gc_until_removed() {
             source_task_id: Some(task_id.clone()),
             source_execution_id: None,
             source_validation_id: None,
+            source_task_version: None,
+            source_context_digest: None,
+            source_definition_revision_id: None,
             acceptance_check_ids_json: "[\"check-1\"]".to_owned(),
             caption: Some("proof".to_owned()),
             evidence_kind: Some("screenshot".to_owned()),
@@ -334,6 +337,8 @@ async fn active_project_evidence_blocks_task_media_gc_until_removed() {
     )
     .await
     .expect("evidence attachment");
+    assert_eq!(attached.source_task_version, Some(1));
+    assert!(attached.source_context_digest.is_some());
 
     TaskMediaRepo::soft_delete_media(&db, &media.id, &now)
         .await
@@ -388,6 +393,9 @@ async fn immutable_release_pin_keeps_asset_referenced_after_task_cleanup() {
             source_task_id: Some(task_id.clone()),
             source_execution_id: None,
             source_validation_id: None,
+            source_task_version: None,
+            source_context_digest: None,
+            source_definition_revision_id: None,
             acceptance_check_ids_json: "[]".to_owned(),
             caption: Some("release proof".to_owned()),
             evidence_kind: Some("screenshot".to_owned()),
@@ -781,6 +789,9 @@ async fn project_evidence_composite_rejects_cross_project_asset() {
                 source_task_id: None,
                 source_execution_id: None,
                 source_validation_id: None,
+                source_task_version: None,
+                source_context_digest: None,
+                source_definition_revision_id: None,
                 acceptance_check_ids_json: "[]".to_owned(),
                 caption: Some("cross project".to_owned()),
                 evidence_kind: Some("screenshot".to_owned()),
@@ -854,6 +865,9 @@ async fn queued_gc_is_restartable_and_rejects_new_typed_references() {
             source_task_id: Some(task_id),
             source_execution_id: None,
             source_validation_id: None,
+            source_task_version: None,
+            source_context_digest: None,
+            source_definition_revision_id: None,
             acceptance_check_ids_json: "[]".to_owned(),
             caption: Some("late".to_owned()),
             evidence_kind: Some("screenshot".to_owned()),

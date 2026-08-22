@@ -266,6 +266,13 @@ impl From<ServiceError> for ApiError {
                 }),
             ),
             ServiceError::Conflict(message) => Self::conflict_with_code("conflict", message),
+            ServiceError::ProductGenesisActiveSession { session_id } => {
+                Self::conflict_with_code_and_details(
+                    "product_genesis.active_session_conflict",
+                    "a Product Genesis session is already active",
+                    json!({ "session_id": session_id }),
+                )
+            }
             ServiceError::DaemonUnavailable { daemon_id } => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 code: "daemon_unavailable",

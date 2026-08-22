@@ -422,6 +422,7 @@ fn export_typescript() {
     DesignDocumentContent::export().expect("export DesignDocumentContent");
     DocumentAcceptanceItem::export().expect("export DocumentAcceptanceItem");
     DocumentFreshness::export().expect("export DocumentFreshness");
+    DocumentFreshnessStatus::export().expect("export DocumentFreshnessStatus");
     DocumentPlanItem::export().expect("export DocumentPlanItem");
     DocumentRevisionLifecycle::export().expect("export DocumentRevisionLifecycle");
     CreateMilestoneRequest::export().expect("export CreateMilestoneRequest");
@@ -484,6 +485,7 @@ fn export_typescript() {
     ProjectMilestone::export().expect("export ProjectMilestone");
     ProjectMilestoneListResponse::export().expect("export ProjectMilestoneListResponse");
     ProjectMilestoneOverview::export().expect("export ProjectMilestoneOverview");
+    ProjectNextAction::export().expect("export ProjectNextAction");
     ProjectMode::export().expect("export ProjectMode");
     ProjectOverview::export().expect("export ProjectOverview");
     ProjectRelease::export().expect("export ProjectRelease");
@@ -491,6 +493,8 @@ fn export_typescript() {
     ProvenanceRef::export().expect("export ProvenanceRef");
     ProvenanceSourceKind::export().expect("export ProvenanceSourceKind");
     ReadinessInput::export().expect("export ReadinessInput");
+    ReadinessFreshnessStatus::export().expect("export ReadinessFreshnessStatus");
+    ReadinessFreshness::export().expect("export ReadinessFreshness");
     ReadinessReason::export().expect("export ReadinessReason");
     ReadinessResult::export().expect("export ReadinessResult");
     ReadinessSnapshot::export().expect("export ReadinessSnapshot");

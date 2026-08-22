@@ -336,7 +336,7 @@ fn user_authorization(action: &str, key: &str) -> ProjectCommandAuthorization {
         authorization_event_id: format!("decision-service-authorization-{key}"),
         authorization_basis: "explicit authenticated user authorization".to_owned(),
         authorization_action: action.to_owned(),
-        authorization_occurred_at: NOW.to_owned(),
+        authorization_occurred_at: db::now_rfc3339(),
         authorization_json: json!({
             "principal": {"type": "user", "id": ACCOUNT_ID},
             "action": action,
@@ -364,7 +364,7 @@ fn agent_authorization(
         authorization_event_id: authorization_event_id.to_owned(),
         authorization_basis: "project_agent_binding_policy".to_owned(),
         authorization_action: authorization_action.to_owned(),
-        authorization_occurred_at: NOW.to_owned(),
+        authorization_occurred_at: db::now_rfc3339(),
         authorization_json: json!({
             "principal": {"type": "agent", "id": AGENT_ID},
             "action": authorization_action,

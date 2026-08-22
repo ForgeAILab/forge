@@ -468,12 +468,14 @@ export function ChatComposer({
   isSending,
   onSend,
   commands = [],
+  placeholder = 'Message this agent…',
 }: {
   disabled?: boolean
   disabledReason?: string
   isSending?: boolean
   onSend: (content: string) => Promise<void>
   commands?: ChatCommand[]
+  placeholder?: string
 }) {
   const [content, setContent] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -626,7 +628,7 @@ export function ChatComposer({
                 event.preventDefault()
                 formRef.current?.requestSubmit()
               }}
-              placeholder="Message this agent…"
+              placeholder={placeholder}
               rows={2}
               disabled={disabled || busy}
               aria-label="Chat message"
@@ -824,8 +826,12 @@ export function AgentChatTimeline({
           {messages.length === 0 ? (
             <div className="flex flex-col items-center justify-center p-6 text-center">
               <EmptyPanel
-                title="Start the conversation"
-                description="Ask this agent to plan, create tasks, or shape project records — it acts directly from chat."
+                title={projectId ? 'Start the conversation' : 'What do you want to make?'}
+                description={
+                  projectId
+                    ? 'Ask this Project Agent to plan work, create Tasks, or shape Project records.'
+                    : 'Describe a new Project in your own words, ask a portfolio question, or explore an idea. Clear new-Project intent starts discovery; it does not approve or create the Project.'
+                }
                 icon={<ChatCircleDots size={19} aria-hidden />}
               />
               {commands && commands.length > 0 ? (
@@ -893,6 +899,11 @@ export function AgentChatTimeline({
         isSending={isSending || retrying}
         onSend={onSend}
         commands={commands}
+        placeholder={
+          projectId
+            ? 'Message this Project Agent…'
+            : 'Describe a new Project, ask about your portfolio, or explore an idea…'
+        }
       />
     </div>
   )

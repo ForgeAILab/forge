@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { handoffProjectIdsForScope } from './ChatPage'
+import { handoffProjectIdsForScope, newGenesisStartIdempotencyKey } from './ChatPage'
 import type { AgentChatEntry } from '@/features/agent-chat/types'
 
 const entries: AgentChatEntry[] = [
@@ -51,5 +51,9 @@ describe('ChatPage scope isolation', () => {
 
   it('allows Main chat to read only explicit handoff metadata for authorized Projects', () => {
     expect(handoffProjectIdsForScope(undefined, entries)).toEqual(['project-a', 'project-b'])
+  })
+
+  it('uses a fresh idempotency key for every explicit Genesis shortcut attempt', () => {
+    expect(newGenesisStartIdempotencyKey()).not.toBe(newGenesisStartIdempotencyKey())
   })
 })

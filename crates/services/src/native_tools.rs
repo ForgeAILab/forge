@@ -32,11 +32,11 @@ use forge_agent_host::{
     ForgeToolProvider, OperationClassification, PublicSearchScope, WorkspaceAccess,
     MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
     MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READINESS_OPERATION, MAIN_CHARTER_READ_OPERATION,
-    MAIN_PROJECT_CREATE_OPERATION, PROJECT_CHARTER_ADOPTION_OPERATION,
-    PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
-    PROJECT_EVIDENCE_OPERATION, PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION,
-    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, TASK_ADAPTIVE_OPERATION,
-    TASK_PROPOSE_OPERATION,
+    MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
+    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
+    PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION,
+    PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
+    PROJECT_RELEASE_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_PROPOSE_OPERATION,
 };
 use reqwest::header::ACCEPT;
 use serde::Deserialize;
@@ -55,7 +55,8 @@ use crate::{
         DirectTaskProposalInput, TaskProposalCommandResult, TaskProposalPayload,
     },
     MainGenesisCharterDraftRequest, MainGenesisCommandService, MainGenesisDraftCommandInput,
-    MainGenesisDraftPrincipal, MainOrchestrationQueryService, OrchestrationAuthorizationService,
+    MainGenesisDraftPrincipal, MainGenesisStartCommandInput, MainGenesisStartPrincipal,
+    MainGenesisStartRequest, MainOrchestrationQueryService, OrchestrationAuthorizationService,
     ProjectOrchestrationActionService, TaskService,
 };
 
@@ -785,6 +786,11 @@ impl CoordinationToolProvider {
                 "proposal payload does not match the typed operation schema".to_owned(),
             )
         })?;
+        if operation == MAIN_GENESIS_START_OPERATION {
+            return self
+                .execute_main_genesis_start(actor_identity_id, scope, arguments, payload)
+                .await;
+        }
         if operation == MAIN_CHARTER_DRAFT_OPERATION {
             return self
                 .execute_main_genesis_charter_draft(actor_identity_id, scope, arguments, payload)
@@ -1048,10 +1054,8 @@ impl CoordinationToolProvider {
                     "adaptive Task command has no server-derived Project target".to_owned(),
                 )
             })?;
-            let adaptive_payload: AdaptiveTaskPayload = serde_json::from_value(payload.clone())
-                .map_err(|_| {
-                    AgentHostError::Unsupported("adaptive Task payload is invalid".to_owned())
-                })?;
+            let adaptive_payload: AdaptiveTaskPayload =
+                typed_command_payload(operation, scope, &correlation_id, payload.clone())?;
             let (
                 source_task_id,
                 expected_task_version,
@@ -1145,9 +1149,7 @@ impl CoordinationToolProvider {
                 )
             })?;
             let payload: TaskProposalPayload =
-                serde_json::from_value(payload.clone()).map_err(|_| {
-                    AgentHostError::Unsupported("task proposal payload is invalid".to_owned())
-                })?;
+                typed_command_payload(operation, scope, &correlation_id, payload.clone())?;
             let payload_json = serde_json::to_string(&payload).map_err(|_| {
                 AgentHostError::Unsupported("task proposal payload is invalid".to_owned())
             })?;
@@ -1269,10 +1271,12 @@ impl CoordinationToolProvider {
         if let Some(object) = payload.as_object_mut() {
             object.remove("action");
         }
-        let request: MainGenesisCharterDraftRequest = serde_json::from_value(payload.clone())
-            .map_err(|_| {
-                AgentHostError::Unsupported("charter.draft payload is invalid".to_owned())
-            })?;
+        let request: MainGenesisCharterDraftRequest = typed_command_payload(
+            MAIN_CHARTER_DRAFT_OPERATION,
+            scope,
+            &correlation_id(&arguments, MAIN_CHARTER_DRAFT_OPERATION, scope),
+            payload.clone(),
+        )?;
         let dedupe_key = required_argument(&arguments, "dedupe_key")?;
         let correlation_id = required_argument(&arguments, "correlation_id")?;
         let causation_id = arguments
@@ -1304,9 +1308,11 @@ impl CoordinationToolProvider {
             .await
             .map_err(service_error)?;
         if policy_result != AgentActionPolicyResult::Allowed {
-            return Err(AgentHostError::Authority(policy_reason.unwrap_or_else(
-                || "Main Charter draft policy did not admit this command".to_owned(),
-            )));
+            let reason = policy_reason.unwrap_or_else(|| {
+                "Main Charter draft policy did not admit this command".to_owned()
+            });
+            tracing::warn!(diagnostic = %reason, "charter.draft policy denied");
+            return Err(AgentHostError::Authority(reason));
         }
         let result = MainGenesisCommandService::new(self.db.clone())
             .execute(MainGenesisDraftCommandInput {
@@ -1329,6 +1335,88 @@ impl CoordinationToolProvider {
             "status": "succeeded",
             "materialized": true,
             "domain_committed": true,
+            "receipt_id": result.receipt_id,
+            "event_id": result.event_id,
+            "domain_result": result.result,
+        }))
+    }
+
+    /// Start Product Genesis from the currently leased Main baseline turn.
+    /// The command service resolves the source message and turn from that
+    /// lease; neither identifier is accepted from model-authored payload.
+    async fn execute_main_genesis_start(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        arguments: Value,
+        mut payload: Value,
+    ) -> Result<Value, AgentHostError> {
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("action");
+        }
+        let correlation_id = required_argument(&arguments, "correlation_id")?;
+        let request: MainGenesisStartRequest = typed_command_payload(
+            MAIN_GENESIS_START_OPERATION,
+            scope,
+            &correlation_id,
+            payload.clone(),
+        )?;
+        let idempotency_key = required_argument(&arguments, "dedupe_key")?;
+        let causation_id = arguments
+            .get("causation_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let causation_depth = arguments
+            .get("causation_depth")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let requested_permission =
+            operation_permission(scope.scope_type, MAIN_GENESIS_START_OPERATION).ok_or_else(
+                || {
+                    AgentHostError::Authority(
+                        "Product Genesis start has no canonical permission descriptor".to_owned(),
+                    )
+                },
+            )?;
+        let (policy_result, policy_reason) = self
+            .actions
+            .evaluate_direct_command_policy(
+                actor_identity_id,
+                scope_type_name(scope.scope_type),
+                &scope.scope_id,
+                requested_permission,
+                MAIN_GENESIS_START_OPERATION,
+                Some(&payload.to_string()),
+            )
+            .await
+            .map_err(service_error)?;
+        if policy_result != AgentActionPolicyResult::Allowed {
+            return Err(AgentHostError::Authority(policy_reason.unwrap_or_else(
+                || "Product Genesis start policy did not admit this command".to_owned(),
+            )));
+        }
+        let result = MainGenesisCommandService::new(self.db.clone())
+            .start(MainGenesisStartCommandInput {
+                principal: MainGenesisStartPrincipal::MainAgent {
+                    identity_id: actor_identity_id.to_owned(),
+                    scope: scope.clone(),
+                },
+                request,
+                idempotency_key,
+                correlation_id,
+                causation_id,
+                causation_depth,
+                policy_result: policy_result.to_string(),
+                requested_permission: requested_permission.to_owned(),
+            })
+            .await
+            .map_err(service_error)?;
+        Ok(json!({
+            "operation": MAIN_GENESIS_START_OPERATION,
+            "status": "succeeded",
+            "materialized": true,
+            "domain_committed": true,
+            "control_transfer": result.control_transfer,
             "receipt_id": result.receipt_id,
             "event_id": result.event_id,
             "domain_result": result.result,
@@ -1670,7 +1758,7 @@ impl CoordinationToolProvider {
                 outcome.retry = Some(RetryInstruction::new(RetryAction::CompleteSetup, false));
                 outcome
             }
-            AgentHostError::Authority(_) => {
+            AgentHostError::Authority(detail) => {
                 let validation_failed = operation == TASK_PROPOSE_OPERATION
                     || operation == MAIN_CHARTER_DRAFT_OPERATION
                     || arguments
@@ -1680,15 +1768,23 @@ impl CoordinationToolProvider {
                             validate_proposal_payload(operation, payload).is_err()
                         });
                 let (code, message, retry) = if validation_failed {
+                    // The contract reason is server-authored and names only
+                    // the offending field, so it is safe to return and is the
+                    // only way the model can correct the call. Without it the
+                    // model retries the same rejected shape indefinitely.
                     (
                         OutcomeCode::ValidationError,
-                        "the operation or arguments are not valid for this Forge surface",
+                        format!(
+                            "the operation or arguments are not valid for this Forge surface ({detail})"
+                        ),
                         Some(RetryInstruction::new(RetryAction::CorrectInput, false)),
                     )
                 } else {
+                    // Policy denials stay generic: the reason can describe
+                    // authority the caller is not entitled to observe.
                     (
                         OutcomeCode::PolicyDenied,
-                        "the operation is not admitted for the current Forge scope",
+                        "the operation is not admitted for the current Forge scope".to_owned(),
                         Some(RetryInstruction::new(RetryAction::Reauthorize, false)),
                     )
                 };
@@ -1702,13 +1798,15 @@ impl CoordinationToolProvider {
                 outcome.retry = retry;
                 outcome
             }
-            AgentHostError::Unsupported(_) => {
+            AgentHostError::Unsupported(detail) => {
                 let mut outcome = OrchestrationOutcome::failed(
                     OutcomeCode::ValidationError,
                     operation,
                     outcome_scope(scope),
                     &correlation_id,
-                    "the operation or arguments are not valid for this Forge surface",
+                    format!(
+                        "the operation or arguments are not valid for this Forge surface ({detail})"
+                    ),
                 );
                 outcome.retry = Some(RetryInstruction::new(RetryAction::CorrectInput, false));
                 outcome
@@ -1941,6 +2039,37 @@ fn action_value(action: &AgentAction) -> Value {
         "target_type": action.target_type,
         "target_id": action.target_id,
         "version": action.version,
+    })
+}
+
+/// Deserialize a model-authored command payload, reporting a schema mismatch
+/// as a model-facing validation outcome.  The model authored this input, so
+/// the offending field path and the expected shape are safe to hand back —
+/// and without them the `CorrectInput` retry instruction names no correction,
+/// which leaves a wrong payload unfixable and invites the model to narrate a
+/// success it never got.
+fn typed_command_payload<T: serde::de::DeserializeOwned>(
+    operation: &str,
+    scope: &CanonicalScope,
+    correlation_id: &str,
+    payload: Value,
+) -> Result<T, AgentHostError> {
+    serde_path_to_error::deserialize(payload).map_err(|error| {
+        let path = error.path().to_string();
+        let detail = if path.is_empty() {
+            error.inner().to_string()
+        } else {
+            format!("{path}: {}", error.inner())
+        };
+        let mut outcome = OrchestrationOutcome::failed(
+            OutcomeCode::ValidationError,
+            operation,
+            outcome_scope(scope),
+            correlation_id,
+            format!("the payload does not match the {operation} schema ({detail})"),
+        );
+        outcome.retry = Some(RetryInstruction::new(RetryAction::CorrectInput, false));
+        AgentHostError::StructuredOutcome(Box::new(outcome))
     })
 }
 
@@ -2427,6 +2556,23 @@ fn native_scope_error(error: crate::ServiceError) -> AgentHostError {
 }
 
 fn service_error(error: crate::ServiceError) -> AgentHostError {
+    // A validation reason from the command boundary names the offending
+    // input, so it returns to the model verbatim. Collapsing it to a bare
+    // "not valid" leaves the model retrying the same rejected shape with
+    // nothing to correct.
+    if let crate::ServiceError::InvalidOperation { message }
+    | crate::ServiceError::TerminalInvalidInput { message } = &error
+    {
+        let mut outcome = OrchestrationOutcome::failed(
+            OutcomeCode::ValidationError,
+            "unknown",
+            OutcomeScopeRef::new(OutcomeScopeType::Account, ""),
+            "",
+            format!("the operation or arguments are not valid for this Forge surface ({message})"),
+        );
+        outcome.retry = Some(RetryInstruction::new(RetryAction::CorrectInput, false));
+        return AgentHostError::StructuredOutcome(Box::new(outcome));
+    }
     let (code, safe_message, setup_requirement, retry) = match error {
         crate::ServiceError::NotFound { .. } | crate::ServiceError::Db(db::DbError::NotFound) => (
             OutcomeCode::NotFound,
@@ -2462,12 +2608,21 @@ fn service_error(error: crate::ServiceError) -> AgentHostError {
             None,
             None,
         ),
-        crate::ServiceError::AuthorizationDenied { .. } => (
-            OutcomeCode::PolicyDenied,
-            "the operation is not admitted for the current Forge scope",
+        crate::ServiceError::ProductGenesisActiveSession { .. } => (
+            OutcomeCode::ActiveSessionConflict,
+            "a Product Genesis discovery session is already active",
             None,
-            Some(RetryInstruction::new(RetryAction::Reauthorize, false)),
+            None,
         ),
+        crate::ServiceError::AuthorizationDenied { message } => {
+            tracing::warn!(diagnostic = %message, "orchestration authorization denied");
+            (
+                OutcomeCode::PolicyDenied,
+                "the operation is not admitted for the current Forge scope",
+                None,
+                Some(RetryInstruction::new(RetryAction::Reauthorize, false)),
+            )
+        }
         crate::ServiceError::InvalidOperation { .. }
         | crate::ServiceError::TerminalInvalidInput { .. } => (
             OutcomeCode::ValidationError,
@@ -2477,7 +2632,7 @@ fn service_error(error: crate::ServiceError) -> AgentHostError {
         ),
         crate::ServiceError::ExecutionSetupRequired { requirements, .. } => (
             OutcomeCode::SetupRequired,
-            "required Project execution setup is incomplete",
+            "required Forge setup is incomplete",
             requirements.first().cloned(),
             Some(RetryInstruction::new(RetryAction::CompleteSetup, true)),
         ),
@@ -2639,6 +2794,42 @@ mod tests {
                 assert!(!retry.retryable);
             }
             other => panic!("idempotency conflicts must be structured, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn genesis_start_failures_keep_stable_structured_codes() {
+        let cases = [
+            (
+                crate::ServiceError::ExecutionSetupRequired {
+                    message: "private setup detail".to_owned(),
+                    requirements: vec![SetupRequirement::new("main_agent")],
+                },
+                OutcomeCode::SetupRequired,
+            ),
+            (
+                crate::ServiceError::ProductGenesisActiveSession {
+                    session_id: "private-session-id".to_owned(),
+                },
+                OutcomeCode::ActiveSessionConflict,
+            ),
+            (
+                crate::ServiceError::Db(db::DbError::IdempotencyConflict),
+                OutcomeCode::IdempotencyConflict,
+            ),
+            (
+                crate::ServiceError::Domain("private storage failure".to_owned()),
+                OutcomeCode::InternalFailure,
+            ),
+        ];
+        for (error, expected) in cases {
+            match service_error(error) {
+                AgentHostError::StructuredOutcome(outcome) => {
+                    assert_eq!(outcome.code, expected);
+                    assert!(!outcome.safe_message.contains("private"));
+                }
+                other => panic!("Genesis start failure must be structured, got {other:?}"),
+            }
         }
     }
 

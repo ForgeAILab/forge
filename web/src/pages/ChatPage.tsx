@@ -54,6 +54,12 @@ export function handoffProjectIdsForScope(
   return entries.flatMap((entry) => (entry.project_id ? [entry.project_id] : []))
 }
 
+export function newGenesisStartIdempotencyKey(): string {
+  return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `genesis-start-${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
 export function ChatPage({ projectId }: { projectId?: string }) {
   const chatsQuery = useAgentChatsQuery()
   const projectsQuery = useProjectsInfiniteQuery(PROJECTS_PAGE_SIZE)
@@ -117,6 +123,7 @@ export function ChatPage({ projectId }: { projectId?: string }) {
   const startGenesis = useCallback(
     async (idea: string) => {
       await startGenesisMutation.mutateAsync({
+        idempotency_key: newGenesisStartIdempotencyKey(),
         initial_idea: idea || null,
         maturity: 'mvp',
         preferred_project_agent_identity_id: null,

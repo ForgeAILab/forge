@@ -38,6 +38,10 @@ const CONTENT_DIGEST_SCHEMA: &str = "forge.agent-chat-content/v1";
 #[serde(rename_all = "snake_case")]
 pub enum AgentTurnTrigger {
     UserMessage,
+    /// A typed Main-Agent control transfer from the account baseline into an
+    /// atomically-created Product Genesis session. It reuses the original
+    /// visible user message while freezing a new discovery-skill admission.
+    GenesisContinuation,
     MainProjectHandoff,
     AutonomousWake,
     /// User-approved execution-baseline activation delivered into the

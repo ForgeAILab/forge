@@ -40,6 +40,7 @@ export type ProductGenesisMutationEnvelope = Omit<MutationEnvelope, 'expected_ve
 }
 
 export interface ProductGenesisStartInput {
+  idempotency_key: string
   maturity: ProductMaturity
   initial_idea: string | null
   preferred_project_agent_identity_id: string | null

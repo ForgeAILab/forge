@@ -557,10 +557,18 @@ pub fn evaluate_readiness(
         &mut has_stale,
         &mut has_blocked,
     );
+    let evidence_freshness = EvidenceFreshnessContext {
+        current_definition_revision_id: &input.definition.id,
+        task_states: &input.task_states,
+        check_results: &ordered_check_results,
+        commit_build_check_context: &commit_build_check_context,
+    };
     evaluate_evidence_requirements(
         &input.definition.content.evidence_requirements,
         &ordered_evidence,
+        &evidence_freshness,
         &mut reasons,
+        &mut has_stale,
         &mut has_blocked,
     );
 
@@ -782,10 +790,19 @@ fn check_reason(
     }
 }
 
+struct EvidenceFreshnessContext<'a> {
+    current_definition_revision_id: &'a str,
+    task_states: &'a [ReadinessTaskState],
+    check_results: &'a [ValidationResult],
+    commit_build_check_context: &'a [String],
+}
+
 fn evaluate_evidence_requirements(
     requirements: &[AcceptanceEvidenceRequirement],
     evidence: &[EvidenceAttachment],
+    freshness: &EvidenceFreshnessContext<'_>,
     reasons: &mut Vec<ReadinessReason>,
+    has_stale: &mut bool,
     has_blocked: &mut bool,
 ) {
     for requirement in requirements
@@ -820,7 +837,75 @@ fn evaluate_evidence_requirements(
             continue;
         }
 
-        let unavailable = supporting
+        let expected_definition_revision_id = requirement
+            .check_definition_revision
+            .as_deref()
+            .unwrap_or(freshness.current_definition_revision_id);
+        let (fresh, stale): (Vec<_>, Vec<_>) = supporting.into_iter().partition(|attachment| {
+            evidence_context_state(
+                attachment,
+                expected_definition_revision_id,
+                freshness.task_states,
+                freshness.check_results,
+                freshness.commit_build_check_context,
+            ) == EvidenceContextState::Fresh
+        });
+        if fresh.is_empty() {
+            *has_stale = true;
+            let missing = stale
+                .iter()
+                .filter(|attachment| {
+                    evidence_context_state(
+                        attachment,
+                        expected_definition_revision_id,
+                        freshness.task_states,
+                        freshness.check_results,
+                        freshness.commit_build_check_context,
+                    ) == EvidenceContextState::Missing
+                })
+                .map(|attachment| attachment.id.clone())
+                .collect::<Vec<_>>();
+            let mismatched = stale
+                .iter()
+                .filter(|attachment| {
+                    evidence_context_state(
+                        attachment,
+                        expected_definition_revision_id,
+                        freshness.task_states,
+                        freshness.check_results,
+                        freshness.commit_build_check_context,
+                    ) == EvidenceContextState::Stale
+                })
+                .map(|attachment| attachment.id.clone())
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                reasons.push(ReadinessReason {
+                    code: "evidence_context_missing".to_owned(),
+                    message: format!(
+                        "required evidence {} is missing its exact source context",
+                        requirement.id
+                    ),
+                    blocking: true,
+                    check_id: Some(requirement.id.clone()),
+                    source_ids: missing,
+                });
+            }
+            if !mismatched.is_empty() {
+                reasons.push(ReadinessReason {
+                    code: "evidence_context_stale".to_owned(),
+                    message: format!(
+                        "required evidence {} no longer matches its exact source context",
+                        requirement.id
+                    ),
+                    blocking: true,
+                    check_id: Some(requirement.id.clone()),
+                    source_ids: mismatched,
+                });
+            }
+            continue;
+        }
+
+        let unavailable = fresh
             .iter()
             .filter(|attachment| attachment.availability != EvidenceAvailability::Available)
             .collect::<Vec<_>>();
@@ -837,6 +922,108 @@ fn evaluate_evidence_requirements(
                     .collect(),
             });
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvidenceContextState {
+    Fresh,
+    Missing,
+    Stale,
+}
+
+fn evidence_context_state(
+    attachment: &EvidenceAttachment,
+    expected_definition_revision_id: &str,
+    task_states: &[ReadinessTaskState],
+    check_results: &[ValidationResult],
+    commit_build_check_context: &[String],
+) -> EvidenceContextState {
+    let Some(source_definition_revision_id) = attachment.source_definition_revision_id.as_deref()
+    else {
+        return EvidenceContextState::Missing;
+    };
+    if source_definition_revision_id != expected_definition_revision_id {
+        return EvidenceContextState::Stale;
+    }
+
+    if let Some(source_validation_id) = attachment.source_validation_id.as_deref() {
+        if !check_results
+            .iter()
+            .any(|result| result.id == source_validation_id)
+        {
+            return EvidenceContextState::Stale;
+        }
+    }
+
+    let source_task_id = attachment
+        .source_task_id
+        .as_deref()
+        .or(attachment.task_id.as_deref());
+    let Some(source_task_id) = source_task_id else {
+        return if attachment.source_task_version.is_none()
+            && attachment.source_context_digest.is_none()
+            && attachment.source_run_id.is_none()
+            && attachment.source_validation_id.is_none()
+        {
+            EvidenceContextState::Fresh
+        } else if attachment.source_context_digest.is_none() {
+            EvidenceContextState::Missing
+        } else {
+            EvidenceContextState::Stale
+        };
+    };
+    let Some(task) = task_states
+        .iter()
+        .find(|task| task.task_id == source_task_id)
+    else {
+        return EvidenceContextState::Stale;
+    };
+    if attachment.source_task_version.is_none() || attachment.source_context_digest.is_none() {
+        return EvidenceContextState::Missing;
+    }
+    if attachment.source_task_version != Some(task.version) {
+        return EvidenceContextState::Stale;
+    }
+
+    let Some(source_context_digest) = attachment.source_context_digest.as_deref() else {
+        return EvidenceContextState::Missing;
+    };
+    let context = commit_build_check_context.iter().find(|context| {
+        let parsed = serde_json::from_str::<serde_json::Value>(context).ok();
+        let context_task_id = parsed
+            .as_ref()
+            .and_then(|value| value.get("task_id"))
+            .and_then(serde_json::Value::as_str);
+        let context_execution_id = parsed
+            .as_ref()
+            .and_then(|value| value.get("execution_id"))
+            .and_then(serde_json::Value::as_str);
+        if let Some(source_run_id) = attachment.source_run_id.as_deref() {
+            context_execution_id == Some(source_run_id)
+        } else {
+            context_task_id == Some(source_task_id)
+        }
+    });
+    let context = context.or_else(|| {
+        (attachment.source_run_id.is_none() && commit_build_check_context.len() == 1)
+            .then(|| &commit_build_check_context[0])
+    });
+    let Some(context) = context else {
+        return EvidenceContextState::Stale;
+    };
+    let expected_digest = serde_json::from_str::<serde_json::Value>(context)
+        .ok()
+        .and_then(|value| {
+            canonical_digest_with_schema(MILESTONE_READINESS_DIGEST_SCHEMA_VERSION, &value).ok()
+        })
+        .or_else(|| {
+            canonical_digest_with_schema(MILESTONE_READINESS_DIGEST_SCHEMA_VERSION, context).ok()
+        });
+    if expected_digest.as_deref() == Some(source_context_digest) {
+        EvidenceContextState::Fresh
+    } else {
+        EvidenceContextState::Stale
     }
 }
 
@@ -1228,6 +1415,15 @@ mod tests {
             source_task_id: Some("task-1".to_owned()),
             source_run_id: None,
             source_validation_id: None,
+            source_task_version: Some(2),
+            source_context_digest: Some(
+                canonical_digest_with_schema(
+                    MILESTONE_READINESS_DIGEST_SCHEMA_VERSION,
+                    &"commit:abc",
+                )
+                .expect("evidence context digest"),
+            ),
+            source_definition_revision_id: Some("definition-1".to_owned()),
             milestone_id: Some("milestone-1".to_owned()),
             acceptance_check_ids: vec!["evidence-1".to_owned()],
             caption: "A useful proof".to_owned(),
@@ -1433,6 +1629,67 @@ mod tests {
             vec![EvidenceAvailability::Available]
         );
         assert_eq!(result.readiness_digest.len(), 64);
+    }
+
+    #[test]
+    fn required_evidence_without_exact_context_is_stale() {
+        let mut input = readiness_input(
+            vec![check("check-1", true)],
+            vec![validation(
+                "result-1",
+                "check-1",
+                AcceptanceCheckResultStatus::Pass,
+                "2026-08-13T00:00:01Z",
+            )],
+            vec![evidence(
+                "evidence-asset-1",
+                EvidenceAvailability::Available,
+            )],
+        );
+        input.evidence[0].source_context_digest = None;
+        let result = evaluate_readiness(input).expect("readiness computes");
+        assert_eq!(result.result, ReadinessResult::Stale);
+        assert!(result
+            .reasons
+            .iter()
+            .any(|reason| reason.code == "evidence_context_missing"));
+    }
+
+    #[test]
+    fn required_evidence_becomes_stale_when_task_or_context_changes() {
+        let mut task_changed = readiness_input(
+            vec![check("check-1", true)],
+            vec![validation(
+                "result-1",
+                "check-1",
+                AcceptanceCheckResultStatus::Pass,
+                "2026-08-13T00:00:01Z",
+            )],
+            vec![evidence(
+                "evidence-asset-1",
+                EvidenceAvailability::Available,
+            )],
+        );
+        task_changed.task_states[0].version += 1;
+        let result = evaluate_readiness(task_changed).expect("readiness computes");
+        assert_eq!(result.result, ReadinessResult::Stale);
+
+        let mut context_changed = readiness_input(
+            vec![check("check-1", true)],
+            vec![validation(
+                "result-1",
+                "check-1",
+                AcceptanceCheckResultStatus::Pass,
+                "2026-08-13T00:00:01Z",
+            )],
+            vec![evidence(
+                "evidence-asset-1",
+                EvidenceAvailability::Available,
+            )],
+        );
+        context_changed.commit_build_check_context = vec!["commit:def".to_owned()];
+        let result = evaluate_readiness(context_changed).expect("readiness computes");
+        assert_eq!(result.result, ReadinessResult::Stale);
     }
 
     #[test]

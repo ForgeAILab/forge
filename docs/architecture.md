@@ -370,11 +370,29 @@ truth.
 
 Every Main Agent Chat turn carries a server-owned operating instruction.
 Outside an active Product Genesis session, the account baseline skill
-`forge.main.baseline/v1` is in force: it tells the model it is Forge's Main
-Agent, hands it the bounded portfolio projection, and restates the no-Task/
-no-repository/no-credential boundary. The baseline is compiled into the server
-(its content digest is pinned by a test, not a seeded row) and is recorded in
-the turn's context manifest like the seeded skills.
+`forge.main.baseline/v1` Revision `@2` is in force: it tells the model it is
+Forge's Main Agent, hands it the bounded portfolio projection, and restates the
+no-Task/no-repository/no-credential boundary. It also routes clear
+natural-language new-Project intent through the Main-only typed
+`genesis.start` operation, asks one concise question for ambiguous
+new-versus-existing Project intent, and keeps non-Project or existing-Project
+requests in baseline scope. The browser does not own semantic classification.
+The baseline is compiled into the server (each revision's content digest is
+pinned by a test, not a seeded row) and the exact revision/digest is frozen in
+the turn's context manifest. Historical `@1` turns remain reproducible from
+their frozen body and digest.
+
+`genesis.start` is implemented by one receipt-backed command shared with the
+REST start route. Account, Main Chat, and native source-turn authority are
+derived server-side. One transaction creates the Genesis session and immutable
+instruction/source provenance, appends the durable event and command receipt,
+and admits a causally linked discovery continuation. On native success the
+source baseline turn terminalizes as a control transfer, its provider loop is
+cancelled, and no assistant response is stored; the continuation reuses the
+single visible user message and freezes `forge.main.project-discovery/v2` only
+after commit. Exact replay returns the committed receipt, while setup, active
+session, altered-key input, and internal failures stay structured for the
+baseline turn to handle.
 
 Product Genesis uses the server-owned `forge.main.project-discovery/v2` skill
 only while its Genesis session is `discovering` or `ready_for_project`. It asks
@@ -442,7 +460,10 @@ evaluation as the authenticated REST route and returns the committed snapshot;
 it is not a request event awaiting an absent consumer. A Project Agent release
 candidate remains non-authoritative: Forge validates the exact ready snapshot
 and milestone version, records the candidate, and raises human attention for
-the user-only release decision.
+the user-only release decision. The candidate-request event is an attention
+projection only; it does not change the governed readiness inputs or advance
+the readiness source watermark. A candidate therefore cannot make its own
+readiness snapshot stale, and it cannot be treated as a release approval.
 
 #### Shared media and evidence lifecycle
 
@@ -465,6 +486,15 @@ serves bytes only while the shared asset is `available` and authorized. A
 cleanup worker re-checks active Task/Project attachments and immutable release
 pins under a lease immediately before deleting bytes, so restart and Task-delete
 races cannot remove still-referenced evidence. Release pins remain immutable.
+For evidence that satisfies a release-gating requirement, the attachment is
+also bound to the exact source context that produced it: the Task revision,
+execution/run (when applicable), validation result and digest, acceptance-check
+definition revision, and bounded build/commit context. A caption, an
+acceptance-check link, or a currently available binary is not freshness proof
+by itself. Missing or mismatched context is projected as stale/unusable and is
+excluded from a ready result until a new authorized attachment is captured.
+The ordered readiness input manifest stores these source identities and
+digests, and the release transaction rechecks them before pinning evidence.
 Cleanup isolates failures per asset and per phase, so one poisoned upload or
 filesystem entry cannot stop unrelated reconciliation or garbage collection.
 Successful recovery of a purged asset is checkpointed, allowing later rows to
@@ -485,6 +515,41 @@ audit data, removes bytes, and both dispositions overlay every affected release
 pin as `evidence_unavailable`; after purge neither former URL serves the bytes.
 Neither route rewrites the immutable release manifest, and neither accepts a
 storage key or raw bytes.
+
+#### Project Overview projection
+
+`GET /api/v1/projects/{id}/overview` is a read-time projection over the
+authoritative Charter, Document, Decision, execution-setup, Task/validation,
+milestone, evidence, readiness, and release records. It is never a second
+editable truth store. A document entry reports both the approved revision
+that governs execution and any newer working draft/proposed revision; a newer
+working revision is `changes_pending`, not proof that the approved revision
+has disappeared. The typed document status is one of `current`,
+`changes_pending`, `stale`, `reconciliation_required`, or `unavailable`. A
+draft-only Document is also `changes_pending`; an invalid approved pointer,
+incompatible governing source, or source-version mismatch is a typed
+stale/reconciliation condition. Effective Decision Log records are projected
+separately from draft/proposed candidate IDs so editor workflow is never
+presented as approved authority.
+
+The projection's `next_action` is typed rather than a display-only sentence.
+It identifies an action `code`, the required principal, target type and id,
+human title/explanation, `action_kind`, canonical route or operation,
+whether it blocks the Project, and the expected version when a compare-and-swap
+mutation is required. The resolver gives conflicts/reconciliation and
+execution setup precedence over downstream work, then baseline approval,
+Task/validation/evidence remediation, readiness, user release, and finally
+milestone definition. Clients must render the action's target and operation;
+they must not infer an executable action from a stale badge, Task counts, or a
+free-form message.
+
+Overview readiness is fresh only when the current milestone definition,
+baseline/policy, acceptance-check definitions and results, document approvals,
+waivers, evidence source context, and bounded repository/build references still
+match the exact input manifest of the displayed `ReadinessSnapshot`. A recent
+snapshot with a `ready` result is therefore displayed as stale when any
+covered source changes. Release history is immutable and is shown separately
+from this mutable projection.
 
 #### Context, memory, and recovery invariants
 

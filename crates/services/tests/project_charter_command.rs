@@ -268,7 +268,7 @@ fn authorization(
         authorization_event_id: event_id.to_owned(),
         authorization_basis: "explicit authenticated authorization".to_owned(),
         authorization_action: action.to_owned(),
-        authorization_occurred_at: NOW.to_owned(),
+        authorization_occurred_at: db::now_rfc3339(),
         authorization_json: "{}".to_owned(),
     }
 }

@@ -851,6 +851,94 @@ impl AgentChatTransactionRepo for SqliteDb {
         Ok(admitted)
     }
 
+    async fn admit_agent_chat_turn_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: AdmitAgentChatTurn,
+    ) -> Result<AdmittedAgentChatTurn> {
+        admit_agent_chat_turn_in_tx(self, transaction, input).await
+    }
+
+    async fn admit_agent_chat_continuation_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateAgentChatTurnJob,
+    ) -> Result<AgentChatTurnJob> {
+        if let Some(existing) =
+            sqlx::query("SELECT * FROM agent_chat_turn_job WHERE dedupe_key = ?")
+                .bind(&input.dedupe_key)
+                .fetch_optional(&mut **transaction)
+                .await?
+        {
+            let turn = map_agent_chat_turn_job(existing)?;
+            if !turn_admission_semantics_match(&input, &turn) {
+                return Err(DbError::IdempotencyConflict);
+            }
+            return Ok(turn);
+        }
+
+        let trigger_chat_id =
+            sqlx::query_scalar::<_, String>("SELECT chat_id FROM agent_chat_message WHERE id = ?")
+                .bind(&input.triggering_message_id)
+                .fetch_optional(&mut **transaction)
+                .await?
+                .ok_or(DbError::NotFound)?;
+        if trigger_chat_id != input.chat_id {
+            return Err(DbError::Check(
+                "chat continuation trigger does not belong to the canonical chat".to_owned(),
+            ));
+        }
+
+        validate_agent_chat_turn_admission(transaction, &input).await?;
+        sqlx::query(
+            "INSERT INTO agent_chat_turn_job (
+                id, chat_id, triggering_message_id, responder_identity_id, profile_id,
+                responder_binding_id, responder_binding_version, responder_identity_version,
+                profile_version, operating_skill_revision_id, policy_revision, policy_digest,
+                permission_policy_digest, tool_policy_digest, admission_digest,
+                canonical_scope_provenance_json, canonical_scope_type, canonical_scope_id,
+                status, dedupe_key, max_attempts, correlation_id, causation_id,
+                causation_depth, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       'queued', ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&input.id)
+        .bind(&input.chat_id)
+        .bind(&input.triggering_message_id)
+        .bind(&input.responder_identity_id)
+        .bind(&input.profile_id)
+        .bind(input.responder_binding_id.as_deref())
+        .bind(input.responder_binding_version)
+        .bind(input.responder_identity_version)
+        .bind(input.profile_version)
+        .bind(input.operating_skill_revision_id.as_deref())
+        .bind(input.policy_revision.as_deref())
+        .bind(input.policy_digest.as_deref())
+        .bind(input.permission_policy_digest.as_deref())
+        .bind(input.tool_policy_digest.as_deref())
+        .bind(input.admission_digest.as_deref())
+        .bind(input.canonical_scope_provenance_json.as_deref())
+        .bind(&input.canonical_scope_type)
+        .bind(&input.canonical_scope_id)
+        .bind(&input.dedupe_key)
+        .bind(input.max_attempts)
+        .bind(&input.correlation_id)
+        .bind(input.causation_id.as_deref())
+        .bind(input.causation_depth)
+        .bind(&input.created_at)
+        .bind(&input.updated_at)
+        .execute(&mut **transaction)
+        .await
+        .map_err(map_chat_write_error)?;
+
+        sqlx::query("SELECT * FROM agent_chat_turn_job WHERE id = ?")
+            .bind(&input.id)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(DbError::from)
+            .and_then(map_agent_chat_turn_job)
+    }
+
     async fn complete_agent_chat_turn(
         &self,
         input: CompleteAgentChatTurn,
@@ -986,6 +1074,133 @@ impl AgentChatTransactionRepo for SqliteDb {
             .and_then(map_agent_chat_turn_job)?;
         transaction.commit().await?;
         Ok(CompletedAgentChatTurn { response, turn })
+    }
+
+    async fn complete_agent_chat_control_transfer(
+        &self,
+        input: CompleteAgentChatControlTransfer,
+    ) -> Result<AgentChatTurnJob> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let current_row = sqlx::query("SELECT * FROM agent_chat_turn_job WHERE id = ?")
+            .bind(&input.turn_job_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        let current = map_agent_chat_turn_job(current_row)?;
+        if current.status == AgentChatTurnState::Succeeded && current.response_message_id.is_none()
+        {
+            transaction.commit().await?;
+            return Ok(current);
+        }
+        if current.version != input.expected_version
+            || current.status != AgentChatTurnState::Leased
+            || current.lease_owner.as_deref() != Some(input.lease_owner.as_str())
+        {
+            return Err(DbError::VersionConflict);
+        }
+
+        let outcome_json = sqlx::query_scalar::<_, String>(
+            "SELECT outcome_json FROM command_receipt
+             WHERE id = ? AND operation = 'genesis.start'",
+        )
+        .bind(&input.command_receipt_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(DbError::NotFound)?;
+        let outcome: serde_json::Value = serde_json::from_str(&outcome_json)
+            .map_err(|_| DbError::Check("Genesis start receipt outcome is invalid".to_owned()))?;
+        if outcome
+            .get("source_turn_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(current.id.as_str())
+            || outcome
+                .get("admitted_turn_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(input.continuation_turn_id.as_str())
+            || outcome
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(input.genesis_session_id.as_str())
+            || outcome
+                .get("control_transfer")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        {
+            return Err(DbError::Check(
+                "Genesis start receipt does not authorize this turn control transfer".to_owned(),
+            ));
+        }
+        let continuation_valid: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM agent_chat_turn_job
+             WHERE id = ? AND chat_id = ? AND triggering_message_id = ?
+               AND status IN ('queued', 'retry_wait', 'leased', 'awaiting_input', 'succeeded')",
+        )
+        .bind(&input.continuation_turn_id)
+        .bind(&current.chat_id)
+        .bind(&current.triggering_message_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if continuation_valid.is_none() {
+            return Err(DbError::Check(
+                "Genesis control transfer continuation is unavailable".to_owned(),
+            ));
+        }
+
+        let updated = sqlx::query(
+            "UPDATE agent_chat_turn_job
+             SET status = 'succeeded', response_message_id = NULL,
+                 lease_owner = NULL, leased_until = NULL, next_attempt_at = NULL,
+                 error_code = NULL, error_message = NULL,
+                 version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ? AND status = 'leased' AND lease_owner = ?",
+        )
+        .bind(&input.updated_at)
+        .bind(&input.turn_job_id)
+        .bind(input.expected_version)
+        .bind(&input.lease_owner)
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(DbError::VersionConflict);
+        }
+
+        DomainEventRepo::append_event_in_tx(
+            self,
+            &mut transaction,
+            &CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "agent_chat.turn.control_transferred".to_owned(),
+                entity_type: "agent_chat_turn_job".to_owned(),
+                entity_id: current.id.clone(),
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                scope_type: "agent_chat".to_owned(),
+                scope_id: current.chat_id.clone(),
+                correlation_id: current.correlation_id.clone(),
+                causation_id: Some(input.command_receipt_id.clone()),
+                causation_depth: current.causation_depth.saturating_add(1).min(16),
+                dedupe_key: Some(format!("agent-chat-control-transfer:{}", current.id)),
+                payload_json: serde_json::json!({
+                    "operation": "genesis.start",
+                    "source_turn_id": current.id,
+                    "continuation_turn_id": input.continuation_turn_id,
+                    "genesis_session_id": input.genesis_session_id,
+                    "command_receipt_id": input.command_receipt_id,
+                    "response_message_committed": false,
+                })
+                .to_string(),
+                created_at: input.updated_at.clone(),
+            },
+        )
+        .await?;
+        let turn = sqlx::query("SELECT * FROM agent_chat_turn_job WHERE id = ?")
+            .bind(&input.turn_job_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(DbError::from)
+            .and_then(map_agent_chat_turn_job)?;
+        transaction.commit().await?;
+        Ok(turn)
     }
 
     async fn fail_agent_chat_turn(&self, input: FailAgentChatTurn) -> Result<AgentChatTurnJob> {
@@ -1950,7 +2165,12 @@ async fn validate_agent_chat_turn_admission(
             .fetch_optional(&mut **transaction)
             .await?
         } else {
-            Some("forge.main.baseline/v1@1".to_owned())
+            let revision = turn
+                .operating_skill_revision_id
+                .as_deref()
+                .filter(|revision| supported_main_baseline_revision(revision))
+                .ok_or(DbError::VersionConflict)?;
+            Some(revision.to_owned())
         }
     } else {
         binding_skill_revision
@@ -1960,6 +2180,31 @@ async fn validate_agent_chat_turn_admission(
     }
 
     Ok(())
+}
+
+fn supported_main_baseline_revision(revision: &str) -> bool {
+    matches!(
+        revision,
+        "forge.main.baseline/v1@1" | "forge.main.baseline/v1@2"
+    )
+}
+
+#[cfg(test)]
+mod main_baseline_revision_tests {
+    use super::supported_main_baseline_revision;
+
+    #[test]
+    fn only_frozen_main_baseline_revisions_are_supported() {
+        assert!(supported_main_baseline_revision("forge.main.baseline/v1@1"));
+        assert!(supported_main_baseline_revision("forge.main.baseline/v1@2"));
+        assert!(!supported_main_baseline_revision(
+            "forge.main.baseline/v1@3"
+        ));
+        assert!(!supported_main_baseline_revision(
+            "forge.main.project-discovery/v2@2"
+        ));
+        assert!(!supported_main_baseline_revision(""));
+    }
 }
 
 pub(crate) fn admission_policy_digest(value: &str) -> Result<String> {

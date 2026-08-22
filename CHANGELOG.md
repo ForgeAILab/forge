@@ -8,12 +8,41 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Main Chat now starts Product Genesis from clear natural-language new-Project
+  intent through the Main-only typed `genesis.start` command. The existing
+  `/start-product <idea>` UI command remains an optional shortcut. Both paths
+  share one atomic, receipt-backed start boundary; native success transfers the
+  leased baseline turn into exactly one discovery continuation without a second
+  visible user message or duplicate assistant response. Ambiguous intent asks a
+  concise question, and ordinary portfolio/existing-Project chat is unchanged.
+
 - Added the native ReadyOnly `task.adaptive` Project Agent operation for
   bounded split, sequence, and replace Task commands. The operation is
   Project/Project-chat scoped, requires `propose_task`, uses direct command
   receipts without an `AgentAction`, and returns receipt-first replay metadata.
 
 ### Fixed
+
+- The Main and Project Agents can see the shape of the payload they must send.
+  The generic orchestration proposal tool declares `payload` as a plain object
+  (provider function-calling APIs only reliably deliver flat schemas), and its
+  description named only the top-level required keys. For an operation whose
+  payload is deeply nested — `charter.draft` carries the whole Charter
+  `content` tree — the field names below the top level were invisible, so the
+  model had to rediscover them one rejected call at a time. A Genesis Charter
+  draft cost 30 rejected `charter.draft` calls before landing, and the
+  knowledge-ledger provenance it could never guess left readiness `blocked`.
+  The payload description now carries a compact recursive signature of the
+  exact contract, including nested objects, arrays, and enum variants.
+
+- Orchestration validation failures tell the model what was wrong. Contract
+  and command-boundary rejections were collapsed into a bare "the operation or
+  arguments are not valid for this Forge surface", discarding a
+  server-authored reason that named the offending field — so the model
+  retried the same rejected shape indefinitely with nothing to correct. The
+  reason now travels in the outcome (for example
+  `(expected_document_version must be positive)`). Policy denials stay generic:
+  their reason can describe authority the caller may not observe.
 
 - A Project can be deleted after its agents have run. `DELETE /api/v1/projects/{id}`
   failed with "context manifests are immutable" for any Project whose agent had
@@ -121,6 +150,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   contract, pinning the Charter and Project versions observed during review.
 
 ### Breaking
+
+- `StartProductGenesisRequest` now requires a non-empty `idempotency_key`.
+  Product Genesis start is atomic across the session, immutable instruction and
+  source provenance, durable event/receipt, and discovery admission. Concurrent
+  active starts now return the typed `active_session_conflict` outcome; missing
+  Main setup returns `setup_required`.
+
+- Project Overview clients must consume a typed `next_action` projection and
+  explicit document/evidence freshness state. The Overview now distinguishes
+  an approved Document revision from a newer working draft, binds release-gating
+  evidence to its exact Task/run/validation/check/build context, and marks
+  missing or mismatched context stale instead of treating an available file or
+  caption as proof. Project Agent release recommendations remain
+  non-authoritative attention records; only the user release operation may
+  consume the exact readiness snapshot and create an immutable release.
 
 - Execution responses now expose the owner-bound liveness projection
   (`execution_version`, opaque `lease_owner`, lease expiry, hard deadline,

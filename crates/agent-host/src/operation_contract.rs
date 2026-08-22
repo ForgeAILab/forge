@@ -12,11 +12,11 @@ use serde_json::{Value, json};
 use crate::operation_catalog::{
     MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
     MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION, MAIN_CHARTER_READINESS_OPERATION,
-    MAIN_PROJECT_CREATE_OPERATION, PROJECT_CHARTER_ADOPTION_OPERATION,
-    PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
-    PROJECT_EVIDENCE_OPERATION, PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION,
-    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, TASK_ADAPTIVE_OPERATION,
-    TASK_PROPOSE_OPERATION,
+    MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
+    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
+    PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION,
+    PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
+    PROJECT_RELEASE_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_PROPOSE_OPERATION,
 };
 
 pub(crate) fn object_schema(properties: Value, required: &[&str]) -> Value {
@@ -27,7 +27,6 @@ pub(crate) fn object_schema(properties: Value, required: &[&str]) -> Value {
         "additionalProperties": false,
     })
 }
-
 pub(crate) fn described_object_schema(
     properties: Value,
     required: &[&str],
@@ -343,6 +342,14 @@ pub(crate) fn execution_baseline_content_schema() -> Value {
 
 pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
     match operation {
+        MAIN_GENESIS_START_OPERATION => object_schema(
+            json!({
+                "action":{"const":"start"},
+                "maturity":{"type":["string","null"],"enum":["prototype","mvp","production","critical",null]},
+                "preferred_project_agent_identity_id":string_or_null_schema()
+            }),
+            &["action"],
+        ),
         MAIN_CHARTER_DRAFT_OPERATION => object_schema(
             json!({
                 "action":{"const":"save_revision"},"charter_id":{"type":"string","minLength":1},"base_revision_id":string_or_null_schema(),"project_mode":{"type":"string","enum":["compact","standard"]},"maturity":{"type":"string","enum":["prototype","mvp","production","critical"]},"content":charter_content_schema(),"rendered_view":{"type":"string","minLength":1,"description":"Omit. The server renders the canonical view from content; provide only to round-trip an exact server-rendered value."},"render_version":{"type":"string","minLength":1,"description":"Omit. The server stamps its own render version; provide only to round-trip an exact server value."},"provenance":revision_provenance_schema()
@@ -726,6 +733,100 @@ pub(crate) fn portable_const_schema(mut schema: Value) -> Value {
     schema
 }
 
+/// Renders one JSON-schema node as a compact structural signature.
+///
+/// Provider function-calling APIs only reliably deliver flat object schemas,
+/// so a nested payload contract cannot travel as a schema. It travels here
+/// instead, in the payload description. Naming only the top-level required
+/// keys is not enough: an operation like `charter.draft` carries a deeply
+/// nested `content` object, and a model that cannot see those field names
+/// has to rediscover them one rejected call at a time.
+fn schema_signature(schema: &Value, depth: usize) -> String {
+    const MAX_DEPTH: usize = 8;
+    if depth > MAX_DEPTH {
+        return "object".to_owned();
+    }
+    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array) {
+        return variants
+            .iter()
+            .map(|variant| schema_signature(variant, depth))
+            .collect::<Vec<_>>()
+            .join("|");
+    }
+    if let Some(constant) = schema.get("const").and_then(Value::as_str) {
+        return format!("\"{constant}\"");
+    }
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        return values
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("|");
+    }
+    let type_names: Vec<&str> = match schema.get("type") {
+        Some(Value::String(name)) => vec![name.as_str()],
+        Some(Value::Array(names)) => names.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    let nullable = type_names.contains(&"null");
+    let Some(primary) = type_names
+        .iter()
+        .find(|name| **name != "null")
+        .copied()
+        .or_else(|| type_names.is_empty().then_some("object"))
+    else {
+        // A `null`-only node (the null arm of a `oneOf`) carries no shape.
+        return "null".to_owned();
+    };
+    let rendered = match primary {
+        "object" => {
+            let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+                return if nullable {
+                    "object|null".to_owned()
+                } else {
+                    "object".to_owned()
+                };
+            };
+            let required: Vec<&str> = schema
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|values| values.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let fields = properties
+                .iter()
+                .map(|(name, property)| {
+                    // `?` marks an optional field so the model can tell what it
+                    // must supply from what it may omit.
+                    let optional = if required.contains(&name.as_str()) {
+                        ""
+                    } else {
+                        "?"
+                    };
+                    format!(
+                        "{name}{optional}: {}",
+                        schema_signature(property, depth + 1)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{{fields}}}")
+        }
+        "array" => {
+            let items = schema
+                .get("items")
+                .map(|items| schema_signature(items, depth + 1))
+                .unwrap_or_else(|| "any".to_owned());
+            format!("[{items}]")
+        }
+        other => other.to_owned(),
+    };
+    if nullable {
+        format!("{rendered}|null")
+    } else {
+        rendered
+    }
+}
+
 /// Summarizes one operation's payload contract as a guidance line for the
 /// declared tool schema. Handles both single-variant payload schemas and
 /// `oneOf` payloads (e.g. document draft vs. approval).
@@ -759,11 +860,12 @@ pub(crate) fn orchestration_payload_summary(schema: &Value) -> String {
                     .join(", ")
             })
             .unwrap_or_default();
+        let shape = schema_signature(variant, 0);
         Some(match action {
             Some(action) if !action.is_empty() => {
-                format!("action={action}; required: [{required}]")
+                format!("action={action}; required: [{required}]; shape: {shape}")
             }
-            _ => format!("required: [{required}]"),
+            _ => format!("required: [{required}]; shape: {shape}"),
         })
     }
     if let Some(variants) = schema.get("oneOf").and_then(Value::as_array) {
@@ -1162,6 +1264,31 @@ mod tests {
             schema["properties"]["expected_baseline_version"]["minimum"],
             0
         );
+    }
+
+    #[test]
+    fn genesis_start_contract_is_closed_and_carries_no_source_authority() {
+        let schema = orchestration_payload_schema(MAIN_GENESIS_START_OPERATION);
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["action"]["const"], "start");
+        let properties = schema["properties"].as_object().expect("properties");
+        assert_eq!(
+            properties.keys().cloned().collect::<Vec<_>>(),
+            [
+                "action".to_owned(),
+                "maturity".to_owned(),
+                "preferred_project_agent_identity_id".to_owned(),
+            ]
+        );
+        for forbidden in [
+            "account_id",
+            "chat_id",
+            "initial_idea",
+            "source_message_id",
+            "source_turn_id",
+        ] {
+            assert!(!properties.contains_key(forbidden));
+        }
     }
 
     #[test]

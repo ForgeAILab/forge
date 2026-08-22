@@ -14,6 +14,7 @@ pub enum OutcomeCode {
     Ok,
     ApprovalRequired,
     SetupRequired,
+    ActiveSessionConflict,
     VersionConflict,
     DigestConflict,
     IdempotencyConflict,
@@ -31,6 +32,7 @@ impl OutcomeCode {
             Self::Ok => "ok",
             Self::ApprovalRequired => "approval_required",
             Self::SetupRequired => "setup_required",
+            Self::ActiveSessionConflict => "active_session_conflict",
             Self::VersionConflict => "version_conflict",
             Self::DigestConflict => "digest_conflict",
             Self::IdempotencyConflict => "idempotency_conflict",
@@ -367,6 +369,7 @@ impl OrchestrationOutcome {
             OutcomeCode::ApprovalRequired => OutcomeStatus::ApprovalRequired,
             OutcomeCode::SetupRequired => OutcomeStatus::SetupRequired,
             OutcomeCode::VersionConflict
+            | OutcomeCode::ActiveSessionConflict
             | OutcomeCode::DigestConflict
             | OutcomeCode::IdempotencyConflict
             | OutcomeCode::PolicyDenied

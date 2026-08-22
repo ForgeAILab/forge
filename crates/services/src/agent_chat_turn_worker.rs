@@ -14,15 +14,16 @@ use db::{
     canonicalize_project_handoff_json, now_rfc3339, project_handoff_request_fingerprint,
     AccountMainAgentBindingRepo, Agent, AgentChatMessage, AgentChatMessageAuthorType,
     AgentChatMessageListQuery, AgentChatMessageRepo, AgentChatMessageStatus, AgentChatRepo,
-    AgentChatTurnJob, AgentChatTurnJobRepo, AgentProfile, AgentProfileRepo, AgentRepo,
-    AgentSession, CredentialHandleRepo, PageRequest, ProjectAgentBindingRepo, ProjectRepo,
-    SqliteDb,
+    AgentChatTransactionRepo, AgentChatTurnJob, AgentChatTurnJobRepo, AgentProfile,
+    AgentProfileRepo, AgentRepo, AgentSession, CompleteAgentChatControlTransfer,
+    CredentialHandleRepo, PageRequest, ProjectAgentBindingRepo, ProjectRepo, SqliteDb,
 };
 use executors::{ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorKind, TaskExecutor};
 use forge_agent_host::RuntimeContextManifestLink;
 use forge_agent_host::{
     AgentSessionBackend, AgentTurnRequest, BackendCapabilities, CanonicalScope, CanonicalScopeType,
     Message, NativeProviderConfig, Role, TurnEventSink, WorkspaceAccess,
+    MAIN_GENESIS_START_OPERATION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -42,17 +43,20 @@ use crate::{
         CreateFrozenAgentChatSession, CreateScopedSession, RequestedCanonicalScope,
     },
     operating_skills::{
-        canonical_main_baseline_operating_skill_body, canonical_main_operating_skill_body,
-        canonical_project_operating_skill_body, render_main_baseline_operating_skill,
-        render_project_operating_skill, EffectiveProjectStateContext, MainBaselineSkillContext,
-        ProjectOperatingSkillContext, MAIN_BASELINE_OPERATING_SKILL_CONTENT_DIGEST,
-        MAIN_BASELINE_OPERATING_SKILL_KEY, MAIN_BASELINE_OPERATING_SKILL_REVISION,
-        MAIN_OPERATING_SKILL_CONTENT_DIGEST, MAIN_OPERATING_SKILL_KEY,
-        MAIN_OPERATING_SKILL_POLICY_DIGEST, MAIN_OPERATING_SKILL_POLICY_JSON,
-        MAIN_OPERATING_SKILL_RENDER_VERSION, MAIN_OPERATING_SKILL_SCHEMA_VERSION,
-        PROJECT_OPERATING_SKILL_CONTENT_DIGEST, PROJECT_OPERATING_SKILL_KEY,
-        PROJECT_OPERATING_SKILL_POLICY_DIGEST, PROJECT_OPERATING_SKILL_POLICY_JSON,
-        PROJECT_OPERATING_SKILL_RENDER_VERSION, PROJECT_OPERATING_SKILL_SCHEMA_VERSION,
+        canonical_main_baseline_operating_skill_body,
+        canonical_main_baseline_operating_skill_body_for_revision,
+        canonical_main_operating_skill_body, canonical_project_operating_skill_body,
+        render_main_baseline_operating_skill, render_project_operating_skill,
+        EffectiveProjectStateContext, MainBaselineSkillContext, ProjectOperatingSkillContext,
+        LEGACY_MAIN_BASELINE_OPERATING_SKILL_REVISION,
+        MAIN_BASELINE_OPERATING_SKILL_CONTENT_DIGEST, MAIN_BASELINE_OPERATING_SKILL_KEY,
+        MAIN_BASELINE_OPERATING_SKILL_REVISION, MAIN_OPERATING_SKILL_CONTENT_DIGEST,
+        MAIN_OPERATING_SKILL_KEY, MAIN_OPERATING_SKILL_POLICY_DIGEST,
+        MAIN_OPERATING_SKILL_POLICY_JSON, MAIN_OPERATING_SKILL_RENDER_VERSION,
+        MAIN_OPERATING_SKILL_SCHEMA_VERSION, PROJECT_OPERATING_SKILL_CONTENT_DIGEST,
+        PROJECT_OPERATING_SKILL_KEY, PROJECT_OPERATING_SKILL_POLICY_DIGEST,
+        PROJECT_OPERATING_SKILL_POLICY_JSON, PROJECT_OPERATING_SKILL_RENDER_VERSION,
+        PROJECT_OPERATING_SKILL_SCHEMA_VERSION,
     },
     project_runtime::{load_effective_project_state, ProjectEffectiveStateProjection},
     EmbeddedAgentService, Result, ServiceError,
@@ -832,11 +836,15 @@ impl FederatedAgentChatTurnRunner {
                 ServiceError::invalid_operation("Agent Chat turn has no operating-skill provenance")
             })?;
         if expected_skill_key == MAIN_BASELINE_OPERATING_SKILL_KEY {
-            if operating_skill_revision_id != MAIN_BASELINE_OPERATING_SKILL_REVISION {
-                return Err(ServiceError::invalid_operation(
-                    "Agent Chat frozen Main baseline skill does not match the active Main context",
-                ));
-            }
+            let (operating_skill_body, operating_skill_content_digest) =
+                canonical_main_baseline_operating_skill_body_for_revision(
+                    &operating_skill_revision_id,
+                )
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "Agent Chat frozen Main baseline skill does not match a supported Main context",
+                    )
+                })?;
             return Ok(Some(FrozenTurnAuthority {
                 binding_id,
                 binding_version,
@@ -847,9 +855,8 @@ impl FederatedAgentChatTurnRunner {
                 permission_policy_digest,
                 tool_policy_digest,
                 operating_skill_key: MAIN_BASELINE_OPERATING_SKILL_KEY.to_owned(),
-                operating_skill_body: canonical_main_baseline_operating_skill_body().to_owned(),
-                operating_skill_content_digest: MAIN_BASELINE_OPERATING_SKILL_CONTENT_DIGEST
-                    .to_owned(),
+                operating_skill_body: operating_skill_body.to_owned(),
+                operating_skill_content_digest: operating_skill_content_digest.to_owned(),
             }));
         }
         let skill_row = sqlx::query(
@@ -3249,6 +3256,13 @@ pub struct AgentChatTurnWorker {
     lease_owner: String,
 }
 
+#[derive(Debug, Clone)]
+struct GenesisControlTransfer {
+    command_receipt_id: String,
+    continuation_turn_id: String,
+    genesis_session_id: String,
+}
+
 impl fmt::Debug for AgentChatTurnWorker {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -3552,7 +3566,32 @@ impl AgentChatTurnWorker {
         let turn_cancellation = cancellation.child_token();
         let renewal =
             self.spawn_lease_renewal(job.id.clone(), stop.clone(), turn_cancellation.clone());
-        let result = self.runner.run_turn(&job, turn_cancellation).await;
+        let baseline_turn = job
+            .operating_skill_revision_id
+            .as_deref()
+            .is_some_and(|revision| {
+                revision == MAIN_BASELINE_OPERATING_SKILL_REVISION
+                    || revision == LEGACY_MAIN_BASELINE_OPERATING_SKILL_REVISION
+            });
+        let mut control_transfer = None;
+        let mut result = None;
+        if baseline_turn {
+            let run = self.runner.run_turn(&job, turn_cancellation.clone());
+            tokio::pin!(run);
+            tokio::select! {
+                completed = &mut run => result = Some(completed),
+                transfer = self.wait_for_genesis_control_transfer(&job.id) => {
+                    control_transfer = Some(transfer);
+                    // The typed command has already committed the durable
+                    // continuation. Stop the baseline provider loop so it
+                    // cannot add a redundant conversational response.
+                    turn_cancellation.cancel();
+                    let _ = tokio::time::timeout(Duration::from_secs(5), &mut run).await;
+                }
+            }
+        } else {
+            result = Some(self.runner.run_turn(&job, turn_cancellation).await);
+        }
         stop.cancel();
         let _ = renewal.await;
         // Renewal is versioned. Re-read after the backend stops so a long
@@ -3563,6 +3602,36 @@ impl AgentChatTurnWorker {
             .ok()
             .flatten()
             .unwrap_or(job.clone());
+        if baseline_turn && control_transfer.is_none() {
+            control_transfer = self
+                .find_genesis_control_transfer(&commit_job.id)
+                .await
+                .ok()
+                .flatten();
+        }
+        if let Some(transfer) = control_transfer {
+            if let Err(error) = AgentChatTransactionRepo::complete_agent_chat_control_transfer(
+                &*self.db,
+                CompleteAgentChatControlTransfer {
+                    turn_job_id: commit_job.id.clone(),
+                    expected_version: commit_job.version,
+                    lease_owner: self.lease_owner.clone(),
+                    command_receipt_id: transfer.command_receipt_id,
+                    continuation_turn_id: transfer.continuation_turn_id,
+                    genesis_session_id: transfer.genesis_session_id,
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await
+            {
+                tracing::warn!(job_id = %commit_job.id, error = %error, "Agent Chat Genesis control transfer commit failed");
+            }
+            return;
+        }
+        let Some(result) = result else {
+            tracing::warn!(job_id = %commit_job.id, "Agent Chat runner stopped without a Genesis control transfer");
+            return;
+        };
         match result {
             Ok(turn) => {
                 if let Some(pending_interaction_id) = turn.pending_interaction_id {
@@ -3611,6 +3680,54 @@ impl AgentChatTurnWorker {
                 }
             }
         }
+    }
+
+    async fn wait_for_genesis_control_transfer(
+        &self,
+        source_turn_id: &str,
+    ) -> GenesisControlTransfer {
+        let mut interval = tokio::time::interval(Duration::from_millis(25));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            match self.find_genesis_control_transfer(source_turn_id).await {
+                Ok(Some(transfer)) => return transfer,
+                Ok(None) => {}
+                Err(error) => tracing::debug!(
+                    turn_id = source_turn_id,
+                    error = %error,
+                    "Genesis control-transfer watch read failed"
+                ),
+            }
+        }
+    }
+
+    async fn find_genesis_control_transfer(
+        &self,
+        source_turn_id: &str,
+    ) -> Result<Option<GenesisControlTransfer>> {
+        let row = sqlx::query(
+            "SELECT id,
+                    json_extract(outcome_json, '$.admitted_turn_id') AS continuation_turn_id,
+                    json_extract(outcome_json, '$.session_id') AS genesis_session_id
+             FROM command_receipt
+             WHERE operation = ?
+               AND json_extract(outcome_json, '$.source_turn_id') = ?
+               AND json_extract(outcome_json, '$.control_transfer') = 1
+             ORDER BY committed_at DESC, id DESC LIMIT 1",
+        )
+        .bind(MAIN_GENESIS_START_OPERATION)
+        .bind(source_turn_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+        row.map(|row| {
+            Ok(GenesisControlTransfer {
+                command_receipt_id: row.try_get("id")?,
+                continuation_turn_id: row.try_get("continuation_turn_id")?,
+                genesis_session_id: row.try_get("genesis_session_id")?,
+            })
+        })
+        .transpose()
     }
 
     async fn commit_success(
@@ -3788,7 +3905,9 @@ fn replace_rendered_skill_body(
 /// transition after admission must not turn a baseline job into discovery (or
 /// the reverse) while it waits in the queue.
 fn main_skill_key_for_frozen_revision(revision_id: &str) -> &'static str {
-    if revision_id == MAIN_BASELINE_OPERATING_SKILL_REVISION {
+    if revision_id == MAIN_BASELINE_OPERATING_SKILL_REVISION
+        || revision_id == LEGACY_MAIN_BASELINE_OPERATING_SKILL_REVISION
+    {
         MAIN_BASELINE_OPERATING_SKILL_KEY
     } else {
         MAIN_OPERATING_SKILL_KEY
@@ -4781,6 +4900,10 @@ mod tests {
             MAIN_BASELINE_OPERATING_SKILL_KEY
         );
         assert_eq!(
+            main_skill_key_for_frozen_revision(LEGACY_MAIN_BASELINE_OPERATING_SKILL_REVISION),
+            MAIN_BASELINE_OPERATING_SKILL_KEY
+        );
+        assert_eq!(
             main_skill_key_for_frozen_revision("forge.main.project-discovery/v2@7"),
             MAIN_OPERATING_SKILL_KEY
         );
@@ -5670,7 +5793,10 @@ mod tests {
             sources[0].source_id,
             "operating_skill:forge.main.baseline/v1"
         );
-        assert_eq!(sources[0].source_revision, "forge.main.baseline/v1@1");
+        assert_eq!(
+            sources[0].source_revision,
+            MAIN_BASELINE_OPERATING_SKILL_REVISION
+        );
         assert_eq!(
             sources[0].selection_reason,
             "server_owned_main_baseline_operating_skill"

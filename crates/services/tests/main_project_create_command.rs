@@ -14,12 +14,12 @@ use std::{
 
 use api_types::ProductMaturity;
 use db::{
-    create_sqlite_pool, run_migrations, AccountMainAgentBindingRepo, AgentActionPolicyResult,
-    AgentActionRepo, AgentActionStatus, AgentChatMessageAuthorType, AgentChatMessageRepo,
-    AgentChatMessageStatus, AgentChatTurnJobRepo, AgentRepo, CreateAccountMainAgentBinding,
-    CreateAgentAction, CreateAgentChatMessage, CreateAgentChatTurnJob, CreateAgentIdentity,
-    CreateAgentProfile, CreateProjectCharter, CreateProjectCharterRevision,
-    ProjectOrchestrationRepo, SqliteDb, User, UserRepo,
+    create_sqlite_pool, now_rfc3339, run_migrations, AccountMainAgentBindingRepo,
+    AgentActionPolicyResult, AgentActionRepo, AgentActionStatus, AgentChatMessageAuthorType,
+    AgentChatMessageRepo, AgentChatMessageStatus, AgentChatTurnJobRepo, AgentRepo,
+    CreateAccountMainAgentBinding, CreateAgentAction, CreateAgentChatMessage,
+    CreateAgentChatTurnJob, CreateAgentIdentity, CreateAgentProfile, CreateProjectCharter,
+    CreateProjectCharterRevision, ProjectOrchestrationRepo, SqliteDb, User, UserRepo,
 };
 use forge_agent_host::MAIN_PROJECT_CREATE_OPERATION;
 use serde_json::{json, Value};
@@ -190,6 +190,7 @@ async fn fixture_with_db(db: Arc<SqliteDb>) -> Fixture {
 /// immutable once created, so a test that needs a deterministic non-provider
 /// backend must select it here.
 async fn fixture_with_project_backend(db: Arc<SqliteDb>, project_backend_kind: &str) -> Fixture {
+    let authorization_now = now_rfc3339();
     UserRepo::create_user(
         &*db,
         &User {
@@ -426,12 +427,12 @@ async fn fixture_with_project_backend(db: Arc<SqliteDb>, project_backend_kind: &
             authorization_basis: "explicit user approval".to_owned(),
             authorization_action: "project.charter.approve".to_owned(),
             explicit_event: "approve exact Main command Charter".to_owned(),
-            authorization_occurred_at: NOW.to_owned(),
+            authorization_occurred_at: authorization_now.clone(),
             source_action: "product_genesis.charter_approval".to_owned(),
             idempotency_key: "main-command-approval-key".to_owned(),
             event_id: "main-command-approval-event".to_owned(),
-            created_at: NOW.to_owned(),
-            updated_at: NOW.to_owned(),
+            created_at: authorization_now.clone(),
+            updated_at: authorization_now.clone(),
         },
     )
     .await
@@ -457,8 +458,8 @@ async fn fixture_with_project_backend(db: Arc<SqliteDb>, project_backend_kind: &
             status: AgentActionStatus::Proposed,
             target_type: Some("project".to_owned()),
             target_id: Some(APPROVAL_ID.to_owned()),
-            created_at: NOW.to_owned(),
-            updated_at: NOW.to_owned(),
+            created_at: authorization_now.clone(),
+            updated_at: authorization_now,
         },
     )
     .await
@@ -497,7 +498,7 @@ fn direct_project_input(authorization_basis: &str) -> CreateProjectFromCharterAp
             action: "product_genesis.create_project_from_approval".to_owned(),
             authorization_basis: authorization_basis.to_owned(),
             event_id: "main-service-project-create-event".to_owned(),
-            occurred_at: NOW.to_owned(),
+            occurred_at: now_rfc3339(),
         },
         correlation_id: "transport-correlation-is-not-canonical".to_owned(),
         causation_depth: 0,
@@ -520,7 +521,7 @@ fn command_input(fixture: &Fixture) -> ExecuteMainOrchestrationActionInput {
 async fn concurrent_project_creation_service_replays_frozen_packet_ids() {
     let (fixture, path) = file_fixture().await;
     let first_input = direct_project_input("authenticated user executed Project creation");
-    let second_input = direct_project_input("authenticated user executed Project creation");
+    let second_input = first_input.clone();
     let (first, second) = tokio::join!(
         create_project_from_charter_approval(Arc::clone(&fixture.db), first_input),
         create_project_from_charter_approval(Arc::clone(&fixture.db), second_input),

@@ -8213,7 +8213,10 @@ impl ProjectOrchestrationRepo for SqliteDb {
             "SELECT COALESCE(
                  (SELECT id FROM domain_event
                   WHERE scope_type = 'project' AND scope_id = ?
-                    AND event_type != 'milestone.readiness.evaluated'
+                    AND event_type NOT IN (
+                        'milestone.readiness.evaluated',
+                        'project_release.candidate_requested'
+                    )
                   ORDER BY sequence DESC LIMIT 1),
                  'none'
              )",

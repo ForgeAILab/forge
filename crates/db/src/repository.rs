@@ -918,10 +918,26 @@ pub trait AgentChatTransactionRepo: Send + Sync {
         &self,
         input: AdmitAgentChatTurn,
     ) -> Result<AdmittedAgentChatTurn>;
+    async fn admit_agent_chat_turn_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: AdmitAgentChatTurn,
+    ) -> Result<AdmittedAgentChatTurn>;
+    /// Queue a causally linked continuation against an existing visible
+    /// trigger message. The caller owns the surrounding domain transaction.
+    async fn admit_agent_chat_continuation_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateAgentChatTurnJob,
+    ) -> Result<AgentChatTurnJob>;
     async fn complete_agent_chat_turn(
         &self,
         input: CompleteAgentChatTurn,
     ) -> Result<CompletedAgentChatTurn>;
+    async fn complete_agent_chat_control_transfer(
+        &self,
+        input: CompleteAgentChatControlTransfer,
+    ) -> Result<AgentChatTurnJob>;
     async fn fail_agent_chat_turn(&self, input: FailAgentChatTurn) -> Result<AgentChatTurnJob>;
     async fn park_agent_chat_turn(&self, input: ParkAgentChatTurn) -> Result<AgentChatTurnJob>;
     /// Cancel a queued/leased/retry-wait turn and append the cancellation
@@ -2149,6 +2165,17 @@ pub struct CompleteAgentChatTurn {
     pub expected_version: i64,
     pub lease_owner: String,
     pub response: CreateAgentChatMessage,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompleteAgentChatControlTransfer {
+    pub turn_job_id: String,
+    pub expected_version: i64,
+    pub lease_owner: String,
+    pub command_receipt_id: String,
+    pub continuation_turn_id: String,
+    pub genesis_session_id: String,
     pub updated_at: String,
 }
 

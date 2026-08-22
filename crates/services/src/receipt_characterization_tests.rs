@@ -21,16 +21,19 @@ use db::{
 use events::EventBus;
 use forge_agent_host::{
     CanonicalScope, CanonicalScopeType, WorkspaceAccess, MAIN_CHARTER_DRAFT_OPERATION,
-    PROJECT_DOCUMENT_OPERATION, PROJECT_EXECUTION_BASELINE_OPERATION,
+    MAIN_GENESIS_START_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_EXECUTION_BASELINE_OPERATION,
 };
 use serde_json::{json, Value};
+use sqlx::Row;
 
 use crate::{
-    test_support::arm_after_domain_commit, AgentActionService,
+    test_support::arm_after_domain_commit, AgentActionService, AgentChatService,
     ExecuteProjectOrchestrationActionInput, ExecuteTaskProposalInput,
     MainGenesisCharterDraftRequest, MainGenesisCommandService, MainGenesisDraftCommandInput,
-    MainGenesisDraftPrincipal, ProjectArtifactCommandService, ProjectCommandAuthorization,
-    ProjectDocumentCreateCommand, ProjectOrchestrationActionService, ServiceError, TaskService,
+    MainGenesisDraftPrincipal, MainGenesisStartCommandInput, MainGenesisStartPrincipal,
+    MainGenesisStartRequest, ProjectArtifactCommandService, ProjectCommandAuthorization,
+    ProjectDocumentCreateCommand, ProjectOrchestrationActionService, SendAgentChatMessageInput,
+    ServiceError, TaskService, MAIN_BASELINE_OPERATING_SKILL_REVISION,
 };
 
 const USER_ID: &str = "characterization-user";
@@ -237,6 +240,61 @@ async fn main_fixture() -> (Arc<SqliteDb>, String, String) {
     (db, main_chat_id, main_agent_id)
 }
 
+async fn main_start_fixture() -> (Arc<SqliteDb>, String, String) {
+    let db = database().await;
+    insert_user(&db).await;
+    let permissions = r#"{"permissions":["propose_discovery","propose_project"]}"#;
+    let main_agent_id = "characterization-start-main-agent".to_owned();
+    let main_profile_id = insert_identity(&db, &main_agent_id, permissions).await;
+    let now = now_rfc3339();
+    let main_chat_id: String = sqlx::query_scalar(
+        "SELECT id FROM agent_chat WHERE account_id = ? AND kind = 'account_main' LIMIT 1",
+    )
+    .bind(USER_ID)
+    .fetch_one(db.pool())
+    .await
+    .expect("generated Main Chat");
+    sqlx::query("UPDATE agent_chat SET status = 'ready' WHERE id = ?")
+        .bind(&main_chat_id)
+        .execute(db.pool())
+        .await
+        .expect("ready Main Chat");
+    sqlx::query(
+        "INSERT INTO account_main_agent_binding
+         (id, account_id, identity_id, profile_id, state, autonomy_policy_json,
+          tool_policy_revision, version, created_at, updated_at)
+         VALUES ('characterization-start-main-binding', ?, ?, ?, 'active', '{}', 'default', 1, ?, ?)",
+    )
+    .bind(USER_ID)
+    .bind(&main_agent_id)
+    .bind(&main_profile_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("active Main binding");
+    (db, main_chat_id, main_agent_id)
+}
+
+fn user_genesis_start_command(idempotency_key: &str, idea: &str) -> MainGenesisStartCommandInput {
+    MainGenesisStartCommandInput {
+        principal: MainGenesisStartPrincipal::User {
+            user_id: USER_ID.to_owned(),
+        },
+        request: MainGenesisStartRequest {
+            maturity: Some(ProductMaturity::Mvp),
+            initial_idea: Some(idea.to_owned()),
+            preferred_project_agent_identity_id: None,
+        },
+        idempotency_key: idempotency_key.to_owned(),
+        correlation_id: format!("{idempotency_key}:correlation"),
+        causation_id: None,
+        causation_depth: 0,
+        policy_result: "allowed".to_owned(),
+        requested_permission: "propose_discovery".to_owned(),
+    }
+}
+
 struct ActionInput<'a> {
     id: &'a str,
     actor_identity_id: &'a str,
@@ -302,6 +360,289 @@ async fn count(db: &SqliteDb, sql: &str, bind: Option<&str>) -> i64 {
         .fetch_one(db.pool())
         .await
         .expect("characterization count")
+}
+
+#[tokio::test]
+async fn genesis_start_replays_exactly_and_rejects_changed_input_or_second_session() {
+    let (db, main_chat_id, _) = main_start_fixture().await;
+    let service = MainGenesisCommandService::new(Arc::clone(&db));
+    let command = user_genesis_start_command(
+        "characterization-genesis-start-replay",
+        "Build a calm incident review workspace",
+    );
+    let first = service
+        .start(command.clone())
+        .await
+        .expect("Genesis start commits");
+    let replay = service
+        .start(command)
+        .await
+        .expect("identical Genesis start replays");
+    assert!(replay.replayed);
+    assert_eq!(replay.receipt_id, first.receipt_id);
+    assert_eq!(replay.event_id, first.event_id);
+    assert_eq!(replay.session.id, first.session.id);
+    assert_eq!(replay.source_message_id, first.source_message_id);
+    assert_eq!(replay.admitted_turn_id, first.admitted_turn_id);
+    assert_eq!(replay.main_chat_id, main_chat_id);
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM product_genesis_session", None,).await,
+        1
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM command_receipt WHERE operation = ?",
+            Some(MAIN_GENESIS_START_OPERATION),
+        )
+        .await,
+        1
+    );
+
+    let changed = service
+        .start(user_genesis_start_command(
+            "characterization-genesis-start-replay",
+            "Build a different product",
+        ))
+        .await
+        .expect_err("same key with changed source input conflicts");
+    assert!(matches!(
+        changed,
+        ServiceError::Db(db::DbError::IdempotencyConflict)
+    ));
+
+    let active_conflict = service
+        .start(user_genesis_start_command(
+            "characterization-genesis-start-second",
+            "Start another product",
+        ))
+        .await
+        .expect_err("a second active Genesis session is rejected");
+    assert!(active_conflict.to_string().contains("already active"));
+}
+
+#[tokio::test]
+async fn native_genesis_start_reuses_visible_message_and_freezes_discovery_continuation() {
+    let (db, main_chat_id, main_agent_id) = main_start_fixture().await;
+    let admitted = AgentChatService::new(Arc::clone(&db))
+        .send_message(SendAgentChatMessageInput {
+            actor_user_id: USER_ID.to_owned(),
+            chat_id: main_chat_id.clone(),
+            content: "Help me start a Project for calm incident reviews.".to_owned(),
+            dedupe_key: Some("characterization-semantic-start-message".to_owned()),
+        })
+        .await
+        .expect("baseline user turn admits");
+    assert_eq!(
+        admitted.turn_job.operating_skill_revision_id.as_deref(),
+        Some(MAIN_BASELINE_OPERATING_SKILL_REVISION)
+    );
+    sqlx::query(
+        "UPDATE agent_chat_turn_job
+         SET status = 'leased', lease_owner = 'characterization-native-owner',
+             leased_until = '2099-01-01T00:00:00Z', attempt_count = 1,
+             version = version + 1
+         WHERE id = ? AND status = 'queued'",
+    )
+    .bind(&admitted.turn_job.id)
+    .execute(db.pool())
+    .await
+    .expect("source baseline turn leases");
+
+    let result = MainGenesisCommandService::new(Arc::clone(&db))
+        .start(MainGenesisStartCommandInput {
+            principal: MainGenesisStartPrincipal::MainAgent {
+                identity_id: main_agent_id,
+                scope: CanonicalScope {
+                    scope_type: CanonicalScopeType::AgentChat,
+                    scope_id: main_chat_id.clone(),
+                    workspace_access: WorkspaceAccess::Deny,
+                },
+            },
+            request: MainGenesisStartRequest {
+                maturity: None,
+                initial_idea: None,
+                preferred_project_agent_identity_id: None,
+            },
+            idempotency_key: "characterization-semantic-start-command".to_owned(),
+            correlation_id: "characterization-semantic-start-correlation".to_owned(),
+            causation_id: Some(admitted.turn_job.correlation_id.clone()),
+            causation_depth: 1,
+            policy_result: "allowed".to_owned(),
+            requested_permission: "propose_discovery".to_owned(),
+        })
+        .await
+        .expect("native semantic start commits");
+    assert!(result.control_transfer);
+    assert_eq!(
+        result.source_turn_id.as_deref(),
+        Some(admitted.turn_job.id.as_str())
+    );
+    assert_eq!(result.source_message_id, admitted.message.id);
+    assert_ne!(result.admitted_turn_id, admitted.turn_job.id);
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM agent_chat_message WHERE chat_id = ?",
+            Some(&main_chat_id),
+        )
+        .await,
+        1,
+        "control transfer must not duplicate the visible user message"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM agent_chat_turn_job WHERE chat_id = ?",
+            Some(&main_chat_id),
+        )
+        .await,
+        2
+    );
+    let discovery_revision: String = sqlx::query_scalar(
+        "SELECT current_revision_id FROM operating_skill WHERE id = 'forge.main.project-discovery/v2'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("current discovery revision");
+    let continuation = sqlx::query(
+        "SELECT triggering_message_id, operating_skill_revision_id, status
+         FROM agent_chat_turn_job WHERE id = ?",
+    )
+    .bind(&result.admitted_turn_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("discovery continuation");
+    assert_eq!(
+        continuation.get::<String, _>("triggering_message_id"),
+        admitted.message.id
+    );
+    assert_eq!(
+        continuation.get::<String, _>("operating_skill_revision_id"),
+        discovery_revision
+    );
+    assert_eq!(continuation.get::<String, _>("status"), "queued");
+}
+
+#[tokio::test]
+async fn concurrent_genesis_starts_have_one_exact_winner() {
+    let (db, _, _) = main_start_fixture().await;
+    let left = MainGenesisCommandService::new(Arc::clone(&db));
+    let right = MainGenesisCommandService::new(Arc::clone(&db));
+    let command = user_genesis_start_command(
+        "characterization-genesis-start-race",
+        "Build one replay-safe product",
+    );
+    let (left_result, right_result) =
+        tokio::join!(left.start(command.clone()), right.start(command.clone()));
+    let left_result = left_result.expect("left exact start succeeds or replays");
+    let right_result = right_result.expect("right exact start succeeds or replays");
+    assert_eq!(left_result.receipt_id, right_result.receipt_id);
+    assert_eq!(left_result.session.id, right_result.session.id);
+    assert_eq!(left_result.admitted_turn_id, right_result.admitted_turn_id);
+    assert!(left_result.replayed || right_result.replayed);
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM product_genesis_session", None,).await,
+        1
+    );
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM agent_chat_turn_job", None,).await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn concurrent_distinct_genesis_starts_leave_one_session_and_one_conflict() {
+    let (db, _, _) = main_start_fixture().await;
+    let left = MainGenesisCommandService::new(Arc::clone(&db));
+    let right = MainGenesisCommandService::new(Arc::clone(&db));
+    let (left_result, right_result) = tokio::join!(
+        left.start(user_genesis_start_command(
+            "characterization-genesis-start-race-left",
+            "Build the left product",
+        )),
+        right.start(user_genesis_start_command(
+            "characterization-genesis-start-race-right",
+            "Build the right product",
+        ))
+    );
+    assert_ne!(left_result.is_ok(), right_result.is_ok());
+    let error = left_result.err().or_else(|| right_result.err()).unwrap();
+    assert!(error.to_string().contains("already active"));
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM product_genesis_session", None,).await,
+        1
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM command_receipt WHERE operation = ?",
+            Some(MAIN_GENESIS_START_OPERATION),
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn genesis_start_receipt_failure_rolls_back_every_domain_write() {
+    let (db, _, _) = main_start_fixture().await;
+    let mut baselines = Vec::new();
+    for table in [
+        "product_genesis_session",
+        "agent_chat_instruction_revision",
+        "agent_chat_message",
+        "agent_chat_turn_job",
+        "domain_event",
+        "command_receipt",
+    ] {
+        baselines.push((
+            table,
+            count(&db, &format!("SELECT COUNT(*) FROM {table}"), None).await,
+        ));
+    }
+    let trigger = format!(
+        "CREATE TEMP TRIGGER genesis_start_receipt_failpoint
+         BEFORE INSERT ON command_receipt
+         WHEN NEW.operation = '{MAIN_GENESIS_START_OPERATION}'
+         BEGIN SELECT RAISE(ABORT, 'Genesis start receipt failpoint'); END;"
+    );
+    sqlx::query(&trigger)
+        .execute(db.pool())
+        .await
+        .expect("Genesis start receipt failpoint");
+
+    let service = MainGenesisCommandService::new(Arc::clone(&db));
+    let error = service
+        .start(user_genesis_start_command(
+            "characterization-genesis-start-rollback",
+            "Build a transactionally safe product",
+        ))
+        .await
+        .expect_err("receipt failure aborts Genesis start");
+    assert!(error
+        .to_string()
+        .contains("Genesis start receipt failpoint"));
+    for (table, before) in baselines {
+        assert_eq!(
+            count(&db, &format!("SELECT COUNT(*) FROM {table}"), None).await,
+            before,
+            "{table} must roll back with the failed receipt"
+        );
+    }
+
+    sqlx::query("DROP TRIGGER genesis_start_receipt_failpoint")
+        .execute(db.pool())
+        .await
+        .expect("remove Genesis start failpoint");
+    let committed = service
+        .start(user_genesis_start_command(
+            "characterization-genesis-start-rollback",
+            "Build a transactionally safe product",
+        ))
+        .await
+        .expect("retry succeeds after rollback");
+    assert!(!committed.receipt_id.is_empty());
 }
 
 fn research_content() -> Value {

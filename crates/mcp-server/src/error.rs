@@ -357,6 +357,9 @@ impl From<ServiceError> for McpToolError {
             // A generic service conflict does not identify a versioned target;
             // do not infer a version conflict by parsing its prose.
             ServiceError::Conflict(_message) => Self::new(-32602, "operation conflict"),
+            ServiceError::ProductGenesisActiveSession { .. } => {
+                Self::new(-32602, "Product Genesis session already active")
+            }
             ServiceError::MissingPrimaryRepo { .. }
             | ServiceError::RepoMismatch { .. }
             | ServiceError::PrProviderMissing { .. }

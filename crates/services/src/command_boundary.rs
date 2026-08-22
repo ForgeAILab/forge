@@ -356,6 +356,12 @@ pub fn outcome_for_service_error_with_correction(
             None,
             None,
         ),
+        ServiceError::ProductGenesisActiveSession { .. } => (
+            OutcomeCode::ActiveSessionConflict,
+            "a Product Genesis discovery session is already active",
+            None,
+            None,
+        ),
         ServiceError::AuthorizationDenied { .. }
         | ServiceError::GuardRejection { .. }
         | ServiceError::AgentPaused { .. }

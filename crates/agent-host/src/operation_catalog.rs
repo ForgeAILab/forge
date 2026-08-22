@@ -13,6 +13,7 @@ use serde_json::Value;
 use crate::CanonicalScopeType;
 
 pub const MAIN_CHARTER_READ_OPERATION: &str = "charter.read";
+pub const MAIN_GENESIS_START_OPERATION: &str = "genesis.start";
 pub const MAIN_CHARTER_DRAFT_OPERATION: &str = "charter.draft";
 pub const MAIN_CHARTER_READINESS_OPERATION: &str = "charter.readiness";
 pub const MAIN_CHARTER_DIFF_OPERATION: &str = "charter.diff";
@@ -156,6 +157,17 @@ const PROJECT_SCOPES: &[CanonicalScopeType] =
     &[CanonicalScopeType::Project, CanonicalScopeType::AgentChat];
 
 pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
+    OperationContract {
+        operation: MAIN_GENESIS_START_OPERATION,
+        surface: OperationSurface::MainOrchestration,
+        exposure: OperationExposure::TypedProposal,
+        input: OperationInputContract::ProposalEnvelope,
+        setup: OperationSetupExposure::Always,
+        supported_scopes: MAIN_SCOPES,
+        classification: OperationClassification::DirectCommand,
+        permission: OperationPermission::ProposeDiscovery,
+        output: SHARED_ORCHESTRATION_OUTCOME,
+    },
     OperationContract {
         operation: MAIN_CHARTER_READ_OPERATION,
         surface: OperationSurface::MainOrchestration,
@@ -804,6 +816,10 @@ mod tests {
             OperationClassification::DirectCommand
         );
         assert_eq!(
+            classify_operation(MAIN_GENESIS_START_OPERATION, None),
+            OperationClassification::DirectCommand
+        );
+        assert_eq!(
             classify_operation(MAIN_PROJECT_CREATE_OPERATION, None),
             OperationClassification::ApprovalRequiredAction
         );
@@ -815,6 +831,28 @@ mod tests {
             classify_operation("project.lifecycle", None),
             OperationClassification::Denied
         );
+    }
+
+    #[test]
+    fn genesis_start_is_main_only_and_uses_discovery_permission() {
+        for scope in [CanonicalScopeType::Account, CanonicalScopeType::AgentChat] {
+            assert!(operation_supported_in_scope(
+                MAIN_GENESIS_START_OPERATION,
+                scope
+            ));
+            assert_eq!(
+                operation_permission(scope, MAIN_GENESIS_START_OPERATION),
+                Some("propose_discovery")
+            );
+        }
+        assert!(!operation_supported_in_scope(
+            MAIN_GENESIS_START_OPERATION,
+            CanonicalScopeType::Project
+        ));
+        assert!(!operation_supported_in_scope(
+            MAIN_GENESIS_START_OPERATION,
+            CanonicalScopeType::Task
+        ));
     }
 
     #[test]

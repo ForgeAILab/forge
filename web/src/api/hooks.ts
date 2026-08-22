@@ -98,6 +98,7 @@ import type {
   WorkflowDefinition,
   Workspace,
 } from '@/types/generated'
+import type { AuthorizationProvenance } from '@/types/generated/bindings/AuthorizationProvenance'
 import { recordUserInitiatedTransition } from '@/lib/notification-toast-suppression'
 
 type TaskSearch = {
@@ -233,6 +234,52 @@ export function useProjectReleaseQuery(projectId: string, releaseId: string) {
     queryKey: qk.projectRelease(projectId, releaseId),
     queryFn: () => apiFetch<ProjectRelease>(`/projects/${projectId}/releases/${releaseId}`),
     enabled: Boolean(projectId && releaseId),
+  })
+}
+
+/**
+ * A user-only release is bound to the exact readiness candidate the user
+ * reviewed. Keep this input separate from the generated wire request because
+ * JSON carries Rust i64 versions as numbers while ts-rs represents them as
+ * bigint in the generated types.
+ */
+export type ProjectMilestoneReleaseInput = {
+  projectId: string
+  milestoneId: string
+  expectedMilestoneVersion: number
+  readinessSnapshotId: string
+  readinessDigest: string
+  idempotencyKey: string
+  authorization: AuthorizationProvenance
+}
+
+export function useReleaseProjectMilestone() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async (input: ProjectMilestoneReleaseInput) =>
+      apiFetch<ProjectRelease>(
+        `/projects/${input.projectId}/milestones/${input.milestoneId}/release`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            mutation: {
+              expected_version: input.expectedMilestoneVersion,
+              expected_digest: input.readinessDigest,
+              idempotency_key: input.idempotencyKey,
+              deduplication_key: null,
+              authorization: input.authorization,
+            },
+            milestone_id: input.milestoneId,
+            readiness_snapshot_id: input.readinessSnapshotId,
+            readiness_digest: input.readinessDigest,
+          }),
+        },
+      ),
+    onSuccess: (release, input) => {
+      void queryClient.invalidateQueries({ queryKey: qk.projectOverview(input.projectId) })
+      void queryClient.invalidateQueries({ queryKey: qk.project(input.projectId) })
+      queryClient.setQueryData(qk.projectRelease(input.projectId, release.id), release)
+    },
   })
 }
 

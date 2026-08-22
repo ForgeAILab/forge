@@ -74,6 +74,7 @@ pub struct ProductGenesisSession {
 #[ts(export)]
 #[serde(deny_unknown_fields)]
 pub struct StartProductGenesisRequest {
+    pub idempotency_key: String,
     pub maturity: Option<ProductMaturity>,
     pub initial_idea: Option<String>,
     pub preferred_project_agent_identity_id: Option<String>,

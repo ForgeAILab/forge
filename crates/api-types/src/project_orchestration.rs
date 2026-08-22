@@ -661,6 +661,20 @@ pub enum DocumentRevisionLifecycle {
     Superseded,
 }
 
+/// Truth status for a document's approved and working pointers. A working
+/// revision ahead of the approved revision is a normal `changes_pending`
+/// state, not evidence that approved Project truth is absent or stale.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum DocumentFreshnessStatus {
+    Current,
+    ChangesPending,
+    Stale,
+    ReconciliationRequired,
+    Unavailable,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 #[serde(deny_unknown_fields)]
@@ -1649,6 +1663,31 @@ pub struct ReadinessReason {
     pub source_ids: Vec<String>,
 }
 
+/// Freshness overlay for the immutable readiness snapshot shown in a live
+/// Overview. The snapshot remains inspectable when stale; this overlay is the
+/// only field that tells callers whether it may be used for a release.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ReadinessFreshnessStatus {
+    Current,
+    Stale,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct ReadinessFreshness {
+    pub status: ReadinessFreshnessStatus,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub snapshot_source_event_watermark: Option<String>,
+    #[serde(default)]
+    pub current_source_event_watermark: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 #[serde(deny_unknown_fields)]
@@ -1752,6 +1791,20 @@ pub struct EvidenceAttachment {
     pub source_run_id: Option<String>,
     #[serde(default)]
     pub source_validation_id: Option<String>,
+    /// Exact Task row version observed when this evidence was captured.
+    /// A missing value is legacy/unpinned and cannot satisfy a required
+    /// release-gating evidence requirement.
+    #[serde(default)]
+    pub source_task_version: Option<i64>,
+    /// Digest of the repository/execution/review context observed when this
+    /// evidence was captured.  It is compared with the current readiness
+    /// context before evidence can support release.
+    #[serde(default)]
+    pub source_context_digest: Option<String>,
+    /// The immutable milestone definition revision that governed the
+    /// attachment.  This is separate from the attachment's own row version.
+    #[serde(default)]
+    pub source_definition_revision_id: Option<String>,
     #[serde(default)]
     pub milestone_id: Option<String>,
     #[serde(default)]
@@ -1937,6 +1990,32 @@ pub enum OverviewProjectionState {
     PermissionDenied,
 }
 
+/// Server-authored next action for the Project Overview.  Clients render this
+/// action and dispatch the named operation; they do not infer a command from
+/// free-form text or from other Overview fields.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectNextAction {
+    /// Stable machine-readable action identifier.
+    pub code: String,
+    /// Principal class expected to perform the action (`user`,
+    /// `project_agent`, `worker`, `reviewer`, or `system`).
+    pub required_principal: String,
+    pub target_type: String,
+    pub target_id: String,
+    pub title: String,
+    pub explanation: String,
+    /// Stable presentation/interaction category such as `approval`,
+    /// `reconciliation`, `setup`, `validation`, `readiness`, or `release`.
+    pub action_kind: String,
+    /// Canonical operation identifier, not a client-assembled URL.
+    pub route_or_operation: String,
+    pub blocking: bool,
+    #[serde(default)]
+    pub expected_version: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 #[serde(deny_unknown_fields)]
@@ -1968,9 +2047,17 @@ pub struct AcceptanceCheckSummary {
 pub struct DocumentFreshness {
     pub document_id: String,
     pub kind: ProjectDocumentKind,
-    pub current_revision_id: String,
-    pub current_digest: String,
-    pub stale: bool,
+    #[serde(default)]
+    pub approved_revision_id: Option<String>,
+    #[serde(default)]
+    pub approved_digest: Option<String>,
+    #[serde(default)]
+    pub working_revision_id: Option<String>,
+    #[serde(default)]
+    pub working_digest: Option<String>,
+    #[serde(default)]
+    pub working_lifecycle: Option<DocumentRevisionLifecycle>,
+    pub status: DocumentFreshnessStatus,
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -1985,6 +2072,8 @@ pub struct ProjectMilestoneOverview {
     pub check_summary: AcceptanceCheckSummary,
     #[serde(default)]
     pub latest_readiness: Option<ReadinessSnapshot>,
+    #[serde(default)]
+    pub readiness_freshness: Option<ReadinessFreshness>,
     #[serde(default)]
     pub evidence: Vec<EvidenceAttachment>,
 }
@@ -2007,6 +2096,10 @@ pub struct ProjectOverview {
     pub check_summary: AcceptanceCheckSummary,
     #[serde(default)]
     pub unresolved_decision_ids: Vec<String>,
+    /// Effective Decision Log records. Draft/proposed candidates remain
+    /// represented separately by `unresolved_decision_ids`.
+    #[serde(default)]
+    pub decisions: Vec<DecisionRecord>,
     #[serde(default)]
     pub risks: Vec<CharterRisk>,
     #[serde(default)]
@@ -2016,7 +2109,7 @@ pub struct ProjectOverview {
     #[serde(default)]
     pub releases: Vec<ProjectRelease>,
     #[serde(default)]
-    pub next_action: Option<String>,
+    pub next_action: Option<ProjectNextAction>,
     pub projection_state: OverviewProjectionState,
     pub source_event_watermark: String,
     pub generated_at: String,

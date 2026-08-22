@@ -343,12 +343,20 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
         'comment.created',
         'notification.created',
         'follow_up.dispatched',
+        // These names must match what the server actually publishes: SSE
+        // frames always carry an `event:` field, so EventSource delivers a
+        // frame only to a listener registered under that exact name and
+        // `onmessage` never sees it. A near-miss here is silent — the chat
+        // stops updating, and its composer stays locked on a turn that
+        // finished, discarding whatever the user types.
         'agent_chat.created',
-        'agent_chat.updated',
-        'agent_chat.message_created',
-        'agent_chat.message_delta',
-        'agent_chat.message_completed',
-        'agent_chat.turn_updated',
+        'agent_chat.summary',
+        'agent_chat.message.admitted',
+        'agent_chat.message.completed',
+        'agent_chat.response.completed',
+        'agent_chat.turn.awaiting_input',
+        'agent_chat.turn.cancelled',
+        'agent_chat.turn.failed',
         'agent_handoff.created',
         'agent_handoff.delivered',
         'agent_handoff.failed',
