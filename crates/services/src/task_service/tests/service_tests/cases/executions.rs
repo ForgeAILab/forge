@@ -104,6 +104,11 @@ async fn workflow_dispatched_commitless_completion_fails_and_schedules_retry() {
         .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
         .await
         .expect("task claims");
+    sqlx::query("UPDATE execution SET role = 'worker' WHERE id = ?")
+        .bind(&claimed.execution.id)
+        .execute(db.pool())
+        .await
+        .expect("execution uses the autonomous worker role");
     // Stamp the dispatcher metadata the workflow dispatch path records, so
     // this run is measured as an autonomous role dispatch (user-claimed runs
     // without the metadata stay exempt).
@@ -149,6 +154,7 @@ async fn workflow_dispatched_commitless_completion_fails_and_schedules_retry() {
         .expect("execution runs");
 
     assert_eq!(updated.status, ExecutionStatus::Failed);
+    assert_eq!(updated.role, "worker");
     assert!(
         updated
             .error
@@ -178,6 +184,99 @@ async fn workflow_dispatched_commitless_completion_fails_and_schedules_retry() {
         metadata.get("deferred_dispatch").is_some(),
         "a deferred redispatch is scheduled: {metadata}"
     );
+}
+
+#[tokio::test]
+async fn uncommitted_native_worker_failure_prompts_a_retry_and_preserves_the_diff() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = service
+        .create_task(
+            project_id,
+            "Commit the preserved implementation",
+            Some("write the implementation and commit it".to_owned()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("task creates");
+    let claimed = service
+        .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
+        .await
+        .expect("task claims");
+    let workspace = WorkspaceRepo::get_by_id(
+        &*db,
+        claimed
+            .execution
+            .workspace_id
+            .as_deref()
+            .expect("workspace id exists"),
+    )
+    .await
+    .expect("workspace loads")
+    .expect("workspace exists");
+
+    let updated = service
+        .run_execution(
+            claimed.execution.id.clone(),
+            &UncommittedWorktreeFailureExecutor,
+        )
+        .await
+        .expect("execution failure is persisted");
+
+    assert_eq!(updated.status, ExecutionStatus::Failed);
+    assert_eq!(
+        updated.error.as_deref(),
+        Some(crate::embedded_task_executor::UNCOMMITTED_WORKTREE_FAILURE)
+    );
+    assert!(std::path::Path::new(&workspace.worktree_path)
+        .join("uncommitted.txt")
+        .exists());
+    assert!(
+        !git::is_worktree_clean(std::path::Path::new(&workspace.worktree_path))
+            .await
+            .expect("worktree cleanliness reads")
+    );
+
+    let comments = db::TaskCommentRepo::list_comments(
+        &*db,
+        &task.id,
+        db::PageRequest {
+            cursor: None,
+            limit: 100,
+            include_total: false,
+            sort_by: db::SortBy::CreatedAt,
+            sort_order: db::SortOrder::Asc,
+        },
+    )
+    .await
+    .expect("comments load");
+    assert!(comments.items.iter().any(|comment| {
+        comment.content.contains("worktree was preserved")
+            && comment.content.contains("commit the result")
+    }));
+
+    let task_after = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    let metadata: serde_json::Value =
+        serde_json::from_str(task_after.metadata_json.as_deref().unwrap_or("{}"))
+            .expect("task metadata parses");
+    assert_eq!(metadata["execution_retry_count"], 1);
+    assert!(metadata.get("deferred_dispatch").is_some());
+    let execution_after = ExecutionRepo::get_by_id(&*db, &claimed.execution.id)
+        .await
+        .expect("execution reloads")
+        .expect("execution exists");
+    assert_eq!(execution_after.resume_policy, Some(db::ResumePolicy::Auto));
 }
 
 #[tokio::test]

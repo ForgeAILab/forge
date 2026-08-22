@@ -35,6 +35,8 @@ use crate::{
 
 const EMBEDDED_EXECUTOR_TYPE: &str = "embedded";
 const TASK_ROLE_MARKER: &str = "_forge_task_role";
+pub(crate) const UNCOMMITTED_WORKTREE_FAILURE: &str =
+    "embedded worker completed with uncommitted worktree changes while HEAD was unchanged; refusing completion because those changes were not delivered";
 
 /// Shared state for the server-owned execution lease.
 ///
@@ -995,8 +997,7 @@ async fn validate_write_capable_delivery(
     })?;
     if after_sha == before_sha && !worktree_clean {
         return Err(ExecutorError::Other(
-            "embedded worker completed with uncommitted worktree changes while HEAD was unchanged; refusing completion because those changes were not delivered"
-                .to_owned(),
+            UNCOMMITTED_WORKTREE_FAILURE.to_owned(),
         ));
     }
     Ok(after_sha)

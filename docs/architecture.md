@@ -876,8 +876,12 @@ worktree is dirty, the execution fails and enters the normal retry/block path;
 the authored files remain uncommitted for inspection or retry. Forge does not
 stage or commit those files on the worker's behalf. Provider-authored commits
 remain valid, while clean no-op turns continue through the workflow-aware no-op
-policy in the Task runner. Read-only planner/reviewer and read-only task-type
-runs remain governed by the separate restore-and-fail backstop.
+policy in the Task runner. Within the execution retry budget, Forge records a
+system comment instructing the assigned worker to inspect the preserved diff,
+finish or clean it up, validate it, and commit before completion, then schedules
+a deferred redispatch. Exhausted retries block visibly instead of looping.
+Read-only planner/reviewer and read-only task-type runs remain governed by the
+separate restore-and-fail backstop.
 
 ### Daemon lifecycle and execution recovery
 

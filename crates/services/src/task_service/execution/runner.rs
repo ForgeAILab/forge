@@ -938,6 +938,9 @@ impl TaskService {
                 "execution hard deadline exceeded at {hard_deadline_at}"
             ));
         }
+        let uncommitted_worktree_failure = result.status == ExecutionOutcome::Failed
+            && result.error.as_deref()
+                == Some(crate::embedded_task_executor::UNCOMMITTED_WORKTREE_FAILURE);
         // A write-capable implementation execution that "completes" while
         // leaving the repository untouched and firing no workflow transition
         // has done nothing the pipeline can advance on — the task would sit
@@ -1245,28 +1248,38 @@ impl TaskService {
                     "failed to handle executor-unavailable execution"
                 );
             }
-        } else if updated.status == ExecutionStatus::Failed && completed_without_repository_effect {
+        } else if updated.status == ExecutionStatus::Failed
+            && (completed_without_repository_effect || uncommitted_worktree_failure)
+        {
             // Thread the failure into the next attempt's dispatch prompt (the
             // dispatch context includes task comments), then run the normal
             // executor-failure machinery regardless of role so the retry
             // budget governs the redispatch and exhaustion blocks visibly.
-            if let Err(error) = self
-                .create_system_comment(
-                    &task.id,
-                    format!(
-                        "Execution {} completed without repository changes or a workflow \
-                         transition. Next attempt: implement the task in the worktree and \
-                         commit the result, or advance the workflow with an explicit reason.",
-                        updated.id
-                    ),
+            let corrective_comment = if uncommitted_worktree_failure {
+                format!(
+                    "Execution {} left uncommitted changes in the Task worktree and did not \
+                     advance HEAD. The worktree was preserved. Next attempt: inspect the \
+                     existing diff, finish or clean up the changes, run relevant validation, \
+                     and commit the result before reporting completion.",
+                    updated.id
                 )
+            } else {
+                format!(
+                    "Execution {} completed without repository changes or a workflow \
+                     transition. Next attempt: implement the task in the worktree and \
+                     commit the result, or advance the workflow with an explicit reason.",
+                    updated.id
+                )
+            };
+            if let Err(error) = self
+                .create_system_comment(&task.id, corrective_comment)
                 .await
             {
                 tracing::warn!(
                     execution_id = %updated.id,
                     task_id = %updated.task_id,
                     %error,
-                    "failed to record no-op completion feedback comment"
+                    "failed to record corrective execution feedback comment"
                 );
             }
             if let Err(error) = self.annotate_executor_failure_block(&updated).await {
@@ -1274,7 +1287,7 @@ impl TaskService {
                     execution_id = %updated.id,
                     task_id = %updated.task_id,
                     %error,
-                    "failed to schedule retry after commit-less completion"
+                    "failed to schedule corrective execution retry"
                 );
             }
         } else if updated.status == ExecutionStatus::Failed

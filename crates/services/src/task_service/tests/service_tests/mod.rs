@@ -41,6 +41,35 @@ impl TaskExecutor for NoDiffExecutor {
     }
 }
 
+struct UncommittedWorktreeFailureExecutor;
+
+#[async_trait]
+impl TaskExecutor for UncommittedWorktreeFailureExecutor {
+    async fn execute(
+        &self,
+        ctx: ExecutionContext,
+    ) -> std::result::Result<ExecutionResult, ExecutorError> {
+        tokio::fs::write(
+            std::path::Path::new(&ctx.worktree_path).join("uncommitted.txt"),
+            "preserve me\n",
+        )
+        .await?;
+        Ok(ExecutionResult {
+            status: ExecutionOutcome::Failed,
+            after_sha: git::get_current_sha(std::path::Path::new(&ctx.worktree_path))
+                .await
+                .ok(),
+            agent_session_id: Some("native-task-session".to_owned()),
+            error: Some(crate::embedded_task_executor::UNCOMMITTED_WORKTREE_FAILURE.to_owned()),
+            ..Default::default()
+        })
+    }
+
+    async fn cancel(&self, _execution_id: &str) -> std::result::Result<(), ExecutorError> {
+        Ok(())
+    }
+}
+
 struct BurstLogExecutor {
     count: u64,
 }
