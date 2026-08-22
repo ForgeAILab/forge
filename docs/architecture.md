@@ -870,6 +870,15 @@ filesystem can still browse paths under its own `--workspace-root`, but
 `execution.start` rejects server-only worktree paths until Forge has a remote
 workspace sync or git handoff path.
 
+A write-capable embedded worker turn checks its repository delivery boundary
+before it reports completion. If the final HEAD is unchanged while the
+worktree is dirty, the execution fails and enters the normal retry/block path;
+the authored files remain uncommitted for inspection or retry. Forge does not
+stage or commit those files on the worker's behalf. Provider-authored commits
+remain valid, while clean no-op turns continue through the workflow-aware no-op
+policy in the Task runner. Read-only planner/reviewer and read-only task-type
+runs remain governed by the separate restore-and-fail backstop.
+
 ### Daemon lifecycle and execution recovery
 
 Remote daemons periodically report local CLI availability and, when connected

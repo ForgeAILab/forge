@@ -312,6 +312,17 @@ impl EmbeddedTaskExecutor {
             .map(str::to_owned);
 
         let role = canonical_task_role(task_role)?;
+        let worktree_read_only =
+            is_read_only_task_role(role) || executors::is_worktree_read_only(&ctx.agent_config);
+        let before_sha = if worktree_read_only {
+            None
+        } else {
+            Some(
+                git::get_current_sha(Path::new(&ctx.worktree_path))
+                    .await
+                    .map_err(ServiceError::from)?,
+            )
+        };
         let session = self
             .embedded_agents
             .create_or_resume_session(CreateScopedSession {
@@ -350,9 +361,7 @@ impl EmbeddedTaskExecutor {
                     scope: CanonicalScope {
                         scope_type: CanonicalScopeType::Task,
                         scope_id: ctx.task_id.clone(),
-                        workspace_access: if is_read_only_task_role(role)
-                            || executors::is_worktree_read_only(&ctx.agent_config)
-                        {
+                        workspace_access: if worktree_read_only {
                             WorkspaceAccess::TaskRead
                         } else {
                             WorkspaceAccess::TaskWrite
@@ -424,20 +433,42 @@ impl EmbeddedTaskExecutor {
                 })?;
             log_sink.record_progress().await;
         }
-        let after_sha = git::get_current_sha(Path::new(&ctx.worktree_path))
-            .await
-            .map_err(ServiceError::from)?;
+        let agent_session_id = output.runtime_session_id;
+        let summary = output.text;
+        let usage = TokenUsage {
+            input_tokens: i64::try_from(output.input_tokens).unwrap_or(i64::MAX),
+            output_tokens: i64::try_from(output.output_tokens).unwrap_or(i64::MAX),
+            model: Some(model),
+            ..TokenUsage::default()
+        };
+        let after_sha = if let Some(before_sha) = before_sha.as_deref() {
+            match validate_write_capable_delivery(Path::new(&ctx.worktree_path), before_sha).await {
+                Ok(after_sha) => after_sha,
+                Err(error) => {
+                    return Ok(ExecutionResult {
+                        status: ExecutionOutcome::Failed,
+                        after_sha: git::get_current_sha(Path::new(&ctx.worktree_path))
+                            .await
+                            .ok(),
+                        agent_session_id: Some(agent_session_id),
+                        summary: Some(summary),
+                        error: Some(error.to_string()),
+                        usage: Some(usage),
+                        ..ExecutionResult::default()
+                    });
+                }
+            }
+        } else {
+            git::get_current_sha(Path::new(&ctx.worktree_path))
+                .await
+                .map_err(ServiceError::from)?
+        };
         Ok(ExecutionResult {
             status: ExecutionOutcome::Completed,
             after_sha: Some(after_sha),
-            agent_session_id: Some(output.runtime_session_id),
-            summary: Some(output.text),
-            usage: Some(TokenUsage {
-                input_tokens: i64::try_from(output.input_tokens).unwrap_or(i64::MAX),
-                output_tokens: i64::try_from(output.output_tokens).unwrap_or(i64::MAX),
-                model: Some(model),
-                ..TokenUsage::default()
-            }),
+            agent_session_id: Some(agent_session_id),
+            summary: Some(summary),
+            usage: Some(usage),
             ..ExecutionResult::default()
         })
     }
@@ -941,6 +972,36 @@ fn is_read_only_task_role(role: &str) -> bool {
     matches!(role, "reviewer" | "planner")
 }
 
+/// Refuse to report delivery when a native worker authored files but did not
+/// commit them.
+///
+/// The dirty worktree is deliberately left untouched for inspection or retry.
+/// Forge does not stage files, choose a message, or create a commit on the
+/// worker's behalf. Clean no-op turns remain subject to the Task runner's
+/// workflow-aware no-op policy.
+async fn validate_write_capable_delivery(
+    worktree: &Path,
+    before_sha: &str,
+) -> std::result::Result<String, ExecutorError> {
+    let after_sha = git::get_current_sha(worktree).await.map_err(|error| {
+        ExecutorError::Other(format!(
+            "embedded worker could not read the final worktree HEAD: {error}"
+        ))
+    })?;
+    let worktree_clean = git::is_worktree_clean(worktree).await.map_err(|error| {
+        ExecutorError::Other(format!(
+            "embedded worker could not inspect final worktree changes: {error}"
+        ))
+    })?;
+    if after_sha == before_sha && !worktree_clean {
+        return Err(ExecutorError::Other(
+            "embedded worker completed with uncommitted worktree changes while HEAD was unchanged; refusing completion because those changes were not delivered"
+                .to_owned(),
+        ));
+    }
+    Ok(after_sha)
+}
+
 /// Marker used by the Task runner when it invokes the executor.  Keeping this
 /// helper in services avoids exposing an executor-specific authority field to
 /// API callers or persisted profile JSON.
@@ -1008,6 +1069,20 @@ impl TaskExecutor for TaskExecutorRouter {
 mod tests {
     use super::*;
 
+    async fn task_repo() -> (tempfile::TempDir, String) {
+        let repo = tempfile::tempdir().expect("temp repository creates");
+        git::init(repo.path())
+            .await
+            .expect("git repository initializes");
+        tokio::fs::write(repo.path().join("README.md"), "# Task\n")
+            .await
+            .expect("initial file writes");
+        let before_sha = git::commit_all(repo.path(), "initial commit")
+            .await
+            .expect("initial commit creates");
+        (repo, before_sha)
+    }
+
     #[test]
     fn only_known_task_roles_receive_task_authority() {
         assert_eq!(canonical_task_role("worker").unwrap(), "worker");
@@ -1034,5 +1109,60 @@ mod tests {
         });
         set_task_role_marker(&mut config, "coder");
         assert_eq!(config[TASK_ROLE_MARKER], "coder");
+    }
+
+    #[tokio::test]
+    async fn dirty_native_worker_changes_fail_loud_and_remain_uncommitted() {
+        let (repo, before_sha) = task_repo().await;
+        tokio::fs::write(repo.path().join("app.ts"), "export const ready = true;\n")
+            .await
+            .expect("worker output writes");
+
+        let error = validate_write_capable_delivery(repo.path(), &before_sha)
+            .await
+            .expect_err("dirty uncommitted output cannot complete");
+
+        assert!(error.to_string().contains("uncommitted worktree changes"));
+        assert_eq!(
+            git::get_current_sha(repo.path())
+                .await
+                .expect("final HEAD reads"),
+            before_sha
+        );
+        assert!(!git::is_worktree_clean(repo.path())
+            .await
+            .expect("worktree cleanliness reads"));
+        assert!(repo.path().join("app.ts").exists());
+    }
+
+    #[tokio::test]
+    async fn clean_unchanged_native_worker_is_left_to_workflow_noop_policy() {
+        let (repo, before_sha) = task_repo().await;
+
+        let after_sha = validate_write_capable_delivery(repo.path(), &before_sha)
+            .await
+            .expect("a clean no-op has no authored files to lose");
+
+        assert_eq!(after_sha, before_sha);
+    }
+
+    #[tokio::test]
+    async fn native_worker_commit_is_accepted_without_mutation() {
+        let (repo, before_sha) = task_repo().await;
+        tokio::fs::write(repo.path().join("app.ts"), "export const ready = true;\n")
+            .await
+            .expect("worker output writes");
+        let worker_sha = git::commit_all(repo.path(), "worker-authored commit")
+            .await
+            .expect("worker commit creates");
+
+        let after_sha = validate_write_capable_delivery(repo.path(), &before_sha)
+            .await
+            .expect("an existing worker commit is delivered");
+
+        assert_eq!(after_sha, worker_sha);
+        assert!(git::is_worktree_clean(repo.path())
+            .await
+            .expect("worktree cleanliness reads"));
     }
 }
