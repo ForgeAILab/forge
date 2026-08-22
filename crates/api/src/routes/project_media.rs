@@ -20,9 +20,8 @@ use axum::{
     Json,
 };
 use db::{
-    new_uuid_v4, now_rfc3339, CreateProjectMediaAsset, CreateProjectMediaAttachment,
-    CreateProjectMediaAttachmentMutation, ProjectMediaTombstone, ProjectMemberRepo, ProjectRepo,
-    SharedMediaRepo, SoftDeleteProjectMediaAttachmentMutation,
+    new_uuid_v4, now_rfc3339, CreateProjectMediaAsset, ProjectMediaTombstone, ProjectMemberRepo,
+    ProjectRepo, SharedMediaRepo, SoftDeleteProjectMediaAttachmentMutation,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -32,6 +31,9 @@ use crate::{
     errors::{ApiError, ApiResult},
     routes::auth::AuthenticatedUser,
     state::AppState,
+};
+use services::{
+    ProjectArtifactCommandService, ProjectCommandAuthorization, ProjectEvidenceCommand,
 };
 
 const EVIDENCE_ATTACH_ACTION: &str = "project.evidence.attach";
@@ -513,65 +515,49 @@ pub async fn attach_evidence(
     if request.mutation.idempotency_key.trim().is_empty() {
         return Err(ApiError::bad_request("idempotency_key is required"));
     }
-    let asset = SharedMediaRepo::get_media_asset(&*state.db, &request.asset_id)
-        .await?
-        .filter(|asset| asset.project_id == project_id)
-        .ok_or_else(|| ApiError::not_found("media", request.asset_id.clone()))?;
-    if asset.deleted_at.is_some() || asset.availability != "available" {
-        return Err(ApiError::conflict_with_code(
-            "media.unavailable",
-            "media asset is not available",
-        ));
-    }
-    let asset = reconcile_asset_checksum(&state, asset).await?;
-    if !is_sha256_digest(&request.checksum)
-        || asset.checksum.as_deref() != Some(request.checksum.as_str())
-    {
+    if !is_sha256_digest(&request.checksum) {
         return Err(ApiError::conflict_with_code(
             "media.digest_mismatch",
             "evidence checksum does not match the asset",
         ));
     }
-    let now = now_rfc3339();
-    let attachment = SharedMediaRepo::create_project_media_attachment_mutation(
-        &*state.db,
-        CreateProjectMediaAttachmentMutation {
-            attachment: CreateProjectMediaAttachment {
-                id: new_uuid_v4(),
+    let authorization_json = serde_json::to_string(&request.mutation.authorization)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let attachment = ProjectArtifactCommandService::new(state.db.clone())
+        .attach_evidence(
+            ProjectEvidenceCommand {
                 project_id: project_id.clone(),
-                asset_id: asset.id.clone(),
-                attachment_kind: "evidence".to_owned(),
-                // A Project evidence attachment is a new reference to the
-                // shared bytes.  Reusing the legacy task_media_id here would
-                // violate the legacy one-row uniqueness constraint when the
-                // same Task asset is cited by more than one milestone.
-                task_media_id: None,
-                task_id: request.task_id.clone(),
-                milestone_id: Some(milestone_id.clone()),
-                milestone_check_id: None,
-                source_task_id: request.task_id.clone(),
-                source_execution_id: request.source_run_id.clone(),
-                source_validation_id: request.source_validation_id.clone(),
-                acceptance_check_ids_json: serde_json::to_string(&request.acceptance_check_ids)
-                    .map_err(|error| ApiError::bad_request(error.to_string()))?,
-                caption: Some(request.caption.clone()),
-                evidence_kind: Some(evidence_kind_name(request.kind).to_owned()),
-                checksum: Some(request.checksum.clone()),
-                availability: "available".to_owned(),
-                project_url: Some(project_media_url(&project_id, &asset.id)),
-                author_type: "user".to_owned(),
-                author_id: Some(user.user_id.clone()),
-                authorization_json: serde_json::to_string(&request.mutation.authorization)
-                    .map_err(|error| ApiError::bad_request(error.to_string()))?,
-                created_at: now.clone(),
+                milestone_id,
+                asset_id: request.asset_id,
+                task_id: request.task_id,
+                source_run_id: request.source_run_id,
+                source_validation_id: request.source_validation_id,
+                acceptance_check_ids: request.acceptance_check_ids,
+                caption: request.caption,
+                evidence_kind: evidence_kind_name(request.kind).to_owned(),
+                checksum: request.checksum,
+                expected_milestone_version: request.mutation.expected_version,
+                idempotency_key: request.mutation.idempotency_key,
+                authorization: ProjectCommandAuthorization {
+                    principal_type: "user".to_owned(),
+                    principal_id: user.user_id.clone(),
+                    policy_result: "allowed".to_owned(),
+                    policy_revision: None,
+                    policy_digest: None,
+                    requested_permission: Some(EVIDENCE_ATTACH_ACTION.to_owned()),
+                    correlation_id: request.mutation.authorization.event_id.clone(),
+                    causation_id: None,
+                    causation_depth: 0,
+                    authorization_event_id: request.mutation.authorization.event_id,
+                    authorization_basis: request.mutation.authorization.authorization_basis,
+                    authorization_action: request.mutation.authorization.action,
+                    authorization_occurred_at: request.mutation.authorization.occurred_at,
+                    authorization_json,
+                },
             },
-            expected_milestone_version: request.mutation.expected_version,
-            idempotency_key: request.mutation.idempotency_key.clone(),
-            mutation_fingerprint: mutation_digest(&request),
-            authorization_event_id: request.mutation.authorization.event_id.clone(),
-        },
-    )
-    .await?;
+            None,
+        )
+        .await?;
     Ok(Json(evidence_attachment_response(attachment)?))
 }
 

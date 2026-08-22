@@ -225,6 +225,7 @@ async fn run_command_socket(state: AppState, daemon_id: String, socket: WebSocke
                         if !handle_daemon_text_frame(
                             &state,
                             &daemon_id,
+                            connection_id,
                             &outbound_tx,
                             text.as_str(),
                         )
@@ -300,9 +301,21 @@ async fn run_command_socket(state: AppState, daemon_id: String, socket: WebSocke
 async fn handle_daemon_text_frame(
     state: &AppState,
     daemon_id: &str,
+    connection_id: u64,
     outbound_tx: &mpsc::Sender<DaemonFrame>,
     text: &str,
 ) -> bool {
+    // A reconnect retains the durable daemon id but receives a new
+    // authenticated connection incarnation. Stop processing a replaced
+    // socket before a delayed response/notification can reach the current
+    // connection's pending requests or execution lease handler.
+    if !state
+        .daemon_connections
+        .is_current(daemon_id, connection_id)
+    {
+        return false;
+    }
+
     let frame = match serde_json::from_str::<DaemonFrame>(text) {
         Ok(frame) => frame,
         Err(error) => {
@@ -339,8 +352,9 @@ async fn handle_daemon_text_frame(
         }
     }
 
-    state.daemon_connections.dispatch_incoming(daemon_id, frame);
-    true
+    state
+        .daemon_connections
+        .dispatch_incoming_for_connection(daemon_id, connection_id, frame)
 }
 
 async fn send_invalid_frame(

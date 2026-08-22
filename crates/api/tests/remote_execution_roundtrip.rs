@@ -70,13 +70,34 @@ async fn poll_failed_task_recovery_state(db: &Arc<db::SqliteDb>, task_id: &str) 
         .expect("task exists")
 }
 
+async fn poll_execution_logs(
+    app: &axum::Router,
+    execution_id: &str,
+    minimum_entries: usize,
+) -> Value {
+    for _ in 0..200 {
+        let logs = fetch_execution_logs(app, execution_id).await;
+        if logs
+            .get("items")
+            .and_then(Value::as_array)
+            .is_some_and(|entries| entries.len() >= minimum_entries)
+        {
+            return logs;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    fetch_execution_logs(app, execution_id).await
+}
+
 struct RemoteRoundtripFixture {
     harness: common::Harness,
     registration: api_types::DaemonRegisterResponse,
     server: TestServer,
     daemon_socket: common::fake_daemon::ClientSocket,
     project_id: String,
+    repo_id: String,
     agent_id: String,
+    reviewer_id: String,
     _repo_dir: TestDir,
     _workspaces_root: TestDir,
 }
@@ -106,7 +127,7 @@ async fn setup_remote_roundtrip(prefix: &str) -> RemoteRoundtripFixture {
     )
     .await;
 
-    let (project_id, _repo_id) =
+    let (project_id, repo_id) =
         create_project_and_repo(&harness.app, &format!("{prefix} Project"), &repo_path).await;
 
     let agent: AgentResponse = json_request_with_bearer(
@@ -124,13 +145,51 @@ async fn setup_remote_roundtrip(prefix: &str) -> RemoteRoundtripFixture {
     .await;
     assert_eq!(agent.effective_status.as_deref(), Some("active"));
 
+    // Remote execution now enforces the same Project execution setup gate as
+    // the production scheduler. Keep the Worker and independent Reviewer
+    // explicit, active, and owned by the daemon used by this round-trip so
+    // the test exercises the transport/liveness path after real admission.
+    let reviewer: AgentResponse = json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        "/api/v1/agents",
+        &admin_jwt(),
+        json!({
+            "name": format!("{prefix}-shell-reviewer"),
+            "executor_type": "shell",
+            "daemon_id": registration.daemon_id,
+            "config_json": {
+                "command": "printf",
+                "args": ["Looks good.\\n===REVIEW: PASS===\\n"]
+            },
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(reviewer.effective_status.as_deref(), Some("active"));
+    assert_ne!(agent.id, reviewer.id, "reviewer must be independent");
+    assert_eq!(
+        reviewer.daemon_id.as_deref(),
+        Some(registration.daemon_id.as_str())
+    );
+    common::configure_execution_test_setup(
+        &harness.state.db,
+        &project_id,
+        &repo_id,
+        &agent.id,
+        &reviewer.id,
+    )
+    .await;
+
     RemoteRoundtripFixture {
         harness,
         registration,
         server,
         daemon_socket,
         project_id,
+        repo_id,
         agent_id: agent.id,
+        reviewer_id: reviewer.id,
         _repo_dir: repo_dir,
         _workspaces_root: workspaces_root,
     }
@@ -206,6 +265,29 @@ async fn claim_task_with_accepted_start(
     (task_id, execution_id)
 }
 
+async fn complete_remote_reviewer(daemon_socket: &mut common::fake_daemon::ClientSocket) {
+    let (start_id, start_params) = next_daemon_request(daemon_socket, METHOD_EXECUTION_START).await;
+    let review_execution_id = start_params["execution_id"]
+        .as_str()
+        .expect("review execution id in start params")
+        .to_owned();
+    send_daemon_response(
+        daemon_socket,
+        start_id,
+        api_types::ExecutionStartResult {
+            execution_id: review_execution_id.clone(),
+            accepted: true,
+        },
+    )
+    .await;
+    send_execution_terminal_completed(
+        daemon_socket,
+        &review_execution_id,
+        Some("Looks good.\n===REVIEW: PASS===\n"),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn remote_execution_completes_and_transitions_task() {
     let mut fixture = setup_remote_roundtrip("remote-roundtrip-success").await;
@@ -228,6 +310,7 @@ async fn remote_execution_completes_and_transitions_task() {
         "remote line one",
     )
     .await;
+    let _ = poll_execution_logs(&fixture.harness.app, &execution_id, 1).await;
     send_execution_log(
         &mut fixture.daemon_socket,
         &execution_id,
@@ -235,6 +318,7 @@ async fn remote_execution_completes_and_transitions_task() {
         "remote line two",
     )
     .await;
+    let _ = poll_execution_logs(&fixture.harness.app, &execution_id, 2).await;
     send_execution_log(
         &mut fixture.daemon_socket,
         &execution_id,
@@ -242,6 +326,11 @@ async fn remote_execution_completes_and_transitions_task() {
         "remote line three",
     )
     .await;
+    // The daemon socket preserves frame order, but notification handling is
+    // dispatched asynchronously. Wait until all three log rows are durable
+    // before sending the terminal frame so the terminal CAS cannot race the
+    // final log notification.
+    let _ = poll_execution_logs(&fixture.harness.app, &execution_id, 3).await;
     send_execution_terminal_completed(
         &mut fixture.daemon_socket,
         &execution_id,
@@ -257,11 +346,16 @@ async fn remote_execution_completes_and_transitions_task() {
     .await;
     assert_eq!(completed.status, DbExecutionStatus::Completed);
 
+    // The configured independent reviewer is also remote. Complete its
+    // daemon-owned execution so the normal review-to-merge cascade remains
+    // part of this round-trip instead of leaving the task at the review gate.
+    complete_remote_reviewer(&mut fixture.daemon_socket).await;
+
     let reviewed =
         poll_task_status_after_execution(&fixture.harness.state.db, &task_id, "done").await;
     assert_eq!(reviewed.status, "done");
 
-    let logs = fetch_execution_logs(&fixture.harness.app, &execution_id).await;
+    let logs = poll_execution_logs(&fixture.harness.app, &execution_id, 3).await;
     let entries = logs["items"].as_array().expect("log items array");
     assert!(
         entries.len() >= 3,
@@ -413,6 +507,14 @@ async fn remote_executor_unavailable_defers_and_persists_route() {
         StatusCode::OK,
     )
     .await;
+    common::configure_execution_test_setup(
+        &fixture.harness.state.db,
+        &fixture.project_id,
+        &fixture.repo_id,
+        &routed_agent.id,
+        &fixture.reviewer_id,
+    )
+    .await;
 
     let created_task: TaskResponse = json_request(
         &fixture.harness.app,
@@ -421,6 +523,11 @@ async fn remote_executor_unavailable_defers_and_persists_route() {
         json!({
             "title": "Remote unavailable roundtrip",
             "description": "exhaust every candidate",
+            "role_assignments": [{
+                "role_name": "coder",
+                "assignee_type": "agent",
+                "assignee_id": routed_agent.id
+            }],
         }),
         StatusCode::OK,
     )

@@ -8,24 +8,24 @@ use db::{
     AgentInboxListQuery, AgentInboxStatus, AgentQuestion, AgentQuestionListQuery,
     AnswerAgentQuestion, CompleteAgentCommitment, CreateAgentAction, CreateAgentActionApproval,
     CreateAgentActionExecution, CreateAgentCommitment, CreateAgentCommitmentEvidence,
-    CreateAgentInboxItem, CreateAgentQuestion, ProjectRepo, SqliteDb, Task, TaskRepo,
-    TransferAgentCommitment, UpdateAgentCommitment, UpdateAgentInboxItem,
+    CreateAgentInboxItem, CreateAgentQuestion, SqliteDb, Task, TransferAgentCommitment,
+    UpdateAgentCommitment, UpdateAgentInboxItem,
 };
 use forge_agent_host::{
-    MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
-    MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READINESS_OPERATION, MAIN_CHARTER_READ_OPERATION,
-    MAIN_PROJECT_CREATE_OPERATION, PROJECT_CHARTER_ADOPTION_OPERATION,
-    PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
-    PROJECT_EVIDENCE_OPERATION, PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION,
-    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
+    classify_operation, is_allowed_project_direct_payload,
+    is_project_orchestration_operation as is_catalog_project_orchestration_operation,
+    operation_contract, OperationClassification, MAIN_CHARTER_DRAFT_OPERATION,
+    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_RELEASE_OPERATION, TASK_ADAPTIVE_OPERATION,
+    TASK_PROPOSE_OPERATION,
 };
-use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 use crate::task_service::TaskService;
 use crate::{Result, ServiceError};
+
+pub use crate::task_service::TaskProposalPayload;
 
 const MAX_CAUSATION_DEPTH: i64 = 8;
 
@@ -550,37 +550,11 @@ pub struct ExecuteActionInput {
     pub idempotency_key: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TaskProposalPayload {
-    pub title: String,
-    pub description: Option<String>,
-    pub parent_task_id: Option<String>,
-    pub priority: Option<i64>,
-    pub task_type: Option<String>,
-    pub task_state_config: Option<String>,
-    pub merge_config: Option<Value>,
-    pub role_assignments: Option<Vec<api_types::InitialRoleAssignment>>,
-    #[serde(default)]
-    pub governance: Option<api_types::TaskGovernanceRequest>,
-    /// Flat baseline-provenance shortcuts for agent proposals. When no full
-    /// `governance` envelope is supplied, Forge binds the Task to the
-    /// Project's active user-approved execution baseline itself and threads
-    /// these fields into that server-derived envelope.
-    #[serde(default)]
-    pub plan_item_id: Option<String>,
-    #[serde(default)]
-    pub milestone_id: Option<String>,
-    #[serde(default)]
-    pub capability_class: Option<String>,
-    #[serde(default)]
-    pub risk_class: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecuteTaskProposalInput {
     pub action_id: String,
     pub expected_version: i64,
+    pub executed_by_type: String,
     pub executed_by_id: String,
     pub idempotency_key: String,
 }
@@ -601,8 +575,38 @@ impl AgentActionService {
         Self { db }
     }
 
+    /// Evaluate the server-issued policy ceiling for a direct command without
+    /// creating an AgentAction.  Directly admitted Main commands still use
+    /// the same identity/profile/scope policy as approval-queue proposals;
+    /// only the durable command receipt, not an action row, records success.
+    pub async fn evaluate_direct_command_policy(
+        &self,
+        actor_identity_id: &str,
+        scope_type: &str,
+        scope_id: &str,
+        requested_permission: &str,
+        operation: &str,
+        payload_json: Option<&str>,
+    ) -> Result<(AgentActionPolicyResult, Option<String>)> {
+        evaluate_action_policy(
+            &self.db,
+            actor_identity_id,
+            scope_type,
+            scope_id,
+            requested_permission,
+            operation,
+            payload_json,
+        )
+        .await
+    }
+
     pub async fn propose(&self, input: ProposeActionInput) -> Result<AgentAction> {
         validate_scope(&input.scope_type, &input.scope_id)?;
+        if input.operation == MAIN_CHARTER_DRAFT_OPERATION {
+            return Err(ServiceError::invalid_operation(
+                "charter.draft is a direct Main command and cannot enter the AgentAction queue",
+            ));
+        }
         if input.causation_depth > MAX_CAUSATION_DEPTH || input.causation_depth < 0 {
             return Err(ServiceError::invalid_operation(
                 "action causation depth exceeds the reaction bound",
@@ -613,7 +617,29 @@ impl AgentActionService {
         let requested_permission =
             required_text("requested permission", &input.requested_permission)?;
         let dedupe_key = required_text("action dedupe key", &input.dedupe_key)?;
-        if operation == "task.propose" {
+        let payload_value: Value = serde_json::from_str(&input.payload_json).map_err(|error| {
+            ServiceError::invalid_operation(format!("action payload is invalid: {error}"))
+        })?;
+        match classify_operation(&operation, Some(&payload_value)) {
+            OperationClassification::ApprovalRequiredAction => {}
+            OperationClassification::DirectCommand => {
+                return Err(ServiceError::invalid_operation(
+                    "direct commands use their shared command service and cannot enter the AgentAction queue",
+                ));
+            }
+            OperationClassification::Query => {
+                return Err(ServiceError::invalid_operation(
+                    "query operations use the shared read boundary and cannot enter the AgentAction queue",
+                ));
+            }
+            OperationClassification::Denied => {
+                return Err(ServiceError::AuthorizationDenied {
+                    message: "operation is denied by the canonical native operation catalog"
+                        .to_owned(),
+                });
+            }
+        }
+        if operation == TASK_PROPOSE_OPERATION {
             serde_json::from_str::<TaskProposalPayload>(&input.payload_json).map_err(|error| {
                 ServiceError::invalid_operation(format!(
                     "task proposal payload is invalid: {error}"
@@ -814,239 +840,30 @@ impl AgentActionService {
         .map_err(Into::into)
     }
 
-    /// Executes a validated `task.propose` through the existing TaskService.
-    /// The action is not itself a Task and remains a proposal until this
-    /// method successfully persists the Task through the normal workflow
-    /// service.  Replays return the Task id recorded in the original outcome.
+    /// Executes an admitted `task.propose` through the atomic TaskService
+    /// command.  The command owns Task/governance/event/receipt/action
+    /// finalization; this service only resolves the source Action and returns
+    /// its durable execution projection.
     pub async fn execute_task_proposal(
         &self,
         task_service: &TaskService,
         input: ExecuteTaskProposalInput,
     ) -> Result<ExecutedTaskProposal> {
         let action = self.get(&input.action_id).await?;
-        if action.operation != "task.propose" {
-            return Err(ServiceError::invalid_operation(
-                "action is not a task proposal",
-            ));
-        }
-        let project_id = action
-            .target_id
-            .clone()
-            .filter(|_| action.target_type.as_deref() == Some("project"))
-            .ok_or_else(|| {
-                ServiceError::invalid_operation("task proposal must target a Project explicitly")
-            })?;
-        match action.scope_type.as_str() {
-            "project" if action.scope_id == project_id => {}
-            "agent_chat" => {
-                let chat = sqlx::query("SELECT kind, project_id FROM agent_chat WHERE id = ?")
-                    .bind(&action.scope_id)
-                    .fetch_optional(self.db.pool())
-                    .await?
-                    .ok_or_else(|| {
-                        ServiceError::not_found("agent_chat", action.scope_id.clone())
-                    })?;
-                let kind: String = chat.try_get("kind")?;
-                let chat_project_id: Option<String> = chat.try_get("project_id")?;
-                if kind != "project" || chat_project_id.as_deref() != Some(project_id.as_str()) {
-                    return Err(ServiceError::invalid_operation(
-                        "task proposal scope must match its owning Project Agent Chat",
-                    ));
-                }
-            }
-            _ => {
-                return Err(ServiceError::invalid_operation(
-                    "task proposal scope must match its target Project",
-                ));
-            }
-        }
-        let binding_permissions = sqlx::query_scalar::<_, String>(
-            "SELECT permission_ceiling_json FROM project_agent_binding
-             WHERE project_id = ? AND identity_id = ? AND state = 'active'",
-        )
-        .bind(&project_id)
-        .bind(&action.actor_identity_id)
-        .fetch_optional(self.db.pool())
-        .await?;
-        if !binding_permissions
-            .as_deref()
-            .is_some_and(|permissions| permission_set(permissions).contains("propose_task"))
-        {
-            return Err(ServiceError::invalid_operation(
-                "task proposal actor is not an active Project binding",
-            ));
-        }
-        if let Some(existing) =
-            db::AgentActionRepo::get_successful_action_execution(&*self.db, &input.action_id)
-                .await?
-        {
-            if existing.idempotency_key != input.idempotency_key {
-                return Err(ServiceError::conflict(
-                    "task proposal already has a successful execution with a different idempotency key",
-                ));
-            }
-            let task_id = existing
-                .result_json
-                .as_deref()
-                .and_then(|value| serde_json::from_str::<Value>(value).ok())
-                .and_then(|value| {
-                    value
-                        .get("task_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-                .ok_or_else(|| {
-                    ServiceError::invalid_operation(
-                        "recorded task proposal outcome does not contain a task id",
-                    )
-                })?;
-            let task = TaskRepo::get_by_id(&*self.db, &task_id, true)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-            return Ok(ExecutedTaskProposal {
-                task,
-                execution: existing,
-            });
-        }
-        if action.status != AgentActionStatus::Approved
-            && action.status != AgentActionStatus::Proposed
-        {
-            return Err(ServiceError::invalid_operation(
-                "task proposal is not admitted for execution",
-            ));
-        }
-        if action.policy_result == AgentActionPolicyResult::Denied
-            || (action.policy_result == AgentActionPolicyResult::ApprovalRequired
-                && action.status != AgentActionStatus::Approved)
-        {
-            return Err(ServiceError::invalid_operation(
-                "task proposal policy has not admitted execution",
-            ));
-        }
-        if action.version != input.expected_version {
-            return Err(ServiceError::Db(db::DbError::VersionConflict));
-        }
-        let mut payload: TaskProposalPayload = serde_json::from_str(&action.payload_json)
-            .map_err(|_| ServiceError::invalid_operation("task proposal payload is invalid"))?;
-        let task_state_config = match payload.task_state_config.take() {
-            Some(config) => Some(config),
-            None => {
-                let project = ProjectRepo::get_by_id(&*self.db, &project_id)
-                    .await?
-                    .ok_or_else(|| ServiceError::not_found("project", project_id.clone()))?;
-                let settings: Value = serde_json::from_str(&project.settings).map_err(|error| {
-                    ServiceError::invalid_operation(format!("invalid Project settings: {error}"))
-                })?;
-                settings
-                    .get("default_review_config")
-                    .cloned()
-                    .map(|review| serde_json::json!({ "review": review }).to_string())
-            }
-        };
-        let governance = match payload.governance.take() {
-            Some(governance) => Some(governance),
-            None => {
-                self.derive_active_baseline_governance(&project_id, &payload)
-                    .await?
-            }
-        };
         let task = task_service
-            .create_task_with_governance(
-                project_id,
-                payload.title,
-                payload.description,
-                payload.parent_task_id,
-                payload.priority,
-                payload.task_type,
-                task_state_config,
-                payload.merge_config,
-                payload.role_assignments,
-                governance,
+            .execute_task_proposal_command(
+                &action,
+                input.expected_version,
+                &input.executed_by_type,
+                &input.executed_by_id,
+                &input.idempotency_key,
             )
             .await?;
-        let result_json = serde_json::json!({ "task_id": task.id }).to_string();
-        let execution = self
-            .execute(ExecuteActionInput {
-                action_id: input.action_id,
-                expected_version: input.expected_version,
-                attempt: 1,
-                result_json: Some(result_json),
-                error: None,
-                executed_by_type: "forge_task_service".to_owned(),
-                executed_by_id: input.executed_by_id,
-                idempotency_key: input.idempotency_key,
-            })
-            .await?;
+        let execution =
+            db::AgentActionRepo::get_successful_action_execution(&*self.db, &input.action_id)
+                .await?
+                .ok_or_else(|| ServiceError::Db(db::DbError::IdempotencyConflict))?;
         Ok(ExecutedTaskProposal { task, execution })
-    }
-
-    /// Derive the server-authoritative governance envelope for an agent Task
-    /// proposal that did not carry one. A charter-backed Project with an
-    /// active user-approved execution baseline binds the Task to that exact
-    /// baseline revision; the proposal only needs to name the plan item and
-    /// (optionally) milestone/classes. Without an active baseline — or when
-    /// the proposal names no plan item, so baseline binding could never
-    /// validate — the proposal stays a pre-baseline plan and
-    /// `prepare_task_governance` applies the charter-only path.
-    ///
-    /// Baseline activation runs the same derivation for Tasks that were
-    /// proposed before the baseline existed:
-    /// `db::promote_baseline_task_governance_in_tx` re-binds matching
-    /// preplanned plan-item Tasks inside the activation transaction. Keep the
-    /// two in sync when this envelope shape changes.
-    async fn derive_active_baseline_governance(
-        &self,
-        project_id: &str,
-        payload: &TaskProposalPayload,
-    ) -> Result<Option<api_types::TaskGovernanceRequest>> {
-        if payload.plan_item_id.is_none() {
-            return Ok(None);
-        }
-        let current_charter_revision_id: Option<String> = sqlx::query_scalar(
-            "SELECT current_charter_revision_id FROM project
-             WHERE id = ? AND charter_status = 'charter_backed'
-               AND charter_setup_required = 0
-             LIMIT 1",
-        )
-        .bind(project_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .flatten();
-        let Some(current_charter_revision_id) = current_charter_revision_id else {
-            return Ok(None);
-        };
-        let baseline = sqlx::query(
-            "SELECT b.id, b.current_revision_id, r.primary_milestone_id
-             FROM project_execution_baseline AS b
-             JOIN project_execution_baseline_revision AS r
-               ON r.id = b.current_revision_id AND r.baseline_id = b.id
-             WHERE b.project_id = ? AND b.lifecycle = 'active'
-               AND r.lifecycle = 'approved'
-             ORDER BY b.updated_at DESC, b.id DESC LIMIT 1",
-        )
-        .bind(project_id)
-        .fetch_optional(self.db.pool())
-        .await?;
-        let Some(baseline) = baseline else {
-            return Ok(None);
-        };
-        let baseline_id: String = baseline.try_get("id")?;
-        let baseline_revision_id: Option<String> = baseline.try_get("current_revision_id")?;
-        let primary_milestone_id: Option<String> = baseline.try_get("primary_milestone_id")?;
-        let Some(baseline_revision_id) = baseline_revision_id else {
-            return Ok(None);
-        };
-        Ok(Some(api_types::TaskGovernanceRequest {
-            charter_revision_id: Some(current_charter_revision_id),
-            baseline_id: Some(baseline_id),
-            baseline_revision_id: Some(baseline_revision_id),
-            plan_item_id: payload.plan_item_id.clone(),
-            milestone_id: payload.milestone_id.clone().or(primary_milestone_id),
-            document_revision_ids: Vec::new(),
-            capability_class: payload.capability_class.clone(),
-            risk_class: payload.risk_class.clone(),
-            provenance: None,
-        }))
     }
 }
 
@@ -1606,36 +1423,43 @@ async fn evaluate_action_policy(
             ));
         }
     }
-    // A Task proposal is still non-authoritative: only the authenticated
-    // Project owner/admin can call the separate execute-task endpoint, which
-    // runs TaskService and records that user as the executor. Requiring a
-    // second Agent approval here creates an impossible cycle in the singular
-    // Project Agent model (the only bound Agent cannot approve itself).
-    //
-    // Project Agent writes are different: explicitly bounded draft
-    // subactions and policy-scoped non-material Document approvals have a
-    // typed agent executor. Charter/baseline approval, waiver, readiness,
-    // evidence, and release paths remain pending until their independent
-    // user/system transaction exists. Never infer this distinction from the
-    // operation name alone; the closed payload action is part of the policy
-    // input, and the Document materializer performs the persisted policy and
-    // release-gate checks.
+    // Classify after the scope/Charter gate above.  The payload is part of the
+    // canonical operation identity: a reversible Project subaction can be a
+    // direct command while an authority action in the same coarse descriptor
+    // remains an approval-backed AgentAction.
+    let payload_value =
+        payload_json.and_then(|payload| serde_json::from_str::<Value>(payload).ok());
+    let classification = classify_operation(operation, payload_value.as_ref());
     let project_draft_allowed =
         payload_json.is_some_and(|payload| is_allowed_project_draft_operation(operation, payload));
-    // Main Charter discovery is intentionally a typed, non-authoritative
-    // materialization path.  Its action ledger still records the proposal,
-    // but a second AgentAction approval would deadlock the singular Main
-    // identity before the typed domain executor can run.  `project.create`
-    // is included in this exact allowlist only to let the authenticated user
-    // executor reach the Charter-receipt check; the Main typed executor
-    // rejects agent execution for that operation.
     let main_orchestration_allowed =
         is_allowed_main_orchestration_operation(requested_permission, operation);
-    let approval_required = (!project_draft_allowed
-        && !main_orchestration_allowed
-        && requested_permission.starts_with("propose_")
-        && !(requested_permission == "propose_task" && operation == "task.propose"))
-        || requested_permission == "task_write"
+    let direct_allowed = project_draft_allowed
+        || main_orchestration_allowed
+        || (operation == TASK_ADAPTIVE_OPERATION && requested_permission == "propose_task")
+        || (operation == TASK_PROPOSE_OPERATION && requested_permission == "propose_task");
+    if matches!(classification, OperationClassification::Denied) {
+        return Ok((
+            AgentActionPolicyResult::Denied,
+            Some("operation is denied by the canonical native operation catalog".to_owned()),
+        ));
+    }
+    if matches!(classification, OperationClassification::Query) {
+        return Ok((
+            AgentActionPolicyResult::Denied,
+            Some("query operations execute through the read boundary".to_owned()),
+        ));
+    }
+    if matches!(classification, OperationClassification::DirectCommand) && !direct_allowed {
+        return Ok((
+            AgentActionPolicyResult::Denied,
+            Some("direct command is not admitted for this permission or payload".to_owned()),
+        ));
+    }
+    let approval_required = matches!(
+        classification,
+        OperationClassification::ApprovalRequiredAction
+    ) || requested_permission == "task_write"
         || operation.starts_with("protected.");
     Ok(if approval_required {
         (
@@ -1649,116 +1473,27 @@ async fn evaluate_action_policy(
 
 fn is_allowed_main_orchestration_operation(requested_permission: &str, operation: &str) -> bool {
     match operation {
-        MAIN_CHARTER_DRAFT_OPERATION
-        | MAIN_CHARTER_READINESS_OPERATION
-        | MAIN_CHARTER_DIFF_OPERATION
-        | MAIN_CHARTER_APPROVAL_TARGET_OPERATION => requested_permission == "propose_discovery",
-        MAIN_PROJECT_CREATE_OPERATION => requested_permission == "propose_project",
+        MAIN_CHARTER_DRAFT_OPERATION => requested_permission == "propose_discovery",
         _ => false,
     }
 }
 
 fn is_allowed_project_draft_operation(operation: &str, payload_json: &str) -> bool {
-    let Ok(Value::Object(payload)) = serde_json::from_str::<Value>(payload_json) else {
+    let Ok(payload) = serde_json::from_str::<Value>(payload_json) else {
         return false;
     };
-    if contains_project_authority_override(&Value::Object(payload.clone())) {
-        return false;
-    }
-    let action = payload.get("action").and_then(Value::as_str);
-    match operation {
-        PROJECT_CHARTER_ADOPTION_OPERATION => action == Some("draft_revision"),
-        PROJECT_DOCUMENT_OPERATION => {
-            matches!(
-                action,
-                Some("draft_revision") | Some("propose_approval") | Some("approve")
-            )
-        }
-        PROJECT_DECISION_OPERATION => {
-            // Implementation choices inside the exact active baseline are
-            // bounded Project-Agent authority. Supersession, invalidation,
-            // and all other decision classes remain user/system-only paths.
-            matches!(action, Some("record_candidate") | Some("record_effective"))
-                && payload.get("decision_class").and_then(Value::as_str)
-                    == Some("project_implementation")
-        }
-        PROJECT_EXECUTION_BASELINE_OPERATION => matches!(
-            action,
-            Some("draft_revision") | Some("revise") | Some("propose_approval")
-        ),
-        PROJECT_MILESTONE_OPERATION => {
-            matches!(
-                action,
-                Some("define") | Some("revise") | Some("set_primary")
-            )
-        }
-        PROJECT_EVIDENCE_OPERATION => action == Some("attach"),
-        PROJECT_READINESS_OPERATION => action == Some("evaluate"),
-        PROJECT_RELEASE_OPERATION => action == Some("propose_candidate"),
-        _ => false,
-    }
-}
-
-fn contains_project_authority_override(value: &Value) -> bool {
-    const FORBIDDEN_FIELDS: &[&str] = &[
-        "actor_identity_id",
-        "identity_id",
-        "scope_type",
-        "scope_id",
-        "project_id",
-        "authority",
-        "permission",
-        "workspace",
-        "workspace_path",
-        "workspace_lease",
-        "repository_path",
-        "repository_url",
-        "credential",
-        "target_type",
-        "target_id",
-    ];
-    match value {
-        Value::Object(object) => object.iter().any(|(key, nested)| {
-            FORBIDDEN_FIELDS.contains(&key.as_str()) || contains_project_authority_override(nested)
-        }),
-        Value::Array(values) => values.iter().any(contains_project_authority_override),
-        _ => false,
-    }
+    matches!(
+        classify_operation(operation, Some(&payload)),
+        OperationClassification::DirectCommand
+    ) && is_allowed_project_direct_payload(operation, &payload)
 }
 
 fn is_project_orchestration_mutation(operation: &str) -> bool {
-    matches!(
-        operation,
-        PROJECT_CHARTER_ADOPTION_OPERATION
-            | PROJECT_DOCUMENT_OPERATION
-            | PROJECT_DECISION_OPERATION
-            | PROJECT_EXECUTION_BASELINE_OPERATION
-            | PROJECT_MILESTONE_OPERATION
-            | PROJECT_EVIDENCE_OPERATION
-            | PROJECT_READINESS_OPERATION
-            | PROJECT_RELEASE_OPERATION
-    )
+    is_catalog_project_orchestration_operation(operation)
 }
 
 fn is_typed_orchestration_operation(operation: &str) -> bool {
-    matches!(
-        operation,
-        MAIN_CHARTER_READ_OPERATION
-            | MAIN_CHARTER_DRAFT_OPERATION
-            | MAIN_CHARTER_READINESS_OPERATION
-            | MAIN_CHARTER_DIFF_OPERATION
-            | MAIN_CHARTER_APPROVAL_TARGET_OPERATION
-            | MAIN_PROJECT_CREATE_OPERATION
-            | PROJECT_CURRENT_STATE_OPERATION
-            | PROJECT_CHARTER_ADOPTION_OPERATION
-            | PROJECT_DOCUMENT_OPERATION
-            | PROJECT_DECISION_OPERATION
-            | PROJECT_EXECUTION_BASELINE_OPERATION
-            | PROJECT_MILESTONE_OPERATION
-            | PROJECT_EVIDENCE_OPERATION
-            | PROJECT_READINESS_OPERATION
-            | PROJECT_RELEASE_OPERATION
-    )
+    operation_contract(operation).is_some()
 }
 
 /// The generic action executor is intentionally limited to ordinary
@@ -1911,6 +1646,12 @@ mod tests {
         CreateAgentProfile, CreateProject, CreateProjectAgentBinding, ProjectAgentBindingRepo,
         ProjectRepo, ReplaceProjectAgentBinding,
     };
+    use forge_agent_host::{
+        MAIN_PROJECT_CREATE_OPERATION, MIGRATED_OPERATION_CONTRACTS, PROJECT_DECISION_OPERATION,
+        PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION,
+        PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION,
+        PROJECT_READINESS_OPERATION,
+    };
 
     #[test]
     fn generic_executor_authority_names_are_not_executable() {
@@ -1930,23 +1671,8 @@ mod tests {
 
     #[test]
     fn generic_executor_rejects_every_typed_orchestration_operation() {
-        for operation in [
-            MAIN_CHARTER_READ_OPERATION,
-            MAIN_CHARTER_DRAFT_OPERATION,
-            MAIN_CHARTER_READINESS_OPERATION,
-            MAIN_CHARTER_DIFF_OPERATION,
-            MAIN_CHARTER_APPROVAL_TARGET_OPERATION,
-            MAIN_PROJECT_CREATE_OPERATION,
-            PROJECT_CURRENT_STATE_OPERATION,
-            PROJECT_CHARTER_ADOPTION_OPERATION,
-            PROJECT_DOCUMENT_OPERATION,
-            PROJECT_DECISION_OPERATION,
-            PROJECT_EXECUTION_BASELINE_OPERATION,
-            PROJECT_MILESTONE_OPERATION,
-            PROJECT_EVIDENCE_OPERATION,
-            PROJECT_READINESS_OPERATION,
-            PROJECT_RELEASE_OPERATION,
-        ] {
+        for contract in MIGRATED_OPERATION_CONTRACTS {
+            let operation = contract.operation;
             assert!(
                 is_typed_orchestration_operation(operation),
                 "generic executor must route typed operation {operation} to its domain executor"
@@ -1966,14 +1692,18 @@ mod tests {
 
     #[test]
     fn nested_artifact_scope_is_not_a_project_authority_override() {
-        assert!(!contains_project_authority_override(&serde_json::json!({
-            "action": "draft_revision",
-            "content": {"scope": {"included": ["checkout"]}},
-        })));
-        assert!(contains_project_authority_override(&serde_json::json!({
-            "project_id": "forged-project",
-            "content": {},
-        })));
+        assert!(!forge_agent_host::contains_authority_override(
+            &serde_json::json!({
+                "action": "draft_revision",
+                "content": {"scope": {"included": ["checkout"]}},
+            })
+        ));
+        assert!(forge_agent_host::contains_authority_override(
+            &serde_json::json!({
+                "project_id": "forged-project",
+                "content": {},
+            })
+        ));
     }
 
     #[tokio::test]
@@ -1985,7 +1715,7 @@ mod tests {
                 actor_identity_id: "agent-a".to_owned(),
                 scope_type: "project".to_owned(),
                 scope_id: "project-1".to_owned(),
-                operation: "task.propose".to_owned(),
+                operation: TASK_PROPOSE_OPERATION.to_owned(),
                 payload_json: serde_json::json!({
                     "title": "Bounded task",
                     "project_id": "caller-authored-project",
@@ -2130,7 +1860,6 @@ mod tests {
             (PROJECT_MILESTONE_OPERATION, "set_primary"),
             (PROJECT_EVIDENCE_OPERATION, "attach"),
             (PROJECT_READINESS_OPERATION, "evaluate"),
-            (PROJECT_RELEASE_OPERATION, "propose_candidate"),
         ];
         for (operation, action) in allowed {
             let mut payload = serde_json::json!({"action": action});
@@ -2153,6 +1882,10 @@ mod tests {
             (PROJECT_RELEASE_OPERATION, "approve"),
             (PROJECT_DECISION_OPERATION, "supersede"),
             (PROJECT_DECISION_OPERATION, "invalidate"),
+            // A release-candidate request is intentionally approval-backed:
+            // it enters the Action queue and must not be treated as a direct
+            // receipt-backed Project coordination write.
+            (PROJECT_RELEASE_OPERATION, "propose_candidate"),
         ] {
             let payload = serde_json::json!({"action": action});
             assert!(
@@ -2160,6 +1893,15 @@ mod tests {
                 "authority action {operation}/{action} must not be admitted"
             );
         }
+
+        assert_eq!(
+            classify_operation(
+                PROJECT_RELEASE_OPERATION,
+                Some(&serde_json::json!({"action": "propose_candidate"}))
+            ),
+            OperationClassification::ApprovalRequiredAction,
+            "release-candidate requests retain their audited approval boundary"
+        );
 
         for decision_class in ["user_scope", "policy", "waiver", "manual_approval"] {
             let payload = serde_json::json!({
@@ -2192,7 +1934,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn main_orchestration_is_allowed_without_secondary_approval_but_create_is_user_only() {
+    async fn main_orchestration_project_create_is_user_only_and_draft_is_direct() {
         let db = db().await;
         let actions = AgentActionService::new(Arc::clone(&db));
         let draft = actions
@@ -2212,20 +1954,18 @@ mod tests {
                 target_type: Some("account".to_owned()),
                 target_id: Some("user-1".to_owned()),
             })
-            .await
-            .expect("Main Charter draft proposal");
-        assert_eq!(draft.policy_result, AgentActionPolicyResult::Allowed);
-        assert_eq!(draft.status, AgentActionStatus::Proposed);
-        assert!(actions
-            .approve(ApproveActionInput {
-                action_id: draft.id,
-                expected_version: draft.version,
-                approver_identity_id: "agent-a".to_owned(),
-                decision: AgentActionApprovalDecision::Approved,
-                reason: None,
-            })
-            .await
-            .is_err());
+            .await;
+        assert!(
+            draft.is_err(),
+            "Main Charter drafts do not enter AgentAction"
+        );
+        let draft_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_action WHERE operation = ?")
+                .bind(MAIN_CHARTER_DRAFT_OPERATION)
+                .fetch_one(db.pool())
+                .await
+                .expect("draft action count");
+        assert_eq!(draft_count, 0);
 
         let create = actions
             .propose(ProposeActionInput {
@@ -2247,8 +1987,11 @@ mod tests {
             })
             .await
             .expect("Main Project create proposal");
-        assert_eq!(create.policy_result, AgentActionPolicyResult::Allowed);
-        assert_eq!(create.status, AgentActionStatus::Proposed);
+        assert_eq!(
+            create.policy_result,
+            AgentActionPolicyResult::ApprovalRequired
+        );
+        assert_eq!(create.status, AgentActionStatus::PendingApproval);
         assert!(actions
             .approve(ApproveActionInput {
                 action_id: create.id.clone(),
@@ -2373,36 +2116,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn self_approval_is_denied_and_proposals_execute_once() {
+    async fn self_approval_is_denied_and_approved_actions_execute_once() {
         let db = db().await;
         let actions = AgentActionService::new(Arc::clone(&db));
         let allowed = actions
             .propose(ProposeActionInput {
                 id: None,
                 actor_identity_id: "agent-a".to_owned(),
-                scope_type: "account".to_owned(),
-                scope_id: "user-1".to_owned(),
-                operation: "account.read".to_owned(),
+                scope_type: "agent".to_owned(),
+                scope_id: "agent-a".to_owned(),
+                operation: "message.propose".to_owned(),
                 payload_json: "{}".to_owned(),
                 dedupe_key: "allowed-1".to_owned(),
                 correlation_id: "corr-allowed".to_owned(),
                 causation_id: None,
                 causation_depth: 0,
-                requested_permission: "read_account".to_owned(),
+                requested_permission: "propose_message".to_owned(),
                 policy_reason: None,
                 target_type: None,
                 target_id: None,
             })
             .await
             .expect("allowed proposal");
-        assert_eq!(allowed.policy_result, AgentActionPolicyResult::Allowed);
+        assert_eq!(
+            allowed.policy_result,
+            AgentActionPolicyResult::ApprovalRequired
+        );
         let denied = actions
             .propose(ProposeActionInput {
                 id: None,
                 actor_identity_id: "agent-a".to_owned(),
                 scope_type: "project".to_owned(),
                 scope_id: "project-1".to_owned(),
-                operation: "agent_chat.read".to_owned(),
+                operation: "project.lifecycle".to_owned(),
                 payload_json: "{}".to_owned(),
                 dedupe_key: "denied-1".to_owned(),
                 correlation_id: "corr-denied".to_owned(),
@@ -2413,10 +2159,12 @@ mod tests {
                 target_type: None,
                 target_id: None,
             })
-            .await
-            .expect("denied proposal is audited");
-        assert_eq!(denied.policy_result, AgentActionPolicyResult::Denied);
-        // Reuse the admitted account-scoped proposal. Newly-created Projects
+            .await;
+        assert!(matches!(
+            denied,
+            Err(ServiceError::AuthorizationDenied { .. })
+        ));
+        // Reuse the admitted identity-scoped proposal. Newly-created Projects
         // are Charter-setup-required and must not admit Task proposals; that
         // boundary is covered separately by Product Genesis acceptance.
         let action = allowed;
@@ -2430,8 +2178,21 @@ mod tests {
             })
             .await;
         assert!(self_approval.is_err());
-        assert_eq!(action.policy_result, AgentActionPolicyResult::Allowed);
-        assert_eq!(action.status, AgentActionStatus::Proposed);
+        assert_eq!(
+            action.policy_result,
+            AgentActionPolicyResult::ApprovalRequired
+        );
+        assert_eq!(action.status, AgentActionStatus::PendingApproval);
+        actions
+            .approve(ApproveActionInput {
+                action_id: action.id.clone(),
+                expected_version: action.version,
+                approver_identity_id: "agent-b".to_owned(),
+                decision: AgentActionApprovalDecision::Approved,
+                reason: None,
+            })
+            .await
+            .expect("independent approval");
         let current = actions.get(&action.id).await.expect("current action");
         let first = actions
             .execute(ExecuteActionInput {
@@ -2482,30 +2243,30 @@ mod tests {
         .await
         .expect("project");
         let actions = AgentActionService::new(Arc::clone(&db));
-        let action = actions
-            .propose(ProposeActionInput {
-                id: None,
-                actor_identity_id: "agent-a".to_owned(),
-                scope_type: "project".to_owned(),
-                scope_id: "project-2".to_owned(),
-                operation: "task.propose".to_owned(),
-                payload_json: r#"{"title":"outside role"}"#.to_owned(),
-                dedupe_key: "role-escalation-1".to_owned(),
-                correlation_id: "corr-role-escalation".to_owned(),
-                causation_id: None,
-                causation_depth: 0,
-                requested_permission: "propose_task".to_owned(),
-                policy_reason: None,
-                target_type: Some("project".to_owned()),
-                target_id: Some("project-2".to_owned()),
-            })
+        let (policy_result, policy_reason) = actions
+            .evaluate_direct_command_policy(
+                "agent-a",
+                "project",
+                "project-2",
+                "propose_task",
+                TASK_PROPOSE_OPERATION,
+                Some(r#"{"title":"outside role"}"#),
+            )
             .await
-            .expect("denied proposal is audited");
-        assert_eq!(action.policy_result, AgentActionPolicyResult::Denied);
-        assert!(action
-            .policy_reason
+            .expect("direct-command policy evaluation");
+        assert_eq!(policy_result, AgentActionPolicyResult::Denied);
+        assert!(policy_reason
             .as_deref()
             .is_some_and(|reason| reason.contains("active binding")));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_action WHERE dedupe_key = 'role-escalation-1'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .expect("direct-command action count"),
+            0
+        );
 
         ProjectRepo::create(
             &*db,
@@ -2543,7 +2304,7 @@ mod tests {
                     profile_id: Some(project_3_agent.profile_id),
                     state: "active".to_owned(),
                     autonomy_policy_json: "{}".to_owned(),
-                    permission_ceiling_json: r#"{"permissions":["propose_task"]}"#.to_owned(),
+                    permission_ceiling_json: r#"{"permissions":["propose_message"]}"#.to_owned(),
                     subscriptions_json: "[]".to_owned(),
                     wake_budget: 10,
                     created_at: now_rfc3339(),
@@ -2560,13 +2321,13 @@ mod tests {
                 actor_identity_id: "agent-a".to_owned(),
                 scope_type: "project".to_owned(),
                 scope_id: "project-3".to_owned(),
-                operation: "task.propose".to_owned(),
-                payload_json: r#"{"title":"needs approval"}"#.to_owned(),
+                operation: "message.propose".to_owned(),
+                payload_json: r#"{"message":"needs approval"}"#.to_owned(),
                 dedupe_key: "cross-project-approval-1".to_owned(),
                 correlation_id: "corr-cross-project-approval".to_owned(),
                 causation_id: None,
                 causation_depth: 0,
-                requested_permission: "propose_task".to_owned(),
+                requested_permission: "propose_message".to_owned(),
                 policy_reason: None,
                 target_type: Some("project".to_owned()),
                 target_id: Some("project-3".to_owned()),

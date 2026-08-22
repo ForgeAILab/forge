@@ -29,17 +29,104 @@ pub(crate) async fn dispatch_with_context(
         "notifications/initialized" => Ok(Value::Null),
         "tools/list" => handle_tools_list(context),
         "tools/call" => {
-            let params: ToolCallParams = parse_params(params)?;
+            let params: ToolCallParams = parse_params(params).map_err(|error| {
+                error.with_call_context(
+                    "tools/call",
+                    context.project_id.as_deref(),
+                    context.user_id.as_deref(),
+                )
+            })?;
+            if !known_tool(&params.name, context.project_id.is_some()) {
+                return Err(McpToolError::protocol(-32601, "method not found"));
+            }
             let arguments = match params.arguments {
                 Value::Null => json!({}),
                 arguments => arguments,
             };
-            let arguments = apply_project_scope(state, &params.name, arguments, context).await?;
-            let result = dispatch_tool(state, &params.name, arguments, context).await?;
+            let arguments = apply_project_scope(state, &params.name, arguments, context)
+                .await
+                .map_err(|error| {
+                    error.with_call_context(
+                        &params.name,
+                        context.project_id.as_deref(),
+                        context.user_id.as_deref(),
+                    )
+                })?;
+            let result = match dispatch_tool(state, &params.name, arguments.clone(), context).await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    let error =
+                        enrich_authorized_conflict(state, &params.name, &arguments, context, error)
+                            .await;
+                    return Err(error.with_call_context(
+                        &params.name,
+                        context.project_id.as_deref(),
+                        context.user_id.as_deref(),
+                    ));
+                }
+            };
             Ok(tool_call_result(result))
         }
-        _ => Err(McpToolError::new(-32601, "method not found")),
+        _ => Err(McpToolError::protocol(-32601, "method not found")),
     }
+}
+
+fn known_tool(name: &str, scoped_project: bool) -> bool {
+    tool_descriptors(scoped_project)
+        .as_array()
+        .is_some_and(|descriptors| {
+            descriptors
+                .iter()
+                .any(|descriptor| descriptor.get("name").and_then(Value::as_str) == Some(name))
+        })
+}
+
+/// Attach a current version only after the target has been resolved inside
+/// the authenticated project scope. A raw database conflict does not carry an
+/// object identity, and returning a guessed id would leak or misdirect the
+/// model's retry; unresolved conflicts therefore remain intentionally opaque.
+async fn enrich_authorized_conflict(
+    state: &AppState,
+    tool_name: &str,
+    arguments: &Value,
+    context: &McpContext,
+    error: McpToolError,
+) -> McpToolError {
+    if context.user_id.is_none()
+        || context.project_id.is_none()
+        || error.is_protocol()
+        || !error.is_version_conflict()
+    {
+        return error;
+    }
+    let Some(arguments) = arguments.as_object() else {
+        return error;
+    };
+    let Some(task_id) = task_version_target(tool_name, arguments) else {
+        return error;
+    };
+    let Ok(Some(task)) = TaskRepo::get_by_id(&*state.db, task_id, false).await else {
+        return error;
+    };
+    if context.project_id.as_deref() != Some(task.project_id.as_str()) {
+        return error;
+    }
+    error.with_authorized_current_target("task", task.id, "version", task.version)
+}
+
+fn task_version_target<'a>(
+    tool_name: &str,
+    arguments: &'a serde_json::Map<String, Value>,
+) -> Option<&'a str> {
+    let field = match tool_name {
+        "forge_update_task" | "forge_transition_task" => "task_id",
+        _ => return None,
+    };
+    arguments
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
 }
 
 async fn apply_project_scope(

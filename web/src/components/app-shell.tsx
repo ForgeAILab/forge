@@ -106,6 +106,49 @@ export function navigationItemsForSection(section: NavItem['section']) {
   return navItems.filter((item) => item.section === section)
 }
 
+const DRAWER_FOCUSABLE_SELECTOR =
+  'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])'
+
+export function getDrawerFocusableElements(container: HTMLElement): HTMLElement[] {
+  return Array.from(container.querySelectorAll<HTMLElement>(DRAWER_FOCUSABLE_SELECTOR)).filter(
+    (element) => !element.hasAttribute('aria-hidden'),
+  )
+}
+
+function isDrawerOwnedOverlayTarget(target: EventTarget | null): boolean {
+  return (
+    target instanceof HTMLElement &&
+    Boolean(target.closest('[role="dialog"], [data-drawer-owned-overlay]'))
+  )
+}
+
+/** Keep keyboard focus within the open mobile/tablet navigation drawer. */
+export function trapDrawerFocus(event: KeyboardEvent, container: HTMLElement): boolean {
+  if (event.key !== 'Tab') return false
+
+  const focusable = getDrawerFocusableElements(container)
+  if (focusable.length === 0) {
+    event.preventDefault()
+    container.focus()
+    return true
+  }
+
+  const activeElement = document.activeElement as HTMLElement | null
+  const activeIndex = activeElement ? focusable.indexOf(activeElement) : -1
+  const wrapsBackward = event.shiftKey && (activeIndex <= 0 || activeIndex === -1)
+  const wrapsForward =
+    !event.shiftKey && (activeIndex === -1 || activeIndex === focusable.length - 1)
+
+  if (wrapsBackward || wrapsForward) {
+    event.preventDefault()
+    const next = event.shiftKey ? focusable[focusable.length - 1] : focusable[0]
+    next.focus()
+    return true
+  }
+
+  return false
+}
+
 const PROJECTS_PAGE_SIZE = 20
 
 function ProjectSwitcher({
@@ -488,6 +531,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   const [railExpanded, setRailExpanded] = useState(false)
   const [drawerOpen, setDrawerOpen] = useState(false)
   const menuButtonRef = useRef<HTMLButtonElement>(null)
+  const drawerRef = useRef<HTMLElement>(null)
   const params = useRouterState({
     select: (state) => state.matches.at(-1)?.params as { projectId?: string } | undefined,
   })
@@ -522,13 +566,39 @@ export function AppShell({ children }: { children: ReactNode }) {
   }, [shellMode])
 
   useEffect(() => {
-    if (!drawerOpen) return
+    if (!drawerOpen || shellMode !== 'overlay') return
+    const drawer = drawerRef.current
+    if (!drawer) return
+
+    const focusFirst = () => {
+      getDrawerFocusableElements(drawer)[0]?.focus()
+    }
+    const focusFrame = requestAnimationFrame(focusFirst)
+    let disposed = false
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') closeDrawer()
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        closeDrawer()
+        return
+      }
+      if (isDrawerOwnedOverlayTarget(document.activeElement)) return
+      trapDrawerFocus(event, drawer)
+    }
+    const onFocusIn = (event: FocusEvent) => {
+      if (drawer.contains(event.target as Node) || isDrawerOwnedOverlayTarget(event.target)) return
+      requestAnimationFrame(() => {
+        if (!disposed && drawerOpen && !drawer.contains(document.activeElement)) focusFirst()
+      })
     }
     document.addEventListener('keydown', onKeyDown)
-    return () => document.removeEventListener('keydown', onKeyDown)
-  }, [closeDrawer, drawerOpen])
+    document.addEventListener('focusin', onFocusIn)
+    return () => {
+      disposed = true
+      cancelAnimationFrame(focusFrame)
+      document.removeEventListener('keydown', onKeyDown)
+      document.removeEventListener('focusin', onFocusIn)
+    }
+  }, [closeDrawer, drawerOpen, shellMode])
 
   const projectNavItems = navigationItemsForSection('project')
   const globalNavItems = navigationItemsForSection('global').filter((item) => {
@@ -616,8 +686,11 @@ export function AppShell({ children }: { children: ReactNode }) {
 
       {shellMode !== 'overlay' || drawerOpen ? (
         <aside
+          ref={drawerRef}
           id="forge-navigation-drawer"
           aria-label="Primary navigation"
+          role={shellMode === 'overlay' ? 'dialog' : undefined}
+          aria-modal={shellMode === 'overlay' ? true : undefined}
           data-navigation-state={effectiveCollapsed ? 'collapsed' : 'expanded'}
           className={cn(
             'flex shrink-0 flex-col border-r border-sidebar-border bg-sidebar motion-safe:transition-[width,transform] motion-safe:duration-200',

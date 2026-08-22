@@ -1,4 +1,6 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
+mod common;
+
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -80,7 +82,7 @@ async fn daemon_onboarding_shell_task_flow_end_to_end() {
     assert_eq!(shell_cli.availability, "authenticated");
     assert!(shell_cli.agents.is_empty());
 
-    let (project_id, _repo_id, _repo_dir) = create_project_and_repo(&app).await;
+    let (project_id, repo_id, _repo_dir) = create_project_and_repo(&app).await;
 
     let agent: AgentResponse = json_request(
         &app,
@@ -102,6 +104,35 @@ async fn daemon_onboarding_shell_task_flow_end_to_end() {
     assert_eq!(agent.daemon_id.as_deref(), Some(daemon_id.as_str()));
     assert_eq!(agent.effective_status.as_deref(), Some("active"));
     let agent_id = agent.id;
+
+    let reviewer: AgentResponse = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/agents",
+        json!({
+            "name": "daemon-onboarding-shell-reviewer",
+            "executor_type": "shell",
+            "daemon_id": daemon_id,
+            "config_json": {
+                "command": "printf",
+                "args": ["===REVIEW: PASS===\\n"]
+            }
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(reviewer.executor_type, "shell");
+    assert_eq!(reviewer.daemon_id.as_deref(), Some(daemon_id.as_str()));
+    assert_eq!(reviewer.effective_status.as_deref(), Some("active"));
+    let reviewer_id = reviewer.id;
+    common::configure_execution_test_setup(
+        &state.db,
+        &project_id,
+        &repo_id,
+        &agent_id,
+        &reviewer_id,
+    )
+    .await;
 
     let clis_after_agent: CliProjectionResponse = empty_request(
         &app,

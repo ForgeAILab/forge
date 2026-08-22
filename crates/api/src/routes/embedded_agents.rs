@@ -424,7 +424,9 @@ fn protected_interaction_error(error: AgentHostError) -> ApiError {
                 "protected interaction is unavailable",
             )
         }
-        AgentHostError::CredentialNotFound | AgentHostError::Runtime(_) => {
+        AgentHostError::CredentialNotFound
+        | AgentHostError::Runtime(_)
+        | AgentHostError::StructuredOutcome(_) => {
             ApiError::internal("protected interaction is unavailable")
         }
     }

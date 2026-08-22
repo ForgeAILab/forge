@@ -236,6 +236,24 @@ export interface OutcomeItem {
   occurred_at: string
 }
 
+export type CoordinationActivityKind = 'direct_command' | 'approval_action'
+
+export interface CoordinationActivityItem {
+  id: string
+  activity_kind: CoordinationActivityKind
+  actor_type: string
+  actor_id: string
+  scope_type: string
+  scope_id: string
+  operation: string
+  input_digest: string
+  policy_result: string
+  status: string
+  correlation_id: string
+  outcome?: JsonObject | null
+  occurred_at: string
+}
+
 export interface RuntimeCapacity {
   active_executions: number
   queued_tasks: number
@@ -259,6 +277,7 @@ export interface MissionControlResponse {
   active_work: ActiveWorkItem[]
   agent_health: AgentHealthItem[]
   recent_outcomes: OutcomeItem[]
+  coordination_activity: CoordinationActivityItem[]
   capacity: RuntimeCapacity
   consumer_health: AttentionConsumerHealth | null
   computed_at: string

@@ -105,6 +105,9 @@ impl AttentionRepo for SqliteDb {
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(dedupe_key) DO UPDATE SET
                 attention_type = excluded.attention_type,
+                scope_type = excluded.scope_type,
+                scope_id = excluded.scope_id,
+                identity_id = COALESCE(excluded.identity_id, attention_projection.identity_id),
                 source_event_id = excluded.source_event_id,
                 priority = excluded.priority,
                 summary = excluded.summary,
@@ -130,6 +133,7 @@ impl AttentionRepo for SqliteDb {
                     THEN NULL
                     ELSE attention_projection.snoozed_until
                 END,
+                version = attention_projection.version + 1,
                 updated_at = excluded.updated_at",
         )
         .bind(&input.id)

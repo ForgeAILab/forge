@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use services::{SetMainAgentBindingInput, SetProjectAgentBindingInput};
 
 use crate::{
+    error::McpToolError,
     protocol::McpContext,
     rpc::{dispatch, dispatch_with_context},
     AppState,
@@ -164,6 +165,25 @@ async fn seed_chat_project(state: &AppState, identity_id: &str) -> String {
         })
         .await
         .expect("project binding creates");
+    // A handoff admits a real Project Agent turn, so the fixture must carry
+    // the same frozen skill/policy provenance as a production binding.  The
+    // binding service intentionally leaves these Charter-era fields unset;
+    // the test supplies the canonical seeded Project skill explicitly rather
+    // than weakening the admission boundary.
+    sqlx::query(
+        "UPDATE project_agent_binding
+         SET operating_skill_revision_id = (
+                 SELECT id FROM operating_skill_revision
+                 WHERE skill_key = 'forge.project.orchestration/v1'
+                 ORDER BY revision DESC LIMIT 1
+             ),
+             policy_revision = 'test-policy', policy_digest = 'test-policy-digest'
+         WHERE project_id = ? AND state = 'active'",
+    )
+    .bind(&project_id)
+    .execute(state.db.pool())
+    .await
+    .expect("project binding provenance updates");
     project_id
 }
 
@@ -452,6 +472,58 @@ fn initialize_returns_correct_protocol_version() {
 }
 
 #[test]
+fn known_tool_version_conflict_is_an_in_band_structured_outcome() {
+    let response = McpToolError::from(db::DbError::VersionConflict)
+        .with_call_context("forge_update_task", Some("project-1"), Some("user-1"))
+        .into_tool_response(json!(1));
+    let result = response.result.expect("tool failures use a success result");
+    assert_eq!(result["isError"], true);
+    assert_eq!(result["structuredContent"]["code"], "version_conflict");
+    assert_eq!(result["structuredContent"]["status"], "failed");
+    assert_eq!(
+        result["structuredContent"]["scope"],
+        json!({"scope_type": "project", "scope_id": "project-1"})
+    );
+    assert_eq!(
+        result["structuredContent"]["retry"]["action"],
+        "refresh_and_retry"
+    );
+    let content = result["content"][0]["text"]
+        .as_str()
+        .expect("structured error includes text content");
+    assert_eq!(
+        serde_json::from_str::<Value>(content).expect("text content is JSON"),
+        result["structuredContent"]
+    );
+}
+
+#[test]
+fn known_tool_internal_failure_redacts_provider_details() {
+    let response = McpToolError::new(-32603, "database secret: 123")
+        .with_data(json!({ "details": "database secret: 123" }))
+        .with_call_context("forge_get_task", None, Some("user-1"))
+        .into_tool_response(json!(1));
+    let result = response.result.expect("tool failures use a success result");
+    assert_eq!(result["structuredContent"]["code"], "internal_failure");
+    assert_eq!(
+        result["structuredContent"]["safe_message"],
+        "the operation failed"
+    );
+    let serialized = serde_json::to_string(&result).expect("result serializes");
+    assert!(!serialized.contains("database secret"));
+    assert!(!serialized.contains("123"));
+}
+
+#[test]
+fn malformed_and_unknown_mcp_failures_remain_json_rpc_errors() {
+    for (code, message) in [(-32700, "parse error"), (-32601, "method not found")] {
+        let response = McpToolError::protocol(code, message).into_response(json!(1));
+        assert!(response.result.is_none());
+        assert_eq!(response.error.expect("protocol error").code, code);
+    }
+}
+
+#[test]
 fn tools_list_returns_descriptors() {
     run_async(async {
         let state = sqlite_state().await;
@@ -512,6 +584,36 @@ fn tools_list_returns_descriptors() {
         assert!(tools
             .iter()
             .any(|tool| tool.get("name").is_some() && tool.get("inputSchema").is_some()));
+    });
+}
+
+#[test]
+fn migrated_orchestration_contracts_are_not_shadowed_by_legacy_mcp_descriptors() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let result = dispatch(&state, "tools/list", json!({}))
+            .await
+            .expect("tools/list succeeds");
+        let mcp_names = result["tools"]
+            .as_array()
+            .expect("tools list")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let overlap = forge_agent_host::MIGRATED_OPERATION_CONTRACTS
+            .iter()
+            .map(|contract| contract.operation)
+            .filter(|operation| mcp_names.contains(operation))
+            .collect::<Vec<_>>();
+
+        assert!(
+            overlap.is_empty(),
+            "a migrated operation may enter MCP only through a descriptor derived from its canonical contract: {overlap:?}"
+        );
+        assert!(mcp_names.contains("forge_create_project"));
+        assert!(!mcp_names.contains(forge_agent_host::MAIN_PROJECT_CREATE_OPERATION));
+        assert!(mcp_names.contains("forge_create_task"));
+        assert!(!mcp_names.contains(forge_agent_host::TASK_PROPOSE_OPERATION));
     });
 }
 

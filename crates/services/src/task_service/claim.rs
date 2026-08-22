@@ -84,11 +84,33 @@ impl TaskService {
         if let Some(claiming_agent) = agent.as_ref() {
             self.ensure_repository_worker_identity(&task.project_id, &claiming_agent.id)
                 .await?;
+            if let Some(role_name) = target_role.as_deref() {
+                crate::ensure_execution_role_principal(
+                    &self.db,
+                    &task.project_id,
+                    role_name,
+                    &claiming_agent.id,
+                )
+                .await?;
+            }
         }
         if let Some(claiming_agent_id) = agent.as_ref().map(|agent| agent.id.as_str()) {
             if let Some(role_name) = target_role.as_deref() {
                 self.ensure_claim_role_available(&task.id, role_name, claiming_agent_id)
                     .await?;
+                // A claim seeds the claiming agent into the role of the state it
+                // enters. That is right for a work role, but the reviewer role
+                // must stay independent of the Worker: without this guard a
+                // Worker claiming its way into the review gate silently became
+                // its own reviewer. Checked here, before a workspace or
+                // transaction exists, so a refused claim costs nothing.
+                self.ensure_review_role_is_independent(
+                    &project,
+                    &task.id,
+                    role_name,
+                    claiming_agent_id,
+                )
+                .await?;
             }
         }
         let previous_status = task.status.clone();
@@ -123,6 +145,40 @@ impl TaskService {
             None => None,
         };
         let agent_id = agent.as_ref().map(|agent| agent.id.clone());
+        let execution = CreateExecution {
+            id: execution_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: agent_id.clone(),
+            role: target_role.clone().unwrap_or_else(|| "executor".to_owned()),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json,
+            workspace_id: Some(workspace.id.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        let execution_lease = match self.initial_execution_lease(&execution).await {
+            Ok(lease) => lease,
+            Err(error) => {
+                if workspace_created_by_attempt {
+                    self.cleanup_fresh_execution_workspace(&task, &workspace)
+                        .await;
+                }
+                return Err(error);
+            }
+        };
         let mut transaction = db::begin_immediate(self.db.pool())
             .await
             .map_err(DbError::from)?;
@@ -137,30 +193,8 @@ impl TaskService {
                 source_status: task.status.clone(),
                 target_status: target_status.clone(),
                 capacity_statuses,
-                execution: CreateExecution {
-                    id: execution_id.clone(),
-                    task_id: task_id.clone(),
-                    agent_id: agent_id.clone(),
-                    role: target_role.clone().unwrap_or_else(|| "executor".to_owned()),
-                    status: ExecutionStatus::Running,
-                    stop_reason: None,
-                    stopped_by: None,
-                    resume_policy: None,
-                    stopped_at: None,
-                    parent_execution_id: None,
-                    agent_session_id: None,
-                    agent_message_id: None,
-                    last_activity_at: None,
-                    summary: None,
-                    logs_path: None,
-                    before_sha: None,
-                    after_sha: None,
-                    error: None,
-                    executor_config_snapshot_json,
-                    workspace_id: Some(workspace.id.clone()),
-                    created_at: now.clone(),
-                    updated_at: now.clone(),
-                },
+                execution,
+                execution_lease,
                 max_concurrent_tasks,
                 claimed_at: now,
             },
@@ -313,6 +347,38 @@ impl TaskService {
         Ok(claimed)
     }
 
+    /// Refuse a claim that would make a Task's Worker its own reviewer.
+    ///
+    /// Only the Project's canonical independent-reviewer role is guarded; work
+    /// roles are still seeded from the claiming agent as before.
+    async fn ensure_review_role_is_independent(
+        &self,
+        project: &db::Project,
+        task_id: &str,
+        role_name: &str,
+        claiming_agent_id: &str,
+    ) -> Result<()> {
+        let roles = crate::resolve_project_execution_roles(&self.db, project).await?;
+        let (Some(worker_role), Some(reviewer_role)) =
+            (roles.worker_role.as_deref(), roles.reviewer_role.as_deref())
+        else {
+            return Ok(());
+        };
+        if !review_role_needs_independence(worker_role, reviewer_role, role_name) {
+            return Ok(());
+        }
+        let worker_assignee =
+            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, task_id, worker_role)
+                .await?
+                .and_then(|assignment| assignment.assignee_id);
+        if worker_assignee.as_deref() == Some(claiming_agent_id) {
+            return Err(ServiceError::conflict(format!(
+                "role '{role_name}' requires an identity independent of the Worker"
+            )));
+        }
+        Ok(())
+    }
+
     async fn dispatch_claim_state_role_agent(
         &self,
         task: &Task,
@@ -453,4 +519,50 @@ fn workflow_capacity_statuses(workflow: &WorkflowDefinition) -> Vec<String> {
         .filter(|state| matches!(state.kind, StateKind::Active | StateKind::Gate))
         .map(|state| state.name.clone())
         .collect()
+}
+
+/// Does claiming `role_name` need to be independent of the Task's Worker?
+///
+/// Only when the workflow genuinely separates the two roles. Plenty of
+/// workflows use a single role to both implement and validate; there the
+/// Worker legitimately claims its own role, and treating that as self-review
+/// refuses the Worker from doing any work at all.
+fn review_role_needs_independence(worker_role: &str, reviewer_role: &str, role_name: &str) -> bool {
+    worker_role != reviewer_role && reviewer_role == role_name
+}
+
+#[cfg(test)]
+mod claim_independence_tests {
+    use super::review_role_needs_independence;
+
+    #[test]
+    fn a_separate_reviewer_role_needs_independence() {
+        assert!(review_role_needs_independence(
+            "coder", "reviewer", "reviewer"
+        ));
+    }
+
+    #[test]
+    fn claiming_the_work_role_never_needs_independence() {
+        assert!(!review_role_needs_independence(
+            "coder", "reviewer", "coder"
+        ));
+    }
+
+    #[test]
+    fn a_shared_role_never_needs_independence() {
+        // The regression that refused a Worker its own work role: when one
+        // role both implements and validates, every claim looked like a
+        // self-review.
+        assert!(!review_role_needs_independence(
+            "worker", "worker", "worker"
+        ));
+    }
+
+    #[test]
+    fn an_unrelated_role_is_untouched() {
+        assert!(!review_role_needs_independence(
+            "coder", "reviewer", "planner"
+        ));
+    }
 }

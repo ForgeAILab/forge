@@ -8,6 +8,7 @@ async fn test_done_transition_emits_dependency_satisfied_event() {
     let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
+    crate::test_support::clear_project_execution_role_defaults(&db, &project_id).await;
 
     let prerequisite = service
         .create_task(

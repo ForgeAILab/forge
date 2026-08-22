@@ -204,24 +204,63 @@ impl AgentActionRepo for SqliteDb {
         input: CreateAgentActionExecution,
     ) -> Result<AgentActionExecution> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let execution = self
+            .record_action_execution_in_tx(&mut transaction, input)
+            .await?;
+        transaction.commit().await?;
+        Ok(execution)
+    }
+
+    async fn record_action_execution_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateAgentActionExecution,
+    ) -> Result<AgentActionExecution> {
         if let Some(existing) = sqlx::query(
             "SELECT * FROM agent_action_execution
              WHERE action_id = ? AND idempotency_key = ?",
         )
         .bind(&input.action_id)
         .bind(&input.idempotency_key)
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&mut **transaction)
         .await?
         .map(map_agent_action_execution)
         .transpose()?
         {
-            transaction.commit().await?;
+            let action = sqlx::query("SELECT * FROM agent_action WHERE id = ?")
+                .bind(&input.action_id)
+                .fetch_optional(&mut **transaction)
+                .await?
+                .map(map_agent_action)
+                .transpose()?
+                .ok_or(DbError::NotFound)?;
+
+            // The execution idempotency key is the replay identity, but the
+            // key does not make a different execution payload equivalent.
+            // Compare every persisted execution field and the action status
+            // outcome that would be advanced by this completion.  IDs,
+            // expected versions, and timestamps are transport/coordination
+            // metadata and are intentionally not replay identity.
+            if existing.action_id != input.action_id
+                || existing.attempt != input.attempt
+                || existing.status != input.status
+                || existing.result_json != input.result_json
+                || existing.error != input.error
+                || existing.executed_by_type != input.executed_by_type
+                || existing.executed_by_id != input.executed_by_id
+                || existing.idempotency_key != input.idempotency_key
+                || action.status != input.action_status
+                || action.outcome_json != input.action_outcome_json
+            {
+                return Err(DbError::IdempotencyConflict);
+            }
+
             return Ok(existing);
         }
 
         let action = sqlx::query("SELECT * FROM agent_action WHERE id = ?")
             .bind(&input.action_id)
-            .fetch_optional(&mut *transaction)
+            .fetch_optional(&mut **transaction)
             .await?
             .map(map_agent_action)
             .transpose()?
@@ -246,7 +285,7 @@ impl AgentActionRepo for SqliteDb {
         .bind(&input.idempotency_key)
         .bind(&input.created_at)
         .bind(input.completed_at.as_deref())
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await
         .map_err(check_error)?;
         let result = sqlx::query(
@@ -258,7 +297,7 @@ impl AgentActionRepo for SqliteDb {
         .bind(&input.updated_at)
         .bind(&input.action_id)
         .bind(input.expected_action_version)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::VersionConflict);
@@ -270,10 +309,9 @@ impl AgentActionRepo for SqliteDb {
             )
             .bind(&input.action_id)
             .bind(&input.idempotency_key)
-            .fetch_one(&mut *transaction)
+            .fetch_one(&mut **transaction)
             .await?,
         )?;
-        transaction.commit().await?;
         Ok(execution)
     }
 

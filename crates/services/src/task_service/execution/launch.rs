@@ -708,14 +708,24 @@ impl TaskService {
             )));
         }
         let now = now_rfc3339();
-        self.cancel_active_execution(
-            &execution,
-            &reason,
-            db::StopReason::UserCancelled,
-            &actor,
-            db::ResumePolicy::Manual,
-        )
-        .await?;
+        let cancellation_committed = self
+            .cancel_active_execution(
+                &execution,
+                &reason,
+                db::StopReason::UserCancelled,
+                &actor,
+                db::ResumePolicy::Manual,
+            )
+            .await?;
+        // A concurrent terminal winner already owns the durable execution
+        // event, lease disposition, and any Task-side cascade.  Do not add a
+        // second manual-stop annotation or recovery transition from this
+        // stale cancellation request.
+        if !cancellation_committed {
+            return ExecutionRepo::get_by_id(&*self.db, &execution_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("execution", execution_id));
+        }
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;

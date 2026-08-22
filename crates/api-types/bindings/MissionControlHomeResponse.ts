@@ -3,7 +3,8 @@ import type { AttentionConsumerHealthResponse } from "./AttentionConsumerHealthR
 import type { AttentionItem } from "./AttentionItem";
 import type { MissionControlAgentHealth } from "./MissionControlAgentHealth";
 import type { MissionControlCapacity } from "./MissionControlCapacity";
+import type { MissionControlCoordinationActivity } from "./MissionControlCoordinationActivity";
 import type { MissionControlRecentOutcome } from "./MissionControlRecentOutcome";
 import type { MissionControlWorkItem } from "./MissionControlWorkItem";
 
-export type MissionControlHomeResponse = { needs_attention: Array<AttentionItem>, review_ready: Array<MissionControlWorkItem>, active_work: Array<MissionControlWorkItem>, agent_health: Array<MissionControlAgentHealth>, recent_outcomes: Array<MissionControlRecentOutcome>, capacity: MissionControlCapacity, consumer_health: AttentionConsumerHealthResponse | null, computed_at: string, };
+export type MissionControlHomeResponse = { needs_attention: Array<AttentionItem>, coordination_activity: Array<MissionControlCoordinationActivity>, review_ready: Array<MissionControlWorkItem>, active_work: Array<MissionControlWorkItem>, agent_health: Array<MissionControlAgentHealth>, recent_outcomes: Array<MissionControlRecentOutcome>, capacity: MissionControlCapacity, consumer_health: AttentionConsumerHealthResponse | null, computed_at: string, };

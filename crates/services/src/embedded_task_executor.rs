@@ -7,7 +7,11 @@
 //! adapter only translates one admitted Task execution into a native runtime
 //! turn and returns the normal executor result.
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex as StdMutex, OnceLock},
+};
 
 use async_trait::async_trait;
 use db::{AgentProfileRepo, AgentRepo, ExecutionRepo, ExecutionStatus, SqliteDb};
@@ -31,6 +35,172 @@ use crate::{
 
 const EMBEDDED_EXECUTOR_TYPE: &str = "embedded";
 const TASK_ROLE_MARKER: &str = "_forge_task_role";
+
+/// Shared state for the server-owned execution lease.
+///
+/// The embedded adapter receives this through a short-lived registry rather
+/// than through `ExecutionContext`: the latter is also constructed by all CLI
+/// adapters and is deliberately transport-neutral.  The runner registers the
+/// handle immediately before dispatch and removes it after the future exits.
+/// Both heartbeat and semantic-progress calls serialize on the same mutex so
+/// every successful CAS advances one authoritative execution version.
+pub(crate) struct EmbeddedExecutionLease {
+    db: Arc<SqliteDb>,
+    execution_id: String,
+    owner: String,
+    state: Mutex<EmbeddedExecutionLeaseState>,
+}
+
+#[derive(Debug, Clone)]
+struct EmbeddedExecutionLeaseState {
+    execution_version: i64,
+}
+
+impl std::fmt::Debug for EmbeddedExecutionLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EmbeddedExecutionLease")
+            .field("execution_id", &self.execution_id)
+            .field("owner", &self.owner)
+            .finish_non_exhaustive()
+    }
+}
+
+impl EmbeddedExecutionLease {
+    pub(crate) fn new(
+        db: Arc<SqliteDb>,
+        execution_id: impl Into<String>,
+        owner: impl Into<String>,
+        execution_version: i64,
+    ) -> Self {
+        Self {
+            db,
+            execution_id: execution_id.into(),
+            owner: owner.into(),
+            state: Mutex::new(EmbeddedExecutionLeaseState { execution_version }),
+        }
+    }
+
+    pub(crate) async fn renew(
+        &self,
+        lease_expires_at: String,
+        now: String,
+    ) -> db::Result<db::ExecutionLeaseMutation> {
+        let mut state = self.state.lock().await;
+        for attempt in 0..2 {
+            let outcome = ExecutionRepo::renew_lease(
+                &*self.db,
+                db::RenewExecutionLease {
+                    execution_id: self.execution_id.clone(),
+                    expected_version: state.execution_version,
+                    owner: self.owner.clone(),
+                    lease_expires_at: lease_expires_at.clone(),
+                    now: now.clone(),
+                },
+            )
+            .await?;
+            match outcome {
+                db::ExecutionLeaseMutation::Updated(execution) => {
+                    state.execution_version = execution.execution_version;
+                    return Ok(db::ExecutionLeaseMutation::Updated(execution));
+                }
+                db::ExecutionLeaseMutation::Concurrent {
+                    current: Some(current),
+                } if attempt == 0
+                    && current.status == ExecutionStatus::Running
+                    && current.lease_owner.as_deref() == Some(self.owner.as_str()) =>
+                {
+                    // A semantic-progress or adjacent same-owner CAS may
+                    // have advanced the version between the heartbeat read
+                    // and renewal. Refresh once; only a different owner or
+                    // terminal row means this runner has truly lost liveness.
+                    state.execution_version = current.execution_version;
+                }
+                other => return Ok(other),
+            }
+        }
+        unreachable!("bounded heartbeat renewal retry always returns")
+    }
+
+    pub(crate) async fn record_progress(
+        &self,
+        progress_at: String,
+        now: String,
+    ) -> db::Result<db::ExecutionLeaseMutation> {
+        let mut state = self.state.lock().await;
+        for attempt in 0..2 {
+            let outcome = ExecutionRepo::record_progress(
+                &*self.db,
+                db::RecordExecutionProgress {
+                    execution_id: self.execution_id.clone(),
+                    expected_version: state.execution_version,
+                    owner: self.owner.clone(),
+                    progress_at: progress_at.clone(),
+                    now: now.clone(),
+                },
+            )
+            .await?;
+            match outcome {
+                db::ExecutionLeaseMutation::Updated(execution) => {
+                    state.execution_version = execution.execution_version;
+                    return Ok(db::ExecutionLeaseMutation::Updated(execution));
+                }
+                db::ExecutionLeaseMutation::Concurrent {
+                    current: Some(current),
+                } if attempt == 0
+                    && current.status == ExecutionStatus::Running
+                    && current.lease_owner.as_deref() == Some(self.owner.as_str()) =>
+                {
+                    state.execution_version = current.execution_version;
+                }
+                other => return Ok(other),
+            }
+        }
+        unreachable!("bounded semantic-progress retry always returns")
+    }
+
+    pub(crate) async fn owner_and_version(&self) -> (String, i64) {
+        let state = self.state.lock().await;
+        (self.owner.clone(), state.execution_version)
+    }
+}
+
+type EmbeddedExecutionLeaseRegistry = StdMutex<HashMap<String, Arc<EmbeddedExecutionLease>>>;
+
+fn embedded_execution_leases() -> &'static EmbeddedExecutionLeaseRegistry {
+    static REGISTRY: OnceLock<EmbeddedExecutionLeaseRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+pub(crate) fn register_execution_lease(
+    execution_id: impl Into<String>,
+    lease: Arc<EmbeddedExecutionLease>,
+) {
+    if let Ok(mut leases) = embedded_execution_leases().lock() {
+        leases.insert(execution_id.into(), lease);
+    }
+}
+
+pub(crate) fn unregister_execution_lease(
+    execution_id: &str,
+    expected: &Arc<EmbeddedExecutionLease>,
+) {
+    if let Ok(mut leases) = embedded_execution_leases().lock() {
+        if leases
+            .get(execution_id)
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
+            leases.remove(execution_id);
+        }
+    }
+}
+
+fn execution_lease_for(execution_id: &str) -> Option<Arc<EmbeddedExecutionLease>> {
+    embedded_execution_leases()
+        .lock()
+        .ok()
+        .and_then(|leases| leases.get(execution_id).cloned())
+}
 
 /// The native Task adapter used by the existing Task execution supervisor.
 #[derive(Clone)]
@@ -252,6 +422,7 @@ impl EmbeddedTaskExecutor {
                 .map_err(|error| {
                     ServiceError::invalid_operation(format!("Task log write failed: {error}"))
                 })?;
+            log_sink.record_progress().await;
         }
         let after_sha = git::get_current_sha(Path::new(&ctx.worktree_path))
             .await
@@ -587,11 +758,12 @@ impl TaskExecutor for EmbeddedTaskExecutor {
         }
 
         let cancellation = CancellationToken::new();
+        let execution_lease = execution_lease_for(&ctx.execution_id);
         let log_sink = Arc::new(NativeTaskLogSink::new(
             &ctx.logs_path,
             &ctx.execution_id,
             ctx.log_sender.clone(),
-            Arc::clone(&self.db),
+            execution_lease,
         ));
         let result = self
             .run_native_turn(
@@ -621,19 +793,14 @@ impl TaskExecutor for EmbeddedTaskExecutor {
 
 /// Log sink preserving the standard Forge JSONL/event stream contract.
 ///
-/// Every event also feeds the execution's `last_activity_at` heartbeat
-/// (throttled), the same liveness signal the CLI daemon path reports through
-/// its event notifications. Without it the stall monitor cannot distinguish a
-/// busy native turn from a hung one and kills any turn longer than the stall
-/// window.
+/// Events are semantic progress only.  They never renew the execution owner
+/// lease: the server-controlled runner heartbeat does that independently, so
+/// a quiet provider request or long-running tool remains live while its owner
+/// is healthy.
 struct NativeTaskLogSink {
     writer: Mutex<LogWriter>,
-    db: Arc<SqliteDb>,
-    execution_id: String,
-    last_activity_bump: std::sync::Mutex<Option<std::time::Instant>>,
+    lease: Option<Arc<EmbeddedExecutionLease>>,
 }
-
-const ACTIVITY_BUMP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl std::fmt::Debug for NativeTaskLogSink {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -648,7 +815,7 @@ impl NativeTaskLogSink {
         path: &str,
         execution_id: &str,
         sender: Option<tokio::sync::mpsc::UnboundedSender<executors::LogEntry>>,
-        db: Arc<SqliteDb>,
+        lease: Option<Arc<EmbeddedExecutionLease>>,
     ) -> Self {
         let mut writer = LogWriter::new(path, execution_id.to_owned(), 10 * 1024 * 1024);
         if let Some(sender) = sender {
@@ -656,9 +823,7 @@ impl NativeTaskLogSink {
         }
         Self {
             writer: Mutex::new(writer),
-            db,
-            execution_id: execution_id.to_owned(),
-            last_activity_bump: std::sync::Mutex::new(None),
+            lease,
         }
     }
 
@@ -670,51 +835,16 @@ impl NativeTaskLogSink {
             .await
     }
 
-    async fn record_activity(&self) {
-        let due = {
-            let mut last = match self.last_activity_bump.lock() {
-                Ok(last) => last,
-                Err(_) => return,
-            };
-            match *last {
-                Some(at) if at.elapsed() < ACTIVITY_BUMP_INTERVAL => false,
-                _ => {
-                    *last = Some(std::time::Instant::now());
-                    true
-                }
-            }
-        };
-        if !due {
+    async fn record_progress(&self) {
+        let Some(lease) = self.lease.as_ref() else {
             return;
-        }
-        let now = db::now_rfc3339();
-        if let Err(error) = ExecutionRepo::update(
-            &*self.db,
-            db::UpdateExecution {
-                id: self.execution_id.clone(),
-                status: None,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: Some(Some(now.clone())),
-                summary: None,
-                logs_path: None,
-                before_sha: None,
-                after_sha: None,
-                error: None,
-                executor_config_snapshot_json: None,
-                updated_at: now,
-            },
-        )
-        .await
-        {
+        };
+        let progress_at = db::now_rfc3339();
+        if let Err(error) = lease.record_progress(progress_at, db::now_rfc3339()).await {
             tracing::debug!(
-                execution_id = %self.execution_id,
+                execution_id = %lease.execution_id,
                 %error,
-                "failed to record native execution activity"
+                "failed to record native execution semantic progress"
             );
         }
     }
@@ -726,7 +856,7 @@ impl TurnEventSink for NativeTaskLogSink {
         let _ = self
             .write(LogKind::AssistantDelta, serde_json::json!({"text": text}))
             .await;
-        self.record_activity().await;
+        self.record_progress().await;
     }
 
     async fn reasoning_delta(&self, text: &str, redacted: bool) {
@@ -735,7 +865,7 @@ impl TurnEventSink for NativeTaskLogSink {
                 .write(LogKind::Thinking, serde_json::json!({"text": text}))
                 .await;
         }
-        self.record_activity().await;
+        self.record_progress().await;
     }
 
     async fn tool_call_started(&self, call_id: &str, name: &str, argument_keys: &[String]) {
@@ -749,7 +879,7 @@ impl TurnEventSink for NativeTaskLogSink {
                 }),
             )
             .await;
-        self.record_activity().await;
+        self.record_progress().await;
     }
 
     async fn tool_call_finished(&self, call_id: &str, name: &str, is_error: bool) {
@@ -764,7 +894,7 @@ impl TurnEventSink for NativeTaskLogSink {
                 }),
             )
             .await;
-        self.record_activity().await;
+        self.record_progress().await;
     }
 }
 

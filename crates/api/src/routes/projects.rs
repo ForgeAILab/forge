@@ -141,7 +141,13 @@ async fn create_direct_project(
         },
     });
 
-    Ok((StatusCode::OK, Json(project_response(project)?)).into_response())
+    let mut response = project_response(project)?;
+    response.execution_setup = Some(
+        services::load_project_execution_setup(&state.db, &response.id)
+            .await
+            .map_err(|_| ApiError::internal("Project execution setup projection is unavailable"))?,
+    );
+    Ok((StatusCode::OK, Json(response)).into_response())
 }
 
 async fn create_project_from_charter_approval(
@@ -149,26 +155,9 @@ async fn create_project_from_charter_approval(
     user: AuthenticatedUser,
     request: CreateProjectFromCharterApprovalRequest,
 ) -> ApiResult<Response> {
-    // Scope the receipt lookup by the authenticated account before entering
-    // the materializer so an approval ID cannot be used to enumerate another
-    // account's Genesis state.
-    let visible: i64 = sqlx::query_scalar(
-        "SELECT EXISTS (
-             SELECT 1 FROM project_charter_approval
-             WHERE id = ? AND approving_principal_type = 'user'
-               AND approving_principal_id = ?
-         )",
-    )
-    .bind(&request.approval_id)
-    .bind(&user.user_id)
-    .fetch_one(state.db.pool())
-    .await?;
-    if visible != 1 {
-        return Err(ApiError::not_found(
-            "project_charter_approval",
-            request.approval_id,
-        ));
-    }
+    // The service derives the account scope/principal, input digest, and
+    // durable receipt from this authenticated user. The route never accepts
+    // a caller-provided digest or receipt and contains no approval SQL.
     let created = materialize_project_from_charter_approval(
         state.db.clone(),
         CreateProjectFromCharterApprovalInput {
@@ -176,11 +165,18 @@ async fn create_project_from_charter_approval(
             idempotency_key: request.idempotency_key,
             account_id: user.user_id.clone(),
             authorization: CreateProjectAuthorization::from_api(&request.authorization),
-            correlation_id: new_uuid_v4(),
+            // The shared service allocates the command correlation id for a
+            // direct authenticated-user command.
+            correlation_id: String::new(),
             causation_depth: 1,
+            command_receipt: None,
+            action_execution: None,
         },
     )
     .await?;
+    let execution_setup = services::load_project_execution_setup(&state.db, &created.project.id)
+        .await
+        .map_err(|_| ApiError::internal("Project execution setup projection is unavailable"))?;
     let response = CreateProjectFromCharterApprovalResponse {
         project_id: created.project.id,
         project_agent_binding_id: created.project_agent_binding_id,
@@ -190,6 +186,7 @@ async fn create_project_from_charter_approval(
         handoff_id: created.handoff_id,
         target_message_id: created.target_message_id,
         target_turn_id: created.target_turn_id,
+        execution_setup,
     };
     Ok((StatusCode::CREATED, Json(response)).into_response())
 }

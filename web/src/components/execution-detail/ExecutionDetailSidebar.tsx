@@ -2,6 +2,10 @@ import { useState } from 'react'
 import { ArrowBendUpLeft, Check, Clock, Copy, GitBranch, Info, Play, Spinner, StopCircle } from '@phosphor-icons/react'
 
 import { PlanChecklist } from '@/components/plan-checklist'
+import {
+  ExecutionLivenessNotice,
+  getExecutionLivenessNotice,
+} from '@/components/execution-detail/ExecutionLivenessNotice'
 import { ExecutionObservabilitySection } from '@/components/execution-detail/ExecutionObservabilitySection'
 import { ExecutionStatusBadge } from '@/components/execution-detail/ExecutionStatusBadge'
 import { formatDate, formatRelativeDate, shortHash } from '@/components/execution-detail/execution-detail-format'
@@ -57,8 +61,12 @@ type HookLogEntry = {
 type SidebarActions = {
   onStop?: () => void
   stopPending?: boolean
+  onRefresh?: () => void
+  refreshPending?: boolean
   onContinue?: () => void
   continuePending?: boolean
+  onRetry?: () => void
+  retryPending?: boolean
 }
 
 export function ExecutionDetailSidebar({
@@ -85,8 +93,14 @@ export function ExecutionDetailSidebar({
   const remainingPlanItems = execution?.plan_progress?.remaining ?? 0
   const completedWithOpenPlan =
     execution?.status === 'completed' && execution.role !== 'planner' && remainingPlanItems > 0
+  const livenessNotice = execution ? getExecutionLivenessNotice(execution) : null
+  const terminalRecoveryLabel = actions?.onContinue
+    ? 'Continue session'
+    : actions?.onRetry
+      ? 'Retry run'
+      : undefined
 
-  const hasActions = Boolean(actions?.onStop || actions?.onContinue)
+  const hasActions = Boolean(actions?.onStop || actions?.onContinue || actions?.onRetry)
 
   return (
     <aside className="flex h-full flex-col">
@@ -153,6 +167,21 @@ export function ExecutionDetailSidebar({
                 </div>
               )}
             </section>
+
+            {livenessNotice ? (
+              <ExecutionLivenessNotice
+                execution={execution}
+                actions={
+                  execution.status === 'running'
+                    ? {
+                        onRefresh: actions?.onRefresh,
+                        refreshPending: actions?.refreshPending,
+                      }
+                    : undefined
+                }
+                nextActionLabel={terminalRecoveryLabel}
+              />
+            ) : null}
 
             <Separator />
 
@@ -334,6 +363,24 @@ export function ExecutionDetailSidebar({
                   <Play className="h-3.5 w-3.5" />
                 )}
                 Continue Session
+              </Button>
+            </Tooltip>
+          )}
+          {actions?.onRetry && (
+            <Tooltip content={`Retry this ${productTerm('run').toLowerCase()} with a new bounded attempt`}>
+              <Button
+                size="sm"
+                variant="outline"
+                className="gap-1.5"
+                disabled={actions.retryPending}
+                onClick={actions.onRetry}
+              >
+                {actions.retryPending ? (
+                  <Spinner className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <ArrowBendUpLeft className="h-3.5 w-3.5" />
+                )}
+                {actions.retryPending ? 'Retrying…' : `Retry ${productTerm('run')}`}
               </Button>
             </Tooltip>
           )}

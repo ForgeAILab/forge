@@ -9,20 +9,23 @@ use std::sync::Arc;
 
 use db::{
     new_uuid_v4, now_rfc3339, AccountMainAgentBinding, AccountMainAgentBindingRepo,
-    AdmitAgentChatTurn, AdmitAgentHandoff, Agent, AgentChat, AgentChatMessage,
-    AgentChatMessageAuthorType, AgentChatMessageRepo, AgentChatMessageStatus, AgentChatRepo,
-    AgentChatTransactionRepo, AgentChatTurnJob, AgentChatTurnJobRepo, AgentChatTurnState,
-    AgentHandoff, AgentHandoffRepo, AgentProfileRepo, AgentRepo, CancelAgentChatTurn,
-    CompleteAgentChatTurn, CreateAccountMainAgentBinding, CreateAgentChat, CreateAgentChatMessage,
-    CreateAgentChatTurnJob, CreateAgentHandoff, CreateProjectAgentBinding, FailAgentChatTurn,
-    ProjectAgentBinding, ProjectAgentBindingRepo, ProjectMemberRepo,
-    ReplaceAccountMainAgentBinding, ReplaceProjectAgentBinding, UpdateAgentChat,
+    AdmitAgentHandoff, Agent, AgentChat, AgentChatMessage, AgentChatMessageAuthorType,
+    AgentChatMessageRepo, AgentChatMessageStatus, AgentChatRepo, AgentChatTransactionRepo,
+    AgentChatTurnJob, AgentChatTurnJobRepo, AgentChatTurnState, AgentHandoff, AgentHandoffRepo,
+    AgentRepo, CancelAgentChatTurn, CompleteAgentChatTurn, CreateAccountMainAgentBinding,
+    CreateAgentChat, CreateAgentChatMessage, CreateAgentChatTurnJob, CreateAgentHandoff,
+    CreateProjectAgentBinding, FailAgentChatTurn, ProjectAgentBinding, ProjectAgentBindingRepo,
+    ProjectMemberRepo, ReplaceAccountMainAgentBinding, ReplaceProjectAgentBinding, UpdateAgentChat,
 };
 use serde_json::json;
 
 use crate::{
     agent_chat_policy::{guard_agent_chat_content, AgentChatOperation, AgentChatScope},
     agent_chat_turn_policy::{bounded_error, failure_after_claim},
+    agent_turn_admission::{
+        content_digest, handoff_content_digest_with_sources, AgentResponderStore,
+        AgentTurnAdmissionService, AgentTurnAdmitInput, AgentTurnPrepareInput, AgentTurnTrigger,
+    },
     Result, ServiceError,
 };
 
@@ -146,7 +149,7 @@ where
         + AgentHandoffRepo
         + AgentChatTransactionRepo
         + AgentRepo
-        + AgentProfileRepo
+        + AgentResponderStore
         + ProjectMemberRepo,
 {
     pub async fn get_authorized_chat(
@@ -381,24 +384,56 @@ where
         let chat = self
             .get_authorized_chat(&input.actor_user_id, &input.chat_id)
             .await?;
-        if chat.status != READY_CHAT_STATUS {
-            return Err(ServiceError::Conflict(
-                "Agent Chat is not ready for turns".to_owned(),
-            ));
-        }
-        let binding = self.responder_for_chat(&chat).await?;
         let guarded = guard_agent_chat_content(&input.content)?;
         let dedupe_key = input
             .dedupe_key
             .filter(|key| !key.trim().is_empty())
             .unwrap_or_else(new_uuid_v4);
-
+        let trigger_content_digest = content_digest(&guarded.content)?;
         let now = now_rfc3339();
         let message_id = new_uuid_v4();
         let correlation_id = new_uuid_v4();
-        let admitted = AgentChatTransactionRepo::admit_agent_chat_turn(
-            &*self.db,
-            AdmitAgentChatTurn {
+        let turn_id = new_uuid_v4();
+        let turn = CreateAgentChatTurnJob {
+            id: turn_id,
+            chat_id: chat.id.clone(),
+            triggering_message_id: message_id.clone(),
+            // The shared admission service overwrites all authority fields
+            // from its current binding/Profile snapshot.
+            responder_identity_id: String::new(),
+            profile_id: String::new(),
+            responder_binding_id: None,
+            responder_binding_version: None,
+            responder_identity_version: None,
+            profile_version: None,
+            operating_skill_revision_id: None,
+            policy_revision: None,
+            policy_digest: None,
+            permission_policy_digest: None,
+            tool_policy_digest: None,
+            admission_digest: None,
+            canonical_scope_provenance_json: None,
+            canonical_scope_type: String::new(),
+            canonical_scope_id: String::new(),
+            dedupe_key: String::new(),
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            correlation_id: correlation_id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        let admitted = AgentTurnAdmissionService::new(Arc::clone(&self.db))
+            .admit(AgentTurnAdmitInput {
+                preparation: AgentTurnPrepareInput {
+                    chat: &chat,
+                    trigger: AgentTurnTrigger::UserMessage,
+                    dedupe_key: &dedupe_key,
+                    content_digest: &trigger_content_digest,
+                    causation_id: None,
+                    causation_depth: 0,
+                    source_responder: None,
+                },
                 message: CreateAgentChatMessage {
                     id: message_id.clone(),
                     chat_id: chat.id.clone(),
@@ -434,25 +469,9 @@ where
                     source_metadata_json: "{}".to_owned(),
                     created_at: now.clone(),
                 },
-                turn: CreateAgentChatTurnJob {
-                    id: new_uuid_v4(),
-                    chat_id: chat.id,
-                    triggering_message_id: message_id,
-                    responder_identity_id: binding.identity_id,
-                    profile_id: binding.profile_id,
-                    canonical_scope_type: "agent_chat".to_owned(),
-                    canonical_scope_id: input.chat_id,
-                    dedupe_key,
-                    max_attempts: DEFAULT_MAX_ATTEMPTS,
-                    correlation_id,
-                    causation_id: None,
-                    causation_depth: 0,
-                    created_at: now.clone(),
-                    updated_at: now,
-                },
-            },
-        )
-        .await?;
+                turn,
+            })
+            .await?;
         Ok(AdmittedAgentChatMessage {
             message: admitted.message,
             turn_job: admitted.turn,
@@ -681,15 +700,15 @@ where
             .ok_or_else(|| {
                 ServiceError::not_found("agent_chat", input.target_project_id.clone())
             })?;
-        if target.kind != PROJECT_CHAT_KIND || target.status != READY_CHAT_STATUS {
+        if target.kind != PROJECT_CHAT_KIND {
+            return Err(ServiceError::not_found("agent_chat", target.id.clone()));
+        }
+        let source_responder = self.responder_for_chat(&source).await?;
+        if source_responder.identity_id()? != source_binding.identity_id {
             return Err(ServiceError::Conflict(
-                "target Project Agent Chat is not ready".to_owned(),
+                "Main Agent binding changed while preparing the handoff".to_owned(),
             ));
         }
-        let binding = self.responder_for_chat(&target).await?;
-        let source_responder = self
-            .responder_for_identity(source_binding.identity_id.clone())
-            .await?;
         let guarded = guard_agent_chat_content(&input.content)?;
         if guarded.content.chars().count() > MAX_HANDOFF_CONTENT_CHARS {
             return Err(ServiceError::invalid_operation(
@@ -701,6 +720,40 @@ where
         let handoff_id = new_uuid_v4();
         let target_message_id = new_uuid_v4();
         let target_turn_id = new_uuid_v4();
+        let bounded_source_revisions = bounded_json(&input.source_revisions_json)?;
+        let handoff_content_digest = handoff_content_digest_with_sources(
+            &guarded.content,
+            &bounded_source_revisions,
+            input.source_message_id.as_deref(),
+            input.source_turn_job_id.as_deref(),
+        )?;
+        let source_causation_depth =
+            if let Some(source_turn_job_id) = input.source_turn_job_id.as_deref() {
+                AgentChatTurnJobRepo::get_agent_chat_turn_job(&*self.db, source_turn_job_id)
+                    .await?
+                    .map(|job| job.causation_depth)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+        let causation_depth = source_causation_depth.saturating_add(1);
+        let target_dedupe_key = format!("handoff:{}", input.dedupe_key);
+        let prepared = AgentTurnAdmissionService::new(Arc::clone(&self.db))
+            .prepare(AgentTurnPrepareInput {
+                chat: &target,
+                trigger: AgentTurnTrigger::MainProjectHandoff,
+                dedupe_key: &target_dedupe_key,
+                content_digest: &handoff_content_digest,
+                // `handoff_id` is a server-minted outcome identifier and is
+                // regenerated on a response-loss retry.  The admission
+                // digest must remain stable for the same caller/source
+                // trigger; the persisted turn still records the concrete
+                // handoff id as its causation edge below.
+                causation_id: None,
+                causation_depth,
+                source_responder: Some(&source_responder),
+            })
+            .await?;
         let handoff = CreateAgentHandoff {
             id: handoff_id.clone(),
             source_chat_id: source.id,
@@ -712,7 +765,7 @@ where
             author_identity_id: Some(source_binding.identity_id.clone()),
             content: guarded.content.clone(),
             content_guard_json: guarded.guard_json.clone(),
-            source_revisions_json: bounded_json(&input.source_revisions_json)?,
+            source_revisions_json: bounded_source_revisions,
             correlation_id: correlation_id.clone(),
             causation_id: None,
             dedupe_key: input.dedupe_key.clone(),
@@ -732,7 +785,7 @@ where
             outcome: Some("handoff_delivered".to_owned()),
             model: None,
             // Preserve source attribution on the delivered message.
-            profile_id: Some(source_responder.profile_id.clone()),
+            profile_id: Some(source_responder.profile_id()?.to_owned()),
             session_id: None,
             context_manifest_id: None,
             token_usage_json: None,
@@ -750,28 +803,47 @@ where
             source_metadata_json: json!({"source_chat_id": handoff.source_chat_id}).to_string(),
             created_at: now.clone(),
         };
-        let target_turn = CreateAgentChatTurnJob {
+        let mut target_turn = prepared.apply_to_turn(CreateAgentChatTurnJob {
             id: target_turn_id,
             chat_id: target.id.clone(),
             triggering_message_id: target_message_id,
-            responder_identity_id: binding.identity_id,
-            profile_id: binding.profile_id,
-            canonical_scope_type: "agent_chat".to_owned(),
-            canonical_scope_id: target.id.clone(),
-            dedupe_key: format!("handoff:{}", handoff.dedupe_key),
+            // PreparedAgentTurnAdmission is the sole mapping authority for
+            // responder/profile/policy provenance. These placeholders are
+            // overwritten before the atomic handoff transaction.
+            responder_identity_id: String::new(),
+            profile_id: String::new(),
+            responder_binding_id: None,
+            responder_binding_version: None,
+            responder_identity_version: None,
+            profile_version: None,
+            operating_skill_revision_id: None,
+            policy_revision: None,
+            policy_digest: None,
+            permission_policy_digest: None,
+            tool_policy_digest: None,
+            admission_digest: None,
+            canonical_scope_provenance_json: None,
+            canonical_scope_type: String::new(),
+            canonical_scope_id: String::new(),
+            dedupe_key: String::new(),
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             correlation_id,
-            causation_id: Some(handoff_id),
-            causation_depth: 1,
+            causation_id: None,
+            causation_depth: 0,
             created_at: now.clone(),
             updated_at: now,
-        };
+        })?;
+        // The concrete handoff id is a persisted causation edge, not input
+        // identity. It is intentionally excluded from the prepared digest so
+        // response-loss replay remains idempotent.
+        target_turn.causation_id = Some(handoff_id);
         let admitted = AgentChatTransactionRepo::admit_agent_handoff(
             &*self.db,
             AdmitAgentHandoff {
                 handoff,
                 target_message,
                 target_turn,
+                source_responder_provenance_json: Some(source_responder.provenance_json()?),
             },
         )
         .await?;
@@ -858,54 +930,14 @@ where
         Ok(())
     }
 
-    async fn responder_for_chat(&self, chat: &AgentChat) -> Result<ResponderBinding> {
-        match chat.kind.as_str() {
-            MAIN_CHAT_KIND => {
-                let account_id = chat
-                    .account_id
-                    .as_deref()
-                    .ok_or_else(|| ServiceError::not_found("agent_chat", chat.id.clone()))?;
-                let binding =
-                    AccountMainAgentBindingRepo::get_active_main_binding(&*self.db, account_id)
-                        .await?
-                        .filter(|binding| binding.state == ACTIVE_BINDING_STATE)
-                        .ok_or_else(|| {
-                            ServiceError::Conflict("Main Agent binding is not configured".into())
-                        })?;
-                self.responder_for_identity(binding.identity_id).await
-            }
-            PROJECT_CHAT_KIND => {
-                let project_id = chat
-                    .project_id
-                    .as_deref()
-                    .ok_or_else(|| ServiceError::not_found("agent_chat", chat.id.clone()))?;
-                let binding =
-                    ProjectAgentBindingRepo::get_active_project_binding(&*self.db, project_id)
-                        .await?
-                        .filter(|binding| {
-                            binding.state == ACTIVE_BINDING_STATE && binding.identity_id.is_some()
-                        })
-                        .ok_or_else(|| {
-                            ServiceError::Conflict("Project Agent binding is not configured".into())
-                        })?;
-                self.responder_for_identity(binding.identity_id.expect("checked above"))
-                    .await
-            }
-            _ => Err(ServiceError::not_found("agent_chat", chat.id.clone())),
-        }
-    }
-
-    /// A binding names the responding agent; the profile serving the turn is
-    /// always the agent's *current* one, so settings edits apply to the next
-    /// turn without republishing or rebinding.
-    async fn responder_for_identity(&self, identity_id: String) -> Result<ResponderBinding> {
-        let identity = AgentRepo::get_by_id(&*self.db, &identity_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("agent_identity", identity_id.clone()))?;
-        Ok(ResponderBinding {
-            identity_id,
-            profile_id: identity.profile_id,
-        })
+    async fn responder_for_chat(
+        &self,
+        chat: &AgentChat,
+    ) -> Result<crate::agent_turn_admission::ResolvedAgentResponder> {
+        let resolver = AgentTurnAdmissionService::new(Arc::clone(&self.db));
+        let responder = resolver.resolve(chat).await?;
+        responder.require_frozen()?;
+        Ok(responder)
     }
 
     async fn require_owned_identity(
@@ -927,12 +959,6 @@ where
             .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
         Ok(())
     }
-}
-
-#[derive(Debug, Clone)]
-struct ResponderBinding {
-    identity_id: String,
-    profile_id: String,
 }
 
 fn bounded_json(value: &str) -> Result<String> {

@@ -260,10 +260,13 @@ export function useCreateProject() {
         method: 'POST',
         body: JSON.stringify(body),
       }),
-    onSuccess: () => {
+    onSuccess: (project) => {
       void queryClient.invalidateQueries({ queryKey: qk.projects })
       void queryClient.invalidateQueries({ queryKey: ['agent-chats'] })
       void queryClient.invalidateQueries({ queryKey: ['product-genesis', 'active'] })
+      if (project.execution_setup) {
+        queryClient.setQueryData(qk.projectExecutionSetup(project.id), project.execution_setup)
+      }
     },
   })
 }
@@ -1140,10 +1143,11 @@ export function useUpdateMcpConfig() {
 
 // --- Repos ---
 
-export function useReposQuery(projectId: string) {
+export function useReposQuery(projectId: string, options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: qk.repos(projectId),
     queryFn: () => apiFetch<PaginatedResponse<Repo>>(`/projects/${projectId}/repos`),
+    enabled: options?.enabled ?? Boolean(projectId),
   })
 }
 

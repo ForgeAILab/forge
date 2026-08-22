@@ -173,8 +173,38 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
         &[StatusCode::OK, StatusCode::CREATED],
     )
     .await;
-    assert_eq!(replay, genesis.create_response);
-    assert_eq!(first, genesis.create_response);
+    // The command receipt freezes the materialized Project/handoff identity,
+    // while execution_setup is a live provisioning projection that may have
+    // advanced between the original response and a response-loss replay.
+    for field in [
+        "project_id",
+        "project_agent_binding_id",
+        "project_chat_id",
+        "charter_id",
+        "charter_revision_id",
+        "handoff_id",
+        "target_message_id",
+        "target_turn_id",
+    ] {
+        assert_eq!(
+            first[field], genesis.create_response[field],
+            "frozen {field}"
+        );
+        assert_eq!(
+            replay[field], genesis.create_response[field],
+            "frozen {field}"
+        );
+    }
+    assert!(first["execution_setup"].is_object());
+    assert!(replay["execution_setup"].is_object());
+    let current_setup =
+        services::load_project_execution_setup(&harness.state.db, &genesis.project_id)
+            .await
+            .expect("replayed Project setup projection remains readable");
+    assert_eq!(
+        replay["execution_setup"],
+        serde_json::to_value(current_setup).expect("setup projection serializes")
+    );
     let conflict = request_json(
         app,
         Method::POST,
@@ -440,10 +470,10 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
     let fixture = create_genesis_project(app, &token, "v076-typed").await;
     let baseline = create_active_baseline(app, &token, &fixture).await;
 
-    // Mainstream Task surfaces may omit the orchestration envelope. Forge
-    // derives the current Charter binding and persists a non-runnable Task;
-    // exact baseline provenance is still required before repository work.
-    let missing_governance = request_json(
+    // A repository implementation proposal must carry the exact active
+    // baseline plan item and milestone. The direct command still derives the
+    // authenticated Project/agent scope and materializes the Task atomically.
+    let governed_proposal = request_json(
         app,
         Method::POST,
         &format!(
@@ -453,33 +483,30 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
         &token,
         json!({
             "project_id": fixture.project_id,
-            "title": "V076 ungoverned task",
-            "description": "Missing governance is safely derived at materialization.",
+            "title": "V076 governed task",
+            "description": "The active baseline supplies stable implementation provenance.",
             "role_assignments": [],
-            "dedupe_key": "v076-task-proposal-missing-governance",
-            "correlation_id": "v076-task-proposal-missing-governance-correlation"
+            "governance": {
+                "charter_revision_id": fixture.charter_revision_id,
+                "baseline_id": baseline.baseline_id,
+                "baseline_revision_id": baseline.baseline_revision_id,
+                "plan_item_id": "v076-plan-item-2",
+                "milestone_id": fixture.milestone_id,
+                "capability_class": "repository_write",
+                "risk_class": "low",
+                "provenance": {"source": "v076-active-baseline"}
+            },
+            "dedupe_key": "v076-task-proposal-governed",
+            "correlation_id": "v076-task-proposal-governed-correlation"
         }),
         &[StatusCode::CREATED, StatusCode::OK],
     )
     .await;
-    assert_eq!(missing_governance["materialized"], json!(false));
-    let missing_governance_id = required_string(&missing_governance, &["id"]);
-    let missing_governance_version = missing_governance["version"]
-        .as_i64()
-        .expect("ungoverned action version");
-    let derived = request_json(
-        app,
-        Method::POST,
-        &format!("/api/v1/actions/{missing_governance_id}/execute-task"),
-        &token,
-        json!({
-            "expected_version": missing_governance_version,
-            "idempotency_key": "v076-task-execution-missing-governance"
-        }),
-        &[StatusCode::OK],
-    )
-    .await;
-    let derived_task_id = required_string(&derived, &["task", "id"]);
+    assert_eq!(governed_proposal["materialized"], json!(true));
+    assert_eq!(governed_proposal["domain_committed"], json!(true));
+    assert_eq!(governed_proposal["policy_result"], json!("allowed"));
+    let derived = &governed_proposal;
+    let derived_task_id = required_string(derived, &["task", "id"]);
     let derived_governance = sqlx::query(
         "SELECT charter_revision_id, baseline_id, baseline_revision_id, runnable
          FROM project_task_governance WHERE task_id = ?",
@@ -492,16 +519,22 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
         derived_governance.get::<String, _>("charter_revision_id"),
         fixture.charter_revision_id
     );
-    assert!(derived_governance
-        .get::<Option<String>, _>("baseline_id")
-        .is_none());
-    assert!(derived_governance
-        .get::<Option<String>, _>("baseline_revision_id")
-        .is_none());
-    assert_eq!(derived_governance.get::<i64, _>("runnable"), 0);
+    assert_eq!(
+        derived_governance
+            .get::<Option<String>, _>("baseline_id")
+            .as_deref(),
+        Some(baseline.baseline_id.as_str())
+    );
+    assert_eq!(
+        derived_governance
+            .get::<Option<String>, _>("baseline_revision_id")
+            .as_deref(),
+        Some(baseline.baseline_revision_id.as_str())
+    );
+    assert_eq!(derived_governance.get::<i64, _>("runnable"), 1);
 
-    // The existing typed Task executor is the authoritative Project Agent
-    // materializer: proposal first, then an explicit user execution.
+    // The typed Task endpoint is the authoritative Project Agent direct
+    // command: one request commits the Task and its receipt.
     let proposal = request_json(
         app,
         Method::POST,
@@ -532,23 +565,9 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
     )
     .await;
     assert_eq!(proposal["operation"], json!("task.propose"));
-    assert_eq!(proposal["materialized"], json!(false));
-    let action_id = required_string(&proposal, &["id"]);
-    let action_version = proposal["version"].as_i64().expect("action version");
-    let executed = request_json(
-        app,
-        Method::POST,
-        &format!("/api/v1/actions/{action_id}/execute-task"),
-        &token,
-        json!({
-            "expected_version": action_version,
-            "idempotency_key": "v076-task-execution"
-        }),
-        &[StatusCode::OK],
-    )
-    .await;
-    assert_eq!(executed["action"]["materialized"], json!(true));
-    let task_id = required_string(&executed, &["task", "id"]);
+    assert_eq!(proposal["materialized"], json!(true));
+    assert_eq!(proposal["domain_committed"], json!(true));
+    let task_id = required_string(&proposal, &["task", "id"]);
     let task_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE id = ? AND project_id = ?")
             .bind(&task_id)
@@ -617,8 +636,8 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
         )
         .await
         .expect("typed Project Document proposal is admitted");
-    assert_eq!(document_proposal["materialized"], json!(true));
-    assert_eq!(document_proposal["domain_committed"], json!(true));
+    assert_eq!(document_proposal["result"]["materialized"], json!(true));
+    assert_eq!(document_proposal["result"]["domain_committed"], json!(true));
     let document_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM project_document_revision
          WHERE document_id = ? AND author_type = 'agent'",
@@ -768,8 +787,8 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
         )
         .await
         .expect("typed Project Decision proposal is admitted");
-    assert_eq!(decision_proposal["materialized"], json!(true));
-    assert_eq!(decision_proposal["domain_committed"], json!(true));
+    assert_eq!(decision_proposal["result"]["materialized"], json!(true));
+    assert_eq!(decision_proposal["result"]["domain_committed"], json!(true));
     let decision_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM project_decision_candidate WHERE project_id = ?")
             .bind(&fixture.project_id)
@@ -1829,6 +1848,7 @@ async fn v076_user_authority_receipts_are_exact_replays_across_gates() {
         "baseline_id": baseline.baseline_id,
         "revision_id": baseline.baseline_revision_id,
         "approval_id": baseline.approval_id,
+        "expected_baseline_version": baseline.baseline_version,
         "content_digest": baseline.content_digest,
         "render_digest": baseline.render_digest
     });
@@ -2510,8 +2530,8 @@ async fn create_genesis_project(app: &Router, token: &str, prefix: &str) -> Gene
             "charter_id": charter_id,
             "project_mode": "compact",
             "maturity": "mvp",
-            "content": content,
-            "rendered_view": rendered.rendered_view,
+            "content": content.clone(),
+            "rendered_view": rendered.rendered_view.clone(),
             "render_version": rendered.render_version,
             "provenance": user_provenance("V076 approved Charter")
         }),
@@ -2616,9 +2636,10 @@ async fn create_genesis_project(app: &Router, token: &str, prefix: &str) -> Gene
     .await;
 
     // Project creation consumes the exact approval receipt atomically. The
-    // create key is independently replay-bound to its complete user receipt;
-    // an opaque, unrelated approval id remains hidden before replay details
-    // are considered.
+    // create key is independently replay-bound to its complete user receipt.
+    // Once that key is committed, changing the approval target is an altered
+    // replay and must return the shared idempotency conflict without looking
+    // up or exposing the alternate target.
     for (label, altered) in user_authorization_replay_variants(&create_body, true) {
         let conflict = request_json(
             app,
@@ -2633,16 +2654,16 @@ async fn create_genesis_project(app: &Router, token: &str, prefix: &str) -> Gene
     }
     let mut altered_create_target = create_body.clone();
     altered_create_target["approval_id"] = json!("v076-different-approval-receipt");
-    let hidden = request_json(
+    let altered_target = request_json(
         app,
         Method::POST,
         "/api/v1/projects",
         token,
         altered_create_target,
-        &[StatusCode::NOT_FOUND],
+        &[StatusCode::CONFLICT],
     )
     .await;
-    assert_eq!(hidden["code"], json!("not_found"));
+    assert_eq!(altered_target["code"], json!("idempotency_conflict"));
     let project_id = required_string(&created, &["project_id"]);
     let project_chat_id = required_string(&created, &["project_chat_id"]);
     let project = request_json(
@@ -2716,28 +2737,6 @@ async fn create_baseline(
     let project_version = project["version"]
         .as_i64()
         .expect("baseline project version");
-    let proposed = request_json(
-        app,
-        Method::POST,
-        &format!("/api/v1/projects/{}/execution-baseline", fixture.project_id),
-        token,
-        json!({
-            "mutation": {
-                "expected_version": project_version,
-                "idempotency_key": "v076-baseline-propose",
-                "authorization": user_authorization("project.execution_baseline.propose", "v076-baseline-propose-event")
-            }
-        }),
-        &[StatusCode::CREATED, StatusCode::OK],
-    )
-    .await;
-    // The baseline shell id is server-minted; clients read it back from the
-    // proposal response.
-    let baseline_id = required_string(&proposed, &["baseline", "id"]);
-    let baseline_id = baseline_id.as_str();
-    let baseline_version = proposed["baseline"]["version"]
-        .as_i64()
-        .expect("baseline version");
     let release_policy: api_types::ExecutionBaselineReleasePolicy = serde_json::from_value(json!({
         "schema_version": services::EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA,
         "revision": "v076-policy-r1",
@@ -2770,7 +2769,7 @@ async fn create_baseline(
             "render_digest": fixture.charter_render_digest
         },
         "document_revisions": [],
-        "plan_item_ids": ["v076-plan-item-1"],
+        "plan_item_ids": ["v076-plan-item-1", "v076-plan-item-2"],
         "milestone_ids": [fixture.milestone_id],
         "milestone_definition_revision_ids": [fixture.milestone_definition_revision_id],
         "primary_milestone_id": fixture.milestone_id,
@@ -2797,6 +2796,37 @@ async fn create_baseline(
         &serde_json::from_value(content.clone()).expect("baseline content type"),
     )
     .expect("baseline renderer");
+    let draft = request_json(
+        app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/execution-baseline", fixture.project_id),
+        token,
+        json!({
+            "mutation": {
+                "expected_version": 0,
+                "idempotency_key": "v076-baseline-draft",
+                "authorization": user_authorization("project.execution_baseline.save_draft", "v076-baseline-draft-event")
+            },
+            "operation": "save_draft",
+            "base_revision_id": null,
+            "content": content.clone(),
+            "rendered_view": rendered.rendered_view.clone(),
+            "render_version": services::EXECUTION_BASELINE_RENDER_VERSION,
+            "content_digest": rendered.content_digest.clone(),
+            "render_digest": rendered.render_digest.clone(),
+            "provenance": user_provenance("V076 baseline draft")
+        }),
+        &[StatusCode::CREATED, StatusCode::OK],
+    )
+    .await;
+    assert_eq!(draft["baseline"]["lifecycle"], json!("draft"));
+    assert_eq!(draft["requires_user_authorization"], json!(false));
+    let baseline_id = required_string(&draft, &["baseline", "id"]);
+    let baseline_id = baseline_id.as_str();
+    let baseline_version = draft["baseline"]["version"]
+        .as_i64()
+        .expect("baseline version");
+    let draft_revision_id = required_string(&draft, &["current_revision", "id"]);
     let saved = request_json(
         app,
         Method::POST,
@@ -2806,20 +2836,26 @@ async fn create_baseline(
             "mutation": {
                 "expected_version": baseline_version,
                 "idempotency_key": "v076-baseline-revision",
-                "authorization": user_authorization("project.execution_baseline.revise", "v076-baseline-revision-event")
+                "authorization": user_authorization("project.execution_baseline.propose_for_approval", "v076-baseline-revision-event")
             },
-            "base_revision_id": null,
-            "content": content,
-            "rendered_view": rendered.rendered_view,
+            "operation": "propose_for_approval",
+            "base_revision_id": draft_revision_id,
+            "content": content.clone(),
+            "rendered_view": rendered.rendered_view.clone(),
             "render_version": services::EXECUTION_BASELINE_RENDER_VERSION,
-            "content_digest": rendered.content_digest,
-            "render_digest": rendered.render_digest,
+            "content_digest": rendered.content_digest.clone(),
+            "render_digest": rendered.render_digest.clone(),
             "provenance": user_provenance("V076 baseline revision")
         }),
         &[StatusCode::CREATED, StatusCode::OK],
     )
     .await;
-    let revision_id = required_string(&saved, &["current_revision", "id"]);
+    assert_eq!(saved["requires_user_authorization"], json!(true));
+    assert_eq!(
+        saved["approval_target"]["requires_user_authorization"],
+        json!(true)
+    );
+    let revision_id = required_string(&saved, &["approval_target", "revision_id"]);
     let revised_version = saved["baseline"]["version"]
         .as_i64()
         .expect("revised baseline version");
@@ -2842,9 +2878,9 @@ async fn create_baseline(
                 "authorization": approval_authorization.clone()
             },
             "revision_id": revision_id,
-            "content_digest": rendered.content_digest,
-            "render_digest": rendered.render_digest,
-            "expected_project_version": project_version + 1
+            "content_digest": rendered.content_digest.clone(),
+            "render_digest": rendered.render_digest.clone(),
+            "expected_project_version": project_version
         }),
         &[StatusCode::CREATED, StatusCode::OK],
     )
@@ -2856,15 +2892,16 @@ async fn create_baseline(
     if activate {
         let activation_body = json!({
             "mutation": {
-                "expected_version": project_version + 1,
+                "expected_version": project_version,
                 "idempotency_key": "v076-baseline-activate",
                 "authorization": user_authorization("project.execution_baseline.activate", "v076-baseline-activate-event")
             },
             "baseline_id": baseline_id,
             "revision_id": revision_id,
             "approval_id": approval_id,
-            "content_digest": rendered.content_digest,
-            "render_digest": rendered.render_digest
+            "expected_baseline_version": approved_version,
+            "content_digest": rendered.content_digest.clone(),
+            "render_digest": rendered.render_digest.clone()
         });
         let activated = request_json(
             app,
@@ -2906,7 +2943,7 @@ async fn create_baseline(
             approved_version
         },
         approval_expected_baseline_version: revised_version,
-        approval_expected_project_version: project_version + 1,
+        approval_expected_project_version: project_version,
         content_digest: rendered.content_digest,
         render_digest: rendered.render_digest,
         approval_id,
@@ -2941,6 +2978,7 @@ async fn activate_baseline(
         "baseline_id": baseline.baseline_id,
         "revision_id": baseline.baseline_revision_id,
         "approval_id": baseline.approval_id,
+        "expected_baseline_version": baseline.baseline_version,
         "content_digest": baseline.content_digest,
         "render_digest": baseline.render_digest
     });
@@ -3256,6 +3294,7 @@ async fn v076_baseline_authority_replay_checks_identity_before_auth() {
         "baseline_id": baseline.baseline_id,
         "revision_id": baseline.baseline_revision_id,
         "approval_id": baseline.approval_id,
+        "expected_baseline_version": baseline.baseline_version,
         "content_digest": baseline.content_digest,
         "render_digest": baseline.render_digest
     });

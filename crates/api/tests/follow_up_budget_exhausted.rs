@@ -1,4 +1,6 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
+mod common;
+
 use std::{
     future::Future,
     path::{Path, PathBuf},
@@ -72,6 +74,14 @@ async fn auditor_failure_exhausts_review_retry_budget_and_blocks_task() {
     let daemon_id = register_daemon_and_report_codex(&harness.app, workspaces_root.path()).await;
     let executor_agent = create_agent(&harness.app, "executor", &daemon_id).await;
     let auditor_agent = create_agent(&harness.app, "auditor", &daemon_id).await;
+    common::configure_execution_test_setup(
+        &harness.state.db,
+        &project.id,
+        &repo.id,
+        &executor_agent.id,
+        &auditor_agent.id,
+    )
+    .await;
 
     let created_task: TaskResponse = json_request(
         &harness.app,
@@ -213,6 +223,14 @@ async fn three_auditor_failures_exhaust_review_budget_three_and_block_task() {
     let daemon_id = register_daemon_and_report_codex(&harness.app, workspaces_root.path()).await;
     let executor_agent = create_agent(&harness.app, "executor", &daemon_id).await;
     let auditor_agent = create_agent(&harness.app, "auditor", &daemon_id).await;
+    common::configure_execution_test_setup(
+        &harness.state.db,
+        &project.id,
+        &repo.id,
+        &executor_agent.id,
+        &auditor_agent.id,
+    )
+    .await;
 
     let created_task: TaskResponse = json_request(
         &harness.app,

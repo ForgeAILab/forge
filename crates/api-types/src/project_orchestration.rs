@@ -1018,6 +1018,20 @@ pub enum ExecutionBaselineLifecycle {
     Revoked,
 }
 
+/// Explicit intent for a Project execution-baseline write.
+///
+/// A draft is never implicitly promoted to a proposal.  The REST revision
+/// endpoint and the typed Project-Agent adapter must name which command they
+/// are invoking so the same payload cannot change lifecycle semantics by
+/// transport convention.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ExecutionBaselineWriteOperation {
+    SaveDraft,
+    ProposeForApproval,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 #[serde(deny_unknown_fields)]
@@ -1182,6 +1196,25 @@ pub struct ExecutionBaselineApproval {
     pub idempotency_key: String,
 }
 
+/// Immutable approval target returned by the proposal command.  This is a
+/// copy of the frozen command outcome at the public boundary; callers must
+/// approve exactly these identifiers, digests, and rendered fields.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionBaselineApprovalTarget {
+    pub baseline_id: String,
+    pub revision_id: String,
+    pub revision: i64,
+    pub content: ExecutionBaselineContent,
+    pub rendered_view: String,
+    pub render_version: String,
+    pub content_digest: String,
+    pub render_digest: String,
+    pub provenance: RevisionProvenance,
+    pub requires_user_authorization: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 #[serde(deny_unknown_fields)]
@@ -1197,6 +1230,13 @@ pub struct ExecutionBaselineResponse {
     pub proposed_revision: Option<ExecutionBaselineRevision>,
     #[serde(default)]
     pub approval: Option<ExecutionBaselineApproval>,
+    /// Exact immutable target returned by a proposal command.  Query-only
+    /// responses leave this absent and set `requires_user_authorization` to
+    /// false.
+    #[serde(default)]
+    pub approval_target: Option<ExecutionBaselineApprovalTarget>,
+    #[serde(default)]
+    pub requires_user_authorization: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -1204,6 +1244,16 @@ pub struct ExecutionBaselineResponse {
 #[ts(export)]
 pub struct CreateExecutionBaselineRequest {
     pub mutation: MutationEnvelope,
+    /// The collection endpoint creates only a first `draft`; `propose_for_approval`
+    /// is rejected there because proposal always targets an existing baseline.
+    pub operation: ExecutionBaselineWriteOperation,
+    pub base_revision_id: Option<String>,
+    pub content: ExecutionBaselineContent,
+    pub rendered_view: String,
+    pub render_version: String,
+    pub content_digest: String,
+    pub render_digest: String,
+    pub provenance: RevisionProvenance,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -1211,6 +1261,7 @@ pub struct CreateExecutionBaselineRequest {
 #[ts(export)]
 pub struct SaveExecutionBaselineRevisionRequest {
     pub mutation: MutationEnvelope,
+    pub operation: ExecutionBaselineWriteOperation,
     pub base_revision_id: Option<String>,
     pub content: ExecutionBaselineContent,
     pub rendered_view: String,
@@ -1969,6 +2020,12 @@ pub struct ProjectOverview {
     pub projection_state: OverviewProjectionState,
     pub source_event_watermark: String,
     pub generated_at: String,
+    /// Independent coordination/setup/gate projection. This is optional only
+    /// for decoding historical cached Overview payloads; the REST route always
+    /// supplies the current value.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub execution_setup: Option<crate::ProjectExecutionSetupResponse>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2049,6 +2106,9 @@ pub struct CreateProjectFromCharterApprovalResponse {
     pub handoff_id: String,
     pub target_message_id: String,
     pub target_turn_id: String,
+    /// Current post-commit execution setup. This is read after provisioning
+    /// reconciliation on both fresh creates and response-loss replays.
+    pub execution_setup: crate::ProjectExecutionSetupResponse,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -2200,6 +2260,9 @@ pub struct ActivateExecutionBaselineRequest {
     pub baseline_id: String,
     pub revision_id: String,
     pub approval_id: String,
+    /// Exact baseline version observed while the user reviewed the approval.
+    /// `mutation.expected_version` remains the Project version CAS.
+    pub expected_baseline_version: i64,
     pub content_digest: String,
     pub render_digest: String,
 }

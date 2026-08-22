@@ -1,4 +1,6 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
+mod common;
+
 use std::{
     future::Future,
     path::{Path, PathBuf},
@@ -66,6 +68,14 @@ async fn merge_conflict_dispatches_follow_up_executor() {
 
     let daemon_id = register_daemon_and_report_codex(&harness.app, workspaces_root.path()).await;
     let executor_agent = create_agent(&harness.app, "executor", &daemon_id).await;
+    common::configure_execution_test_setup(
+        &harness.state.db,
+        &project.id,
+        &repo.id,
+        &executor_agent.id,
+        &executor_agent.id,
+    )
+    .await;
 
     let task_id = db::new_uuid_v4();
     let worktree_path = workspaces_root.path().join(&task_id).join("repo");

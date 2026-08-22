@@ -282,39 +282,253 @@ happen only in admitted Task Worker/reviewer Workspaces. A handoff is an
 immutable, bounded, provenance-linked packet with at most one target turn, not
 shared hidden context or a second chat.
 
-## Starting a Project from Main Chat
+## End-to-end: Main Chat to a traceable Task
 
-Use the global Main Chat for Product Genesis by typing an idea into the composer
-and selecting "Start a product" or initiating discovery from the empty state.
-Discovery creates a typed session with sensible defaults (`mvp` maturity, no
-agent preference), and setup parameters can be tailored in-conversation through
-the runtime questionnaire. The server-owned `forge.main.project-discovery/v2`
-skill keeps the discovery turn bounded (at most two consequential questions),
-separates facts from user decisions, research, assumptions, and hypotheses, and
-maintains a revisioned Project Charter. It recommends the Project name, mode
-(`compact` or `standard`), scope, non-goals, success signal, constraints, and
-selected Project Agent; only the user approves the exact Charter revision.
+This is the supported path for turning a rough idea into repository-backed work.
+The web UI presents the same records and gates described below; the endpoint
+names are included so that API clients can follow the same flow. A Main or
+Project Agent Chat is a coordinator: it never receives a repository or
+filesystem lease. Only a separately selected Task Worker or reviewer can work
+in a Task Workspace.
 
-The Main Chat shows the exact Charter content/render digests and approval target.
-Approval creates a single-use receipt. Project creation then uses the typed
-`CreateProjectFromCharterApproval` operation with that receipt and an
-idempotency key. A ready Genesis brief or a generic
-`product_genesis_session_id` is not enough. The atomic operation creates the
-Project, Project Agent binding and Chat, Charter attachment, handoff, target
-message/turn, events, and `handed_off` Genesis state together. If it fails,
-Forge leaves Genesis `ready_for_project`, keeps the receipt active, and creates
-no partial Project or handoff; retrying with the same key returns the original
-result after a committed response loss.
+### 1. Main Chat: rough idea → exact Charter
 
-Use the “Continue with Project Agent” action to enter the Project Chat. The
-Project Agent acknowledges the approved Charter, avoids re-asking settled
-questions, and creates only the typed Documents needed by the Project:
-`research`, `delivery_brief`, `product_spec`, `design`, `architecture`, or
-`execution_plan`. Before a repository-capable Task can run, the user approves
-one exact execution baseline digest covering the governing artifacts,
-acceptance/evidence matrix, risk/capability classes, release policy, and
-adaptive envelope. The Project Agent can then manage Tasks inside that envelope;
-repository access remains limited to scheduler-issued Task Workspaces.
+First connect a provider, create an account-owned agent, and bind it as the
+account's Main Agent in Agent Settings. In Main Chat, choose **Start a product**
+and enter the rough idea. This starts one typed Product Genesis session through
+`POST /api/v1/account/main-agent/product-genesis`; without a valid Main binding
+the server returns `setup_required` and creates no session or turn.
+
+The `forge.main.project-discovery/v2` skill keeps discovery bounded (at most two
+consequential questions per turn) and records facts, decisions, research,
+assumptions, and hypotheses separately. It proposes the Project name/mode,
+scope, non-goals, success signal, constraints, and a Project Agent. Review the
+rendered Charter, its content/render digests, and the selected identity's
+current Profile. Do not treat a chat answer or a ready-looking brief as
+approval: only the exact revision can be approved.
+
+Click **Approve Charter** (or call
+`POST /api/v1/account/main-agent/product-genesis/{session_id}/charter/revisions/{revision_id}/approve`)
+for that revision. The receipt is single-use and binds the exact Charter
+revision and digests, user, selected Project Agent identity/Profile,
+operating-skill revision, policy digest, and expected version. Genesis approval
+omits `expected_project_version` because there is not yet a Project.
+
+### 2. Exact approval → atomic Project and handoff
+
+Click **Create Project and hand off**. The API form is a typed
+`CreateProjectFromCharterApproval` request to `POST /api/v1/projects`:
+
+```json
+{
+  "approval_id": "<single-use-charter-approval>",
+  "idempotency_key": "<new-key-for-this-create>",
+  "authorization": { "<explicit-user-authorization-fields>": "..." }
+}
+```
+
+`product_genesis_session_id` or a generic “ready” brief is not a substitute for
+the receipt. One transaction creates the Project, Project Agent binding and
+Chat, Charter attachment, immutable Main-to-Project handoff, target message and
+turn, durable provisioning operation, events, and `handed_off` Genesis state.
+The response includes the Project, binding, Chat, handoff, target-turn IDs, and
+the current `execution_setup` projection. A response-loss retry with the same
+key returns those original IDs and refreshes setup; it never creates another
+Project, handoff, repository, or provisioning operation.
+
+Use **Continue with Project Agent** to open the Project Chat. The handoff is
+visible there as a bounded, provenance-linked message. It contains approved
+discovery references, not credentials, hidden Main history, or Main authority.
+
+### 3. Read the three readiness dimensions
+
+Open the Project's **Execution readiness** panel or call
+`GET /api/v1/projects/{id}/execution-setup`. Forge deliberately reports three
+independent dimensions:
+
+| Dimension | What it answers | Important states |
+| --- | --- | --- |
+| `coordination_state` | Can the singular Project Chat admit a turn? | `ready`, `setup_required`, `unavailable` |
+| `execution_setup_state` | Are the repository and required Worker/reviewer principals ready? | `provisioning`, `ready`, `setup_required`, `failed`, `unavailable` |
+| `execution_gate` | What does the current baseline permit? | `pre_baseline_read_only`, `baseline_approval_required`, `active`, `reconciliation_required`, `unavailable` |
+
+Project creation can therefore succeed while execution setup is
+`provisioning` or `setup_required`. A ready Project Chat only means planning
+turns are available. A ready execution setup still does not grant repository
+write access until an approved baseline is active. Check each dimension's
+`availability` and `setup_requirements`; never infer one from another.
+
+### 4. Select a Worker, independent reviewer, and repository
+
+The Project Agent can continue with documents and planning while setup is
+incomplete. The Project owner/admin completes setup from the panel, or through
+these owner/admin-only commands. Every write uses the `project_version` shown by
+the latest projection and a fresh non-empty idempotency key:
+
+```http
+POST /api/v1/projects/{id}/execution-setup/worker
+{"identity_id":"<worker>","expected_project_version":<version>,"idempotency_key":"..."}
+
+POST /api/v1/projects/{id}/execution-setup/independent-reviewer
+{"identity_id":"<reviewer>","expected_project_version":<version>,"idempotency_key":"..."}
+
+POST /api/v1/projects/{id}/execution-setup/repository
+{"repo_id":"<repo>","expected_project_version":<version>,"idempotency_key":"..."}
+```
+
+Forge excludes the active Main and Project Agent identities from Task Workspace
+roles. The independent reviewer must be a different eligible identity from the
+Worker; reusing the same provider or model is fine, reusing the same principal
+is not. A reviewer who needs to make a correction receives a separate Worker
+assignment rather than a wider reviewer lease.
+
+If a required Worker or reviewer is missing, the projection remains
+`execution_setup_state: setup_required` and names the missing role. Create or
+connect another account-owned agent in Agent Settings, then refresh the
+projection and select it. If only one eligible execution identity exists, do
+not assign it as its own reviewer; setup must remain blocked until a distinct
+principal is available. No coordinator is silently promoted to “make the
+Project executable.”
+
+### 5. Repository provisioning and setup recovery
+
+Genesis provisioning is a durable, checkpointed operation covering preflight,
+filesystem initialization, repository registration, Project linkage, and role
+assignment. While `execution_setup_state` is `provisioning`, the panel shows
+the checkpoint and attempt count. Refresh
+`GET /api/v1/projects/{id}/execution-setup`; provisioning is not success until
+the server reports `ready`.
+
+For a recorded failure, read `provisioning.last_error_code`,
+`last_error_message`, `retryable`, `next_retry_at`, and `version`. Fix the
+reported repository, filesystem, or eligibility problem, then retry the same
+durable operation:
+
+```http
+POST /api/v1/projects/{id}/execution-setup/provisioning/retry
+{"expected_operation_version":<provisioning-version>,"idempotency_key":"<new-retry-key>"}
+```
+
+Retries reconcile the deterministic directory, repository row, Project pointer,
+and role assignments. They do not create a second repository or reset the
+Project. If the finite retry budget is exhausted, setup is visibly `failed`
+with a configuration/retry action; the approved Charter, Project Chat, and
+handoff remain intact. A stale version or changed idempotency input is a
+conflict: refetch the projection and use a new key, rather than guessing a
+version.
+
+### 6. Project Chat, current Profile, and the execution baseline
+
+The Project binding names an identity, not a permanently frozen Profile. When a
+new user message, handoff, retry, or autonomous wake is admitted, Forge resolves
+that identity's current Profile, operating skill, and policy, then freezes those
+revisions on the turn. Editing/selecting the Project Agent's Profile before the
+next turn therefore affects that turn; a queued or leased turn keeps the Profile
+that it was admitted with. This is why a Profile change does not require
+rebinding the Project Chat.
+
+The Project Agent acknowledges the handoff, creates the needed typed Documents
+and milestone definitions, and drafts one execution baseline. The baseline is
+the contract for repository-capable work; it must reference the exact Charter,
+governing Document revisions, plan items, milestone and definition revisions,
+acceptance/evidence matrix, capability/risk classes, reviewer independence
+rules, release policy, and adaptive/rollback envelope.
+
+Baseline lifecycle is intentionally four separate operations:
+
+1. **Save a draft.** `POST /api/v1/projects/{id}/execution-baseline` with
+   `operation: "save_draft"` appends an immutable `draft` revision. It does not
+   request or imply user authorization.
+2. **Propose for approval.** The Project Agent calls
+   `POST /api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions` with
+   `operation: "propose_for_approval"` and the current baseline version. A
+   complete candidate returns `requires_user_authorization: true` and a frozen
+   `approval_target` containing the exact revision and digests.
+3. **Approve the exact revision.** The interactive user reviews that target and
+   calls `POST .../revisions/{revision_id}/approve`. Approval is bound to the
+   current Project version, content digest, render digest, and user receipt.
+4. **Activate.** The same user calls `POST .../execution-baseline/{baseline_id}/activate`
+   with the exact `baseline_id`, `revision_id`, `approval_id`, expected Project
+   and baseline versions, and digests. Activation atomically advances the active
+   pointer, promotes matching preplanned Tasks, updates reconciliation state,
+   and emits the activation event. A Project Agent action or chat sentence
+   cannot approve or activate a baseline.
+
+Until step 4, `execution_gate` remains read-only or approval-required. If a
+baseline is not executable, use the state and corrective fields rather than
+trying to dispatch around them:
+
+- `baseline_approval_required`: inspect the exact approval target, approve it,
+  then activate it; proposal success is not activation.
+- `version_conflict` or `digest_conflict`: refresh the Project/baseline
+  projection, compare the current Charter, Documents, milestones, and setup,
+  and re-propose from the current revision. Retry the same idempotency key only
+  for a lost response to the identical command.
+- `reconciliation_required`: resolve the named stale/missing Charter,
+  Document, milestone, repository, role, or policy input, then create a new
+  exact proposal. Do not edit an immutable proposed revision in place.
+- `setup_required` or `unavailable`: complete or refresh execution setup first;
+  a missing Worker/reviewer/repository must not be disguised as a baseline
+  problem.
+
+### 7. Traceable Task execution, review, and Project Agent wake
+
+After setup is `ready` and the baseline gate is `active`, the Project Agent
+creates implementation Tasks in the bound Project through
+`POST /api/v1/projects/{id}/tasks`. Each Task is linked to its Charter revision,
+active baseline/revision, stable plan-item identity, milestone, relevant
+Document revisions, capability class, risk class, and provenance. An
+implementation-shaped Task created before baseline activation may be retained as
+a non-runnable plan, but it cannot receive a repository write lease.
+
+When setup, baseline, dependencies, and the current Task version all pass, the
+scheduler assigns the selected Worker and issues one Task-scoped Workspace
+lease. `POST /api/v1/tasks/{id}/start`/`resume` and normal workflow scheduling
+use the same admission checks. Main and Project Chat identities never receive
+that lease. Inspect the linked Task, transitions, executions, and Workspace
+diff through `GET /api/v1/tasks/{id}`, `GET /api/v1/tasks/{id}/transitions`,
+`GET /api/v1/tasks/{id}/executions`, and
+`GET /api/v1/tasks/{id}/diff`.
+
+The normal workflow moves work through its configured active state into review
+and delivery (`working → review → merging → done` in the autonomous preset).
+Review guards run the configured checks. Depending on the active workflow and
+baseline, Forge requests an independent reviewer attestation or an awaiting-
+human approval; remediation is always a separate Worker assignment. The
+execution record exposes owner health, lease expiry/hard deadline, heartbeat,
+and semantic progress separately. A quiet provider/tool call remains healthy
+while its owner lease is current, and a hard deadline still bounds it.
+
+Terminal execution events feed Attention and the durable `agent-wake-turns`
+consumer. A relevant Project incident is recorded as exactly one of
+`turn_admitted`, `deterministically_suppressed`, `deferred`, or
+`setup_required`. An admitted wake uses the same responder resolver, current
+Profile selection, canonical Project scope, and turn runner as a user message
+or handoff; it cannot silently use a stale Profile or disappear because the
+chat was temporarily unavailable. The Project Chat shows the resulting wake
+turn, task outcome, review request, or durable retry/setup action.
+
+The resulting audit trail is intentionally traceable: Charter revision and
+digests → approval receipt → Project/handoff/target turn IDs → setup and
+provisioning operation → baseline revision/approval/activation → Task governance
+and transitions → Worker execution/Workspace lease → checks/review → Attention
+and wake disposition. Preserve these IDs when diagnosing a response loss or
+conflict; they are the links between chat, Project truth, and repository work.
+
+### Recovery quick reference
+
+| Symptom | What it means | Safe next action |
+| --- | --- | --- |
+| `coordination_state: setup_required` | Main/Project binding or Chat admission is incomplete | Fix the authorized binding/Profile in Agent Settings, then refresh the Chat; no turn is fabricated. |
+| Missing Worker | No eligible Task Worker exists | Create/connect a separate Worker identity, select it in Execution readiness, and retry setup. |
+| Missing independent reviewer | Review policy requires a distinct reviewer | Create/select another eligible identity; never assign the Worker as its own reviewer. |
+| `execution_setup_state: provisioning` | Durable setup is still reconciling | Refresh the projection; wait for `ready` or follow the recorded retry action. |
+| `execution_setup_state: failed` | A checkpoint stopped with a typed error | Fix the recorded cause and retry the same provisioning operation with its current version and a new idempotency key. |
+| `execution_gate: baseline_approval_required` | Setup is ready but no approved active baseline exists | Review the exact proposal, approve it as the user, and activate the exact receipt/digests. |
+| `version_conflict`, `digest_conflict`, or stale projection | Another command changed the authoritative revision | Refetch current state and re-propose/retry with the correct version; do not overwrite immutable history. |
+| Wake `deferred` or `setup_required` | Delivery could not safely admit a turn yet | Follow the durable retry/setup action; the event remains traceable and is reconsidered after state changes. |
+
+### After execution: milestones, readiness, and release evidence
 
 Milestones are outcome contracts, not editable percentages. Their definition
 revisions and live lifecycle are distinct. The Project Agent may request a
@@ -379,57 +593,6 @@ remain in place; migration does not move or duplicate files or claim an on-disk
 layout break. If a migration or server restart fails, old media references and
 bytes remain usable and physical cleanup is retried separately after checking
 attachments and release pins.
-
-## End-to-end walkthrough
-
-This drives a task from `todo → done` against a real local repo, using the
-`shell` executor so you don't need any AI CLI installed.
-
-```bash
-# 1. Create a project + repo pointing at a real git checkout.
-PROJECT_ID=$(curl -sS -X POST "$FORGE_URL/api/v1/projects" \
-  -H 'content-type: application/json' \
-  -d '{"name":"demo"}' | jq -r .id)
-
-curl -sS -X POST "$FORGE_URL/api/v1/projects/$PROJECT_ID/repos" \
-  -H 'content-type: application/json' \
-  -d '{"name":"my-repo","url":"/abs/path/to/repo","default_branch":"main"}'
-
-# 2. Use the auto-reported daemon and register a shell agent.
-DAEMON_ID=$(curl -sS "$FORGE_URL/api/v1/daemons" | jq -r '.items[0].id')
-AGENT_ID=$(curl -sS -X POST "$FORGE_URL/api/v1/agents" \
-  -H 'content-type: application/json' \
-  -d "{\"name\":\"demo-agent\",\"executor_type\":\"shell\",\"daemon_id\":\"$DAEMON_ID\"}" \
-  | jq -r .id)
-
-# 3. Create a task with inline CI steps.
-TASK_ID=$(curl -sS -X POST "$FORGE_URL/api/v1/projects/$PROJECT_ID/tasks" \
-  -H 'content-type: application/json' \
-  -d '{
-    "title":"greet",
-    "description":"echo hi > greeting.txt && git add . && git -c user.email=a@b -c user.name=a commit -m hi",
-    "review_config":{"ci_steps":["test -f greeting.txt"]}
-  }' | jq -r .id)
-
-# 4. Claim the task — the executor auto-dispatches.
-curl -sS -X POST "$FORGE_URL/api/v1/tasks/$TASK_ID/claim" \
-  -H 'content-type: application/json' \
-  -d "{\"agent_id\":\"$AGENT_ID\",\"overrides\":null}"
-
-# 5. Transition to review. The review runner fires the CI steps inline and
-#    returns {task, review} in one response.
-curl -sS -X POST "$FORGE_URL/api/v1/tasks/$TASK_ID/transition" \
-  -H 'content-type: application/json' \
-  -d '{"status":"review","version":2}'
-
-# 6. Transition to merging. The merge runs, the task auto-advances to done,
-#    and the worktree is cleaned up synchronously.
-curl -sS -X POST "$FORGE_URL/api/v1/tasks/$TASK_ID/transition" \
-  -H 'content-type: application/json' \
-  -d '{"status":"merging","version":3}'
-```
-
-The same flow is exercised end-to-end by `cargo test -p api --test happy_path`.
 
 ## Using `forge-ctl`
 

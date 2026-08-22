@@ -1,8 +1,10 @@
 use crate::auditor::{self, AuditorVerdict};
+use chrono::{Duration as ChronoDuration, Utc};
 use db::{
-    new_uuid_v4, now_rfc3339, Agent, AgentRepo, AgentStatus, CreateExecution, CreateReview,
-    Execution, ExecutionRepo, ExecutionStatus, RepoRepo, Review, ReviewRepo, ReviewStatus,
-    SqliteDb, TaskRepo, UpdateExecution,
+    new_uuid_v4, now_rfc3339, Agent, AgentRepo, AgentStatus, ClaimExecutionLease, CreateExecution,
+    CreateReview, Execution, ExecutionLeaseDisposition, ExecutionLeaseMutation, ExecutionRepo,
+    ExecutionStatus, ExecutionTerminalOutcome, RenewExecutionLease, RepoRepo, Review, ReviewRepo,
+    ReviewStatus, SqliteDb, TaskRepo, TerminalizeExecution,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{
@@ -10,9 +12,9 @@ use executors::{
     ExecutionOverrides, LogEntry, LogKind, LogStream, LogWriter, TaskExecutor,
 };
 use serde_json::{json, Value};
-use std::{path::PathBuf, process::ExitStatus, sync::Arc};
+use std::{future::Future, path::PathBuf, process::ExitStatus, sync::Arc};
 use thiserror::Error;
-use tokio::process::Command;
+use tokio::{process::Command, sync::oneshot, task::JoinHandle};
 use uuid::Uuid;
 
 const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
@@ -87,6 +89,15 @@ pub enum ReviewError {
 
     #[error("executor execution has no workspace: {0}")]
     ExecutorExecutionMissingWorkspace(Uuid),
+
+    #[error("review execution lease was lost: {execution_id}")]
+    ExecutionLeaseLost { execution_id: String },
+
+    #[error("review execution hard deadline reached: {execution_id}")]
+    ExecutionHardDeadline { execution_id: String },
+
+    #[error("review execution lease could not be claimed: {execution_id}")]
+    ExecutionLeaseUnavailable { execution_id: String },
 }
 
 impl ReviewRunner {
@@ -99,6 +110,23 @@ impl ReviewRunner {
             db,
             event_bus,
             executor: Arc::new(AdapterExecutor::new(adapter_registry)),
+        }
+    }
+
+    /// Return a runner that dispatches through `executor` instead of the raw
+    /// CLI adapter registry.
+    ///
+    /// The embedded runtime is not an adapter: it is routed separately from
+    /// the CLI adapters, so an `AdapterExecutor` answers an embedded reviewer
+    /// with "No adapter registered for executor type: embedded". The review
+    /// path therefore has to share the same routed executor the Task path
+    /// uses, which only the composition root can build.
+    #[must_use]
+    pub fn with_task_executor(&self, executor: Arc<dyn TaskExecutor>) -> Self {
+        Self {
+            db: Arc::clone(&self.db),
+            event_bus: Arc::clone(&self.event_bus),
+            executor,
         }
     }
 
@@ -136,23 +164,73 @@ impl ReviewRunner {
             ReviewError::ExecutorExecutionMissingWorkspace(req.executor_execution_id),
         )?;
 
-        let reviewer_execution = self
+        let (reviewer_execution, reviewer_owner) = self
             .create_reviewer_execution(&task_id, &executor_execution_id, workspace_id.clone(), &req)
             .await?;
         let review = self
             .create_review(&task_id, &reviewer_execution.id, attempt_number)
             .await?;
 
-        let (mut status, mut outcome, step_results, mut failed_step_index) = if ci_steps.is_empty()
-        {
-            (
-                ReviewStatus::Passed,
-                ReviewOutcome::Passed,
-                Vec::new(),
-                None,
-            )
+        let reviewer_lease = ReviewExecutionLease::start(
+            Arc::clone(&self.db),
+            reviewer_execution.clone(),
+            reviewer_owner.clone(),
+        )?;
+        let reviewer_steps = if ci_steps.is_empty() {
+            reviewer_lease
+                .run(async {
+                    Ok::<_, ReviewError>((
+                        ReviewStatus::Passed,
+                        ReviewOutcome::Passed,
+                        Vec::new(),
+                        None,
+                    ))
+                })
+                .await
+                .and_then(|result| result)
         } else {
-            self.run_steps(&req, &reviewer_execution, &ci_steps).await?
+            reviewer_lease
+                .run(self.run_steps(&req, &reviewer_execution, &ci_steps))
+                .await
+                .and_then(|result| result)
+        };
+        let (mut status, mut outcome, step_results, mut failed_step_index) = match reviewer_steps {
+            Ok(result) => {
+                let terminalized = terminalize_review_execution(
+                    &self.db,
+                    &reviewer_execution,
+                    &reviewer_owner,
+                    ExecutionStatus::Completed,
+                    Some(format!("review:{}", review.id)),
+                    None,
+                    ReviewTerminalPolicy::default(),
+                )
+                .await?;
+                if !terminalized {
+                    return Err(ReviewError::ExecutionLeaseLost {
+                        execution_id: reviewer_execution.id.clone(),
+                    });
+                }
+                result
+            }
+            Err(error) => {
+                let terminalized = terminalize_review_execution(
+                    &self.db,
+                    &reviewer_execution,
+                    &reviewer_owner,
+                    ExecutionStatus::Failed,
+                    None,
+                    Some(error.to_string()),
+                    review_terminal_policy(&error),
+                )
+                .await?;
+                if !terminalized {
+                    return Err(ReviewError::ExecutionLeaseLost {
+                        execution_id: reviewer_execution.id.clone(),
+                    });
+                }
+                return Err(error);
+            }
         };
 
         let mut auditor_details = None;
@@ -204,29 +282,6 @@ impl ReviewRunner {
             _ => {}
         }
 
-        ExecutionRepo::update(
-            &*self.db,
-            UpdateExecution {
-                id: reviewer_execution.id.clone(),
-                status: Some(ExecutionStatus::Completed),
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: Some(Some(format!("review:{}", review.id))),
-                logs_path: None,
-                before_sha: None,
-                after_sha: None,
-                error: None,
-                executor_config_snapshot_json: None,
-                updated_at: finished_at,
-            },
-        )
-        .await?;
-
         self.publish_review_event(&task_id, &review, outcome.clone(), failed_step_index);
 
         Ok((review, outcome))
@@ -238,12 +293,14 @@ impl ReviewRunner {
         executor_execution_id: &str,
         workspace_id: String,
         req: &ReviewRequest,
-    ) -> Result<Execution, ReviewError> {
-        let now = now_rfc3339();
-        ExecutionRepo::create(
+    ) -> Result<(Execution, String), ReviewError> {
+        let execution_id = new_uuid_v4().to_string();
+        let lease_claim = ReviewExecutionLease::new_claim(&execution_id);
+        let now = lease_claim.claim.now.clone();
+        let execution = ExecutionRepo::create_with_lease(
             &*self.db,
             CreateExecution {
-                id: new_uuid_v4(),
+                id: execution_id,
                 task_id: task_id.to_owned(),
                 agent_id: None,
                 role: "reviewer".to_string(),
@@ -266,9 +323,11 @@ impl ReviewRunner {
                 created_at: now.clone(),
                 updated_at: now,
             },
+            lease_claim.claim,
         )
         .await
-        .map_err(Into::into)
+        .map_err(ReviewError::from)?;
+        Ok((execution, lease_claim.owner))
     }
 
     async fn create_review(
@@ -405,11 +464,12 @@ impl ReviewRunner {
             &auditor_agent,
         );
         let snapshot = build_auditor_config_snapshot(&auditor_agent, extra_config).await?;
-        let now = now_rfc3339();
-        let auditor_execution = ExecutionRepo::create(
+        let lease_claim = ReviewExecutionLease::new_claim(&auditor_execution_id.to_string());
+        let now = lease_claim.claim.now.clone();
+        let auditor_execution = ExecutionRepo::create_with_lease(
             &*self.db,
             CreateExecution {
-                id: auditor_execution_id.clone(),
+                id: auditor_execution_id.to_string(),
                 task_id: task_id.clone(),
                 agent_id: Some(auditor_agent.id.clone()),
                 role: "auditor".to_string(),
@@ -432,12 +492,18 @@ impl ReviewRunner {
                 created_at: now.clone(),
                 updated_at: now,
             },
+            lease_claim.claim,
         )
         .await?;
 
-        let execution_result = self
-            .executor
-            .execute(ExecutionContext {
+        let auditor_owner = lease_claim.owner;
+        let auditor_lease = ReviewExecutionLease::start(
+            Arc::clone(&self.db),
+            auditor_execution.clone(),
+            auditor_owner.clone(),
+        )?;
+        let (execution_result, lease_error) = match auditor_lease
+            .run(self.executor.execute(ExecutionContext {
                 task_id,
                 execution_id: auditor_execution.id.clone(),
                 worktree_path: req.workspace_path.display().to_string(),
@@ -447,8 +513,15 @@ impl ReviewRunner {
                 heartbeat_interval_seconds: heartbeat_interval(&auditor_agent),
                 max_turns: None,
                 log_sender: None,
-            })
-            .await;
+            }))
+            .await
+        {
+            Ok(result) => (result, None),
+            Err(error) => (
+                Err(executors::ExecutorError::Other(error.to_string())),
+                Some(error),
+            ),
+        };
         let restore_result = git::restore_worktree(&req.workspace_path, &auditor_before_sha)
             .await
             .map_err(|error| {
@@ -465,32 +538,43 @@ impl ReviewRunner {
             (Err(error), Ok(())) => Err(error),
         };
 
+        if let Some(error) = lease_error {
+            let terminalized = terminalize_review_execution(
+                &self.db,
+                &auditor_execution,
+                &auditor_owner,
+                ExecutionStatus::Failed,
+                None,
+                Some(error.to_string()),
+                review_terminal_policy(&error),
+            )
+            .await?;
+            if !terminalized {
+                return Err(ReviewError::ExecutionLeaseLost {
+                    execution_id: auditor_execution.id.clone(),
+                });
+            }
+            return Err(error);
+        }
+
         let result = match execution_result {
             Ok(result) => result,
             Err(error) => {
-                let finished_at = now_rfc3339();
-                ExecutionRepo::update(
-                    &*self.db,
-                    UpdateExecution {
-                        id: auditor_execution.id,
-                        status: Some(ExecutionStatus::Failed),
-                        stop_reason: None,
-                        stopped_by: None,
-                        resume_policy: None,
-                        stopped_at: None,
-                        agent_session_id: None,
-                        agent_message_id: None,
-                        last_activity_at: None,
-                        summary: None,
-                        logs_path: None,
-                        before_sha: None,
-                        after_sha: None,
-                        error: Some(Some(error.to_string())),
-                        executor_config_snapshot_json: None,
-                        updated_at: finished_at,
-                    },
+                let terminalized = terminalize_review_execution(
+                    &self.db,
+                    &auditor_execution,
+                    &auditor_owner,
+                    ExecutionStatus::Failed,
+                    None,
+                    Some(error.to_string()),
+                    ReviewTerminalPolicy::default(),
                 )
                 .await?;
+                if !terminalized {
+                    return Err(ReviewError::ExecutionLeaseLost {
+                        execution_id: auditor_execution.id.clone(),
+                    });
+                }
                 return Ok(Some(AuditorRunResult::failed("auditor_execution_failed")));
             }
         };
@@ -500,29 +584,25 @@ impl ReviewRunner {
             ExecutionOutcome::Failed => ExecutionStatus::Failed,
             ExecutionOutcome::Cancelled => ExecutionStatus::Cancelled,
         };
-        let finished_at = now_rfc3339();
-        ExecutionRepo::update(
-            &*self.db,
-            UpdateExecution {
-                id: auditor_execution.id,
-                status: Some(execution_status),
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                agent_session_id: Some(result.agent_session_id),
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: Some(result.summary),
-                logs_path: None,
-                before_sha: None,
-                after_sha: Some(result.after_sha),
-                error: Some(result.error.clone()),
-                executor_config_snapshot_json: None,
-                updated_at: finished_at,
+        let terminalized = terminalize_review_execution_with_result(
+            &self.db,
+            &auditor_execution,
+            &auditor_owner,
+            ReviewTerminalUpdate {
+                status: execution_status,
+                summary: result.summary,
+                after_sha: result.after_sha,
+                error: result.error.clone(),
+                agent_session_id: result.agent_session_id,
+                policy: ReviewTerminalPolicy::default(),
             },
         )
         .await?;
+        if !terminalized {
+            return Err(ReviewError::ExecutionLeaseLost {
+                execution_id: auditor_execution.id.clone(),
+            });
+        }
 
         if result.status != ExecutionOutcome::Completed {
             return Ok(Some(AuditorRunResult::failed(
@@ -593,6 +673,302 @@ impl ReviewRunner {
             context,
         });
     }
+}
+
+const REVIEW_LEASE_SECONDS: i64 = 30;
+const REVIEW_HARD_DEADLINE_SECONDS: i64 = 30 * 60;
+const REVIEW_HEARTBEAT_SECONDS: u64 = 10;
+
+/// Review and auditor executions are ordinary running executions.  Keep an
+/// authenticated owner lease alive independently of CI/model output so a
+/// quiet provider/tool call is not mistaken for a dead reviewer.
+#[derive(Debug, Clone, Copy)]
+enum ReviewLeaseSignal {
+    OwnerLost,
+    HardDeadline,
+}
+
+struct ReviewLeaseClaim {
+    owner: String,
+    claim: ClaimExecutionLease,
+}
+
+struct ReviewExecutionLease {
+    execution_id: String,
+    owner: String,
+    stop_tx: Option<oneshot::Sender<()>>,
+    heartbeat: JoinHandle<()>,
+    signal_rx: oneshot::Receiver<ReviewLeaseSignal>,
+}
+
+impl ReviewExecutionLease {
+    fn new_claim(execution_id: &str) -> ReviewLeaseClaim {
+        let owner = format!("review-owner:{}", new_uuid_v4());
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let lease_expires_at = (now + ChronoDuration::seconds(REVIEW_LEASE_SECONDS)).to_rfc3339();
+        let hard_deadline_at =
+            (now + ChronoDuration::seconds(REVIEW_HARD_DEADLINE_SECONDS)).to_rfc3339();
+        ReviewLeaseClaim {
+            owner: owner.clone(),
+            claim: ClaimExecutionLease {
+                execution_id: execution_id.to_owned(),
+                expected_version: 1,
+                owner,
+                lease_expires_at,
+                hard_deadline_at,
+                now: now_text,
+            },
+        }
+    }
+
+    fn start(db: Arc<SqliteDb>, claimed: Execution, owner: String) -> Result<Self, ReviewError> {
+        if claimed.status != ExecutionStatus::Running
+            || claimed.lease_owner.as_deref() != Some(owner.as_str())
+        {
+            return Err(ReviewError::ExecutionLeaseUnavailable {
+                execution_id: claimed.id,
+            });
+        }
+
+        let (stop_tx, mut stop_rx) = oneshot::channel();
+        let (signal_tx, signal_rx) = oneshot::channel();
+        let db_for_heartbeat = Arc::clone(&db);
+        let execution_id = claimed.id.clone();
+        let execution_id_for_heartbeat = execution_id.clone();
+        let owner_for_heartbeat = owner.clone();
+        let heartbeat = tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(REVIEW_HEARTBEAT_SECONDS));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    _ = interval.tick() => {
+                        let now = Utc::now();
+                        let now_text = now.to_rfc3339();
+                        let proposed_expiry = now + ChronoDuration::seconds(REVIEW_LEASE_SECONDS);
+                        let lease_expires_at = claimed
+                            .hard_deadline_at
+                            .as_deref()
+                            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                            .map(|hard_deadline| {
+                                std::cmp::min(
+                                    proposed_expiry,
+                                    hard_deadline.with_timezone(&Utc),
+                                )
+                                .to_rfc3339()
+                            })
+                            .unwrap_or_else(|| proposed_expiry.to_rfc3339());
+
+                        // The heartbeat loop owns the latest execution
+                        // version by re-reading after each CAS.  This keeps
+                        // terminalization after a long future from using a
+                        // stale version after a renewal.
+                        let current = match ExecutionRepo::get_by_id(&*db_for_heartbeat, &execution_id_for_heartbeat).await {
+                            Ok(Some(current)) => current,
+                            Ok(None) => {
+                                let _ = signal_tx.send(ReviewLeaseSignal::OwnerLost);
+                                break;
+                            }
+                            Err(error) => {
+                                tracing::debug!(
+                                    execution_id = %execution_id_for_heartbeat,
+                                    %error,
+                                    "review execution lease read failed; expiry monitor remains authoritative"
+                                );
+                                continue;
+                            }
+                        };
+                        if current.status != ExecutionStatus::Running
+                            || current.lease_owner.as_deref() != Some(owner_for_heartbeat.as_str())
+                        {
+                            let _ = signal_tx.send(ReviewLeaseSignal::OwnerLost);
+                            break;
+                        }
+                        match ExecutionRepo::renew_lease(
+                            &*db_for_heartbeat,
+                            RenewExecutionLease {
+                                execution_id: execution_id_for_heartbeat.clone(),
+                                expected_version: current.execution_version,
+                                owner: owner_for_heartbeat.clone(),
+                                lease_expires_at,
+                                now: now_text,
+                            },
+                        ).await {
+                            Ok(ExecutionLeaseMutation::Updated(_)) => {}
+                            Ok(ExecutionLeaseMutation::Concurrent { current: Some(current) })
+                                if current.status == ExecutionStatus::Running
+                                    && current.lease_owner.as_deref() == Some(owner_for_heartbeat.as_str()) => {}
+                            Ok(ExecutionLeaseMutation::Concurrent { .. }) => {
+                                let _ = signal_tx.send(ReviewLeaseSignal::OwnerLost);
+                                break;
+                            }
+                            Ok(ExecutionLeaseMutation::HardDeadline { .. }) => {
+                                let _ = signal_tx.send(ReviewLeaseSignal::HardDeadline);
+                                break;
+                            }
+                            Err(error) => {
+                                tracing::debug!(
+                                    execution_id = %execution_id_for_heartbeat,
+                                    %error,
+                                    "review execution lease renewal failed; expiry monitor remains authoritative"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            execution_id,
+            owner,
+            stop_tx: Some(stop_tx),
+            heartbeat,
+            signal_rx,
+        })
+    }
+
+    async fn run<F, T, E>(self, future: F) -> Result<Result<T, E>, ReviewError>
+    where
+        F: Future<Output = Result<T, E>>,
+    {
+        let Self {
+            execution_id,
+            owner: _owner,
+            mut stop_tx,
+            heartbeat,
+            mut signal_rx,
+        } = self;
+        tokio::pin!(future);
+        let result = tokio::select! {
+            result = &mut future => Ok(result),
+            signal = &mut signal_rx => Err(match signal {
+                Ok(ReviewLeaseSignal::OwnerLost) | Err(_) => {
+                    ReviewError::ExecutionLeaseLost { execution_id }
+                }
+                Ok(ReviewLeaseSignal::HardDeadline) => {
+                    ReviewError::ExecutionHardDeadline { execution_id }
+                }
+            }),
+        };
+        if let Some(stop_tx) = stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        let _ = heartbeat.await;
+        result
+    }
+}
+
+async fn terminalize_review_execution(
+    db: &SqliteDb,
+    execution: &Execution,
+    owner: &str,
+    status: ExecutionStatus,
+    summary: Option<String>,
+    error: Option<String>,
+    policy: ReviewTerminalPolicy,
+) -> Result<bool, ReviewError> {
+    terminalize_review_execution_with_result(
+        db,
+        execution,
+        owner,
+        ReviewTerminalUpdate {
+            status,
+            summary,
+            after_sha: None,
+            error,
+            agent_session_id: None,
+            policy,
+        },
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReviewTerminalPolicy {
+    stop_reason: Option<db::StopReason>,
+    stopped_by: Option<String>,
+    resume_policy: Option<db::ResumePolicy>,
+}
+
+fn review_terminal_policy(error: &ReviewError) -> ReviewTerminalPolicy {
+    if matches!(error, ReviewError::ExecutionHardDeadline { .. }) {
+        ReviewTerminalPolicy {
+            stop_reason: Some(db::StopReason::AgentTimeout),
+            stopped_by: Some("system:heartbeat_monitor".to_owned()),
+            resume_policy: Some(db::ResumePolicy::Manual),
+        }
+    } else {
+        ReviewTerminalPolicy::default()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ReviewTerminalUpdate {
+    status: ExecutionStatus,
+    summary: Option<String>,
+    after_sha: Option<String>,
+    error: Option<String>,
+    agent_session_id: Option<String>,
+    policy: ReviewTerminalPolicy,
+}
+
+async fn terminalize_review_execution_with_result(
+    db: &SqliteDb,
+    execution: &Execution,
+    owner: &str,
+    update: ReviewTerminalUpdate,
+) -> Result<bool, ReviewError> {
+    let mut candidate = execution.clone();
+    for _ in 0..3 {
+        let updated_at = now_rfc3339();
+        let outcome = ExecutionRepo::terminalize(
+            db,
+            TerminalizeExecution {
+                execution_id: candidate.id.clone(),
+                expected_version: candidate.execution_version,
+                lease_owner: Some(owner.to_owned()),
+                status: update.status.clone(),
+                stop_reason: update.policy.stop_reason.clone().map(Some),
+                stopped_by: update.policy.stopped_by.clone().map(Some),
+                stopped_at: Some(Some(updated_at.clone())),
+                resume_policy: update.policy.resume_policy.clone().map(Some),
+                agent_session_id: Some(update.agent_session_id.clone()),
+                agent_message_id: None,
+                last_activity_at: None,
+                last_progress_at: None,
+                summary: Some(update.summary.clone()),
+                logs_path: None,
+                before_sha: None,
+                after_sha: Some(update.after_sha.clone()),
+                error: Some(update.error.clone()),
+                executor_config_snapshot_json: None,
+                updated_at,
+                actor_type: "system".to_owned(),
+                actor_id: Some("review".to_owned()),
+                correlation_id: Some(candidate.id.clone()),
+                causation_id: None,
+                causation_depth: 0,
+                lease_disposition: ExecutionLeaseDisposition::Revoke,
+            },
+        )
+        .await?;
+        match outcome {
+            ExecutionTerminalOutcome::Committed { .. } => return Ok(true),
+            ExecutionTerminalOutcome::Concurrent {
+                current: Some(current),
+            } if current.status == ExecutionStatus::Running
+                && current.lease_owner.as_deref() == Some(owner) =>
+            {
+                candidate = current;
+            }
+            ExecutionTerminalOutcome::Concurrent { .. } => return Ok(false),
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -822,6 +1198,13 @@ async fn last_assistant_message(logs_path: &str) -> Result<String, ReviewError> 
         };
         if entry.kind == LogKind::Assistant {
             append_assistant_log_text(&entry.payload, &mut message);
+        } else if entry.kind == LogKind::Stdout {
+            // A shell auditor has no assistant channel: its verdict marker is
+            // ordinary stdout. Reading only assistant text made every shell
+            // auditor fail as "verdict marker missing" even when it printed
+            // the marker. This is the auditor's own log, so its stdout is as
+            // authoritative here as an agent's final message.
+            append_stdout_log_text(&entry.payload, &mut message);
         } else if entry.kind == LogKind::SessionInfo
             && entry.payload.get("subtype").and_then(Value::as_str) == Some("success")
         {
@@ -831,6 +1214,16 @@ async fn last_assistant_message(logs_path: &str) -> Result<String, ReviewError> 
         }
     }
     Ok(message)
+}
+
+fn append_stdout_log_text(payload: &Value, message: &mut String) {
+    for key in ["line", "text", "content"] {
+        if let Some(text) = payload.get(key).and_then(Value::as_str) {
+            message.push_str(text);
+            message.push('\n');
+            return;
+        }
+    }
 }
 
 fn append_assistant_log_text(payload: &Value, message: &mut String) {

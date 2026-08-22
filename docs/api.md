@@ -31,6 +31,7 @@ database for historical provenance.
 | PATCH  | `/api/v1/projects/{id}` | Update project |
 | DELETE | `/api/v1/projects/{id}` | Delete a Project through the guarded, transactional teardown of its Project-owned records |
 | GET    | `/api/v1/projects/{id}/analytics` | Read Project analytics (CI steps, review summary, token and cost breakdown by model and by agent) |
+| GET    | `/api/v1/mission-control` | Read authorized attention, work, health, and bounded coordination activity projections; optional `project_id` restricts the feed to that Project |
 | GET    | `/api/v1/account/main-agent/product-genesis/{session_id}/charter` | Read the active Genesis Charter and revision/approval state |
 | POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/charter/revisions` | Append an immutable Genesis Charter draft revision |
 | POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/charter/revisions/{revision_id}/approve` | Create the exact principal-bound, single-use Charter approval receipt |
@@ -80,10 +81,15 @@ database for historical provenance.
 | DELETE | `/api/v1/projects/{id}/milestones/{milestone_id}/evidence/{evidence_id}` | Remove a milestone evidence attachment (release pins remain immutable) |
 | GET    | `/api/v1/projects/{id}/overview` | Read the derived Project Overview projection |
 | GET    | `/api/v1/projects/{id}/execution-baseline` | Read the Project's current execution-baseline proposal/approval projection |
-| POST   | `/api/v1/projects/{id}/execution-baseline` | Propose one Project execution-baseline shell; the `baseline_id` is server-minted and returned in the response (the request body carries only the mutation envelope) |
-| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions` | Append an exact, digest-bound execution-baseline revision |
+| GET    | `/api/v1/projects/{id}/execution-setup` | Read independent coordination, execution-setup, and baseline-gate state plus eligible Worker/reviewer identities |
+| POST   | `/api/v1/projects/{id}/execution-setup/worker` | Project owner/admin selects an eligible Worker identity with `expected_project_version` and `idempotency_key` |
+| POST   | `/api/v1/projects/{id}/execution-setup/independent-reviewer` | Project owner/admin selects a distinct eligible independent reviewer with `expected_project_version` and `idempotency_key` |
+| POST   | `/api/v1/projects/{id}/execution-setup/repository` | Project owner/admin attaches a repository with `expected_project_version` and `idempotency_key` |
+| POST   | `/api/v1/projects/{id}/execution-setup/provisioning/retry` | Project owner/admin retries the durable, finite provisioning operation with `expected_operation_version` and `idempotency_key` |
+| POST   | `/api/v1/projects/{id}/execution-baseline` | Save the first complete or incomplete execution-baseline candidate as a `draft`; the request must carry `operation: "save_draft"`, the candidate content, canonical rendered view/digests, provenance, and `mutation.expected_version: 0` (the baseline id is server-minted) |
+| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions` | Save an exact digest-bound revision with explicit `operation: "save_draft"` or `"propose_for_approval"`; only the latter returns `requires_user_authorization: true` and a frozen `approval_target` |
 | POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions/{revision_id}/approve` | Record the exact authenticated user's baseline approval receipt |
-| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/activate` | Activate the exact user-approved baseline and promote matching preplanned Tasks: rows bound to the activated revision flip runnable, non-terminal Tasks naming a covered plan item are re-bound to it, and a missing Project primary-milestone pointer is set from the baseline's primary (or only) active milestone |
+| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/activate` | Activate the exact user-approved baseline; the request supplies both `mutation.expected_version` (Project version) and `expected_baseline_version` (baseline version), then atomically promotes matching preplanned Tasks and fills a missing Project primary-milestone pointer from the baseline's primary (or only) active milestone |
 | GET    | `/api/v1/projects/{id}/memory/search` | Search project memory |
 | GET    | `/api/v1/memory/{id}` | Get memory item |
 | POST   | `/api/v1/memory/{id}/publish` | Explicitly publish an owned private assertion into an authorized scope |
@@ -198,12 +204,11 @@ database for historical provenance.
 | POST   | `/api/v1/questions/{id}/answer` | Answer an authorized question |
 | GET    | `/api/v1/agents/{id}/actions` | List auditable proposals for an owned identity |
 | POST   | `/api/v1/agents/{id}/actions` | Create a typed proposal; Forge derives permission and policy server-side |
-| POST   | `/api/v1/agents/{id}/task-proposals` | Create a typed Task proposal in an admitted Project scope |
+| POST   | `/api/v1/agents/{id}/task-proposals` | Execute an admitted typed Task command in a Project scope; returns its durable receipt and Task |
 | GET    | `/api/v1/actions/{id}` | Get an authorized proposal and its server policy result |
 | POST   | `/api/v1/actions/{id}/approve` | Record an independent, scope-authorized approval/denial |
 | POST   | `/api/v1/actions/{id}/execute` | Record an admitted action execution idempotently |
 | POST   | `/api/v1/actions/{id}/execute-orchestration` | Materialize a Main Charter/Project orchestration proposal through its typed domain executor; generic execution rejects these operations |
-| POST   | `/api/v1/actions/{id}/execute-task` | Create the authoritative Task through TaskService and audit the outcome |
 | GET    | `/api/v1/tasks/{id}/executions` | List executions |
 | GET    | `/api/v1/executions/{id}` | Get execution |
 | GET    | `/api/v1/executions/{id}/logs` | Get execution logs |
@@ -333,8 +338,8 @@ approval still validates the exact identity/profile/skill/policy revision set
 the client submits.
 
 Charter lifecycle moments are anchored in the Main Chat history as durable
-system messages: saving a revision (either route or the Main Agent's
-`charter.draft` action), recording an approval receipt, and creating the
+system messages: saving a revision (either route or the Main Agent's direct
+`charter.draft` command), recording an approval receipt, and creating the
 Project each append one. The message ids are deterministic
 (`charter-proposal:{revision_id}`, `charter-approval:{approval_id}`,
 `genesis-project-created:{project_id}`), so replays never duplicate an anchor,
@@ -342,11 +347,16 @@ and the appends are best-effort — they never fail the committed mutation.
 
 On success, one transaction creates the Project, Project Agent binding, Project
 Chat, Charter attachment, bounded immutable handoff, target message/turn job,
+the durable Genesis provisioning operation with its five pending checkpoints,
 domain events, Genesis `handed_off` state, and consumed receipt. There is no
 `handoff_pending` state. Any failure rolls back every record, leaves Genesis
 `ready_for_project` and the receipt `active`, and can be retried with the same
-receipt/idempotency key. A replay after a committed response loss returns the
-original Project and handoff identities without creating a duplicate.
+receipt/idempotency key. The response includes the committed Project/handoff
+identities plus `execution_setup`, a current setup projection that may report
+`provisioning` or `setup_required` without treating the committed Project
+creation as failed. A replay returns the frozen original IDs from the receipt
+and refreshes only `execution_setup`, so it reflects current provisioning state
+without creating a duplicate Project, repository, or operation.
 
 After attachment, Charter ownership is Project-scoped: later revisions or
 adoption proposals use the Project Charter routes, not Main Genesis routes.
@@ -354,7 +364,12 @@ Genesis does not accept raw Project or chat IDs as authority. A normal
 authorized human/API `POST /api/v1/projects` may still create an explicit
 `legacy_unverified`/`charter_setup_required` Project, but it cannot invent a
 user approval; release remains blocked until the user approves an exact
-adoption Charter revision.
+adoption Charter revision. Its response is the committed `ProjectResponse`
+with a non-null `execution_setup` field. That field is the current canonical
+projection of the independent `coordination_state`, `execution_setup_state`,
+and `execution_gate` dimensions; clients must not treat Project creation or
+any one dimension as evidence that the other two are ready. The same
+projection is available at `GET /api/v1/projects/{id}/execution-setup`.
 
 Approval and manual-check idempotency is scoped by operation, Project (or the
 account during pre-Project Genesis), and authenticated principal. Reusing the
@@ -481,6 +496,24 @@ binding can be inferred is marked `agent_setup_required`; Project and Task data
 remain readable and usable, but Project Agent turns are unavailable until the
 user selects an identity. A primary Worker is never inferred as the binding.
 
+## Mission Control coordination activity
+
+`GET /api/v1/mission-control` includes a bounded, newest-first
+`coordination_activity` projection alongside attention and work items. Each
+entry is either a committed `direct_command` receipt or an `approval_action`
+whose `AgentAction` is still `pending_approval` or has been `approved`.
+Entries carry actor, canonical scope, operation, input digest, policy result,
+status, correlation id, optional committed outcome, and occurrence time. The
+projection never returns an action payload body.
+
+Without `project_id`, authorized account/Main activity and all visible Project
+activity are included. Account/Main Chat entries are visible only to the
+account owner; Project and Project Chat/task entries require Project access.
+With `project_id`, the feed is restricted to that Project (including its
+Project Chat/task scopes) and intentionally excludes account/Main activity.
+Direct receipts linked to an `AgentActionExecution` are omitted from the
+direct stream so one approved execution cannot appear twice.
+
 ## Commitments, inbox, and typed actions
 
 Coordination endpoints are authenticated and least-authority scoped. An
@@ -518,18 +551,23 @@ outcome. Protected approvals require an independently authorized active
 identity in the same scope and reject self-approval. Executions are
 idempotent by action/idempotency key.
 
-`task.propose` is available through the typed Task proposal endpoint. Its
-execution validates the Project Agent binding and proposal contract, then calls
-the existing `TaskService`; the resulting Task/workspace/workflow authority
-is not replaced by the action envelope. A denied or invalid proposal is never
-listed as a Task. The exact closed proposal payload is validated before the
-action ledger accepts it. For a Charter-backed Project, an omitted governance
-object is derived from the current Charter: implementation Tasks remain
-non-runnable until a matching baseline activates them, while pre-baseline
-`planning_task` and `discovery` claims are restricted to the read-only lane.
+`task.propose` is available through the typed Task proposal endpoint. An
+automatically admitted request invokes one atomic `TaskService` command: the
+Task, derived governance projection, durable `task.created` event, and direct
+command receipt become visible together. It does not create an `AgentAction` or
+`AgentActionExecution`; the receipt principal is the authenticated user while
+the selected Project Agent remains the source actor. A response-loss retry
+with the same canonical input returns the frozen original Task; reusing the
+key with changed input or principal is an idempotency conflict. A denied or
+invalid proposal is never listed as a Task. The exact closed proposal payload
+is validated before the command runs. For a Charter-backed Project, an omitted
+governance object is derived from the current Charter: implementation Tasks
+remain non-runnable until a matching baseline activates them, while
+pre-baseline `planning_task` and `discovery` claims are restricted to the
+read-only lane.
 `task_type`, when present, is the same closed enum as normal
 Task creation: `task`, `planning_task`, `sub_task`, or `discovery`; unknown
-values are rejected before an action is admitted. Terminal Task delivery,
+values are rejected before the command is admitted. Terminal Task delivery,
 blocked, failed, and cancelled
 events are reconciled by the durable `agent-coordination-outcomes` consumer:
 the originating proposal inbox is acknowledged, one task-outcome inbox item
@@ -537,12 +575,27 @@ is delivered, and successful delivery adds evidence and completes the linked
 commitment exactly once. Cursor replay after restart uses event-derived
 dedupe keys and cannot duplicate those projections.
 
-Main orchestration proposals use the dedicated
-`POST /api/v1/actions/{id}/execute-orchestration` route. The service resolves
-account and Main-Chat scope from the action's bound identity, then performs the
-canonical Charter repository operation for `charter.draft`,
-`charter.readiness`, `charter.diff`, and `charter.approval_target`. A
-`project.create` proposal is user-only: Forge rechecks the exact active Charter
+The native Project Agent also exposes the ReadyOnly `task.adaptive` operation
+on the Coordination surface (Project scope and Project Agent Chat scope only).
+Its closed payload is one of `split`, `sequence`, or `replace`, and always
+includes `source_task_id`, `expected_task_version`,
+`expected_board_revision`, and `rationale`; the action-specific fields are a
+non-empty child `items` list, an ordered Task-id list, or replacement
+`title`/optional `description`. Project, scope, actor, permission,
+governance, and fixed-boundary values are derived from the authenticated
+binding and active baseline; unknown or override fields are rejected. The
+adapter calls the shared Task command directly, creates no `AgentAction`, and
+returns bounded receipt/event, source Task, Task-id, board-revision, and
+`replayed` fields. Exact retries replay the frozen receipt result before
+mutable governance is rechecked; a changed payload under the same key is an
+idempotency conflict. This is a native operation only; no REST or MCP dotted
+operation is added.
+
+Main Charter drafts execute directly through the shared Genesis command, while
+Charter reads/readiness/diffs/approval targets use the query boundary and do
+not create Actions. Approval-backed Main orchestration uses the dedicated
+`POST /api/v1/actions/{id}/execute-orchestration` route. A `project.create`
+proposal is user-only: Forge rechecks the exact active Charter
 approval receipt, selected identity/profile/operating-skill/policy revisions,
 canonical digests, and authenticated approving principal before invoking the
 atomic `CreateProjectFromCharterApproval` transaction. The generic
@@ -550,6 +603,35 @@ atomic `CreateProjectFromCharterApproval` transaction. The generic
 cannot masquerade as a persisted Charter revision or Project handoff. Both
 typed execution and the underlying Charter/Project mutation require the action
 version and idempotency key; replays return the committed execution/result.
+
+Native Project coordination uses the same catalog boundary. Closed safe
+Document, Decision, Charter-adoption, execution-baseline, Milestone, evidence,
+and readiness subactions execute through their shared command services and
+return a committed receipt/event without an Action id. Release requests and
+any other approval-required subaction remain pending `AgentAction` records
+until their authorized executor commits the domain command. Exact direct
+replays return the frozen receipt result even if mutable binding or Profile
+policy changes after the first commit; a receipt miss is reauthorized before
+mutation.
+
+Project Agent execution-baseline proposals use the typed
+`project.execution_baseline` operation. Every payload supplies canonical
+`content`, `rendered_view`, `render_version`, `content_digest`,
+`render_digest`, and revision provenance. `draft_revision` creates a
+server-identified baseline when `baseline_id` is absent; `draft_revision` and
+`revise` both persist `draft`. `propose_approval` requires an existing baseline
+and exact positive `expected_baseline_version`, persists `proposed`, and returns
+the frozen approval target with `requires_user_authorization=true`. The native
+adapter never approves or activates a baseline and applies the same shared
+ArtifactRef, milestone-definition, Charter, policy, version, digest, and
+reconciliation checks as REST.
+
+Project Agent evidence proposals use the typed `project.evidence` operation.
+An `attach` payload must include the current positive
+`expected_milestone_version` alongside `milestone_id`, `asset_id`, `caption`,
+`kind`, and `checksum`. Forge preserves receipt-first replay for an identical
+retry, but a new proposal with a stale milestone version fails the same
+compare-and-swap check as the REST evidence route.
 
 ## Agent Chats
 
@@ -563,14 +645,34 @@ without rebinding. The binding row's stored profile reference is a bind-time
 snapshot reserved for future per-binding overrides. Connected but unbound
 identities do not create additional chats.
 
-Message admission authorizes the chat and current binding, applies content
-guards, appends one immutable user message, creates exactly one queued turn job,
-and records matching domain events in one short transaction. The turn then
-executes outside that transaction and exposes only the finite states `queued`,
-`leased`, `retry_wait`, `succeeded`, `failed`, and `cancelled`. Expiring leases,
-finite attempt budgets, optimistic versions, and idempotency keys make retries
-observable and prevent duplicate assistant messages. A missing assistant
-message with a non-success turn is never rendered as a completed exchange.
+User messages, Main-to-Project handoffs, and policy-admitted wakes share one
+turn-admission service. Admission authorizes the chat and current binding,
+resolves the identity's current Profile plus operating-skill and policy
+revisions, freezes their IDs/versions/digests and canonical scope on the turn,
+applies content guards, appends one immutable trigger message, creates exactly
+one queued turn job, and records matching domain events in one short
+transaction. Trigger-specific provenance remains distinguishable, but no
+producer can substitute a different responder or runner. Explicit retry uses
+the admitted frozen snapshot; only a newly admitted turn observes later
+binding, Profile, skill, or policy changes. A worker retry of a `retry_wait`
+job reuses that same admitted job and frozen provenance; it does not resolve
+the current binding or Profile again.
+
+The turn executes outside that transaction and exposes only the finite states
+`queued`, `leased`, `awaiting_input`, `retry_wait`, `succeeded`, `failed`, and
+`cancelled`. `awaiting_input` means the turn has a pending protected
+interaction and is not a terminal result. Expiring leases, finite attempt
+budgets, optimistic versions, and idempotency keys make retries observable
+and prevent duplicate assistant messages. A missing assistant message with a
+non-success turn is never rendered as a completed exchange.
+
+The durable wake consumer records exactly one disposition for every claimed
+wake: `turn_admitted`, `deterministically_suppressed`, `deferred`, or
+`setup_required`. Those dispositions are delivery provenance, not a separate
+REST resource or generated API type; no wake-disposition endpoint is exposed.
+REST callers observe an admitted wake through the normal
+`AgentChatTurnJobResponse` and its finite turn status, while setup blockers use
+the Project execution-setup projection and documented REST error details.
 Cancellation is allowed only for an authorized non-terminal turn and requires
 its current optimistic version plus an idempotency key; stale or terminal
 requests return a conflict instead of rewriting the durable outcome.
@@ -647,6 +749,34 @@ the rules in `project.project_hooks_json`; saving rules does not run hook
 actions. Omitting `project_hooks` leaves existing rules unchanged; sending an
 empty array clears all rules.
 
+### Project execution setup
+
+`GET /api/v1/projects/{id}/execution-setup` is the canonical setup projection.
+It reports `coordination_state`, `execution_setup_state`, and `execution_gate`
+independently, along with the current repository, selected principals, eligible
+identities, typed setup requirements, and the durable provisioning operation
+when one exists.
+
+The response also includes `availability` for each dimension. `current` means
+the authoritative rows were read; `unavailable` (with a `refresh_and_retry`
+action) means that dimension must not be inferred from the other two. A
+backfilled local repository may report `repository_initialized=skipped` with
+`filesystem_verified=false`: V087 verifies only persisted repository linkage,
+workflow/baseline role requirements, and effectively eligible identities. It
+does not inspect the filesystem or fabricate a successful initialization.
+
+The Worker, independent-reviewer, and repository actions are owner/admin-only
+and use optimistic concurrency. Each request supplies the version shown by
+the projection plus a non-empty `idempotency_key`; committed receipts replay
+the original accepted command/effect and reject the same key when its input
+changes. The response after a replay is a fresh canonical setup projection,
+so it may include later durable provisioning progress.
+The reviewer must be a distinct eligible identity from the Worker. Provider
+and model reuse is allowed when the identities are distinct, while active Main
+and Project Agent coordinator identities are excluded by the shared
+eligibility resolver. Provisioning retry delegates to the durable finite
+operation and never creates a second repository as a retry side effect.
+
 Project hook validation rejects unsupported trigger and action types, the
 `task.stuck` trigger in v1, empty rule `id`, empty rule `name`, and empty
 required action strings such as `dispatch_agent.agent_id`.
@@ -665,6 +795,45 @@ names, and state kind, with unknown states defaulting to `working`.
 response-build time from the project's resolved workflow and the task's current
 `status`; it is not persisted. The value is one of `backlog`, `ready`,
 `working`, `review`, or `done`. Cancelled workflow states map to `done`.
+
+## Execution status and liveness
+
+`GET /api/v1/executions/{id}` and the execution items returned by
+`GET /api/v1/tasks/{id}/executions` include an owner-bound liveness projection
+in the `ExecutionResponse`. The fields intentionally distinguish the
+optimistic execution version and owner lease from semantic progress:
+
+```json
+{
+  "execution_version": 4,
+  "lease_owner": "execution-owner:opaque-reference",
+  "owner_health": "healthy",
+  "lease_expires_at": "2026-08-21T16:00:30Z",
+  "hard_deadline_at": "2026-08-21T16:30:00Z",
+  "last_heartbeat_at": "2026-08-21T15:59:30Z",
+  "last_progress_at": "2026-08-21T15:58:42Z",
+  "liveness_warning": null,
+  "interruption": null
+}
+```
+
+`owner_health` is `healthy` only when a running execution has a current owner
+lease, `expired` when that lease is past its expiry, `unknown` when ownership
+cannot be verified, and `unowned` for terminal executions. A quiet provider or
+tool call can therefore remain `healthy` while `last_progress_at` is older;
+semantic output does not serve as the owner heartbeat. `hard_deadline_at` is a
+fixed capability/profile bound and cannot be extended by heartbeat renewal.
+`liveness_warning` is a bounded owner/deadline recovery code such as
+`owner_lease_expired`, `owner_lease_unverified`, or `hard_deadline_reached`.
+Stale semantic progress is projected separately as a `progress_warning`
+Attention incident and does not change owner health. Terminal interruption
+metadata is present only when a terminal outcome has a stop reason or failure
+interruption.
+
+`lease_owner` is an opaque, server-owned reference for diagnostics only. It is
+not an authentication credential, bearer token, provider secret, or connection
+handle. Clients must not use it to renew, cancel, or terminalize an execution;
+those operations remain authorized server-side CAS operations.
 
 ## Agent execution options
 
@@ -1404,8 +1573,8 @@ envelope when mirrored, with `event_type`, `entity_id`, and `timestamp`.
 | `project.decision.approved` | `{ "project_id": "...", "candidate_id": "...", "decision_id": "..." }` |
 | `project.decision.candidate_rejected` | `{ "project_id": "...", "candidate_id": "...", "reason": "..." }` |
 | `project.decision.created` | `{ "project_id": "...", "decision_id": "...", "state": "active", "decision_class": "..." }` |
-| `project.execution_baseline.proposed` | `{ "project_id": "...", "baseline_id": "..." }` |
-| `project.execution_baseline.revised` | `{ "project_id": "...", "baseline_id": "...", "revision_id": "...", "content_digest": "...", "render_digest": "..." }` |
+| `project.execution_baseline.draft_saved` | `{ "operation": "save_draft", "project_id": "...", "baseline_id": "...", "revision_id": "...", "revision": 1, "lifecycle": "draft", "result": { ... } }` |
+| `project.execution_baseline.proposed` | `{ "operation": "propose_for_approval", "project_id": "...", "baseline_id": "...", "revision_id": "...", "revision": 2, "lifecycle": "proposed", "result": { ... } }` |
 | `project.execution_baseline.approved` | `{ "project_id": "...", "baseline_id": "...", "revision_id": "...", "approval_id": "..." }` |
 | `project.execution_baseline.activated` | `{ "project_id": "...", "baseline_id": "...", "revision_id": "..." }` |
 | `task.media.uploaded` | `{ "task_id": "...", "media_id": "...", "content_type": "...", "byte_size": 12345, "filename": "evidence.png" }` |
@@ -1467,6 +1636,140 @@ Common HTTP mappings:
 | 412 | Workflow guard rejection (`before_exit` blocked the transition) |
 | 422 | Illegal state transition |
 | 500 | Internal error |
+
+Execution-setup mutations that cannot proceed because a required principal,
+repository, or other prerequisite is missing return HTTP `409` with code
+`execution_setup_required`. The response's `details.setup_requirements` array
+contains the typed missing requirements and permitted remediation actions;
+clients must not infer readiness from the HTTP status of Project creation or
+from a different setup dimension.
+
+For service-level invalid command arguments, REST returns HTTP 400 with code
+`validation_error`, matching the native orchestration outcome code. Transport
+and endpoint-specific validation may use their documented endpoint code.
+
+### Native and MCP orchestration outcomes
+
+Native and MCP orchestration commands use one shared model-facing
+`OrchestrationOutcome` envelope. Callers branch on `code` and typed fields;
+they must not classify an outcome by parsing `safe_message`.
+
+The envelope has these fields:
+
+```json
+{
+  "code": "ok",
+  "status": "succeeded",
+  "operation": "project.document",
+  "scope": { "scope_type": "project", "scope_id": "project-uuid" },
+  "result": {},
+  "approval_target": null,
+  "setup_requirements": null,
+  "current_version_or_revision": null,
+  "retry": null,
+  "safe_message": "command completed",
+  "correlation_id": "correlation-uuid",
+  "replayed": false,
+  "receipt_id": "receipt-uuid",
+  "event_id": "event-uuid"
+}
+```
+
+`result`, `approval_target`, `setup_requirements`,
+`current_version_or_revision`, `retry`, `receipt_id`, and `event_id` are
+optional and omitted when they do not apply; the `null` entries above are
+schema placeholders. `scope.scope_type` is one of `account`,
+`project`, `agent_chat`, or `task`. `result` is the operation-specific
+committed value; `receipt_id` and `event_id` identify the durable command
+records when the operation produced them.
+
+`code` is one of:
+
+| Code | Meaning |
+|------|---------|
+| `ok` | The domain command succeeded. |
+| `approval_required` | An exact approval target was created or returned; the domain operation is not represented as fully authorized or committed. |
+| `setup_required` | A required Worker, reviewer, repository, binding, or other execution prerequisite is missing. |
+| `version_conflict` | An authorized mutable version or base revision is stale. |
+| `digest_conflict` | The submitted content/render digest does not match the authorized candidate. |
+| `idempotency_conflict` | The idempotency key is already bound to a different request. |
+| `policy_denied` | The operation is not admitted for the authenticated scope. |
+| `not_found` | The authorized resource is unavailable. |
+| `transient_failure` | The operation may succeed after the bounded retry guidance is followed. |
+| `internal_failure` | The operation failed without a safe caller-facing diagnosis. |
+| `validation_error` | The operation or its closed arguments are invalid. |
+
+`status` is one of `succeeded`, `approval_required`, `setup_required`, or
+`failed`. `ok` maps to `succeeded`; `approval_required` and `setup_required`
+retain their named statuses; all conflict, denial, not-found, transient,
+internal, and validation codes map to `failed`. Replay is never a status:
+`replayed: true` means that the frozen result was returned for an exact
+response-loss retry, while the original status and result remain unchanged.
+
+The optional corrective fields are typed and bounded:
+
+- `approval_target` identifies the exact target, operation, version/revision,
+  digests, and `requires_user_authorization` flag.
+- `setup_requirements` lists the missing requirement type and, when safe, its
+  resource, role/capability, and permitted remediation action.
+- `current_version_or_revision` contains only an authorized resource identity,
+  current version/revision, and applicable content/render digests.
+- `retry` contains an action, `retryable`, optional `after_seconds`, and a
+  typed `arguments` map. Actions include `refresh_and_retry`,
+  `use_new_idempotency_key`, `repropose`, `reauthorize`, `complete_setup`,
+  `retry_after`, `correct_input`, `select_worker`,
+  `select_independent_reviewer`, `attach_repository`, and
+  `retry_provisioning`.
+
+Current-state and corrective data are loaded only after the caller's identity
+and canonical scope have been authorized, and only for resources that caller
+may inspect. Forge omits those fields rather than leaking cross-scope state.
+An `idempotency_conflict` never loads current resource state; its safe action
+is to use a new key. Protected persistence/runtime causes are retained in
+operator diagnostics and redacted from the envelope. `safe_message` is bounded
+guidance, and `correlation_id` is the handle for authorized support/log
+correlation.
+
+Native agent tools return domain failures in-band as the structured tool value
+with the runtime error marker (`is_error: true`), so the model can branch on
+the envelope without receiving free-form provider or database errors. MCP
+known-tool failures likewise return a successful JSON-RPC response whose
+`result` has `isError: true`, the same envelope in `structuredContent`, and a
+JSON text representation in `content`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "result": {
+    "isError": true,
+    "structuredContent": {
+      "code": "version_conflict",
+      "status": "failed",
+      "operation": "project.document.save",
+      "scope": { "scope_type": "project", "scope_id": "project-uuid" },
+      "current_version_or_revision": {
+        "resource_type": "document",
+        "resource_id": "document-uuid",
+        "version": 7
+      },
+      "retry": {
+        "action": "refresh_and_retry",
+        "retryable": true,
+        "arguments": { "expected_document_version": 7 }
+      },
+      "safe_message": "the authorized resource version changed; refresh before retrying",
+      "correlation_id": "correlation-uuid",
+      "replayed": false
+    },
+    "content": [{ "type": "text", "text": "{...same outcome JSON...}" }]
+  }
+}
+```
+
+JSON-RPC parse/invalid-request errors, unknown methods, and other protocol
+failures remain top-level JSON-RPC `error` responses. They are not converted
+into a known-tool `result` and do not use the orchestration envelope.
 
 ## Server-Sent Events
 
@@ -1548,10 +1851,27 @@ Task IDs are only references that Forge authorizes.
 
 Disable the endpoint with `forge --no-mcp` if you don't want it.
 
-`forge_create_task` accepts the optional `type` field (`task`, `planning_task`,
-`sub_task`, or `discovery`) and passes it through to the authoritative Task service. A
-project-scoped MCP connection may omit `project_id`; Forge injects the bound
-Project and rejects a conflicting reference.
+Known-tool failures are returned as JSON-RPC success responses with
+`result.isError: true`, `result.structuredContent` containing the shared
+`OrchestrationOutcome`, and `result.content` containing the same envelope as
+JSON text. Clients should inspect `structuredContent.code` and its typed
+corrections. JSON-RPC parse/invalid-request errors and unknown methods remain
+top-level `error` responses, as described in [Native and MCP orchestration
+outcomes](#native-and-mcp-orchestration-outcomes).
+
+`forge_create_task` is a separate direct Task-service API, not the
+`task.propose` action/receipt operation; its result therefore has no
+`AgentAction` execution id. It accepts the optional `type` field (`task`,
+`planning_task`, `sub_task`, or `discovery`) and passes it through to the
+authoritative Task service. A project-scoped MCP connection may omit
+`project_id`; Forge injects the bound Project and rejects a conflicting
+reference.
+
+The MCP registry currently exposes no canonical dotted orchestration operation
+IDs (`charter.*`, `project.*`, or `task.propose`). Those migrated native
+operations derive their input, output, scope, and permission metadata from one
+host-owned canonical contract. The `forge_*` tools above remain separate public
+APIs; Forge tests that their descriptor names do not shadow a migrated contract.
 
 ### Memory MCP tools
 

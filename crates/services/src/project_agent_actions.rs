@@ -6,41 +6,45 @@
 //! action executor deliberately rejects these operations, so an arbitrary
 //! result can never masquerade as a domain mutation.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
+#[cfg(test)]
+use api_types::canonical_digest_with_schema;
 use api_types::{
-    canonical_digest_with_schema, canonical_json, AdaptiveEnvelope, ArtifactRef,
-    AuthorizationProvenance, ExecutionBaselineContent, MilestoneDefinitionContent, PrincipalKind,
-    PrincipalRef, ProjectCharterContent, ProjectDocumentContent, ProjectDocumentKind,
-    RevisionProvenance,
+    CurrentVersionOrRevision, ExecutionBaselineContent, PrincipalKind, ProjectCharterContent,
+    ProjectDocumentContent, ProjectDocumentKind, RevisionProvenance,
 };
 use db::{
     new_uuid_v4, now_rfc3339, AgentAction, AgentActionExecution, AgentActionExecutionStatus,
-    AgentActionPolicyResult, AgentActionRepo, AgentActionStatus, ApproveProjectDocument,
-    CreateAgentActionExecution, CreateDomainEvent, CreateProjectCharter,
-    CreateProjectCharterRevision, CreateProjectCharterRevisionAtomically,
-    CreateProjectDecisionCandidate, CreateProjectDocument, CreateProjectDocumentAtomically,
-    CreateProjectDocumentRevision, CreateProjectMediaAttachment, CreateProjectMilestone,
-    CreateProjectMilestoneAtomically, CreateProjectMilestoneRevision, DomainEventRepo,
-    ProjectOrchestrationRepo, SharedMediaRepo, SqliteDb,
+    AgentActionPolicyResult, AgentActionRepo, AgentActionStatus, CommandReceipt,
+    CommandReceiptRepo, CreateAgentActionExecution, ProjectOrchestrationRepo, ProjectRepo,
+    SqliteDb,
 };
 use forge_agent_host::{
+    is_allowed_project_direct_payload, is_project_orchestration_operation,
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
     PROJECT_EVIDENCE_OPERATION, PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION,
     PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 use crate::{
-    baseline_column_json, document_content_digest, document_render_digest, parse_document_kind,
-    render_execution_baseline, render_project_document, validate_execution_baseline_policy,
-    AgentActionService, MilestoneRuntime, Result, ServiceError, EXECUTION_BASELINE_RENDER_VERSION,
-    EXECUTION_BASELINE_SCHEMA_VERSION, PROJECT_DOCUMENT_RENDER_VERSION,
-    PROJECT_DOCUMENT_SCHEMA_VERSION,
+    parse_document_kind, AgentActionProvenance, AgentActionService,
+    AuthorizationProvenance as CommandAuthorizationProvenance, CommandContext, CommandPrincipal,
+    CommandScope, CommandScopeType, ExecutionBaselineCommandService, ExpectedCommandState,
+    NewCommandContext, ProjectArtifactCommandService, ProjectCharterCommandService,
+    ProjectCharterRevisionCommand, ProjectCommandAuthorization, ProjectDocumentApprovalCommand,
+    ProjectDocumentRevisionCommand, ProjectEvidenceCommand, ProjectMilestoneCommandService,
+    ProposeExecutionBaselineForApprovalCommand, Result, SaveExecutionBaselineDraftCommand,
+    ServiceError, EXECUTION_BASELINE_PROPOSE_COMMAND, EXECUTION_BASELINE_SAVE_DRAFT_COMMAND,
 };
 
+#[cfg(test)]
 const MILESTONE_DEFINITION_SCHEMA: &str = "forge.milestone-definition/v1";
+#[cfg(test)]
 const MILESTONE_RENDER_SCHEMA: &str = "forge.milestone-definition-render/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +54,41 @@ pub struct ExecuteProjectOrchestrationActionInput {
     pub executed_by_type: String,
     pub executed_by_id: String,
     pub idempotency_key: String,
+}
+
+/// Authenticated input for a directly admitted Project coordination command.
+/// The native adapter supplies the canonical scope selected by the host and
+/// the bound Project id; this service verifies both against the durable
+/// Project-Agent binding before a receipt miss can mutate state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecuteDirectProjectCommandInput {
+    pub actor_identity_id: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub project_id: String,
+    pub operation: String,
+    pub payload: Value,
+    pub idempotency_key: String,
+    pub correlation_id: String,
+    pub causation_id: Option<String>,
+    pub causation_depth: i64,
+    pub requested_permission: String,
+}
+
+/// Frozen direct-command response.  `result` is copied from the durable
+/// receipt, never rebuilt from current Project projections, so a response-loss
+/// retry has exactly the same domain outcome and event identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DirectProjectCommandResult {
+    pub receipt_id: String,
+    pub event_id: String,
+    pub operation: String,
+    pub project_id: String,
+    pub result: Value,
+    pub agent_action_execution_id: Option<String>,
+    /// True only when this response was reconstructed from an exact durable
+    /// receipt match rather than produced by the fresh writer transaction.
+    pub replayed: bool,
 }
 
 #[derive(Clone)]
@@ -67,6 +106,368 @@ impl ProjectOrchestrationActionService {
         }
     }
 
+    /// Load the minimal current state needed to correct an authorized
+    /// version/digest conflict.  The native adapter has already established
+    /// the actor's active Project binding before calling this method; this
+    /// service still verifies that the named domain record belongs to that
+    /// Project before returning any state.  Repository getters are used here
+    /// instead of allowing adapters to become alternate persistence paths.
+    pub(crate) async fn authorized_current_version_or_revision(
+        &self,
+        project_id: &str,
+        operation: &str,
+        arguments: &Value,
+    ) -> Result<Option<CurrentVersionOrRevision>> {
+        let Some(project) = ProjectRepo::get_by_id(&*self.db, project_id).await? else {
+            return Ok(None);
+        };
+        let payload = arguments.get("payload").unwrap_or(arguments);
+        let Some(payload) = payload.as_object() else {
+            return Ok(None);
+        };
+
+        match operation {
+            PROJECT_DOCUMENT_OPERATION => {
+                let Some(document_id) = payload.get("document_id").and_then(Value::as_str) else {
+                    return Ok(None);
+                };
+                let Some(document) =
+                    ProjectOrchestrationRepo::get_project_document(&*self.db, document_id).await?
+                else {
+                    return Ok(None);
+                };
+                if document.project_id != project.id {
+                    return Ok(None);
+                }
+                let mut current =
+                    CurrentVersionOrRevision::new("project_document", document.id.clone());
+                current.version = Some(document.version);
+                if let Some(revision_id) = document.current_draft_revision_id {
+                    if let Some(revision) = ProjectOrchestrationRepo::get_project_document_revision(
+                        &*self.db,
+                        &revision_id,
+                    )
+                    .await?
+                    {
+                        if revision.document_id != document.id {
+                            return Ok(None);
+                        }
+                        current.revision_id = Some(revision.id);
+                        current.revision = Some(revision.revision);
+                        current.content_digest = Some(revision.content_digest);
+                        current.rendered_digest = Some(revision.rendered_digest);
+                    }
+                }
+                Ok(Some(current))
+            }
+            PROJECT_EXECUTION_BASELINE_OPERATION => {
+                let Some(baseline_id) = payload.get("baseline_id").and_then(Value::as_str) else {
+                    return Ok(None);
+                };
+                let Some(baseline) = ProjectOrchestrationRepo::get_project_execution_baseline(
+                    &*self.db,
+                    baseline_id,
+                )
+                .await?
+                else {
+                    return Ok(None);
+                };
+                if baseline.project_id != project.id {
+                    return Ok(None);
+                }
+
+                let mut current = CurrentVersionOrRevision::new(
+                    "project_execution_baseline",
+                    baseline.id.clone(),
+                );
+                current.version = Some(baseline.version);
+                if let Some(revision_id) = baseline.current_revision_id {
+                    current.revision_id = Some(revision_id.clone());
+                    if let Some(revision) =
+                        ProjectOrchestrationRepo::get_project_execution_baseline_revision(
+                            &*self.db,
+                            &revision_id,
+                        )
+                        .await?
+                    {
+                        if revision.baseline_id != baseline.id {
+                            return Ok(None);
+                        }
+                        current.revision = Some(revision.revision);
+                        current.content_digest = Some(revision.content_digest);
+                        current.rendered_digest = Some(revision.rendered_digest);
+                    }
+                }
+                Ok(Some(current))
+            }
+            PROJECT_MILESTONE_OPERATION
+                if matches!(
+                    payload.get("action").and_then(Value::as_str),
+                    Some("define") | Some("set_primary")
+                ) =>
+            {
+                let mut current = CurrentVersionOrRevision::new("project", project.id);
+                current.version = Some(project.version);
+                Ok(Some(current))
+            }
+            PROJECT_MILESTONE_OPERATION
+            | PROJECT_EVIDENCE_OPERATION
+            | PROJECT_READINESS_OPERATION
+            | PROJECT_RELEASE_OPERATION => {
+                let milestone_id = payload
+                    .get("milestone_id")
+                    .or_else(|| payload.get("primary_milestone_id"))
+                    .and_then(Value::as_str);
+                let Some(milestone_id) = milestone_id else {
+                    return Ok(None);
+                };
+                let Some(milestone) =
+                    ProjectOrchestrationRepo::get_project_milestone(&*self.db, milestone_id)
+                        .await?
+                else {
+                    return Ok(None);
+                };
+                if milestone.project_id != project.id {
+                    return Ok(None);
+                }
+
+                let mut current =
+                    CurrentVersionOrRevision::new("project_milestone", milestone.id.clone());
+                current.version = Some(milestone.version);
+                if let Some(revision_id) = milestone.current_definition_revision_id {
+                    current.revision_id = Some(revision_id.clone());
+                    if let Some(revision) =
+                        ProjectOrchestrationRepo::get_project_milestone_revision(
+                            &*self.db,
+                            &revision_id,
+                        )
+                        .await?
+                    {
+                        if revision.milestone_id != milestone.id {
+                            return Ok(None);
+                        }
+                        current.revision = Some(revision.revision);
+                        current.content_digest = Some(revision.content_digest);
+                        current.rendered_digest = Some(revision.rendered_digest);
+                    }
+                }
+                Ok(Some(current))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn replay_direct(&self, context: &CommandContext) -> Result<Option<CommandReceipt>> {
+        direct_replay(&self.db, context).await
+    }
+
+    async fn authorize_direct_actor(&self, input: &ExecuteDirectProjectCommandInput) -> Result<()> {
+        let actor =
+            sqlx::query("SELECT paused, archived_at FROM agent_identity WHERE id = ? LIMIT 1")
+                .bind(&input.actor_identity_id)
+                .fetch_optional(self.db.pool())
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found("agent_identity", input.actor_identity_id.clone())
+                })?;
+        if actor.try_get::<i64, _>("paused")? != 0
+            || actor.try_get::<Option<String>, _>("archived_at")?.is_some()
+        {
+            return Err(ServiceError::AuthorizationDenied {
+                message: "Project Agent is paused or archived".to_owned(),
+            });
+        }
+
+        let project_exists: Option<String> =
+            sqlx::query_scalar("SELECT id FROM project WHERE id = ? LIMIT 1")
+                .bind(&input.project_id)
+                .fetch_optional(self.db.pool())
+                .await?;
+        if project_exists.is_none() {
+            return Err(ServiceError::not_found("project", input.project_id.clone()));
+        }
+
+        match input.scope_type.as_str() {
+            "project" if input.scope_id == input.project_id => {}
+            "project" => {
+                return Err(ServiceError::AuthorizationDenied {
+                    message: "direct Project command scope does not match its canonical Project"
+                        .to_owned(),
+                });
+            }
+            "agent_chat" => {
+                let chat =
+                    sqlx::query("SELECT kind, project_id FROM agent_chat WHERE id = ? LIMIT 1")
+                        .bind(&input.scope_id)
+                        .fetch_optional(self.db.pool())
+                        .await?;
+                let Some(chat) = chat else {
+                    return Err(ServiceError::not_found(
+                        "agent_chat",
+                        input.scope_id.clone(),
+                    ));
+                };
+                if chat.try_get::<String, _>("kind")? != "project"
+                    || chat.try_get::<Option<String>, _>("project_id")?.as_deref()
+                        != Some(input.project_id.as_str())
+                {
+                    return Err(ServiceError::AuthorizationDenied {
+                        message:
+                            "direct command requires the Project Agent Chat bound to this Project"
+                                .to_owned(),
+                    });
+                }
+            }
+            _ => unreachable!("direct input scope was validated before authorization"),
+        }
+
+        let bound: Option<String> = sqlx::query_scalar(
+            "SELECT identity_id FROM project_agent_binding
+             WHERE project_id = ? AND identity_id = ? AND state = 'active' LIMIT 1",
+        )
+        .bind(&input.project_id)
+        .bind(&input.actor_identity_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+        if bound.is_none() {
+            return Err(ServiceError::AuthorizationDenied {
+                message: "Project Agent is not actively bound to this Project".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Execute one closed, automatically-allowed Project coordination
+    /// subaction directly.  The receipt lookup intentionally precedes the
+    /// current binding/policy check: a response-loss retry returns its frozen
+    /// result even if the Project Agent was subsequently paused or rebound.
+    /// Fresh commands are re-authorized before entering the shared typed
+    /// materializers.  `CommandContext.action_provenance` is always `None` in
+    /// this path, so no AgentAction or AgentActionExecution row can be made.
+    pub async fn execute_direct(
+        &self,
+        input: ExecuteDirectProjectCommandInput,
+    ) -> Result<DirectProjectCommandResult> {
+        validate_direct_input(&input)?;
+        let payload = input.payload.clone();
+        let receipt_operation = direct_receipt_operation(&input.operation, &payload)?;
+        let context = direct_command_context(&input, &receipt_operation, &payload, "allowed")?;
+
+        if let Some(receipt) = self.replay_direct(&context).await? {
+            return direct_result_from_receipt(receipt, &input.project_id, true);
+        }
+
+        self.authorize_direct_actor(&input).await?;
+        let (policy_result, reason) = self
+            .actions
+            .evaluate_direct_command_policy(
+                &input.actor_identity_id,
+                &input.scope_type,
+                &input.scope_id,
+                &input.requested_permission,
+                &input.operation,
+                Some(&serde_json::to_string(&payload).map_err(|error| {
+                    ServiceError::invalid_operation(format!(
+                        "serialize direct Project command payload: {error}"
+                    ))
+                })?),
+            )
+            .await?;
+        if policy_result != AgentActionPolicyResult::Allowed {
+            return Err(ServiceError::AuthorizationDenied {
+                message: reason.unwrap_or_else(|| {
+                    "direct Project command policy did not admit this operation".to_owned()
+                }),
+            });
+        }
+
+        let action = direct_materialization_action(&input, &payload);
+        let result = match input.operation.as_str() {
+            PROJECT_CHARTER_ADOPTION_OPERATION => {
+                self.materialize_charter_adoption(&action, &input.project_id, &payload, &context)
+                    .await?
+            }
+            PROJECT_DOCUMENT_OPERATION => {
+                self.materialize_document_with_command(
+                    &action,
+                    &input.project_id,
+                    &payload,
+                    Some(&context),
+                )
+                .await?
+            }
+            PROJECT_DECISION_OPERATION => {
+                self.materialize_decision_checked_with_command(
+                    &action,
+                    &input.project_id,
+                    &payload,
+                    Some(&context),
+                )
+                .await?
+            }
+            PROJECT_EXECUTION_BASELINE_OPERATION => {
+                self.materialize_direct_execution_baseline(
+                    &action,
+                    &input.project_id,
+                    &payload,
+                    &context,
+                )
+                .await?
+            }
+            PROJECT_MILESTONE_OPERATION => {
+                self.materialize_milestone(&action, &input.project_id, &payload, Some(&context))
+                    .await?
+            }
+            PROJECT_EVIDENCE_OPERATION => {
+                self.materialize_evidence_with_command(
+                    &action,
+                    &input.project_id,
+                    &payload,
+                    Some(&context),
+                )
+                .await?
+            }
+            PROJECT_READINESS_OPERATION => {
+                self.materialize_readiness_request(
+                    &action,
+                    &input.project_id,
+                    &payload,
+                    Some(&context),
+                )
+                .await?
+            }
+            _ => {
+                return Err(ServiceError::invalid_operation(
+                    "Project release candidates remain approval-backed actions",
+                ));
+            }
+        };
+
+        // The typed command service owns the durable receipt.  Read that
+        // frozen row only to assemble the transport-neutral direct result;
+        // never rebuild the result from mutable domain projections.
+        let receipt = self.replay_direct(&context).await?.ok_or_else(|| {
+            ServiceError::Conflict(format!(
+                "direct Project command {} committed without a command receipt",
+                input.operation
+            ))
+        })?;
+        if receipt.agent_action_execution_id.is_some() {
+            return Err(ServiceError::Conflict(
+                "direct Project command unexpectedly created an AgentAction execution".to_owned(),
+            ));
+        }
+        // Keep the materializer result evaluated so malformed command-service
+        // outcomes fail before the receipt is exposed, while the receipt
+        // remains the authoritative replay payload.
+        if !result.is_object() {
+            return Err(ServiceError::Conflict(
+                "direct Project command returned a non-object domain result".to_owned(),
+            ));
+        }
+        direct_result_from_receipt(receipt, &input.project_id, false)
+    }
+
     /// Materialize one admitted Project Agent action through a typed domain
     /// operation.  A successful action replay is resolved before mutable
     /// Project state is loaded, making lost responses safe to retry.
@@ -81,9 +482,28 @@ impl ProjectOrchestrationActionService {
             ));
         }
         let project_id = self.project_id_for_action(&action).await?;
-        self.authorize_actor(&action, &project_id, &input).await?;
+        let payload: Value = serde_json::from_str(&action.payload_json)
+            .map_err(|_| ServiceError::invalid_operation("Project action payload is invalid"))?;
 
-        if let Some(existing) =
+        // A receipt is the replay boundary for the migrated command families.
+        // It is resolved before admission/lifecycle checks so a response lost
+        // after commit remains replayable even after the Project has advanced.
+        let command_context = if is_project_orchestration_operation(&action.operation) {
+            Some(
+                self.project_command_context(&action, &input, &project_id, &payload)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        if let Some(context) = command_context.as_ref() {
+            if let Some(existing) = self
+                .resolve_project_command_replay(&action, context)
+                .await?
+            {
+                return Ok(existing);
+            }
+        } else if let Some(existing) =
             AgentActionRepo::get_successful_action_execution(&*self.db, &input.action_id).await?
         {
             if existing.idempotency_key != input.idempotency_key {
@@ -93,6 +513,11 @@ impl ProjectOrchestrationActionService {
             }
             return Ok(existing);
         }
+
+        // Resolve an exact command receipt before re-admitting the current
+        // actor binding. A response-loss retry must replay after a binding is
+        // paused or replaced; fresh commands are re-authorized below.
+        self.authorize_actor(&action, &project_id, &input).await?;
 
         let admitted = matches!(
             (&action.policy_result, &action.status),
@@ -113,40 +538,73 @@ impl ProjectOrchestrationActionService {
             return Err(ServiceError::Db(db::DbError::VersionConflict));
         }
 
-        let payload: Value = serde_json::from_str(&action.payload_json)
-            .map_err(|_| ServiceError::invalid_operation("Project action payload is invalid"))?;
         let result = match action.operation.as_str() {
             PROJECT_CHARTER_ADOPTION_OPERATION => {
-                self.materialize_charter_adoption(&action, &project_id, &payload)
+                let context = command_context.as_ref().ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "Project Charter execution requires a canonical command context",
+                    )
+                })?;
+                self.materialize_charter_adoption(&action, &project_id, &payload, context)
                     .await?
             }
             PROJECT_DOCUMENT_OPERATION => {
-                self.materialize_document(&action, &project_id, &payload)
-                    .await?
+                self.materialize_document_with_command(
+                    &action,
+                    &project_id,
+                    &payload,
+                    command_context.as_ref(),
+                )
+                .await?
             }
             PROJECT_DECISION_OPERATION => {
-                self.materialize_decision_checked(&action, &project_id, &payload)
-                    .await?
+                self.materialize_decision_checked_with_command(
+                    &action,
+                    &project_id,
+                    &payload,
+                    command_context.as_ref(),
+                )
+                .await?
             }
             PROJECT_EXECUTION_BASELINE_OPERATION => {
-                self.materialize_execution_baseline(&action, &project_id, &payload)
-                    .await?
+                self.materialize_execution_baseline(
+                    &action,
+                    &project_id,
+                    &payload,
+                    command_context.as_ref(),
+                )
+                .await?
             }
             PROJECT_MILESTONE_OPERATION => {
-                self.materialize_milestone(&action, &project_id, &payload)
+                self.materialize_milestone(&action, &project_id, &payload, command_context.as_ref())
                     .await?
             }
             PROJECT_EVIDENCE_OPERATION => {
-                self.materialize_evidence(&action, &project_id, &payload)
-                    .await?
+                self.materialize_evidence_with_command(
+                    &action,
+                    &project_id,
+                    &payload,
+                    command_context.as_ref(),
+                )
+                .await?
             }
             PROJECT_READINESS_OPERATION => {
-                self.materialize_readiness_request(&action, &project_id, &payload)
-                    .await?
+                self.materialize_readiness_request(
+                    &action,
+                    &project_id,
+                    &payload,
+                    command_context.as_ref(),
+                )
+                .await?
             }
             PROJECT_RELEASE_OPERATION => {
-                self.materialize_release_request(&action, &project_id, &payload)
-                    .await?
+                self.materialize_release_request(
+                    &action,
+                    &project_id,
+                    &payload,
+                    command_context.as_ref(),
+                )
+                .await?
             }
             _ => unreachable!("operation was validated above"),
         };
@@ -156,6 +614,28 @@ impl ProjectOrchestrationActionService {
                 "serialize Project orchestration execution result: {error}"
             ))
         })?;
+        if is_project_orchestration_operation(&action.operation) {
+            #[cfg(test)]
+            if crate::test_support::take_after_domain_commit(&action.id) {
+                return Err(ServiceError::conflict(
+                    "characterization failpoint: stopped after Project domain commit before AgentAction receipt",
+                ));
+            }
+            return AgentActionRepo::get_successful_action_execution(&*self.db, &input.action_id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::Conflict(
+                        "Project command committed without a successful AgentAction execution"
+                            .to_owned(),
+                    )
+                });
+        }
+        #[cfg(test)]
+        if crate::test_support::take_after_domain_commit(&action.id) {
+            return Err(ServiceError::conflict(
+                "characterization failpoint: stopped after Project domain commit before AgentAction receipt",
+            ));
+        }
         AgentActionRepo::record_action_execution(
             &*self.db,
             CreateAgentActionExecution {
@@ -178,6 +658,215 @@ impl ProjectOrchestrationActionService {
         )
         .await
         .map_err(Into::into)
+    }
+
+    async fn project_command_context(
+        &self,
+        action: &AgentAction,
+        input: &ExecuteProjectOrchestrationActionInput,
+        project_id: &str,
+        payload: &Value,
+    ) -> Result<CommandContext> {
+        if !matches!(
+            action.scope_type.as_str(),
+            "account" | "project" | "agent_chat" | "task"
+        ) {
+            return Err(ServiceError::invalid_operation(
+                "Project orchestration action has an invalid canonical scope",
+            ));
+        }
+        let principal_type = required("typed Project executor type", &input.executed_by_type)?;
+        let principal_id = required("typed Project executor id", &input.executed_by_id)?;
+        let idempotency_key = required("execution idempotency key", &input.idempotency_key)?;
+
+        let mut versions = BTreeMap::from([(action.id.clone(), input.expected_version)]);
+        for key in [
+            "expected_project_version",
+            "expected_charter_version",
+            "expected_document_version",
+            "expected_candidate_version",
+        ] {
+            if let Some(value) = payload.get(key).and_then(Value::as_i64) {
+                versions.insert(key.to_owned(), value);
+            }
+        }
+        if action.operation == PROJECT_EVIDENCE_OPERATION {
+            let expected_milestone_version = payload
+                .get("expected_milestone_version")
+                .and_then(Value::as_i64)
+                .filter(|value| *value >= 1)
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "expected_milestone_version must be a positive integer",
+                    )
+                })?;
+            versions.insert(
+                "expected_milestone_version".to_owned(),
+                expected_milestone_version,
+            );
+        } else if let Some(value) = payload
+            .get("expected_milestone_version")
+            .and_then(Value::as_i64)
+        {
+            versions.insert("expected_milestone_version".to_owned(), value);
+        }
+        if action.operation == PROJECT_DOCUMENT_OPERATION
+            && payload.get("action").and_then(Value::as_str) == Some("draft_revision")
+            && payload.get("base_revision_id").is_none_or(Value::is_null)
+        {
+            // The first Document shell has a fixed server-side CAS version;
+            // native payloads intentionally omit it because the shell does
+            // not exist yet.
+            versions.insert("expected_document_version".to_owned(), 1);
+        }
+        let digests = BTreeMap::from([
+            ("action_scope_type".to_owned(), action.scope_type.clone()),
+            ("action_scope_id".to_owned(), action.scope_id.clone()),
+            ("project_id".to_owned(), project_id.to_owned()),
+        ]);
+
+        CommandContext::from_authorized_input(
+            NewCommandContext {
+                principal: CommandPrincipal {
+                    principal_type,
+                    principal_id,
+                },
+                canonical_scope: CommandScope {
+                    // Project domain command repositories require a canonical
+                    // Project scope even when the proposal arrived through a
+                    // Project Agent Chat.  The original action scope remains
+                    // bound above in the digest.
+                    scope_type: CommandScopeType::Project,
+                    scope_id: project_id.to_owned(),
+                },
+                operation: action.operation.clone(),
+                idempotency_key,
+                expected_state: ExpectedCommandState { versions, digests },
+                authorization_provenance: Some(CommandAuthorizationProvenance {
+                    policy_result: action.policy_result.to_string(),
+                    policy_revision: None,
+                    policy_digest: None,
+                    requested_permission: Some(action.requested_permission.clone()),
+                }),
+                action_provenance: Some(AgentActionProvenance {
+                    action_id: action.id.clone(),
+                    expected_action_version: input.expected_version,
+                    attempt: 1,
+                    execution_idempotency_key: input.idempotency_key.clone(),
+                    executed_by_type: input.executed_by_type.clone(),
+                    executed_by_id: input.executed_by_id.clone(),
+                }),
+                correlation_id: action.correlation_id.clone(),
+                causation_id: action.causation_id.clone(),
+                causation_depth: action.causation_depth,
+            },
+            payload,
+        )
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "serialize Project command input digest: {error}"
+            ))
+        })
+    }
+
+    async fn resolve_project_command_replay(
+        &self,
+        action: &AgentAction,
+        context: &CommandContext,
+    ) -> Result<Option<AgentActionExecution>> {
+        if action.operation == PROJECT_EXECUTION_BASELINE_OPERATION {
+            return self
+                .resolve_execution_baseline_replay(action, context)
+                .await;
+        }
+        let receipt = CommandReceiptRepo::get_command_receipt(
+            &*self.db,
+            context.principal().principal_type(),
+            context.principal().principal_id(),
+            context.canonical_scope().scope_type().as_str(),
+            context.canonical_scope().scope_id(),
+            context.operation(),
+            context.idempotency_key(),
+            context.input_digest(),
+        )
+        .await?;
+        if let Some(receipt) = receipt {
+            let execution = AgentActionRepo::get_successful_action_execution(&*self.db, &action.id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::Conflict(
+                        "Project command receipt has no successful AgentAction execution"
+                            .to_owned(),
+                    )
+                })?;
+            if receipt.agent_action_execution_id.as_deref() != Some(execution.id.as_str())
+                || receipt.outcome_json != execution.result_json.clone().unwrap_or_default()
+                || execution.idempotency_key != context.idempotency_key()
+                || execution.executed_by_type != context.principal().principal_type()
+                || execution.executed_by_id != context.principal().principal_id()
+            {
+                return Err(ServiceError::Conflict(
+                    "Project command receipt provenance does not match its AgentAction execution"
+                        .to_owned(),
+                ));
+            }
+            return Ok(Some(execution));
+        }
+
+        // Do not fall back to the old action-execution-only replay path here.
+        // If a receipt exists under this scope/key with a different digest,
+        // the composite DB command will classify it as an idempotency
+        // conflict.  If a pre-migration execution has no receipt, attempting
+        // the new command is allowed to fail atomically rather than silently
+        // treating an unbound legacy row as a frozen command result.
+        Ok(None)
+    }
+
+    /// Baseline commands have lifecycle-specific receipt operations below the
+    /// coarse native action operation.  Replay therefore follows the frozen
+    /// action-execution link rather than asking the generic Project command
+    /// lookup to guess a digest/operation that the adapter never owns.
+    async fn resolve_execution_baseline_replay(
+        &self,
+        action: &AgentAction,
+        context: &CommandContext,
+    ) -> Result<Option<AgentActionExecution>> {
+        let Some(execution) =
+            AgentActionRepo::get_successful_action_execution(&*self.db, &action.id).await?
+        else {
+            return Ok(None);
+        };
+        if execution.idempotency_key != context.idempotency_key()
+            || execution.executed_by_type != context.principal().principal_type()
+            || execution.executed_by_id != context.principal().principal_id()
+        {
+            return Err(ServiceError::Db(db::DbError::IdempotencyConflict));
+        }
+        let receipt = CommandReceiptRepo::get_command_receipt_by_agent_action_execution(
+            &*self.db,
+            &execution.id,
+        )
+        .await?;
+        let Some(receipt) = receipt else {
+            return Err(ServiceError::Conflict(
+                "execution baseline action execution has no linked command receipt".to_owned(),
+            ));
+        };
+        if receipt.scope_type != CommandScopeType::Project.as_str()
+            || receipt.scope_id != context.canonical_scope().scope_id()
+            || !matches!(
+                receipt.operation.as_str(),
+                EXECUTION_BASELINE_SAVE_DRAFT_COMMAND | EXECUTION_BASELINE_PROPOSE_COMMAND
+            )
+            || receipt.agent_action_execution_id.as_deref() != Some(execution.id.as_str())
+            || receipt.idempotency_key != execution.idempotency_key
+            || receipt.principal_type != execution.executed_by_type
+            || receipt.principal_id != execution.executed_by_id
+            || receipt.outcome_json != execution.result_json.clone().unwrap_or_default()
+        {
+            return Err(ServiceError::Db(db::DbError::IdempotencyConflict));
+        }
+        Ok(Some(execution))
     }
 
     async fn project_id_for_action(&self, action: &AgentAction) -> Result<String> {
@@ -255,722 +944,217 @@ impl ProjectOrchestrationActionService {
         action: &AgentAction,
         project_id: &str,
         payload: &Value,
+        command_context: &CommandContext,
     ) -> Result<Value> {
-        // `charter_id` is a reference, never a primary key: a live run had the
-        // model coining `charter-<project>-001` and that slug became the row's
-        // id. The Project owns at most one adoption Charter, so resolve it by
-        // Project scope and mint the id when there is none yet -- matching the
-        // Genesis Charter precedent. The real id comes back in the result JSON.
-        let project = sqlx::query(
-            "SELECT owner_id, charter_status, charter_setup_required,
-                    current_charter_id, current_charter_revision_id
-             FROM project WHERE id = ? LIMIT 1",
-        )
-        .bind(project_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
-        let project_owner_id: Option<String> = project.try_get("owner_id")?;
-        let account_id = if let Some(owner_id) = project_owner_id {
-            owner_id
-        } else {
-            sqlx::query_scalar::<_, String>(
-                "SELECT owner_id FROM agent_identity WHERE id = ? LIMIT 1",
-            )
-            .bind(&action.actor_identity_id)
-            .fetch_optional(self.db.pool())
-            .await?
-            .ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "Project adoption has no account owner for its Charter scope",
-                )
-            })?
-        };
-        let charter =
-            ProjectOrchestrationRepo::get_project_adoption_charter(&*self.db, project_id).await?;
-        if let Some(referenced_id) = payload.get("charter_id").and_then(Value::as_str) {
-            // A reference to some other Project's Charter is a scope error, not
-            // a placeholder: reject it rather than silently retargeting.
-            if charter
-                .as_ref()
-                .is_none_or(|charter| charter.id != referenced_id)
-                && ProjectOrchestrationRepo::get_project_charter(&*self.db, referenced_id)
-                    .await?
-                    .is_some()
-            {
-                return Err(ServiceError::invalid_operation(
-                    "Charter adoption crosses Project scope",
-                ));
-            }
-        }
-        let charter_id = charter
-            .as_ref()
-            .map_or_else(new_uuid_v4, |charter| charter.id.clone());
-        let current_charter_id: Option<String> = project.try_get("current_charter_id")?;
-        let current_charter_revision_id: Option<String> =
-            project.try_get("current_charter_revision_id")?;
-        let is_setup_project = project.try_get::<String, _>("charter_status")?
-            == "legacy_unverified"
-            && project.try_get::<i64, _>("charter_setup_required")? == 1
-            && current_charter_id.is_none()
-            && current_charter_revision_id.is_none();
-        if charter.is_none() && !is_setup_project {
-            return Err(ServiceError::invalid_operation(
-                "Project Charter adoption requires a setup Project or an existing Project Charter",
-            ));
-        }
-        if charter.is_none()
-            && (current_charter_id.is_some() || current_charter_revision_id.is_some())
-        {
-            return Err(ServiceError::invalid_operation(
-                "Project Charter adoption cannot replace an existing current Charter",
-            ));
-        }
-        let content: ProjectCharterContent = from_value(payload, "content")?;
-        // The render is derived from `content`, so the server produces it
-        // either way. Requiring the agent to reproduce it byte-for-byte is not
-        // something a model can do, and the Project surface exposes no draft
-        // operation to read the canonical render from. Match the Main Charter
-        // contract: verify a supplied render, otherwise use the server's.
-        let render = crate::render_and_digest_charter(&content);
-        let supplied_view = optional_string(payload, "rendered_view");
-        let supplied_version = optional_string(payload, "render_version");
-        if supplied_view.is_some_and(|view| view != render.rendered_view)
-            || supplied_version.is_some_and(|version| version != render.render_version)
-        {
-            return Err(ServiceError::conflict(
-                "Charter adoption render does not match the server renderer",
-            ));
-        }
-        let project_mode = string(payload, "project_mode")?;
-        let maturity = string(payload, "maturity")?;
+        let content = payload
+            .get("content")
+            .cloned()
+            .ok_or_else(|| ServiceError::invalid_operation("Charter content is required"))?;
+        let content: ProjectCharterContent = serde_json::from_value(content).map_err(|error| {
+            ServiceError::invalid_operation(format!("Charter content is invalid: {error}"))
+        })?;
         let provenance: RevisionProvenance = from_value(payload, "provenance")?;
-        let base_revision_id = payload
-            .get("base_revision_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let base_revision = if let Some(base_id) = base_revision_id.as_deref() {
-            let base = ProjectOrchestrationRepo::get_project_charter_revision(&*self.db, base_id)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("project_charter_revision", base_id))?;
-            if base.charter_id != charter_id || charter.is_none() {
-                return Err(ServiceError::invalid_operation(
-                    "Charter adoption base revision crosses Charter scope",
-                ));
-            }
-            base.revision
+        let authorization_event_id = command_context
+            .action_provenance
+            .as_ref()
+            .map(|value| value.action_id.clone())
+            .unwrap_or_else(|| command_context.correlation_id().to_owned());
+        let authorization_basis = if command_context.action_provenance.is_some() {
+            "agent_action"
         } else {
-            0
+            "project_agent_binding_policy"
         };
-        let requested_charter_version = integer(payload, "expected_charter_version")?;
-        let (expected_charter_version, charter_mode, charter_maturity) = match charter.as_ref() {
-            Some(charter) => {
-                // Every conflict here names the value that would satisfy it. The
-                // Project surface has no operation that reads a Charter, so a
-                // model that is only told "the version is wrong" has nowhere to
-                // look it up: a live run alternated between these two errors
-                // eight times and gave up without writing a revision.
-                let expected = if requested_charter_version == 0 {
-                    if charter.version != 1 || charter.current_draft_revision_id.is_some() {
-                        return Err(ServiceError::conflict(format!(
-                            "a Project Charter adoption draft already exists; \
-                             send expected_charter_version = {} \
-                             (and base_revision_id = {} to revise that draft)",
-                            charter.version,
-                            charter
-                                .current_draft_revision_id
-                                .as_deref()
-                                .unwrap_or("<none>"),
-                        )));
-                    }
-                    charter.version
-                } else {
-                    requested_charter_version
-                };
-                if charter.version != expected {
-                    return Err(ServiceError::conflict(format!(
-                        "the Project Charter changed before adoption was materialized; \
-                         expected_charter_version = {} was sent but the Charter is at \
-                         version {}. Send {} and retry.",
-                        expected, charter.version, charter.version,
-                    )));
-                }
-                if charter.project_mode != project_mode || charter.maturity != maturity {
-                    return Err(ServiceError::conflict(format!(
-                        "Project Charter mode and maturity are immutable after draft \
-                         creation; this Charter is project_mode = {}, maturity = {}",
-                        charter.project_mode, charter.maturity,
-                    )));
-                }
-                (
-                    expected,
-                    charter.project_mode.clone(),
-                    charter.maturity.clone(),
-                )
-            }
-            None => {
-                if requested_charter_version != 0 || base_revision_id.is_some() {
-                    return Err(ServiceError::conflict(
-                        "a new Project adoption Charter begins at expected version 0 with no base revision",
-                    ));
-                }
-                (1, project_mode.clone(), maturity.clone())
-            }
-        };
-        let revision_input = CreateProjectCharterRevision {
-            id: new_uuid_v4(),
-            charter_id: charter_id.clone(),
-            expected_charter_version,
-            project_mode: charter_mode.clone(),
-            maturity: charter_maturity.clone(),
-            base_revision,
-            base_revision_id: base_revision_id.clone(),
-            lifecycle: "draft".to_owned(),
-            schema_version: "forge.project-charter/v1".to_owned(),
-            render_version: render.render_version,
-            content_json: canonical_json(&content)
-                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-            rendered_view: render.rendered_view,
-            change_summary: provenance.change_summary,
-            author_type: "agent".to_owned(),
-            author_id: Some(action.actor_identity_id.clone()),
-            source_message_id: None,
-            source_turn_job_id: None,
-            source_refs_json: serde_json::to_string(&provenance.source_refs)
-                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-            content_digest: render.content_digest,
-            rendered_digest: render.render_digest,
-            created_at: now_rfc3339(),
-        };
-        // The atomic path exists to write a Charter shell and its first revision
-        // together, and it only accepts a first revision. Choosing it whenever
-        // the Project is still in setup made every *revision* of an adoption
-        // draft fail with a bare version conflict, so the agent could never act
-        // on review feedback before approval. The shell is what decides.
-        let revision = if charter.is_some() {
-            ProjectOrchestrationRepo::create_project_charter_revision(&*self.db, revision_input)
-                .await?
-        } else {
-            let now = now_rfc3339();
-            let charter_record = charter.as_ref();
-            ProjectOrchestrationRepo::create_project_charter_revision_atomically(
-                &*self.db,
-                CreateProjectCharterRevisionAtomically {
-                    project_id: Some(project_id.to_owned()),
-                    genesis_session_id: None,
-                    account_id: account_id.clone(),
-                    charter: CreateProjectCharter {
-                        id: charter_id.clone(),
-                        account_id: account_id.clone(),
-                        genesis_session_id: None,
-                        project_mode: charter_record
-                            .map(|charter| charter.project_mode.clone())
-                            .unwrap_or_else(|| charter_mode.clone()),
-                        maturity: charter_record
-                            .map(|charter| charter.maturity.clone())
-                            .unwrap_or_else(|| charter_maturity.clone()),
-                        created_at: charter_record
-                            .map(|charter| charter.created_at.clone())
-                            .unwrap_or_else(|| now.clone()),
-                        updated_at: charter_record
-                            .map(|charter| charter.updated_at.clone())
-                            .unwrap_or(now),
-                    },
-                    revision: revision_input,
+        let authorization = ProjectCommandAuthorization {
+            principal_type: command_context.principal().principal_type().to_owned(),
+            principal_id: command_context.principal().principal_id().to_owned(),
+            policy_result: command_context
+                .authorization_provenance
+                .as_ref()
+                .map_or_else(
+                    || action.policy_result.to_string(),
+                    |value| value.policy_result.clone(),
+                ),
+            policy_revision: None,
+            policy_digest: command_context
+                .authorization_provenance
+                .as_ref()
+                .and_then(|value| value.policy_digest.clone()),
+            requested_permission: command_context
+                .authorization_provenance
+                .as_ref()
+                .and_then(|value| value.requested_permission.clone()),
+            correlation_id: command_context.correlation_id().to_owned(),
+            causation_id: command_context.causation_id.clone(),
+            causation_depth: command_context.causation_depth,
+            authorization_event_id: authorization_event_id.clone(),
+            authorization_basis: authorization_basis.to_owned(),
+            authorization_action: "project_charter.revision.save".to_owned(),
+            authorization_occurred_at: action.created_at.clone(),
+            authorization_json: json!({
+                "principal": {
+                    "kind": command_context.principal().principal_type(),
+                    "id": command_context.principal().principal_id(),
                 },
-            )
-            .await?
+                "authorization_basis": authorization_basis,
+                "action": "project_charter.revision.save",
+                "event_id": authorization_event_id,
+                "correlation_id": command_context.correlation_id(),
+                "causation_id": command_context.causation_id,
+            })
+            .to_string(),
         };
-        // Revising the draft needs the Charter's post-write version. Without it
-        // the model can only guess, and a wrong guess is a bare optimistic-
-        // concurrency conflict it cannot recover from.
-        let charter_version: i64 =
-            sqlx::query_scalar("SELECT version FROM project_charter WHERE id = ?")
-                .bind(&charter_id)
-                .fetch_one(self.db.pool())
-                .await?;
-        // A committed revision is not necessarily an approvable one: the user
-        // cannot approve a revision whose readiness is blocked. Returning the
-        // verdict here — as the Main Charter draft already does — is what lets
-        // the model fill the gaps instead of reporting the Charter as done and
-        // leaving the user with a draft nothing will accept.
-        let readiness = crate::evaluate_project_charter_readiness(
-            &content,
-            crate::main_orchestration_actions::parse_project_mode(&charter_mode)?,
-            crate::main_orchestration_actions::parse_maturity(&charter_maturity)?,
-            crate::CHARTER_READINESS_POLICY_VERSION,
-            &revision.created_at,
-        );
+        let command = ProjectCharterRevisionCommand {
+            project_id: project_id.to_owned(),
+            charter_id: optional_string(payload, "charter_id").unwrap_or_default(),
+            base_revision_id: payload
+                .get("base_revision_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            expected_digest: optional_string(payload, "expected_digest"),
+            project_mode: string(payload, "project_mode")?,
+            maturity: string(payload, "maturity")?,
+            content,
+            rendered_view: optional_string(payload, "rendered_view"),
+            render_version: optional_string(payload, "render_version"),
+            provenance,
+            expected_charter_version: integer(payload, "expected_charter_version")?,
+            idempotency_key: command_context.idempotency_key().to_owned(),
+            authorization,
+        };
+        let outcome = ProjectCharterCommandService::new(Arc::clone(&self.db))
+            .save_revision_with_context(command, command_context.clone())
+            .await?;
         Ok(json!({
             "operation": PROJECT_CHARTER_ADOPTION_OPERATION,
             "project_id": project_id,
-            "charter_id": charter_id,
-            "charter_version": charter_version,
-            "revision_id": revision.id,
-            "revision": revision.revision,
-            "lifecycle": revision.lifecycle,
-            "readiness": readiness,
+            "charter_id": outcome.revision.charter_id,
+            "charter_version": outcome.charter_version,
+            "revision_id": outcome.revision.id,
+            "revision": outcome.revision.revision,
+            "content_digest": outcome.revision.content_digest,
+            "render_digest": outcome.revision.rendered_digest,
+            "lifecycle": outcome.revision.lifecycle,
+            "readiness": outcome.readiness,
             "domain_committed": true,
             "requires_user_authorization": true,
         }))
     }
 
-    async fn materialize_document(
+    async fn materialize_document_with_command(
         &self,
         action: &AgentAction,
         project_id: &str,
         payload: &Value,
+        command_context: Option<&CommandContext>,
     ) -> Result<Value> {
-        let requested_document_id = string(payload, "document_id")?;
-        let kind_text = string(payload, "kind")?;
-        let kind = parse_document_kind(&kind_text)
-            .ok_or_else(|| ServiceError::invalid_operation("Project Document kind is invalid"))?;
-        let title = string(payload, "title")?;
+        let context = command_context.ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "Project Document execution requires a canonical command context",
+            )
+        })?;
         let document_action = string(payload, "action")?;
-        let base_revision_id_present = payload
-            .get("base_revision_id")
-            .map(|value| !value.is_null())
-            .unwrap_or(false);
-        let existing =
-            ProjectOrchestrationRepo::get_project_document(&*self.db, &requested_document_id)
-                .await?;
-        let document = match existing {
-            Some(document) => document,
-            // A Charter-created Project starts with no Documents and the
-            // Agent surface has no separate create operation, so the first
-            // draft_revision of an unknown Document id creates the Document.
-            // The agent-supplied id is a placeholder only -- it is never
-            // trusted as a primary key -- so the real id is minted here
-            // (matching the Charter precedent) and returned in the result
-            // JSON for the model to use on follow-up actions.  Shell,
-            // revision, and draft pointer are persisted atomically so a
-            // failure past this point can never leave an orphan Document
-            // with no revisions.
-            None if document_action == "draft_revision" && !base_revision_id_present => {
-                let content = parse_document_content(
-                    kind,
-                    payload.get("content").ok_or_else(|| {
-                        ServiceError::invalid_operation("Project Document content is required")
-                    })?,
-                )?;
-                let document_id = new_uuid_v4();
-                let rendered_view = render_project_document(&title, kind, &content);
-                let now = now_rfc3339();
-                let revision = ProjectOrchestrationRepo::create_project_document_atomically(
-                    &*self.db,
-                    CreateProjectDocumentAtomically {
-                        document: CreateProjectDocument {
-                            id: document_id.clone(),
-                            project_id: project_id.to_owned(),
-                            kind: kind_text,
-                            title,
-                            approval_policy: "user_or_project_agent".to_owned(),
-                            created_at: now.clone(),
-                            updated_at: now.clone(),
-                        },
-                        revision: CreateProjectDocumentRevision {
-                            id: new_uuid_v4(),
-                            document_id: document_id.clone(),
-                            expected_document_version: 1,
-                            base_revision: 0,
-                            base_revision_id: None,
-                            lifecycle: "draft".to_owned(),
-                            schema_version: PROJECT_DOCUMENT_SCHEMA_VERSION.to_owned(),
-                            render_version: PROJECT_DOCUMENT_RENDER_VERSION.to_owned(),
-                            content_json: crate::render_project_document_json(&content),
-                            rendered_view: rendered_view.clone(),
-                            change_summary: "Project Agent authored a typed document revision"
-                                .to_owned(),
-                            author_type: "agent".to_owned(),
-                            author_id: Some(action.actor_identity_id.clone()),
-                            source_refs_json: "[]".to_owned(),
-                            content_digest: document_content_digest(&content),
-                            rendered_digest: document_render_digest(
-                                PROJECT_DOCUMENT_RENDER_VERSION,
-                                &rendered_view,
-                            ),
-                            created_at: now,
-                        },
-                    },
-                )
-                .await?;
-                return Ok(json!({
-                    "operation": PROJECT_DOCUMENT_OPERATION,
-                    "project_id": project_id,
-                    "document_id": document_id,
-                    "revision_id": revision.id,
-                    "revision": revision.revision,
-                    "lifecycle": revision.lifecycle,
-                    "domain_committed": true,
-                    "requires_user_authorization": false,
-                }));
-            }
-            None => {
-                return Err(ServiceError::not_found(
-                    "project_document",
-                    requested_document_id,
-                ));
-            }
-        };
-        if document.project_id != project_id {
-            return Err(ServiceError::invalid_operation(
-                "Project Document action crosses Project scope",
-            ));
-        }
-        if document.kind != kind_text || document.title != title {
-            return Err(ServiceError::conflict(
-                "Project Document identity does not match the proposal",
-            ));
-        }
-        if document_action == "approve" {
-            return self
-                .materialize_document_approval(action, project_id, payload, &document)
-                .await;
-        }
-        if !matches!(
+        let requested_document_id = string(payload, "document_id")?;
+        let service = ProjectArtifactCommandService::new(Arc::clone(&self.db));
+        if matches!(
             document_action.as_str(),
             "draft_revision" | "propose_approval"
         ) {
-            return Err(ServiceError::invalid_operation(
-                "Project Agent may draft or propose a Document revision only",
-            ));
-        }
-        let content = parse_document_content(
-            kind,
-            payload.get("content").ok_or_else(|| {
-                ServiceError::invalid_operation("Project Document content is required")
-            })?,
-        )?;
-        let rendered_view = render_project_document(&document.title, kind, &content);
-        let base_revision_id = payload
-            .get("base_revision_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let base_revision = if let Some(base_id) = base_revision_id.as_deref() {
-            let base = ProjectOrchestrationRepo::get_project_document_revision(&*self.db, base_id)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("project_document_revision", base_id))?;
-            if base.document_id != document.id {
-                return Err(ServiceError::invalid_operation(
-                    "Project Document base revision crosses Document scope",
-                ));
-            }
-            base.revision
-        } else {
-            0
-        };
-        let lifecycle = if document_action == "propose_approval" {
-            "proposed"
-        } else {
-            "draft"
-        };
-        let revision = ProjectOrchestrationRepo::create_project_document_revision(
-            &*self.db,
-            CreateProjectDocumentRevision {
-                id: new_uuid_v4(),
-                document_id: document.id.clone(),
-                expected_document_version: integer(payload, "expected_document_version")?,
-                base_revision,
-                base_revision_id,
-                lifecycle: lifecycle.to_owned(),
-                schema_version: PROJECT_DOCUMENT_SCHEMA_VERSION.to_owned(),
-                render_version: PROJECT_DOCUMENT_RENDER_VERSION.to_owned(),
-                content_json: crate::render_project_document_json(&content),
-                rendered_view: rendered_view.clone(),
+            let kind_text = string(payload, "kind")?;
+            let kind = parse_document_kind(&kind_text).ok_or_else(|| {
+                ServiceError::invalid_operation("Project Document kind is invalid")
+            })?;
+            let title = string(payload, "title")?;
+            let content = parse_document_content(
+                kind,
+                payload.get("content").ok_or_else(|| {
+                    ServiceError::invalid_operation("Project Document content is required")
+                })?,
+            )?;
+            let lifecycle = if document_action == "propose_approval" {
+                api_types::DocumentRevisionLifecycle::Proposed
+            } else {
+                api_types::DocumentRevisionLifecycle::Draft
+            };
+            let base_revision_id = payload
+                .get("base_revision_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let expected_document_version = payload
+                .get("expected_document_version")
+                .and_then(Value::as_i64)
+                .unwrap_or_else(|| if base_revision_id.is_none() { 1 } else { 0 });
+            let authorization =
+                document_command_authorization(action, context, "project.document.revision.save");
+            let provenance = api_types::RevisionProvenance {
+                author: api_types::PrincipalRef {
+                    kind: PrincipalKind::Agent,
+                    id: action.actor_identity_id.clone(),
+                    display_name: None,
+                },
+                profile_revision: None,
+                operating_skill_revision: None,
+                source_refs: Vec::new(),
                 change_summary: "Project Agent authored a typed document revision".to_owned(),
-                author_type: "agent".to_owned(),
-                author_id: Some(action.actor_identity_id.clone()),
-                source_refs_json: "[]".to_owned(),
-                content_digest: document_content_digest(&content),
-                rendered_digest: document_render_digest(
-                    PROJECT_DOCUMENT_RENDER_VERSION,
-                    &rendered_view,
-                ),
-                created_at: now_rfc3339(),
-            },
-        )
-        .await?;
-        Ok(json!({
-            "operation": PROJECT_DOCUMENT_OPERATION,
-            "project_id": project_id,
-            "document_id": document.id,
-            "revision_id": revision.id,
-            "revision": revision.revision,
-            "lifecycle": revision.lifecycle,
-            "domain_committed": true,
-            "requires_user_authorization": lifecycle == "proposed",
-        }))
-    }
-
-    /// Materialize the Project Agent's narrow Document approval authority.
-    ///
-    /// This is intentionally separate from the user HTTP approval path.  The
-    /// agent may approve only a Document whose policy explicitly admits the
-    /// agent, and only while its authenticated Project binding is active.  An
-    /// active execution baseline is used as a boundary, never as a grant: a
-    /// Document already selected by that baseline, or required by an active
-    /// release-gating check, is material scope and remains user-only.  The
-    /// baseline/envelope fields are optional for pre-baseline planning
-    /// Documents, but whenever supplied they must identify the exact active
-    /// revision and envelope digest; stale or malformed persisted JSON fails
-    /// closed.
-    async fn materialize_document_approval(
-        &self,
-        action: &AgentAction,
-        project_id: &str,
-        payload: &Value,
-        document: &db::ProjectDocumentRecord,
-    ) -> Result<Value> {
-        if !matches!(
-            document.approval_policy.as_str(),
-            "project_agent" | "user_or_project_agent"
-        ) {
+                material_diff: None,
+            };
+            let revision = service
+                .save_document_revision_with_context(
+                    ProjectDocumentRevisionCommand {
+                        project_id: project_id.to_owned(),
+                        document_id: requested_document_id,
+                        kind: Some(kind_text),
+                        title: Some(title),
+                        approval_policy: Some("user_or_project_agent".to_owned()),
+                        base_revision_id,
+                        lifecycle,
+                        content,
+                        change_summary: provenance.change_summary.clone(),
+                        provenance,
+                        expected_document_version,
+                        expected_digest: optional_string(payload, "expected_digest"),
+                        idempotency_key: context.idempotency_key().to_owned(),
+                        authorization,
+                    },
+                    context.clone(),
+                )
+                .await?;
+            return Ok(json!({
+                "operation": PROJECT_DOCUMENT_OPERATION,
+                "project_id": project_id,
+                "document_id": revision.document_id,
+                "revision_id": revision.id,
+                "revision": revision.revision,
+                "lifecycle": revision.lifecycle,
+                "domain_committed": true,
+                "requires_user_authorization": revision.lifecycle == "proposed",
+            }));
+        }
+        if document_action != "approve" {
             return Err(ServiceError::invalid_operation(
-                "Project Agent cannot approve a user-only or approval-free Document",
+                "Project Agent may draft, propose, or approve a Document revision only",
             ));
         }
-
-        let revision_id = string(payload, "revision_id")?;
-        let content_digest = string(payload, "content_digest")?;
-        let rendered_digest = string(payload, "render_digest")?;
-        let expected_document_version = integer(payload, "expected_document_version")?;
-        let revision =
-            ProjectOrchestrationRepo::get_project_document_revision(&*self.db, &revision_id)
-                .await?
-                .ok_or_else(|| {
-                    ServiceError::not_found("project_document_revision", revision_id.clone())
-                })?;
-        if revision.document_id != document.id {
-            return Err(ServiceError::invalid_operation(
-                "Project Document approval crosses Document scope",
-            ));
-        }
-        if revision.content_digest != content_digest || revision.rendered_digest != rendered_digest
-        {
-            return Err(ServiceError::conflict(
-                "Project Document approval digests do not match the exact revision",
-            ));
-        }
-        if !matches!(revision.lifecycle.as_str(), "draft" | "proposed") {
-            return Err(ServiceError::conflict(
-                "Project Document approval target is not an approvable draft or proposal",
-            ));
-        }
-        if document.current_draft_revision_id.as_deref() != Some(revision_id.as_str()) {
-            return Err(ServiceError::conflict(
-                "Project Document approval target is not the current draft revision",
-            ));
-        }
-
-        // Re-read the binding at materialization time.  The action's actor
-        // identity is not enough: a replaced/paused binding must not retain
-        // authority over a Project action that was proposed earlier.
-        let binding = sqlx::query(
-            "SELECT b.id, b.identity_id, b.profile_id, b.policy_revision,
-                    b.policy_digest, b.charter_revision_id,
-                    p.identity_id AS profile_identity_id,
-                    i.paused AS identity_paused
-             FROM project_agent_binding AS b
-             JOIN agent_profile AS p ON p.id = b.profile_id
-             JOIN agent_identity AS i ON i.id = b.identity_id
-             WHERE b.project_id = ? AND b.identity_id = ? AND b.state = 'active'
-             LIMIT 1",
-        )
-        .bind(project_id)
-        .bind(&action.actor_identity_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .ok_or_else(|| {
-            ServiceError::invalid_operation(
-                "Project Document approval requires the proposing identity's active Project binding",
+        let authorization =
+            document_command_authorization(action, context, "project.document.approve");
+        let approval = service
+            .approve_document_with_context(
+                ProjectDocumentApprovalCommand {
+                    project_id: project_id.to_owned(),
+                    document_id: requested_document_id,
+                    revision_id: string(payload, "revision_id")?,
+                    content_digest: string(payload, "content_digest")?,
+                    rendered_digest: string(payload, "render_digest")?,
+                    expected_document_version: integer(payload, "expected_document_version")?,
+                    idempotency_key: context.idempotency_key().to_owned(),
+                    authorization,
+                },
+                context.clone(),
             )
-        })?;
-        let binding_id: String = binding.try_get("id")?;
-        let binding_identity_id: String = binding.try_get("identity_id")?;
-        let binding_profile_id: String = binding.try_get("profile_id")?;
-        let binding_policy_revision: String = binding.try_get("policy_revision")?;
-        let binding_policy_digest: String = binding.try_get("policy_digest")?;
-        let binding_charter_revision_id: Option<String> = binding.try_get("charter_revision_id")?;
-        let profile_identity_id: String = binding.try_get("profile_identity_id")?;
-        let identity_paused: bool = binding.try_get::<i64, _>("identity_paused")? != 0;
-        if binding_identity_id != action.actor_identity_id
-            || profile_identity_id != action.actor_identity_id
-            || binding_profile_id.trim().is_empty()
-            || binding_policy_revision.trim().is_empty()
-            || binding_policy_digest.trim().is_empty()
-            || identity_paused
-        {
-            return Err(ServiceError::invalid_operation(
-                "Project Document approval binding is stale, incomplete, or paused",
-            ));
-        }
-        let current_charter_revision_id: Option<String> = sqlx::query_scalar(
-            "SELECT current_charter_revision_id
-             FROM project
-             WHERE id = ? AND charter_status = 'charter_backed'
-               AND charter_setup_required = 0
-             LIMIT 1",
-        )
-        .bind(project_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .flatten();
-        if current_charter_revision_id.is_some()
-            && binding_charter_revision_id.as_deref() != current_charter_revision_id.as_deref()
-        {
-            return Err(ServiceError::invalid_operation(
-                "Project Document approval binding is not attached to the current approved Charter",
-            ));
-        }
-
-        let requested_baseline_id = optional_nonempty_string(payload, "baseline_id")?;
-        let requested_baseline_revision_id =
-            optional_nonempty_string(payload, "baseline_revision_id")?;
-        let requested_envelope_digest = optional_nonempty_string(payload, "envelope_digest")?;
-        if requested_baseline_id.is_some() != requested_baseline_revision_id.is_some()
-            || requested_baseline_id.is_none() != requested_envelope_digest.is_none()
-        {
-            return Err(ServiceError::invalid_operation(
-                "Project Document approval baseline_id, baseline_revision_id, and envelope_digest must be supplied together",
-            ));
-        }
-
-        let active_baseline = sqlx::query(
-            "SELECT b.id, b.current_revision_id, r.content_digest,
-                    r.adaptive_envelope_json, r.document_revisions_json
-             FROM project_execution_baseline AS b
-             JOIN project_execution_baseline_revision AS r
-               ON r.id = b.current_revision_id AND r.baseline_id = b.id
-             WHERE b.project_id = ? AND b.lifecycle = 'active'
-               AND r.lifecycle = 'approved'
-             ORDER BY b.updated_at DESC, b.id DESC LIMIT 1",
-        )
-        .bind(project_id)
-        .fetch_optional(self.db.pool())
-        .await?;
-        let mut active_baseline_document_ids = Vec::new();
-        if let Some(baseline) = active_baseline {
-            let active_baseline_id: String = baseline.try_get("id")?;
-            let active_baseline_revision_id: String = baseline.try_get("current_revision_id")?;
-            let adaptive_envelope_json: String = baseline.try_get("adaptive_envelope_json")?;
-            let adaptive_envelope: Value =
-                serde_json::from_str(&adaptive_envelope_json).map_err(|error| {
-                    ServiceError::invalid_operation(format!(
-                        "active execution baseline adaptive envelope is invalid: {error}"
-                    ))
-                })?;
-            validate_adaptive_envelope_value(&adaptive_envelope)?;
-            let envelope_digest = adaptive_envelope_digest(&adaptive_envelope)?;
-            if requested_baseline_id.as_deref() != Some(active_baseline_id.as_str())
-                || requested_baseline_revision_id.as_deref()
-                    != Some(active_baseline_revision_id.as_str())
-                || requested_envelope_digest.as_deref() != Some(envelope_digest.as_str())
-            {
-                return Err(ServiceError::conflict(
-                    "Project Document approval must bind the exact active baseline and adaptive envelope",
-                ));
-            }
-            let baseline_documents_json: String = baseline.try_get("document_revisions_json")?;
-            let baseline_documents: Vec<ArtifactRef> =
-                serde_json::from_str(&baseline_documents_json).map_err(|error| {
-                    ServiceError::invalid_operation(format!(
-                        "active execution baseline Document references are invalid: {error}"
-                    ))
-                })?;
-            active_baseline_document_ids.extend(
-                baseline_documents
-                    .iter()
-                    .map(|reference| reference.artifact_id.clone()),
-            );
-            if active_baseline_document_ids
-                .iter()
-                .any(|artifact_id| artifact_id == &document.id)
-            {
-                return Err(ServiceError::invalid_operation(
-                    "Project Agent cannot approve a Document selected by the active execution baseline",
-                ));
-            }
-        } else if requested_baseline_id.is_some() {
-            return Err(ServiceError::conflict(
-                "Project Document approval names a baseline but the Project has no active baseline",
-            ));
-        }
-
-        // A required document-approval check is a release gate even when the
-        // Document's own policy is agent-admissible.  The check target is
-        // carried by the immutable milestone definition's ArtifactRefs; a
-        // malformed definition cannot be treated as an empty gate.
-        let gate_rows = sqlx::query(
-            "SELECT r.document_revisions_json
-             FROM project_milestone_check AS c
-             JOIN project_milestone AS m
-               ON m.id = c.milestone_id AND m.project_id = c.project_id
-             JOIN project_milestone_revision AS r
-               ON r.id = c.definition_revision_id AND r.milestone_id = m.id
-             WHERE c.project_id = ? AND c.required = 1
-               AND c.source_kind = 'document_approval'
-               AND m.lifecycle IN ('planned', 'active', 'ready_for_release')",
-        )
-        .bind(project_id)
-        .fetch_all(self.db.pool())
-        .await?;
-        for row in gate_rows {
-            let document_revisions_json: String = row.try_get("document_revisions_json")?;
-            let references: Vec<ArtifactRef> = serde_json::from_str(&document_revisions_json)
-                .map_err(|error| {
-                    ServiceError::invalid_operation(format!(
-                        "release-gating milestone Document references are invalid: {error}"
-                    ))
-                })?;
-            if references.is_empty()
-                || references
-                    .iter()
-                    .any(|reference| reference.artifact_id == document.id)
-            {
-                return Err(ServiceError::invalid_operation(
-                    "Project Agent cannot approve a release-gating Document",
-                ));
-            }
-        }
-
-        // Execution Plans are the material execution contract by definition;
-        // their approval must remain an explicit user decision even if a
-        // caller labels the policy as agent-admissible.
-        if document.kind == "execution_plan" {
-            return Err(ServiceError::invalid_operation(
-                "Project Agent cannot approve the material execution-plan Document",
-            ));
-        }
-
-        let now = now_rfc3339();
-        let approval = ProjectOrchestrationRepo::approve_project_document(
-            &*self.db,
-            ApproveProjectDocument {
-                id: new_uuid_v4(),
-                document_id: document.id.clone(),
-                revision_id: revision.id.clone(),
-                expected_document_version,
-                principal_type: "agent".to_owned(),
-                principal_id: action.actor_identity_id.clone(),
-                authorization_basis: format!(
-                    "project_agent_document_policy:{}:{}:{}",
-                    document.approval_policy, binding_id, binding_policy_revision
-                ),
-                authorization_action: "project.document.approve".to_owned(),
-                explicit_event: action.id.clone(),
-                authorization_occurred_at: action.created_at.clone(),
-                content_digest: revision.content_digest.clone(),
-                rendered_digest: revision.rendered_digest.clone(),
-                idempotency_key: format!("project.document.agent-approve:{}", action.dedupe_key),
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        )
-        .await?;
+            .await?;
         Ok(json!({
             "operation": PROJECT_DOCUMENT_OPERATION,
             "project_id": project_id,
-            "document_id": document.id,
+            "document_id": approval.document_id,
             "revision_id": approval.revision_id,
             "approval_id": approval.id,
             "content_digest": approval.content_digest,
@@ -983,388 +1167,22 @@ impl ProjectOrchestrationActionService {
         }))
     }
 
-    async fn materialize_decision_checked(
+    /// Translate an admitted native Decision action into the shared service.
+    async fn materialize_decision_checked_with_command(
         &self,
         action: &AgentAction,
         project_id: &str,
         payload: &Value,
+        command_context: Option<&CommandContext>,
     ) -> Result<Value> {
-        let operation = string(payload, "action")?;
-        if !matches!(operation.as_str(), "record_candidate" | "record_effective") {
-            return Err(ServiceError::invalid_operation(
-                "Project Agent may record implementation choices or propose candidates; supersession, invalidation, and user-scope decisions remain user-only",
-            ));
-        }
-        if payload.get("decision_class").and_then(Value::as_str) != Some("project_implementation") {
-            return Err(ServiceError::invalid_operation(
-                "Project Agent decisions must use the project_implementation class",
-            ));
-        }
-        let baseline_id = string(payload, "baseline_id")?;
-        let baseline_revision_id = string(payload, "baseline_revision_id")?;
-        let baseline = sqlx::query(
-            "SELECT b.id, r.charter_revision_id, r.content_digest AS baseline_content_digest,
-                    r.render_version AS baseline_render_version,
-                    r.rendered_digest AS baseline_render_digest,
-                    r.document_revisions_json,
-                    r.milestone_id, r.milestone_ids_json, r.primary_milestone_id,
-                    r.adaptive_envelope_json
-             FROM project_execution_baseline AS b
-             JOIN project_execution_baseline_revision AS r
-               ON r.id = b.current_revision_id
-             WHERE b.id = ? AND b.project_id = ? AND b.lifecycle = 'active'
-               AND b.current_revision_id = ? AND r.lifecycle = 'approved'
-             LIMIT 1",
-        )
-        .bind(&baseline_id)
-        .bind(project_id)
-        .bind(&baseline_revision_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .ok_or_else(|| {
-            ServiceError::conflict(
-                "Project decision must reference the exact approved revision of the active baseline",
+        let context = command_context.ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "Project Decision execution requires a canonical command context",
             )
         })?;
-        let baseline_charter_revision_id: String = baseline.try_get("charter_revision_id")?;
-        let baseline_document_revisions_json: String =
-            baseline.try_get("document_revisions_json")?;
-        let baseline_milestone_id: Option<String> = baseline.try_get("milestone_id")?;
-        let baseline_milestone_ids_json: String = baseline.try_get("milestone_ids_json")?;
-        let baseline_primary_milestone_id: Option<String> =
-            baseline.try_get("primary_milestone_id")?;
-        let adaptive_envelope_json: String = baseline.try_get("adaptive_envelope_json")?;
-        let adaptive_envelope = parse_adaptive_envelope(&adaptive_envelope_json)?;
-        let baseline_document_revisions: Vec<ArtifactRef> =
-            serde_json::from_str(&baseline_document_revisions_json).map_err(|_| {
-                ServiceError::invalid_operation("active baseline Document references are invalid")
-            })?;
-        let affected_artifact_refs: Vec<ArtifactRef> = serde_json::from_value(
-            payload
-                .get("affected_artifact_refs")
-                .cloned()
-                .unwrap_or_else(|| Value::Array(Vec::new())),
-        )
-        .map_err(|_| ServiceError::invalid_operation("affected artifact references are invalid"))?;
-        let affected_task_ids: Vec<String> = serde_json::from_value(
-            payload
-                .get("affected_task_ids")
-                .cloned()
-                .unwrap_or_else(|| Value::Array(Vec::new())),
-        )
-        .map_err(|_| ServiceError::invalid_operation("affected Task IDs are invalid"))?;
-        let affected_milestone_ids: Vec<String> = serde_json::from_value(
-            payload
-                .get("affected_milestone_ids")
-                .cloned()
-                .unwrap_or_else(|| Value::Array(Vec::new())),
-        )
-        .map_err(|_| ServiceError::invalid_operation("affected milestone IDs are invalid"))?;
-
-        // Resolve references before deciding whether the choice is inside the
-        // baseline.  A cross-Project or stale reference is a hard denial;
-        // a same-Project reference not named by the baseline becomes a
-        // reconciliation candidate below.
-        for reference in &affected_artifact_refs {
-            let row = sqlx::query(
-                "SELECT r.render_version, r.rendered_digest
-                 FROM project_document_revision AS r
-                 JOIN project_document AS d ON d.id = r.document_id
-                 WHERE d.project_id = ? AND d.id = ? AND r.id = ? AND r.content_digest = ?
-                 UNION ALL
-                 SELECT r.render_version, r.rendered_digest
-                 FROM project_charter_revision AS r
-                 JOIN project_charter AS c ON c.id = r.charter_id
-                 WHERE c.project_id = ? AND c.id = ? AND r.id = ? AND r.content_digest = ?
-                 UNION ALL
-                 SELECT r.render_version, r.rendered_digest
-                 FROM project_execution_baseline_revision AS r
-                 JOIN project_execution_baseline AS b ON b.id = r.baseline_id
-                 WHERE b.project_id = ? AND b.id = ? AND r.id = ? AND r.content_digest = ?
-                 UNION ALL
-                 SELECT r.render_version, r.rendered_digest
-                 FROM project_milestone_revision AS r
-                 JOIN project_milestone AS m ON m.id = r.milestone_id
-                 WHERE m.project_id = ? AND m.id = ? AND r.id = ? AND r.content_digest = ?
-                 LIMIT 1",
-            )
-            .bind(project_id)
-            .bind(&reference.artifact_id)
-            .bind(&reference.revision_id)
-            .bind(&reference.content_digest)
-            .bind(project_id)
-            .bind(&reference.artifact_id)
-            .bind(&reference.revision_id)
-            .bind(&reference.content_digest)
-            .bind(project_id)
-            .bind(&reference.artifact_id)
-            .bind(&reference.revision_id)
-            .bind(&reference.content_digest)
-            .bind(project_id)
-            .bind(&reference.artifact_id)
-            .bind(&reference.revision_id)
-            .bind(&reference.content_digest)
-            .fetch_optional(self.db.pool())
-            .await?
-            .ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "decision artifact reference is unknown, stale, or outside Project scope",
-                )
-            })?;
-            let render_version: String = row.try_get("render_version")?;
-            let render_digest: String = row.try_get("rendered_digest")?;
-            if reference
-                .render_version
-                .as_deref()
-                .is_some_and(|value| value != render_version)
-                || reference
-                    .render_digest
-                    .as_deref()
-                    .is_some_and(|value| value != render_digest)
-            {
-                return Err(ServiceError::conflict(
-                    "decision artifact reference render digest is stale",
-                ));
-            }
-        }
-        for task_id in &affected_task_ids {
-            let owned: Option<i64> = sqlx::query_scalar(
-                "SELECT 1
-                     FROM task AS t
-                     JOIN project_task_governance AS g ON g.task_id = t.id
-                     WHERE t.id = ? AND t.project_id = ?
-                       AND g.baseline_id = ? AND g.baseline_revision_id = ?
-                     LIMIT 1",
-            )
-            .bind(task_id)
-            .bind(project_id)
-            .bind(&baseline_id)
-            .bind(&baseline_revision_id)
-            .fetch_optional(self.db.pool())
-            .await?;
-            if owned.is_none() {
-                return Err(ServiceError::invalid_operation(
-                    "decision affected Task crosses Project scope",
-                ));
-            }
-        }
-        for milestone_id in &affected_milestone_ids {
-            let owned: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM project_milestone WHERE id = ? AND project_id = ? LIMIT 1",
-            )
-            .bind(milestone_id)
-            .bind(project_id)
-            .fetch_optional(self.db.pool())
-            .await?;
-            if owned.is_none() {
-                return Err(ServiceError::invalid_operation(
-                    "decision affected milestone crosses Project scope",
-                ));
-            }
-        }
-
-        let baseline_charter = sqlx::query(
-            "SELECT c.id AS artifact_id, r.content_digest, r.render_version,
-                    r.rendered_digest, r.lifecycle
-             FROM project_charter_revision AS r
-             JOIN project_charter AS c ON c.id = r.charter_id
-             WHERE r.id = ? AND c.project_id = ? LIMIT 1",
-        )
-        .bind(&baseline_charter_revision_id)
-        .bind(project_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .ok_or_else(|| {
-            ServiceError::conflict("active baseline Charter is outside Project scope")
-        })?;
-        let baseline_charter_id: String = baseline_charter.try_get("artifact_id")?;
-        let baseline_charter_content_digest: String = baseline_charter.try_get("content_digest")?;
-        let baseline_charter_render_version: String = baseline_charter.try_get("render_version")?;
-        let baseline_charter_render_digest: String = baseline_charter.try_get("rendered_digest")?;
-        let baseline_charter_lifecycle: String = baseline_charter.try_get("lifecycle")?;
-        let baseline_content_digest: String = baseline.try_get("baseline_content_digest")?;
-        let baseline_render_version: String = baseline.try_get("baseline_render_version")?;
-        let baseline_render_digest: String = baseline.try_get("baseline_render_digest")?;
-        if baseline_charter_content_digest.trim().is_empty()
-            || baseline_charter_render_version.trim().is_empty()
-            || baseline_charter_render_digest.trim().is_empty()
-            || baseline_content_digest.trim().is_empty()
-            || baseline_render_version.trim().is_empty()
-            || baseline_render_digest.trim().is_empty()
-            || baseline_charter_lifecycle != "approved"
-        {
-            return Err(ServiceError::invalid_operation(
-                "active baseline references are missing exact immutable digests",
-            ));
-        }
-        let mut baseline_artifacts = baseline_document_revisions;
-        baseline_artifacts.push(ArtifactRef {
-            artifact_id: baseline_charter_id,
-            revision_id: baseline_charter_revision_id.clone(),
-            content_digest: baseline_charter_content_digest,
-            render_version: Some(baseline_charter_render_version),
-            render_digest: Some(baseline_charter_render_digest),
-        });
-        baseline_artifacts.push(ArtifactRef {
-            artifact_id: baseline_id.clone(),
-            revision_id: baseline_revision_id.clone(),
-            content_digest: baseline_content_digest,
-            render_version: Some(baseline_render_version),
-            render_digest: Some(baseline_render_digest),
-        });
-        let references_inside_baseline = affected_artifact_refs.iter().all(|reference| {
-            baseline_artifacts.iter().any(|allowed| {
-                reference.artifact_id == allowed.artifact_id
-                    && reference.revision_id == allowed.revision_id
-                    && reference.content_digest == allowed.content_digest
-                    && reference.render_version == allowed.render_version
-                    && reference.render_digest == allowed.render_digest
-            })
-        });
-        let milestones_inside_baseline = affected_milestone_ids.iter().all(|milestone_id| {
-            baseline_milestone_id.as_deref() == Some(milestone_id.as_str())
-                || baseline_primary_milestone_id.as_deref() == Some(milestone_id.as_str())
-                || json_contains_identifier(&baseline_milestone_ids_json, milestone_id)
-        });
-        let selected_outcome = optional_string(payload, "selected_outcome");
-        let outcome_inside_envelope =
-            selected_outcome_is_inside_envelope(&adaptive_envelope, selected_outcome.as_deref());
-        let reconciliation_reason = if !references_inside_baseline {
-            Some("affected artifact is outside the active baseline".to_owned())
-        } else if !milestones_inside_baseline {
-            Some("affected milestone is outside the active baseline".to_owned())
-        } else if !outcome_inside_envelope {
-            Some("selected outcome is outside the active adaptive envelope".to_owned())
-        } else {
-            None
-        };
-        let options = payload
-            .get("options")
-            .cloned()
-            .unwrap_or_else(|| Value::Array(Vec::new()));
-        let expected_project_version = integer(payload, "expected_project_version")?;
-        let current_project_version = project_version(&self.db, project_id).await?;
-        if expected_project_version != current_project_version {
-            return Err(ServiceError::Db(db::DbError::VersionConflict));
-        }
-        let question = string(payload, "question")?;
-        let rationale = optional_string(payload, "rationale");
-        let context_json = json!({
-            "decision_class": "project_implementation",
-            "summary": reconciliation_reason.as_ref().map_or_else(
-                || "Implementation choice inside the active execution baseline".to_owned(),
-                |reason| format!("reconciliation_required: {reason}"),
-            ),
-            "affected_artifact_refs": affected_artifact_refs,
-            "affected_task_ids": affected_task_ids,
-            "affected_milestone_ids": affected_milestone_ids,
-            "governing_baseline_revision_id": baseline_revision_id.clone(),
-        })
-        .to_string();
-        let context_value: Value = serde_json::from_str(&context_json).map_err(|_| {
-            ServiceError::invalid_operation("Project decision context could not be encoded")
-        })?;
-        let affected_records_json = json!({
-            "artifact_refs": context_value
-                .get("affected_artifact_refs")
-                .cloned()
-                .unwrap_or_else(|| json!([])),
-            "task_ids": context_value
-                .get("affected_task_ids")
-                .cloned()
-                .unwrap_or_else(|| json!([])),
-            "milestone_ids": context_value
-                .get("affected_milestone_ids")
-                .cloned()
-                .unwrap_or_else(|| json!([])),
-        })
-        .to_string();
-        let source_refs_json = json!([{
-            "source_kind": "project_chat",
-            "source_id": action.id,
-            "observed_at": now_rfc3339(),
-        }])
-        .to_string();
-        if operation == "record_effective" && reconciliation_reason.is_none() {
-            let selected_outcome = selected_outcome.ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "an effective implementation decision requires selected_outcome",
-                )
-            })?;
-            let rationale = rationale.ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "an effective implementation decision requires rationale",
-                )
-            })?;
-            let decision_id = string(payload, "decision_id")?;
-            let decision = ProjectOrchestrationRepo::append_project_decision(
-                &*self.db,
-                db::CreateProjectDecision {
-                    id: decision_id,
-                    project_id: project_id.to_owned(),
-                    expected_project_version,
-                    state: "active".to_owned(),
-                    decision_class: "project_implementation".to_owned(),
-                    question,
-                    context_json,
-                    options_json: options.to_string(),
-                    selected_outcome,
-                    rationale,
-                    principal_type: "agent".to_owned(),
-                    principal_id: action.actor_identity_id.clone(),
-                    authority_basis: "active_execution_baseline_adaptive_envelope".to_owned(),
-                    authorization_action: "project.decision.record_effective".to_owned(),
-                    explicit_event: action.id.clone(),
-                    authorization_occurred_at: action.created_at.clone(),
-                    charter_revision_id: Some(baseline_charter_revision_id),
-                    baseline_revision_id: Some(baseline_revision_id),
-                    source_refs_json,
-                    affected_records_json,
-                    supersedes_decision_id: None,
-                    created_at: now_rfc3339(),
-                },
-            )
-            .await?;
-            return Ok(json!({
-                "operation": PROJECT_DECISION_OPERATION,
-                "project_id": project_id,
-                "decision_id": decision.id,
-                "state": decision.state,
-                "authority_basis": decision.authority_basis,
-                "domain_committed": true,
-                "requires_user_authorization": false,
-            }));
-        }
-        let candidate = ProjectOrchestrationRepo::create_project_decision_candidate(
-            &*self.db,
-            CreateProjectDecisionCandidate {
-                id: new_uuid_v4(),
-                project_id: project_id.to_owned(),
-                lifecycle: "proposed".to_owned(),
-                question,
-                context_json,
-                options_json: options.to_string(),
-                selected_outcome,
-                rationale,
-                principal_type: Some("agent".to_owned()),
-                principal_id: Some(action.actor_identity_id.clone()),
-                source_refs_json,
-                expected_project_version,
-                created_at: now_rfc3339(),
-                updated_at: now_rfc3339(),
-            },
-        )
-        .await?;
-        Ok(json!({
-            "operation": PROJECT_DECISION_OPERATION,
-            "project_id": project_id,
-            "candidate_id": candidate.id,
-            "lifecycle": candidate.lifecycle,
-            "reconciliation_required": reconciliation_reason.is_some(),
-            "reconciliation_reason": reconciliation_reason,
-            "domain_committed": true,
-            "requires_user_authorization": true,
-        }))
+        crate::ProjectDecisionCommandService::new(Arc::clone(&self.db))
+            .execute_project_agent_command(action, project_id, payload, context)
+            .await
     }
 
     async fn materialize_execution_baseline(
@@ -1372,462 +1190,201 @@ impl ProjectOrchestrationActionService {
         action: &AgentAction,
         project_id: &str,
         payload: &Value,
+        command_context: Option<&CommandContext>,
     ) -> Result<Value> {
-        // A baseline shell id is server-minted, never taken from the agent
-        // payload: omit baseline_id to draft a new baseline, name an existing
-        // one to revise it.
-        let requested_baseline_id = optional_nonempty_string(payload, "baseline_id")?;
-        let operation = string(payload, "action")?;
-        if !matches!(
-            operation.as_str(),
-            "draft_revision" | "revise" | "propose_approval"
-        ) {
-            return Err(ServiceError::invalid_operation(
-                "Project Agent may draft or propose a baseline; approval and activation are user-only",
-            ));
-        }
-        if operation != "draft_revision" && requested_baseline_id.is_none() {
-            return Err(ServiceError::invalid_operation(
-                "baseline_id naming an existing execution baseline is required for this action; \
-                 read the Project current state to find it",
-            ));
-        }
-        if operation == "propose_approval" {
-            // The Project Agent can prepare an exact approval target, but the
-            // approval itself remains an interactive-user-only mutation.
-            if payload.get("approval_id").is_some() {
-                return Err(ServiceError::invalid_operation(
-                    "Project Agent cannot create or consume an execution-baseline approval receipt",
-                ));
-            }
-        }
-
-        let content = if let Some(content) = payload.get("content") {
-            // Derive the release-policy digest from the caller's own frozen
-            // policy when it is omitted from a full content object.
-            let mut content_value = content.clone();
-            // The Charter ArtifactRef digests are server truths: resolve them
-            // from the referenced approved revision instead of requiring the
-            // caller to reproduce them byte-for-byte.
-            if let Some(revision_id) = content_value
-                .get("charter_revision")
-                .and_then(|reference| reference.get("revision_id"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-            {
-                let charter = sqlx::query(
-                    "SELECT c.id AS artifact_id, r.content_digest, r.render_version,
-                            r.rendered_digest
-                     FROM project_charter_revision r
-                     JOIN project_charter c ON c.id = r.charter_id
-                     WHERE r.id = ? AND c.project_id = ? AND r.lifecycle = 'approved'",
-                )
-                .bind(&revision_id)
-                .bind(project_id)
-                .fetch_optional(self.db.pool())
-                .await?
-                .ok_or_else(|| {
-                    ServiceError::conflict(
-                        "baseline Charter revision is not approved and Project-scoped",
-                    )
-                })?;
-                content_value["charter_revision"] = json!({
-                    "artifact_id": charter.try_get::<String, _>("artifact_id")?,
-                    "revision_id": revision_id,
-                    "content_digest": charter.try_get::<String, _>("content_digest")?,
-                    "render_version": charter.try_get::<String, _>("render_version")?,
-                    "render_digest": charter.try_get::<String, _>("rendered_digest")?,
-                });
-            }
-            // Document ArtifactRef digests are likewise server truths keyed
-            // by revision_id.
-            let document_reference_ids: Vec<(usize, String)> = content_value
-                .get("document_revisions")
-                .and_then(Value::as_array)
-                .map(|references| {
-                    references
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, reference)| {
-                            reference
-                                .get("revision_id")
-                                .and_then(Value::as_str)
-                                .map(|revision_id| (index, revision_id.to_owned()))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            for (index, revision_id) in document_reference_ids {
-                let row = sqlx::query(
-                    "SELECT d.id AS artifact_id, r.content_digest, r.render_version,
-                            r.rendered_digest
-                     FROM project_document_revision r
-                     JOIN project_document d ON d.id = r.document_id
-                     WHERE r.id = ? AND d.project_id = ?",
-                )
-                .bind(&revision_id)
-                .bind(project_id)
-                .fetch_optional(self.db.pool())
-                .await?
-                .ok_or_else(|| {
-                    ServiceError::conflict("baseline Document revision is not Project-scoped")
-                })?;
-                content_value["document_revisions"][index] = json!({
-                    "artifact_id": row.try_get::<String, _>("artifact_id")?,
-                    "revision_id": revision_id,
-                    "content_digest": row.try_get::<String, _>("content_digest")?,
-                    "render_version": row.try_get::<String, _>("render_version")?,
-                    "render_digest": row.try_get::<String, _>("rendered_digest")?,
-                });
-            }
-            if let Some(object) = content_value.as_object_mut() {
-                let digest_missing = object
-                    .get("release_policy_digest")
-                    .and_then(Value::as_str)
-                    .map(|value| value.trim().is_empty())
-                    .unwrap_or(true);
-                if digest_missing {
-                    if let Some(policy_value) = object.get("release_policy").cloned() {
-                        let policy: api_types::ExecutionBaselineReleasePolicy =
-                            serde_json::from_value(policy_value).map_err(|error| {
-                                ServiceError::invalid_operation(format!(
-                                    "invalid release policy: {error}"
-                                ))
-                            })?;
-                        let digest = crate::execution_baseline::release_policy_digest(&policy)
-                            .map_err(|error| {
-                                ServiceError::invalid_operation(format!(
-                                    "release policy digest: {error}"
-                                ))
-                            })?;
-                        object.insert("release_policy_digest".to_owned(), json!(digest));
-                    }
-                }
-            }
-            from_value::<ExecutionBaselineContent>(&json!({ "content": content_value }), "content")?
-        } else {
-            let release_policy_value = payload.get("release_policy").cloned().ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "execution baseline proposals require a complete frozen release_policy",
-                )
-            })?;
-            // The digest is derived from the caller's own frozen policy; the
-            // server computes it when the caller omits it.
-            let release_policy_digest_value = match payload
-                .get("release_policy_digest")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-            {
-                Some(digest) => digest.to_owned(),
-                None => {
-                    let policy: api_types::ExecutionBaselineReleasePolicy =
-                        serde_json::from_value(release_policy_value.clone()).map_err(|error| {
-                            ServiceError::invalid_operation(format!(
-                                "invalid release policy: {error}"
-                            ))
-                        })?;
-                    crate::execution_baseline::release_policy_digest(&policy).map_err(|error| {
-                        ServiceError::invalid_operation(format!("release policy digest: {error}"))
-                    })?
-                }
-            };
-            let charter_revision_id = string(payload, "charter_revision_id")?;
-            let charter = sqlx::query(
-                "SELECT c.id AS artifact_id, r.content_digest, r.render_version,
-                        r.rendered_digest
-                 FROM project_charter_revision r
-                 JOIN project_charter c ON c.id = r.charter_id
-                 WHERE r.id = ? AND c.project_id = ? AND r.lifecycle = 'approved'",
+        let context = command_context.ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "Project execution-baseline execution requires a canonical command context",
             )
-            .bind(&charter_revision_id)
-            .bind(project_id)
-            .fetch_optional(self.db.pool())
-            .await?
-            .ok_or_else(|| {
-                ServiceError::conflict(
-                    "baseline Charter revision is not approved and Project-scoped",
-                )
-            })?;
-            let charter_ref = json!({
-                "artifact_id": charter.try_get::<String, _>("artifact_id")?,
-                "revision_id": charter_revision_id,
-                "content_digest": charter.try_get::<String, _>("content_digest")?,
-                "render_version": charter.try_get::<String, _>("render_version")?,
-                "render_digest": charter.try_get::<String, _>("rendered_digest")?,
-            });
-            serde_json::from_value(json!({
-                "charter_revision": charter_ref,
-                "document_revisions": payload.get("document_revisions").cloned().unwrap_or_else(|| json!([])),
-                "plan_item_ids": payload.get("plan_item_ids").cloned().unwrap_or_else(|| json!([])),
-                "milestone_ids": payload.get("milestone_ids").cloned().unwrap_or_else(|| json!([])),
-                "milestone_definition_revision_ids": payload
-                    .get("milestone_definition_revision_ids")
-                    .cloned()
-                    .ok_or_else(|| {
-                        ServiceError::invalid_operation(
-                            "execution baseline proposals require exact milestone definition revisions",
-                        )
-                    })?,
-                "primary_milestone_id": payload.get("primary_milestone_id").cloned().unwrap_or(Value::Null),
-                "release_policy_revision": string(payload, "release_policy_revision")?,
-                "release_policy_digest": release_policy_digest_value,
-                "release_policy": release_policy_value,
-                "acceptance_evidence_matrix": payload.get("acceptance_evidence_matrix").cloned().unwrap_or_else(|| json!([])),
-                "capability_classes": payload.get("capability_classes").cloned().unwrap_or_else(|| json!([])),
-                "risk_classes": payload.get("risk_classes").cloned().unwrap_or_else(|| json!([])),
-                "reviewer_independence_rules": payload.get("reviewer_independence_rules").cloned().unwrap_or_else(|| json!([])),
-                "elevated_operations": payload.get("elevated_operations").cloned().unwrap_or_else(|| json!([])),
-                "adaptive_envelope": payload.get("adaptive_envelope").cloned().unwrap_or_else(|| json!({})),
-                "rollback_and_recovery": payload.get("rollback_and_recovery").cloned().unwrap_or_else(|| json!([])),
-                "exclusions": payload.get("exclusions").cloned().unwrap_or_else(|| json!([])),
-            }))
-            .map_err(|error| ServiceError::invalid_operation(format!("invalid execution baseline content: {error}")))?
-        };
-
-        validate_execution_baseline_policy(&content).map_err(ServiceError::conflict)?;
-        let project_charter_revision: Option<String> = sqlx::query_scalar(
-            "SELECT current_charter_revision_id FROM project
-             WHERE id = ? AND charter_status = 'charter_backed' AND charter_setup_required = 0",
-        )
-        .bind(project_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .flatten();
-        if project_charter_revision.as_deref()
-            != Some(content.charter_revision.revision_id.as_str())
-        {
-            return Err(ServiceError::conflict(
-                "execution baseline must reference the current approved Project Charter revision",
-            ));
-        }
-        validate_agent_baseline_artifacts(&self.db, project_id, &content).await?;
-
-        let rendered = render_execution_baseline(&content).map_err(|error| {
-            ServiceError::invalid_operation(format!("render execution baseline: {error}"))
         })?;
-        for (field, supplied, computed) in [
-            (
-                "rendered_view",
-                payload.get("rendered_view").and_then(Value::as_str),
-                Some(rendered.rendered_view.as_str()),
-            ),
-            (
-                "content_digest",
-                payload.get("content_digest").and_then(Value::as_str),
-                Some(rendered.content_digest.as_str()),
-            ),
-            (
-                "render_digest",
-                payload.get("render_digest").and_then(Value::as_str),
-                Some(rendered.render_digest.as_str()),
-            ),
-        ] {
-            if let Some(supplied) = supplied {
-                if Some(supplied) != computed {
-                    return Err(ServiceError::conflict(format!(
-                        "execution baseline {field} does not match the server renderer"
-                    )));
-                }
-            }
-        }
-        if let Some(schema_version) = payload.get("schema_version").and_then(Value::as_str) {
-            if schema_version != EXECUTION_BASELINE_SCHEMA_VERSION {
-                return Err(ServiceError::conflict(
-                    "execution baseline schema version is stale",
+        let action_name = string(payload, "action")?;
+        let content: ExecutionBaselineContent = from_value(payload, "content")?;
+        let provenance: RevisionProvenance = from_value(payload, "provenance")?;
+        let rendered_view = string(payload, "rendered_view")?;
+        let render_version = string(payload, "render_version")?;
+        let content_digest = string(payload, "content_digest")?;
+        let render_digest = string(payload, "render_digest")?;
+        let authorization_action = match action_name.as_str() {
+            "draft_revision" | "revise" => EXECUTION_BASELINE_SAVE_DRAFT_COMMAND,
+            "propose_approval" => EXECUTION_BASELINE_PROPOSE_COMMAND,
+            _ => {
+                return Err(ServiceError::invalid_operation(
+                    "Project Agent may draft or propose a baseline; approval and activation are user-only",
                 ));
             }
-        }
-        if let Some(render_version) = payload.get("render_version").and_then(Value::as_str) {
-            if render_version != EXECUTION_BASELINE_RENDER_VERSION {
-                return Err(ServiceError::conflict(
-                    "execution baseline render version is stale",
-                ));
-            }
-        }
-
-        let columns = baseline_column_json(&content)
-            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-        let manifest = json!({
-            "schema": "forge.execution-baseline-manifest/v1",
-            "content": content,
-            "rendered_view": rendered.rendered_view,
-            "provenance": payload.get("provenance").cloned().unwrap_or_else(|| json!({})),
-            "source_action_id": action.id.clone(),
-        });
-        let now = now_rfc3339();
-        let mut tx = db::begin_immediate(self.db.pool()).await?;
-        let (baseline_id, baseline_lifecycle, baseline_version, current_revision_id) =
-            if let Some(baseline_id) = requested_baseline_id {
-                let row = sqlx::query(
-                    "SELECT project_id, lifecycle, version, current_revision_id
-                     FROM project_execution_baseline WHERE id = ?",
-                )
-                .bind(&baseline_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or_else(|| {
-                    ServiceError::invalid_operation(
-                        "unknown baseline_id: omit baseline_id to draft a new execution \
-                         baseline (its id is server-minted), or name an existing baseline \
-                         from the Project current state",
-                    )
-                })?;
-                let owner: String = row.try_get("project_id")?;
-                if owner != project_id {
-                    return Err(ServiceError::invalid_operation(
-                        "execution baseline crosses Project scope",
-                    ));
-                }
-                (
-                    baseline_id,
-                    row.try_get::<String, _>("lifecycle")?,
-                    row.try_get::<i64, _>("version")?,
-                    row.try_get::<Option<String>, _>("current_revision_id")?,
-                )
-            } else {
-                let baseline_id = new_uuid_v4();
-                sqlx::query(
-                    "INSERT INTO project_execution_baseline
-                 (id, project_id, lifecycle, version, created_at, updated_at)
-                 VALUES (?, ?, 'draft', 1, ?, ?)",
-                )
-                .bind(&baseline_id)
-                .bind(project_id)
-                .bind(&now)
-                .bind(&now)
-                .execute(&mut *tx)
-                .await?;
-                (baseline_id, "draft".to_owned(), 1, None)
-            };
+        };
+        let authorization = document_command_authorization(action, context, authorization_action);
+        let baseline_id = optional_nonempty_string(payload, "baseline_id")?;
+        let base_revision_id = optional_nonempty_string(payload, "base_revision_id")?;
         let expected_baseline_version = payload
             .get("expected_baseline_version")
-            .and_then(Value::as_i64)
-            .unwrap_or(baseline_version);
-        if expected_baseline_version != baseline_version {
-            return Err(ServiceError::Db(db::DbError::VersionConflict));
-        }
-        let base_revision_id = payload
-            .get("base_revision_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        if current_revision_id.is_some() && base_revision_id.is_none() {
-            return Err(ServiceError::conflict(
-                "base_revision_id is required when revising an execution baseline",
-            ));
-        }
-        if current_revision_id.is_none() && base_revision_id.is_some() {
-            return Err(ServiceError::conflict(
-                "a first execution baseline revision cannot name a base revision",
-            ));
-        }
-        let base_revision = if let Some(base_revision_id) = base_revision_id.as_deref() {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT revision FROM project_execution_baseline_revision
-                 WHERE id = ? AND baseline_id = ?",
-            )
-            .bind(base_revision_id)
-            .bind(&baseline_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| ServiceError::conflict("execution baseline base revision is stale"))?
-        } else {
-            0
+            .map(|_| nonnegative_integer(payload, "expected_baseline_version"))
+            .transpose()?;
+        let service = ExecutionBaselineCommandService::new(Arc::clone(&self.db));
+        let _outcome = match authorization_action {
+            EXECUTION_BASELINE_SAVE_DRAFT_COMMAND => {
+                service
+                    .save_draft(SaveExecutionBaselineDraftCommand {
+                        project_id: project_id.to_owned(),
+                        baseline_id,
+                        base_revision_id,
+                        expected_baseline_version,
+                        content,
+                        rendered_view,
+                        render_version,
+                        content_digest,
+                        render_digest,
+                        provenance,
+                        idempotency_key: context.idempotency_key().to_owned(),
+                        authorization,
+                        action: context.action_provenance.clone(),
+                    })
+                    .await?
+            }
+            EXECUTION_BASELINE_PROPOSE_COMMAND => {
+                let baseline_id = baseline_id.ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "baseline_id is required when proposing an execution baseline for approval",
+                    )
+                })?;
+                let expected_baseline_version = expected_baseline_version.ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "expected_baseline_version is required when proposing an execution baseline for approval",
+                    )
+                })?;
+                service
+                    .propose_for_approval(ProposeExecutionBaselineForApprovalCommand {
+                        project_id: project_id.to_owned(),
+                        baseline_id,
+                        base_revision_id,
+                        expected_baseline_version,
+                        content,
+                        rendered_view,
+                        render_version,
+                        content_digest,
+                        render_digest,
+                        provenance,
+                        idempotency_key: context.idempotency_key().to_owned(),
+                        authorization,
+                        action: context.action_provenance.clone(),
+                    })
+                    .await?
+            }
+            _ => unreachable!(),
         };
-        if base_revision_id.is_some()
-            && current_revision_id.as_deref() != base_revision_id.as_deref()
-        {
-            return Err(ServiceError::conflict(
-                "execution baseline base revision is not current",
-            ));
-        }
-        let revision_number: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(revision), 0) + 1
-             FROM project_execution_baseline_revision WHERE baseline_id = ?",
-        )
-        .bind(&baseline_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        let revision_id = new_uuid_v4();
-        let milestone_ids_json = serde_json::to_string(&content.milestone_ids)
-            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-        sqlx::query(
-            "INSERT INTO project_execution_baseline_revision (
-                id, baseline_id, revision, base_revision, base_revision_id, lifecycle,
-                charter_revision_id, document_revisions_json, plan_items_json,
-                milestone_id, milestone_ids_json, milestone_definition_revision_ids_json,
-                primary_milestone_id, release_policy_json,
-                release_policy_revision, release_policy_digest, acceptance_matrix_json,
-                capability_classes_json, risk_classes_json, adaptive_envelope_json,
-                elevated_operations_json, exclusions_json, rollback_recovery_json,
-                schema_version, render_version, rendered_view, content_digest,
-                rendered_digest, source_refs_json, created_at
-             ) VALUES (
-                 ?, ?, ?, ?, ?, 'proposed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-             )",
-        )
-        .bind(&revision_id)
-        .bind(&baseline_id)
-        .bind(revision_number)
-        .bind(base_revision)
-        .bind(base_revision_id.as_deref())
-        .bind(&content.charter_revision.revision_id)
-        .bind(&columns.document_revisions_json)
-        .bind(&columns.plan_items_json)
-        .bind(columns.milestone_id.as_deref())
-        .bind(&milestone_ids_json)
-        .bind(&columns.milestone_definition_revision_ids_json)
-        .bind(columns.primary_milestone_id.as_deref())
-        .bind(&columns.release_policy_json)
-        .bind(&content.release_policy_revision)
-        .bind(&content.release_policy_digest)
-        .bind(&columns.acceptance_matrix_json)
-        .bind(&columns.capability_classes_json)
-        .bind(&columns.risk_classes_json)
-        .bind(&columns.adaptive_envelope_json)
-        .bind(&columns.elevated_operations_json)
-        .bind(&columns.exclusions_json)
-        .bind(&columns.rollback_recovery_json)
-        .bind(EXECUTION_BASELINE_SCHEMA_VERSION)
-        .bind(EXECUTION_BASELINE_RENDER_VERSION)
-        .bind(&rendered.rendered_view)
-        .bind(&rendered.content_digest)
-        .bind(&rendered.render_digest)
-        .bind(
-            serde_json::to_string(&manifest)
-                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-        )
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
-        let advanced = sqlx::query(
-            "UPDATE project_execution_baseline
-             SET current_revision_id = CASE WHEN lifecycle IN ('draft', 'proposed') THEN ? ELSE current_revision_id END,
-                 version = version + 1, updated_at = ?
-             WHERE id = ? AND version = ?",
-        )
-        .bind(&revision_id)
-        .bind(&now)
-        .bind(&baseline_id)
-        .bind(baseline_version)
-        .execute(&mut *tx)
-        .await?;
-        if advanced.rows_affected() != 1 {
-            return Err(ServiceError::Db(db::DbError::VersionConflict));
-        }
-        tx.commit().await?;
-        Ok(json!({
-            "operation": PROJECT_EXECUTION_BASELINE_OPERATION,
-            "project_id": project_id,
-            "baseline_id": baseline_id,
-            "revision_id": revision_id,
-            "revision": revision_number,
-            "lifecycle": "proposed",
-            "baseline_lifecycle": baseline_lifecycle,
-            "content_digest": rendered.content_digest,
-            "render_digest": rendered.render_digest,
-            "domain_committed": true,
-        }))
+        let execution = AgentActionRepo::get_successful_action_execution(&*self.db, &action.id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::Conflict(
+                    "execution baseline command committed without its AgentAction execution"
+                        .to_owned(),
+                )
+            })?;
+        let frozen = execution.result_json.ok_or_else(|| {
+            ServiceError::Conflict(
+                "execution baseline command AgentAction execution has no frozen outcome".to_owned(),
+            )
+        })?;
+        serde_json::from_str(&frozen).map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "deserialize frozen execution baseline outcome: {error}"
+            ))
+        })
+    }
+
+    async fn materialize_direct_execution_baseline(
+        &self,
+        action: &AgentAction,
+        project_id: &str,
+        payload: &Value,
+        context: &CommandContext,
+    ) -> Result<Value> {
+        let action_name = string(payload, "action")?;
+        let content: ExecutionBaselineContent = from_value(payload, "content")?;
+        let provenance: RevisionProvenance = from_value(payload, "provenance")?;
+        let rendered_view = string(payload, "rendered_view")?;
+        let render_version = string(payload, "render_version")?;
+        let content_digest = string(payload, "content_digest")?;
+        let render_digest = string(payload, "render_digest")?;
+        let authorization_action = match action_name.as_str() {
+            "draft_revision" | "revise" => EXECUTION_BASELINE_SAVE_DRAFT_COMMAND,
+            "propose_approval" => EXECUTION_BASELINE_PROPOSE_COMMAND,
+            _ => {
+                return Err(ServiceError::invalid_operation(
+                    "Project Agent may draft or propose a baseline; approval and activation are user-only",
+                ));
+            }
+        };
+        let authorization = document_command_authorization(action, context, authorization_action);
+        let baseline_id = optional_nonempty_string(payload, "baseline_id")?;
+        let base_revision_id = optional_nonempty_string(payload, "base_revision_id")?;
+        let expected_baseline_version = payload
+            .get("expected_baseline_version")
+            .map(|_| nonnegative_integer(payload, "expected_baseline_version"))
+            .transpose()?;
+        let service = ExecutionBaselineCommandService::new(Arc::clone(&self.db));
+        let outcome = match authorization_action {
+            EXECUTION_BASELINE_SAVE_DRAFT_COMMAND => {
+                service
+                    .save_draft_with_context(
+                        SaveExecutionBaselineDraftCommand {
+                            project_id: project_id.to_owned(),
+                            baseline_id,
+                            base_revision_id,
+                            expected_baseline_version,
+                            content,
+                            rendered_view,
+                            render_version,
+                            content_digest,
+                            render_digest,
+                            provenance,
+                            idempotency_key: context.idempotency_key().to_owned(),
+                            authorization,
+                            action: None,
+                        },
+                        context.clone(),
+                    )
+                    .await?
+            }
+            EXECUTION_BASELINE_PROPOSE_COMMAND => {
+                let baseline_id = baseline_id.ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "baseline_id is required when proposing an execution baseline for approval",
+                    )
+                })?;
+                let expected_baseline_version = expected_baseline_version.ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "expected_baseline_version is required when proposing an execution baseline for approval",
+                    )
+                })?;
+                service
+                    .propose_for_approval_with_context(
+                        ProposeExecutionBaselineForApprovalCommand {
+                            project_id: project_id.to_owned(),
+                            baseline_id,
+                            base_revision_id,
+                            expected_baseline_version,
+                            content,
+                            rendered_view,
+                            render_version,
+                            content_digest,
+                            render_digest,
+                            provenance,
+                            idempotency_key: context.idempotency_key().to_owned(),
+                            authorization,
+                            action: None,
+                        },
+                        context.clone(),
+                    )
+                    .await?
+            }
+            _ => unreachable!(),
+        };
+        serde_json::to_value(outcome).map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "serialize direct execution baseline outcome: {error}"
+            ))
+        })
     }
 
     async fn materialize_milestone(
@@ -1835,262 +1392,98 @@ impl ProjectOrchestrationActionService {
         action: &AgentAction,
         project_id: &str,
         payload: &Value,
+        command_context: Option<&CommandContext>,
     ) -> Result<Value> {
-        let operation = string(payload, "action")?;
-        if operation == "set_primary" {
-            let primary_id = string(payload, "primary_milestone_id")?;
-            let milestone = ProjectOrchestrationRepo::get_project_milestone(&*self.db, &primary_id)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("project_milestone", primary_id.clone()))?;
-            if milestone.project_id != project_id {
-                return Err(ServiceError::invalid_operation(
-                    "primary milestone crosses Project scope",
-                ));
-            }
-            let expected = integer(payload, "expected_milestone_version")?;
-            let now = now_rfc3339();
-            let update = sqlx::query(
-                "UPDATE project SET primary_milestone_id = ?, version = version + 1,
-                 updated_at = ? WHERE id = ? AND version = ?",
+        let context = command_context.ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "Project milestone execution requires a canonical command context",
             )
-            .bind(&primary_id)
-            .bind(&now)
-            .bind(project_id)
-            .bind(expected)
-            .execute(self.db.pool())
-            .await?;
-            if update.rows_affected() != 1 {
-                return Err(ServiceError::Db(db::DbError::VersionConflict));
-            }
-            return Ok(json!({
-                "operation": PROJECT_MILESTONE_OPERATION,
-                "project_id": project_id,
-                "milestone_id": primary_id,
-                "primary": true,
-                "domain_committed": true,
-                "requires_user_authorization": false,
-            }));
-        }
-
-        let content: MilestoneDefinitionContent = from_value(payload, "content")?;
-        // Bootstrap holds the shell input only when this is a "define" (first
-        // definition) proposal.  The shell and its first revision are then
-        // persisted together atomically, so a failure past this point can
-        // never leave an orphan Milestone with no revisions.  A milestone id
-        // is always server-minted, never taken from the agent payload.
-        let (milestone_id, expected_version, base_revision_id, base_revision, bootstrap) =
-            if operation == "define" {
-                let project_version = project_version(&self.db, project_id).await?;
-                let sequence: i64 = sqlx::query_scalar(
-                    "SELECT COALESCE(MAX(milestone_sequence), 0) + 1
-                     FROM project_milestone WHERE project_id = ?",
-                )
-                .bind(project_id)
-                .fetch_one(self.db.pool())
-                .await?;
-                let milestone_id = new_uuid_v4();
-                let now = now_rfc3339();
-                let milestone = CreateProjectMilestone {
-                    id: milestone_id.clone(),
-                    project_id: project_id.to_owned(),
-                    expected_project_version: project_version,
-                    milestone_sequence: sequence,
-                    milestone_key: crate::milestone_identity(sequence)
-                        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-                    display_label: optional_string(payload, "display_label")
-                        .or_else(|| Some(content.name.clone())),
-                    created_at: now.clone(),
-                    updated_at: now,
-                };
-                (milestone_id, 1, None, 0, Some(milestone))
-            } else {
-                let milestone_id = string(payload, "milestone_id")?;
-                let milestone =
-                    ProjectOrchestrationRepo::get_project_milestone(&*self.db, &milestone_id)
-                        .await?
-                        .ok_or_else(|| {
-                            ServiceError::not_found("project_milestone", milestone_id.clone())
-                        })?;
-                if milestone.project_id != project_id {
-                    return Err(ServiceError::invalid_operation(
-                        "milestone revision crosses Project scope",
-                    ));
-                }
-                let revisions = ProjectOrchestrationRepo::list_project_milestone_revisions(
-                    &*self.db,
-                    &milestone_id,
-                )
-                .await?;
-                let base = revisions
-                    .iter()
-                    .find(|revision| {
-                        Some(revision.id.as_str())
-                            == milestone.current_definition_revision_id.as_deref()
-                    })
-                    .ok_or_else(|| ServiceError::conflict("milestone has no current definition"))?;
-                (
-                    milestone.id,
-                    integer(payload, "expected_milestone_version")?,
-                    Some(base.id.clone()),
-                    base.revision,
-                    None,
-                )
-            };
-
-        let canonical = canonical_json(&content)
-            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-        let revision_input = CreateProjectMilestoneRevision {
-            id: new_uuid_v4(),
-            milestone_id: milestone_id.clone(),
-            expected_milestone_version: expected_version,
-            base_revision,
-            base_revision_id,
-            lifecycle: if operation == "define" {
-                "draft".to_owned()
-            } else {
-                "proposed".to_owned()
-            },
-            display_label: Some(content.name.clone()),
-            outcome: content.outcome.clone(),
-            included_scope_json: serde_json::to_string(&content.included_scope)
-                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-            excluded_scope_json: serde_json::to_string(&content.excluded_scope)
-                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-            charter_revision_id: content
-                .charter_revision
-                .as_ref()
-                .map(|reference| reference.revision_id.clone()),
-            document_revisions_json: serde_json::to_string(&content.document_revisions)
-                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-            task_selection_json: serde_json::to_string(&content.task_ids)
-                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-            dependencies_json: serde_json::to_string(&content.dependencies)
-                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-            risks_json: serde_json::to_string(&content.risks)
-                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-            acceptance_checks_json: serde_json::to_string(&content.acceptance_checks)
-                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-            evidence_requirements_json: serde_json::to_string(&content.evidence_requirements)
-                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-            known_issues_json: serde_json::to_string(&content.known_issues)
-                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-            change_summary: "Project Agent authored a typed milestone definition".to_owned(),
-            schema_version: MILESTONE_DEFINITION_SCHEMA.to_owned(),
-            render_version: MILESTONE_RENDER_SCHEMA.to_owned(),
-            rendered_view: canonical.clone(),
-            content_digest: canonical_digest_with_schema(MILESTONE_DEFINITION_SCHEMA, &content)
-                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-            rendered_digest: canonical_digest_with_schema(MILESTONE_RENDER_SCHEMA, &canonical)
-                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
-            author_type: "agent".to_owned(),
-            author_id: Some(action.actor_identity_id.clone()),
-            source_refs_json: "[]".to_owned(),
-            created_at: now_rfc3339(),
-        };
-        let revision = if let Some(milestone) = bootstrap {
-            ProjectOrchestrationRepo::create_project_milestone_atomically(
-                &*self.db,
-                CreateProjectMilestoneAtomically {
-                    milestone,
-                    revision: revision_input,
-                },
-            )
-            .await?
-        } else {
-            ProjectOrchestrationRepo::create_project_milestone_revision(&*self.db, revision_input)
-                .await?
-        };
-        Ok(json!({
-            "operation": PROJECT_MILESTONE_OPERATION,
-            "project_id": project_id,
-            "milestone_id": milestone_id,
-            "revision_id": revision.id,
-            "revision": revision.revision,
-            "lifecycle": revision.lifecycle,
-            "domain_committed": true,
-            "requires_user_authorization": operation != "define",
-        }))
+        })?;
+        ProjectMilestoneCommandService::new(Arc::clone(&self.db))
+            .execute_project_agent_command(action, project_id, payload, context)
+            .await
     }
 
-    async fn materialize_evidence(
+    async fn materialize_evidence_with_command(
         &self,
         action: &AgentAction,
         project_id: &str,
         payload: &Value,
+        command_context: Option<&CommandContext>,
     ) -> Result<Value> {
+        let context = command_context.ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "Project evidence execution requires a canonical command context",
+            )
+        })?;
         let milestone_id = string(payload, "milestone_id")?;
-        let milestone = ProjectOrchestrationRepo::get_project_milestone(&*self.db, &milestone_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project_milestone", milestone_id.clone()))?;
-        if milestone.project_id != project_id {
-            return Err(ServiceError::invalid_operation(
-                "evidence milestone crosses Project scope",
-            ));
-        }
         let asset_id = string(payload, "asset_id")?;
-        let asset = SharedMediaRepo::get_media_asset(&*self.db, &asset_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("media_asset", asset_id.clone()))?;
-        if asset.project_id != project_id
-            || asset.deleted_at.is_some()
-            || asset.availability != "available"
-        {
-            return Err(ServiceError::conflict(
-                "evidence media is unavailable or cross-Project",
-            ));
-        }
         let requested_checksum = string(payload, "checksum")?;
-        if asset.checksum.as_deref() != Some(requested_checksum.as_str()) {
-            return Err(ServiceError::conflict(
-                "evidence checksum does not match the media asset",
-            ));
-        }
-        let acceptance_check_ids = payload
-            .get("acceptance_check_ids")
-            .cloned()
-            .unwrap_or_else(|| Value::Array(Vec::new()));
-        let attachment = SharedMediaRepo::create_project_media_attachment(
-            &*self.db,
-            CreateProjectMediaAttachment {
-                id: new_uuid_v4(),
-                project_id: project_id.to_owned(),
-                asset_id: asset_id.clone(),
-                attachment_kind: "evidence".to_owned(),
-                // Project evidence is an independent reference to the shared
-                // bytes. Keeping the legacy task_media_id here would collide
-                // with the legacy one-row attachment uniqueness constraint
-                // when an asset is cited by multiple milestones.
-                task_media_id: None,
-                task_id: optional_string(payload, "task_id"),
-                milestone_id: Some(milestone_id.clone()),
-                milestone_check_id: None,
-                source_task_id: optional_string(payload, "task_id"),
-                source_execution_id: None,
-                source_validation_id: None,
-                acceptance_check_ids_json: acceptance_check_ids.to_string(),
-                caption: Some(string(payload, "caption")?),
-                evidence_kind: Some(string(payload, "kind")?),
-                checksum: Some(requested_checksum),
-                availability: "available".to_owned(),
-                project_url: Some(format!("/api/v1/projects/{project_id}/media/{asset_id}")),
-                author_type: "agent".to_owned(),
-                author_id: Some(action.actor_identity_id.clone()),
-                // Readiness replays this as a typed AuthorizationProvenance
-                // whose principal must equal the attachment author and whose
-                // action must be the evidence-attach receipt action; the
-                // admitted AgentAction row is the durable authorizing event.
-                authorization_json: json!({
-                    "principal": {"kind": "agent", "id": action.actor_identity_id},
-                    "authorization_basis": "project_agent_binding_policy",
-                    "action": "project.evidence.attach",
-                    "event_id": action.id,
-                    "occurred_at": action.created_at,
-                })
-                .to_string(),
-                created_at: now_rfc3339(),
-            },
-        )
-        .await?;
+        let acceptance_check_ids: Vec<String> = from_value(payload, "acceptance_check_ids")?;
+        let expected_milestone_version = positive_integer(payload, "expected_milestone_version")?;
+        let authorization_event_id = context
+            .action_provenance
+            .as_ref()
+            .map(|provenance| provenance.action_id.clone())
+            .unwrap_or_else(|| context.correlation_id().to_owned());
+        let authorization = ProjectCommandAuthorization {
+            principal_type: context.principal().principal_type().to_owned(),
+            principal_id: context.principal().principal_id().to_owned(),
+            policy_result: context.authorization_provenance.as_ref().map_or_else(
+                || action.policy_result.to_string(),
+                |value| value.policy_result.clone(),
+            ),
+            policy_revision: context
+                .authorization_provenance
+                .as_ref()
+                .and_then(|value| value.policy_revision.clone()),
+            policy_digest: context
+                .authorization_provenance
+                .as_ref()
+                .and_then(|value| value.policy_digest.clone()),
+            requested_permission: context
+                .authorization_provenance
+                .as_ref()
+                .and_then(|value| value.requested_permission.clone()),
+            correlation_id: context.correlation_id().to_owned(),
+            causation_id: context.causation_id.clone(),
+            causation_depth: context.causation_depth,
+            authorization_event_id: authorization_event_id.clone(),
+            authorization_basis: "project_agent_binding_policy".to_owned(),
+            authorization_action: "project.evidence.attach".to_owned(),
+            authorization_occurred_at: action.created_at.clone(),
+            authorization_json: json!({
+                "principal": {
+                    "kind": context.principal().principal_type(),
+                    "id": context.principal().principal_id(),
+                },
+                "authorization_basis": "project_agent_binding_policy",
+                "action": "project.evidence.attach",
+                "event_id": authorization_event_id,
+                "occurred_at": action.created_at,
+            })
+            .to_string(),
+        };
+        let attachment = ProjectArtifactCommandService::new(Arc::clone(&self.db))
+            .attach_evidence_with_context(
+                ProjectEvidenceCommand {
+                    project_id: project_id.to_owned(),
+                    milestone_id: milestone_id.clone(),
+                    asset_id: asset_id.clone(),
+                    task_id: optional_string(payload, "task_id"),
+                    source_run_id: optional_string(payload, "source_run_id"),
+                    source_validation_id: optional_string(payload, "source_validation_id"),
+                    acceptance_check_ids,
+                    caption: string(payload, "caption")?,
+                    evidence_kind: string(payload, "kind")?,
+                    checksum: requested_checksum,
+                    expected_milestone_version,
+                    idempotency_key: context.idempotency_key().to_owned(),
+                    authorization,
+                },
+                context.clone(),
+            )
+            .await?;
         Ok(json!({
             "operation": PROJECT_EVIDENCE_OPERATION,
             "project_id": project_id,
@@ -2106,72 +1499,16 @@ impl ProjectOrchestrationActionService {
         action: &AgentAction,
         project_id: &str,
         payload: &Value,
+        command_context: Option<&CommandContext>,
     ) -> Result<Value> {
-        let milestone_id = string(payload, "milestone_id")?;
-        let milestone = ProjectOrchestrationRepo::get_project_milestone(&*self.db, &milestone_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project_milestone", milestone_id.clone()))?;
-        if milestone.project_id != project_id {
-            return Err(ServiceError::invalid_operation(
-                "readiness request crosses Project scope",
-            ));
-        }
-        let baseline_id = string(payload, "baseline_id")?;
-        let baseline_revision_id = string(payload, "baseline_revision_id")?;
-        let policy_revision = string(payload, "release_policy_revision")?;
-        let baseline = sqlx::query(
-            "SELECT b.id, b.current_revision_id, r.content_digest, r.release_policy_revision,
-                    r.release_policy_digest
-             FROM project_execution_baseline b
-             JOIN project_execution_baseline_revision r ON r.id = b.current_revision_id
-             WHERE b.id = ? AND b.project_id = ? AND b.lifecycle = 'active'
-               AND b.current_revision_id = ? AND r.lifecycle = 'approved' LIMIT 1",
-        )
-        .bind(&baseline_id)
-        .bind(project_id)
-        .bind(&baseline_revision_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .ok_or_else(|| ServiceError::conflict("readiness request baseline is not active"))?;
-        let release_policy_revision: String = baseline.try_get("release_policy_revision")?;
-        if release_policy_revision != policy_revision {
-            return Err(ServiceError::conflict("readiness request policy is stale"));
-        }
-        let actor = PrincipalRef {
-            kind: PrincipalKind::Agent,
-            id: action.actor_identity_id.clone(),
-            display_name: None,
-        };
-        let authorization = AuthorizationProvenance {
-            principal: actor.clone(),
-            authorization_basis: "bound_project_agent_action".to_owned(),
-            action: "project.milestone.readiness".to_owned(),
-            event_id: action.id.clone(),
-            occurred_at: action.created_at.clone(),
-        };
-        let snapshot = MilestoneRuntime::new(Arc::clone(&self.db))
-            .evaluate(
-                project_id,
-                &actor,
-                &authorization,
-                &milestone_id,
-                integer(payload, "milestone_version")?,
-                &baseline_id,
-                &baseline_revision_id,
-                &release_policy_revision,
-                &format!("project-agent-readiness:{}", action.dedupe_key),
+        let context = command_context.ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "Project readiness execution requires a canonical command context",
             )
-            .await?;
-        Ok(json!({
-            "operation": PROJECT_READINESS_OPERATION,
-            "project_id": project_id,
-            "milestone_id": milestone_id,
-            "readiness_snapshot_id": snapshot.id,
-            "readiness_digest": snapshot.readiness_digest,
-            "result": snapshot.result,
-            "status": "computed",
-            "domain_committed": true,
-        }))
+        })?;
+        ProjectMilestoneCommandService::new(Arc::clone(&self.db))
+            .execute_project_agent_command(action, project_id, payload, context)
+            .await
     }
 
     async fn materialize_release_request(
@@ -2179,214 +1516,222 @@ impl ProjectOrchestrationActionService {
         action: &AgentAction,
         project_id: &str,
         payload: &Value,
+        command_context: Option<&CommandContext>,
     ) -> Result<Value> {
-        let milestone_id = string(payload, "milestone_id")?;
-        let milestone = ProjectOrchestrationRepo::get_project_milestone(&*self.db, &milestone_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project_milestone", milestone_id.clone()))?;
-        if milestone.project_id != project_id {
-            return Err(ServiceError::invalid_operation(
-                "release request crosses Project scope",
-            ));
-        }
-        let snapshot_id = string(payload, "readiness_snapshot_id")?;
-        let snapshot_digest = string(payload, "readiness_digest")?;
-        let snapshot = sqlx::query(
-            "SELECT id, readiness_digest, outcome FROM project_readiness_snapshot
-             WHERE id = ? AND project_id = ? AND milestone_id = ? LIMIT 1",
-        )
-        .bind(&snapshot_id)
-        .bind(project_id)
-        .bind(&milestone_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .ok_or_else(|| {
-            ServiceError::not_found("project_readiness_snapshot", snapshot_id.clone())
+        let context = command_context.ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "Project release-request execution requires a canonical command context",
+            )
         })?;
-        let stored_digest: String = snapshot.try_get("readiness_digest")?;
-        if stored_digest != snapshot_digest {
-            return Err(ServiceError::conflict(
-                "release request readiness digest is stale",
-            ));
-        }
-        if snapshot.try_get::<String, _>("outcome")? != "ready"
-            || milestone.lifecycle != "ready_for_release"
-            || milestone.version != integer(payload, "milestone_version")?
-        {
-            return Err(ServiceError::conflict(
-                "release candidate requires the current ready-for-release milestone snapshot",
-            ));
-        }
-        let event_id = new_uuid_v4();
-        let dedupe = format!("project-release-request:{}", action.dedupe_key);
-        if let Some(existing) = DomainEventRepo::get_event_by_dedupe(&*self.db, &dedupe).await? {
-            return Ok(json!({
-                "operation": PROJECT_RELEASE_OPERATION,
-                "project_id": project_id,
-                "candidate_event_id": existing.id,
-                "status": "pending_user_release_approval",
-                "domain_committed": true,
-            }));
-        }
-        DomainEventRepo::append_event(
-            &*self.db,
-            CreateDomainEvent {
-                id: event_id.clone(),
-                event_type: "project_release.candidate_requested".to_owned(),
-                entity_type: "project_readiness_snapshot".to_owned(),
-                entity_id: snapshot_id.clone(),
-                actor_type: "agent".to_owned(),
-                actor_id: Some(action.actor_identity_id.clone()),
-                scope_type: "project".to_owned(),
-                scope_id: project_id.to_owned(),
-                correlation_id: action.correlation_id.clone(),
-                causation_id: Some(action.id.clone()),
-                causation_depth: action.causation_depth + 1,
-                dedupe_key: Some(dedupe),
-                payload_json: json!({
-                    "milestone_id": milestone_id,
-                    "milestone_version": payload.get("milestone_version"),
-                    "readiness_snapshot_id": snapshot_id,
-                    "readiness_digest": snapshot_digest,
-                    "status": "pending_user_release_approval",
-                    "final_release_created": false,
-                })
-                .to_string(),
-                created_at: now_rfc3339(),
-            },
-        )
-        .await?;
-        Ok(json!({
-            "operation": PROJECT_RELEASE_OPERATION,
-            "project_id": project_id,
-            "candidate_event_id": event_id,
-            "status": "pending_user_release_approval",
-            "domain_committed": true,
-            "final_release_created": false,
-        }))
+        ProjectMilestoneCommandService::new(Arc::clone(&self.db))
+            .execute_project_agent_command(action, project_id, payload, context)
+            .await
     }
 }
 
-pub fn is_project_orchestration_operation(operation: &str) -> bool {
-    matches!(
-        operation,
-        PROJECT_CHARTER_ADOPTION_OPERATION
-            | PROJECT_DOCUMENT_OPERATION
-            | PROJECT_DECISION_OPERATION
-            | PROJECT_EXECUTION_BASELINE_OPERATION
-            | PROJECT_MILESTONE_OPERATION
-            | PROJECT_EVIDENCE_OPERATION
-            | PROJECT_READINESS_OPERATION
-            | PROJECT_RELEASE_OPERATION
-    )
-}
-
-async fn validate_agent_baseline_artifacts(
-    db: &SqliteDb,
-    project_id: &str,
-    content: &ExecutionBaselineContent,
-) -> Result<()> {
-    let charter = sqlx::query(
-        "SELECT c.id AS artifact_id, r.content_digest, r.render_version,
-                r.rendered_digest, r.lifecycle
-         FROM project_charter_revision r
-         JOIN project_charter c ON c.id = r.charter_id
-         WHERE r.id = ? AND c.project_id = ?
-         LIMIT 1",
-    )
-    .bind(&content.charter_revision.revision_id)
-    .bind(project_id)
-    .fetch_optional(db.pool())
-    .await?
-    .ok_or_else(|| ServiceError::conflict("baseline Charter revision is not Project-scoped"))?;
-    let charter_artifact_id: String = charter.try_get("artifact_id")?;
-    let charter_content_digest: String = charter.try_get("content_digest")?;
-    let charter_lifecycle: String = charter.try_get("lifecycle")?;
-    let charter_render_version: String = charter.try_get("render_version")?;
-    let charter_render_digest: String = charter.try_get("rendered_digest")?;
-    if charter_artifact_id != content.charter_revision.artifact_id
-        || charter_content_digest != content.charter_revision.content_digest
-        || charter_lifecycle != "approved"
-        || content.charter_revision.render_version.as_deref()
-            != Some(charter_render_version.as_str())
-        || content.charter_revision.render_digest.as_deref() != Some(charter_render_digest.as_str())
-    {
-        return Err(ServiceError::conflict(
-            "baseline Charter ArtifactRef does not match its approved revision",
+fn validate_direct_input(input: &ExecuteDirectProjectCommandInput) -> Result<()> {
+    for (field, value) in [
+        ("actor_identity_id", input.actor_identity_id.as_str()),
+        ("scope_type", input.scope_type.as_str()),
+        ("scope_id", input.scope_id.as_str()),
+        ("project_id", input.project_id.as_str()),
+        ("operation", input.operation.as_str()),
+        ("idempotency_key", input.idempotency_key.as_str()),
+        ("correlation_id", input.correlation_id.as_str()),
+        ("requested_permission", input.requested_permission.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(ServiceError::invalid_operation(format!(
+                "direct Project command {field} is required"
+            )));
+        }
+    }
+    if !matches!(input.scope_type.as_str(), "project" | "agent_chat") {
+        return Err(ServiceError::invalid_operation(
+            "direct Project commands require a Project or Project Agent Chat scope",
         ));
     }
-    for reference in &content.document_revisions {
-        let row = sqlx::query(
-            "SELECT d.id AS artifact_id, r.content_digest, r.render_version,
-                    r.rendered_digest, r.lifecycle
-             FROM project_document_revision r
-             JOIN project_document d ON d.id = r.document_id
-             WHERE r.id = ? AND d.project_id = ?",
-        )
-        .bind(&reference.revision_id)
-        .bind(project_id)
-        .fetch_optional(db.pool())
-        .await?
-        .ok_or_else(|| {
-            ServiceError::conflict("baseline Document revision is not Project-scoped")
-        })?;
-        let artifact_id: String = row.try_get("artifact_id")?;
-        let content_digest: String = row.try_get("content_digest")?;
-        let lifecycle: String = row.try_get("lifecycle")?;
-        let render_version: String = row.try_get("render_version")?;
-        let render_digest: String = row.try_get("rendered_digest")?;
-        let exact = artifact_id == reference.artifact_id
-            && content_digest == reference.content_digest
-            && lifecycle == "approved"
-            && reference.render_version.as_deref() == Some(render_version.as_str())
-            && reference.render_digest.as_deref() == Some(render_digest.as_str());
-        if !exact {
-            return Err(ServiceError::conflict(
-                "baseline Document ArtifactRef does not match its approved revision",
-            ));
-        }
+    if input.requested_permission != "propose_project" {
+        return Err(ServiceError::AuthorizationDenied {
+            message: "direct Project commands require the propose_project permission".to_owned(),
+        });
     }
-    for milestone_id in &content.milestone_ids {
-        let owned: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM project_milestone WHERE id = ? AND project_id = ? LIMIT 1",
-        )
-        .bind(milestone_id)
-        .bind(project_id)
-        .fetch_optional(db.pool())
-        .await?;
-        if owned.is_none() {
-            return Err(ServiceError::conflict(
-                "baseline milestone is not Project-scoped",
-            ));
-        }
+    if !(0..=8).contains(&input.causation_depth) {
+        return Err(ServiceError::invalid_operation(
+            "direct Project command causation depth exceeds the reaction bound",
+        ));
+    }
+    if input.payload.get("project_id").is_some() {
+        return Err(ServiceError::invalid_operation(
+            "Project command scope is server-derived; project_id must not be supplied in payload",
+        ));
+    }
+    if !is_allowed_project_direct_payload(&input.operation, &input.payload) {
+        return Err(ServiceError::invalid_operation(
+            "Project operation is not an automatically allowed coordination subaction",
+        ));
     }
     Ok(())
 }
 
-async fn project_version(db: &SqliteDb, project_id: &str) -> Result<i64> {
-    sqlx::query_scalar("SELECT version FROM project WHERE id = ? LIMIT 1")
-        .bind(project_id)
-        .fetch_optional(db.pool())
-        .await?
-        .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))
+fn direct_receipt_operation(operation: &str, payload: &Value) -> Result<String> {
+    if !is_allowed_project_direct_payload(operation, payload) {
+        return Err(ServiceError::invalid_operation(
+            "Project operation is not an automatically allowed coordination subaction",
+        ));
+    }
+    if operation == PROJECT_EXECUTION_BASELINE_OPERATION {
+        return match payload.get("action").and_then(Value::as_str) {
+            Some("draft_revision") | Some("revise") => {
+                Ok(EXECUTION_BASELINE_SAVE_DRAFT_COMMAND.to_owned())
+            }
+            Some("propose_approval") => Ok(EXECUTION_BASELINE_PROPOSE_COMMAND.to_owned()),
+            _ => Err(ServiceError::invalid_operation(
+                "Project Agent may draft or propose a baseline; approval and activation are user-only",
+            )),
+        };
+    }
+    Ok(operation.to_owned())
 }
 
-fn json_contains_identifier(value: &str, identifier: &str) -> bool {
-    serde_json::from_str::<Value>(value)
-        .ok()
-        .is_some_and(|value| json_contains_identifier_value(&value, identifier))
+fn direct_command_context(
+    input: &ExecuteDirectProjectCommandInput,
+    operation: &str,
+    payload: &Value,
+    policy_result: &str,
+) -> Result<CommandContext> {
+    let mut versions = BTreeMap::new();
+    for key in [
+        "expected_project_version",
+        "expected_charter_version",
+        "expected_document_version",
+        "expected_candidate_version",
+        "expected_milestone_version",
+        "milestone_version",
+    ] {
+        if let Some(value) = payload.get(key).and_then(Value::as_i64) {
+            versions.insert(key.to_owned(), value);
+        }
+    }
+    if operation == EXECUTION_BASELINE_SAVE_DRAFT_COMMAND
+        || operation == EXECUTION_BASELINE_PROPOSE_COMMAND
+    {
+        versions.insert(
+            "baseline_version".to_owned(),
+            payload
+                .get("expected_baseline_version")
+                .and_then(Value::as_i64)
+                .unwrap_or(1),
+        );
+    }
+    let digests = BTreeMap::from([
+        ("action_scope_type".to_owned(), input.scope_type.clone()),
+        ("action_scope_id".to_owned(), input.scope_id.clone()),
+        ("project_id".to_owned(), input.project_id.clone()),
+    ]);
+    CommandContext::from_authorized_input(
+        NewCommandContext {
+            principal: CommandPrincipal {
+                principal_type: "agent".to_owned(),
+                principal_id: input.actor_identity_id.clone(),
+            },
+            canonical_scope: CommandScope {
+                scope_type: CommandScopeType::Project,
+                scope_id: input.project_id.clone(),
+            },
+            operation: operation.to_owned(),
+            idempotency_key: input.idempotency_key.clone(),
+            expected_state: ExpectedCommandState { versions, digests },
+            authorization_provenance: Some(CommandAuthorizationProvenance {
+                policy_result: policy_result.to_owned(),
+                policy_revision: None,
+                policy_digest: None,
+                requested_permission: Some(input.requested_permission.clone()),
+            }),
+            action_provenance: None,
+            correlation_id: input.correlation_id.clone(),
+            causation_id: input.causation_id.clone(),
+            causation_depth: input.causation_depth,
+        },
+        payload,
+    )
+    .map_err(|error| {
+        ServiceError::invalid_operation(format!("serialize direct Project command: {error}"))
+    })
 }
 
-fn json_contains_identifier_value(value: &Value, identifier: &str) -> bool {
-    match value {
-        Value::String(value) => value == identifier,
-        Value::Array(values) => values
-            .iter()
-            .any(|value| json_contains_identifier_value(value, identifier)),
-        Value::Object(values) => values
-            .values()
-            .any(|value| json_contains_identifier_value(value, identifier)),
-        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+async fn direct_replay(db: &SqliteDb, context: &CommandContext) -> Result<Option<CommandReceipt>> {
+    CommandReceiptRepo::get_command_receipt(
+        db,
+        context.principal().principal_type(),
+        context.principal().principal_id(),
+        context.canonical_scope().scope_type().as_str(),
+        context.canonical_scope().scope_id(),
+        context.operation(),
+        context.idempotency_key(),
+        context.input_digest(),
+    )
+    .await
+    .map_err(Into::into)
+}
+
+fn direct_result_from_receipt(
+    receipt: CommandReceipt,
+    project_id: &str,
+    replayed: bool,
+) -> Result<DirectProjectCommandResult> {
+    if receipt.agent_action_execution_id.is_some() {
+        return Err(ServiceError::Conflict(
+            "direct Project command receipt is unexpectedly linked to an AgentAction execution"
+                .to_owned(),
+        ));
+    }
+    let result: Value = serde_json::from_str(&receipt.outcome_json).map_err(|error| {
+        ServiceError::Conflict(format!(
+            "direct Project command receipt outcome is invalid: {error}"
+        ))
+    })?;
+    Ok(DirectProjectCommandResult {
+        receipt_id: receipt.id,
+        event_id: receipt.event_id,
+        operation: receipt.operation,
+        project_id: project_id.to_owned(),
+        result,
+        agent_action_execution_id: None,
+        replayed,
+    })
+}
+
+fn direct_materialization_action(
+    input: &ExecuteDirectProjectCommandInput,
+    payload: &Value,
+) -> AgentAction {
+    let now = now_rfc3339();
+    let payload_json = payload.to_string();
+    let mut hasher = Sha256::new();
+    hasher.update(payload_json.as_bytes());
+    AgentAction {
+        id: format!("direct-command:{}", input.correlation_id),
+        actor_identity_id: input.actor_identity_id.clone(),
+        scope_type: input.scope_type.clone(),
+        scope_id: input.scope_id.clone(),
+        operation: input.operation.clone(),
+        payload_hash: hex::encode(hasher.finalize()),
+        payload_json,
+        dedupe_key: input.idempotency_key.clone(),
+        correlation_id: input.correlation_id.clone(),
+        causation_id: input.causation_id.clone(),
+        causation_depth: input.causation_depth,
+        requested_permission: input.requested_permission.clone(),
+        policy_result: AgentActionPolicyResult::Allowed,
+        policy_reason: None,
+        status: AgentActionStatus::Proposed,
+        target_type: None,
+        target_id: None,
+        outcome_json: None,
+        version: 1,
+        created_at: now.clone(),
+        updated_at: now,
     }
 }
 
@@ -2442,77 +1787,31 @@ fn optional_nonempty_string(payload: &Value, field: &str) -> Result<Option<Strin
     }
 }
 
-fn parse_adaptive_envelope(value: &str) -> Result<AdaptiveEnvelope> {
-    let value: Value = serde_json::from_str(value).map_err(|error| {
-        ServiceError::invalid_operation(format!(
-            "active execution baseline adaptive envelope is invalid: {error}"
-        ))
-    })?;
-    validate_adaptive_envelope_value(&value)
-}
-
-fn validate_adaptive_envelope_value(value: &Value) -> Result<AdaptiveEnvelope> {
-    let object = value.as_object().ok_or_else(|| {
-        ServiceError::invalid_operation(
-            "active execution baseline adaptive envelope must be an object",
-        )
-    })?;
-    const FIELDS: [&str; 6] = [
-        "allowed_task_operations",
-        "fixed_outcomes",
-        "fixed_acceptance",
-        "fixed_risk_classes",
-        "forbidden_side_effects",
-        "elevated_operations",
-    ];
-    if object.len() != FIELDS.len() || FIELDS.iter().any(|field| !object.contains_key(*field)) {
-        return Err(ServiceError::invalid_operation(
-            "active execution baseline adaptive envelope must contain exactly its required arrays",
-        ));
-    }
-    for field in FIELDS {
-        if !object.get(field).is_some_and(Value::is_array)
-            || object
-                .get(field)
-                .and_then(Value::as_array)
-                .is_some_and(|values| values.iter().any(|value| !value.is_string()))
-        {
-            return Err(ServiceError::invalid_operation(format!(
-                "active execution baseline adaptive envelope field {field} must be a string array"
-            )));
-        }
-    }
-    serde_json::from_value(value.clone()).map_err(|error| {
-        ServiceError::invalid_operation(format!(
-            "active execution baseline adaptive envelope is invalid: {error}"
-        ))
-    })
-}
-
-fn adaptive_envelope_digest(value: &Value) -> Result<String> {
-    let envelope = validate_adaptive_envelope_value(value)?;
-    canonical_digest_with_schema("forge.execution-baseline-adaptive-envelope/v1", &envelope)
-        .map_err(|error| ServiceError::invalid_operation(error.to_string()))
-}
-
-fn selected_outcome_is_inside_envelope(
-    envelope: &AdaptiveEnvelope,
-    selected_outcome: Option<&str>,
-) -> bool {
-    envelope.fixed_outcomes.is_empty()
-        || selected_outcome.is_some_and(|outcome| {
-            envelope
-                .fixed_outcomes
-                .iter()
-                .any(|fixed| fixed.as_str() == outcome)
-        })
-}
-
 fn integer(payload: &Value, field: &str) -> Result<i64> {
     payload
         .get(field)
         .and_then(Value::as_i64)
         .ok_or_else(|| ServiceError::invalid_operation(format!("{field} is required")))
+}
+
+fn positive_integer(payload: &Value, field: &str) -> Result<i64> {
+    let value = integer(payload, field)?;
+    if value < 1 {
+        return Err(ServiceError::invalid_operation(format!(
+            "{field} must be a positive integer"
+        )));
+    }
+    Ok(value)
+}
+
+fn nonnegative_integer(payload: &Value, field: &str) -> Result<i64> {
+    let value = integer(payload, field)?;
+    if value < 0 {
+        return Err(ServiceError::invalid_operation(format!(
+            "{field} must be a non-negative integer"
+        )));
+    }
+    Ok(value)
 }
 
 fn from_value<T: serde::de::DeserializeOwned>(payload: &Value, field: &str) -> Result<T> {
@@ -2534,11 +1833,65 @@ fn required(field: &str, value: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 
+fn document_command_authorization(
+    action: &AgentAction,
+    context: &CommandContext,
+    authorization_action: &str,
+) -> ProjectCommandAuthorization {
+    let provenance = context.authorization_provenance.as_ref();
+    let authorization_event_id = context
+        .action_provenance
+        .as_ref()
+        .map(|value| value.action_id.clone())
+        .unwrap_or_else(|| context.correlation_id().to_owned());
+    // Document commands historically record the binding-policy basis even
+    // when an approval-backed AgentAction supplied the audit event.  Keep
+    // that basis stable for action-backed replay; direct commands use the
+    // same policy basis with a correlation-backed authorization event.
+    let authorization_basis = "project_agent_binding_policy";
+    ProjectCommandAuthorization {
+        principal_type: context.principal().principal_type().to_owned(),
+        principal_id: context.principal().principal_id().to_owned(),
+        policy_result: provenance.map_or_else(
+            || action.policy_result.to_string(),
+            |value| value.policy_result.clone(),
+        ),
+        policy_revision: provenance.and_then(|value| value.policy_revision.clone()),
+        policy_digest: provenance.and_then(|value| value.policy_digest.clone()),
+        requested_permission: provenance.and_then(|value| value.requested_permission.clone()),
+        correlation_id: context.correlation_id().to_owned(),
+        causation_id: context.causation_id.clone(),
+        causation_depth: context.causation_depth,
+        authorization_event_id,
+        authorization_basis: authorization_basis.to_owned(),
+        authorization_action: authorization_action.to_owned(),
+        authorization_occurred_at: action.created_at.clone(),
+        authorization_json: json!({
+            "principal": {
+                "kind": context.principal().principal_type(),
+                "id": context.principal().principal_id(),
+            },
+            "authorization_basis": authorization_basis,
+            "action": authorization_action,
+            "event_id": context
+                .action_provenance
+                .as_ref()
+                .map(|value| value.action_id.as_str())
+                .unwrap_or_else(|| context.correlation_id()),
+            "correlation_id": context.correlation_id(),
+            "causation_id": context.causation_id,
+            "occurred_at": action.created_at,
+        })
+        .to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use api_types::{
         AdaptiveEnvelope, ArtifactRef, ExecutionBaselineContent, ExecutionBaselineReleasePolicy,
+        PrincipalKind, PrincipalRef,
     };
     use db::{create_sqlite_pool, run_migrations, CreateProject, ProjectRepo};
     use std::sync::Arc;
@@ -2606,402 +1959,6 @@ mod tests {
         }
     }
 
-    fn adoption_charter_content_fixture() -> Value {
-        json!({
-            "identity": {
-                "working_name": "NoteJot",
-                "slug_proposal": "notejot",
-                "one_line_vision": "Keep an existing Project intent durable and auditable.",
-                "maturity": "mvp",
-                "lifecycle_intent": "validate the smallest useful workflow",
-                "project_type": "product",
-                "value_proposition": "Preserve exact approved project intent."
-            },
-            "problem_and_people": {
-                "problem_or_opportunity": "Existing Project intent is scattered across mutable history.",
-                "target_users": ["Forge builders"],
-                "beneficiaries": ["Project collaborators"],
-                "jobs_pains_opportunity": ["Keep one bounded source of truth."],
-                "current_alternatives": ["Unversioned chat notes"],
-                "stakeholders": ["Project owner"],
-                "excluded_audiences": ["Unrelated projects"]
-            },
-            "core_experience": {
-                "primary_outcome": "A Project Agent can continue from the approved Charter.",
-                "core_loop": "discover, approve, hand off, validate",
-                "principal_journeys": ["Owner approves then Project Agent executes."]
-            },
-            "scope": {
-                "must_have_outcomes": ["Persist the approved Project outcome."],
-                "required_deliverables": ["One durable Project Chat."],
-                "later_possibilities": ["Expand Project-local execution."],
-                "explicit_non_goals": ["Managing unrelated Projects"]
-            },
-            "success": {
-                "qualitative_outcome": "Project intent remains verifiable.",
-                "success_signals": ["Agent starts without restating intent."],
-                "acceptance_statements": ["A replay does not create a second Project."],
-                "required_evidence": ["Database assertions."],
-                "non_claims": ["This does not prove implementation quality."]
-            },
-            "constraints_and_risks": {
-                "product": ["Single Project local-first operation."],
-                "time_and_budget": ["One bounded iteration."],
-                "technology": ["SQLite and the existing Forge API."],
-                "data": ["Do not copy hidden chat history."],
-                "integrations": [],
-                "security_privacy_compliance": ["Require explicit user approval."],
-                "accessibility": [],
-                "operations": [],
-                "migration": [],
-                "launch": [],
-                "agent_authority": ["Project Agent remains Project-scoped."],
-                "risks": []
-            },
-            "knowledge_ledger": { "items": [] },
-            "handoff_note": {
-                "recommended_first_action": "Create the first Project-local execution plan.",
-                "bounded_summary": "Start from the approved Project outcome.",
-                "unresolved_item_ids": []
-            }
-        })
-    }
-
-    fn adoption_action(project_id: &str, payload: &Value, dedupe_key: &str) -> AgentAction {
-        let now = now_rfc3339();
-        AgentAction {
-            id: new_uuid_v4(),
-            actor_identity_id: new_uuid_v4(),
-            scope_type: "project".to_owned(),
-            scope_id: project_id.to_owned(),
-            operation: PROJECT_CHARTER_ADOPTION_OPERATION.to_owned(),
-            payload_json: payload.to_string(),
-            payload_hash: "payload-hash".to_owned(),
-            dedupe_key: dedupe_key.to_owned(),
-            correlation_id: new_uuid_v4(),
-            causation_id: None,
-            causation_depth: 0,
-            requested_permission: "propose_project".to_owned(),
-            policy_result: AgentActionPolicyResult::Allowed,
-            policy_reason: None,
-            status: AgentActionStatus::Proposed,
-            target_type: Some("project".to_owned()),
-            target_id: Some(project_id.to_owned()),
-            outcome_json: None,
-            version: 1,
-            created_at: now.clone(),
-            updated_at: now,
-        }
-    }
-
-    async fn setup_adoption_project(db: &SqliteDb) -> String {
-        let now = now_rfc3339();
-        let user_id = new_uuid_v4();
-        let project_id = new_uuid_v4();
-        sqlx::query(
-            "INSERT INTO user (id, email, password_hash, display_name, created_at, updated_at)
-             VALUES (?, ?, 'test', 'Adoption User', ?, ?)",
-        )
-        .bind(&user_id)
-        .bind(format!("{user_id}@example.test"))
-        .bind(&now)
-        .bind(&now)
-        .execute(db.pool())
-        .await
-        .expect("user");
-        ProjectRepo::create(
-            db,
-            CreateProject {
-                id: project_id.clone(),
-                name: "Adoption project".to_owned(),
-                settings: "{}".to_owned(),
-                workflow_definition: "{}".to_owned(),
-                primary_repo_id: None,
-                owner_id: Some(user_id),
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        )
-        .await
-        .expect("project");
-        project_id
-    }
-
-    #[tokio::test]
-    async fn adoption_charter_id_is_server_minted_not_the_agent_placeholder() {
-        let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
-        run_migrations(&pool).await.expect("schema");
-        let db = SqliteDb::new(pool);
-        let project_id = setup_adoption_project(&db).await;
-        let service = ProjectOrchestrationActionService::new(Arc::new(db.clone()));
-
-        let payload = json!({
-            "action": "draft_revision",
-            "charter_id": "charter-notejot-001",
-            "expected_charter_version": 0,
-            "project_mode": "compact",
-            "maturity": "mvp",
-            "content": adoption_charter_content_fixture(),
-            "provenance": {
-                "author": { "kind": "agent", "id": "project-agent" },
-                "change_summary": "Adopt the existing Project",
-                "source_refs": []
-            }
-        });
-        let result = service
-            .materialize_charter_adoption(
-                &adoption_action(&project_id, &payload, "adoption-1"),
-                &project_id,
-                &payload,
-            )
-            .await
-            .expect("adoption draft materializes");
-
-        let charter_id = result["charter_id"].as_str().expect("charter id");
-        assert_ne!(charter_id, "charter-notejot-001");
-        // The verdict the user's approval will be judged against travels back
-        // with the result, so the model can close the gaps in the same turn.
-        assert!(result["readiness"]["status"].is_string());
-        let stored: String =
-            sqlx::query_scalar("SELECT id FROM project_charter WHERE project_id = ?")
-                .bind(&project_id)
-                .fetch_one(db.pool())
-                .await
-                .expect("adoption charter row");
-        assert_eq!(stored, charter_id);
-        assert!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM project_charter WHERE id = 'charter-notejot-001'"
-            )
-            .fetch_one(db.pool())
-            .await
-            .expect("placeholder count")
-                == 0
-        );
-    }
-
-    #[tokio::test]
-    async fn adoption_version_conflict_names_the_version_to_send() {
-        let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
-        run_migrations(&pool).await.expect("schema");
-        let db = SqliteDb::new(pool);
-        let project_id = setup_adoption_project(&db).await;
-        let service = ProjectOrchestrationActionService::new(Arc::new(db.clone()));
-        let content = adoption_charter_content_fixture();
-        let first = json!({
-            "action": "draft_revision",
-            "expected_charter_version": 0,
-            "project_mode": "compact",
-            "maturity": "mvp",
-            "content": content,
-            "provenance": {
-                "author": { "kind": "agent", "id": "project-agent" },
-                "change_summary": "Adopt",
-                "source_refs": []
-            }
-        });
-        let created = service
-            .materialize_charter_adoption(
-                &adoption_action(&project_id, &first, "adoption-1"),
-                &project_id,
-                &first,
-            )
-            .await
-            .expect("first adoption draft");
-        let charter_version = created["charter_version"]
-            .as_i64()
-            .expect("charter version");
-
-        // A model that repeats `0` must be told the version to send, not just
-        // that the one it sent is wrong: nothing on the Project surface reads a
-        // Charter, so an unnamed version is a dead end.
-        let repeat_zero = service
-            .materialize_charter_adoption(
-                &adoption_action(&project_id, &first, "adoption-2"),
-                &project_id,
-                &first,
-            )
-            .await
-            .expect_err("a second draft at version 0 conflicts");
-        let message = repeat_zero.to_string();
-        assert!(
-            message.contains(&format!("expected_charter_version = {charter_version}")),
-            "{message}"
-        );
-        assert!(
-            message.contains(created["revision_id"].as_str().expect("revision id")),
-            "{message}"
-        );
-
-        let stale = json!({
-            "action": "draft_revision",
-            "expected_charter_version": charter_version + 7,
-            "project_mode": "compact",
-            "maturity": "mvp",
-            "content": content,
-            "provenance": {
-                "author": { "kind": "agent", "id": "project-agent" },
-                "change_summary": "Revise",
-                "source_refs": []
-            }
-        });
-        let stale_error = service
-            .materialize_charter_adoption(
-                &adoption_action(&project_id, &stale, "adoption-3"),
-                &project_id,
-                &stale,
-            )
-            .await
-            .expect_err("a stale version conflicts");
-        assert!(
-            stale_error
-                .to_string()
-                .contains(&format!("version {charter_version}")),
-            "{stale_error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn adoption_draft_can_be_revised_before_approval() {
-        let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
-        run_migrations(&pool).await.expect("schema");
-        let db = SqliteDb::new(pool);
-        let project_id = setup_adoption_project(&db).await;
-        let service = ProjectOrchestrationActionService::new(Arc::new(db.clone()));
-        let content = adoption_charter_content_fixture();
-
-        let first = json!({
-            "action": "draft_revision",
-            "charter_id": "charter-notejot-001",
-            "expected_charter_version": 0,
-            "project_mode": "compact",
-            "maturity": "mvp",
-            "content": content,
-            "provenance": {
-                "author": { "kind": "agent", "id": "project-agent" },
-                "change_summary": "Adopt",
-                "source_refs": []
-            }
-        });
-        let created = service
-            .materialize_charter_adoption(
-                &adoption_action(&project_id, &first, "adoption-1"),
-                &project_id,
-                &first,
-            )
-            .await
-            .expect("first adoption draft");
-        let charter_id = created["charter_id"]
-            .as_str()
-            .expect("charter id")
-            .to_owned();
-        let charter_version = created["charter_version"]
-            .as_i64()
-            .expect("charter version");
-        let base_revision_id = created["revision_id"]
-            .as_str()
-            .expect("revision id")
-            .to_owned();
-
-        // The model repeats its own placeholder instead of the returned id.
-        let second = json!({
-            "action": "draft_revision",
-            "charter_id": "charter-notejot-001",
-            "base_revision_id": base_revision_id,
-            "expected_charter_version": charter_version,
-            "project_mode": "compact",
-            "maturity": "mvp",
-            "content": content,
-            "provenance": {
-                "author": { "kind": "agent", "id": "project-agent" },
-                "change_summary": "Revise",
-                "source_refs": []
-            }
-        });
-        let revised = service
-            .materialize_charter_adoption(
-                &adoption_action(&project_id, &second, "adoption-2"),
-                &project_id,
-                &second,
-            )
-            .await
-            .expect("second adoption draft targets the same Charter");
-        assert_eq!(revised["charter_id"].as_str(), Some(charter_id.as_str()));
-        assert_eq!(revised["revision"].as_i64(), Some(2));
-        let charters: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM project_charter WHERE project_id = ?")
-                .bind(&project_id)
-                .fetch_one(db.pool())
-                .await
-                .expect("charter count");
-        assert_eq!(charters, 1);
-    }
-
-    #[tokio::test]
-    async fn agent_defined_milestone_uses_canonical_project_sequence_key() {
-        let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
-        run_migrations(&pool).await.expect("schema");
-        let db = SqliteDb::new(pool);
-        let now = now_rfc3339();
-        let project_id = new_uuid_v4();
-        ProjectRepo::create(
-            &db,
-            CreateProject {
-                id: project_id.clone(),
-                name: "Milestone key project".to_owned(),
-                settings: "{}".to_owned(),
-                workflow_definition: "{}".to_owned(),
-                primary_repo_id: None,
-                owner_id: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-        )
-        .await
-        .expect("project");
-        let payload = json!({
-            "action": "define",
-            "content": {
-                "name": "Checkout flow",
-                "outcome": "Customers can complete checkout"
-            }
-        });
-        let action = AgentAction {
-            id: new_uuid_v4(),
-            actor_identity_id: new_uuid_v4(),
-            scope_type: "project".to_owned(),
-            scope_id: project_id.clone(),
-            operation: PROJECT_MILESTONE_OPERATION.to_owned(),
-            payload_json: payload.to_string(),
-            payload_hash: "payload-hash".to_owned(),
-            dedupe_key: "milestone-key-action".to_owned(),
-            correlation_id: new_uuid_v4(),
-            causation_id: None,
-            causation_depth: 0,
-            requested_permission: "propose_project".to_owned(),
-            policy_result: AgentActionPolicyResult::Allowed,
-            policy_reason: None,
-            status: AgentActionStatus::Proposed,
-            target_type: Some("project".to_owned()),
-            target_id: Some(project_id.clone()),
-            outcome_json: None,
-            version: 1,
-            created_at: now.clone(),
-            updated_at: now,
-        };
-        ProjectOrchestrationActionService::new(Arc::new(db.clone()))
-            .materialize_milestone(&action, &project_id, &payload)
-            .await
-            .expect("milestone definition materializes");
-        let key: String =
-            sqlx::query_scalar("SELECT milestone_key FROM project_milestone WHERE project_id = ?")
-                .bind(&project_id)
-                .fetch_one(db.pool())
-                .await
-                .expect("milestone key");
-        assert_eq!(key, "M001");
-    }
-
     #[tokio::test]
     async fn action_baseline_materializer_persists_ordered_milestone_definition_manifest_v076() {
         let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
@@ -3014,7 +1971,6 @@ mod tests {
         let charter_revision_id = new_uuid_v4();
         let milestone_id = new_uuid_v4();
         let milestone_definition_revision_id = new_uuid_v4();
-        let action_id = new_uuid_v4();
 
         sqlx::query(
             "INSERT INTO user (id, email, password_hash, display_name, created_at, updated_at)
@@ -3159,47 +2115,59 @@ mod tests {
             serde_json::to_value(&content.release_policy).expect("release policy JSON");
         let expected_adaptive_envelope =
             serde_json::to_value(&content.adaptive_envelope).expect("adaptive envelope JSON");
-        // No baseline_id: drafting a new baseline must server-mint the shell id.
-        let payload = json!({
-            "action": "draft_revision",
-            "content": content,
-        });
-        let action = AgentAction {
-            id: action_id,
-            actor_identity_id: new_uuid_v4(),
-            scope_type: "project".to_owned(),
-            scope_id: project_id.clone(),
-            operation: PROJECT_EXECUTION_BASELINE_OPERATION.to_owned(),
-            payload_json: payload.to_string(),
-            payload_hash: "payload-hash".to_owned(),
-            dedupe_key: "baseline-action-dedupe".to_owned(),
-            correlation_id: new_uuid_v4(),
-            causation_id: None,
-            causation_depth: 0,
-            requested_permission: "propose_project".to_owned(),
-            policy_result: AgentActionPolicyResult::Allowed,
-            policy_reason: None,
-            status: AgentActionStatus::Proposed,
-            target_type: Some("project".to_owned()),
-            target_id: Some(project_id.clone()),
-            outcome_json: None,
-            version: 1,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        };
-        let service = ProjectOrchestrationActionService::new(Arc::new(db.clone()));
+        // No baseline_id: drafting a new baseline must server-mint the shell
+        // id. The native adapter uses this same command service below.
+        let rendered = crate::render_execution_baseline(&content).expect("render baseline");
+        let service = crate::ExecutionBaselineCommandService::new(Arc::new(db.clone()));
         let result = service
-            .materialize_execution_baseline(&action, &project_id, &payload)
+            .save_draft(crate::SaveExecutionBaselineDraftCommand {
+                project_id: project_id.clone(),
+                baseline_id: None,
+                base_revision_id: None,
+                expected_baseline_version: None,
+                content,
+                rendered_view: rendered.rendered_view,
+                render_version: crate::EXECUTION_BASELINE_RENDER_VERSION.to_owned(),
+                content_digest: rendered.content_digest,
+                render_digest: rendered.render_digest,
+                provenance: RevisionProvenance {
+                    author: PrincipalRef {
+                        kind: PrincipalKind::User,
+                        id: user_id.clone(),
+                        display_name: None,
+                    },
+                    profile_revision: None,
+                    operating_skill_revision: None,
+                    source_refs: Vec::new(),
+                    change_summary: "test baseline draft".to_owned(),
+                    material_diff: None,
+                },
+                idempotency_key: "baseline-action-dedupe".to_owned(),
+                authorization: ProjectCommandAuthorization {
+                    principal_type: "user".to_owned(),
+                    principal_id: user_id,
+                    policy_result: "allowed".to_owned(),
+                    policy_revision: None,
+                    policy_digest: None,
+                    requested_permission: Some("propose_project".to_owned()),
+                    correlation_id: "baseline-action-correlation".to_owned(),
+                    causation_id: None,
+                    causation_depth: 0,
+                    authorization_event_id: "baseline-action-authorization".to_owned(),
+                    authorization_basis: "test".to_owned(),
+                    authorization_action: crate::EXECUTION_BASELINE_SAVE_DRAFT_COMMAND.to_owned(),
+                    authorization_occurred_at: now,
+                    authorization_json: "{}".to_owned(),
+                },
+                action: None,
+            })
             .await
-            .expect("Project action baseline materializes on fresh V076 schema");
-        let minted_baseline_id = result
-            .get("baseline_id")
-            .and_then(Value::as_str)
-            .expect("baseline id");
+            .expect("baseline command materializes on fresh V076 schema");
+        let minted_baseline_id = result.baseline_id.as_str();
         uuid::Uuid::parse_str(minted_baseline_id).expect("baseline id is a server-minted UUID");
         let revision_id = result
-            .get("revision_id")
-            .and_then(Value::as_str)
+            .revision_id
+            .as_deref()
             .expect("revision id")
             .to_owned();
         let row = sqlx::query(
@@ -3257,63 +2225,58 @@ mod tests {
     }
 
     #[test]
-    fn baseline_identifier_matching_is_structural_and_bounded() {
-        let baseline = r#"{"plan_items":[{"id":"plan-1"}],"milestones":["milestone-1"]}"#;
-        assert!(json_contains_identifier(baseline, "plan-1"));
-        assert!(json_contains_identifier(baseline, "milestone-1"));
-        assert!(!json_contains_identifier(baseline, "plan-2"));
-        assert!(!json_contains_identifier("not-json", "plan-1"));
+    fn direct_project_allowlist_excludes_approval_and_release_operations() {
+        assert!(is_allowed_project_direct_payload(
+            PROJECT_CHARTER_ADOPTION_OPERATION,
+            &json!({"action": "draft_revision"}),
+        ));
+        assert!(is_allowed_project_direct_payload(
+            PROJECT_DOCUMENT_OPERATION,
+            &json!({"action": "propose_approval"}),
+        ));
+        assert!(is_allowed_project_direct_payload(
+            PROJECT_DOCUMENT_OPERATION,
+            &json!({"action": "approve"}),
+        ));
+        assert!(is_allowed_project_direct_payload(
+            PROJECT_DECISION_OPERATION,
+            &json!({
+                "action": "record_effective",
+                "decision_class": "project_implementation"
+            }),
+        ));
+        assert!(!is_allowed_project_direct_payload(
+            PROJECT_RELEASE_OPERATION,
+            &json!({"action": "propose_candidate"}),
+        ));
     }
 
     #[test]
-    fn adaptive_envelope_is_closed_and_rejects_out_of_envelope_outcomes() {
-        let value = json!({
-            "allowed_task_operations": ["task.read"],
-            "fixed_outcomes": ["approved"],
-            "fixed_acceptance": ["checks_pass"],
-            "fixed_risk_classes": ["low"],
-            "forbidden_side_effects": ["release"],
-            "elevated_operations": []
-        });
-        let envelope = validate_adaptive_envelope_value(&value).expect("valid envelope");
-        assert!(selected_outcome_is_inside_envelope(
-            &envelope,
-            Some("approved")
-        ));
-        assert!(!selected_outcome_is_inside_envelope(
-            &envelope,
-            Some("rejected")
-        ));
-        assert!(!selected_outcome_is_inside_envelope(&envelope, None));
-
-        let mut with_unknown = value.clone();
-        with_unknown["unexpected"] = json!([]);
-        assert!(validate_adaptive_envelope_value(&with_unknown).is_err());
-        let mut with_missing = value;
-        with_missing
-            .as_object_mut()
-            .expect("object")
-            .remove("fixed_acceptance");
-        assert!(validate_adaptive_envelope_value(&with_missing).is_err());
-    }
-
-    #[test]
-    fn adaptive_envelope_digest_binding_rejects_wrong_digest() {
-        let value = json!({
-            "allowed_task_operations": [],
-            "fixed_outcomes": ["approved"],
-            "fixed_acceptance": [],
-            "fixed_risk_classes": [],
-            "forbidden_side_effects": [],
-            "elevated_operations": []
-        });
-        let digest = adaptive_envelope_digest(&value).expect("digest");
-        assert_ne!(digest, "wrong-envelope-digest");
-        let mut tampered = value;
-        tampered["fixed_outcomes"] = json!(["rejected"]);
-        assert_ne!(
-            adaptive_envelope_digest(&tampered).expect("tampered digest"),
-            digest
-        );
+    fn direct_context_has_agent_principal_and_no_action_provenance() {
+        let input = ExecuteDirectProjectCommandInput {
+            actor_identity_id: "agent-1".to_owned(),
+            scope_type: "agent_chat".to_owned(),
+            scope_id: "chat-1".to_owned(),
+            project_id: "project-1".to_owned(),
+            operation: PROJECT_MILESTONE_OPERATION.to_owned(),
+            payload: json!({"action": "set_primary", "expected_milestone_version": 1}),
+            idempotency_key: "direct-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            causation_id: Some("cause-1".to_owned()),
+            causation_depth: 0,
+            requested_permission: "propose_project".to_owned(),
+        };
+        let context = direct_command_context(
+            &input,
+            PROJECT_MILESTONE_OPERATION,
+            &input.payload,
+            "allowed",
+        )
+        .expect("direct command context");
+        assert_eq!(context.principal().principal_type(), "agent");
+        assert_eq!(context.principal().principal_id(), "agent-1");
+        assert_eq!(context.canonical_scope().scope_id(), "project-1");
+        assert!(context.action_provenance.is_none());
+        assert_eq!(context.operation(), PROJECT_MILESTONE_OPERATION);
     }
 }

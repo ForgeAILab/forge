@@ -294,7 +294,7 @@ async fn seed_agent_with_executor_type(
             config_json: config_json.to_owned(),
             credential_ref: None,
             daemon_id: Some(daemon_id),
-            max_concurrent_tasks: 1,
+            max_concurrent_tasks: 2,
             heartbeat_interval_seconds: 30,
             max_missed_heartbeats: 3,
             status: AgentStatus::Idle,
@@ -309,6 +309,19 @@ async fn seed_agent_with_executor_type(
     )
     .await
     .expect("agent creates");
+    let project_ids: Vec<String> = sqlx::query_scalar("SELECT id FROM project")
+        .fetch_all(db.pool())
+        .await
+        .expect("test project ids load");
+    for project_id in project_ids {
+        crate::test_support::configure_project_execution_test_setup(
+            db,
+            &project_id,
+            &agent_id,
+            &agent_id,
+        )
+        .await;
+    }
     agent_id
 }
 

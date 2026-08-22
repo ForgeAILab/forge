@@ -129,6 +129,18 @@ impl DomainEventRepo for SqliteDb {
             .transpose()
     }
 
+    async fn get_consumer_cutover(
+        &self,
+        consumer_name: &str,
+    ) -> Result<Option<EventConsumerCutover>> {
+        sqlx::query("SELECT * FROM event_consumer_cutover WHERE consumer_name = ?")
+            .bind(consumer_name)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| map_event_consumer_cutover(row).map_err(DbError::from))
+            .transpose()
+    }
+
     async fn claim_event_batch(&self, input: ClaimDomainEvents) -> Result<Vec<DomainEvent>> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         sqlx::query(
@@ -366,7 +378,7 @@ fn event_semantics_match(input: &CreateDomainEvent, existing: &DomainEvent) -> b
         && input.payload_json == existing.payload_json
 }
 
-fn map_domain_event(row: SqliteRow) -> std::result::Result<DomainEvent, sqlx::Error> {
+pub(super) fn map_domain_event(row: SqliteRow) -> std::result::Result<DomainEvent, sqlx::Error> {
     Ok(DomainEvent {
         sequence: row.try_get("sequence")?,
         id: row.try_get("id")?,
@@ -394,5 +406,16 @@ fn map_event_consumer_cursor(
         last_sequence: row.try_get("last_sequence")?,
         version: row.try_get("version")?,
         updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn map_event_consumer_cutover(
+    row: SqliteRow,
+) -> std::result::Result<EventConsumerCutover, sqlx::Error> {
+    Ok(EventConsumerCutover {
+        consumer_name: row.try_get("consumer_name")?,
+        cutover_sequence: row.try_get("cutover_sequence")?,
+        reason: row.try_get("reason")?,
+        created_at: row.try_get("created_at")?,
     })
 }

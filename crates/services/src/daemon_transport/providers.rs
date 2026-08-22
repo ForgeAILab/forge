@@ -17,6 +17,13 @@ pub trait FilesystemProvider: Send + Sync {
 
 #[async_trait]
 pub trait ExecutionProvider: Send + Sync {
+    /// The authenticated connection incarnation that owns a remote
+    /// execution, when this provider is backed by a daemon socket. Embedded
+    /// providers return `None` and use their in-process lease owner.
+    fn execution_lease_owner(&self) -> Option<String> {
+        None
+    }
+
     async fn start(
         &self,
         params: api_types::ExecutionStartParams,

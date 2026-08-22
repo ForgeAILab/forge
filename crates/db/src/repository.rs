@@ -261,11 +261,79 @@ pub trait AgentActionRepo: Send + Sync {
         &self,
         input: CreateAgentActionExecution,
     ) -> Result<AgentActionExecution>;
+    /// Record the execution row and CAS the action's terminal status/outcome
+    /// inside a caller-owned transaction.  The caller commits this together
+    /// with the command's domain rows, receipt, and event.
+    async fn record_action_execution_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateAgentActionExecution,
+    ) -> Result<AgentActionExecution>;
     async fn get_successful_action_execution(
         &self,
         action_id: &str,
     ) -> Result<Option<AgentActionExecution>>;
     async fn list_action_executions(&self, action_id: &str) -> Result<Vec<AgentActionExecution>>;
+}
+
+/// Durable replay records for shared mutating commands.
+// The lookup deliberately spells out the complete canonical receipt identity
+// at the repository boundary so callers cannot accidentally omit one of its
+// authorization or replay components.
+#[allow(clippy::too_many_arguments)]
+#[async_trait]
+pub trait CommandReceiptRepo: Send + Sync {
+    /// Look up a receipt by its canonical storage identity without requiring
+    /// the caller to know the input digest. Command services still use the
+    /// digest-aware lookup to enforce replay equality.
+    #[allow(clippy::too_many_arguments)]
+    async fn get_command_receipt_by_identity(
+        &self,
+        principal_type: &str,
+        principal_id: &str,
+        scope_type: &str,
+        scope_id: &str,
+        operation: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<CommandReceipt>>;
+    /// Look up the receipt by its complete canonical identity.  If the key is
+    /// already committed with a different input digest, return
+    /// `DbError::IdempotencyConflict` rather than exposing or rerunning it.
+    async fn get_command_receipt(
+        &self,
+        principal_type: &str,
+        principal_id: &str,
+        scope_type: &str,
+        scope_id: &str,
+        operation: &str,
+        idempotency_key: &str,
+        input_digest: &str,
+    ) -> Result<Option<CommandReceipt>>;
+    /// Look up the single frozen receipt linked to an action execution.
+    ///
+    /// This is used by adapters whose coarse action operation differs from
+    /// the lifecycle-specific command operation stored in the receipt.
+    async fn get_command_receipt_by_agent_action_execution(
+        &self,
+        agent_action_execution_id: &str,
+    ) -> Result<Option<CommandReceipt>>;
+    async fn create_command_receipt(&self, input: CreateCommandReceipt) -> Result<CommandReceipt>;
+    async fn get_command_receipt_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        principal_type: &str,
+        principal_id: &str,
+        scope_type: &str,
+        scope_id: &str,
+        operation: &str,
+        idempotency_key: &str,
+        input_digest: &str,
+    ) -> Result<Option<CommandReceipt>>;
+    async fn create_command_receipt_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CreateCommandReceipt,
+    ) -> Result<CommandReceipt>;
 }
 
 #[async_trait]
@@ -394,8 +462,60 @@ pub trait DomainEventRepo: Send + Sync {
     async fn list_events_after(&self, sequence: i64, limit: i64) -> Result<Vec<DomainEvent>>;
     async fn get_consumer_cursor(&self, consumer_name: &str)
         -> Result<Option<EventConsumerCursor>>;
+    async fn get_consumer_cutover(
+        &self,
+        consumer_name: &str,
+    ) -> Result<Option<EventConsumerCutover>>;
     async fn claim_event_batch(&self, input: ClaimDomainEvents) -> Result<Vec<DomainEvent>>;
     async fn complete_claimed_event(&self, input: CompleteDomainEvent) -> Result<bool>;
+}
+
+/// Durable wake dispositions and their atomic event checkpoint boundary.
+/// Disposition attempts are immutable; deferred/setup-required retry paths
+/// append a later attempt and move the current pointer.
+#[async_trait]
+pub trait AgentWakeDispositionRepo: Send + Sync {
+    async fn get_agent_wake_disposition(
+        &self,
+        consumer_name: &str,
+        source_event_id: &str,
+        attempt_number: i64,
+    ) -> Result<Option<AgentWakeDisposition>>;
+    async fn get_current_agent_wake_disposition(
+        &self,
+        consumer_name: &str,
+        source_event_id: &str,
+    ) -> Result<Option<AgentWakeDisposition>>;
+    async fn list_due_agent_wake_dispositions(
+        &self,
+        consumer_name: &str,
+        now: &str,
+        limit: i64,
+    ) -> Result<Vec<AgentWakeDisposition>>;
+    /// Return deferred attempts whose retry clock elapsed and setup-required
+    /// attempts whose linked Attention incident or authoritative scope setup
+    /// (binding/chat) changed after admission.  The latter is intentionally
+    /// change-driven rather than an endless polling loop over an unchanged
+    /// setup blocker.
+    async fn list_reconsiderable_agent_wake_dispositions(
+        &self,
+        consumer_name: &str,
+        now: &str,
+        limit: i64,
+    ) -> Result<Vec<AgentWakeDisposition>>;
+    /// Persist the first disposition and complete the claimed source event
+    /// in one transaction.  A replay of the same attempt is exact and does
+    /// not create a second row or advance the cursor twice.
+    async fn complete_claimed_agent_wake(
+        &self,
+        input: CompleteClaimedWake,
+    ) -> Result<AgentWakeDisposition>;
+    /// Append a due deferred/setup-required retry attempt and move the
+    /// current pointer without rewriting the prior immutable attempt.
+    async fn retry_agent_wake(
+        &self,
+        input: RetryAgentWakeDisposition,
+    ) -> Result<AgentWakeDisposition>;
 }
 
 #[async_trait]
@@ -613,6 +733,14 @@ pub trait RuntimeRepo: Send + Sync {
 #[async_trait]
 pub trait ExecutionRepo: Send + Sync {
     async fn create(&self, input: CreateExecution) -> Result<Execution>;
+    /// Atomically insert a running execution and establish its first owner
+    /// lease.  Dispatchers should prefer this boundary so a process crash
+    /// cannot leave a newly-created running row ownerless.
+    async fn create_with_lease(
+        &self,
+        input: CreateExecution,
+        lease: ClaimExecutionLease,
+    ) -> Result<Execution>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Execution>>;
     async fn stats_by_agent(&self, agent_id: &str) -> Result<AgentExecutionStats>;
     async fn list_by_task(&self, task_id: &str, page: PageRequest) -> Result<Page<Execution>>;
@@ -624,9 +752,47 @@ pub trait ExecutionRepo: Send + Sync {
         page: PageRequest,
     ) -> Result<Page<Execution>>;
     async fn count_by_task_and_role(&self, task_id: &str, role: &str) -> Result<i64>;
+    /// Metadata-only patch.  `status: Some(_)` is rejected; all terminal
+    /// transitions must use `terminalize` so the owner/version CAS also owns
+    /// terminal event and Workspace-lease side effects.
     async fn update(&self, input: UpdateExecution) -> Result<Execution>;
-    async fn update_last_activity_at(&self, id: &str, timestamp: &str) -> Result<()>;
-    async fn list_stalled_running(&self, stale_before: &str) -> Result<Vec<Execution>>;
+    /// Claim or take over an execution lease through the execution-version
+    /// compare-and-swap boundary.  A takeover is allowed only after the prior
+    /// lease has expired; a first claim fixes the hard deadline.
+    async fn claim_lease(&self, input: ClaimExecutionLease) -> Result<ExecutionLeaseMutation>;
+    /// Renew an owner-bound lease without consulting streamed output.  The
+    /// returned mutation is typed so a caller can distinguish a concurrent
+    /// owner/version loss from a hard-deadline refusal.
+    async fn renew_lease(&self, input: RenewExecutionLease) -> Result<ExecutionLeaseMutation>;
+    /// Record semantic progress separately from the owner heartbeat.
+    async fn record_progress(
+        &self,
+        input: RecordExecutionProgress,
+    ) -> Result<ExecutionLeaseMutation>;
+    /// Atomically publish one typed progress-warning event for a still-live
+    /// owner.  A semantic progress update or terminal CAS that wins first
+    /// makes this return `Concurrent` and prevents a stale Attention item.
+    async fn record_progress_warning(
+        &self,
+        input: RecordExecutionProgressWarning,
+    ) -> Result<ExecutionProgressWarningOutcome>;
+    /// Complete, fail, cancel, or expire an execution using one terminal CAS.
+    /// The winning transaction appends the terminal domain event and revokes
+    /// or expires the matching active Workspace lease before commit.
+    async fn terminalize(&self, input: TerminalizeExecution) -> Result<ExecutionTerminalOutcome>;
+    /// Return running rows whose owner lease or hard deadline is no longer
+    /// valid.  A live lease is never considered stalled merely because its
+    /// semantic progress timestamp is old.
+    async fn list_expired_leases(&self, now: &str, limit: i64) -> Result<Vec<Execution>>;
+    /// Return executions whose owner lease is still live but semantic output
+    /// is stale.  This powers a distinct progress-warning policy and must not
+    /// be used as owner-death evidence.
+    async fn list_stale_progress(
+        &self,
+        now: &str,
+        stale_before: &str,
+        limit: i64,
+    ) -> Result<Vec<Execution>>;
     async fn list_running(&self) -> Result<Vec<Execution>>;
     async fn list_running_for_daemon_not_in(
         &self,
@@ -1099,6 +1265,61 @@ pub trait ProjectRepo: Send + Sync {
     ) -> Result<i64>;
     async fn set_paused_at(&self, id: &str, paused_at: Option<String>) -> Result<()>;
     async fn delete(&self, id: &str) -> Result<()>;
+}
+
+/// Atomic Project execution-setup mutation boundary. The command receipt is
+/// committed in the same SQLite transaction as the Project CAS update, so a
+/// response-loss replay cannot apply the setup mutation twice.
+#[async_trait]
+pub trait ProjectExecutionSetupCommandRepo: Send + Sync {
+    async fn apply_project_execution_setup_command(
+        &self,
+        input: ApplyProjectExecutionSetupCommand,
+    ) -> Result<AppliedProjectExecutionSetupCommand>;
+}
+
+/// Durable reconciliation state for the cross-filesystem Project setup
+/// operation.  These methods are intentionally separate from `ProjectRepo`:
+/// setup readiness is not a Project version or a chat-binding lifecycle.
+#[async_trait]
+pub trait ProjectProvisioningRepo: Send + Sync {
+    async fn get_provisioning_operation(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<ProjectProvisioningOperation>>;
+    async fn get_provisioning_operation_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<ProjectProvisioningOperation>>;
+    async fn create_provisioning_operation(
+        &self,
+        input: CreateProjectProvisioningOperation,
+    ) -> Result<ProjectProvisioningOperation>;
+    async fn update_provisioning_operation(
+        &self,
+        input: UpdateProjectProvisioningOperation,
+    ) -> Result<ProjectProvisioningOperation>;
+    async fn list_provisioning_checkpoints(
+        &self,
+        operation_id: &str,
+    ) -> Result<Vec<ProjectProvisioningCheckpoint>>;
+    async fn get_provisioning_checkpoint(
+        &self,
+        operation_id: &str,
+        checkpoint: &str,
+    ) -> Result<Option<ProjectProvisioningCheckpoint>>;
+    async fn upsert_provisioning_checkpoint(
+        &self,
+        input: UpsertProjectProvisioningCheckpoint,
+    ) -> Result<ProjectProvisioningCheckpoint>;
+    async fn list_provisioning_errors(
+        &self,
+        operation_id: &str,
+    ) -> Result<Vec<ProjectProvisioningError>>;
+    async fn record_provisioning_error(
+        &self,
+        input: CreateProjectProvisioningError,
+    ) -> Result<ProjectProvisioningError>;
 }
 
 #[async_trait]
@@ -1669,6 +1890,10 @@ pub struct ClaimTask {
     pub target_status: String,
     pub capacity_statuses: Vec<String>,
     pub execution: CreateExecution,
+    /// The initial owner lease is part of the claim transaction.  A running
+    /// execution may never be inserted first and claimed later, since that
+    /// would leave an unrecoverable ownerless window.
+    pub execution_lease: ClaimExecutionLease,
     pub max_concurrent_tasks: i64,
     pub claimed_at: String,
 }
@@ -1720,6 +1945,7 @@ pub struct CreateExecution {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateExecution {
     pub id: String,
+    /// Must remain `None`; terminal status belongs to the CAS API.
     pub status: Option<ExecutionStatus>,
     pub stop_reason: Option<Option<StopReason>>,
     pub stopped_by: Option<Option<String>>,
@@ -1847,6 +2073,19 @@ pub struct CreateAgentChatTurnJob {
     pub triggering_message_id: String,
     pub responder_identity_id: String,
     pub profile_id: String,
+    /// Immutable admission provenance.  Legacy producers may leave these
+    /// nullable until they are migrated to the shared admission service.
+    pub responder_binding_id: Option<String>,
+    pub responder_binding_version: Option<i64>,
+    pub responder_identity_version: Option<i64>,
+    pub profile_version: Option<i64>,
+    pub operating_skill_revision_id: Option<String>,
+    pub policy_revision: Option<String>,
+    pub policy_digest: Option<String>,
+    pub permission_policy_digest: Option<String>,
+    pub tool_policy_digest: Option<String>,
+    pub admission_digest: Option<String>,
+    pub canonical_scope_provenance_json: Option<String>,
     pub canonical_scope_type: String,
     pub canonical_scope_id: String,
     pub dedupe_key: String,
@@ -1955,6 +2194,10 @@ pub struct AdmitAgentHandoff {
     pub handoff: CreateAgentHandoff,
     pub target_message: CreateAgentChatMessage,
     pub target_turn: CreateAgentChatTurnJob,
+    /// Redaction-safe source responder provenance prepared by the shared
+    /// resolver.  The SQLite composite revalidates it against the current
+    /// Main binding/Profile before publishing a handoff.
+    pub source_responder_provenance_json: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2499,6 +2742,26 @@ pub struct CreateAgentActionExecution {
     pub created_at: String,
     pub completed_at: Option<String>,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateCommandReceipt {
+    pub id: String,
+    pub principal_type: String,
+    pub principal_id: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub operation: String,
+    pub idempotency_key: String,
+    pub input_digest: String,
+    pub policy_result: String,
+    pub correlation_id: String,
+    pub causation_id: Option<String>,
+    pub causation_depth: i64,
+    pub event_id: String,
+    pub agent_action_execution_id: Option<String>,
+    pub outcome_json: String,
+    pub committed_at: String,
 }
 
 #[async_trait]

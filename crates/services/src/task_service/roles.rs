@@ -389,73 +389,128 @@ impl TaskService {
         stop_reason: db::StopReason,
         actor: &api_types::Actor,
         resume_policy: db::ResumePolicy,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let reconciliation_reason = match &stop_reason {
             db::StopReason::RoleReassigned => "stopped because task moved".to_owned(),
             _ => reason.to_owned(),
         };
         let preserve_resume_context = resume_policy == db::ResumePolicy::Manual;
-        if self.daemon_connections.is_some() || self.task_executor.is_some() {
-            if let Err(error) = self.cancel_execution_with_provider(execution, reason).await {
-                if matches!(error, ServiceError::DaemonUnavailable { .. }) {
-                    return Err(error);
+
+        // Terminalization is the authority boundary.  Claiming the terminal
+        // state before touching the provider is important: a stale role/task
+        // caller must not cancel a newer owner or perform any live/runtime
+        // side effect after losing the execution CAS.
+        let actor_type = if actor.is_user() {
+            "user".to_owned()
+        } else if actor.is_agent() {
+            "agent".to_owned()
+        } else {
+            "system".to_owned()
+        };
+        let mut terminal_candidate = execution.clone();
+        let mut outcome = None;
+        for _ in 0..3 {
+            let terminalized_at = now_rfc3339();
+            let attempt = ExecutionRepo::terminalize(
+                &*self.db,
+                TerminalizeExecution {
+                    execution_id: terminal_candidate.id.clone(),
+                    expected_version: terminal_candidate.execution_version,
+                    lease_owner: terminal_candidate.lease_owner.clone(),
+                    status: ExecutionStatus::Cancelled,
+                    stop_reason: Some(Some(stop_reason.clone())),
+                    stopped_by: Some(Some(actor.display())),
+                    stopped_at: Some(Some(terminalized_at.clone())),
+                    resume_policy: Some(Some(resume_policy.clone())),
+                    agent_session_id: (!preserve_resume_context).then_some(None),
+                    agent_message_id: None,
+                    last_activity_at: None,
+                    last_progress_at: None,
+                    summary: None,
+                    logs_path: None,
+                    before_sha: None,
+                    after_sha: None,
+                    error: Some(Some(reason.to_owned())),
+                    executor_config_snapshot_json: (!preserve_resume_context).then_some(None),
+                    updated_at: terminalized_at,
+                    actor_type: actor_type.clone(),
+                    actor_id: None,
+                    correlation_id: Some(terminal_candidate.id.clone()),
+                    causation_id: None,
+                    causation_depth: 0,
+                    lease_disposition: ExecutionLeaseDisposition::Revoke,
+                },
+            )
+            .await
+            .map_err(|error| ServiceError::invalid_operation(format!("cancel failed: {error}")))?;
+            match attempt {
+                ExecutionTerminalOutcome::Concurrent {
+                    current: Some(current),
+                } if current.status == ExecutionStatus::Running => {
+                    // Heartbeats/progress also advance execution_version.  A
+                    // cancellation that loses only to that liveness CAS may
+                    // retry against the fresh owner/version; terminal rows
+                    // are returned as ordinary concurrent losers below.
+                    terminal_candidate = current;
                 }
+                other => {
+                    outcome = Some(other);
+                    break;
+                }
+            }
+        }
+        let outcome = outcome.unwrap_or(ExecutionTerminalOutcome::Concurrent {
+            current: Some(terminal_candidate),
+        });
+
+        let committed_execution = match outcome {
+            ExecutionTerminalOutcome::Committed { execution, .. } => execution,
+            ExecutionTerminalOutcome::Concurrent { current } => {
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    current_status = ?current.as_ref().map(|execution| &execution.status),
+                    "skipping stale execution cancellation after terminal CAS loss"
+                );
+                return Ok(false);
+            }
+        };
+
+        // The provider is only contacted after this caller has won the
+        // execution CAS.  A provider-side failure is safe to recover from:
+        // durable execution/event/lease truth is already committed.
+        if self.daemon_connections.is_some() || self.task_executor.is_some() {
+            if let Err(error) = self
+                .cancel_execution_with_provider(&committed_execution, reason)
+                .await
+            {
                 tracing::warn!(
                     execution_id = %execution.id,
                     %error,
-                    "executor cancellation failed; marking execution cancelled"
+                    "executor cancellation failed after durable cancellation"
                 );
             }
         }
-        ExecutionRepo::update(
-            &*self.db,
-            db::UpdateExecution {
-                id: execution.id.clone(),
-                status: Some(ExecutionStatus::Cancelled),
-                stop_reason: Some(Some(stop_reason)),
-                stopped_by: Some(Some(actor.display())),
-                resume_policy: Some(Some(resume_policy)),
-                stopped_at: Some(Some(now_rfc3339())),
-                // Manual user stops retain the session and executor snapshot so the
-                // task façade can resume the same worker thread. Lifecycle and task
-                // cancellation paths still clear those fields.
-                agent_session_id: (!preserve_resume_context).then_some(None),
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: None,
-                logs_path: None,
-                before_sha: None,
-                after_sha: None,
-                error: Some(Some(reason.to_owned())),
-                executor_config_snapshot_json: (!preserve_resume_context).then_some(None),
-                updated_at: now_rfc3339(),
-            },
-        )
-        .await
-        .map_err(|error| ServiceError::invalid_operation(format!("cancel failed: {error}")))?;
-        self.revoke_active_workspace_lease_for_execution(&execution.task_id, &execution.id)
-            .await;
         self.publish(ForgeEvent {
             event_type: "task.execution_cancelled".to_owned(),
-            entity_id: execution.task_id.clone(),
+            entity_id: committed_execution.task_id.clone(),
             timestamp: event_timestamp(),
             context: EventContext::TaskExecutionCancelled {
-                task_id: execution.task_id.clone(),
-                execution_id: execution.id.clone(),
+                task_id: committed_execution.task_id.clone(),
+                execution_id: committed_execution.id.clone(),
                 reason: reason.to_owned(),
             },
         });
         self.publish(ForgeEvent {
             event_type: "reconciliation.event".to_owned(),
-            entity_id: execution.task_id.clone(),
+            entity_id: committed_execution.task_id.clone(),
             timestamp: event_timestamp(),
             context: EventContext::ReconciliationEvent {
-                task_id: Some(execution.task_id.clone()),
-                execution_id: Some(execution.id.clone()),
+                task_id: Some(committed_execution.task_id.clone()),
+                execution_id: Some(committed_execution.id.clone()),
                 reason: reconciliation_reason,
             },
         });
-        Ok(())
+        Ok(true)
     }
 
     async fn apply_reassignment_reset(

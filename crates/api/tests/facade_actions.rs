@@ -149,19 +149,35 @@ async fn execution_facade_actions_work_for_both_workflows() {
         .initialize()
         .await
         .expect("workflow templates initialize");
-    let (agent_id, _) =
+    let (worker_id, reviewer_id) =
         common::create_shell_agents(&harness.app, workspace_root.path(), "facade-execution").await;
 
-    let (autonomous_project, _) =
+    let (autonomous_project, autonomous_repo) =
         common::create_project_and_repo(&harness.app, "Autonomous", &repo_path).await;
     set_workflow(&harness.app, &autonomous_project, "autonomous_v1").await;
-    let (strict_project, _) =
+    let (strict_project, strict_repo) =
         common::create_project_and_repo(&harness.app, "Strict", &repo_path).await;
+    common::configure_execution_test_setup(
+        &harness.state.db,
+        &autonomous_project,
+        &autonomous_repo,
+        &worker_id,
+        &reviewer_id,
+    )
+    .await;
+    common::configure_execution_test_setup(
+        &harness.state.db,
+        &strict_project,
+        &strict_repo,
+        &worker_id,
+        &reviewer_id,
+    )
+    .await;
 
     for project_id in [autonomous_project, strict_project] {
         let task = create_task_with_description(&harness.app, &project_id, "sleep 5").await;
         sqlx::query("UPDATE task SET assignee_type = 'agent', assignee_id = ? WHERE id = ?")
-            .bind(&agent_id)
+            .bind(&worker_id)
             .bind(&task.id)
             .execute(harness.state.db.pool())
             .await

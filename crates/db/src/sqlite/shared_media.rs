@@ -1,5 +1,6 @@
+use super::command_finalization::finalize_command_in_tx;
 use super::*;
-use crate::{BeginProjectMediaUpload, ProjectMediaUpload};
+use crate::{BeginProjectMediaUpload, CommandReceipt, CommandReceiptRepo, ProjectMediaUpload};
 
 fn map_media_asset(row: &SqliteRow) -> Result<MediaAsset> {
     Ok(MediaAsset {
@@ -150,6 +151,119 @@ async fn replay_project_media_tombstone_in_tx(
     .fetch_one(&mut **transaction)
     .await?;
     Ok(Some(map_media_asset(&row)?))
+}
+
+/// Resolve a committed evidence command from its immutable receipt/event
+/// provenance.  This is intentionally performed before any current asset,
+/// milestone, or authorization checks so a response-loss retry can replay the
+/// exact original attachment even if one of those mutable projections has
+/// since changed.
+async fn replay_project_media_attachment_command_in_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    input: &CreateProjectMediaAttachmentMutation,
+    receipt: &CommandReceipt,
+) -> Result<ProjectMediaAttachment> {
+    let outcome: serde_json::Value =
+        serde_json::from_str(&receipt.outcome_json).map_err(|_| DbError::IdempotencyConflict)?;
+    let attachment_id = outcome
+        .get("attachment_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(DbError::IdempotencyConflict)?;
+    let event = sqlx::query(
+        "SELECT event_type, entity_type, entity_id, actor_type, actor_id,
+                scope_type, scope_id, correlation_id, causation_id,
+                causation_depth, payload_json
+         FROM domain_event WHERE id = ?",
+    )
+    .bind(&receipt.event_id)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(DbError::IdempotencyConflict)?;
+    let event_type: String = event.try_get("event_type")?;
+    let entity_type: String = event.try_get("entity_type")?;
+    let entity_id: String = event.try_get("entity_id")?;
+    let actor_type: String = event.try_get("actor_type")?;
+    let actor_id: Option<String> = event.try_get("actor_id")?;
+    let scope_type: String = event.try_get("scope_type")?;
+    let scope_id: String = event.try_get("scope_id")?;
+    let correlation_id: String = event.try_get("correlation_id")?;
+    let causation_id: Option<String> = event.try_get("causation_id")?;
+    let causation_depth: i64 = event.try_get("causation_depth")?;
+    let payload_json: String = event.try_get("payload_json")?;
+    let payload: serde_json::Value = serde_json::from_str(&payload_json)
+        .map_err(|error| DbError::Check(format!("invalid evidence event: {error}")))?;
+
+    let same_provenance = event_type == "project.evidence.attached"
+        && entity_type == "project_media_attachment"
+        && entity_id == attachment_id
+        && actor_type == receipt.principal_type
+        && actor_id.as_deref() == Some(receipt.principal_id.as_str())
+        && scope_type == receipt.scope_type
+        && scope_id == receipt.scope_id
+        && correlation_id == receipt.correlation_id
+        && causation_id == receipt.causation_id
+        && causation_depth == receipt.causation_depth
+        && scope_type == "project"
+        && scope_id == input.attachment.project_id
+        && payload.get("project_id").and_then(|value| value.as_str())
+            == Some(input.attachment.project_id.as_str())
+        && payload.get("milestone_id").and_then(|value| value.as_str())
+            == input.attachment.milestone_id.as_deref()
+        && payload.get("asset_id").and_then(|value| value.as_str())
+            == Some(input.attachment.asset_id.as_str())
+        && payload.get("evidence_id").and_then(|value| value.as_str()) == Some(attachment_id)
+        && payload.get("checksum").and_then(|value| value.as_str())
+            == input.attachment.checksum.as_deref()
+        && payload
+            .get("expected_milestone_version")
+            .and_then(|value| value.as_i64())
+            == Some(input.expected_milestone_version)
+        && payload
+            .get("authorization_event_id")
+            .and_then(|value| value.as_str())
+            == Some(input.authorization_event_id.as_str())
+        && payload
+            .get("mutation_fingerprint")
+            .and_then(|value| value.as_str())
+            == Some(input.mutation_fingerprint.as_str())
+        && payload.get("attachment")
+            == Some(&serde_json::json!({
+                "id": attachment_id,
+                "project_id": input.attachment.project_id,
+                "asset_id": input.attachment.asset_id,
+                "attachment_kind": input.attachment.attachment_kind,
+                "task_media_id": input.attachment.task_media_id,
+                "task_id": input.attachment.task_id,
+                "milestone_id": input.attachment.milestone_id,
+                "milestone_check_id": input.attachment.milestone_check_id,
+                "source_task_id": input.attachment.source_task_id,
+                "source_execution_id": input.attachment.source_execution_id,
+                "source_validation_id": input.attachment.source_validation_id,
+                "acceptance_check_ids_json": input.attachment.acceptance_check_ids_json,
+                "caption": input.attachment.caption,
+                "evidence_kind": input.attachment.evidence_kind,
+                "checksum": input.attachment.checksum,
+                "availability": input.attachment.availability,
+                "project_url": input.attachment.project_url,
+                "author_type": input.attachment.author_type,
+                "author_id": input.attachment.author_id,
+                "authorization_json": input.attachment.authorization_json,
+            }));
+    if !same_provenance {
+        return Err(DbError::IdempotencyConflict);
+    }
+
+    let row = sqlx::query(&format!(
+        "SELECT {PROJECT_MEDIA_ATTACHMENT_COLUMNS}
+         FROM project_media_attachment
+         WHERE id = ? AND project_id = ? AND attachment_kind = 'evidence'"
+    ))
+    .bind(attachment_id)
+    .bind(&input.attachment.project_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    map_project_media_attachment(&row)
 }
 
 #[async_trait]
@@ -977,51 +1091,151 @@ impl SharedMediaRepo for SqliteDb {
     ) -> Result<ProjectMediaAttachment> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         let attachment = &input.attachment;
-        let dedupe_key = format!(
-            "project-evidence-attach:{}:{}",
-            attachment.project_id, input.idempotency_key
-        );
-        if let Some(existing) = sqlx::query(
-            "SELECT entity_id, event_type, payload_json
-             FROM domain_event WHERE dedupe_key = ?",
-        )
-        .bind(&dedupe_key)
-        .fetch_optional(&mut *transaction)
-        .await?
-        {
-            let entity_id: String = existing.try_get("entity_id")?;
-            let event_type: String = existing.try_get("event_type")?;
-            let payload_json: String = existing.try_get("payload_json")?;
-            let payload: serde_json::Value = serde_json::from_str(&payload_json)
-                .map_err(|error| DbError::Check(format!("invalid evidence event: {error}")))?;
-            if event_type != "project.evidence.attached"
-                || payload.get("project_id").and_then(|v| v.as_str())
-                    != Some(attachment.project_id.as_str())
-                || payload.get("milestone_id").and_then(|v| v.as_str())
-                    != attachment.milestone_id.as_deref()
-                || payload.get("asset_id").and_then(|v| v.as_str())
-                    != Some(attachment.asset_id.as_str())
-                || payload.get("checksum").and_then(|v| v.as_str())
-                    != attachment.checksum.as_deref()
-                || payload.get("mutation_fingerprint").and_then(|v| v.as_str())
-                    != Some(input.mutation_fingerprint.as_str())
-                || payload
-                    .get("expected_milestone_version")
-                    .and_then(|v| v.as_i64())
-                    != Some(input.expected_milestone_version)
+        let command_receipt = input.command_receipt.as_ref();
+        if command_receipt.is_none() && input.action_execution.is_some() {
+            return Err(DbError::Check(
+                "AgentAction execution requires a command receipt".to_owned(),
+            ));
+        }
+        if let Some(receipt) = command_receipt {
+            // The DB boundary does not accept a caller-selected Project or
+            // operation.  A receipt is valid only for this canonical evidence
+            // command and the exact mutation identity supplied to the method.
+            if receipt.scope_type != "project"
+                || receipt.scope_id != attachment.project_id
+                || receipt.operation != "project.evidence"
+                || receipt.idempotency_key != input.idempotency_key
+                || receipt.principal_type.trim().is_empty()
+                || receipt.principal_id.trim().is_empty()
             {
                 return Err(DbError::IdempotencyConflict);
             }
-            let row = sqlx::query(&format!(
-                "SELECT {PROJECT_MEDIA_ATTACHMENT_COLUMNS}
-                 FROM project_media_attachment WHERE id = ?"
-            ))
-            .bind(&entity_id)
-            .fetch_one(&mut *transaction)
+            if attachment.author_type != receipt.principal_type
+                || attachment.author_id.as_deref() != Some(receipt.principal_id.as_str())
+            {
+                return Err(DbError::IdempotencyConflict);
+            }
+
+            if let Some(existing) = CommandReceiptRepo::get_command_receipt_in_tx(
+                self,
+                &mut transaction,
+                &receipt.principal_type,
+                &receipt.principal_id,
+                &receipt.scope_type,
+                &receipt.scope_id,
+                &receipt.operation,
+                &receipt.idempotency_key,
+                &receipt.input_digest,
+            )
+            .await?
+            {
+                if receipt.policy_result != existing.policy_result
+                    || receipt.correlation_id != existing.correlation_id
+                    || receipt.causation_id != existing.causation_id
+                    || receipt.causation_depth != existing.causation_depth
+                {
+                    return Err(DbError::IdempotencyConflict);
+                }
+                if let Some(action_execution) = input.action_execution.as_ref() {
+                    let replayed = AgentActionRepo::record_action_execution_in_tx(
+                        self,
+                        &mut transaction,
+                        action_execution.clone(),
+                    )
+                    .await?;
+                    if existing.agent_action_execution_id.is_none()
+                        || replayed.result_json.as_deref() != Some(existing.outcome_json.as_str())
+                        || replayed.executed_by_type != existing.principal_type
+                        || replayed.executed_by_id != existing.principal_id
+                        || replayed.idempotency_key != existing.idempotency_key
+                    {
+                        return Err(DbError::IdempotencyConflict);
+                    }
+                }
+                let attachment = replay_project_media_attachment_command_in_tx(
+                    &mut transaction,
+                    &input,
+                    &existing,
+                )
+                .await?;
+                transaction.commit().await?;
+                return Ok(attachment);
+            }
+
+            // A fresh receipt-only native Project command must be checked
+            // against the current binding while this same BEGIN IMMEDIATE
+            // transaction is held.  Exact replays returned above remain
+            // intentionally independent of the live binding.
+            super::orchestration::reauthorize_direct_project_command_in_tx(
+                &mut transaction,
+                receipt,
+            )
             .await?;
-            let attachment = map_project_media_attachment(&row)?;
-            transaction.commit().await?;
-            return Ok(attachment);
+        }
+
+        let dedupe_key = command_receipt.map_or_else(
+            || {
+                format!(
+                    "project-evidence-attach:{}:{}",
+                    attachment.project_id, input.idempotency_key
+                )
+            },
+            |receipt| {
+                format!(
+                    "command-event:{}:{}:{}",
+                    receipt.scope_id, receipt.operation, receipt.idempotency_key
+                )
+            },
+        );
+        if command_receipt.is_none() {
+            if let Some(existing) = sqlx::query(
+                "SELECT entity_id, event_type, payload_json
+                 FROM domain_event WHERE dedupe_key = ?",
+            )
+            .bind(&dedupe_key)
+            .fetch_optional(&mut *transaction)
+            .await?
+            {
+                let entity_id: String = existing.try_get("entity_id")?;
+                let event_type: String = existing.try_get("event_type")?;
+                let payload_json: String = existing.try_get("payload_json")?;
+                let payload: serde_json::Value = serde_json::from_str(&payload_json)
+                    .map_err(|error| DbError::Check(format!("invalid evidence event: {error}")))?;
+                if event_type != "project.evidence.attached"
+                    || payload.get("project_id").and_then(|v| v.as_str())
+                        != Some(attachment.project_id.as_str())
+                    || payload.get("milestone_id").and_then(|v| v.as_str())
+                        != attachment.milestone_id.as_deref()
+                    || payload.get("asset_id").and_then(|v| v.as_str())
+                        != Some(attachment.asset_id.as_str())
+                    || payload.get("checksum").and_then(|v| v.as_str())
+                        != attachment.checksum.as_deref()
+                    || payload.get("mutation_fingerprint").and_then(|v| v.as_str())
+                        != Some(input.mutation_fingerprint.as_str())
+                    || payload
+                        .get("expected_milestone_version")
+                        .and_then(|v| v.as_i64())
+                        != Some(input.expected_milestone_version)
+                {
+                    return Err(DbError::IdempotencyConflict);
+                }
+                let row = sqlx::query(&format!(
+                    "SELECT {PROJECT_MEDIA_ATTACHMENT_COLUMNS}
+                     FROM project_media_attachment WHERE id = ?"
+                ))
+                .bind(&entity_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+                let attachment = map_project_media_attachment(&row)?;
+                transaction.commit().await?;
+                return Ok(attachment);
+            }
+        }
+
+        if attachment.attachment_kind != "evidence" {
+            return Err(DbError::Check(
+                "Project media mutation must create evidence".to_owned(),
+            ));
         }
 
         let milestone_id = attachment
@@ -1091,6 +1305,28 @@ impl SharedMediaRepo for SqliteDb {
                 ));
             }
         }
+        if let Some(task_media_id) = attachment.task_media_id.as_deref() {
+            let task_media = sqlx::query(
+                "SELECT tm.asset_id, tm.task_id, t.project_id
+                 FROM task_media tm JOIN task t ON t.id = tm.task_id
+                 WHERE tm.id = ?",
+            )
+            .bind(task_media_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(DbError::NotFound)?;
+            let task_media_asset_id: String = task_media.try_get("asset_id")?;
+            let task_media_task_id: String = task_media.try_get("task_id")?;
+            let task_media_project: String = task_media.try_get("project_id")?;
+            if task_media_project != attachment.project_id
+                || task_media_asset_id != attachment.asset_id
+                || attachment.task_id.as_deref() != Some(task_media_task_id.as_str())
+            {
+                return Err(DbError::Check(
+                    "evidence Task media is outside the attached Project scope".to_owned(),
+                ));
+            }
+        }
 
         if let Some(source_task_id) = attachment.source_task_id.as_deref() {
             let source_project =
@@ -1130,6 +1366,16 @@ impl SharedMediaRepo for SqliteDb {
 
         let check_ids: Vec<String> = serde_json::from_str(&attachment.acceptance_check_ids_json)
             .map_err(|error| DbError::Check(format!("invalid acceptance check list: {error}")))?;
+        if let Some(milestone_check_id) = attachment.milestone_check_id.as_deref() {
+            if !check_ids
+                .iter()
+                .any(|check_id| check_id == milestone_check_id)
+            {
+                return Err(DbError::Check(
+                    "evidence milestone check must be in the acceptance check list".to_owned(),
+                ));
+            }
+        }
         for check_id in &check_ids {
             let check = sqlx::query(
                 "SELECT project_id, milestone_id, definition_revision_id
@@ -1224,7 +1470,7 @@ impl SharedMediaRepo for SqliteDb {
             ));
         }
 
-        let payload_json = serde_json::json!({
+        let mut payload = serde_json::json!({
             "project_id": attachment.project_id,
             "milestone_id": milestone_id,
             "asset_id": attachment.asset_id,
@@ -1233,25 +1479,67 @@ impl SharedMediaRepo for SqliteDb {
             "expected_milestone_version": input.expected_milestone_version,
             "authorization_event_id": input.authorization_event_id,
             "mutation_fingerprint": input.mutation_fingerprint,
-        })
-        .to_string();
+        });
+        if command_receipt.is_some() {
+            payload["attachment"] = serde_json::json!({
+                "id": attachment.id,
+                "project_id": attachment.project_id,
+                "asset_id": attachment.asset_id,
+                "attachment_kind": attachment.attachment_kind,
+                "task_media_id": attachment.task_media_id,
+                "task_id": attachment.task_id,
+                "milestone_id": attachment.milestone_id,
+                "milestone_check_id": attachment.milestone_check_id,
+                "source_task_id": attachment.source_task_id,
+                "source_execution_id": attachment.source_execution_id,
+                "source_validation_id": attachment.source_validation_id,
+                "acceptance_check_ids_json": attachment.acceptance_check_ids_json,
+                "caption": attachment.caption,
+                "evidence_kind": attachment.evidence_kind,
+                "checksum": attachment.checksum,
+                "availability": attachment.availability,
+                "project_url": attachment.project_url,
+                "author_type": attachment.author_type,
+                "author_id": attachment.author_id,
+                "authorization_json": attachment.authorization_json,
+            });
+        }
+        let payload_json = payload.to_string();
         let event = CreateDomainEvent {
             id: new_uuid_v4(),
             event_type: "project.evidence.attached".to_owned(),
             entity_type: "project_media_attachment".to_owned(),
             entity_id: attachment.id.clone(),
-            actor_type: attachment.author_type.clone(),
-            actor_id: attachment.author_id.clone(),
-            scope_type: "project".to_owned(),
-            scope_id: attachment.project_id.clone(),
-            correlation_id: dedupe_key.clone(),
-            causation_id: None,
-            causation_depth: 0,
+            actor_type: command_receipt
+                .map(|receipt| receipt.principal_type.clone())
+                .unwrap_or_else(|| attachment.author_type.clone()),
+            actor_id: command_receipt
+                .map(|receipt| Some(receipt.principal_id.clone()))
+                .unwrap_or_else(|| attachment.author_id.clone()),
+            scope_type: command_receipt
+                .map(|receipt| receipt.scope_type.clone())
+                .unwrap_or_else(|| "project".to_owned()),
+            scope_id: command_receipt
+                .map(|receipt| receipt.scope_id.clone())
+                .unwrap_or_else(|| attachment.project_id.clone()),
+            correlation_id: command_receipt
+                .map(|receipt| receipt.correlation_id.clone())
+                .unwrap_or_else(|| dedupe_key.clone()),
+            causation_id: command_receipt.and_then(|receipt| receipt.causation_id.clone()),
+            causation_depth: command_receipt.map_or(0, |receipt| receipt.causation_depth),
             dedupe_key: Some(dedupe_key),
             payload_json,
             created_at: attachment.created_at.clone(),
         };
         DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
+        finalize_command_in_tx(
+            self,
+            &mut transaction,
+            &event.id,
+            input.command_receipt.clone(),
+            input.action_execution.clone(),
+        )
+        .await?;
         let row = sqlx::query(&format!(
             "SELECT {PROJECT_MEDIA_ATTACHMENT_COLUMNS}
              FROM project_media_attachment WHERE id = ?"

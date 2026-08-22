@@ -182,6 +182,7 @@ export function BaselineApprovalCard({ projectId }: { projectId: string }) {
             baseline_id: data.baseline.id,
             revision_id: revision.id,
             approval_id: activationApproval.id,
+            expected_baseline_version: baselineVersion,
             content_digest: revision.content_digest,
             render_digest: revision.render_digest,
           }),

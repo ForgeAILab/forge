@@ -1,4 +1,6 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
+mod common;
+
 use std::{
     future::Future,
     path::{Path, PathBuf},
@@ -61,6 +63,14 @@ async fn follow_up_execution_happy_path_returns_task_execution_and_workspace() {
 
     let daemon_id = register_daemon_and_report_shell(&harness.app, workspaces_root.path()).await;
     let agent = create_agent(&harness.app, "shell-agent", &daemon_id).await;
+    common::configure_execution_test_setup(
+        &harness.state.db,
+        &project.id,
+        &repo.id,
+        &agent.id,
+        &agent.id,
+    )
+    .await;
 
     let seeded = seed_parent_execution(
         &harness,

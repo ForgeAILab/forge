@@ -15,31 +15,18 @@ impl TaskService {
                 "task {parent_task_id} is not a root task"
             )));
         }
-
-        let subtasks = TaskRepo::list_subtasks_ordered(&*self.db, &parent.id).await?;
-        let subtask_ids: HashSet<_> = subtasks.iter().map(|s| s.id.clone()).collect();
-
-        let submitted = ordered_ids.iter().cloned().collect::<HashSet<_>>();
-        if submitted.len() != ordered_ids.len() {
-            return Err(ServiceError::invalid_operation(
-                "reorder payload must contain unique ids",
-            ));
-        }
-        if submitted != subtask_ids {
-            return Err(ServiceError::invalid_operation(
-                "reorder payload must contain exactly the subtask ids",
-            ));
-        }
-
-        TaskRepo::reorder_subtasks(&*self.db, &parent.id, &ordered_ids, &now_rfc3339()).await?;
-        self.publish(ForgeEvent {
-            event_type: "task.updated".to_owned(),
-            entity_id: parent.id.clone(),
-            timestamp: event_timestamp(),
-            context: EventContext::TaskUpdated {
-                project_id: parent.project_id,
+        let board_revision = TaskBoardRepo::board_revision(&*self.db, &parent.project_id).await?;
+        self.execute_adaptive_task_command(AdaptiveTaskCommand::system(
+            parent.project_id.clone(),
+            parent.id.clone(),
+            parent.version,
+            board_revision,
+            AdaptiveTaskOperation::Sequence {
+                ordered_task_ids: ordered_ids,
             },
-        });
+            "Sequence Task subtasks",
+        ))
+        .await?;
         Ok(())
     }
 }

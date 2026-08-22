@@ -1,4 +1,6 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
+mod common;
+
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -85,6 +87,14 @@ async fn forge_happy_path_end_to_end() {
     .await;
     assert_eq!(agent.effective_status.as_deref(), Some("active"));
     let agent_id = agent.id;
+    common::configure_execution_test_setup(
+        &harness.state.db,
+        &project_id,
+        &repo_id,
+        &agent_id,
+        &agent_id,
+    )
+    .await;
 
     let created_task: TaskResponse = json_request(
         &harness.app,
@@ -224,7 +234,7 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
     )
     .await;
     let project_id = project.id;
-    let _: RepoResponse = json_request(
+    let repo: RepoResponse = json_request(
         &harness.app,
         Method::POST,
         &format!("/api/v1/projects/{project_id}/repos"),
@@ -257,6 +267,15 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
             "daemon_id": daemon_id,
         }),
         StatusCode::OK,
+    )
+    .await;
+    assert_eq!(agent.effective_status.as_deref(), Some("active"));
+    common::configure_execution_test_setup(
+        &harness.state.db,
+        &project_id,
+        &repo.id,
+        &agent.id,
+        &agent.id,
     )
     .await;
 

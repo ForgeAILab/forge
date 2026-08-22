@@ -127,6 +127,7 @@ async fn create_claim_and_transition_task() {
     let mut rx = event_bus.subscribe();
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
+    crate::test_support::clear_project_execution_role_defaults(&db, &project_id).await;
 
     let task = service
         .create_task(

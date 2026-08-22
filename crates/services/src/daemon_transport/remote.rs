@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::daemon_transport::providers::{ExecutionProvider, FilesystemProvider};
-use crate::daemon_transport::DaemonConnectionRegistry;
+use crate::daemon_transport::{execution_lease_owner, DaemonConnectionRegistry};
 use crate::{Result, ServiceError};
 
 #[derive(Clone)]
@@ -53,26 +53,41 @@ impl FilesystemProvider for RemoteFilesystemProvider {
 pub struct RemoteExecutionProvider {
     registry: Arc<DaemonConnectionRegistry>,
     daemon_id: String,
+    /// The authenticated socket incarnation selected for this dispatch.  A
+    /// daemon reconnect keeps the durable id but must not receive requests or
+    /// own the lease issued to the replaced connection.
+    connection_id: u64,
 }
 
 impl RemoteExecutionProvider {
     pub fn new(registry: Arc<DaemonConnectionRegistry>, daemon_id: String) -> Self {
+        let connection_id = registry
+            .get(&daemon_id)
+            .map(|connection| connection.id())
+            .unwrap_or_default();
         Self {
             registry,
             daemon_id,
+            connection_id,
         }
     }
 }
 
 #[async_trait]
 impl ExecutionProvider for RemoteExecutionProvider {
+    fn execution_lease_owner(&self) -> Option<String> {
+        (self.connection_id != 0)
+            .then(|| execution_lease_owner(&self.daemon_id, self.connection_id))
+    }
+
     async fn start(
         &self,
         params: api_types::ExecutionStartParams,
     ) -> Result<api_types::ExecutionStartResult> {
         self.registry
-            .send_request(
+            .send_request_for_connection(
                 &self.daemon_id,
+                self.connection_id,
                 api_types::METHOD_EXECUTION_START,
                 params,
                 api_types::DEFAULT_DAEMON_COMMAND_TIMEOUT_SECS,
@@ -85,8 +100,9 @@ impl ExecutionProvider for RemoteExecutionProvider {
         params: api_types::ExecutionCancelParams,
     ) -> Result<api_types::ExecutionCancelResult> {
         self.registry
-            .send_request(
+            .send_request_for_connection(
                 &self.daemon_id,
+                self.connection_id,
                 api_types::METHOD_EXECUTION_CANCEL,
                 params,
                 api_types::DEFAULT_DAEMON_COMMAND_TIMEOUT_SECS,

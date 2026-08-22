@@ -6,7 +6,7 @@
 //! the frozen request envelope.
 
 use api_types::{
-    canonical_digest_with_schema, canonical_json, AuthorizationProvenance, CreateMilestoneRequest,
+    canonical_digest_with_schema, AuthorizationProvenance, CreateMilestoneRequest,
     EvaluateMilestoneReadinessRequest, ExecutionBaselineReleasePolicy,
     MilestoneDefinitionLifecycle, MilestoneDefinitionRevision,
     MilestoneDefinitionRevisionListResponse, MilestoneLifecycle, PrincipalKind, PrincipalRef,
@@ -40,13 +40,11 @@ use crate::{
 const PRIMARY_ACTION: &str = "project.milestone.primary.set";
 const CREATE_ACTION: &str = "project.milestone.create";
 const REVISION_ACTION: &str = "project.milestone.revision.save";
+const READINESS_ACTION: &str = "project.milestone.readiness";
 const REVISION_TRANSITION_ACTION: &str = "project.milestone.revision.transition";
 const MILESTONE_TRANSITION_ACTION: &str = "project.milestone.transition";
 const CHECK_RESULT_ACTION: &str = "project.milestone.check.record";
 const CHECK_WAIVE_ACTION: &str = "project.milestone.check.waive";
-const MILESTONE_DEFINITION_SCHEMA: &str = "forge.milestone-definition/v1";
-const MILESTONE_RENDER_SCHEMA: &str = "forge.milestone-definition-render/v1";
-const MILESTONE_RENDER_VERSION: &str = MILESTONE_RENDER_SCHEMA;
 const MAX_AUTHORIZATION_CLOCK_SKEW_SECONDS: i64 = 48 * 60 * 60;
 const MAX_AUTHORIZATION_TIMESTAMP_LEN: usize = 64;
 
@@ -69,234 +67,37 @@ pub async fn create_milestone(
         CREATE_ACTION,
     )?;
     require_idempotency_key(&request.mutation.idempotency_key)?;
-    if !matches!(
-        request.lifecycle,
-        MilestoneDefinitionLifecycle::Draft | MilestoneDefinitionLifecycle::Proposed
-    ) {
-        return Err(ApiError::bad_request(
-            "a new milestone definition must be draft or proposed",
-        ));
-    }
-    let requested_content_digest =
-        canonical_digest_with_schema(MILESTONE_DEFINITION_SCHEMA, &request.content)
-            .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let prepared = prepare_revision(
-        &request.content,
-        &request.rendered_view,
-        &request.render_version,
-        &request.change_summary,
-        &request.provenance.source_refs,
-    )?;
-    let create_dedupe = format!(
-        "milestone.definition.created:{project_id}:{}",
-        request.mutation.idempotency_key
-    );
-    if let Some(event) = DomainEventRepo::get_event_by_dedupe(&*state.db, &create_dedupe).await? {
-        let payload: serde_json::Value = serde_json::from_str(&event.payload_json)
-            .map_err(|_| ApiError::internal("persisted milestone event is invalid"))?;
-        let same_request = payload
-            .get("content_digest")
-            .and_then(serde_json::Value::as_str)
-            == Some(requested_content_digest.as_str())
-            && payload.get("lifecycle").and_then(serde_json::Value::as_str)
-                == Some(milestone_definition_lifecycle_name(request.lifecycle))
-            && payload
-                .get("render_digest")
-                .and_then(serde_json::Value::as_str)
-                == Some(prepared.render_digest.as_str())
-            && payload
-                .get("render_version")
-                .and_then(serde_json::Value::as_str)
-                == Some(prepared.render_version.as_str())
-            && payload.get("display_label") == Some(&json!(request.display_label))
-            && payload
-                .get("expected_project_version")
-                .and_then(serde_json::Value::as_i64)
-                == Some(request.mutation.expected_version)
-            && payload
-                .get("principal_id")
-                .and_then(serde_json::Value::as_str)
-                == Some(user.user_id.as_str())
-            && payload
-                .get("authorization")
-                .cloned()
-                .and_then(|value| serde_json::from_value::<AuthorizationProvenance>(value).ok())
-                .as_ref()
-                == Some(&request.mutation.authorization);
-        if !same_request {
-            return Err(ApiError::conflict_with_code(
-                "idempotency_conflict",
-                "the idempotency key was already used for a different milestone definition",
-            ));
-        }
-        let milestone_id = payload
-            .get("milestone_id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| ApiError::internal("milestone event has no milestone id"))?;
-        let runtime = MilestoneRuntime::new(state.db.clone());
-        let milestone = runtime
-            .get(&project_id, milestone_id)
-            .await
-            .map_err(ApiError::from)?
-            .ok_or_else(|| ApiError::not_found("milestone", milestone_id.to_owned()))?;
-        return Ok((StatusCode::OK, Json(milestone)));
-    }
-
-    // The project row is locked before deriving the Project-local sequence.
-    // This makes MAX(sequence)+1 and the milestone/revision/event writes one
-    // authoritative mutation rather than three independently committed ones.
-    let mut tx = db::begin_immediate(state.db.pool()).await?;
-    let locked = sqlx::query("UPDATE project SET version = version WHERE id = ? AND version = ?")
-        .bind(&project_id)
-        .bind(request.mutation.expected_version)
-        .execute(&mut *tx)
-        .await?;
-    if locked.rows_affected() != 1 {
-        return Err(ApiError::conflict_with_code(
-            "version_conflict",
-            "the Project changed before the milestone was created",
-        ));
-    }
-    let sequence: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(milestone_sequence), 0) + 1
-         FROM project_milestone WHERE project_id = ?",
-    )
-    .bind(&project_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    let milestone_id = new_uuid_v4();
-    let revision_id = new_uuid_v4();
-    let now = now_rfc3339();
-    let milestone_key = services::milestone_identity(sequence)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    sqlx::query(
-        "INSERT INTO project_milestone (
-            id, project_id, milestone_sequence, milestone_key, display_label,
-            lifecycle, blocker_reason_json, stale_reason_json,
-            reconciliation_reason_json, version, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, 'planned', '[]', '[]', '[]', 1, ?, ?)",
-    )
-    .bind(&milestone_id)
-    .bind(&project_id)
-    .bind(sequence)
-    .bind(&milestone_key)
-    .bind(request.display_label.as_deref())
-    .bind(&now)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
-    validate_definition_refs_in_tx(&mut tx, &project_id, &milestone_id, &request.content).await?;
-    insert_revision_in_tx(
-        &mut tx,
-        &revision_id,
-        &milestone_id,
-        1,
-        0,
-        None,
-        request.lifecycle,
-        &prepared,
-        &user.user_id,
-        &now,
-    )
-    .await?;
-    if request.lifecycle != MilestoneDefinitionLifecycle::Draft {
-        materialize_check_definitions_in_tx(
-            &mut tx,
-            &project_id,
-            &milestone_id,
-            &revision_id,
-            &request.content.acceptance_checks,
-            &now,
+    let revision = services::ProjectMilestoneCommandService::new(state.db.clone())
+        .define_milestone(
+            services::ProjectMilestoneDefinitionCommand {
+                project_id: project_id.clone(),
+                milestone_id: None,
+                display_label: request.display_label,
+                lifecycle: request.lifecycle,
+                content: request.content,
+                rendered_view: request.rendered_view,
+                render_version: request.render_version,
+                change_summary: request.change_summary,
+                provenance: request.provenance,
+                base_revision_id: None,
+                expected_project_version: request.mutation.expected_version,
+                expected_milestone_version: 1,
+                idempotency_key: request.mutation.idempotency_key,
+                authorization: milestone_authorization(
+                    &request.mutation.authorization,
+                    &user.user_id,
+                    CREATE_ACTION,
+                )?,
+            },
+            None,
         )
         .await?;
-    }
-    // A draft is intentionally not the current definition pointer: the
-    // pointer guard only permits proposed/approved revisions.  The mutable
-    // milestone version still records that a definition was appended.
-    let advanced = if request.lifecycle == MilestoneDefinitionLifecycle::Proposed {
-        sqlx::query(
-            "UPDATE project_milestone
-             SET current_definition_revision_id = ?, version = version + 1, updated_at = ?
-             WHERE id = ? AND project_id = ? AND version = 1",
-        )
-        .bind(&revision_id)
-        .bind(&now)
-        .bind(&milestone_id)
-        .bind(&project_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-    } else {
-        sqlx::query(
-            "UPDATE project_milestone SET version = version + 1, updated_at = ?
-             WHERE id = ? AND project_id = ? AND version = 1",
-        )
-        .bind(&now)
-        .bind(&milestone_id)
-        .bind(&project_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-    };
-    if advanced != 1 {
-        return Err(ApiError::conflict_with_code(
-            "version_conflict",
-            "the milestone changed while its first definition was materialized",
-        ));
-    }
-    let project_advanced = sqlx::query(
-        "UPDATE project SET version = version + 1, updated_at = ? WHERE id = ? AND version = ?",
-    )
-    .bind(&now)
-    .bind(&project_id)
-    .bind(request.mutation.expected_version)
-    .execute(&mut *tx)
-    .await?;
-    if project_advanced.rows_affected() != 1 {
-        return Err(ApiError::conflict_with_code(
-            "version_conflict",
-            "the Project changed while its milestone was materialized",
-        ));
-    }
-    let event_id = new_uuid_v4();
-    let event_inserted = append_milestone_event_in_tx(
-        &state,
-        &mut tx,
-        "milestone.definition.created",
-        &project_id,
-        &milestone_id,
-        &user.user_id,
-        &event_id,
-        &request.mutation.authorization,
-        &request.mutation.idempotency_key,
-        json!({
-            "milestone_id": milestone_id,
-            "revision_id": revision_id,
-            "content_digest": requested_content_digest,
-            "lifecycle": milestone_definition_lifecycle_name(request.lifecycle),
-            "render_digest": prepared.render_digest,
-            "render_version": prepared.render_version,
-            "display_label": request.display_label,
-            "expected_project_version": request.mutation.expected_version,
-            "principal_id": user.user_id,
-        }),
-        &now,
-    )
-    .await?;
-    if !event_inserted {
-        tx.rollback().await?;
-        return Err(ApiError::conflict_with_code(
-            "idempotency_in_progress",
-            "another request committed this milestone mutation; retry with the same key",
-        ));
-    }
-    tx.commit().await?;
     let runtime = MilestoneRuntime::new(state.db.clone());
     let milestone = runtime
-        .get(&project_id, &milestone_id)
+        .get(&project_id, &revision.milestone_id)
         .await
         .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::not_found("milestone", milestone_id.clone()))?;
+        .ok_or_else(|| ApiError::not_found("milestone", revision.milestone_id.clone()))?;
     Ok((StatusCode::CREATED, Json(milestone)))
 }
 
@@ -609,238 +410,42 @@ pub async fn save_milestone_revision(
         REVISION_ACTION,
     )?;
     require_idempotency_key(&request.mutation.idempotency_key)?;
-    if request.base_revision_id.trim().is_empty()
-        || !matches!(
-            request.lifecycle,
-            MilestoneDefinitionLifecycle::Draft | MilestoneDefinitionLifecycle::Proposed
-        )
-    {
+    if request.base_revision_id.trim().is_empty() {
         return Err(ApiError::bad_request(
-            "a milestone revision requires a UUID base and draft/proposed lifecycle",
+            "a milestone revision requires a UUID base",
         ));
     }
-    let requested_content_digest =
-        canonical_digest_with_schema(MILESTONE_DEFINITION_SCHEMA, &request.content)
-            .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let prepared = prepare_revision(
-        &request.content,
-        &request.rendered_view,
-        &request.render_version,
-        &request.change_summary,
-        &request.provenance.source_refs,
-    )?;
-    let revision_dedupe = format!(
-        "milestone.definition.revised:{project_id}:{}",
-        request.mutation.idempotency_key
-    );
-    if let Some(event) = DomainEventRepo::get_event_by_dedupe(&*state.db, &revision_dedupe).await? {
-        let payload: serde_json::Value = serde_json::from_str(&event.payload_json)
-            .map_err(|_| ApiError::internal("persisted milestone event is invalid"))?;
-        let same_request = payload
-            .get("content_digest")
-            .and_then(serde_json::Value::as_str)
-            == Some(requested_content_digest.as_str())
-            && payload.get("lifecycle").and_then(serde_json::Value::as_str)
-                == Some(milestone_definition_lifecycle_name(request.lifecycle))
-            && payload
-                .get("render_digest")
-                .and_then(serde_json::Value::as_str)
-                == Some(prepared.render_digest.as_str())
-            && payload
-                .get("render_version")
-                .and_then(serde_json::Value::as_str)
-                == Some(prepared.render_version.as_str())
-            && payload
-                .get("base_revision_id")
-                .and_then(serde_json::Value::as_str)
-                == Some(request.base_revision_id.as_str())
-            && payload
-                .get("expected_milestone_version")
-                .and_then(serde_json::Value::as_i64)
-                == Some(request.mutation.expected_version)
-            && payload
-                .get("principal_id")
-                .and_then(serde_json::Value::as_str)
-                == Some(user.user_id.as_str())
-            && payload
-                .get("authorization")
-                .cloned()
-                .and_then(|value| serde_json::from_value::<AuthorizationProvenance>(value).ok())
-                .as_ref()
-                == Some(&request.mutation.authorization);
-        if !same_request {
-            return Err(ApiError::conflict_with_code(
-                "idempotency_conflict",
-                "the idempotency key was already used for a different milestone revision",
-            ));
-        }
-        let revision_id = payload
-            .get("revision_id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| ApiError::internal("milestone event has no revision id"))?;
-        let runtime = MilestoneRuntime::new(state.db.clone());
-        let revision = runtime
-            .definition_revision(&project_id, &milestone_id, revision_id)
-            .await
-            .map_err(ApiError::from)?
-            .ok_or_else(|| {
-                ApiError::not_found("milestone_definition_revision", revision_id.to_owned())
-            })?;
-        return Ok((axum::http::StatusCode::OK, Json(revision)));
-    }
-    let mut tx = db::begin_immediate(state.db.pool()).await?;
-    let locked = sqlx::query(
-        "UPDATE project_milestone SET version = version
-         WHERE id = ? AND project_id = ? AND version = ?",
-    )
-    .bind(&milestone_id)
-    .bind(&project_id)
-    .bind(request.mutation.expected_version)
-    .execute(&mut *tx)
-    .await?;
-    if locked.rows_affected() != 1 {
-        return Err(ApiError::conflict_with_code(
-            "version_conflict",
-            "the milestone changed before its definition revision was saved",
-        ));
-    }
-    let milestone = sqlx::query(
-        "SELECT current_definition_revision_id FROM project_milestone
-         WHERE id = ? AND project_id = ?",
-    )
-    .bind(&milestone_id)
-    .bind(&project_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    let current_revision_id: Option<String> =
-        milestone.try_get("current_definition_revision_id")?;
-    let base = sqlx::query(
-        "SELECT id, revision FROM project_milestone_revision
-         WHERE id = ? AND milestone_id = ?",
-    )
-    .bind(&request.base_revision_id)
-    .bind(&milestone_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| {
-        ApiError::not_found(
-            "milestone_definition_revision",
-            request.base_revision_id.clone(),
-        )
-    })?;
-    if current_revision_id.as_deref() != Some(request.base_revision_id.as_str()) {
-        return Err(ApiError::conflict_with_code(
-            "version_conflict",
-            "the base revision is not the current milestone definition",
-        ));
-    }
-    let base_revision: i64 = base.try_get("revision")?;
-    validate_definition_refs_in_tx(&mut tx, &project_id, &milestone_id, &request.content).await?;
-    let revision_id = new_uuid_v4();
-    let created_at = now_rfc3339();
-    let revision: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(revision), 0) + 1
-         FROM project_milestone_revision WHERE milestone_id = ?",
-    )
-    .bind(&milestone_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    insert_revision_in_tx(
-        &mut tx,
-        &revision_id,
-        &milestone_id,
-        revision,
-        base_revision,
-        Some(&request.base_revision_id),
-        request.lifecycle,
-        &prepared,
-        &user.user_id,
-        &created_at,
-    )
-    .await?;
-    if request.lifecycle != MilestoneDefinitionLifecycle::Draft {
-        materialize_check_definitions_in_tx(
-            &mut tx,
-            &project_id,
-            &milestone_id,
-            &revision_id,
-            &request.content.acceptance_checks,
-            &created_at,
+    let revision = services::ProjectMilestoneCommandService::new(state.db.clone())
+        .revise_milestone(
+            services::ProjectMilestoneDefinitionCommand {
+                project_id: project_id.clone(),
+                milestone_id: Some(milestone_id.clone()),
+                display_label: None,
+                lifecycle: request.lifecycle,
+                content: request.content,
+                rendered_view: request.rendered_view,
+                render_version: request.render_version,
+                change_summary: request.change_summary,
+                provenance: request.provenance,
+                base_revision_id: Some(request.base_revision_id),
+                expected_project_version: 0,
+                expected_milestone_version: request.mutation.expected_version,
+                idempotency_key: request.mutation.idempotency_key,
+                authorization: milestone_authorization(
+                    &request.mutation.authorization,
+                    &user.user_id,
+                    REVISION_ACTION,
+                )?,
+            },
+            None,
         )
         .await?;
-    }
-    let advanced = if request.lifecycle == MilestoneDefinitionLifecycle::Proposed {
-        sqlx::query(
-            "UPDATE project_milestone
-             SET current_definition_revision_id = ?, version = version + 1, updated_at = ?
-             WHERE id = ? AND project_id = ? AND version = ?",
-        )
-        .bind(&revision_id)
-        .bind(&created_at)
-        .bind(&milestone_id)
-        .bind(&project_id)
-        .bind(request.mutation.expected_version)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-    } else {
-        sqlx::query(
-            "UPDATE project_milestone SET version = version + 1, updated_at = ?
-             WHERE id = ? AND project_id = ? AND version = ?",
-        )
-        .bind(&created_at)
-        .bind(&milestone_id)
-        .bind(&project_id)
-        .bind(request.mutation.expected_version)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-    };
-    if advanced != 1 {
-        return Err(ApiError::conflict_with_code(
-            "version_conflict",
-            "the milestone changed while its definition revision was materialized",
-        ));
-    }
-    let event_id = new_uuid_v4();
-    let event_inserted = append_milestone_event_in_tx(
-        &state,
-        &mut tx,
-        "milestone.definition.revised",
-        &project_id,
-        &milestone_id,
-        &user.user_id,
-        &event_id,
-        &request.mutation.authorization,
-        &request.mutation.idempotency_key,
-        json!({
-            "milestone_id": milestone_id,
-            "revision_id": revision_id,
-            "content_digest": requested_content_digest,
-            "lifecycle": milestone_definition_lifecycle_name(request.lifecycle),
-            "render_digest": prepared.render_digest,
-            "render_version": prepared.render_version,
-            "base_revision_id": request.base_revision_id,
-            "expected_milestone_version": request.mutation.expected_version,
-            "principal_id": user.user_id,
-        }),
-        &created_at,
-    )
-    .await?;
-    if !event_inserted {
-        tx.rollback().await?;
-        return Err(ApiError::conflict_with_code(
-            "idempotency_in_progress",
-            "another request committed this milestone revision; retry with the same key",
-        ));
-    }
-    tx.commit().await?;
     let runtime = MilestoneRuntime::new(state.db.clone());
     let revision = runtime
-        .definition_revision(&project_id, &milestone_id, &revision_id)
+        .definition_revision(&project_id, &milestone_id, &revision.id)
         .await
         .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::not_found("milestone_definition_revision", revision_id))?;
+        .ok_or_else(|| ApiError::not_found("milestone_definition_revision", revision.id))?;
     Ok((StatusCode::CREATED, Json(revision)))
 }
 
@@ -1932,22 +1537,34 @@ pub async fn evaluate_readiness(
             "milestone_id in the path and request must match",
         ));
     }
-    let runtime = MilestoneRuntime::new(state.db.clone());
-    let actor = user_principal(&user.user_id);
-    let snapshot = runtime
-        .evaluate(
-            &project_id,
-            &actor,
-            &request.mutation.authorization,
-            &milestone_id,
-            request.mutation.expected_version,
-            &request.baseline_id,
-            &request.baseline_revision_id,
-            &request.release_policy_revision,
-            &request.mutation.idempotency_key,
+    require_idempotency_key(&request.mutation.idempotency_key)?;
+    let record = services::ProjectMilestoneCommandService::new(state.db.clone())
+        .request_readiness(
+            services::ProjectReadinessRequestCommand {
+                project_id: project_id.clone(),
+                milestone_id: milestone_id.clone(),
+                expected_milestone_version: request.mutation.expected_version,
+                baseline_id: request.baseline_id,
+                baseline_revision_id: request.baseline_revision_id,
+                release_policy_revision: request.release_policy_revision,
+                idempotency_key: request.mutation.idempotency_key,
+                authenticated_user_id: Some(user.user_id.clone()),
+                authorization: readiness_authorization(
+                    &request.mutation.authorization,
+                    &user.user_id,
+                    READINESS_ACTION,
+                )?,
+            },
+            None,
         )
+        .await?;
+    let snapshot_id = record.id.clone();
+    let runtime = MilestoneRuntime::new(state.db.clone());
+    let snapshot = runtime
+        .get_readiness(&project_id, &milestone_id, &snapshot_id)
         .await
-        .map_err(ApiError::from)?;
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("readiness_snapshot", snapshot_id))?;
     Ok(Json(snapshot))
 }
 
@@ -2085,166 +1702,28 @@ pub async fn set_primary_milestone(
         &user.user_id,
         PRIMARY_ACTION,
     )?;
-    let runtime = MilestoneRuntime::new(state.db.clone());
-    runtime
-        .set_primary(
-            &project_id,
-            request.mutation.expected_version,
-            request.primary_milestone_id.as_deref(),
-            &user_principal(&user.user_id),
-            &request.mutation.authorization,
-            &request.mutation.idempotency_key,
+    require_idempotency_key(&request.mutation.idempotency_key)?;
+    let updated = services::ProjectMilestoneCommandService::new(state.db.clone())
+        .set_primary_milestone(
+            services::ProjectPrimaryMilestoneCommand {
+                project_id: project_id.clone(),
+                primary_milestone_id: request.primary_milestone_id,
+                expected_project_version: request.mutation.expected_version,
+                idempotency_key: request.mutation.idempotency_key,
+                authorization: milestone_authorization(
+                    &request.mutation.authorization,
+                    &user.user_id,
+                    PRIMARY_ACTION,
+                )?,
+            },
+            None,
         )
-        .await
-        .map_err(ApiError::from)?;
-    let updated = ProjectRepo::get_by_id(&*state.db, &project_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.clone()))?;
+        .await?;
     Ok(Json(serde_json::json!({
         "project_id": project_id,
         "primary_milestone_id": updated.primary_milestone_id,
         "version": updated.version,
     })))
-}
-
-struct PreparedRevision {
-    name: String,
-    outcome: String,
-    included_scope_json: String,
-    excluded_scope_json: String,
-    charter_revision_id: Option<String>,
-    document_revisions_json: String,
-    task_selection_json: String,
-    dependencies_json: String,
-    risks_json: String,
-    acceptance_checks_json: String,
-    evidence_requirements_json: String,
-    known_issues_json: String,
-    change_summary: String,
-    render_version: String,
-    rendered_view: String,
-    content_digest: String,
-    rendered_digest: String,
-    render_digest: String,
-    source_refs_json: String,
-}
-
-fn prepare_revision(
-    content: &api_types::MilestoneDefinitionContent,
-    rendered_view: &str,
-    render_version: &str,
-    change_summary: &str,
-    source_refs: &[api_types::ProvenanceRef],
-) -> ApiResult<PreparedRevision> {
-    let canonical_view = canonical_json(content).map_err(|error| {
-        ApiError::bad_request(format!("cannot render milestone definition: {error}"))
-    })?;
-    if rendered_view != canonical_view {
-        return Err(ApiError::bad_request(
-            "rendered_view must equal the server canonical milestone definition rendering",
-        ));
-    }
-    if render_version != MILESTONE_RENDER_VERSION {
-        return Err(ApiError::bad_request(
-            "render_version must name the current server milestone renderer",
-        ));
-    }
-    Ok(PreparedRevision {
-        name: content.name.clone(),
-        outcome: content.outcome.clone(),
-        included_scope_json: serde_json::to_string(&content.included_scope)
-            .map_err(|error| ApiError::bad_request(error.to_string()))?,
-        excluded_scope_json: serde_json::to_string(&content.excluded_scope)
-            .map_err(|error| ApiError::bad_request(error.to_string()))?,
-        charter_revision_id: content
-            .charter_revision
-            .as_ref()
-            .map(|reference| reference.revision_id.clone()),
-        document_revisions_json: serde_json::to_string(&content.document_revisions)
-            .map_err(|error| ApiError::bad_request(error.to_string()))?,
-        task_selection_json: serde_json::to_string(&content.task_ids)
-            .map_err(|error| ApiError::bad_request(error.to_string()))?,
-        dependencies_json: serde_json::to_string(&content.dependencies)
-            .map_err(|error| ApiError::bad_request(error.to_string()))?,
-        risks_json: serde_json::to_string(&content.risks)
-            .map_err(|error| ApiError::bad_request(error.to_string()))?,
-        acceptance_checks_json: serde_json::to_string(&content.acceptance_checks)
-            .map_err(|error| ApiError::bad_request(error.to_string()))?,
-        evidence_requirements_json: serde_json::to_string(&content.evidence_requirements)
-            .map_err(|error| ApiError::bad_request(error.to_string()))?,
-        known_issues_json: serde_json::to_string(&content.known_issues)
-            .map_err(|error| ApiError::bad_request(error.to_string()))?,
-        change_summary: change_summary.to_owned(),
-        render_version: render_version.to_owned(),
-        rendered_view: canonical_view,
-        content_digest: canonical_digest_with_schema(MILESTONE_DEFINITION_SCHEMA, content)
-            .map_err(|error| ApiError::bad_request(error.to_string()))?,
-        rendered_digest: canonical_digest_with_schema(MILESTONE_RENDER_SCHEMA, &rendered_view)
-            .map_err(|error| ApiError::bad_request(error.to_string()))?,
-        render_digest: canonical_digest_with_schema(MILESTONE_RENDER_SCHEMA, &rendered_view)
-            .map_err(|error| ApiError::bad_request(error.to_string()))?,
-        source_refs_json: serde_json::to_string(source_refs)
-            .map_err(|error| ApiError::bad_request(error.to_string()))?,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn insert_revision_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    id: &str,
-    milestone_id: &str,
-    revision: i64,
-    base_revision: i64,
-    base_revision_id: Option<&str>,
-    lifecycle: MilestoneDefinitionLifecycle,
-    values: &PreparedRevision,
-    author_id: &str,
-    created_at: &str,
-) -> ApiResult<()> {
-    sqlx::query(
-        "INSERT INTO project_milestone_revision (
-            id, milestone_id, revision, base_revision, base_revision_id, lifecycle,
-            display_label, outcome, included_scope_json, excluded_scope_json,
-            charter_revision_id, document_revisions_json, task_selection_json,
-            dependencies_json, risks_json, acceptance_checks_json,
-            evidence_requirements_json, known_issues_json, change_summary,
-            schema_version, render_version, rendered_view, content_digest,
-            rendered_digest, author_type, author_id, source_refs_json, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(id)
-    .bind(milestone_id)
-    .bind(revision)
-    .bind(base_revision)
-    .bind(base_revision_id)
-    .bind(milestone_definition_lifecycle_name(lifecycle))
-    .bind(&values.name)
-    .bind(&values.outcome)
-    .bind(&values.included_scope_json)
-    .bind(&values.excluded_scope_json)
-    .bind(values.charter_revision_id.as_deref())
-    .bind(&values.document_revisions_json)
-    .bind(&values.task_selection_json)
-    .bind(&values.dependencies_json)
-    .bind(&values.risks_json)
-    .bind(&values.acceptance_checks_json)
-    .bind(&values.evidence_requirements_json)
-    .bind(&values.known_issues_json)
-    .bind(&values.change_summary)
-    .bind(MILESTONE_DEFINITION_SCHEMA)
-    .bind(&values.render_version)
-    .bind(&values.rendered_view)
-    .bind(&values.content_digest)
-    .bind(&values.rendered_digest)
-    // HTTP author identity is always the authenticated actor.  The request's
-    // provenance author is context, not an authority that can be spoofed.
-    .bind("user")
-    .bind(author_id)
-    .bind(&values.source_refs_json)
-    .bind(created_at)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
 }
 
 async fn materialize_check_definitions_in_tx(
@@ -2362,77 +1841,6 @@ fn acceptance_source_kind_name(value: api_types::AcceptanceCheckSourceKind) -> &
         api_types::AcceptanceCheckSourceKind::MediaEvidence => "media_evidence",
         api_types::AcceptanceCheckSourceKind::GitRef => "git_ref",
     }
-}
-
-async fn validate_definition_refs_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    project_id: &str,
-    milestone_id: &str,
-    content: &api_types::MilestoneDefinitionContent,
-) -> ApiResult<()> {
-    if let Some(charter) = content.charter_revision.as_ref() {
-        let found: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM project_charter_revision r
-             JOIN project_charter c ON c.id = r.charter_id
-             WHERE r.id = ? AND r.charter_id = ? AND c.project_id = ? LIMIT 1",
-        )
-        .bind(&charter.revision_id)
-        .bind(&charter.artifact_id)
-        .bind(project_id)
-        .fetch_optional(&mut **tx)
-        .await?;
-        if found.is_none() {
-            return Err(ApiError::bad_request(
-                "milestone Charter revision is missing or belongs to another Project",
-            ));
-        }
-    }
-    for document in &content.document_revisions {
-        let found: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM project_document_revision r
-             JOIN project_document d ON d.id = r.document_id
-             WHERE r.id = ? AND r.document_id = ? AND d.project_id = ? LIMIT 1",
-        )
-        .bind(&document.revision_id)
-        .bind(&document.artifact_id)
-        .bind(project_id)
-        .fetch_optional(&mut **tx)
-        .await?;
-        if found.is_none() {
-            return Err(ApiError::bad_request(
-                "milestone Document revision is missing or belongs to another Project",
-            ));
-        }
-    }
-    for task_id in &content.task_ids {
-        let found: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM task WHERE id = ? AND project_id = ? LIMIT 1")
-                .bind(task_id)
-                .bind(project_id)
-                .fetch_optional(&mut **tx)
-                .await?;
-        if found.is_none() {
-            return Err(ApiError::bad_request(
-                "milestone Task reference is missing or belongs to another Project",
-            ));
-        }
-    }
-    for check in &content.acceptance_checks {
-        let found: Option<(String, String)> = sqlx::query_as(
-            "SELECT project_id, milestone_id FROM project_milestone_check WHERE id = ?",
-        )
-        .bind(&check.id)
-        .fetch_optional(&mut **tx)
-        .await?;
-        if let Some((check_project_id, check_milestone_id)) = found {
-            if check_project_id != project_id || check_milestone_id != milestone_id {
-                return Err(ApiError::bad_request(
-                    "milestone acceptance check belongs to another Project or milestone",
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2789,6 +2197,53 @@ fn user_principal(user_id: &str) -> PrincipalRef {
         id: user_id.to_owned(),
         display_name: None,
     }
+}
+
+fn milestone_authorization(
+    authorization: &AuthorizationProvenance,
+    user_id: &str,
+    action: &str,
+) -> ApiResult<services::ProjectCommandAuthorization> {
+    Ok(services::ProjectCommandAuthorization {
+        principal_type: "user".to_owned(),
+        principal_id: user_id.to_owned(),
+        policy_result: "allowed".to_owned(),
+        policy_revision: None,
+        policy_digest: None,
+        requested_permission: Some(action.to_owned()),
+        correlation_id: authorization.event_id.clone(),
+        causation_id: None,
+        causation_depth: 0,
+        authorization_event_id: authorization.event_id.clone(),
+        authorization_basis: authorization.authorization_basis.clone(),
+        authorization_action: authorization.action.clone(),
+        authorization_occurred_at: authorization.occurred_at.clone(),
+        authorization_json: serde_json::to_string(authorization)
+            .map_err(|error| ApiError::bad_request(error.to_string()))?,
+    })
+}
+
+fn readiness_authorization(
+    authorization: &AuthorizationProvenance,
+    user_id: &str,
+    action: &str,
+) -> ApiResult<services::ProjectCommandAuthorization> {
+    let mut command_authorization = milestone_authorization(authorization, user_id, action)?;
+    // Readiness replay must compare the submitted authority envelope before
+    // authenticating a new command.  Keep the submitted principal in the
+    // digest for that comparison; `authenticated_user_id` on the command
+    // still binds new REST requests to the JWT user.
+    command_authorization.principal_type = match authorization.principal.kind {
+        PrincipalKind::User => "user",
+        PrincipalKind::Agent => "agent",
+        PrincipalKind::Worker => "worker",
+        PrincipalKind::Reviewer => "reviewer",
+        PrincipalKind::Service => "service",
+        PrincipalKind::System => "system",
+    }
+    .to_owned();
+    command_authorization.principal_id = authorization.principal.id.clone();
+    Ok(command_authorization)
 }
 
 fn validate_authorization(

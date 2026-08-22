@@ -10,6 +10,7 @@ agent-runtime.workspace = true
 async-trait = "0.1"
 chacha20poly1305 = "0.10"
 db = { path = "../db" }
+api-types = { path = "../api-types" }
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }

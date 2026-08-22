@@ -424,9 +424,46 @@ async fn setup(
     let repo_path = common::setup_git_repo(workspace_root);
     let (project_id, repo_id) =
         common::create_project_and_repo(&harness.app, "Execution Controls", &repo_path).await;
-    let (agent_id, _) =
+    let (agent_id, reviewer_id) =
         common::create_shell_agents(&harness.app, workspace_root, "execution-controls").await;
+    common::configure_execution_test_setup(
+        &harness.state.db,
+        &project_id,
+        &repo_id,
+        &agent_id,
+        &reviewer_id,
+    )
+    .await;
+    // These fixtures exercise the interactive launch/recovery endpoints. Keep
+    // the explicit Project-eligible identities, but do not also seed default
+    // role dispatch, which would race the endpoint's own launch.
+    clear_project_execution_role_defaults(&harness.state.db, &project_id).await;
     (project_id, repo_id, agent_id)
+}
+
+async fn clear_project_execution_role_defaults(db: &db::SqliteDb, project_id: &str) {
+    let existing_settings: Option<String> =
+        sqlx::query_scalar("SELECT settings FROM project WHERE id = ?")
+            .bind(project_id)
+            .fetch_optional(db.pool())
+            .await
+            .expect("test project settings lookup");
+    let mut settings = existing_settings
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    settings
+        .as_object_mut()
+        .expect("project settings object")
+        .remove("default_role_assignments");
+    sqlx::query("UPDATE project SET settings = ?, updated_at = ? WHERE id = ?")
+        .bind(settings.to_string())
+        .bind(db::now_rfc3339())
+        .bind(project_id)
+        .execute(db.pool())
+        .await
+        .expect("test execution role defaults clear");
 }
 
 async fn create_task(harness: &common::Harness, project_id: &str, title: &str) -> TaskResponse {

@@ -18,7 +18,12 @@ futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["sync"] }
+tracing = { workspace = true }
 uuid = "1"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+forge-agent-host = { path = "../agent-host" }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }

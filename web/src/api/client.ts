@@ -22,6 +22,7 @@ import type {
   UpdateSettingsRequest,
   WorkflowTemplateResponse,
   WorkflowTemplateSummary,
+  ErrorResponse,
 } from '@/types/generated'
 import type { ProjectHookRunsResponse } from '@/types/generated/bindings/ProjectHookRunsResponse'
 import { refreshAccess, RefreshUnavailableError, useAuthStore } from '@/stores/auth'
@@ -35,12 +36,37 @@ type ApiFetchInit = RequestInit & {
 export class ApiError extends Error {
   status: number
   requestId?: string
+  code?: string
+  details?: unknown
+  response?: ErrorResponse
 
-  constructor(message: string, status: number, requestId?: string) {
+  constructor(message: string, status: number, requestId?: string, response?: ErrorResponse) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.requestId = requestId
+    this.code = response?.code
+    this.details = response?.details
+    this.response = response
+  }
+}
+
+function parseErrorResponse(text: string): ErrorResponse | undefined {
+  try {
+    const value: unknown = JSON.parse(text)
+    if (typeof value !== 'object' || value === null) return undefined
+    const candidate = value as Record<string, unknown>
+    if (typeof candidate.code !== 'string' || typeof candidate.message !== 'string') {
+      return undefined
+    }
+    return {
+      code: candidate.code,
+      message: candidate.message,
+      details: candidate.details,
+      request_id: typeof candidate.request_id === 'string' ? candidate.request_id : '',
+    }
+  } catch {
+    return undefined
   }
 }
 
@@ -95,10 +121,12 @@ async function apiResponse(path: string, init?: ApiFetchInit): Promise<Response>
 
   if (!response.ok) {
     const text = await response.text()
+    const errorResponse = parseErrorResponse(text)
     throw new ApiError(
       text || response.statusText,
       response.status,
-      response.headers.get('x-request-id') ?? undefined,
+      response.headers.get('x-request-id') ?? errorResponse?.request_id ?? undefined,
+      errorResponse,
     )
   }
 

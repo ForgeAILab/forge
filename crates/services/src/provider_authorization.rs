@@ -916,7 +916,7 @@ impl ProviderAuthorizationService {
             _ => {
                 return Err(ServiceError::invalid_operation(
                     "unsupported OAuth provider",
-                ))
+                ));
             }
         };
         let mut request = self.client.get(endpoint).bearer_auth(access_token);

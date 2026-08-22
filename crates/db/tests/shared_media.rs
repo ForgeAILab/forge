@@ -798,6 +798,8 @@ async fn project_evidence_composite_rejects_cross_project_asset() {
             idempotency_key: "cross-project-evidence".to_owned(),
             mutation_fingerprint: "cross-project-fingerprint".to_owned(),
             authorization_event_id: "auth-cross-project".to_owned(),
+            command_receipt: None,
+            action_execution: None,
         },
     )
     .await;

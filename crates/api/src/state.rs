@@ -189,6 +189,11 @@ impl AppState {
             cli_task_executor,
             embedded_task_executor,
         ));
+        // Reviews dispatch the auditor the same way Tasks dispatch a Worker.
+        // The caller can only build a CLI-adapter runner, because the embedded
+        // runtime is constructed here; upgrade it to the routed executor so an
+        // embedded identity can serve as reviewer.
+        let review_runner = Arc::new(review_runner.with_task_executor(Arc::clone(&task_executor)));
         let workspace_exec_locks = Arc::new(WorkspaceExecutionLockManager::default());
         let repo_cache_locks = Arc::new(RepoCacheLockManager::default());
         let terminal_activity = Arc::new(TerminalActivityTracker::default());
@@ -209,6 +214,7 @@ impl AppState {
                 Arc::clone(&event_bus),
                 execution_event_handler,
             ));
+        execution_events.set_connection_registry(Arc::downgrade(&daemon_connections));
         let terminal_service = Arc::new(TerminalService::new_with_activity_tracker(
             Arc::clone(&db),
             Arc::clone(&event_bus),

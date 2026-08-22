@@ -3,6 +3,7 @@
 
 import type { CanonicalPhase } from './bindings/CanonicalPhase'
 import type { ProjectHookRule } from './bindings/ProjectHookRule'
+import type { ProjectExecutionSetupResponse } from './bindings/ProjectExecutionSetupResponse'
 
 export type TaskStatus = string
 
@@ -10,6 +11,12 @@ export type TaskType = 'task' | 'planning_task' | 'sub_task' | 'discovery'
 
 export type ExecutionRole = string
 export type ExecutionStatus = 'running' | 'completed' | 'failed' | 'cancelled'
+export type ExecutionOwnerHealth = 'unowned' | 'healthy' | 'expired' | 'unknown'
+export interface ExecutionInterruptionResponse {
+  reason: string
+  kind: string | null
+  created_at: string
+}
 export type StopReason =
   | 'user_cancelled'
   | 'task_cancelled'
@@ -603,6 +610,17 @@ export interface Execution {
   plan_progress?: PlanProgressSummary | null
   plan_artifact?: PlanArtifactDetail | null
   usage?: ExecutionUsage[] | null
+  execution_version?: number
+  /** Stable server-owned owner reference; never a credential or bearer token. */
+  lease_owner?: string | null
+  owner_health?: ExecutionOwnerHealth
+  lease_expires_at?: string | null
+  hard_deadline_at?: string | null
+  last_heartbeat_at?: string | null
+  /** Semantic progress is separate from the owner heartbeat. */
+  last_progress_at?: string | null
+  liveness_warning?: string | null
+  interruption?: ExecutionInterruptionResponse | null
   created_at: string
   updated_at: string
 }
@@ -675,6 +693,7 @@ export interface Project {
   current_charter_version: number
   primary_milestone_id: string | null
   version: number
+  execution_setup: ProjectExecutionSetupResponse | null
   created_at: string
   updated_at: string
 }
@@ -829,7 +848,7 @@ export interface TaskMovedEventPayload {
 export interface ErrorResponse {
   code: string
   message: string
-  details?: Record<string, unknown> | null
+  details?: unknown | null
   request_id: string
 }
 

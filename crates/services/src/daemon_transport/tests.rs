@@ -1,17 +1,19 @@
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use chrono::{Duration as ChronoDuration, Utc};
 use db::{
-    new_uuid_v4, now_rfc3339, AgentRepo, AgentStatus, CreateAgent, CreateExecution, CreateProject,
-    CreateRepo, CreateTask, DaemonRepo, DaemonStatus, ExecutionRepo, ExecutionStatus, ProjectRepo,
-    RepoRepo, TaskRepo, UpsertDaemon, WorkMode,
+    new_uuid_v4, now_rfc3339, AgentRepo, AgentStatus, ClaimExecutionLease, CreateAgent,
+    CreateExecution, CreateProject, CreateRepo, CreateTask, DaemonRepo, DaemonStatus,
+    ExecutionLeaseMutation, ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo, TaskRepo,
+    UpsertDaemon, WorkMode,
 };
 use events::EventBus;
 use serde::Deserialize;
 use serde_json::json;
 
 use super::{
-    DaemonConnection, DaemonConnectionRegistry, DaemonExecutionEventHandler,
+    execution_lease_owner, DaemonConnection, DaemonConnectionRegistry, DaemonExecutionEventHandler,
     ServerExecutionEventSink,
 };
 use crate::ServiceError;
@@ -23,6 +25,7 @@ impl DaemonExecutionEventHandler for NoopHandler {
     async fn handle_log(
         &self,
         _daemon_id: &str,
+        _connection_id: u64,
         _notification: api_types::ExecutionLogNotification,
     ) -> Result<(), ServiceError> {
         Ok(())
@@ -31,6 +34,7 @@ impl DaemonExecutionEventHandler for NoopHandler {
     async fn handle_terminal(
         &self,
         _daemon_id: &str,
+        _connection_id: u64,
         _notification: api_types::ExecutionTerminalNotification,
     ) -> Result<(), ServiceError> {
         Ok(())
@@ -274,6 +278,56 @@ async fn daemon_transport_registry_timeout_returns_daemon_timeout() {
 }
 
 #[tokio::test]
+async fn stale_connection_cannot_resolve_current_connection_request() {
+    let registry = make_registry();
+    let (first, _first_outbound) = DaemonConnection::new("daemon-incarnation".to_owned());
+    let first_id = first.id();
+    registry.register("daemon-incarnation".to_owned(), first);
+    let (second, mut second_outbound) = DaemonConnection::new("daemon-incarnation".to_owned());
+    let second_id = second.id();
+    registry.register("daemon-incarnation".to_owned(), second);
+
+    let dispatcher = registry.clone();
+    let mut request = tokio::spawn(async move {
+        dispatcher
+            .send_request::<_, TestResponse>("daemon-incarnation", "test.echo", json!({}), 1)
+            .await
+    });
+    let frame = second_outbound.recv().await.expect("current request sent");
+    let api_types::DaemonFrame::Request { id, .. } = frame else {
+        panic!("expected current request frame");
+    };
+
+    assert!(!registry.dispatch_incoming_for_connection(
+        "daemon-incarnation",
+        first_id,
+        api_types::DaemonFrame::Response {
+            id: id.clone(),
+            result: json!({"message": "stale"}),
+        },
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut request)
+            .await
+            .is_err()
+    );
+
+    assert!(registry.dispatch_incoming_for_connection(
+        "daemon-incarnation",
+        second_id,
+        api_types::DaemonFrame::Response {
+            id,
+            result: json!({"message": "current"}),
+        },
+    ));
+    let response = request
+        .await
+        .expect("request task joins")
+        .expect("response succeeds");
+    assert_eq!(response.message, "current");
+}
+
+#[tokio::test]
 async fn daemon_transport_registry_unknown_daemon_returns_unavailable() {
     let registry = make_registry();
 
@@ -303,9 +357,37 @@ fn daemon_transport_register_returns_prior_connection_on_second_call() {
     assert!(registry.is_connected("daemon-1"));
 }
 
-fn register_daemon_connection(registry: &DaemonConnectionRegistry, daemon_id: &str) {
+fn register_daemon_connection(registry: &DaemonConnectionRegistry, daemon_id: &str) -> u64 {
     let (connection, _outbound) = DaemonConnection::new(daemon_id.to_owned());
+    let connection_id = connection.id();
     registry.register(daemon_id.to_owned(), connection);
+    connection_id
+}
+
+async fn claim_remote_execution(
+    db: &db::SqliteDb,
+    execution: &db::Execution,
+    daemon_id: &str,
+    connection_id: u64,
+) -> db::Execution {
+    let now = Utc::now();
+    let mutation = ExecutionRepo::claim_lease(
+        db,
+        ClaimExecutionLease {
+            execution_id: execution.id.clone(),
+            expected_version: execution.execution_version,
+            owner: execution_lease_owner(daemon_id, connection_id),
+            lease_expires_at: (now + ChronoDuration::seconds(30)).to_rfc3339(),
+            hard_deadline_at: (now + ChronoDuration::minutes(5)).to_rfc3339(),
+            now: now.to_rfc3339(),
+        },
+    )
+    .await
+    .expect("remote execution lease claims");
+    let ExecutionLeaseMutation::Updated(execution) = mutation else {
+        panic!("remote execution lease claim unexpectedly lost");
+    };
+    execution
 }
 
 #[tokio::test]
@@ -388,7 +470,7 @@ async fn execution_log_for_unknown_execution_is_ignored() {
 }
 
 #[tokio::test]
-async fn execution_log_from_owner_updates_last_activity_at() {
+async fn execution_log_from_owner_records_semantic_progress_without_heartbeat() {
     let db = sqlite_db().await;
     let event_bus = Arc::new(EventBus::new(16));
     let workspace_root = std::env::temp_dir().join(format!(
@@ -401,9 +483,11 @@ async fn execution_log_from_owner_updates_last_activity_at() {
     let sink = execution_event_sink(Arc::clone(&db), Arc::clone(&event_bus), workspace_root);
     let registry = Arc::new(DaemonConnectionRegistry::new(
         Arc::clone(&event_bus),
-        sink as Arc<dyn DaemonExecutionEventHandler>,
+        sink.clone() as Arc<dyn DaemonExecutionEventHandler>,
     ));
-    register_daemon_connection(&registry, &owner_daemon_id);
+    let connection_id = register_daemon_connection(&registry, &owner_daemon_id);
+    sink.set_connection_registry(Arc::downgrade(&registry));
+    let execution = claim_remote_execution(&db, &execution, &owner_daemon_id, connection_id).await;
     let activity_ts = now_rfc3339();
 
     registry.dispatch_incoming(
@@ -426,8 +510,8 @@ async fn execution_log_from_owner_updates_last_activity_at() {
             .await
             .expect("execution loads")
             .expect("execution exists");
-        if updated.last_activity_at.as_deref() != Some("1970-01-01T00:00:00Z") {
-            assert_ne!(
+        if updated.last_progress_at.is_some() {
+            assert_eq!(
                 updated.last_activity_at.as_deref(),
                 Some("1970-01-01T00:00:00Z")
             );
@@ -436,7 +520,52 @@ async fn execution_log_from_owner_updates_last_activity_at() {
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "execution last_activity_at was not updated"
+            "execution last_progress_at was not updated"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn remote_transport_heartbeat_renews_silent_execution() {
+    let db = sqlite_db().await;
+    let event_bus = Arc::new(EventBus::new(16));
+    let workspace_root = std::env::temp_dir().join(format!(
+        "forge-daemon-transport-heartbeat-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&workspace_root).expect("workspace root creates");
+    let owner_daemon_id = seed_daemon(&db, "owner-machine-heartbeat").await;
+    let (_agent_id, execution) = seed_running_execution(&db, &owner_daemon_id).await;
+    let sink = execution_event_sink(Arc::clone(&db), Arc::clone(&event_bus), workspace_root);
+    let registry = Arc::new(DaemonConnectionRegistry::new(
+        Arc::clone(&event_bus),
+        sink.clone() as Arc<dyn DaemonExecutionEventHandler>,
+    ));
+    let connection_id = register_daemon_connection(&registry, &owner_daemon_id);
+    sink.set_connection_registry(Arc::downgrade(&registry));
+    let execution = claim_remote_execution(&db, &execution, &owner_daemon_id, connection_id).await;
+    let prior_heartbeat = execution.last_heartbeat_at.clone();
+
+    registry.dispatch_incoming(
+        &owner_daemon_id,
+        api_types::DaemonFrame::Heartbeat { seq: 1 },
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let updated = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("execution loads")
+            .expect("execution exists");
+        if updated.last_heartbeat_at != prior_heartbeat {
+            assert!(updated.lease_expires_at.is_some());
+            assert_eq!(updated.status, ExecutionStatus::Running);
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "remote heartbeat did not renew the silent execution"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

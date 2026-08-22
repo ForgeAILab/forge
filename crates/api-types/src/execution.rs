@@ -9,6 +9,34 @@ use crate::{
     WorkflowExceptionSummary, WorkflowHealthSummary, WorkspaceResponse,
 };
 
+/// Public owner state for a running execution.  This is deliberately
+/// separate from semantic progress: a healthy owner may be quiet while a
+/// provider or tool call is in flight.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ExecutionOwnerHealth {
+    /// The execution is terminal and has no live owner lease.
+    Unowned,
+    /// The running execution has a current owner lease.
+    Healthy,
+    /// The owner lease has expired (or was observed expired) while the
+    /// execution is still represented as running.
+    Expired,
+    /// The owner/lease state is not available in this response.
+    Unknown,
+}
+
+/// Bounded public metadata for a terminal interruption. Rejected late results
+/// are retained as durable diagnostics instead of mutating this projection.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct ExecutionInterruptionResponse {
+    pub reason: String,
+    pub kind: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
@@ -250,7 +278,8 @@ pub struct TaskUsageSummaryResponse {
     pub execution_count: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct ExecutionResponse {
     pub id: String,
     pub task_id: String,
@@ -269,11 +298,24 @@ pub struct ExecutionResponse {
     pub stopped_by: Option<String>,
     pub resume_policy: Option<ResumePolicy>,
     pub stopped_at: Option<String>,
+    #[ts(type = "Record<string, unknown> | null")]
     pub executor_config_snapshot: Option<Value>,
     pub workspace_id: Option<String>,
     pub plan_progress: Option<PlanProgressSummary>,
     pub plan_artifact: Option<PlanArtifactDetail>,
     pub usage: Option<Vec<ExecutionUsageResponse>>,
+    /// Optimistic version used by owner renewal and terminal CAS operations.
+    pub execution_version: i64,
+    /// Stable server-owned reference for the current owner, never a secret.
+    pub lease_owner: Option<String>,
+    pub owner_health: ExecutionOwnerHealth,
+    pub lease_expires_at: Option<String>,
+    pub hard_deadline_at: Option<String>,
+    pub last_heartbeat_at: Option<String>,
+    /// Semantic progress is intentionally distinct from the owner heartbeat.
+    pub last_progress_at: Option<String>,
+    pub liveness_warning: Option<String>,
+    pub interruption: Option<ExecutionInterruptionResponse>,
     pub created_at: String,
     pub updated_at: String,
 }

@@ -345,6 +345,182 @@ async fn agent_chat_scope_flows_through_session_lcm_memory_manifest_and_action_r
 }
 
 #[tokio::test]
+async fn legacy_agent_chat_scope_upgrades_to_frozen_authority_without_data_loss() {
+    let db = database().await;
+    let now = "2026-08-21T00:00:00.000Z";
+    let account_id = "legacy-frozen-account";
+    let identity_id = "legacy-frozen-identity";
+    let profile_id = "legacy-frozen-profile";
+    UserRepo::create_user(
+        &db,
+        &User {
+            id: account_id.to_owned(),
+            email: "legacy-frozen@example.test".to_owned(),
+            password_hash: "test".to_owned(),
+            display_name: Some("Legacy Frozen".to_owned()),
+            is_admin: false,
+            created_at: now.to_owned(),
+            updated_at: now.to_owned(),
+        },
+    )
+    .await
+    .expect("account creates");
+    AgentRepo::create_identity_with_profile(
+        &db,
+        CreateAgentIdentity {
+            id: identity_id.to_owned(),
+            name: "Legacy Frozen Agent".to_owned(),
+            description: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: "idle".parse().expect("identity status"),
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: Some(account_id.to_owned()),
+            visibility: "account".to_owned(),
+            account_permission_ceiling: "{}".to_owned(),
+            created_at: now.to_owned(),
+            updated_at: now.to_owned(),
+        },
+        CreateAgentProfile {
+            id: profile_id.to_owned(),
+            identity_id: identity_id.to_owned(),
+            backend_kind: "native".to_owned(),
+            executor_type: "embedded".to_owned(),
+            provider: Some("test".to_owned()),
+            model: Some("legacy-frozen".to_owned()),
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "{}".to_owned(),
+            tool_policy_json: "{}".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            created_at: now.to_owned(),
+            updated_at: now.to_owned(),
+        },
+    )
+    .await
+    .expect("identity/profile creates");
+    let chat = AgentChatRepo::get_main_chat(&db, account_id)
+        .await
+        .expect("Main Chat lookup")
+        .expect("Main Chat exists");
+
+    let legacy_authority = serde_json::json!({
+        "issued_to_user_id": account_id,
+        "revision": 1,
+        "scope": {"chat_id": chat.id.clone(), "type": "agent_chat"},
+        "legacy_marker": "retain-this-claim"
+    });
+    let scope = AgentContextScopeRepo::create_context_scope(
+        &db,
+        CreateAgentContextScope {
+            id: "legacy-frozen-scope".to_owned(),
+            identity_id: identity_id.to_owned(),
+            scope_type: "agent_chat".to_owned(),
+            scope_id: chat.id.clone(),
+            project_id: None,
+            task_id: None,
+            task_role: None,
+            workspace_access: "deny".to_owned(),
+            authority_json: legacy_authority.to_string(),
+            created_at: now.to_owned(),
+            updated_at: now.to_owned(),
+        },
+    )
+    .await
+    .expect("legacy context scope creates");
+    assert_eq!(scope.version, 1);
+
+    let frozen_authority = serde_json::json!({
+        "issued_to_user_id": account_id,
+        "revision": 1,
+        "scope": {"chat_id": chat.id.clone(), "type": "agent_chat"},
+        "frozen_binding_id": "binding-1",
+        "frozen_binding_version": 1,
+        "frozen_profile_id": profile_id,
+        "frozen_profile_version": 1,
+        "frozen_policy_revision": "default",
+        "frozen_policy_digest": "policy-digest",
+        "frozen_permission_policy_digest": "permission-digest",
+        "frozen_tool_policy_digest": "tool-digest"
+    });
+    let reconciled = AgentContextScopeRepo::create_context_scope(
+        &db,
+        CreateAgentContextScope {
+            id: "new-id-is-ignored-on-replay".to_owned(),
+            identity_id: identity_id.to_owned(),
+            scope_type: "agent_chat".to_owned(),
+            scope_id: chat.id.clone(),
+            project_id: None,
+            task_id: None,
+            task_role: None,
+            workspace_access: "deny".to_owned(),
+            authority_json: frozen_authority.to_string(),
+            created_at: now.to_owned(),
+            updated_at: "2026-08-21T00:00:01.000Z".to_owned(),
+        },
+    )
+    .await
+    .expect("legacy authority reconciles");
+    assert_eq!(reconciled.id, scope.id);
+    assert_eq!(reconciled.version, 2);
+    let stored_authority: serde_json::Value =
+        serde_json::from_str(&reconciled.authority_json).expect("stored authority JSON");
+    assert_eq!(stored_authority["legacy_marker"], "retain-this-claim");
+    assert_eq!(stored_authority["frozen_binding_id"], "binding-1");
+
+    let replay = AgentContextScopeRepo::create_context_scope(
+        &db,
+        CreateAgentContextScope {
+            id: "another-id-is-ignored-on-replay".to_owned(),
+            identity_id: identity_id.to_owned(),
+            scope_type: "agent_chat".to_owned(),
+            scope_id: chat.id.clone(),
+            project_id: None,
+            task_id: None,
+            task_role: None,
+            workspace_access: "deny".to_owned(),
+            authority_json: frozen_authority.to_string(),
+            created_at: now.to_owned(),
+            updated_at: "2026-08-21T00:00:02.000Z".to_owned(),
+        },
+    )
+    .await
+    .expect("frozen authority replay succeeds");
+    assert_eq!(replay.id, scope.id);
+    assert_eq!(replay.version, 2);
+
+    let mut changed_authority = frozen_authority;
+    changed_authority["frozen_binding_version"] = serde_json::json!(2);
+    let conflict = AgentContextScopeRepo::create_context_scope(
+        &db,
+        CreateAgentContextScope {
+            id: "conflicting-id".to_owned(),
+            identity_id: identity_id.to_owned(),
+            scope_type: "agent_chat".to_owned(),
+            scope_id: chat.id,
+            project_id: None,
+            task_id: None,
+            task_role: None,
+            workspace_access: "deny".to_owned(),
+            authority_json: changed_authority.to_string(),
+            created_at: now.to_owned(),
+            updated_at: now.to_owned(),
+        },
+    )
+    .await;
+    assert!(conflict
+        .expect_err("changed frozen authority must fail closed")
+        .to_string()
+        .contains("different authority"));
+}
+
+#[tokio::test]
 async fn identity_profile_session_replacement_preserves_per_identity_chat_continuity() {
     let db = database().await;
     let now = "2026-08-13T00:00:00.000Z";

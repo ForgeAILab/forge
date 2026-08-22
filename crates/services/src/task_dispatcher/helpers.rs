@@ -20,10 +20,11 @@ pub(super) fn is_io_or_workspace_error(error: &ServiceError) -> bool {
 /// retrying the dispatch cannot succeed until a user approves an execution
 /// baseline. The dispatcher parks such tasks instead of rescheduling them.
 pub(super) fn is_not_runnable_error(error: &ServiceError) -> bool {
-    matches!(
-        error,
-        ServiceError::InvalidOperation { message } if message.contains("is not runnable")
-    )
+    match error {
+        ServiceError::ExecutionSetupRequired { .. } => true,
+        ServiceError::InvalidOperation { message } => message.contains("is not runnable"),
+        _ => false,
+    }
 }
 
 pub(super) fn has_blocking_annotation(task: &db::Task) -> bool {

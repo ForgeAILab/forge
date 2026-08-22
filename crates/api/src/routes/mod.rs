@@ -6,6 +6,7 @@ use api_types::{
     StepResultResponse, Task as ApiTask, TaskAnnotation, TaskBlockingAnnotation, TaskResponse,
     TaskRoleAssignmentResponse, TaskType, WorkspaceResponse,
 };
+use chrono::{DateTime, Utc};
 use db::{
     Agent, Daemon, Execution, Page, PageRequest, Project, ProjectRepo, Repo, Review, SortBy,
     SortOrder, Task, TaskRoleAssignment, TaskRoleAssignmentRepo, TransitionLogRepo, Workspace,
@@ -50,6 +51,7 @@ pub mod product_genesis;
 pub mod project_agents;
 pub mod project_charters;
 pub mod project_documents;
+pub mod project_execution_setup;
 pub mod project_media;
 pub mod project_orchestration;
 pub mod project_overview;
@@ -190,6 +192,7 @@ pub fn project_response(project: Project) -> ApiResult<ProjectResponse> {
         current_charter_version: project.current_charter_version,
         primary_milestone_id: project.primary_milestone_id,
         version: project.version,
+        execution_setup: None,
     })
 }
 
@@ -690,6 +693,10 @@ pub fn workspace_response(workspace: Workspace) -> WorkspaceResponse {
 }
 
 pub fn execution_response(execution: Execution) -> ExecutionResponse {
+    let now = Utc::now();
+    let owner_health = execution_owner_health(&execution, now);
+    let liveness_warning = execution_liveness_warning(&execution, owner_health, now);
+    let interruption = execution_interruption_response(&execution);
     ExecutionResponse {
         id: execution.id,
         task_id: execution.task_id,
@@ -715,8 +722,130 @@ pub fn execution_response(execution: Execution) -> ExecutionResponse {
         plan_progress: None,
         plan_artifact: None,
         usage: None,
+        execution_version: execution.execution_version,
+        lease_owner: execution.lease_owner,
+        owner_health,
+        lease_expires_at: execution.lease_expires_at,
+        hard_deadline_at: execution.hard_deadline_at,
+        last_heartbeat_at: execution.last_heartbeat_at,
+        last_progress_at: execution.last_progress_at,
+        liveness_warning,
+        interruption,
         created_at: execution.created_at,
         updated_at: execution.updated_at,
+    }
+}
+
+fn execution_owner_health(
+    execution: &Execution,
+    now: DateTime<Utc>,
+) -> api_types::ExecutionOwnerHealth {
+    if !matches!(execution.status, db::ExecutionStatus::Running) {
+        return api_types::ExecutionOwnerHealth::Unowned;
+    }
+
+    let Some(owner) = execution.lease_owner.as_deref() else {
+        return api_types::ExecutionOwnerHealth::Unknown;
+    };
+    if owner.is_empty() {
+        return api_types::ExecutionOwnerHealth::Unknown;
+    }
+    let Some(expires_at) = execution.lease_expires_at.as_deref() else {
+        return api_types::ExecutionOwnerHealth::Unknown;
+    };
+    let Ok(expires_at) = DateTime::parse_from_rfc3339(expires_at) else {
+        return api_types::ExecutionOwnerHealth::Unknown;
+    };
+    if expires_at.with_timezone(&Utc) > now {
+        api_types::ExecutionOwnerHealth::Healthy
+    } else {
+        api_types::ExecutionOwnerHealth::Expired
+    }
+}
+
+fn execution_liveness_warning(
+    execution: &Execution,
+    owner_health: api_types::ExecutionOwnerHealth,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    if matches!(execution.status, db::ExecutionStatus::Running) {
+        if let Some(deadline) = execution.hard_deadline_at.as_deref() {
+            if DateTime::parse_from_rfc3339(deadline)
+                .map(|value| value.with_timezone(&Utc) <= now)
+                .unwrap_or(false)
+            {
+                return Some("hard_deadline_reached".to_owned());
+            }
+        }
+
+        return match owner_health {
+            api_types::ExecutionOwnerHealth::Expired => Some("owner_lease_expired".to_owned()),
+            api_types::ExecutionOwnerHealth::Unknown => Some("owner_lease_unverified".to_owned()),
+            api_types::ExecutionOwnerHealth::Healthy | api_types::ExecutionOwnerHealth::Unowned => {
+                None
+            }
+        };
+    }
+
+    match execution.stop_reason.as_ref() {
+        Some(db::StopReason::AgentTimeout) => Some("hard_deadline_reached".to_owned()),
+        // A terminal stalled outcome is owner-loss recovery.  Semantic
+        // progress warnings are projected separately and never inferred from
+        // this terminal stop reason.
+        Some(db::StopReason::ExecutionStalled) => Some("owner_lease_expired".to_owned()),
+        Some(db::StopReason::CrashRecovery) => Some("owner_recovery".to_owned()),
+        Some(db::StopReason::DaemonDisconnected) => Some("remote_owner_disconnected".to_owned()),
+        _ => None,
+    }
+}
+
+fn execution_interruption_response(
+    execution: &Execution,
+) -> Option<api_types::ExecutionInterruptionResponse> {
+    if matches!(execution.status, db::ExecutionStatus::Running) {
+        return None;
+    }
+
+    let kind = execution.stop_reason.as_ref().map(stop_reason_code);
+    if kind.is_none() && !matches!(execution.status, db::ExecutionStatus::Failed) {
+        return None;
+    }
+
+    Some(api_types::ExecutionInterruptionResponse {
+        reason: kind
+            .clone()
+            .unwrap_or_else(|| execution_status_code(&execution.status).to_owned()),
+        kind,
+        created_at: execution
+            .stopped_at
+            .clone()
+            .unwrap_or_else(|| execution.updated_at.clone()),
+    })
+}
+
+fn stop_reason_code(value: &db::StopReason) -> String {
+    match value {
+        db::StopReason::UserCancelled => "user_cancelled",
+        db::StopReason::TaskCancelled => "task_cancelled",
+        db::StopReason::RoleReassigned => "role_reassigned",
+        db::StopReason::GracefulShutdown => "graceful_shutdown",
+        db::StopReason::CrashRecovery => "crash_recovery",
+        db::StopReason::AgentTimeout => "agent_timeout",
+        db::StopReason::ExecutionStalled => "execution_stalled",
+        db::StopReason::DaemonDisconnected => "daemon_disconnected",
+        db::StopReason::ExecutorCancelled => "executor_cancelled",
+        db::StopReason::ExecutorFailed => "executor_failed",
+        db::StopReason::LegacyUnknown => "legacy_unknown",
+    }
+    .to_owned()
+}
+
+fn execution_status_code(value: &db::ExecutionStatus) -> &'static str {
+    match value {
+        db::ExecutionStatus::Running => "running",
+        db::ExecutionStatus::Completed => "completed",
+        db::ExecutionStatus::Failed => "failed",
+        db::ExecutionStatus::Cancelled => "cancelled",
     }
 }
 
@@ -1027,5 +1156,107 @@ mod idempotency_tests {
         assert_ne!(first, other_project);
         assert_ne!(first, other_user);
         assert_eq!(client_idempotency_key(&first), "same:key");
+    }
+}
+
+#[cfg(test)]
+mod execution_liveness_response_tests {
+    use super::{execution_response, Execution};
+    use chrono::{Duration, Utc};
+
+    fn running_execution() -> Execution {
+        let now = Utc::now();
+        Execution {
+            id: "execution-1".to_owned(),
+            task_id: "task-1".to_owned(),
+            agent_id: Some("agent-1".to_owned()),
+            role: "worker".to_owned(),
+            status: db::ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: Some((now - Duration::minutes(3)).to_rfc3339()),
+            prompt: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            execution_version: 7,
+            lease_owner: Some("execution-owner:opaque".to_owned()),
+            lease_expires_at: Some((now + Duration::minutes(1)).to_rfc3339()),
+            hard_deadline_at: Some((now + Duration::hours(1)).to_rfc3339()),
+            last_heartbeat_at: Some(now.to_rfc3339()),
+            last_progress_at: Some((now - Duration::minutes(3)).to_rfc3339()),
+            created_at: (now - Duration::minutes(5)).to_rfc3339(),
+            updated_at: now.to_rfc3339(),
+        }
+    }
+
+    #[test]
+    fn response_keeps_owner_heartbeat_distinct_from_semantic_progress() {
+        let response = execution_response(running_execution());
+
+        assert_eq!(response.execution_version, 7);
+        assert_eq!(
+            response.lease_owner.as_deref(),
+            Some("execution-owner:opaque")
+        );
+        assert_eq!(
+            response.owner_health,
+            api_types::ExecutionOwnerHealth::Healthy
+        );
+        assert_ne!(response.last_heartbeat_at, response.last_progress_at);
+        assert!(response.liveness_warning.is_none());
+        assert!(response.interruption.is_none());
+    }
+
+    #[test]
+    fn response_surfaces_expiry_without_conflating_it_with_progress() {
+        let mut execution = running_execution();
+        execution.lease_expires_at = Some((Utc::now() - Duration::seconds(1)).to_rfc3339());
+
+        let response = execution_response(execution);
+
+        assert_eq!(
+            response.owner_health,
+            api_types::ExecutionOwnerHealth::Expired
+        );
+        assert_eq!(
+            response.liveness_warning.as_deref(),
+            Some("owner_lease_expired")
+        );
+        assert!(response.last_progress_at.is_some());
+    }
+
+    #[test]
+    fn terminal_timeout_has_bounded_interruption_metadata() {
+        let mut execution = running_execution();
+        execution.status = db::ExecutionStatus::Failed;
+        execution.stop_reason = Some(db::StopReason::AgentTimeout);
+        execution.stopped_at = Some(Utc::now().to_rfc3339());
+        execution.lease_owner = None;
+        execution.lease_expires_at = None;
+        execution.last_heartbeat_at = None;
+
+        let response = execution_response(execution);
+
+        assert_eq!(
+            response.owner_health,
+            api_types::ExecutionOwnerHealth::Unowned
+        );
+        assert_eq!(
+            response.liveness_warning.as_deref(),
+            Some("hard_deadline_reached")
+        );
+        let interruption = response.interruption.expect("timeout interruption");
+        assert_eq!(interruption.kind.as_deref(), Some("agent_timeout"));
+        assert_eq!(interruption.reason, "agent_timeout");
     }
 }

@@ -6,21 +6,17 @@
 //! atomic Agent Chat service composite.  A failed adapter call is persisted on
 //! the job with a bounded error and a finite retry budget.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeSet, fmt, path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use db::{
-    now_rfc3339, Agent, AgentChatMessage, AgentChatMessageAuthorType, AgentChatMessageListQuery,
-    AgentChatMessageRepo, AgentChatMessageStatus, AgentChatRepo, AgentChatTurnJob,
-    AgentChatTurnJobRepo, AgentProfile, AgentProfileRepo, AgentRepo, AgentSession,
-    CredentialHandleRepo, PageRequest, ProjectAgentBindingRepo, ProjectRepo, SqliteDb,
+    canonicalize_project_handoff_json, now_rfc3339, project_handoff_request_fingerprint,
+    AccountMainAgentBindingRepo, Agent, AgentChatMessage, AgentChatMessageAuthorType,
+    AgentChatMessageListQuery, AgentChatMessageRepo, AgentChatMessageStatus, AgentChatRepo,
+    AgentChatTurnJob, AgentChatTurnJobRepo, AgentProfile, AgentProfileRepo, AgentRepo,
+    AgentSession, CredentialHandleRepo, PageRequest, ProjectAgentBindingRepo, ProjectRepo,
+    SqliteDb,
 };
 use executors::{ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorKind, TaskExecutor};
 use forge_agent_host::RuntimeContextManifestLink;
@@ -42,19 +38,21 @@ use crate::{
     },
     agent_chat_turn_policy::failure_after_claim,
     context_manifest::{ContextManifestInput, ContextManifestService, ContextSourceInput},
-    embedded_agent_service::{CreateScopedSession, RequestedCanonicalScope},
+    embedded_agent_service::{
+        CreateFrozenAgentChatSession, CreateScopedSession, RequestedCanonicalScope,
+    },
     operating_skills::{
-        canonical_main_operating_skill_body, canonical_project_operating_skill_body,
-        render_main_baseline_operating_skill, render_project_operating_skill,
-        EffectiveProjectStateContext, MainBaselineSkillContext, ProjectOperatingSkillContext,
-        MAIN_BASELINE_OPERATING_SKILL_CONTENT_DIGEST, MAIN_BASELINE_OPERATING_SKILL_KEY,
-        MAIN_BASELINE_OPERATING_SKILL_REVISION, MAIN_OPERATING_SKILL_CONTENT_DIGEST,
-        MAIN_OPERATING_SKILL_KEY, MAIN_OPERATING_SKILL_POLICY_DIGEST,
-        MAIN_OPERATING_SKILL_POLICY_JSON, MAIN_OPERATING_SKILL_RENDER_VERSION,
-        MAIN_OPERATING_SKILL_SCHEMA_VERSION, PROJECT_OPERATING_SKILL_CONTENT_DIGEST,
-        PROJECT_OPERATING_SKILL_KEY, PROJECT_OPERATING_SKILL_POLICY_DIGEST,
-        PROJECT_OPERATING_SKILL_POLICY_JSON, PROJECT_OPERATING_SKILL_RENDER_VERSION,
-        PROJECT_OPERATING_SKILL_SCHEMA_VERSION,
+        canonical_main_baseline_operating_skill_body, canonical_main_operating_skill_body,
+        canonical_project_operating_skill_body, render_main_baseline_operating_skill,
+        render_project_operating_skill, EffectiveProjectStateContext, MainBaselineSkillContext,
+        ProjectOperatingSkillContext, MAIN_BASELINE_OPERATING_SKILL_CONTENT_DIGEST,
+        MAIN_BASELINE_OPERATING_SKILL_KEY, MAIN_BASELINE_OPERATING_SKILL_REVISION,
+        MAIN_OPERATING_SKILL_CONTENT_DIGEST, MAIN_OPERATING_SKILL_KEY,
+        MAIN_OPERATING_SKILL_POLICY_DIGEST, MAIN_OPERATING_SKILL_POLICY_JSON,
+        MAIN_OPERATING_SKILL_RENDER_VERSION, MAIN_OPERATING_SKILL_SCHEMA_VERSION,
+        PROJECT_OPERATING_SKILL_CONTENT_DIGEST, PROJECT_OPERATING_SKILL_KEY,
+        PROJECT_OPERATING_SKILL_POLICY_DIGEST, PROJECT_OPERATING_SKILL_POLICY_JSON,
+        PROJECT_OPERATING_SKILL_RENDER_VERSION, PROJECT_OPERATING_SKILL_SCHEMA_VERSION,
     },
     project_runtime::{load_effective_project_state, ProjectEffectiveStateProjection},
     EmbeddedAgentService, Result, ServiceError,
@@ -150,6 +148,25 @@ struct LoadedAgentChatTurn {
     /// the authenticated bounded Project state.  These are appended to the
     /// runtime context manifest when the backend returns one.
     operating_context_sources: Vec<ContextSourceInput>,
+}
+
+/// Authority-bearing values copied into a turn job at admission.  Binding
+/// rows and Profiles are retained as history, but the active binding is not a
+/// valid source for an already-admitted job: replacement must never mix a new
+/// binding/policy with the old Profile or operating skill.
+#[derive(Debug, Clone)]
+struct FrozenTurnAuthority {
+    binding_id: String,
+    binding_version: i64,
+    profile_version: i64,
+    operating_skill_revision_id: String,
+    policy_revision: String,
+    policy_digest: String,
+    permission_policy_digest: String,
+    tool_policy_digest: String,
+    operating_skill_key: String,
+    operating_skill_body: String,
+    operating_skill_content_digest: String,
 }
 
 #[derive(Debug, Clone)]
@@ -549,6 +566,333 @@ impl FederatedAgentChatTurnRunner {
         }
     }
 
+    /// Validate and load the authority snapshot captured at turn admission.
+    ///
+    /// V088 deliberately leaves the provenance columns nullable for rows
+    /// created before the cutover.  Such rows take the legacy path and are
+    /// still subject to the existing conservative authority checks.  A row
+    /// created after the cutover must be complete; falling back to an active
+    /// binding, the selected Profile, or the current skill would make a
+    /// queued turn change meaning while it was waiting.
+    async fn load_frozen_authority(
+        &self,
+        chat: &db::AgentChat,
+        job: &AgentChatTurnJob,
+        agent: &Agent,
+        profile: &AgentProfile,
+    ) -> Result<Option<FrozenTurnAuthority>> {
+        let provenance_fields = [
+            job.responder_binding_id.is_some(),
+            job.responder_binding_version.is_some(),
+            job.responder_identity_version.is_some(),
+            job.profile_version.is_some(),
+            job.operating_skill_revision_id.is_some(),
+            job.policy_revision.is_some(),
+            job.policy_digest.is_some(),
+            job.permission_policy_digest.is_some(),
+            job.tool_policy_digest.is_some(),
+            job.admission_digest.is_some(),
+            job.canonical_scope_provenance_json.is_some(),
+        ];
+        if provenance_fields.iter().all(|present| !present) {
+            return Ok(None);
+        }
+        if provenance_fields.iter().any(|present| !present) {
+            return Err(ServiceError::invalid_operation(
+                "Agent Chat turn has incomplete admission provenance",
+            ));
+        }
+        if job.canonical_scope_type != "agent_chat" || job.canonical_scope_id != job.chat_id {
+            return Err(ServiceError::invalid_operation(
+                "Agent Chat turn has an invalid frozen canonical scope",
+            ));
+        }
+        let binding_id = job.responder_binding_id.clone().ok_or_else(|| {
+            ServiceError::invalid_operation("Agent Chat turn has no frozen responder binding")
+        })?;
+        let binding_version = job.responder_binding_version.ok_or_else(|| {
+            ServiceError::invalid_operation("Agent Chat turn has no frozen binding version")
+        })?;
+        let profile_version = job.profile_version.ok_or_else(|| {
+            ServiceError::invalid_operation("Agent Chat turn has no frozen Profile version")
+        })?;
+        let identity_version = job.responder_identity_version.ok_or_else(|| {
+            ServiceError::invalid_operation("Agent Chat turn has no frozen identity version")
+        })?;
+        if profile.version != profile_version {
+            return Err(ServiceError::invalid_operation(
+                "Agent Chat turn Profile revision is no longer available",
+            ));
+        }
+        if job.profile_id.as_deref() != Some(profile.id.as_str())
+            || job.responder_identity_id.as_deref() != Some(agent.id.as_str())
+        {
+            return Err(ServiceError::invalid_operation(
+                "Agent Chat turn frozen responder does not match its Profile",
+            ));
+        }
+
+        // The provenance JSON is redaction-safe, but it is still checked as a
+        // second representation of the admission receipt.  This catches a
+        // partially migrated row or an accidental column mix before any
+        // session/backend work occurs.
+        let provenance =
+            serde_json::from_str::<crate::agent_turn_admission::ResolvedAgentResponder>(
+                job.canonical_scope_provenance_json
+                    .as_deref()
+                    .ok_or_else(|| {
+                        ServiceError::invalid_operation(
+                            "Agent Chat turn has no canonical scope provenance",
+                        )
+                    })?,
+            )
+            .map_err(|_| {
+                ServiceError::invalid_operation("Agent Chat turn canonical provenance is invalid")
+            })?;
+        provenance.require_frozen()?;
+        if provenance.chat_id != chat.id
+            || provenance.canonical_scope_type != job.canonical_scope_type
+            || provenance.canonical_scope_id != job.canonical_scope_id
+            || provenance.binding_id.as_deref() != Some(binding_id.as_str())
+            || provenance.binding_version != Some(binding_version)
+            || provenance.identity_id.as_deref() != Some(agent.id.as_str())
+            || provenance.identity_version != Some(identity_version)
+            || provenance.profile_id.as_deref() != Some(profile.id.as_str())
+            || provenance.profile_version != Some(profile_version)
+            || provenance.operating_skill_revision.as_deref()
+                != job.operating_skill_revision_id.as_deref()
+            || provenance.policy_revision.as_deref() != job.policy_revision.as_deref()
+            || provenance.policy_digest.as_deref() != job.policy_digest.as_deref()
+            || provenance.permission_policy_digest.as_deref()
+                != job.permission_policy_digest.as_deref()
+            || provenance.tool_policy_digest.as_deref() != job.tool_policy_digest.as_deref()
+        {
+            return Err(ServiceError::invalid_operation(
+                "Agent Chat turn frozen provenance representations disagree",
+            ));
+        }
+
+        let (
+            binding_identity_id,
+            policy_json,
+            permission_json,
+            policy_revision,
+            stored_policy_digest,
+            binding_state,
+            binding_row_version,
+            expected_skill_key,
+        ) = match chat.kind.as_str() {
+            "account_main" => {
+                let account_id = chat.account_id.as_deref().ok_or_else(|| {
+                    ServiceError::invalid_operation("Main Agent Chat has no account scope")
+                })?;
+                let binding = AccountMainAgentBindingRepo::get_main_binding(&*self.db, &binding_id)
+                    .await?
+                    .filter(|binding| binding.account_id == account_id)
+                    .ok_or_else(|| {
+                        ServiceError::invalid_operation(
+                            "Agent Chat frozen Main binding history is unavailable",
+                        )
+                    })?;
+                (
+                    binding.identity_id,
+                    binding.autonomy_policy_json,
+                    // Main account ceilings are mutable command-time policy.
+                    // The admission digest is retained below for provenance,
+                    // but it must not turn a later tightening into a reason
+                    // to reject an otherwise frozen model turn.
+                    String::new(),
+                    binding.tool_policy_revision,
+                    None,
+                    binding.state,
+                    binding.version,
+                    main_skill_key_for_frozen_revision(
+                        job.operating_skill_revision_id
+                            .as_deref()
+                            .unwrap_or_default(),
+                    ),
+                )
+            }
+            "project" => {
+                let project_id = chat.project_id.as_deref().ok_or_else(|| {
+                    ServiceError::invalid_operation("Project Agent Chat has no Project scope")
+                })?;
+                let row = sqlx::query(
+                    "SELECT identity_id, profile_id, state, version, autonomy_policy_json,
+                            permission_ceiling_json,
+                            operating_skill_revision_id, policy_revision, policy_digest
+                     FROM project_agent_binding
+                     WHERE id = ? AND project_id = ?",
+                )
+                .bind(&binding_id)
+                .bind(project_id)
+                .fetch_optional(self.db.pool())
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "Agent Chat frozen Project binding history is unavailable",
+                    )
+                })?;
+                let identity_id: Option<String> = row.try_get("identity_id")?;
+                let binding_row_version: i64 = row.try_get("version")?;
+                let autonomy_policy_json: String = row.try_get("autonomy_policy_json")?;
+                let permission_json: String = row.try_get("permission_ceiling_json")?;
+                let policy_revision: String = row.try_get("policy_revision")?;
+                let stored_policy_digest: String = row.try_get("policy_digest")?;
+                (
+                    identity_id.ok_or_else(|| {
+                        ServiceError::invalid_operation(
+                            "Agent Chat frozen Project binding has no identity",
+                        )
+                    })?,
+                    autonomy_policy_json,
+                    permission_json,
+                    policy_revision,
+                    Some(stored_policy_digest),
+                    row.try_get("state")?,
+                    binding_row_version,
+                    PROJECT_OPERATING_SKILL_KEY,
+                )
+            }
+            _ => {
+                return Err(ServiceError::invalid_operation(
+                    "Agent Chat has an unsupported canonical kind",
+                ));
+            }
+        };
+
+        let historical_binding_version_matches = binding_row_version == binding_version
+            || (binding_state == "replaced" && binding_row_version == binding_version + 1);
+        if binding_identity_id != agent.id || !historical_binding_version_matches {
+            return Err(ServiceError::invalid_operation(
+                "Agent Chat frozen binding does not match its responder",
+            ));
+        }
+        // A replaced binding is valid history for its already-admitted job.
+        // A paused/revoked/setup row is an explicit authority withdrawal and
+        // must fail closed without selecting a newer active binding.
+        if matches!(
+            binding_state.as_str(),
+            "paused" | "revoked" | "agent_setup_required"
+        ) {
+            return Err(ServiceError::invalid_operation(
+                "Agent Chat frozen responder binding is no longer executable",
+            ));
+        }
+        if let Some(expected) = job.policy_revision.as_deref() {
+            if expected != policy_revision {
+                return Err(ServiceError::invalid_operation(
+                    "Agent Chat frozen policy revision is no longer available",
+                ));
+            }
+        }
+        let computed_policy_digest = crate::agent_turn_admission::policy_digest(&policy_json)?;
+        let expected_policy_digest = job.policy_digest.as_deref().ok_or_else(|| {
+            ServiceError::invalid_operation("Agent Chat turn has no frozen policy digest")
+        })?;
+        if chat.kind == "account_main" {
+            if expected_policy_digest != computed_policy_digest {
+                return Err(ServiceError::invalid_operation(
+                    "Agent Chat frozen Main policy changed after admission",
+                ));
+            }
+        } else if stored_policy_digest.as_deref() != Some(expected_policy_digest) {
+            return Err(ServiceError::invalid_operation(
+                "Agent Chat frozen Project policy changed after admission",
+            ));
+        }
+        let expected_permission_policy_digest =
+            job.permission_policy_digest.as_deref().ok_or_else(|| {
+                ServiceError::invalid_operation("Agent Chat turn has no frozen permission digest")
+            })?;
+        if expected_permission_policy_digest.trim().is_empty() {
+            return Err(ServiceError::invalid_operation(
+                "Agent Chat turn has an empty frozen permission digest",
+            ));
+        }
+        if chat.kind == "project"
+            && crate::agent_turn_admission::policy_digest(&permission_json)?
+                != expected_permission_policy_digest
+        {
+            return Err(ServiceError::invalid_operation(
+                "Agent Chat frozen permission policy changed after admission",
+            ));
+        }
+        let permission_policy_digest = expected_permission_policy_digest.to_owned();
+        let tool_policy_digest =
+            crate::agent_turn_admission::policy_digest(&profile.tool_policy_json)?;
+        if job.tool_policy_digest.as_deref() != Some(tool_policy_digest.as_str()) {
+            return Err(ServiceError::invalid_operation(
+                "Agent Chat frozen Profile policy changed after admission",
+            ));
+        }
+
+        let operating_skill_revision_id =
+            job.operating_skill_revision_id.clone().ok_or_else(|| {
+                ServiceError::invalid_operation("Agent Chat turn has no operating-skill provenance")
+            })?;
+        if expected_skill_key == MAIN_BASELINE_OPERATING_SKILL_KEY {
+            if operating_skill_revision_id != MAIN_BASELINE_OPERATING_SKILL_REVISION {
+                return Err(ServiceError::invalid_operation(
+                    "Agent Chat frozen Main baseline skill does not match the active Main context",
+                ));
+            }
+            return Ok(Some(FrozenTurnAuthority {
+                binding_id,
+                binding_version,
+                profile_version,
+                operating_skill_revision_id,
+                policy_revision,
+                policy_digest: expected_policy_digest.to_owned(),
+                permission_policy_digest,
+                tool_policy_digest,
+                operating_skill_key: MAIN_BASELINE_OPERATING_SKILL_KEY.to_owned(),
+                operating_skill_body: canonical_main_baseline_operating_skill_body().to_owned(),
+                operating_skill_content_digest: MAIN_BASELINE_OPERATING_SKILL_CONTENT_DIGEST
+                    .to_owned(),
+            }));
+        }
+        let skill_row = sqlx::query(
+            "SELECT id, skill_key, canonical_body, content_digest
+             FROM operating_skill_revision WHERE id = ?",
+        )
+        .bind(&operating_skill_revision_id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "Agent Chat frozen operating-skill revision is no longer available",
+            )
+        })?;
+        let skill_id: String = skill_row.try_get("id")?;
+        let skill_key: String = skill_row.try_get("skill_key")?;
+        let skill_body: String = skill_row.try_get("canonical_body")?;
+        let skill_content_digest: String = skill_row.try_get("content_digest")?;
+        if skill_id != operating_skill_revision_id
+            || skill_key != expected_skill_key
+            || skill_body.trim().is_empty()
+            || skill_content_digest.trim().is_empty()
+        {
+            return Err(ServiceError::invalid_operation(
+                "Agent Chat frozen operating-skill revision is invalid",
+            ));
+        }
+
+        Ok(Some(FrozenTurnAuthority {
+            binding_id,
+            binding_version,
+            profile_version,
+            operating_skill_revision_id,
+            policy_revision,
+            policy_digest: expected_policy_digest.to_owned(),
+            permission_policy_digest,
+            tool_policy_digest,
+            operating_skill_key: skill_key,
+            operating_skill_body: skill_body,
+            operating_skill_content_digest: skill_content_digest,
+        }))
+    }
+
     async fn load_turn(&self, job: &AgentChatTurnJob) -> Result<LoadedAgentChatTurn> {
         if job.canonical_scope_type != "agent_chat" || job.canonical_scope_id != job.chat_id {
             return Err(ServiceError::invalid_operation(
@@ -580,6 +924,9 @@ impl FederatedAgentChatTurnRunner {
             .await?
             .filter(|profile| profile.identity_id == agent.id)
             .ok_or_else(|| ServiceError::not_found("agent_profile", profile_id.to_owned()))?;
+        let frozen_authority = self
+            .load_frozen_authority(&chat, job, &agent, &profile)
+            .await?;
 
         // The Project operating skill is admitted before session creation or
         // any model call.  A Project Chat is never allowed to fall back to a
@@ -592,34 +939,76 @@ impl FederatedAgentChatTurnRunner {
                         "Main Agent Chat unexpectedly has a Project scope",
                     ));
                 }
-                // Genesis instructions are immutable history rows, but only
-                // the currently active session is admitted as model context.
-                // Joining the lifecycle table here prevents a cancelled/
-                // handed-off protocol from remaining an authority-bearing
-                // overlay after restart.
-                let instruction_row = sqlx::query(
-                    "SELECT instruction.id AS instruction_id, instruction.revision,
-                            instruction.body,
-                            genesis.id AS genesis_id, genesis.version AS genesis_version,
-                            genesis.lifecycle AS genesis_lifecycle,
-                            genesis.charter_id, genesis.charter_revision_id,
-                            revision.content_digest AS charter_content_digest,
-                            revision.rendered_digest AS charter_render_digest
-                     FROM agent_chat_instruction_revision AS instruction
-                     JOIN product_genesis_session AS genesis
-                       ON genesis.id = instruction.source_id
-                      AND genesis.main_chat_id = instruction.chat_id
-                     LEFT JOIN project_charter_revision AS revision
-                       ON revision.id = genesis.charter_revision_id
-                     WHERE instruction.chat_id = ?
-                       AND instruction.source_type = 'native'
-                       AND genesis.lifecycle IN ('discovering', 'ready_for_project')
-                     ORDER BY instruction.revision DESC, instruction.id DESC
-                     LIMIT 1",
-                )
-                .bind(&job.chat_id)
-                .fetch_optional(self.db.pool())
-                .await?;
+                // A complete job chooses its Main branch from the persisted
+                // skill revision, not from a lifecycle read taken after the
+                // job was admitted.  Historical Genesis instructions are
+                // immutable; constrain the lookup to rows that existed by
+                // admission so a later Genesis cannot replace the context.
+                let frozen_skill_key = frozen_authority
+                    .as_ref()
+                    .map(|snapshot| snapshot.operating_skill_key.as_str());
+                let frozen_baseline = frozen_skill_key == Some(MAIN_BASELINE_OPERATING_SKILL_KEY);
+                let frozen_genesis = frozen_skill_key == Some(MAIN_OPERATING_SKILL_KEY);
+                if frozen_authority.is_some() && !frozen_baseline && !frozen_genesis {
+                    return Err(ServiceError::invalid_operation(
+                        "Agent Chat frozen Main skill branch is unsupported",
+                    ));
+                }
+                let instruction_row = if frozen_baseline {
+                    None
+                } else if frozen_genesis {
+                    sqlx::query(
+                        "SELECT instruction.id AS instruction_id, instruction.revision,
+                                instruction.body,
+                                genesis.id AS genesis_id, genesis.version AS genesis_version,
+                                genesis.lifecycle AS genesis_lifecycle,
+                                genesis.charter_id, genesis.charter_revision_id,
+                                revision.content_digest AS charter_content_digest,
+                                revision.rendered_digest AS charter_render_digest
+                         FROM agent_chat_instruction_revision AS instruction
+                         JOIN product_genesis_session AS genesis
+                           ON genesis.id = instruction.source_id
+                          AND genesis.main_chat_id = instruction.chat_id
+                         LEFT JOIN project_charter_revision AS revision
+                           ON revision.id = genesis.charter_revision_id
+                         WHERE instruction.chat_id = ?
+                           AND instruction.source_type = 'native'
+                           AND instruction.created_at <= ?
+                           AND genesis.lifecycle IN (
+                               'discovering', 'ready_for_project', 'handed_off', 'cancelled'
+                           )
+                         ORDER BY instruction.revision DESC, instruction.id DESC
+                         LIMIT 1",
+                    )
+                    .bind(&job.chat_id)
+                    .bind(&job.created_at)
+                    .fetch_optional(self.db.pool())
+                    .await?
+                } else {
+                    sqlx::query(
+                        "SELECT instruction.id AS instruction_id, instruction.revision,
+                                instruction.body,
+                                genesis.id AS genesis_id, genesis.version AS genesis_version,
+                                genesis.lifecycle AS genesis_lifecycle,
+                                genesis.charter_id, genesis.charter_revision_id,
+                                revision.content_digest AS charter_content_digest,
+                                revision.rendered_digest AS charter_render_digest
+                         FROM agent_chat_instruction_revision AS instruction
+                         JOIN product_genesis_session AS genesis
+                           ON genesis.id = instruction.source_id
+                          AND genesis.main_chat_id = instruction.chat_id
+                         LEFT JOIN project_charter_revision AS revision
+                           ON revision.id = genesis.charter_revision_id
+                         WHERE instruction.chat_id = ?
+                           AND instruction.source_type = 'native'
+                           AND genesis.lifecycle IN ('discovering', 'ready_for_project')
+                         ORDER BY instruction.revision DESC, instruction.id DESC
+                         LIMIT 1",
+                    )
+                    .bind(&job.chat_id)
+                    .fetch_optional(self.db.pool())
+                    .await?
+                };
                 if let Some(instruction_row) = instruction_row {
                     let instruction_id: String = instruction_row.try_get("instruction_id")?;
                     let instruction_revision: i64 = instruction_row.try_get("revision")?;
@@ -627,20 +1016,35 @@ impl FederatedAgentChatTurnRunner {
                     let genesis_id: String = instruction_row.try_get("genesis_id")?;
                     let genesis_version: i64 = instruction_row.try_get("genesis_version")?;
                     let genesis_lifecycle: String = instruction_row.try_get("genesis_lifecycle")?;
-                    let main_skill_row = sqlx::query(
-                        "SELECT os.current_revision_id,
-                                sr.id, sr.skill_key, sr.revision,
-                                sr.schema_version, sr.render_version,
-                                sr.canonical_body, sr.policy_json,
-                                sr.policy_digest, sr.content_digest
-                         FROM operating_skill AS os
-                         JOIN operating_skill_revision AS sr
-                           ON sr.id = os.current_revision_id
-                         WHERE os.id = ? AND os.lifecycle = 'active'",
-                    )
-                    .bind(MAIN_OPERATING_SKILL_KEY)
-                    .fetch_optional(self.db.pool())
-                    .await?
+                    let main_skill_row = if let Some(frozen) = frozen_authority.as_ref() {
+                        sqlx::query(
+                            "SELECT sr.id AS current_revision_id,
+                                    sr.id, sr.skill_key, sr.revision,
+                                    sr.schema_version, sr.render_version,
+                                    sr.canonical_body, sr.policy_json,
+                                    sr.policy_digest, sr.content_digest
+                             FROM operating_skill_revision AS sr
+                             WHERE sr.id = ?",
+                        )
+                        .bind(&frozen.operating_skill_revision_id)
+                        .fetch_optional(self.db.pool())
+                        .await?
+                    } else {
+                        sqlx::query(
+                            "SELECT os.current_revision_id,
+                                    sr.id, sr.skill_key, sr.revision,
+                                    sr.schema_version, sr.render_version,
+                                    sr.canonical_body, sr.policy_json,
+                                    sr.policy_digest, sr.content_digest
+                             FROM operating_skill AS os
+                             JOIN operating_skill_revision AS sr
+                               ON sr.id = os.current_revision_id
+                             WHERE os.id = ? AND os.lifecycle = 'active'",
+                        )
+                        .bind(MAIN_OPERATING_SKILL_KEY)
+                        .fetch_optional(self.db.pool())
+                        .await?
+                    }
                     .ok_or_else(|| {
                         ServiceError::invalid_operation(
                             "Main Agent Genesis has no active server operating-skill revision",
@@ -661,17 +1065,29 @@ impl FederatedAgentChatTurnRunner {
                         main_skill_row.try_get("policy_digest")?;
                     let main_skill_content_digest: String =
                         main_skill_row.try_get("content_digest")?;
-                    if main_skill_key != MAIN_OPERATING_SKILL_KEY
-                        || main_skill_revision_number < 1
-                        || main_skill_revision
-                            != format!("{MAIN_OPERATING_SKILL_KEY}@{main_skill_revision_number}")
-                        || main_skill_schema_version != MAIN_OPERATING_SKILL_SCHEMA_VERSION
-                        || main_skill_render_version != MAIN_OPERATING_SKILL_RENDER_VERSION
-                        || main_skill_canonical_body != canonical_main_operating_skill_body()
-                        || main_skill_policy_json != MAIN_OPERATING_SKILL_POLICY_JSON
-                        || main_skill_policy_digest != MAIN_OPERATING_SKILL_POLICY_DIGEST
-                        || main_skill_content_digest != MAIN_OPERATING_SKILL_CONTENT_DIGEST
-                    {
+                    let historical_skill_valid = frozen_authority.as_ref().is_some_and(|frozen| {
+                        main_skill_revision == frozen.operating_skill_revision_id
+                            && main_skill_key == frozen.operating_skill_key
+                            && main_skill_revision_number >= 1
+                            && !main_skill_schema_version.trim().is_empty()
+                            && !main_skill_render_version.trim().is_empty()
+                            && !main_skill_canonical_body.trim().is_empty()
+                            && !main_skill_policy_json.trim().is_empty()
+                            && !main_skill_policy_digest.trim().is_empty()
+                            && main_skill_content_digest == frozen.operating_skill_content_digest
+                    });
+                    let current_skill_valid = frozen_authority.is_none()
+                        && main_skill_key == MAIN_OPERATING_SKILL_KEY
+                        && main_skill_revision_number >= 1
+                        && main_skill_revision
+                            == format!("{MAIN_OPERATING_SKILL_KEY}@{main_skill_revision_number}")
+                        && main_skill_schema_version == MAIN_OPERATING_SKILL_SCHEMA_VERSION
+                        && main_skill_render_version == MAIN_OPERATING_SKILL_RENDER_VERSION
+                        && main_skill_canonical_body == canonical_main_operating_skill_body()
+                        && main_skill_policy_json == MAIN_OPERATING_SKILL_POLICY_JSON
+                        && main_skill_policy_digest == MAIN_OPERATING_SKILL_POLICY_DIGEST
+                        && main_skill_content_digest == MAIN_OPERATING_SKILL_CONTENT_DIGEST;
+                    if !historical_skill_valid && !current_skill_valid {
                         return Err(ServiceError::invalid_operation(
                             "Main Agent Genesis operating skill does not match this server \
                              build's canonical contract; restart the Forge server so pending \
@@ -749,7 +1165,10 @@ impl FederatedAgentChatTurnRunner {
                     (
                         Some(instruction_body),
                         main_operating_context_sources(
-                            MAIN_OPERATING_SKILL_KEY,
+                            frozen_authority
+                                .as_ref()
+                                .map(|snapshot| snapshot.operating_skill_key.as_str())
+                                .unwrap_or(MAIN_OPERATING_SKILL_KEY),
                             &main_skill_revision,
                             &main_skill_content_digest,
                             "server_owned_main_genesis_operating_skill",
@@ -758,18 +1177,22 @@ impl FederatedAgentChatTurnRunner {
                         ),
                     )
                 } else {
-                    let active_genesis_id = sqlx::query_scalar::<_, Option<String>>(
-                        "SELECT id
-                         FROM product_genesis_session
-                         WHERE main_chat_id = ?
-                           AND lifecycle IN ('discovering', 'ready_for_project')
-                         ORDER BY version DESC, id DESC
-                         LIMIT 1",
-                    )
-                    .bind(&job.chat_id)
-                    .fetch_optional(self.db.pool())
-                    .await?
-                    .flatten();
+                    let active_genesis_id = if frozen_authority.is_some() {
+                        None
+                    } else {
+                        sqlx::query_scalar::<_, Option<String>>(
+                            "SELECT id
+                             FROM product_genesis_session
+                             WHERE main_chat_id = ?
+                               AND lifecycle IN ('discovering', 'ready_for_project')
+                             ORDER BY version DESC, id DESC
+                             LIMIT 1",
+                        )
+                        .bind(&job.chat_id)
+                        .fetch_optional(self.db.pool())
+                        .await?
+                        .flatten()
+                    };
                     if active_genesis_id.is_some() {
                         return Err(ServiceError::invalid_operation(
                             "Active Product Genesis has no immutable Main instruction revision",
@@ -800,7 +1223,7 @@ impl FederatedAgentChatTurnRunner {
                         "authenticated_main_profile",
                     )];
                     references.extend(self.load_main_portfolio_context(account_id).await?);
-                    let instruction =
+                    let instruction = replace_rendered_skill_body(
                         render_main_baseline_operating_skill(&MainBaselineSkillContext {
                             portfolio_references: references
                                 .iter()
@@ -810,13 +1233,32 @@ impl FederatedAgentChatTurnRunner {
                                 .map(|reference| reference.display.clone())
                                 .collect(),
                             profile_text: profile.prompt_template.clone().unwrap_or_default(),
-                        });
-                    (
-                        Some(instruction),
-                        main_operating_context_sources(
+                        }),
+                        frozen_authority
+                            .as_ref()
+                            .map(|snapshot| snapshot.operating_skill_body.as_str()),
+                        canonical_main_baseline_operating_skill_body(),
+                    )?;
+                    let (skill_key, skill_revision, skill_content_digest) = frozen_authority
+                        .as_ref()
+                        .map(|snapshot| {
+                            (
+                                snapshot.operating_skill_key.as_str(),
+                                snapshot.operating_skill_revision_id.as_str(),
+                                snapshot.operating_skill_content_digest.as_str(),
+                            )
+                        })
+                        .unwrap_or((
                             MAIN_BASELINE_OPERATING_SKILL_KEY,
                             MAIN_BASELINE_OPERATING_SKILL_REVISION,
                             MAIN_BASELINE_OPERATING_SKILL_CONTENT_DIGEST,
+                        ));
+                    (
+                        Some(instruction),
+                        main_operating_context_sources(
+                            skill_key,
+                            skill_revision,
+                            skill_content_digest,
                             "server_owned_main_baseline_operating_skill",
                             "main_baseline_context",
                             &references,
@@ -831,7 +1273,13 @@ impl FederatedAgentChatTurnRunner {
                     )
                 })?;
                 let snapshot = self
-                    .load_project_operating_skill(project_id, &agent, &profile, &chat.id, job)
+                    .load_project_operating_skill(
+                        project_id,
+                        &agent,
+                        &profile,
+                        &chat.id,
+                        frozen_authority.as_ref(),
+                    )
                     .await?;
                 (Some(snapshot.instruction), snapshot.context_sources)
             }
@@ -845,17 +1293,35 @@ impl FederatedAgentChatTurnRunner {
             .owner_id
             .clone()
             .ok_or_else(|| ServiceError::invalid_operation("Agent identity has no owner"))?;
-        let session = self
-            .embedded_agents
-            .create_or_resume_session(CreateScopedSession {
-                actor_user_id: owner_user_id,
-                identity_id: agent.id.clone(),
-                profile_id: Some(profile.id.clone()),
-                scope: RequestedCanonicalScope::AgentChat {
-                    chat_id: job.chat_id.clone(),
-                },
-            })
-            .await?;
+        let scope = RequestedCanonicalScope::AgentChat {
+            chat_id: job.chat_id.clone(),
+        };
+        let session = if let Some(frozen) = frozen_authority.as_ref() {
+            self.embedded_agents
+                .create_or_resume_frozen_chat_session(CreateFrozenAgentChatSession {
+                    actor_user_id: owner_user_id,
+                    identity_id: agent.id.clone(),
+                    profile_id: profile.id.clone(),
+                    profile_version: frozen.profile_version,
+                    binding_id: frozen.binding_id.clone(),
+                    binding_version: frozen.binding_version,
+                    policy_revision: frozen.policy_revision.clone(),
+                    policy_digest: frozen.policy_digest.clone(),
+                    permission_policy_digest: frozen.permission_policy_digest.clone(),
+                    tool_policy_digest: frozen.tool_policy_digest.clone(),
+                    scope,
+                })
+                .await?
+        } else {
+            self.embedded_agents
+                .create_or_resume_session(CreateScopedSession {
+                    actor_user_id: owner_user_id,
+                    identity_id: agent.id.clone(),
+                    profile_id: Some(profile.id.clone()),
+                    scope,
+                })
+                .await?
+        };
         let history = AgentChatMessageRepo::list_agent_chat_messages(
             &*self.db,
             AgentChatMessageListQuery {
@@ -952,25 +1418,36 @@ impl FederatedAgentChatTurnRunner {
         agent: &Agent,
         profile: &AgentProfile,
         project_chat_id: &str,
-        _job: &AgentChatTurnJob,
+        frozen: Option<&FrozenTurnAuthority>,
     ) -> Result<ProjectOperatingSkillSnapshot> {
         // Authenticate the Project Agent binding before retrieving any
         // Project row.  The chat's project_id is a routing hint, not an ACL
         // grant, so cross-scope rows must never become a lookup oracle.
-        let binding = ProjectAgentBindingRepo::get_active_project_binding(&*self.db, project_id)
-            .await?
-            .filter(|binding| {
-                // The binding names the agent; the job's profile is the
-                // enqueue-time snapshot of that agent's settings, already
-                // proven to belong to the identity during admission.
-                binding.state == "active"
-                    && binding.identity_id.as_deref() == Some(agent.id.as_str())
-            })
-            .ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "Project Agent turn has no authenticated active Project binding",
-                )
-            })?;
+        let binding = if let Some(frozen) = frozen {
+            ProjectAgentBindingRepo::get_project_binding(&*self.db, &frozen.binding_id)
+                .await?
+                .filter(|binding| binding.project_id == project_id)
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "Project Agent turn has no historical admitted Project binding",
+                    )
+                })?
+        } else {
+            ProjectAgentBindingRepo::get_active_project_binding(&*self.db, project_id)
+                .await?
+                .filter(|binding| {
+                    // Legacy rows have no frozen binding.  Keep the old
+                    // conservative path, which requires the active binding
+                    // to still name the admitted identity.
+                    binding.state == "active"
+                        && binding.identity_id.as_deref() == Some(agent.id.as_str())
+                })
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(
+                        "Project Agent turn has no authenticated active Project binding",
+                    )
+                })?
+        };
         let project = ProjectRepo::get_by_id(&*self.db, project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
@@ -989,7 +1466,7 @@ impl FederatedAgentChatTurnRunner {
         // stale Rust model cannot accidentally turn a missing column into a
         // permissive default.
         let binding_row = sqlx::query(
-            "SELECT id, project_id, state, identity_id,
+            "SELECT id, project_id, state, version, identity_id,
                     operating_skill_revision_id, policy_revision, policy_digest,
                     charter_id, charter_revision_id, charter_setup_required
              FROM project_agent_binding
@@ -1005,6 +1482,7 @@ impl FederatedAgentChatTurnRunner {
             )
         })?;
         let binding_state: String = binding_row.try_get("state")?;
+        let binding_version: i64 = binding_row.try_get("version")?;
         let binding_project_id: String = binding_row.try_get("project_id")?;
         let binding_identity_id: Option<String> = binding_row.try_get("identity_id")?;
         let binding_skill_revision_id: Option<String> =
@@ -1015,6 +1493,20 @@ impl FederatedAgentChatTurnRunner {
         let binding_charter_revision_id: Option<String> =
             binding_row.try_get("charter_revision_id")?;
         let binding_charter_setup_required: i64 = binding_row.try_get("charter_setup_required")?;
+        if let Some(frozen) = frozen {
+            let historical_binding_version_matches = binding_version == frozen.binding_version
+                || (binding_state == "replaced" && binding_version == frozen.binding_version + 1);
+            if !historical_binding_version_matches
+                || binding_skill_revision_id.as_deref()
+                    != Some(frozen.operating_skill_revision_id.as_str())
+                || binding_policy_revision != frozen.policy_revision
+                || binding_policy_digest != frozen.policy_digest
+            {
+                return Err(ServiceError::invalid_operation(
+                    "Project Agent historical binding no longer matches turn admission",
+                ));
+            }
+        }
 
         // Existing Projects intentionally remain usable while they are being
         // adopted into the Charter model.  Their Project Agent may only read
@@ -1160,7 +1652,12 @@ impl FederatedAgentChatTurnRunner {
                 "Project Agent turn is blocked until the Project has an approved Charter",
             ));
         }
-        if binding_state != "active"
+        let binding_is_executable = if frozen.is_some() {
+            matches!(binding_state.as_str(), "active" | "replaced")
+        } else {
+            binding_state == "active"
+        };
+        if !binding_is_executable
             || binding_project_id != project_id
             || binding_identity_id.as_deref() != Some(agent.id.as_str())
             || binding_charter_setup_required != 0
@@ -1339,8 +1836,8 @@ impl FederatedAgentChatTurnRunner {
             || approval_render_digest != charter_render_digest
             || charter_content_digest.trim().is_empty()
             || charter_render_digest.trim().is_empty()
-            || selected_identity_id.as_deref() != Some(agent.id.as_str())
-            || selected_profile_id.as_deref() != Some(profile.id.as_str())
+            || (frozen.is_none() && selected_identity_id.as_deref() != Some(agent.id.as_str()))
+            || (frozen.is_none() && selected_profile_id.as_deref() != Some(profile.id.as_str()))
             // The approval receipt immutably records the skill revision that
             // was current at approval time. The skill body is server-owned —
             // the user approved the agent and policy, not the instruction
@@ -1349,13 +1846,15 @@ impl FederatedAgentChatTurnRunner {
             // carry the exact current server contract.
             || !expected_skill_revision_id
                 .starts_with(&format!("{PROJECT_OPERATING_SKILL_KEY}@"))
-            || selected_policy_revision.as_deref() != Some(binding_policy_revision.as_str())
-            || selected_policy_digest.as_deref() != Some(binding_policy_digest.as_str())
-            || expected_identity_id != agent.id
-            || expected_profile_revision_id != profile.id
-            || expected_policy_revision != binding_policy_revision
-            || expected_policy_digest != binding_policy_digest
-            || expected_policy_digest != recomputed_policy_digest
+            || (frozen.is_none()
+                && selected_policy_revision.as_deref() != Some(binding_policy_revision.as_str()))
+            || (frozen.is_none()
+                && selected_policy_digest.as_deref() != Some(binding_policy_digest.as_str()))
+            || (frozen.is_none() && expected_identity_id != agent.id)
+            || (frozen.is_none() && expected_profile_revision_id != profile.id)
+            || (frozen.is_none() && expected_policy_revision != binding_policy_revision)
+            || (frozen.is_none() && expected_policy_digest != binding_policy_digest)
+            || (frozen.is_none() && expected_policy_digest != recomputed_policy_digest)
             || consumed_project_id.as_deref() != Some(project_id)
         {
             return Err(ServiceError::invalid_operation(
@@ -1387,22 +1886,34 @@ impl FederatedAgentChatTurnRunner {
         let skill_policy_json: String = skill_row.try_get("policy_json")?;
         let skill_policy_digest: String = skill_row.try_get("policy_digest")?;
         let skill_content_digest: String = skill_row.try_get("content_digest")?;
-        if skill_id != binding_skill_revision_id
-            || skill_key != PROJECT_OPERATING_SKILL_KEY
-            || skill_revision < 1
-            || skill_schema_version != PROJECT_OPERATING_SKILL_SCHEMA_VERSION
-            || skill_render_version != PROJECT_OPERATING_SKILL_RENDER_VERSION
-            || skill_canonical_body != canonical_project_operating_skill_body()
-            || skill_policy_json != PROJECT_OPERATING_SKILL_POLICY_JSON
-            || skill_policy_digest != PROJECT_OPERATING_SKILL_POLICY_DIGEST
-            || skill_content_digest != PROJECT_OPERATING_SKILL_CONTENT_DIGEST
-            || binding_skill_revision_id
-                != format!("{PROJECT_OPERATING_SKILL_KEY}@{skill_revision}")
-            || skill_row
+        let historical_skill_valid = frozen.is_some_and(|snapshot| {
+            skill_id == snapshot.operating_skill_revision_id
+                && skill_key == snapshot.operating_skill_key
+                && skill_revision >= 1
+                && !skill_schema_version.trim().is_empty()
+                && !skill_render_version.trim().is_empty()
+                && !skill_canonical_body.trim().is_empty()
+                && !skill_policy_json.trim().is_empty()
+                && !skill_policy_digest.trim().is_empty()
+                && skill_content_digest == snapshot.operating_skill_content_digest
+        });
+        let current_skill_valid = frozen.is_none()
+            && skill_id == binding_skill_revision_id
+            && skill_key == PROJECT_OPERATING_SKILL_KEY
+            && skill_revision >= 1
+            && skill_schema_version == PROJECT_OPERATING_SKILL_SCHEMA_VERSION
+            && skill_render_version == PROJECT_OPERATING_SKILL_RENDER_VERSION
+            && skill_canonical_body == canonical_project_operating_skill_body()
+            && skill_policy_json == PROJECT_OPERATING_SKILL_POLICY_JSON
+            && skill_policy_digest == PROJECT_OPERATING_SKILL_POLICY_DIGEST
+            && skill_content_digest == PROJECT_OPERATING_SKILL_CONTENT_DIGEST
+            && binding_skill_revision_id
+                == format!("{PROJECT_OPERATING_SKILL_KEY}@{skill_revision}")
+            && skill_row
                 .try_get::<Option<String>, _>("current_revision_id")?
                 .as_deref()
-                != Some(binding_skill_revision_id.as_str())
-        {
+                == Some(binding_skill_revision_id.as_str());
+        if !historical_skill_valid && !current_skill_valid {
             return Err(ServiceError::invalid_operation(
                 "Project Agent operating-skill revision is not the selected server contract",
             ));
@@ -2285,7 +2796,11 @@ impl FederatedAgentChatTurnRunner {
                 .collect(),
             profile_text: profile.prompt_template.clone().unwrap_or_default(),
         };
-        let instruction = render_project_operating_skill(&context);
+        let instruction = replace_rendered_skill_body(
+            render_project_operating_skill(&context),
+            frozen.map(|snapshot| snapshot.operating_skill_body.as_str()),
+            canonical_project_operating_skill_body(),
+        )?;
         let context_sources = project_operating_context_sources(
             &binding_skill_revision_id,
             &skill_content_digest,
@@ -3028,6 +3543,11 @@ impl AgentChatTurnWorker {
     }
 
     async fn process_claimed(&self, job: AgentChatTurnJob, cancellation: CancellationToken) {
+        // RetryWait is a retry of this same logical admission, not a new turn.
+        // Keep the claimed job (including its frozen responder/Profile/policy
+        // provenance) as the runner input; claim/lease bookkeeping may change
+        // status, attempt count, and version, but must never re-resolve the
+        // current binding or Profile here.
         let stop = CancellationToken::new();
         let turn_cancellation = cancellation.child_token();
         let renewal =
@@ -3238,6 +3758,41 @@ fn compose_system_prompt(
         ));
     }
     (!sections.is_empty()).then(|| sections.join("\n\n"))
+}
+
+/// Render dynamic context with the immutable skill body captured by the job.
+/// The renderer module owns the section ordering, while this small boundary
+/// keeps an admitted historical revision from being silently replaced by the
+/// current compiled body after a server-skill cutover.
+fn replace_rendered_skill_body(
+    rendered: String,
+    persisted_body: Option<&str>,
+    current_body: &str,
+) -> Result<String> {
+    let Some(persisted_body) = persisted_body else {
+        return Ok(rendered);
+    };
+    if persisted_body == current_body {
+        return Ok(rendered);
+    }
+    let suffix = rendered.strip_prefix(current_body).ok_or_else(|| {
+        ServiceError::invalid_operation(
+            "rendered operating skill does not match its server-owned renderer",
+        )
+    })?;
+    Ok(format!("{persisted_body}{suffix}"))
+}
+
+/// Select the Main renderer branch from admission provenance alone.  The
+/// current Product Genesis lifecycle is intentionally absent: a lifecycle
+/// transition after admission must not turn a baseline job into discovery (or
+/// the reverse) while it waits in the queue.
+fn main_skill_key_for_frozen_revision(revision_id: &str) -> &'static str {
+    if revision_id == MAIN_BASELINE_OPERATING_SKILL_REVISION {
+        MAIN_BASELINE_OPERATING_SKILL_KEY
+    } else {
+        MAIN_OPERATING_SKILL_KEY
+    }
 }
 
 fn agent_chat_manifest_id(
@@ -3757,8 +4312,8 @@ fn handoff_source_manifest_matches_packet(
     if let Some(delivery) = expected.get_mut("delivery").and_then(Value::as_object_mut) {
         delivery.insert("delivered_at".to_owned(), Value::Null);
     }
-    canonicalize_json_value(&Value::Object(expected.clone()))
-        == canonicalize_json_value(source_manifest)
+    canonicalize_project_handoff_json(&Value::Object(expected.clone()))
+        == canonicalize_project_handoff_json(source_manifest)
 }
 
 /// Reproduce the DB transaction's immutable handoff-request fingerprint after
@@ -3769,34 +4324,8 @@ fn handoff_request_fingerprint(
     value: &Value,
     authorization: &ProjectCharterHandoffAuthorization,
 ) -> Result<String> {
-    let mut normalized = value.clone();
-    let object = normalized.as_object_mut().ok_or_else(|| {
-        ServiceError::invalid_operation("Project Agent handoff source manifest must be an object")
-    })?;
-    object.remove("approval_id");
-    if let Some(request) = object.get_mut("request").and_then(Value::as_object_mut) {
-        request.remove("policy_revision");
-        request.remove("policy_digest");
-        request.remove("source_revisions_digest");
-        request.remove("authorization");
-    }
-    if let Some(target) = object.get_mut("target").and_then(Value::as_object_mut) {
-        target.insert("chat_id".to_owned(), Value::Null);
-    }
-    if let Some(delivery) = object.get_mut("delivery").and_then(Value::as_object_mut) {
-        delivery.insert("delivered_at".to_owned(), Value::Null);
-    }
-    if let Some(source) = object.get_mut("source").and_then(Value::as_object_mut) {
-        source.remove("message_id");
-    }
-    let request = object
-        .entry("request".to_owned())
-        .or_insert_with(|| Value::Object(serde_json::Map::new()));
-    let request = request.as_object_mut().ok_or_else(|| {
-        ServiceError::invalid_operation("Project Agent handoff request must be an object")
-    })?;
-    let source_revisions_json = request
-        .get("source_revisions_json")
+    let source_revisions_json = value
+        .pointer("/request/source_revisions_json")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
@@ -3804,61 +4333,13 @@ fn handoff_request_fingerprint(
                 "Project Agent handoff request source manifest is required",
             )
         })?;
-    let source_revisions_json = canonical_json_string(source_revisions_json)?;
-    request.insert(
-        "source_revisions_json".to_owned(),
-        Value::String(source_revisions_json),
-    );
-    request.insert(
-        "authorization".to_owned(),
-        serde_json::json!({
-            "principal_type": authorization.principal_type,
-            "principal_id": authorization.principal_id,
-            "authorization_basis": authorization.authorization_basis,
-            "action": authorization.action,
-            "event_id": authorization.event_id,
-            "occurred_at": authorization.occurred_at,
-        }),
-    );
-    let canonical = canonicalize_json_value(&normalized);
-    let bytes = serde_json::to_vec(&canonical).map_err(|error| {
+    let authorization = serde_json::to_value(authorization).map_err(|error| {
         ServiceError::invalid_operation(format!(
-            "Project Agent handoff source manifest is invalid: {error}"
+            "Project Agent handoff authorization is invalid: {error}"
         ))
     })?;
-    Ok(hex::encode(Sha256::digest(&bytes)))
-}
-
-fn canonical_json_string(value: &str) -> Result<String> {
-    let parsed: Value = serde_json::from_str(value).map_err(|error| {
-        ServiceError::invalid_operation(format!(
-            "Project Agent handoff source manifest is invalid: {error}"
-        ))
-    })?;
-    serde_json::to_string(&canonicalize_json_value(&parsed)).map_err(|error| {
-        ServiceError::invalid_operation(format!(
-            "Project Agent handoff source manifest is invalid: {error}"
-        ))
-    })
-}
-
-fn canonicalize_json_value(value: &Value) -> Value {
-    match value {
-        Value::Object(object) => {
-            let sorted = object
-                .iter()
-                .map(|(key, value)| (key.clone(), canonicalize_json_value(value)))
-                .collect::<BTreeMap<_, _>>();
-            Value::Object(sorted.into_iter().collect())
-        }
-        Value::Array(values) => Value::Array(
-            values
-                .iter()
-                .map(canonicalize_json_value)
-                .collect::<Vec<_>>(),
-        ),
-        scalar => scalar.clone(),
-    }
+    project_handoff_request_fingerprint(value, source_revisions_json, &authorization)
+        .map_err(ServiceError::invalid_operation)
 }
 
 fn non_empty(value: &str) -> bool {
@@ -4291,6 +4772,21 @@ mod tests {
     }
 
     #[test]
+    fn frozen_main_branch_ignores_later_genesis_lifecycle_changes() {
+        // The branch is selected from the immutable admission marker.  A
+        // lifecycle flip (baseline -> discovery or discovery -> handed_off)
+        // therefore cannot silently change a queued turn's server contract.
+        assert_eq!(
+            main_skill_key_for_frozen_revision(MAIN_BASELINE_OPERATING_SKILL_REVISION),
+            MAIN_BASELINE_OPERATING_SKILL_KEY
+        );
+        assert_eq!(
+            main_skill_key_for_frozen_revision("forge.main.project-discovery/v2@7"),
+            MAIN_OPERATING_SKILL_KEY
+        );
+    }
+
+    #[test]
     fn cli_chat_wraps_profile_config_in_executor_snapshot() {
         let snapshot = cli_executor_snapshot(
             "smith",
@@ -4447,6 +4943,28 @@ mod tests {
                     .find("SERVER-OWNED OPERATING INSTRUCTION")
                     .expect("authority")
         );
+    }
+
+    #[test]
+    fn frozen_operating_skill_body_replaces_the_compiled_revision() {
+        let current = "current skill body";
+        let rendered = format!("{current}\n\n## BOUNDED CONTEXT\nproject:p1@v4");
+        let historical =
+            replace_rendered_skill_body(rendered, Some("historical skill body"), current)
+                .expect("historical body should be retained");
+        assert!(historical.starts_with("historical skill body\n\n## BOUNDED CONTEXT"));
+        assert!(!historical.starts_with(current));
+    }
+
+    #[test]
+    fn frozen_operating_skill_body_fails_closed_on_renderer_drift() {
+        let error = replace_rendered_skill_body(
+            "unexpected renderer output".to_owned(),
+            Some("historical skill body"),
+            "current skill body",
+        )
+        .expect_err("renderer drift must not silently mix a frozen skill");
+        assert!(error.to_string().contains("renderer"));
     }
 
     #[test]
@@ -4819,6 +5337,71 @@ mod tests {
         assert_eq!(packet.handoff_id, "handoff-1");
         assert_eq!(packet.target.chat_id, "project-chat-8");
         assert_eq!(packet.redaction_manifest.excluded_categories.len(), 6);
+    }
+
+    #[test]
+    fn project_handoff_fingerprint_matches_database_materialized_transport_fields() {
+        let packet: Value = serde_json::from_str(&handoff_packet_json()).expect("packet");
+        let authorization: ProjectCharterHandoffAuthorization =
+            serde_json::from_value(packet["request"]["authorization"].clone())
+                .expect("authorization");
+        let expected = packet["request"]["source_revisions_digest"]
+            .as_str()
+            .expect("source digest");
+
+        let mut candidate = packet.clone();
+        candidate["handoff_id"] = Value::String("handoff-allocated-later".to_owned());
+        candidate["correlation_id"] = Value::String("correlation-allocated-later".to_owned());
+        candidate["created_at"] = Value::String("2026-08-14T00:00:00Z".to_owned());
+        candidate["project"]["id"] = Value::String("project-allocated-later".to_owned());
+        candidate["target"]["chat_id"] = Value::String("chat-allocated-later".to_owned());
+        candidate["target"]["binding_id"] = Value::String("binding-allocated-later".to_owned());
+        candidate["target"]["message_id"] = Value::String("message-allocated-later".to_owned());
+        candidate["target"]["turn_id"] = Value::String("turn-allocated-later".to_owned());
+        candidate["source"]["message_id"] = Value::String("source-allocated-later".to_owned());
+        candidate["delivery"]["delivered_at"] = Value::String("2026-08-14T00:00:01Z".to_owned());
+
+        let mut nested: Value = serde_json::from_str(
+            candidate["request"]["source_revisions_json"]
+                .as_str()
+                .expect("source manifest"),
+        )
+        .expect("source manifest JSON");
+        nested["handoff_id"] = Value::String("nested-handoff-allocated-later".to_owned());
+        nested["correlation_id"] = Value::String("nested-correlation-allocated-later".to_owned());
+        nested["created_at"] = Value::String("2026-08-14T00:00:02Z".to_owned());
+        nested["project"]["id"] = Value::String("nested-project-allocated-later".to_owned());
+        nested["target"]["binding_id"] = Value::String("nested-binding-allocated-later".to_owned());
+        nested["target"]["message_id"] = Value::String("nested-message-allocated-later".to_owned());
+        nested["target"]["turn_id"] = Value::String("nested-turn-allocated-later".to_owned());
+        candidate["request"]["source_revisions_json"] = Value::String(nested.to_string());
+
+        assert_eq!(
+            expected,
+            handoff_request_fingerprint(&candidate, &authorization)
+                .expect("database transport allocations are excluded")
+        );
+    }
+
+    #[test]
+    fn project_handoff_canonicalization_is_stable_for_nested_object_order() {
+        let left = serde_json::json!({
+            "outer": {"z": 1, "a": [{"right": true, "left": false}]},
+            "first": "value"
+        });
+        let right = serde_json::json!({
+            "first": "value",
+            "outer": {"a": [{"left": false, "right": true}], "z": 1}
+        });
+
+        assert_eq!(
+            canonicalize_project_handoff_json(&left),
+            canonicalize_project_handoff_json(&right)
+        );
+        assert_eq!(
+            serde_json::to_string(&canonicalize_project_handoff_json(&left)).expect("canonical"),
+            serde_json::to_string(&canonicalize_project_handoff_json(&right)).expect("canonical")
+        );
     }
 
     #[test]

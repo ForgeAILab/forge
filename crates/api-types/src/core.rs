@@ -34,8 +34,9 @@ pub enum AgentStatus {
 
 pub type ExecutionRole = String;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum ExecutionStatus {
     Running,
     Completed,

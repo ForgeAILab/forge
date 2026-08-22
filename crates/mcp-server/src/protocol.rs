@@ -72,11 +72,16 @@ pub async fn mcp_handler(
     let request = match request {
         Ok(Json(request)) => request,
         Err(error) => {
+            let syntax_error = matches!(&error, JsonRejection::JsonSyntaxError(_));
             return Json(error_response(
                 Value::Null,
-                -32700,
-                "parse error",
-                Some(json!({ "details": error.to_string() })),
+                if syntax_error { -32700 } else { -32600 },
+                if syntax_error {
+                    "parse error"
+                } else {
+                    "invalid request"
+                },
+                None,
             ))
             .into_response();
         }
@@ -107,7 +112,8 @@ pub async fn mcp_handler(
 
     Json(match result {
         Ok(result) => success_response(id, result),
-        Err(error) => error.into_response(id),
+        Err(error) if error.is_protocol() => error.into_response(id),
+        Err(error) => error.into_tool_response(id),
     })
     .into_response()
 }
@@ -141,7 +147,7 @@ pub fn mcp_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-fn success_response(id: Value, result: Value) -> McpResponse {
+pub(crate) fn success_response(id: Value, result: Value) -> McpResponse {
     McpResponse {
         jsonrpc: jsonrpc_version(),
         result: Some(result),

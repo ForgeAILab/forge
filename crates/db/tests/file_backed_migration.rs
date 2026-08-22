@@ -22,6 +22,76 @@ fn unique_temp_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("forge-{name}-{}-{nanos}", std::process::id()))
 }
 
+async fn migrate_wake_cursor_from_v087(initial_sequence: i64) -> (i64, i64, i64) {
+    let migration_dir = unique_temp_path("wake-cutover-migrations");
+    fs::create_dir_all(&migration_dir).expect("temp migration dir creates");
+    copy_migrations_up_to(87, &migration_dir);
+
+    let db_path = unique_temp_path("wake-cutover-db").with_extension("db");
+    let url = format!("sqlite://{}", db_path.display());
+    let pool = create_sqlite_pool(&url).await.expect("pool");
+    run_migrations_from(&pool, &migration_dir)
+        .await
+        .expect("pre-V088 migrations apply");
+
+    for (id, dedupe_key) in [
+        ("wake-cutover-event-1", "wake-cutover-dedupe-1"),
+        ("wake-cutover-event-2", "wake-cutover-dedupe-2"),
+    ] {
+        sqlx::query(
+            "INSERT INTO domain_event (
+                id, event_type, entity_type, entity_id, actor_type,
+                scope_type, scope_id, correlation_id, causation_depth,
+                dedupe_key, payload_json, created_at
+             ) VALUES (?, 'wake.test', 'project', 'wake-cutover-project',
+                       'system', 'project', 'wake-cutover-project', ?, 0, ?, '{}', ?)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(dedupe_key)
+        .bind("2026-08-21T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("pre-cutover event inserts");
+    }
+    let cutover_max: i64 = sqlx::query_scalar("SELECT MAX(sequence) FROM domain_event")
+        .fetch_one(&pool)
+        .await
+        .expect("pre-cutover sequence loads");
+    sqlx::query(
+        "INSERT INTO event_consumer_cursor (
+            consumer_name, last_sequence, version, updated_at
+         ) VALUES ('agent-wake-turns', ?, 7, '2026-08-21T00:00:00Z')",
+    )
+    .bind(initial_sequence)
+    .execute(&pool)
+    .await
+    .expect("legacy wake cursor inserts");
+
+    run_migrations(&pool).await.expect("V088 applies");
+    let cursor: (i64, i64) = sqlx::query_as(
+        "SELECT last_sequence, version
+         FROM event_consumer_cursor
+         WHERE consumer_name = 'agent-wake-turns'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("wake cursor loads");
+    let cutover: i64 = sqlx::query_scalar(
+        "SELECT cutover_sequence
+         FROM event_consumer_cutover
+         WHERE consumer_name = 'agent-wake-turns'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("wake cutover loads");
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(migration_dir);
+    assert_eq!(cutover, cutover_max);
+    (cursor.0, cursor.1, cutover)
+}
+
 #[tokio::test]
 async fn file_backed_migrations_apply_cleanly() {
     let db_path = unique_temp_path("migtest").with_extension("db");
@@ -29,6 +99,19 @@ async fn file_backed_migrations_apply_cleanly() {
     let url = format!("sqlite://{}", db_path.display());
     let pool = create_sqlite_pool(&url).await.expect("pool");
     run_migrations(&pool).await.expect("migrations");
+}
+
+#[tokio::test]
+async fn wake_cutover_advances_existing_lagging_cursor_but_preserves_ahead_cursor() {
+    let (lagging_sequence, lagging_version, cutover) = migrate_wake_cursor_from_v087(0).await;
+    assert_eq!(lagging_sequence, cutover);
+    assert_eq!(lagging_version, 8);
+
+    let (ahead_sequence, ahead_version, ahead_cutover) =
+        migrate_wake_cursor_from_v087(cutover + 10).await;
+    assert_eq!(ahead_cutover, cutover);
+    assert_eq!(ahead_sequence, cutover + 10);
+    assert_eq!(ahead_version, 7);
 }
 
 #[tokio::test]

@@ -494,6 +494,53 @@ async fn product_genesis_approval_creates_one_exact_project_and_handoff() {
     assert!(!created.target_message_id.is_empty());
     assert!(!created.target_turn_id.is_empty());
 
+    let (
+        principal_type,
+        principal_id,
+        scope_type,
+        scope_id,
+        input_digest,
+        event_id,
+        action_execution_id,
+        outcome_json,
+    ): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+    ) = sqlx::query_as(
+        "SELECT principal_type, principal_id, scope_type, scope_id, input_digest,
+                event_id, agent_action_execution_id, outcome_json
+         FROM command_receipt
+         WHERE operation = 'product_genesis.create_project_from_approval'
+           AND idempotency_key = ?",
+    )
+    .bind("create-exact")
+    .fetch_one(harness.state.db.pool())
+    .await
+    .expect("direct REST Project-create command receipt exists");
+    assert_eq!(principal_type, "user");
+    assert_eq!(principal_id, "test-user-id");
+    assert_eq!(scope_type, "account");
+    assert_eq!(scope_id, "test-user-id");
+    assert!(!input_digest.is_empty());
+    assert!(!event_id.is_empty());
+    assert!(action_execution_id.is_none());
+    let outcome: serde_json::Value =
+        serde_json::from_str(&outcome_json).expect("frozen Project-create outcome is JSON");
+    assert_eq!(
+        outcome["project_id"].as_str(),
+        Some(created.project_id.as_str())
+    );
+    assert_eq!(
+        outcome["project_chat_id"].as_str(),
+        Some(created.project_chat_id.as_str())
+    );
+
     let genesis = services::ProductGenesisService::for_sqlite(harness.state.db.clone());
     let completed = genesis
         .get(&started.session.id)
@@ -664,7 +711,42 @@ async fn product_genesis_approval_creates_one_exact_project_and_handoff() {
             StatusCode::CREATED,
         )
         .await;
-    assert_eq!(replayed, created);
+    // The command receipt freezes the materialized Project/handoff identity,
+    // but the response also carries the current provisioning projection.  A
+    // response-loss replay reconciles that projection and may legitimately
+    // advance its attempt/version/retry fields, so compare the frozen
+    // identity separately from the live setup view.
+    assert_eq!(replayed.project_id, created.project_id);
+    assert_eq!(
+        replayed.project_agent_binding_id,
+        created.project_agent_binding_id
+    );
+    assert_eq!(replayed.project_chat_id, created.project_chat_id);
+    assert_eq!(replayed.charter_id, created.charter_id);
+    assert_eq!(replayed.charter_revision_id, created.charter_revision_id);
+    assert_eq!(replayed.handoff_id, created.handoff_id);
+    assert_eq!(replayed.target_message_id, created.target_message_id);
+    assert_eq!(replayed.target_turn_id, created.target_turn_id);
+
+    let replayed_setup =
+        services::load_project_execution_setup(&harness.state.db, &replayed.project_id)
+            .await
+            .expect("replayed Project setup projection remains readable");
+    assert_eq!(replayed.execution_setup, replayed_setup);
+    assert_eq!(replayed.execution_setup.project_id, replayed.project_id);
+
+    let (replayed_input_digest, replayed_outcome_json): (String, String) = sqlx::query_as(
+        "SELECT input_digest, outcome_json
+         FROM command_receipt
+         WHERE operation = 'product_genesis.create_project_from_approval'
+           AND idempotency_key = ?",
+    )
+    .bind("create-exact")
+    .fetch_one(harness.state.db.pool())
+    .await
+    .expect("replayed Project-create receipt remains durable");
+    assert_eq!(replayed_input_digest, input_digest);
+    assert_eq!(replayed_outcome_json, outcome_json);
 
     let changed_authorization: ErrorResponse = common::json_request_with_bearer(
         app,

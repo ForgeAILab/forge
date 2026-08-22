@@ -175,6 +175,8 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 - **Composer behavior:** Enter submits a non-composing message; Shift+Enter inserts a newline; IME composition is never interrupted. The send control is disabled while the current turn is live or the binding is not ready, with truthful copy explaining why.
 - **Handoffs:** a handoff's Continue action opens the target Project Agent Chat and never redirects to a board/task view. Context provenance remains inspectable from the explicit manifest identifier.
 - **States:** loading, recoverable error with retry, empty timeline, setup required, pending turn, and settled timeline all have explicit copy and keyboard-visible actions.
+- **Structured tool outcomes:** model-facing native/MCP command failures remain in-band and are represented by the stable outcome code/status plus typed approval, setup, current-version, digest, or retry data; do not turn them into free-form provider/database prose. If a user-facing surface exposes the result, show the bounded `safe_message`, explicit code/status, and a permitted next action. `replayed` is a boolean provenance marker and never a replacement status.
+- **Outcome privacy:** show `correlation_id` only as bounded inspectable diagnostic metadata; never render protected causes, raw persistence errors, payload bodies, or unredacted outcome JSON. Current versions, revisions, and corrective arguments may be shown only after the server has authorized the caller for that exact scope/resource.
 - **Refresh:** server events may accelerate updates, but mounted timelines poll messages, turns, handoffs, and chat status at a bounded interval so a completed response never depends on an unavailable event channel.
 
 ### Project Agent Workspace
@@ -221,6 +223,10 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 ### Mission Control and Agent detail
 
 - **Hierarchy:** primary views lead with the singular Main binding, one Project binding per authorized Project, relevant Task Worker/reviewer activity, Attention, and outcomes. Connected profiles without a binding or active Task scope stay in secondary configuration inventory.
+- **Coordination activity:** render one titled, durable activity section with two explicit groups: `Durable direct-command receipts` for commands committed through the shared command boundary, and `Pending and approved approval actions` for frozen approval-required records. The groups remain visually and semantically distinct even when one group is empty; never imply that an approval action has applied its domain effect until a committed command receipt exists.
+- **Activity provenance:** each row exposes the operation, status, policy result, actor type/ID, scope type/ID, input digest, correlation ID, and occurred-at time in a wrapped metadata grid. Render IDs and digests as inspectable metadata with `break-all`/`title` support; never render raw input or outcome JSON. A recorded outcome may be acknowledged as metadata only (for example, `Outcome recorded`).
+- **Activity states:** direct-command rows use the receipt label and committed/terminal status supplied by the server; approval rows use the approval-action label and preserve pending, approved, denied, or terminal status text. The section's empty state explains that no durable receipts or approval actions are currently projected. Status is text plus the existing `StateBadge` treatment, never color alone.
+- **Responsive/accessibility:** the section is a named landmark with `h2`/`h3` group headings, a count, and `dl` metadata. At 1280px rows may use a two-column metadata grid; at 768px they collapse to one ordered column; at 375px all identifiers wrap inside the row and no page-level horizontal overflow is introduced. Long metadata remains keyboard/screen-reader inspectable without exposing protected payload bodies.
 - **Scope isolation:** a Project Agent view requests only its Project's handoff metadata; the Main timeline may show explicit handoff receipts but never imports Project-private history or memory.
 - **Recovery:** live chat turns expose a server-versioned “Cancel turn” action using an idempotency key; terminal turns expose only a bounded “Retry turn” action that re-admits the same request through normal server policy. Leased, queued, and retry-wait turns remain server-controlled and do not expose an unbounded client retry.
 - **Containment:** long message, identifier, and error content wraps inside the timeline; the timeline owns horizontal clipping and never creates page-level overflow.
@@ -281,6 +287,106 @@ All primitives use `min-width: 0`, wrap long labels/identifiers, and keep horizo
 - **Current outcome card:** show the milestone identity/outcome, included and excluded scope, lifecycle, blockers, check counts, evidence coverage, and concrete Task counts by workflow state. Ember marks current active work; success marks an actual passing/released result; warning marks stale/waived data. Never render an editable percentage or a released badge from terminal Task counts alone.
 - **States:** apply the shared state contract to the Overview and current-outcome card. `empty` is a Project with no active milestone and names the next setup action; `setup-required` explains adoption while keeping Tasks/chat/evidence usable; `stale` shows the projection watermark and separates cached progress from release truth; `conflict` names the affected authority domain; `permission-denied` preserves navigation but withholds protected Project details.
 - **Responsive:** at 1280px, use a main outcome/status column with a bounded right rail for Decisions/Evidence/Release history; at 768px, collapse to one ordered column with the next action and outcome first; at 375px, stack header actions, wrap labels/identifiers, keep the composer/deep links reachable, and contain any horizontal gallery inside its own region. The page itself never scrolls horizontally.
+
+#### Project execution readiness state rail
+
+- **Structure:** Project Overview and Project Agent Chat share one compact, titled
+  readiness rail with three independent rows: `Coordination`, `Execution setup`,
+  and `Execution gate`. Each row renders the server-supplied state, bounded
+  detail, and exactly one concrete next action. A ready coordination row never
+  upgrades an unconfigured execution row, and an active baseline never upgrades
+  a missing repository or role.
+- **State copy:** `setup_required` names the missing role or repository action;
+  `provisioning` names the checkpoint currently running and says the Project is
+  committed but not executable; `failed` names bounded retry/configuration
+  guidance; `retrying` preserves the operation identity and attempt status;
+  `ready` says execution setup is ready without implying an active baseline;
+  `pre_baseline_read_only`, `baseline_approval_required`, `active`, and
+  `reconciliation_required` remain distinct execution-gate labels. Unavailable
+  or stale projections retain the last known content as non-current and expose a
+  safe retry action.
+- **Allowed next actions:** select/create Worker, select independent reviewer,
+  attach/retry repository, retry provisioning, or the exact authorized baseline
+  action supplied by the server. The rail never invents a fallback action,
+  grants a coordinator a Worker lease, or presents the Project as operational
+  while setup/baseline gates are closed.
+- **Accessibility:** use one named `section`/landmark per surface with a
+  heading, status text, and a single keyboard-reachable action per state. State
+  changes use `role="status"`; actionable failures use `role="alert"`. Status
+  meaning is written text plus icon/structure, never color alone. Disabled
+  actions use native `disabled` and explain the missing authorization or
+  prerequisite. Keep Chat, Documents, Decisions, evidence capture, and safe
+  planning usable while implementation dispatch is denied.
+- **Responsive:** at 1280px the rail sits beside current outcome or the durable
+  timeline; at 768px it becomes the first ordered full-width panel; at 375px
+  rows stack, IDs wrap, and the one next action becomes full width. The rail
+  owns no page-level horizontal overflow and respects reduced motion.
+
+#### Structured operational state feedback
+
+All server-authored operational states use one bounded status surface: a plain-language
+heading, the stable state/code, the safe server message, the smallest authorized metadata
+needed to recover, and exactly one clear next action. Never replace a structured state with
+provider/database prose, raw outcome JSON, or a client-invented success. Status is conveyed
+with text and structure as well as the semantic token/icon treatment, and the action remains
+keyboard reachable at every width.
+
+- **Conflict:** use the warning treatment and name the affected authority domain. Show
+  expected/current version or revision and digest only when the server authorizes those
+  values; preserve the user's draft and disable the stale mutation until the current
+  projection is loaded. The one next action is `Refresh`/`Review current revision`, never an
+  automatic retry against newer truth. Reconciliation is `role="status"`; a conflict that
+  blocks an action is `role="alert"` with the refresh action in the same region.
+- **Approval-required:** use an ember-edged approval card that says what exact operation is
+  waiting, names its authorization target/revision/digest, and separates approval from the
+  eventual domain effect. The primary control names the exact candidate (for example,
+  `Approve exact Charter revision`); it never says “approve latest” and never implies that an
+  approval record alone committed the effect. Keep the card pinned near the workflow that
+  produced it, preserve it while approval is pending, and announce success/failure politely.
+- **Setup-required:** state the blocked scope (`Project Agent`, Worker, reviewer, repository,
+  or baseline), explain what remains usable, and provide the server-supplied configuration
+  action. Do not disable safe planning, Documents, Decisions, or evidence capture just because
+  implementation dispatch is closed. Use `role="status"` for a verified requirement and one
+  full-width primary action on compact screens.
+- **Provisioning / retrying / failed:** show the committed-but-not-executable distinction,
+  current checkpoint, bounded operation ID, attempt/max-attempt count, operation status, and
+  next retry time when supplied. `retrying` keeps the operation visible and busy until the
+  server confirms `ready`; `failed` keeps the bounded error and retry/configuration action
+  visible without claiming success. A retry action is disabled while its request is pending and
+  is never duplicated by an optimistic ready badge. Use `role="status"` for provisioning and
+  retrying; use `role="alert"` for failed states.
+- **Deferred wake:** render `Wake deferred` as durable work that will be reconsidered, not as
+  delivered, suppressed, or succeeded. Show the bounded reason, attempt/max-attempt and next
+  retry time when authorized, preserve the source/correlation reference, and expose one safe
+  action (`Refresh configuration` or the exact setup action supplied by the server). Never
+  advance a user-facing progress indicator or imply that an Agent turn ran when the wake was
+  only deferred. This state is polite status until user configuration is required, then an
+  actionable alert.
+- **Semantic progress warning:** label the condition `Waiting for semantic progress`, separate
+  it from owner health, and keep a healthy/quiet provider or tool call from being presented as
+  failed. Show the last semantic-progress time when available and offer one `Inspect run`
+  action. The warning is amber and announced as status; it becomes an actionable alert only
+  when the server supplies a terminal interruption or recovery requirement.
+- **Owner lease expired / deadline interruption:** distinguish owner loss from a hard deadline.
+  `Owner lease expired` means the execution owner stopped renewing and must not be presented as
+  semantic failure; `Hard deadline reached` means the immutable deadline ended the run and a
+  heartbeat could not extend it. For terminal rows show the bounded interruption reason, kind,
+  and time, retain the committed terminal result, and offer one authorized `Retry run` or
+  `Continue session` action. Late results never overwrite the visible terminal state.
+- **Retry states:** render `Retrying`, `Retry wait`, and `Retry exhausted` with attempt budget,
+  next-at time, and the server's bounded recovery action. Keep the composer/action row disabled
+  while a turn is live, retain the original request when a retry is offered, and avoid an
+  unbounded client retry loop. A terminal retry failure uses an alert; a scheduled retry uses
+  polite status and does not steal focus.
+
+At 1280px, these states sit beside the current outcome/timeline with metadata in a bounded
+two-column grid and the next action aligned to the state header. At 768px, they become the
+first ordered full-width panel, with metadata in one column and the action still visible before
+secondary details. At 375px, heading, state, metadata, and action stack; IDs/digests wrap with
+`overflow-wrap:anywhere`, the primary action fills the available width, and no page-level
+horizontal scrolling is introduced. Preserve the same order and labels at all breakpoints,
+keep focus in the state surface after a mutation, and respect `prefers-reduced-motion` by
+retaining text/state meaning without relying on spinners or pulse animation.
 
 #### Project Document freshness and Decision/Risk panel
 

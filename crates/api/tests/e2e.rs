@@ -1,4 +1,6 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
+mod common;
+
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -21,7 +23,7 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn forge_mvp_rest_api_flow() {
-    let app = test_app().await;
+    let (app, state) = test_app_with_state().await;
 
     let project: ProjectResponse = json_request(
         &app,
@@ -49,7 +51,7 @@ async fn forge_mvp_rest_api_flow() {
         StatusCode::OK,
     )
     .await;
-    let _repo_id = repo.id;
+    let repo_id = repo.id;
 
     let daemon_id = existing_daemon_id(&app).await;
     let agent: AgentResponse = json_request(
@@ -61,6 +63,8 @@ async fn forge_mvp_rest_api_flow() {
     )
     .await;
     let agent_id = agent.id;
+    common::configure_execution_test_setup(&state.db, &project_id, &repo_id, &agent_id, &agent_id)
+        .await;
 
     let created_task: TaskResponse = json_request(
         &app,
@@ -528,8 +532,8 @@ async fn claim_blocked_by_dependency_gate_returns_conflict() {
 
 #[tokio::test]
 async fn agent_claim_succeeds() {
-    let app = test_app().await;
-    let (project_id, _repo_id, _repo_dir) = create_project_and_repo(&app).await;
+    let (app, state) = test_app_with_state().await;
+    let (project_id, repo_id, _repo_dir) = create_project_and_repo(&app).await;
     let daemon_id = existing_daemon_id(&app).await;
     let agent: AgentResponse = json_request(
         &app,
@@ -539,6 +543,8 @@ async fn agent_claim_succeeds() {
         StatusCode::OK,
     )
     .await;
+    common::configure_execution_test_setup(&state.db, &project_id, &repo_id, &agent.id, &agent.id)
+        .await;
     let task: TaskResponse = json_request(
         &app,
         Method::POST,
@@ -636,6 +642,10 @@ async fn scoped_mcp_endpoint_creates_task_without_project_id_argument() {
 }
 
 async fn test_app() -> Router {
+    test_app_with_state().await.0
+}
+
+async fn test_app_with_state() -> (Router, AppState) {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool creates");
@@ -726,7 +736,8 @@ async fn test_app() -> Router {
     std::fs::create_dir_all(&web_dist_dir).expect("create web dist dir");
     std::fs::write(web_dist_dir.join("index.html"), "<html></html>").expect("write index");
 
-    build_router(state, web_dist_dir)
+    let app = build_router(state.clone(), web_dist_dir);
+    (app, state)
 }
 
 async fn existing_daemon_id(app: &Router) -> String {

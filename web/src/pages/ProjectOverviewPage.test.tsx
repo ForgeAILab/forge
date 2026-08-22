@@ -33,6 +33,10 @@ vi.mock('@/api/hooks', () => ({
   useProjectQuery: vi.fn(() => ({ data: undefined, isLoading: false })),
 }))
 
+vi.mock('@/features/project-execution/ProjectExecutionSetupPanel', () => ({
+  ProjectExecutionSetupPanel: () => null,
+}))
+
 const mediaFetch = vi.hoisted(() => vi.fn())
 vi.mock('@/api/client', () => {
   class MockApiError extends Error {
@@ -314,9 +318,9 @@ describe('ProjectOverviewPage', () => {
     expect(screen.getByRole('link', { name: /View Tasks/ }).getAttribute('href')).toContain(
       '/projects/project-1/tasks',
     )
-    expect(screen.getAllByRole('link', { name: /Continue with Project Agent/ }).length).toBeGreaterThan(
-      0,
-    )
+    expect(
+      screen.getAllByRole('link', { name: /Continue with Project Agent/ }).length,
+    ).toBeGreaterThan(0)
   })
 
   it('routes release history to the authenticated immutable snapshot view', () => {
@@ -381,7 +385,9 @@ describe('ProjectOverviewPage', () => {
 
     expect(await screen.findByRole('link', { name: /Open evidence file/ })).toBeTruthy()
     expect(mediaFetch).toHaveBeenCalledWith('/projects/project-1/media/asset-report')
-    expect(screen.getByText(/Task task-1 · validation validation-1 · uploaded by Test User/)).toBeTruthy()
+    expect(
+      screen.getByText(/Task task-1 · validation validation-1 · uploaded by Test User/),
+    ).toBeTruthy()
     expect(screen.getByRole('link', { name: 'Download' }).getAttribute('href')).toBe(
       'blob:evidence-preview',
     )

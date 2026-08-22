@@ -188,7 +188,7 @@ async fn seed_agent(
             config_json: "{}".to_owned(),
             credential_ref: None,
             daemon_id: Some(daemon_id),
-            max_concurrent_tasks,
+            max_concurrent_tasks: max_concurrent_tasks + 1,
             heartbeat_interval_seconds: 30,
             max_missed_heartbeats: 3,
             status: agent_status,
@@ -259,6 +259,18 @@ async fn assign_role(db: &db::SqliteDb, task_id: &str, role_name: &str, agent_id
     )
     .await
     .expect("role assignment creates");
+    let project_id: String = sqlx::query_scalar("SELECT project_id FROM task WHERE id = ?")
+        .bind(task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("task project lookup");
+    crate::test_support::configure_project_execution_test_setup(
+        db,
+        &project_id,
+        agent_id,
+        agent_id,
+    )
+    .await;
 }
 
 async fn set_review_ci_config(db: &db::SqliteDb, task: &Task) -> Task {
@@ -756,6 +768,7 @@ async fn dispatcher_skips_task_when_agent_at_capacity() {
         crate::workflow::default_roles::CODER,
     )
     .await;
+    crate::test_support::set_test_agent_capacity(&db, &agent_id, 1).await;
     let task = seed_task(&db, &project_id, &repo_id, "todo", "todo", 0).await;
     assign_role(
         &db,
@@ -949,6 +962,13 @@ async fn dispatcher_respects_priority_ordering() {
         &high.id,
         crate::workflow::default_roles::CODER,
         &agent_id,
+    )
+    .await;
+    crate::test_support::force_task_version_conflict_after_transition(
+        &db,
+        &high.id,
+        crate::workflow::default_states::IN_PROGRESS,
+        &low.id,
     )
     .await;
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;

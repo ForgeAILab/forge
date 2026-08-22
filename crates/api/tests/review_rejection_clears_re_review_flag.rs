@@ -1,4 +1,6 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
+mod common;
+
 use std::{
     future::Future,
     path::{Path, PathBuf},
@@ -75,6 +77,14 @@ async fn reviewer_rejection_clears_review_passed_at_and_next_review_runs_full_au
     let daemon_id = register_daemon_and_report_codex(&harness.app, workspaces_root.path()).await;
     let executor_agent = create_agent(&harness.app, "executor", &daemon_id).await;
     let auditor_agent = create_agent(&harness.app, "auditor", &daemon_id).await;
+    common::configure_execution_test_setup(
+        &harness.state.db,
+        &project.id,
+        &repo.id,
+        &executor_agent.id,
+        &auditor_agent.id,
+    )
+    .await;
 
     let task_id = new_uuid_v4();
     let worktree_path = workspaces_root.path().join(&task_id).join("repo");

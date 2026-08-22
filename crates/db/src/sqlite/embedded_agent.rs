@@ -5,7 +5,19 @@ use crate::{
     UpdateAgentSession, UpsertAgentConnectionHealth,
 };
 use async_trait::async_trait;
+use serde_json::Value;
 use sqlx::{sqlite::SqliteRow, Row, Sqlite, Transaction};
+
+const FROZEN_AGENT_CHAT_AUTHORITY_FIELDS: &[&str] = &[
+    "frozen_binding_id",
+    "frozen_binding_version",
+    "frozen_profile_id",
+    "frozen_profile_version",
+    "frozen_policy_revision",
+    "frozen_policy_digest",
+    "frozen_permission_policy_digest",
+    "frozen_tool_policy_digest",
+];
 
 #[async_trait]
 impl CredentialHandleRepo for SqliteDb {
@@ -163,7 +175,7 @@ impl AgentContextScopeRepo for SqliteDb {
         .execute(&self.pool)
         .await?;
 
-        let scope = self
+        let mut scope = self
             .get_context_scope_for_identity(&input.identity_id, &input.scope_type, &input.scope_id)
             .await?
             .ok_or(DbError::NotFound)?;
@@ -171,8 +183,54 @@ impl AgentContextScopeRepo for SqliteDb {
             || scope.task_id != input.task_id
             || scope.task_role != input.task_role
             || scope.workspace_access != input.workspace_access
-            || scope.authority_json != input.authority_json
         {
+            return Err(DbError::Check(
+                "canonical context scope already exists with different scope linkage".to_owned(),
+            ));
+        }
+
+        if !context_scope_authority_matches(
+            &input.scope_type,
+            &scope.authority_json,
+            &input.authority_json,
+        ) {
+            if let Some(reconciled_authority) = reconcile_legacy_frozen_authority(
+                &input.scope_type,
+                &scope.authority_json,
+                &input.authority_json,
+            ) {
+                // A legacy scope is shared by queued turns and active
+                // sessions.  Upgrade it only when the row is still exactly
+                // the legacy row we read, so a concurrent admission cannot
+                // overwrite a newer authority revision.
+                let _updated = sqlx::query(
+                    "UPDATE agent_context_scope
+                     SET authority_json = ?, version = version + 1, updated_at = ?
+                     WHERE id = ? AND version = ? AND authority_json = ?",
+                )
+                .bind(&reconciled_authority)
+                .bind(&input.updated_at)
+                .bind(&scope.id)
+                .bind(scope.version)
+                .bind(&scope.authority_json)
+                .execute(&self.pool)
+                .await?;
+                scope = self
+                    .get_context_scope_for_identity(
+                        &input.identity_id,
+                        &input.scope_type,
+                        &input.scope_id,
+                    )
+                    .await?
+                    .ok_or(DbError::NotFound)?;
+            }
+        }
+
+        if !context_scope_authority_matches(
+            &input.scope_type,
+            &scope.authority_json,
+            &input.authority_json,
+        ) {
             return Err(DbError::Check(
                 "canonical context scope already exists with different authority".to_owned(),
             ));
@@ -427,6 +485,87 @@ impl AgentConnectionHealthRepo for SqliteDb {
             .map(map_connection_health)
             .transpose()
     }
+}
+
+fn context_scope_authority_matches(
+    scope_type: &str,
+    existing_json: &str,
+    requested_json: &str,
+) -> bool {
+    if existing_json == requested_json {
+        return true;
+    }
+    if scope_type != "agent_chat" {
+        return false;
+    }
+
+    let Ok(existing) = serde_json::from_str::<Value>(existing_json) else {
+        return false;
+    };
+    let Ok(requested) = serde_json::from_str::<Value>(requested_json) else {
+        return false;
+    };
+    let (Value::Object(existing), Value::Object(requested)) = (existing, requested) else {
+        return false;
+    };
+
+    let requested_is_frozen = FROZEN_AGENT_CHAT_AUTHORITY_FIELDS
+        .iter()
+        .all(|field| requested.contains_key(*field));
+    let existing_is_frozen = FROZEN_AGENT_CHAT_AUTHORITY_FIELDS
+        .iter()
+        .all(|field| existing.contains_key(*field));
+    if !requested_is_frozen && !existing_is_frozen {
+        return false;
+    }
+
+    // A frozen authority may carry harmless legacy keys retained during the
+    // one-time upgrade.  Treat the requested authority as a subset only when
+    // every requested key has the same value in the stored row.  This keeps
+    // retries idempotent without accepting a changed frozen binding/policy.
+    requested
+        .iter()
+        .all(|(key, value)| existing.get(key) == Some(value))
+}
+
+fn reconcile_legacy_frozen_authority(
+    scope_type: &str,
+    existing_json: &str,
+    requested_json: &str,
+) -> Option<String> {
+    if scope_type != "agent_chat" {
+        return None;
+    }
+
+    let existing = serde_json::from_str::<Value>(existing_json).ok()?;
+    let requested = serde_json::from_str::<Value>(requested_json).ok()?;
+    let (Value::Object(existing), Value::Object(requested)) = (existing, requested) else {
+        return None;
+    };
+
+    let requested_is_frozen = FROZEN_AGENT_CHAT_AUTHORITY_FIELDS
+        .iter()
+        .all(|field| requested.contains_key(*field));
+    let existing_is_frozen = FROZEN_AGENT_CHAT_AUTHORITY_FIELDS
+        .iter()
+        .any(|field| existing.contains_key(*field));
+    if !requested_is_frozen || existing_is_frozen {
+        return None;
+    }
+
+    // Never overwrite an overlapping legacy authority claim.  The service
+    // derives the frozen fields, while this check ensures a stale or forged
+    // legacy row cannot be silently reinterpreted as the new admission.
+    if existing
+        .iter()
+        .any(|(key, value)| requested.get(key).is_some_and(|current| current != value))
+    {
+        return None;
+    }
+
+    let mut merged = existing;
+    merged.extend(requested);
+    serde_json::to_string(&Value::Object(merged)).ok()
 }
 
 async fn insert_agent_session(

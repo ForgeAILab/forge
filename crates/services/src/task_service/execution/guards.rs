@@ -51,41 +51,11 @@ impl TaskService {
                 effective_status = %status,
                 "waiting to dispatch execution"
             );
-            // Queue-waiting is supervised liveness, not a stall: this loop is
-            // the heartbeat. If the process dies mid-wait the bumps stop and
-            // the stall monitor reclaims the execution normally.
-            let now = now_rfc3339();
-            if let Err(error) = ExecutionRepo::update(
-                &*self.db,
-                db::UpdateExecution {
-                    id: execution.id.clone(),
-                    status: None,
-                    stop_reason: None,
-                    stopped_by: None,
-                    resume_policy: None,
-                    stopped_at: None,
-                    agent_session_id: None,
-                    agent_message_id: None,
-                    last_activity_at: Some(Some(now.clone())),
-                    summary: None,
-                    logs_path: None,
-                    before_sha: None,
-                    after_sha: None,
-                    error: None,
-                    executor_config_snapshot_json: None,
-                    updated_at: now,
-                },
-            )
-            .await
-            {
-                tracing::debug!(
-                    execution_id = %execution.id,
-                    %error,
-                    "failed to record queued-dispatch activity"
-                );
-            }
-            // V1 keeps the wait inside the existing execution task instead of adding
-            // a scheduler queue; queued work remains Running and resumes on recovery.
+            // Queue waiting is not semantic execution progress and must not
+            // repurpose the legacy activity timestamp as a heartbeat.  The
+            // owner-bound lease is renewed by the executor after admission;
+            // an unowned pre-dispatch row remains eligible for deterministic
+            // recovery if this process disappears.
             tokio::time::sleep(DISPATCH_STATUS_POLL_INTERVAL).await;
         }
     }
@@ -232,44 +202,88 @@ impl TaskService {
         } else {
             db::ResumePolicy::Manual
         };
-        let execution = ExecutionRepo::update(
-            &*self.db,
-            db::UpdateExecution {
-                id: execution_id.to_owned(),
-                status: Some(ExecutionStatus::Failed),
-                stop_reason: Some(Some(db::StopReason::ExecutorFailed)),
-                stopped_by: Some(Some(
-                    api_types::Actor::system(api_types::SystemComponent::Dispatch).display(),
-                )),
-                resume_policy: Some(Some(resume_policy)),
-                stopped_at: Some(Some(now_rfc3339())),
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: None,
-                logs_path: None,
-                before_sha: None,
-                after_sha: None,
-                error: Some(Some(error)),
-                executor_config_snapshot_json: None,
-                updated_at: now_rfc3339(),
-            },
-        )
-        .await
-        .map_err(ServiceError::from)?;
-        self.revoke_active_workspace_lease_for_execution(&execution.task_id, &execution.id)
-            .await;
-        super::publish_terminal_execution_event(self, &execution);
-        if should_block_task_for_failed_execution(&execution) {
-            if let Err(error) = self.annotate_dispatch_failure_block(&execution).await {
-                tracing::warn!(
-                    execution_id = %execution.id,
-                    task_id = %execution.task_id,
-                    %error,
-                    "failed to block task after dispatch failure"
-                );
+        let current = ExecutionRepo::get_by_id(&*self.db, execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", execution_id.to_owned()))?;
+        if current.status != ExecutionStatus::Running {
+            return Ok(current);
+        }
+        let mut terminal_candidate = current;
+        let mut outcome = None;
+        for _ in 0..3 {
+            let terminalized_at = now_rfc3339();
+            let attempt = ExecutionRepo::terminalize(
+                &*self.db,
+                TerminalizeExecution {
+                    execution_id: terminal_candidate.id.clone(),
+                    expected_version: terminal_candidate.execution_version,
+                    // Pre-dispatch failures are authorized by the freshly
+                    // read execution version. If a scheduler has already
+                    // claimed an owner, include it as an additional
+                    // predicate; legacy rows with no owner intentionally use
+                    // version-only cancellation.
+                    lease_owner: terminal_candidate.lease_owner.clone(),
+                    status: ExecutionStatus::Failed,
+                    stop_reason: Some(Some(db::StopReason::ExecutorFailed)),
+                    stopped_by: Some(Some(
+                        api_types::Actor::system(api_types::SystemComponent::Dispatch).display(),
+                    )),
+                    stopped_at: Some(Some(terminalized_at.clone())),
+                    resume_policy: Some(Some(resume_policy.clone())),
+                    agent_session_id: None,
+                    agent_message_id: None,
+                    last_activity_at: None,
+                    last_progress_at: None,
+                    summary: None,
+                    logs_path: None,
+                    before_sha: None,
+                    after_sha: None,
+                    error: Some(Some(error.clone())),
+                    executor_config_snapshot_json: None,
+                    updated_at: terminalized_at,
+                    actor_type: "system".to_owned(),
+                    actor_id: Some("dispatch".to_owned()),
+                    correlation_id: Some(terminal_candidate.id.clone()),
+                    causation_id: None,
+                    causation_depth: 0,
+                    lease_disposition: ExecutionLeaseDisposition::Revoke,
+                },
+            )
+            .await
+            .map_err(ServiceError::from)?;
+            match attempt {
+                ExecutionTerminalOutcome::Concurrent {
+                    current: Some(current),
+                } if current.status == ExecutionStatus::Running => {
+                    terminal_candidate = current;
+                }
+                other => {
+                    outcome = Some(other);
+                    break;
+                }
             }
         }
-        Ok(execution)
+        let outcome = outcome.unwrap_or(ExecutionTerminalOutcome::Concurrent {
+            current: Some(terminal_candidate),
+        });
+        match outcome {
+            ExecutionTerminalOutcome::Committed { execution, .. } => {
+                super::publish_terminal_execution_event(self, &execution);
+                if should_block_task_for_failed_execution(&execution) {
+                    if let Err(error) = self.annotate_dispatch_failure_block(&execution).await {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            task_id = %execution.task_id,
+                            %error,
+                            "failed to block task after dispatch failure"
+                        );
+                    }
+                }
+                Ok(execution)
+            }
+            ExecutionTerminalOutcome::Concurrent { current } => {
+                current.ok_or_else(|| ServiceError::not_found("execution", execution_id.to_owned()))
+            }
+        }
     }
 }

@@ -1,16 +1,34 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use db::{
-    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
-    CreateAgentIdentity, CreateAgentProfile, CreateDomainEvent, CreateExecution, DomainEventRepo,
-    ExecutionRepo, ExecutionStatus, SqliteDb, UpdateExecution,
+    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentChatRepo,
+    AgentChatTurnJobRepo, AgentChatTurnState, AgentProfileRepo, AgentRepo, AgentStatus,
+    AttentionRepo, ClaimDomainEvents, ClaimExecutionLease, CreateAgentIdentity, CreateAgentProfile,
+    CreateDomainEvent, CreateExecution, CreateProject, DomainEventRepo, ExecutionLeaseDisposition,
+    ExecutionRepo, ExecutionStatus, ProjectRepo, ResumePolicy, SelectAgentProfile, SqliteDb,
+    StopReason, TerminalizeExecution, UpdateAgentChatTurnJob, User, UserRepo,
 };
-use services::{AttentionService, WakeTurnConsumer};
+use services::{
+    wake_attention_incident_digest, AgentChatService, AgentChatTurnRunner, AgentChatTurnWorker,
+    AttentionService, CompletedAgentChatTurn, CreateAgentHandoffInput, SendAgentChatMessageInput,
+    ServiceError, SetMainAgentBindingInput, SetProjectAgentBindingInput, WakeTurnConsumer,
+};
+use tokio_util::sync::CancellationToken;
 
 async fn database() -> Arc<SqliteDb> {
     let pool = create_sqlite_pool("sqlite::memory:").await.unwrap();
     run_migrations(&pool).await.unwrap();
     Arc::new(SqliteDb::new(pool))
+}
+
+async fn file_database() -> (Arc<SqliteDb>, String) {
+    let path = format!("/tmp/forge-wake-turn-{}.sqlite", new_uuid_v4());
+    let pool = create_sqlite_pool(&format!("sqlite://{path}"))
+        .await
+        .unwrap();
+    run_migrations(&pool).await.unwrap();
+    (Arc::new(SqliteDb::new(pool)), path)
 }
 
 async fn identity_with_profile(db: &SqliteDb, id: &str) -> String {
@@ -59,6 +77,236 @@ async fn identity_with_profile(db: &SqliteDb, id: &str) -> String {
     profile_id
 }
 
+async fn owned_identity_with_profile(
+    db: &SqliteDb,
+    id: &str,
+    owner_id: &str,
+    profile_id: &str,
+) -> String {
+    let now = now_rfc3339();
+    AgentRepo::create_identity_with_profile(
+        db,
+        CreateAgentIdentity {
+            id: id.to_owned(),
+            name: "chat-turn-test".to_owned(),
+            description: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: Some(owner_id.to_owned()),
+            visibility: "account".to_owned(),
+            account_permission_ceiling: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        CreateAgentProfile {
+            id: profile_id.to_owned(),
+            identity_id: id.to_owned(),
+            backend_kind: "native".to_owned(),
+            executor_type: "embedded".to_owned(),
+            provider: Some("test".to_owned()),
+            model: Some("test".to_owned()),
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "[]".to_owned(),
+            tool_policy_json: "{}".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    profile_id.to_owned()
+}
+
+async fn select_profile(db: &SqliteDb, identity_id: &str, profile_id: &str, model: &str) -> String {
+    let identity = AgentRepo::get_by_id(db, identity_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let now = now_rfc3339();
+    AgentProfileRepo::create_and_select_profile(
+        db,
+        CreateAgentProfile {
+            id: profile_id.to_owned(),
+            identity_id: identity_id.to_owned(),
+            backend_kind: "native".to_owned(),
+            executor_type: "embedded".to_owned(),
+            provider: Some("test".to_owned()),
+            model: Some(model.to_owned()),
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "[]".to_owned(),
+            tool_policy_json: "{}".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        SelectAgentProfile {
+            identity_id: identity_id.to_owned(),
+            profile_id: profile_id.to_owned(),
+            expected_version: identity.version,
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    profile_id.to_owned()
+}
+
+struct ChatTurnFixture {
+    db: Arc<SqliteDb>,
+    account_id: String,
+    project_id: String,
+    chat_id: String,
+    identity_id: String,
+}
+
+struct FailingWakeRunner;
+
+#[async_trait]
+impl AgentChatTurnRunner for FailingWakeRunner {
+    async fn run_turn(
+        &self,
+        _job: &db::AgentChatTurnJob,
+        _cancellation: CancellationToken,
+    ) -> services::Result<CompletedAgentChatTurn> {
+        Err(ServiceError::Conflict(
+            "synthetic admitted-wake runner failure".to_owned(),
+        ))
+    }
+}
+
+async fn chat_turn_fixture() -> ChatTurnFixture {
+    let db = database().await;
+    let account_id = new_uuid_v4();
+    let now = now_rfc3339();
+    UserRepo::create_user(
+        &*db,
+        &User {
+            id: account_id.clone(),
+            email: format!("{account_id}@example.test"),
+            password_hash: "test".to_owned(),
+            display_name: Some("Chat Turn Test".to_owned()),
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let project_id = new_uuid_v4();
+    ProjectRepo::create(
+        &*db,
+        CreateProject {
+            id: project_id.clone(),
+            name: "chat-turn-project".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some(account_id.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    // ProjectRepo creates the canonical chat/binding, but membership is a
+    // separate durable record used by the chat service's authorization gate.
+    sqlx::query(
+        "INSERT INTO project_member (id, project_id, user_id, role, created_at, updated_at)
+         VALUES (?, ?, ?, 'owner', ?, ?)",
+    )
+    .bind(new_uuid_v4())
+    .bind(&project_id)
+    .bind(&account_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let identity_id = new_uuid_v4();
+    let profile_id = new_uuid_v4();
+    owned_identity_with_profile(&db, &identity_id, &account_id, &profile_id).await;
+
+    let chats = AgentChatService::new(Arc::clone(&db));
+    chats
+        .set_main_binding(SetMainAgentBindingInput {
+            actor_user_id: account_id.clone(),
+            account_id: account_id.clone(),
+            identity_id: identity_id.clone(),
+            autonomy_policy_json: "{}".to_owned(),
+            tool_policy_revision: "test".to_owned(),
+            expected_version: None,
+            replacement_reason: None,
+        })
+        .await
+        .unwrap();
+    let setup_binding_version: (i64,) = sqlx::query_as(
+        "SELECT version FROM project_agent_binding
+         WHERE project_id = ? AND state = 'agent_setup_required'",
+    )
+    .bind(&project_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    chats
+        .set_project_binding(SetProjectAgentBindingInput {
+            actor_user_id: account_id.clone(),
+            project_id: project_id.clone(),
+            identity_id: Some(identity_id.clone()),
+            state: "active".to_owned(),
+            autonomy_policy_json: "{}".to_owned(),
+            permission_ceiling_json: "{}".to_owned(),
+            subscriptions_json: "[]".to_owned(),
+            wake_budget: 10,
+            expected_version: Some(setup_binding_version.0),
+            replacement_reason: None,
+        })
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE project_agent_binding
+         SET operating_skill_revision_id = (
+                 SELECT id FROM operating_skill_revision
+                 WHERE skill_key = 'forge.project.orchestration/v1'
+                 ORDER BY revision DESC LIMIT 1
+             ),
+             policy_revision = 'test-policy', policy_digest = 'test-policy-digest'
+         WHERE project_id = ? AND state = 'active'",
+    )
+    .bind(&project_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let chat_id = AgentChatRepo::get_project_chat(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+
+    ChatTurnFixture {
+        db,
+        account_id,
+        project_id,
+        chat_id,
+        identity_id,
+    }
+}
+
 /// Insert a Project (the schema trigger creates its chat and setup binding),
 /// promote the chat to ready, and bind the identity as the active responder.
 async fn bound_project(db: &SqliteDb, identity_id: &str, profile_id: &str) -> (String, String) {
@@ -86,6 +334,11 @@ async fn bound_project(db: &SqliteDb, identity_id: &str, profile_id: &str) -> (S
     sqlx::query(
         "UPDATE project_agent_binding
          SET identity_id = ?, profile_id = ?, state = 'active'
+             , operating_skill_revision_id = (
+                 SELECT id FROM operating_skill_revision
+                 WHERE skill_key = 'forge.project.orchestration/v1'
+                 ORDER BY revision DESC LIMIT 1
+             ), policy_revision = 'test-policy', policy_digest = 'test-policy-digest'
          WHERE project_id = ?",
     )
     .bind(identity_id)
@@ -101,7 +354,541 @@ async fn append_event(db: &SqliteDb, event: CreateDomainEvent) {
     DomainEventRepo::append_event(db, event).await.unwrap();
 }
 
-fn wake_event(identity_id: &str, project_id: &str, incident_key: &str) -> CreateDomainEvent {
+#[tokio::test]
+async fn user_handoff_and_retry_turns_freeze_admitted_profile_after_edit_and_rebinding() {
+    let fixture = chat_turn_fixture().await;
+    let current_profile = select_profile(
+        &fixture.db,
+        &fixture.identity_id,
+        &new_uuid_v4(),
+        "profile-at-admission",
+    )
+    .await;
+    let chats = AgentChatService::new(Arc::clone(&fixture.db));
+
+    let user_turn = chats
+        .send_message(SendAgentChatMessageInput {
+            actor_user_id: fixture.account_id.clone(),
+            chat_id: fixture.chat_id.clone(),
+            content: "user trigger".to_owned(),
+            dedupe_key: Some("characterization:user".to_owned()),
+        })
+        .await
+        .unwrap()
+        .turn_job;
+    assert_eq!(
+        user_turn.responder_identity_id.as_deref(),
+        Some(fixture.identity_id.as_str())
+    );
+    assert_eq!(
+        user_turn.profile_id.as_deref(),
+        Some(current_profile.as_str())
+    );
+
+    let main_chat = AgentChatRepo::get_main_chat(&*fixture.db, &fixture.account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let handoff_turn = chats
+        .create_handoff(CreateAgentHandoffInput {
+            actor_user_id: fixture.account_id.clone(),
+            source_chat_id: main_chat.id,
+            source_message_id: None,
+            source_turn_job_id: None,
+            target_project_id: fixture.project_id.clone(),
+            content: "handoff trigger".to_owned(),
+            source_revisions_json: "{}".to_owned(),
+            dedupe_key: "characterization:handoff".to_owned(),
+        })
+        .await
+        .unwrap()
+        .target_turn_job;
+    assert_eq!(
+        handoff_turn.responder_identity_id.as_deref(),
+        Some(fixture.identity_id.as_str())
+    );
+    assert_eq!(
+        handoff_turn.profile_id.as_deref(),
+        Some(current_profile.as_str())
+    );
+
+    let wake_consumer = WakeTurnConsumer::new(Arc::clone(&fixture.db), "provenance-wake");
+    wake_consumer.run_once(100).await.unwrap();
+    let incident_key = format!("attention:provenance:project:{}", fixture.project_id);
+    let source_event = new_uuid_v4();
+    append_event(
+        &fixture.db,
+        CreateDomainEvent {
+            id: source_event.clone(),
+            event_type: "execution.failed".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: new_uuid_v4(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "project".to_owned(),
+            scope_id: fixture.project_id.clone(),
+            correlation_id: source_event.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("provenance-source:{source_event}")),
+            payload_json: "{}".to_owned(),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO attention_projection (
+            id, attention_type, scope_type, scope_id, identity_id, source_event_id,
+            priority, status, summary, details_json, dedupe_key, occurred_at,
+            updated_at, recommended_action
+         ) VALUES (?, 'execution_failed', 'project', ?, ?, ?, 85, 'open',
+                   'Provenance incident', ?, ?, ?, ?, 'inspect_run')",
+    )
+    .bind(new_uuid_v4())
+    .bind(&fixture.project_id)
+    .bind(&fixture.identity_id)
+    .bind(&source_event)
+    .bind(
+        serde_json::json!({
+            "scope_type": "project",
+            "scope_id": fixture.project_id,
+        })
+        .to_string(),
+    )
+    .bind(&incident_key)
+    .bind(now_rfc3339())
+    .bind(now_rfc3339())
+    .execute(fixture.db.pool())
+    .await
+    .unwrap();
+    append_event(
+        &fixture.db,
+        wake_event_for_attention(
+            &fixture.db,
+            &fixture.identity_id,
+            &fixture.project_id,
+            &incident_key,
+        )
+        .await,
+    )
+    .await;
+    wake_consumer.run_once(100).await.unwrap();
+    let wake_turn = AgentChatTurnJobRepo::get_agent_chat_turn_job(
+        &*fixture.db,
+        &sqlx::query_scalar::<_, String>(
+            "SELECT id FROM agent_chat_turn_job
+             WHERE chat_id = ? AND dedupe_key LIKE 'wake-turn:%'",
+        )
+        .bind(&fixture.chat_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .unwrap(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    macro_rules! assert_frozen_provenance {
+        ($left:expr, $right:expr) => {{
+            assert_eq!($left.responder_identity_id, $right.responder_identity_id);
+            assert_eq!($left.profile_id, $right.profile_id);
+            assert_eq!($left.responder_binding_id, $right.responder_binding_id);
+            assert_eq!(
+                $left.responder_binding_version,
+                $right.responder_binding_version
+            );
+            assert_eq!(
+                $left.responder_identity_version,
+                $right.responder_identity_version
+            );
+            assert_eq!($left.profile_version, $right.profile_version);
+            assert_eq!(
+                $left.operating_skill_revision_id,
+                $right.operating_skill_revision_id
+            );
+            assert_eq!($left.policy_revision, $right.policy_revision);
+            assert_eq!($left.policy_digest, $right.policy_digest);
+            assert_eq!(
+                $left.permission_policy_digest,
+                $right.permission_policy_digest
+            );
+            assert_eq!($left.tool_policy_digest, $right.tool_policy_digest);
+            assert_eq!($left.canonical_scope_type, $right.canonical_scope_type);
+            assert_eq!($left.canonical_scope_id, $right.canonical_scope_id);
+            assert!($left
+                .admission_digest
+                .as_deref()
+                .is_some_and(|value| !value.is_empty()));
+            assert!($left
+                .canonical_scope_provenance_json
+                .as_deref()
+                .is_some_and(|value| !value.is_empty()));
+        }};
+    }
+    assert_frozen_provenance!(user_turn, handoff_turn);
+    assert_frozen_provenance!(user_turn, wake_turn);
+
+    // A worker retry reuses the admitted turn job. The profile on that job is
+    // the retry's provenance, rather than a later binding/profile lookup.
+    let retry_turn = AgentChatTurnJobRepo::update_agent_chat_turn_job(
+        &*fixture.db,
+        UpdateAgentChatTurnJob {
+            id: user_turn.id.clone(),
+            expected_version: user_turn.version,
+            status: AgentChatTurnState::RetryWait,
+            pending_interaction_id: None,
+            lease_owner: Some(None),
+            leased_until: Some(None),
+            attempt_count: Some(1),
+            next_attempt_at: Some(Some(now_rfc3339())),
+            response_message_id: None,
+            error_code: Some(Some("transient".to_owned())),
+            error_message: Some(Some("retry characterization".to_owned())),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(retry_turn.status, AgentChatTurnState::RetryWait);
+    assert_eq!(
+        retry_turn.responder_identity_id.as_deref(),
+        Some(fixture.identity_id.as_str())
+    );
+    assert_eq!(
+        retry_turn.profile_id.as_deref(),
+        Some(current_profile.as_str())
+    );
+    assert_frozen_provenance!(user_turn, retry_turn);
+
+    // Change the selected Profile and replace the Project binding after all
+    // three turns were admitted. Their frozen responder provenance must not
+    // be rewritten by either later mutation.
+    let later_profile = select_profile(
+        &fixture.db,
+        &fixture.identity_id,
+        &new_uuid_v4(),
+        "profile-after-admission",
+    )
+    .await;
+    assert_ne!(later_profile, current_profile);
+    let replacement_identity = new_uuid_v4();
+    let replacement_profile = new_uuid_v4();
+    owned_identity_with_profile(
+        &fixture.db,
+        &replacement_identity,
+        &fixture.account_id,
+        &replacement_profile,
+    )
+    .await;
+    let current_binding: (i64,) = sqlx::query_as(
+        "SELECT version FROM project_agent_binding
+         WHERE project_id = ? AND state IN ('active', 'agent_setup_required')",
+    )
+    .bind(&fixture.project_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    chats
+        .set_project_binding(SetProjectAgentBindingInput {
+            actor_user_id: fixture.account_id.clone(),
+            project_id: fixture.project_id.clone(),
+            identity_id: Some(replacement_identity),
+            state: "active".to_owned(),
+            autonomy_policy_json: "{}".to_owned(),
+            permission_ceiling_json: "{}".to_owned(),
+            subscriptions_json: "[]".to_owned(),
+            wake_budget: 10,
+            expected_version: Some(current_binding.0),
+            replacement_reason: Some("characterization rebinding".to_owned()),
+        })
+        .await
+        .unwrap();
+
+    for turn_id in [user_turn.id, handoff_turn.id] {
+        let frozen = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*fixture.db, &turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            frozen.responder_identity_id.as_deref(),
+            Some(fixture.identity_id.as_str())
+        );
+        assert_eq!(frozen.profile_id.as_deref(), Some(current_profile.as_str()));
+    }
+    let frozen_retry = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*fixture.db, &retry_turn.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        frozen_retry.responder_identity_id.as_deref(),
+        Some(fixture.identity_id.as_str())
+    );
+    assert_eq!(
+        frozen_retry.profile_id.as_deref(),
+        Some(current_profile.as_str())
+    );
+}
+
+#[tokio::test]
+async fn wake_turn_resolves_identity_current_profile_after_profile_edit() {
+    let fixture = chat_turn_fixture().await;
+    let consumer = WakeTurnConsumer::new(Arc::clone(&fixture.db), "characterization-wake-profile");
+    consumer.run_once(100).await.unwrap();
+
+    let incident_key = format!("attention:profile_edit:project:{}", fixture.project_id);
+    let source_event = new_uuid_v4();
+    append_event(
+        &fixture.db,
+        CreateDomainEvent {
+            id: source_event.clone(),
+            event_type: "execution.failed".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: new_uuid_v4(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "project".to_owned(),
+            scope_id: fixture.project_id.clone(),
+            correlation_id: source_event.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("characterization-profile-source:{source_event}")),
+            payload_json: "{}".to_owned(),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO attention_projection (
+            id, attention_type, scope_type, scope_id, identity_id, source_event_id,
+            priority, status, summary, details_json, dedupe_key, occurred_at,
+            updated_at, recommended_action
+         ) VALUES (?, 'execution_failed', 'project', ?, NULL, ?, 85, 'open',
+                   'Profile edit characterization', ?, ?, ?, ?, 'inspect_run')",
+    )
+    .bind(new_uuid_v4())
+    .bind(&fixture.project_id)
+    .bind(&source_event)
+    .bind(
+        serde_json::json!({
+            "scope_type": "project",
+            "scope_id": fixture.project_id,
+        })
+        .to_string(),
+    )
+    .bind(&incident_key)
+    .bind(now_rfc3339())
+    .bind(now_rfc3339())
+    .execute(fixture.db.pool())
+    .await
+    .unwrap();
+
+    // The binding still names the same identity, but its Profile snapshot is
+    // now stale. Manual admission uses this newly selected Profile already.
+    let current_profile = select_profile(
+        &fixture.db,
+        &fixture.identity_id,
+        &new_uuid_v4(),
+        "wake-profile-after-edit",
+    )
+    .await;
+    append_event(
+        &fixture.db,
+        wake_event_for_attention(
+            &fixture.db,
+            &fixture.identity_id,
+            &fixture.project_id,
+            &incident_key,
+        )
+        .await,
+    )
+    .await;
+    let run = consumer.run_once(100).await.unwrap();
+    assert_eq!(run.delivered_turns, 1);
+
+    let profile: String = sqlx::query_scalar(
+        "SELECT profile_id FROM agent_chat_turn_job
+         WHERE chat_id = ? AND dedupe_key LIKE 'wake-turn:%'",
+    )
+    .bind(&fixture.chat_id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(profile, current_profile);
+}
+
+#[tokio::test]
+async fn alternate_wake_producer_cannot_override_server_resolved_responder() {
+    let db = database().await;
+    let identity_id = new_uuid_v4();
+    let bound_profile_id = identity_with_profile(&db, &identity_id).await;
+    let (project_id, chat_id) = bound_project(&db, &identity_id, &bound_profile_id).await;
+    // The binding's profile snapshot is intentionally stale by the time the
+    // alternate producer emits its event. Admission must follow the identity
+    // to its current selected Profile and ignore responder fields in payload.
+    let current_profile_id = select_profile(
+        &db,
+        &identity_id,
+        &new_uuid_v4(),
+        "current-wake-producer-profile",
+    )
+    .await;
+    let consumer = WakeTurnConsumer::new(Arc::clone(&db), "alternate-producer-consumer");
+    consumer.run_once(100).await.unwrap();
+
+    let incident_key = format!("attention:alternate_producer:project:{project_id}");
+    let source_event = new_uuid_v4();
+    append_event(
+        &db,
+        CreateDomainEvent {
+            id: source_event.clone(),
+            event_type: "execution.failed".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: new_uuid_v4(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "project".to_owned(),
+            scope_id: project_id.clone(),
+            correlation_id: source_event.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("alternate-producer-source:{source_event}")),
+            payload_json: "{}".to_owned(),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO attention_projection (
+            id, attention_type, scope_type, scope_id, identity_id, source_event_id,
+            priority, status, summary, details_json, dedupe_key, occurred_at,
+            updated_at, recommended_action
+         ) VALUES (?, 'execution_failed', 'project', ?, ?, ?, 85, 'open',
+                   'Alternate producer incident', ?, ?, ?, ?, 'inspect_run')",
+    )
+    .bind(new_uuid_v4())
+    .bind(&project_id)
+    .bind(&identity_id)
+    .bind(&source_event)
+    .bind(
+        serde_json::json!({
+            "scope_type": "project",
+            "scope_id": project_id,
+        })
+        .to_string(),
+    )
+    .bind(&incident_key)
+    .bind(now_rfc3339())
+    .bind(now_rfc3339())
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let mut wake =
+        wake_event_for_attention(&db, "spoofed-identity", &project_id, &incident_key).await;
+    let mut payload: serde_json::Value = serde_json::from_str(&wake.payload_json).unwrap();
+    payload["responder_identity_id"] = serde_json::json!("spoofed-identity");
+    payload["responder_profile_id"] = serde_json::json!("spoofed-profile");
+    wake.payload_json = payload.to_string();
+    append_event(&db, wake).await;
+
+    let run = consumer.run_once(100).await.unwrap();
+    assert_eq!(run.delivered_turns, 1);
+    let (responder, profile): (String, String) = sqlx::query_as(
+        "SELECT responder_identity_id, profile_id
+         FROM agent_chat_turn_job
+         WHERE chat_id = ? AND dedupe_key LIKE 'wake-turn:%'",
+    )
+    .bind(&chat_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(responder, identity_id);
+    assert_eq!(profile, current_profile_id);
+}
+
+async fn wake_event_for_attention(
+    db: &SqliteDb,
+    identity_id: &str,
+    project_id: &str,
+    incident_key: &str,
+) -> CreateDomainEvent {
+    wake_event_for_attention_in_scope(db, identity_id, project_id, incident_key).await
+}
+
+async fn append_project_attention_wake(
+    db: &SqliteDb,
+    identity_id: &str,
+    project_id: &str,
+    incident_key: &str,
+) -> String {
+    let source_event = new_uuid_v4();
+    append_event(
+        db,
+        CreateDomainEvent {
+            id: source_event.clone(),
+            event_type: "execution.failed".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: new_uuid_v4(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "project".to_owned(),
+            scope_id: project_id.to_owned(),
+            correlation_id: source_event.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("wake-test-source:{source_event}")),
+            payload_json: "{}".to_owned(),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO attention_projection (
+            id, attention_type, scope_type, scope_id, identity_id, source_event_id,
+            priority, status, summary, details_json, dedupe_key, occurred_at,
+            updated_at, recommended_action
+         ) VALUES (?, 'execution_failed', 'project', ?, ?, ?, 85, 'open',
+                   'Wake test incident', ?, ?, ?, ?, 'inspect_run')",
+    )
+    .bind(new_uuid_v4())
+    .bind(project_id)
+    .bind(identity_id)
+    .bind(&source_event)
+    .bind(
+        serde_json::json!({
+            "scope_type": "project",
+            "scope_id": project_id,
+            "state": "initial",
+        })
+        .to_string(),
+    )
+    .bind(incident_key)
+    .bind(now_rfc3339())
+    .bind(now_rfc3339())
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let wake_event = wake_event_for_attention(db, identity_id, project_id, incident_key).await;
+    let wake_event_id = wake_event.id.clone();
+    append_event(db, wake_event).await;
+    wake_event_id
+}
+
+async fn wake_event_for_attention_in_scope(
+    db: &SqliteDb,
+    identity_id: &str,
+    event_scope_project_id: &str,
+    incident_key: &str,
+) -> CreateDomainEvent {
+    let attention_id: String =
+        sqlx::query_scalar("SELECT id FROM attention_projection WHERE dedupe_key = ?")
+            .bind(incident_key)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let attention = AttentionRepo::get_attention(db, &attention_id)
+        .await
+        .unwrap()
+        .unwrap();
     let event_id = new_uuid_v4();
     CreateDomainEvent {
         id: event_id.clone(),
@@ -111,22 +898,23 @@ fn wake_event(identity_id: &str, project_id: &str, incident_key: &str) -> Create
         actor_type: "attention_projection".to_owned(),
         actor_id: None,
         scope_type: "project".to_owned(),
-        scope_id: project_id.to_owned(),
-        correlation_id: event_id,
+        scope_id: event_scope_project_id.to_owned(),
+        correlation_id: event_id.clone(),
         causation_id: None,
         causation_depth: 1,
-        dedupe_key: Some(format!(
-            "agent-wake-admitted:{identity_id}:project:{project_id}:{incident_key}"
-        )),
+        dedupe_key: Some(format!("test-wake-admitted:{event_id}")),
         payload_json: serde_json::json!({
-            "action": "wake_admitted",
+            "decision": "admitted",
             "identity_id": identity_id,
             "scope_type": "project",
-            "scope_id": project_id,
+            "scope_id": event_scope_project_id,
             "incident_key": incident_key,
+            "incident_digest": wake_attention_incident_digest(&attention),
+            "attention_id": attention.id,
+            "reaction_depth": 0,
         })
         .to_string(),
-        created_at: now_rfc3339(),
+        created_at: attention.occurred_at,
     }
 }
 
@@ -137,8 +925,8 @@ async fn admitted_wake_becomes_a_project_agent_turn() {
     let profile_id = identity_with_profile(&db, &identity_id).await;
     let (project_id, chat_id) = bound_project(&db, &identity_id, &profile_id).await;
 
-    // Arm both consumers before any event exists: the first run initializes
-    // the cursor past pre-existing history (upgrade fast-forward).
+    // Arm both consumers before any event exists; the migration-installed
+    // cutover cursor is already authoritative for this consumer.
     let consumer = WakeTurnConsumer::new(Arc::clone(&db), "test-lease-owner");
     consumer.run_once(100).await.unwrap();
     let replay = WakeTurnConsumer::new(Arc::clone(&db), "other-lease-owner")
@@ -152,7 +940,7 @@ async fn admitted_wake_becomes_a_project_agent_turn() {
             priority, status, summary, details_json, dedupe_key, occurred_at,
             updated_at, recommended_action
          ) VALUES (?, 'execution_failed', 'project', ?, NULL, ?, 85, 'open',
-                   'Task execution failed', '{}', ?, ?, ?, 'inspect_run')",
+                   'Task execution failed', ?, ?, ?, ?, 'inspect_run')",
     )
     .bind(new_uuid_v4())
     .bind(&project_id)
@@ -180,6 +968,13 @@ async fn admitted_wake_becomes_a_project_agent_turn() {
         .await;
         source
     })
+    .bind(
+        serde_json::json!({
+            "scope_type": "project",
+            "scope_id": project_id,
+        })
+        .to_string(),
+    )
     .bind(&incident_key)
     .bind(now_rfc3339())
     .bind(now_rfc3339())
@@ -187,7 +982,11 @@ async fn admitted_wake_becomes_a_project_agent_turn() {
     .await
     .unwrap();
 
-    append_event(&db, wake_event(&identity_id, &project_id, &incident_key)).await;
+    append_event(
+        &db,
+        wake_event_for_attention(&db, &identity_id, &project_id, &incident_key).await,
+    )
+    .await;
 
     let run = consumer.run_once(100).await.unwrap();
     assert!(run.delivered_turns >= 1, "wake must deliver a turn");
@@ -226,6 +1025,372 @@ async fn admitted_wake_becomes_a_project_agent_turn() {
     .await
     .unwrap();
     assert_eq!(turn_count, 1, "replay must reuse the deduped turn");
+}
+
+#[tokio::test]
+async fn wake_incident_for_another_project_fails_closed_without_cross_project_turn() {
+    let db = database().await;
+    let identity_id = new_uuid_v4();
+    let profile_id = identity_with_profile(&db, &identity_id).await;
+    let (event_project_id, event_chat_id) = bound_project(&db, &identity_id, &profile_id).await;
+    let (attention_project_id, attention_chat_id) =
+        bound_project(&db, &identity_id, &profile_id).await;
+    let consumer = WakeTurnConsumer::new(Arc::clone(&db), "cross-project-consumer");
+    consumer.run_once(100).await.unwrap();
+
+    let incident_key = format!("attention:cross_project:project:{attention_project_id}");
+    let source_event = new_uuid_v4();
+    append_event(
+        &db,
+        CreateDomainEvent {
+            id: source_event.clone(),
+            event_type: "execution.failed".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: new_uuid_v4(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "project".to_owned(),
+            scope_id: attention_project_id.clone(),
+            correlation_id: source_event.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("cross-project-source:{source_event}")),
+            payload_json: "{}".to_owned(),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO attention_projection (
+            id, attention_type, scope_type, scope_id, identity_id, source_event_id,
+            priority, status, summary, details_json, dedupe_key, occurred_at,
+            updated_at, recommended_action
+         ) VALUES (?, 'execution_failed', 'project', ?, ?, ?, 85, 'open',
+                   'Other project incident', ?, ?, ?, ?, 'inspect_run')",
+    )
+    .bind(new_uuid_v4())
+    .bind(&attention_project_id)
+    .bind(&identity_id)
+    .bind(&source_event)
+    .bind(
+        serde_json::json!({
+            "scope_type": "project",
+            "scope_id": attention_project_id,
+        })
+        .to_string(),
+    )
+    .bind(&incident_key)
+    .bind(now_rfc3339())
+    .bind(now_rfc3339())
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    // The event and payload claim the first Project scope, while the
+    // attention reference and incident key belong to the other Project.
+    // Scope matching must reject this before chat lookup/admission.
+    let wake =
+        wake_event_for_attention_in_scope(&db, &identity_id, &event_project_id, &incident_key)
+            .await;
+    let wake_event_id = wake.id.clone();
+    append_event(&db, wake).await;
+
+    let run = consumer.run_once(100).await.unwrap();
+    assert_eq!(run.delivered_turns, 0);
+    let (disposition, reason): (String, String) = sqlx::query_as(
+        "SELECT disposition.disposition, disposition.reason
+         FROM agent_wake_disposition_current AS current
+         JOIN agent_wake_disposition AS disposition
+           ON disposition.id = current.disposition_id
+         WHERE current.consumer_name = ? AND current.source_event_id = ?",
+    )
+    .bind("agent-wake-turns")
+    .bind(&wake_event_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(disposition, "deterministically_suppressed");
+    assert_eq!(reason, "cross_scope_incident");
+    for chat_id in [event_chat_id, attention_chat_id] {
+        let turn_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_chat_turn_job
+             WHERE chat_id = ? AND dedupe_key LIKE 'wake-turn:%'",
+        )
+        .bind(chat_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(turn_count, 0, "cross-project wake must not enqueue a turn");
+    }
+}
+
+#[tokio::test]
+async fn admitted_wake_runner_failure_is_terminal_on_budget_and_keeps_admission_disposition() {
+    let db = database().await;
+    let identity_id = new_uuid_v4();
+    let profile_id = identity_with_profile(&db, &identity_id).await;
+    let (project_id, chat_id) = bound_project(&db, &identity_id, &profile_id).await;
+    let wake_consumer = WakeTurnConsumer::new(Arc::clone(&db), "runner-failure-consumer");
+    wake_consumer.run_once(100).await.unwrap();
+
+    let incident_key = format!("attention:runner_failure:project:{project_id}");
+    let wake_event_id =
+        append_project_attention_wake(&db, &identity_id, &project_id, &incident_key).await;
+    let admitted = wake_consumer.run_once(100).await.unwrap();
+    assert_eq!(admitted.delivered_turns, 1);
+    let turn_id: String = sqlx::query_scalar(
+        "SELECT id FROM agent_chat_turn_job
+         WHERE chat_id = ? AND dedupe_key = ?",
+    )
+    .bind(&chat_id)
+    .bind(format!("wake-turn:{wake_event_id}"))
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+
+    let worker = AgentChatTurnWorker::with_runner(
+        Arc::clone(&db),
+        Arc::new(FailingWakeRunner) as Arc<dyn AgentChatTurnRunner>,
+    );
+    assert_eq!(worker.run_once().await.unwrap(), 1);
+    let first = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.status, AgentChatTurnState::RetryWait);
+    assert_eq!(first.attempt_count, 1);
+
+    // Make each finite retry due without changing the admitted wake job or
+    // its frozen authority fields.
+    for expected_attempt in [1_i64, 2_i64] {
+        sqlx::query(
+            "UPDATE agent_chat_turn_job
+             SET next_attempt_at = '1970-01-01T00:00:00Z',
+                 version = version + 1, updated_at = ?
+             WHERE id = ? AND status = 'retry_wait' AND attempt_count = ?",
+        )
+        .bind(now_rfc3339())
+        .bind(&turn_id)
+        .bind(expected_attempt)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(worker.run_once().await.unwrap(), 1);
+    }
+
+    let terminal = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(terminal.status, AgentChatTurnState::Failed);
+    assert_eq!(terminal.attempt_count, 3);
+    assert!(terminal.next_attempt_at.is_none());
+    assert_eq!(terminal.error_code.as_deref(), Some("backend_failed"));
+
+    let (disposition_count, disposition, disposition_turn_id, reason): (
+        i64,
+        String,
+        String,
+        String,
+    ) = sqlx::query_as(
+        "SELECT COUNT(*), MAX(disposition), MAX(turn_job_id), MAX(reason)
+         FROM agent_wake_disposition
+         WHERE consumer_name = ? AND source_event_id = ?",
+    )
+    .bind("agent-wake-turns")
+    .bind(&wake_event_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(disposition_count, 1);
+    assert_eq!(disposition, "turn_admitted");
+    assert_eq!(disposition_turn_id, turn_id);
+    assert_eq!(reason, "turn_admitted");
+}
+
+#[tokio::test]
+async fn malformed_wake_is_terminally_suppressed_with_one_disposition() {
+    let db = database().await;
+    let consumer = WakeTurnConsumer::new(Arc::clone(&db), "malformed-wake-lease")
+        .with_consumer_name("malformed-wake-consumer");
+    consumer.run_once(100).await.unwrap();
+    let event_id = new_uuid_v4();
+    append_event(
+        &db,
+        CreateDomainEvent {
+            id: event_id.clone(),
+            event_type: "agent.wake.admitted".to_owned(),
+            entity_type: "agent_wake".to_owned(),
+            entity_id: "malformed".to_owned(),
+            actor_type: "attention_projection".to_owned(),
+            actor_id: None,
+            scope_type: "project".to_owned(),
+            scope_id: new_uuid_v4(),
+            correlation_id: event_id.clone(),
+            causation_id: None,
+            causation_depth: 1,
+            dedupe_key: Some(format!("malformed-wake:{event_id}")),
+            payload_json: serde_json::json!({
+                "scope_type": "project",
+                "incident_key": "missing-scope-id",
+            })
+            .to_string(),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await;
+
+    let run = consumer.run_once(100).await.unwrap();
+    assert_eq!(run.delivered_turns, 0);
+    let (count, disposition, reason): (i64, String, String) = sqlx::query_as(
+        "SELECT COUNT(*), MAX(disposition), MAX(reason)
+         FROM agent_wake_disposition
+         WHERE consumer_name = ? AND source_event_id = ?",
+    )
+    .bind("malformed-wake-consumer")
+    .bind(&event_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(disposition, "deterministically_suppressed");
+    assert_eq!(reason, "scope_id_missing");
+    let receipt_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM event_projection_receipt
+         WHERE consumer_name = ? AND event_id = ?",
+    )
+    .bind("malformed-wake-consumer")
+    .bind(&event_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(receipt_count, 1);
+}
+
+#[tokio::test]
+async fn setup_required_wake_reconsiders_after_binding_change() {
+    let db = database().await;
+    let identity_id = new_uuid_v4();
+    let profile_id = identity_with_profile(&db, &identity_id).await;
+    let (project_id, chat_id) = bound_project(&db, &identity_id, &profile_id).await;
+    let consumer = WakeTurnConsumer::new(Arc::clone(&db), "setup-reconsideration-consumer");
+    consumer.run_once(100).await.unwrap();
+
+    let setup_at = now_rfc3339();
+    sqlx::query(
+        "UPDATE project_agent_binding
+         SET identity_id = NULL, profile_id = NULL, state = 'agent_setup_required',
+             updated_at = ?, version = version + 1
+         WHERE project_id = ?",
+    )
+    .bind(&setup_at)
+    .bind(&project_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let incident_key = format!("attention:setup:project:{project_id}");
+    let source_event = new_uuid_v4();
+    append_event(
+        &db,
+        CreateDomainEvent {
+            id: source_event.clone(),
+            event_type: "execution.failed".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: new_uuid_v4(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "project".to_owned(),
+            scope_id: project_id.clone(),
+            correlation_id: source_event.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("setup-source:{source_event}")),
+            payload_json: "{}".to_owned(),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO attention_projection (
+            id, attention_type, scope_type, scope_id, identity_id, source_event_id,
+            priority, status, summary, details_json, dedupe_key, occurred_at,
+            updated_at, recommended_action
+         ) VALUES (?, 'execution_failed', 'project', ?, ?, ?, 85, 'open',
+                   'Setup incident', ?, ?, ?, ?, 'configure_binding')",
+    )
+    .bind(new_uuid_v4())
+    .bind(&project_id)
+    .bind(&identity_id)
+    .bind(&source_event)
+    .bind(
+        serde_json::json!({
+            "scope_type": "project",
+            "scope_id": project_id,
+        })
+        .to_string(),
+    )
+    .bind(&incident_key)
+    .bind(now_rfc3339())
+    .bind(now_rfc3339())
+    .execute(db.pool())
+    .await
+    .unwrap();
+    append_event(
+        &db,
+        wake_event_for_attention(&db, &identity_id, &project_id, &incident_key).await,
+    )
+    .await;
+
+    consumer.run_once(100).await.unwrap();
+    let (first_disposition, attention_id): (String, Option<String>) = sqlx::query_as(
+        "SELECT disposition, attention_id FROM agent_wake_disposition
+         WHERE consumer_name = ? ORDER BY attempt_number LIMIT 1",
+    )
+    .bind("agent-wake-turns")
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(first_disposition, "setup_required");
+    assert!(attention_id.is_some(), "setup must link an Attention row");
+
+    let restored_at = "9999-01-01T00:00:00Z";
+    sqlx::query(
+        "UPDATE project_agent_binding
+         SET identity_id = ?, profile_id = ?, state = 'active',
+             updated_at = ?, version = version + 1
+         WHERE project_id = ?",
+    )
+    .bind(&identity_id)
+    .bind(&profile_id)
+    .bind(restored_at)
+    .bind(&project_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let retry_run = consumer.run_once(100).await.unwrap();
+    assert_eq!(retry_run.delivered_turns, 1);
+    let (attempt_count, admitted_count): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), SUM(disposition = 'turn_admitted')
+         FROM agent_wake_disposition
+         WHERE consumer_name = ?",
+    )
+    .bind("agent-wake-turns")
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(attempt_count, 2);
+    assert_eq!(admitted_count, 1);
+    let turn_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_chat_turn_job
+         WHERE chat_id = ? AND dedupe_key LIKE 'wake-turn:%'",
+    )
+    .bind(&chat_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(turn_count, 1);
 }
 
 #[tokio::test]
@@ -286,7 +1451,7 @@ async fn baseline_activation_delivers_begin_execution_turn() {
 /// the Project chat. No user message anywhere.
 #[tokio::test]
 async fn failed_execution_wakes_the_project_agent_end_to_end() {
-    let db = database().await;
+    let (db, database_path) = file_database().await;
     let identity_id = new_uuid_v4();
     let profile_id = identity_with_profile(&db, &identity_id).await;
     let (project_id, chat_id) = bound_project(&db, &identity_id, &profile_id).await;
@@ -308,7 +1473,7 @@ async fn failed_execution_wakes_the_project_agent_end_to_end() {
     .unwrap();
 
     let execution_id = new_uuid_v4();
-    ExecutionRepo::create(
+    let running_execution = ExecutionRepo::create_with_lease(
         &*db,
         CreateExecution {
             id: execution_id.clone(),
@@ -334,33 +1499,49 @@ async fn failed_execution_wakes_the_project_agent_end_to_end() {
             created_at: now.clone(),
             updated_at: now.clone(),
         },
+        ClaimExecutionLease {
+            execution_id: execution_id.clone(),
+            expected_version: 1,
+            owner: "embedded:wake-turn-test".to_owned(),
+            lease_expires_at: "9999-01-01T00:00:00+00:00".to_owned(),
+            hard_deadline_at: "9999-01-01T00:00:00+00:00".to_owned(),
+            now: now.clone(),
+        },
     )
     .await
     .unwrap();
-    ExecutionRepo::update(
+    ExecutionRepo::terminalize(
         &*db,
-        UpdateExecution {
-            id: execution_id.clone(),
-            status: Some(ExecutionStatus::Failed),
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
+        TerminalizeExecution {
+            execution_id: execution_id.clone(),
+            expected_version: running_execution.execution_version,
+            lease_owner: running_execution.lease_owner.clone(),
+            status: ExecutionStatus::Failed,
+            stop_reason: Some(Some(StopReason::ExecutorFailed)),
+            stopped_by: Some(Some("embedded:wake-turn-test".to_owned())),
+            stopped_at: Some(Some(now.clone())),
+            resume_policy: Some(Some(ResumePolicy::Manual)),
             agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
+            last_progress_at: None,
             summary: None,
             logs_path: None,
             before_sha: None,
             after_sha: None,
             error: Some(Some("gemini exited with status 1".to_owned())),
             executor_config_snapshot_json: None,
-            updated_at: now_rfc3339(),
+            updated_at: now.clone(),
+            actor_type: "system".to_owned(),
+            actor_id: Some("wake-turn-test".to_owned()),
+            correlation_id: Some(format!("wake-turn:{execution_id}")),
+            causation_id: None,
+            causation_depth: 0,
+            lease_disposition: ExecutionLeaseDisposition::Expire,
         },
     )
     .await
     .unwrap();
-
     AttentionService::new(Arc::clone(&db))
         .project_once(100)
         .await
@@ -391,32 +1572,569 @@ async fn failed_execution_wakes_the_project_agent_end_to_end() {
     assert_eq!(status, "queued");
     assert_eq!(responder, identity_id);
     assert!(content.contains("Task execution failed"));
+    drop(db);
+    let _ = std::fs::remove_file(database_path);
 }
 
 #[tokio::test]
-async fn wake_for_replaced_binding_is_skipped_with_receipt() {
+async fn wake_re_evaluates_current_replacement_binding() {
+    let db = database().await;
+    let original_identity = new_uuid_v4();
+    let original_profile = identity_with_profile(&db, &original_identity).await;
+    let (project_id, chat_id) = bound_project(&db, &original_identity, &original_profile).await;
+
+    let consumer = WakeTurnConsumer::new(Arc::clone(&db), "replacement-binding-consumer");
+    consumer.run_once(100).await.unwrap();
+
+    let replacement_identity = new_uuid_v4();
+    let replacement_profile = identity_with_profile(&db, &replacement_identity).await;
+    let updated_at = now_rfc3339();
+    sqlx::query(
+        "UPDATE project_agent_binding
+         SET identity_id = ?, profile_id = ?, state = 'active',
+             updated_at = ?, version = version + 1
+         WHERE project_id = ?",
+    )
+    .bind(&replacement_identity)
+    .bind(&replacement_profile)
+    .bind(&updated_at)
+    .bind(&project_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let incident_key = format!("attention:binding_replaced:project:{project_id}");
+    let source_event = new_uuid_v4();
+    append_event(
+        &db,
+        CreateDomainEvent {
+            id: source_event.clone(),
+            event_type: "execution.failed".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: new_uuid_v4(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "project".to_owned(),
+            scope_id: project_id.clone(),
+            correlation_id: source_event.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("replacement-source:{source_event}")),
+            payload_json: "{}".to_owned(),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO attention_projection (
+            id, attention_type, scope_type, scope_id, identity_id, source_event_id,
+            priority, status, summary, details_json, dedupe_key, occurred_at,
+            updated_at, recommended_action
+         ) VALUES (?, 'execution_failed', 'project', ?, ?, ?, 85, 'open',
+                   'Binding was replaced', ?, ?, ?, ?, 'inspect_run')",
+    )
+    .bind(new_uuid_v4())
+    .bind(&project_id)
+    .bind(&original_identity)
+    .bind(&source_event)
+    .bind(
+        serde_json::json!({
+            "scope_type": "project",
+            "scope_id": project_id,
+        })
+        .to_string(),
+    )
+    .bind(&incident_key)
+    .bind(now_rfc3339())
+    .bind(now_rfc3339())
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    // The decision names the old identity, but delivery must resolve the
+    // current binding and freeze the replacement identity/Profile.
+    append_event(
+        &db,
+        wake_event_for_attention(&db, &original_identity, &project_id, &incident_key).await,
+    )
+    .await;
+
+    let run = consumer.run_once(100).await.unwrap();
+    assert_eq!(run.delivered_turns, 1);
+
+    let (responder, profile): (String, String) = sqlx::query_as(
+        "SELECT responder_identity_id, profile_id
+         FROM agent_chat_turn_job
+         WHERE chat_id = ? AND dedupe_key LIKE 'wake-turn:%'",
+    )
+    .bind(&chat_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(responder, replacement_identity);
+    assert_eq!(profile, replacement_profile);
+}
+
+#[tokio::test]
+async fn deferred_wake_retries_after_authoritative_responder_recovery() {
     let db = database().await;
     let identity_id = new_uuid_v4();
     let profile_id = identity_with_profile(&db, &identity_id).await;
     let (project_id, chat_id) = bound_project(&db, &identity_id, &profile_id).await;
-
-    let consumer = WakeTurnConsumer::new(Arc::clone(&db), "test-lease-owner");
+    let consumer = WakeTurnConsumer::new(Arc::clone(&db), "deferred-recovery-owner");
     consumer.run_once(100).await.unwrap();
 
-    // Admit a wake for a different identity than the current binding holder.
-    let stranger = new_uuid_v4();
-    identity_with_profile(&db, &stranger).await;
-    append_event(&db, wake_event(&stranger, &project_id, "attention:x:1")).await;
+    // A paused responder is a transient authoritative-unavailable state,
+    // rather than malformed wake input. Delivery must checkpoint it as a
+    // bounded deferred attempt and leave the source receipt/cursor durable.
+    sqlx::query(
+        "UPDATE agent_identity
+         SET paused = 1, version = version + 1, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(now_rfc3339())
+    .bind(&identity_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
 
-    let run = consumer.run_once(100).await.unwrap();
-    assert_eq!(run.delivered_turns, 0);
-    assert!(run.processed_events >= 1, "skipped wake still checkpoints");
+    let incident_key = format!("attention:deferred_recovery:project:{project_id}");
+    let source_event_id = new_uuid_v4();
+    append_event(
+        &db,
+        CreateDomainEvent {
+            id: source_event_id.clone(),
+            event_type: "execution.failed".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: new_uuid_v4(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "project".to_owned(),
+            scope_id: project_id.clone(),
+            correlation_id: source_event_id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("deferred-recovery-source:{source_event_id}")),
+            payload_json: "{}".to_owned(),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO attention_projection (
+            id, attention_type, scope_type, scope_id, identity_id, source_event_id,
+            priority, status, summary, details_json, dedupe_key, occurred_at,
+            updated_at, recommended_action
+         ) VALUES (?, 'execution_failed', 'project', ?, ?, ?, 85, 'open',
+                   'Responder temporarily unavailable', ?, ?, ?, ?, 'restore_responder')",
+    )
+    .bind(new_uuid_v4())
+    .bind(&project_id)
+    .bind(&identity_id)
+    .bind(&source_event_id)
+    .bind(
+        serde_json::json!({
+            "scope_type": "project",
+            "scope_id": project_id,
+        })
+        .to_string(),
+    )
+    .bind(&incident_key)
+    .bind(now_rfc3339())
+    .bind(now_rfc3339())
+    .execute(db.pool())
+    .await
+    .unwrap();
 
-    let turn_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat_turn_job WHERE chat_id = ?")
-            .bind(&chat_id)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-    assert_eq!(turn_count, 0);
+    let wake_event = wake_event_for_attention(&db, &identity_id, &project_id, &incident_key).await;
+    let wake_event_id = wake_event.id.clone();
+    append_event(&db, wake_event).await;
+
+    let first = consumer.run_once(100).await.unwrap();
+    assert_eq!(first.delivered_turns, 0);
+
+    let wake_row = DomainEventRepo::get_event(&*db, &wake_event_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let (attempt, max_attempts, disposition, reason, retry_at): (
+        i64,
+        i64,
+        String,
+        String,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT disposition.attempt_number, disposition.max_attempts,
+                disposition.disposition, disposition.reason, disposition.retry_at
+         FROM agent_wake_disposition_current AS current
+         JOIN agent_wake_disposition AS disposition
+           ON disposition.id = current.disposition_id
+         WHERE current.consumer_name = ? AND current.source_event_id = ?",
+    )
+    .bind("agent-wake-turns")
+    .bind(&wake_event_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(attempt, 1);
+    assert_eq!(max_attempts, 3);
+    assert_eq!(disposition, "deferred");
+    assert_eq!(reason, "responder_unavailable");
+    assert!(
+        retry_at.is_some(),
+        "deferred wake must have a retry deadline"
+    );
+
+    let receipt_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM event_projection_receipt
+         WHERE consumer_name = ? AND event_id = ?",
+    )
+    .bind("agent-wake-turns")
+    .bind(&wake_event_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        receipt_count, 1,
+        "deferred wake must still checkpoint its receipt"
+    );
+    let cursor = DomainEventRepo::get_consumer_cursor(&*db, "agent-wake-turns")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cursor.last_sequence, wake_row.sequence);
+
+    // Repair the authoritative responder, then let the immutable retry
+    // deadline become due. The retry lineage must admit one turn, not replay
+    // the source event or create a second turn.
+    sqlx::query(
+        "UPDATE agent_identity
+         SET paused = 0, version = version + 1, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(now_rfc3339())
+    .bind(&identity_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+
+    let retry = consumer.run_once(100).await.unwrap();
+    assert_eq!(retry.delivered_turns, 1);
+    let (disposition_count, admitted_count): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), SUM(disposition = 'turn_admitted')
+         FROM agent_wake_disposition
+         WHERE consumer_name = ? AND source_event_id = ?",
+    )
+    .bind("agent-wake-turns")
+    .bind(&wake_event_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(disposition_count, 2);
+    assert_eq!(admitted_count, 1);
+    let turn_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_chat_turn_job
+         WHERE chat_id = ? AND dedupe_key = ?",
+    )
+    .bind(&chat_id)
+    .bind(format!("wake-turn:{wake_event_id}"))
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(turn_count, 1);
+    let receipt_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM event_projection_receipt
+         WHERE consumer_name = ? AND event_id = ?",
+    )
+    .bind("agent-wake-turns")
+    .bind(&wake_event_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(receipt_count, 1, "retry must preserve one source receipt");
+}
+
+#[tokio::test]
+async fn deferred_wake_rechecks_changed_incident_material_before_delivery() {
+    let db = database().await;
+    let identity_id = new_uuid_v4();
+    let profile_id = identity_with_profile(&db, &identity_id).await;
+    let (project_id, chat_id) = bound_project(&db, &identity_id, &profile_id).await;
+    let consumer = WakeTurnConsumer::new(Arc::clone(&db), "changed-material-consumer");
+    consumer.run_once(100).await.unwrap();
+
+    // Force a durable deferred disposition without making the Attention
+    // itself malformed. The source wake remains the immutable trigger whose
+    // original digest must not be replayed after the incident changes.
+    sqlx::query(
+        "UPDATE agent_identity
+         SET paused = 1, version = version + 1, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(now_rfc3339())
+    .bind(&identity_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let incident_key = format!("attention:changed_material:project:{project_id}");
+    let wake_event_id =
+        append_project_attention_wake(&db, &identity_id, &project_id, &incident_key).await;
+    let first = consumer.run_once(100).await.unwrap();
+    assert_eq!(first.delivered_turns, 0);
+    let (first_attempt, first_disposition, first_digest): (i64, String, String) = sqlx::query_as(
+        "SELECT disposition.attempt_number, disposition.disposition,
+                    disposition.incident_digest
+             FROM agent_wake_disposition_current AS current
+             JOIN agent_wake_disposition AS disposition
+               ON disposition.id = current.disposition_id
+             WHERE current.consumer_name = ? AND current.source_event_id = ?",
+    )
+    .bind("agent-wake-turns")
+    .bind(&wake_event_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(first_attempt, 1);
+    assert_eq!(first_disposition, "deferred");
+
+    // A material Attention update changes both the version and canonical
+    // incident digest. Once the retry is due, the consumer must evaluate the
+    // current projection and suppress the stale wake rather than admit its
+    // old content or replay the deferred disposition.
+    sqlx::query(
+        "UPDATE attention_projection
+         SET details_json = ?, version = version + 1, updated_at = ?
+         WHERE dedupe_key = ?",
+    )
+    .bind(
+        serde_json::json!({
+            "scope_type": "project",
+            "scope_id": project_id,
+            "state": "materially-changed",
+        })
+        .to_string(),
+    )
+    .bind(now_rfc3339())
+    .bind(&incident_key)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+
+    let retry = consumer.run_once(100).await.unwrap();
+    assert_eq!(retry.delivered_turns, 0);
+    let (attempt, disposition, reason, current_digest): (i64, String, String, String) =
+        sqlx::query_as(
+            "SELECT disposition.attempt_number, disposition.disposition,
+                    disposition.reason, disposition.incident_digest
+             FROM agent_wake_disposition_current AS current
+             JOIN agent_wake_disposition AS disposition
+               ON disposition.id = current.disposition_id
+             WHERE current.consumer_name = ? AND current.source_event_id = ?",
+        )
+        .bind("agent-wake-turns")
+        .bind(&wake_event_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(attempt, 2);
+    assert_eq!(disposition, "deterministically_suppressed");
+    assert_eq!(reason, "attention_changed");
+    assert_ne!(current_digest, first_digest);
+    let turn_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_chat_turn_job
+         WHERE chat_id = ? AND dedupe_key = ?",
+    )
+    .bind(&chat_id)
+    .bind(format!("wake-turn:{wake_event_id}"))
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        turn_count, 0,
+        "stale deferred content must not be delivered"
+    );
+}
+
+#[tokio::test]
+async fn file_backed_restart_race_recovers_expired_lease_and_preserves_post_cutover_event() {
+    let (db, database_path) = file_database().await;
+    let identity_id = new_uuid_v4();
+    let profile_id = identity_with_profile(&db, &identity_id).await;
+    let (project_id, chat_id) = bound_project(&db, &identity_id, &profile_id).await;
+    let cutover_consumer = WakeTurnConsumer::new(Arc::clone(&db), "cutover-owner");
+    cutover_consumer.run_once(100).await.unwrap();
+
+    let incident_key = format!("attention:restart_race:project:{project_id}");
+    let source_event_id = new_uuid_v4();
+    append_event(
+        &db,
+        CreateDomainEvent {
+            id: source_event_id.clone(),
+            event_type: "execution.failed".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: new_uuid_v4(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "project".to_owned(),
+            scope_id: project_id.clone(),
+            correlation_id: source_event_id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("restart-race-source:{source_event_id}")),
+            payload_json: "{}".to_owned(),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO attention_projection (
+            id, attention_type, scope_type, scope_id, identity_id, source_event_id,
+            priority, status, summary, details_json, dedupe_key, occurred_at,
+            updated_at, recommended_action
+         ) VALUES (?, 'execution_failed', 'project', ?, ?, ?, 85, 'open',
+                   'Restart race incident', ?, ?, ?, ?, 'inspect_run')",
+    )
+    .bind(new_uuid_v4())
+    .bind(&project_id)
+    .bind(&identity_id)
+    .bind(&source_event_id)
+    .bind(
+        serde_json::json!({
+            "scope_type": "project",
+            "scope_id": project_id,
+        })
+        .to_string(),
+    )
+    .bind(&incident_key)
+    .bind(now_rfc3339())
+    .bind(now_rfc3339())
+    .execute(db.pool())
+    .await
+    .unwrap();
+    // The source event is before the wake and is consumed before the process
+    // loss seam; the wake itself is the post-cutover event under test.
+    cutover_consumer.run_once(100).await.unwrap();
+    let wake_event = wake_event_for_attention(&db, &identity_id, &project_id, &incident_key).await;
+    let wake_event_id = wake_event.id.clone();
+    append_event(&db, wake_event).await;
+    let wake_row = DomainEventRepo::get_event(&*db, &wake_event_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Simulate a process that claimed the event and died before writing its
+    // disposition. A live replacement must remain blocked at the cursor
+    // head; only after lease expiry may a restarted owner claim it.
+    let claimed = DomainEventRepo::claim_event_batch(
+        &*db,
+        ClaimDomainEvents {
+            consumer_name: "agent-wake-turns".to_owned(),
+            lease_owner: "crashed-process".to_owned(),
+            now: now_rfc3339(),
+            leased_until: "9999-12-31T00:00:00Z".to_owned(),
+            limit: 1,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].id, wake_event_id);
+    let blocked = WakeTurnConsumer::new(Arc::clone(&db), "blocked-observer")
+        .run_once(1)
+        .await
+        .unwrap();
+    assert_eq!(blocked.claimed_events, 0);
+    assert_eq!(blocked.delivered_turns, 0);
+
+    sqlx::query(
+        "UPDATE event_processing_lease
+         SET leased_until = '2000-01-01T00:00:00Z', updated_at = '2000-01-01T00:00:00Z'
+         WHERE consumer_name = ? AND event_sequence = ?",
+    )
+    .bind("agent-wake-turns")
+    .bind(wake_row.sequence)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let restart_a = WakeTurnConsumer::new(Arc::clone(&db), "restart-a");
+    let restart_b = WakeTurnConsumer::new(Arc::clone(&db), "restart-b");
+    let (run_a, run_b) = tokio::join!(restart_a.run_once(1), restart_b.run_once(1));
+    let run_a = run_a.unwrap();
+    let run_b = run_b.unwrap();
+    // Turn admission itself may append a follow-up domain event while the
+    // losing race participant is still polling. The wake source is still
+    // claimed exactly once, as proved by its one receipt/disposition below.
+    assert!(run_a.claimed_events + run_b.claimed_events >= 1);
+    assert_eq!(run_a.delivered_turns + run_b.delivered_turns, 1);
+
+    let (disposition_count, current_count, turn_count, receipt_count): (i64, i64, i64, i64) =
+        sqlx::query_as(
+            "SELECT
+                 (SELECT COUNT(*) FROM agent_wake_disposition
+                  WHERE consumer_name = 'agent-wake-turns' AND source_event_id = ?),
+                 (SELECT COUNT(*) FROM agent_wake_disposition_current
+                  WHERE consumer_name = 'agent-wake-turns' AND source_event_id = ?),
+                 (SELECT COUNT(*) FROM agent_chat_turn_job
+                  WHERE chat_id = ? AND dedupe_key = ?),
+                 (SELECT COUNT(*) FROM event_projection_receipt
+                  WHERE consumer_name = 'agent-wake-turns' AND event_id = ?)",
+        )
+        .bind(&wake_event_id)
+        .bind(&wake_event_id)
+        .bind(&chat_id)
+        .bind(format!("wake-turn:{wake_event_id}"))
+        .bind(&wake_event_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        disposition_count, 1,
+        "race must write one disposition attempt"
+    );
+    assert_eq!(current_count, 1, "race must leave one current disposition");
+    assert_eq!(turn_count, 1, "race must admit one turn");
+    assert_eq!(receipt_count, 1, "race must write one receipt");
+
+    // A new event appended after the immutable migration cutover must remain
+    // visible after recovery; cursor repair cannot fast-forward over it.
+    let post_cutover_event = CreateDomainEvent {
+        id: new_uuid_v4(),
+        event_type: "task.transitioned".to_owned(),
+        entity_type: "task".to_owned(),
+        entity_id: new_uuid_v4(),
+        actor_type: "system".to_owned(),
+        actor_id: None,
+        scope_type: "project".to_owned(),
+        scope_id: project_id,
+        correlation_id: new_uuid_v4(),
+        causation_id: None,
+        causation_depth: 0,
+        dedupe_key: Some(format!("restart-race-post-cutover:{}", new_uuid_v4())),
+        payload_json: "{}".to_owned(),
+        created_at: now_rfc3339(),
+    };
+    let post_cutover_id = post_cutover_event.id.clone();
+    append_event(&db, post_cutover_event).await;
+    WakeTurnConsumer::new(Arc::clone(&db), "restart-after-race")
+        .run_once(100)
+        .await
+        .unwrap();
+    let post_receipt_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM event_projection_receipt
+         WHERE consumer_name = 'agent-wake-turns' AND event_id = ?",
+    )
+    .bind(&post_cutover_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(post_receipt_count, 1, "post-cutover event must not be lost");
+
+    drop(restart_a);
+    drop(restart_b);
+    drop(cutover_consumer);
+    drop(db);
+    let _ = std::fs::remove_file(database_path);
 }

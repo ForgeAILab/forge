@@ -200,6 +200,161 @@ impl MilestoneRuntime {
         Ok(hydrated)
     }
 
+    /// Compute one readiness candidate without persisting it.  Command
+    /// services use this read-locked computation to prepare the complete
+    /// immutable snapshot, then hand that snapshot to the command-aware DB
+    /// composite, which commits the snapshot, lifecycle projection, event,
+    /// receipt, and optional action execution together.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn evaluate_candidate(
+        &self,
+        project_id: &str,
+        actor: &PrincipalRef,
+        authorization: &AuthorizationProvenance,
+        milestone_id: &str,
+        expected_milestone_version: i64,
+        baseline_id: &str,
+        baseline_revision_id: &str,
+        release_policy_revision: &str,
+    ) -> crate::Result<ReadinessSnapshot> {
+        if expected_milestone_version < 1
+            || project_id.trim().is_empty()
+            || milestone_id.trim().is_empty()
+            || baseline_id.trim().is_empty()
+            || baseline_revision_id.trim().is_empty()
+            || release_policy_revision.trim().is_empty()
+        {
+            return Err(crate::ServiceError::InvalidOperation {
+                message: "readiness candidate references are incomplete".to_owned(),
+            });
+        }
+        validate_authorization(authorization, actor, "project.milestone.readiness")?;
+        let mut tx = db::begin_immediate(self.db.pool()).await?;
+        if actor.kind == PrincipalKind::Agent {
+            let bound_agent = self
+                .project_agent_principal_in_tx(&mut tx, project_id)
+                .await?;
+            if bound_agent.id != actor.id {
+                return Err(crate::ServiceError::InvalidOperation {
+                    message: "readiness may only be requested by the bound Project Agent"
+                        .to_owned(),
+                });
+            }
+        }
+        let locked = sqlx::query(
+            "UPDATE project_milestone SET version = version
+             WHERE id = ? AND project_id = ? AND version = ?",
+        )
+        .bind(milestone_id)
+        .bind(project_id)
+        .bind(expected_milestone_version)
+        .execute(&mut *tx)
+        .await?;
+        if locked.rows_affected() != 1 {
+            return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
+        }
+        let milestone = self
+            .get_record_in_tx(&mut tx, project_id, milestone_id)
+            .await?
+            .ok_or_else(|| crate::ServiceError::not_found("milestone", milestone_id))?;
+        let revision_id = milestone
+            .current_definition_revision_id
+            .clone()
+            .ok_or_else(|| crate::ServiceError::InvalidOperation {
+                message: "milestone has no current definition revision".to_owned(),
+            })?;
+        let definition_record = self
+            .definition_record_in_tx(&mut tx, project_id, milestone_id, &revision_id)
+            .await?
+            .ok_or_else(|| {
+                crate::ServiceError::not_found("milestone_definition_revision", revision_id.clone())
+            })?;
+        let mut definition = definition_from_record(definition_record, project_id)?;
+        self.hydrate_charter_in_tx(&mut tx, project_id, &mut definition)
+            .await?;
+        let (baseline_digest, _stored_policy_revision, release_policy_digest) = self
+            .baseline_inputs_in_tx(
+                &mut tx,
+                project_id,
+                baseline_id,
+                baseline_revision_id,
+                release_policy_revision,
+            )
+            .await?;
+        let check_results = self
+            .check_results_in_tx(
+                &mut tx,
+                project_id,
+                milestone_id,
+                &revision_id,
+                definition
+                    .content
+                    .charter_revision
+                    .as_ref()
+                    .map(|charter| charter.revision_id.as_str()),
+                baseline_revision_id,
+                release_policy_revision,
+                &release_policy_digest,
+            )
+            .await?;
+        let evidence = self
+            .evidence_in_tx(&mut tx, project_id, milestone_id)
+            .await?;
+        let waiver_ids = self
+            .waiver_ids_in_tx(&mut tx, project_id, milestone_id)
+            .await?;
+        let (task_states, document_states) = self
+            .source_states_in_tx(&mut tx, project_id, milestone_id, &definition)
+            .await?;
+        let commit_build_check_context = self
+            .commit_build_check_context_in_tx(&mut tx, project_id, &task_states)
+            .await?;
+        let input_manifest = self
+            .input_manifest_in_tx(
+                &mut tx,
+                project_id,
+                milestone_id,
+                &revision_id,
+                definition.content.charter_revision.as_ref(),
+                baseline_id,
+                baseline_revision_id,
+                &baseline_digest,
+                release_policy_revision,
+                &release_policy_digest,
+                &check_results,
+                &evidence,
+                &waiver_ids,
+                &task_states,
+                &document_states,
+                &commit_build_check_context,
+            )
+            .await?;
+        let source_event_watermark = self.source_watermark_in_tx(&mut tx, project_id).await?;
+        let evaluation = evaluate_readiness(ReadinessEvaluationInput {
+            milestone: project_milestone_from_record(milestone)?,
+            definition,
+            baseline_id: baseline_id.to_owned(),
+            baseline_revision_id: baseline_revision_id.to_owned(),
+            baseline_digest,
+            release_policy_revision: release_policy_revision.to_owned(),
+            release_policy_digest,
+            source_event_watermark,
+            computing_policy_revision: COMPUTING_POLICY_REVISION.to_owned(),
+            input_manifest,
+            check_results,
+            evidence,
+            waiver_ids,
+            task_states,
+            document_states,
+            commit_build_check_context,
+            authorization: authorization.clone(),
+        })
+        .map_err(map_orchestration_error)?;
+        let snapshot = evaluation.into_snapshot(new_uuid_v4(), now_rfc3339());
+        tx.commit().await?;
+        Ok(snapshot)
+    }
+
     /// Compute and persist one immutable readiness candidate.  The exact
     /// source rows are loaded before the insert and their versions/digests are
     /// included in the pure evaluator's ordered manifest.  A successful

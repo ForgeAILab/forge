@@ -95,6 +95,10 @@ pub async fn get_project_overview(
         stale = true;
     }
 
+    let execution_setup = services::load_project_execution_setup(&state.db, &project.id)
+        .await
+        .map_err(|_| ApiError::internal("Project execution setup projection is unavailable"))?;
+
     let mut milestone_overviews = Vec::with_capacity(active_milestones.len());
     for (milestone, definition) in active_milestones {
         let milestone_id = milestone
@@ -169,6 +173,7 @@ pub async fn get_project_overview(
         "projection_state": projection_state,
         "source_event_watermark": watermark,
         "generated_at": generated_at,
+        "execution_setup": execution_setup,
     }))
     .map_err(|error| {
         tracing::error!(error = %error, "invalid Project Overview projection");

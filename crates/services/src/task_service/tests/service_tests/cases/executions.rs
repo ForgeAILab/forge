@@ -437,6 +437,7 @@ async fn launch_execution_creates_interactive_execution_and_workspace() {
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
+    crate::test_support::clear_project_execution_role_defaults(&db, &project_id).await;
     let task = service
         .create_task(
             project_id,
@@ -2204,6 +2205,7 @@ async fn interactive_execution_completion_does_not_trigger_review_cascade() {
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
+    crate::test_support::clear_project_execution_role_defaults(&db, &project_id).await;
     let task = service
         .create_task(
             project_id,

@@ -2,12 +2,14 @@ use crate::{
     daemon_transport::DaemonConnectionRegistry, embedded_daemon::is_embedded_daemon_machine,
     workflow::engine::WorkflowEngine, DomainEventService, Result, ServiceError, TaskService,
 };
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use db::{
     now_rfc3339, Agent, AgentListQuery, AgentRepo, AgentSessionRepo, AgentStatus, Daemon,
-    DaemonRepo, Execution, ExecutionRepo, ExecutionStatus, PageRequest, Project, ProjectRepo,
-    ResumePolicy, SortBy, SortOrder, SqliteDb, StopReason, Task, TaskListQuery, TaskRepo,
-    UpdateAgent, UpdateExecution, UpdateTaskStatus, WorkspaceLeaseRepo,
+    DaemonRepo, Execution, ExecutionLeaseDisposition, ExecutionProgressWarningOutcome,
+    ExecutionRepo, ExecutionStatus, ExecutionTerminalOutcome, PageRequest, Project, ProjectRepo,
+    RecordExecutionProgressWarning, ResumePolicy, SortBy, SortOrder, SqliteDb, StopReason, Task,
+    TaskListQuery, TaskRepo, TerminalizeExecution, UpdateAgent, UpdateExecution, UpdateTaskStatus,
+    WorkspaceLeaseRepo,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::TaskExecutor;
@@ -360,6 +362,9 @@ impl HeartbeatMonitor {
             );
         }
         renew_workspace_leases(&self.db).await?;
+        let progress_warnings = self.check_stale_progress().await?;
+        let stalled = self.check_stalled_executions().await?;
+        let disconnected = self.check_disconnected_daemon_executions().await?;
         let expired = expire_workspace_leases(
             &self.db,
             &self.event_bus,
@@ -368,9 +373,7 @@ impl HeartbeatMonitor {
             true,
         )
         .await?;
-        let stalled = self.check_stalled_executions().await?;
-        let disconnected = self.check_disconnected_daemon_executions().await?;
-        Ok(timed_out + stalled + disconnected + expired)
+        Ok(timed_out + progress_warnings + stalled + disconnected + expired)
     }
 
     #[tracing::instrument(skip(self))]
@@ -403,71 +406,112 @@ impl HeartbeatMonitor {
     }
 
     async fn check_stalled_executions(&self) -> Result<u64> {
-        let stale_before = Utc::now()
-            - ChronoDuration::from_std(self.execution_stall_timeout).unwrap_or_else(|_| {
-                ChronoDuration::seconds(Self::DEFAULT_EXECUTION_STALL_TIMEOUT.as_secs() as i64)
-            });
-        let stale_before = stale_before.to_rfc3339();
-        let executions = ExecutionRepo::list_stalled_running(&*self.db, &stale_before).await?;
-        let mut stalled = 0;
+        // Semantic progress is deliberately not the owner-death signal. A
+        // quiet provider/tool call remains live while its owner lease is
+        // current; only an expired lease or hard deadline is eligible for
+        // terminal CAS here. The configured stall timeout is retained as a
+        // progress-warning threshold for the separate policy projector.
+        let now = now_rfc3339();
+        let executions = ExecutionRepo::list_expired_leases(&*self.db, &now, 500).await?;
+        let mut expired = 0;
 
         for execution in executions {
+            let deadline = execution
+                .hard_deadline_at
+                .as_deref()
+                .filter(|deadline| *deadline <= now.as_str())
+                .or(execution.lease_expires_at.as_deref())
+                .unwrap_or(&now);
+            let hard_deadline_reached = execution
+                .hard_deadline_at
+                .as_deref()
+                .is_some_and(|value| value <= now.as_str());
+            let error = if hard_deadline_reached {
+                format!("Execution hard deadline reached at {deadline}")
+            } else {
+                format!("Execution owner lease expired at {deadline}")
+            };
+            let stop_reason = if hard_deadline_reached {
+                StopReason::AgentTimeout
+            } else {
+                StopReason::ExecutionStalled
+            };
+            let stopped_by =
+                api_types::Actor::system(api_types::SystemComponent::HeartbeatMonitor).display();
+            let outcome = ExecutionRepo::terminalize(
+                &*self.db,
+                TerminalizeExecution {
+                    execution_id: execution.id.clone(),
+                    expected_version: execution.execution_version,
+                    lease_owner: execution.lease_owner.clone(),
+                    status: ExecutionStatus::Failed,
+                    stop_reason: Some(Some(stop_reason)),
+                    stopped_by: Some(Some(stopped_by.clone())),
+                    stopped_at: Some(Some(now.clone())),
+                    resume_policy: Some(Some(ResumePolicy::Manual)),
+                    agent_session_id: None,
+                    agent_message_id: None,
+                    last_activity_at: None,
+                    last_progress_at: None,
+                    summary: None,
+                    before_sha: None,
+                    after_sha: None,
+                    logs_path: None,
+                    error: Some(Some(error)),
+                    executor_config_snapshot_json: None,
+                    updated_at: now.clone(),
+                    actor_type: "system".to_owned(),
+                    actor_id: None,
+                    correlation_id: None,
+                    causation_id: None,
+                    causation_depth: 0,
+                    lease_disposition: ExecutionLeaseDisposition::Expire,
+                },
+            )
+            .await?;
+
+            let ExecutionTerminalOutcome::Committed {
+                execution: updated, ..
+            } = outcome
+            else {
+                // A runner, cancellation, or another monitor won the CAS.
+                // Its terminal event, lease disposition, and Task cascade are
+                // authoritative; this stale observation must be inert.
+                continue;
+            };
+
             if let Some(task_executor) = self.task_executor.as_ref() {
                 // Agents without a daemon binding run in-process, so only a
-                // definitively remote-owned execution skips the embedded cancel.
-                if !execution_is_remote_owned(&self.db, &execution)
+                // definitively remote-owned execution skips the embedded
+                // cancellation. External cancellation is a side effect of
+                // the winning terminal transition and therefore happens only
+                // after the CAS commits.
+                if !execution_is_remote_owned(&self.db, &updated)
                     .await
                     .unwrap_or(false)
                 {
-                    if let Err(error) = task_executor.cancel(&execution.id).await {
+                    if let Err(error) = task_executor.cancel(&updated.id).await {
                         tracing::warn!(
-                            execution_id = %execution.id,
+                            execution_id = %updated.id,
                             %error,
-                            "failed to cancel stalled execution"
+                            "failed to cancel expired execution owner"
                         );
                     }
                 }
             }
 
-            let now = now_rfc3339();
-            let updated = ExecutionRepo::update(
-                &*self.db,
-                UpdateExecution {
-                    id: execution.id.clone(),
-                    status: Some(ExecutionStatus::Failed),
-                    stop_reason: Some(Some(StopReason::ExecutionStalled)),
-                    stopped_by: Some(Some(
-                        api_types::Actor::system(api_types::SystemComponent::HeartbeatMonitor)
-                            .display(),
-                    )),
-                    resume_policy: Some(Some(ResumePolicy::Manual)),
-                    stopped_at: Some(Some(now.clone())),
-                    agent_session_id: None,
-                    agent_message_id: None,
-                    last_activity_at: Some(Some(now.clone())),
-                    summary: None,
-                    logs_path: None,
-                    before_sha: None,
-                    after_sha: None,
-                    error: Some(Some(format!(
-                        "Execution stalled: no activity since before {stale_before}"
-                    ))),
-                    executor_config_snapshot_json: None,
-                    updated_at: now,
-                },
-            )
-            .await?;
-
-            revoke_active_workspace_lease(&self.db, &updated.task_id).await;
-
             self.publish(ForgeEvent {
-                event_type: "execution.stalled".to_owned(),
+                event_type: if hard_deadline_reached {
+                    "execution.hard_deadline_exceeded".to_owned()
+                } else {
+                    "execution.stalled".to_owned()
+                },
                 entity_id: updated.id.clone(),
                 timestamp: event_timestamp(),
                 context: EventContext::ExecutionStalled {
                     task_id: updated.task_id.clone(),
                     execution_id: updated.id.clone(),
-                    stale_before: stale_before.clone(),
+                    stale_before: deadline.to_owned(),
                 },
             });
             self.publish(ForgeEvent {
@@ -477,7 +521,11 @@ impl HeartbeatMonitor {
                 context: EventContext::ReconciliationEvent {
                     task_id: Some(updated.task_id.clone()),
                     execution_id: Some(updated.id.clone()),
-                    reason: "stalled".to_owned(),
+                    reason: if hard_deadline_reached {
+                        "hard_deadline_reached".to_owned()
+                    } else {
+                        "execution_lease_expired".to_owned()
+                    },
                 },
             });
 
@@ -489,21 +537,64 @@ impl HeartbeatMonitor {
                             execution_id = %updated.id,
                             task_id = %updated.task_id,
                             %error,
-                            "failed to cascade stalled execution"
+                            "failed to cascade expired execution"
                         );
                     }
                 }
             }
-            stalled += 1;
+            expired += 1;
         }
 
-        if stalled > 0 {
+        if expired > 0 {
             tracing::info!(
-                stalled_executions = stalled,
-                "heartbeat monitor detected stalled executions"
+                expired_executions = expired,
+                "heartbeat monitor detected expired execution leases"
             );
         }
-        Ok(stalled)
+        Ok(expired)
+    }
+
+    async fn check_stale_progress(&self) -> Result<u64> {
+        let now = now_rfc3339();
+        let stale_before = Utc::now()
+            - ChronoDuration::from_std(self.execution_stall_timeout).unwrap_or_else(|_| {
+                ChronoDuration::seconds(Self::DEFAULT_EXECUTION_STALL_TIMEOUT.as_secs() as i64)
+            });
+        let stale_before = stale_before.to_rfc3339();
+        let candidates =
+            ExecutionRepo::list_stale_progress(&*self.db, &now, &stale_before, 500).await?;
+        let mut warned = 0;
+
+        for candidate in candidates {
+            // The list query is advisory. Revalidate owner/version/status,
+            // lease and semantic progress while appending the warning in one
+            // repository transaction. A fresh progress update or terminal CAS
+            // that wins first therefore returns `Concurrent` and cannot leave
+            // a warning behind after the authoritative state has changed.
+            let Some(owner) = candidate.lease_owner.clone() else {
+                continue;
+            };
+            let outcome = ExecutionRepo::record_progress_warning(
+                &*self.db,
+                RecordExecutionProgressWarning {
+                    execution_id: candidate.id.clone(),
+                    expected_version: candidate.execution_version,
+                    owner,
+                    expected_last_progress_at: candidate.last_progress_at.clone(),
+                    stale_before: stale_before.clone(),
+                    now: now.clone(),
+                },
+            )
+            .await?;
+            let ExecutionProgressWarningOutcome::Committed { event, .. } = outcome else {
+                continue;
+            };
+            DomainEventService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
+                .publish_committed(&event);
+            warned += 1;
+        }
+
+        Ok(warned)
     }
 
     async fn check_disconnected_daemon_executions(&self) -> Result<u64> {
@@ -577,8 +668,10 @@ impl HeartbeatMonitor {
             self.disconnect_observed
                 .lock()
                 .expect("disconnect observation lock")
-                .remove(&updated.id);
-            disconnected += 1;
+                .remove(&execution.id);
+            if updated.is_some() {
+                disconnected += 1;
+            }
         }
 
         if disconnected > 0 {
@@ -628,8 +721,36 @@ async fn expire_workspace_leases(
     task_service: Option<&TaskService>,
     terminalize_running: bool,
 ) -> Result<u64> {
-    let expired = WorkspaceLeaseRepo::expire(db, &now_rfc3339(), 500).await?;
-    let expired_count = expired.len() as u64;
+    let expired = if terminalize_running {
+        // The live monitor must not mutate a WorkspaceLease before it has
+        // won the execution terminal CAS.  There is no bulk read API for
+        // leases yet, so inspect the bounded running set and select only
+        // active grants whose execution is still running.  `terminalize`
+        // then closes the matching grant in its own transaction.  Startup
+        // recovery may continue using the standalone expiry mutation because
+        // it deliberately leaves running attempts for crash recovery.
+        let now = now_rfc3339();
+        let running = ExecutionRepo::list_running(db).await?;
+        let mut candidates = Vec::new();
+        for execution in running {
+            let Some(lease) =
+                WorkspaceLeaseRepo::get_active_for_task(db, &execution.task_id).await?
+            else {
+                continue;
+            };
+            if lease.execution_id == execution.id && lease.expires_at <= now {
+                candidates.push(lease);
+            }
+        }
+        candidates
+    } else {
+        WorkspaceLeaseRepo::expire(db, &now_rfc3339(), 500).await?
+    };
+    let mut expired_count = if terminalize_running {
+        0
+    } else {
+        expired.len() as u64
+    };
     if !terminalize_running {
         return Ok(expired_count);
     }
@@ -642,37 +763,25 @@ async fn expire_workspace_leases(
             continue;
         }
 
-        if let Some(task_executor) = task_executor {
-            if !execution_is_remote_owned(db, &execution)
-                .await
-                .unwrap_or(false)
-            {
-                if let Err(error) = task_executor.cancel(&execution.id).await {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        %error,
-                        "failed to cancel execution after WorkspaceLease expiry"
-                    );
-                }
-            }
-        }
-
         let now = now_rfc3339();
-        let updated = match ExecutionRepo::update(
+        let outcome = match ExecutionRepo::terminalize(
             db,
-            UpdateExecution {
-                id: execution.id.clone(),
-                status: Some(ExecutionStatus::Failed),
+            TerminalizeExecution {
+                execution_id: execution.id.clone(),
+                expected_version: execution.execution_version,
+                lease_owner: execution.lease_owner.clone(),
+                status: ExecutionStatus::Failed,
                 stop_reason: Some(Some(StopReason::ExecutionStalled)),
                 stopped_by: Some(Some(
                     api_types::Actor::system(api_types::SystemComponent::HeartbeatMonitor)
                         .display(),
                 )),
-                resume_policy: Some(Some(ResumePolicy::Manual)),
                 stopped_at: Some(Some(now.clone())),
+                resume_policy: Some(Some(ResumePolicy::Manual)),
                 agent_session_id: None,
                 agent_message_id: None,
-                last_activity_at: Some(Some(now.clone())),
+                last_activity_at: None,
+                last_progress_at: None,
                 summary: None,
                 logs_path: None,
                 before_sha: None,
@@ -680,11 +789,17 @@ async fn expire_workspace_leases(
                 error: Some(Some("scheduler WorkspaceLease expired".to_owned())),
                 executor_config_snapshot_json: None,
                 updated_at: now,
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                correlation_id: None,
+                causation_id: None,
+                causation_depth: 0,
+                lease_disposition: ExecutionLeaseDisposition::Expire,
             },
         )
         .await
         {
-            Ok(updated) => updated,
+            Ok(outcome) => outcome,
             Err(error) => {
                 tracing::warn!(
                     execution_id = %execution.id,
@@ -694,6 +809,33 @@ async fn expire_workspace_leases(
                 continue;
             }
         };
+
+        let ExecutionTerminalOutcome::Committed {
+            execution: updated, ..
+        } = outcome
+        else {
+            // A concurrent completion/cancellation/monitor winner owns the
+            // terminal event and lease disposition. Do not duplicate any
+            // downstream recovery side effect for this expired grant.
+            continue;
+        };
+
+        expired_count += 1;
+
+        if let Some(task_executor) = task_executor {
+            if !execution_is_remote_owned(db, &updated)
+                .await
+                .unwrap_or(false)
+            {
+                if let Err(error) = task_executor.cancel(&updated.id).await {
+                    tracing::warn!(
+                        execution_id = %updated.id,
+                        %error,
+                        "failed to cancel execution after WorkspaceLease expiry"
+                    );
+                }
+            }
+        }
 
         event_bus.publish(ForgeEvent {
             event_type: "execution.stalled".to_owned(),
@@ -728,27 +870,6 @@ async fn expire_workspace_leases(
     }
 
     Ok(expired_count)
-}
-
-async fn revoke_active_workspace_lease(db: &SqliteDb, task_id: &str) {
-    match WorkspaceLeaseRepo::get_active_for_task(db, task_id).await {
-        Ok(Some(lease)) => {
-            if let Err(error) =
-                WorkspaceLeaseRepo::revoke(db, &lease.id, lease.version, &now_rfc3339()).await
-            {
-                tracing::warn!(
-                    task_id,
-                    lease_id = %lease.id,
-                    %error,
-                    "failed to revoke WorkspaceLease at recovery terminal boundary"
-                );
-            }
-        }
-        Ok(None) => {}
-        Err(error) => {
-            tracing::warn!(task_id, %error, "failed to load WorkspaceLease at recovery terminal boundary")
-        }
-    }
 }
 
 pub(crate) struct CancelledExecution {
@@ -828,19 +949,20 @@ async fn recover_task(
             task.status
         )));
     }
-    let cancelled = cancel_running_executions(
+    let cancelled = cancel_running_executions_for_recovery(
         db,
         &task.id,
         stop_reason.clone(),
         stopped_by,
         ResumePolicy::Manual,
+        stop_reason == StopReason::AgentTimeout,
     )
     .await?;
 
-    // A cancelled attempt must never retain its repository authority. If the
-    // recovery policy later schedules a retry, it receives a fresh execution
-    // identity and lease through TaskService admission.
-    revoke_active_workspace_lease(db, &task.id).await;
+    // Each committed terminal CAS disposes only the WorkspaceLease bound to
+    // that execution. Never revoke by Task here: a zero-row CAS is a
+    // concurrent winner, and a newer execution may already hold a healthy
+    // successor lease for the same Task.
 
     if cancelled.is_empty() {
         return Ok(RecoverTaskOutcome {
@@ -1052,6 +1174,25 @@ pub(crate) async fn cancel_running_executions(
     stopped_by: &api_types::Actor,
     resume_policy: ResumePolicy,
 ) -> Result<Vec<CancelledExecution>> {
+    cancel_running_executions_for_recovery(
+        db,
+        task_id,
+        stop_reason,
+        stopped_by,
+        resume_policy,
+        false,
+    )
+    .await
+}
+
+async fn cancel_running_executions_for_recovery(
+    db: &SqliteDb,
+    task_id: &str,
+    stop_reason: StopReason,
+    stopped_by: &api_types::Actor,
+    resume_policy: ResumePolicy,
+    preserve_healthy_owner: bool,
+) -> Result<Vec<CancelledExecution>> {
     let page = ExecutionRepo::list_by_task(
         db,
         task_id,
@@ -1065,26 +1206,32 @@ pub(crate) async fn cancel_running_executions(
     )
     .await?;
     let mut cancelled = Vec::new();
+    let now = now_rfc3339();
     for execution in page.items {
         if execution.status != ExecutionStatus::Running {
             continue;
         }
-        let cancelled_execution = CancelledExecution {
-            execution_id: execution.id.clone(),
-            agent_session_id: execution.agent_session_id.clone(),
-        };
-        if ExecutionRepo::update(
+        if preserve_healthy_owner && execution_owner_lease_is_healthy(&execution, &now) {
+            // Legacy AgentStatus heartbeat timeout is not authoritative for
+            // an attempt that still has a live execution owner lease. The
+            // expiry/deadline monitor remains responsible for this execution.
+            continue;
+        }
+        let outcome = ExecutionRepo::terminalize(
             db,
-            UpdateExecution {
-                id: execution.id,
-                status: Some(ExecutionStatus::Cancelled),
+            TerminalizeExecution {
+                execution_id: execution.id.clone(),
+                expected_version: execution.execution_version,
+                lease_owner: execution.lease_owner.clone(),
+                status: ExecutionStatus::Cancelled,
                 stop_reason: Some(Some(stop_reason.clone())),
                 stopped_by: Some(Some(stopped_by.display())),
-                resume_policy: Some(Some(resume_policy.clone())),
                 stopped_at: Some(Some(now_rfc3339())),
+                resume_policy: Some(Some(resume_policy.clone())),
                 agent_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
+                last_progress_at: None,
                 summary: None,
                 logs_path: None,
                 before_sha: None,
@@ -1092,15 +1239,59 @@ pub(crate) async fn cancel_running_executions(
                 error: Some(Some("Recovered".to_owned())),
                 executor_config_snapshot_json: None,
                 updated_at: now_rfc3339(),
+                actor_type: if stopped_by.is_system() {
+                    "system".to_owned()
+                } else if stopped_by.is_agent() {
+                    "agent".to_owned()
+                } else {
+                    "user".to_owned()
+                },
+                actor_id: None,
+                correlation_id: None,
+                causation_id: None,
+                causation_depth: 0,
+                lease_disposition: ExecutionLeaseDisposition::Revoke,
             },
         )
-        .await
-        .is_ok()
+        .await?;
+        if let ExecutionTerminalOutcome::Committed {
+            execution: cancelled_execution,
+            ..
+        } = outcome
         {
-            cancelled.push(cancelled_execution);
+            cancelled.push(CancelledExecution {
+                execution_id: cancelled_execution.id,
+                agent_session_id: execution.agent_session_id.clone(),
+            });
         }
     }
     Ok(cancelled)
+}
+
+fn execution_owner_lease_is_healthy(execution: &Execution, now: &str) -> bool {
+    if execution.status != ExecutionStatus::Running || execution.lease_owner.is_none() {
+        return false;
+    }
+    let Some(lease_expires_at) = execution.lease_expires_at.as_deref() else {
+        return false;
+    };
+    if !rfc3339_is_after(lease_expires_at, now) {
+        return false;
+    }
+    execution
+        .hard_deadline_at
+        .as_deref()
+        .is_some_and(|hard_deadline_at| rfc3339_is_after(hard_deadline_at, now))
+}
+
+fn rfc3339_is_after(value: &str, other: &str) -> bool {
+    let Some(value) = DateTime::parse_from_rfc3339(value).ok() else {
+        return false;
+    };
+    let Some(other) = DateTime::parse_from_rfc3339(other).ok() else {
+        return false;
+    };
+    value > other
 }
 
 async fn list_projects(db: &SqliteDb) -> Result<Vec<Project>> {
@@ -1176,7 +1367,7 @@ pub(crate) async fn fail_execution_daemon_disconnected(
     event_bus: &EventBus,
     task_service: Option<&TaskService>,
     input: FailDaemonDisconnectedExecution<'_>,
-) -> Result<Execution> {
+) -> Result<Option<Execution>> {
     let FailDaemonDisconnectedExecution {
         execution,
         daemon_id,
@@ -1185,18 +1376,21 @@ pub(crate) async fn fail_execution_daemon_disconnected(
         reconciliation_reason,
     } = input;
     let now = now_rfc3339();
-    let updated = ExecutionRepo::update(
+    let outcome = ExecutionRepo::terminalize(
         db,
-        UpdateExecution {
-            id: execution.id.clone(),
-            status: Some(ExecutionStatus::Failed),
+        TerminalizeExecution {
+            execution_id: execution.id.clone(),
+            expected_version: execution.execution_version,
+            lease_owner: execution.lease_owner.clone(),
+            status: ExecutionStatus::Failed,
             stop_reason: Some(Some(StopReason::DaemonDisconnected)),
             stopped_by: Some(Some(stopped_by.to_owned())),
-            resume_policy: Some(Some(ResumePolicy::Manual)),
             stopped_at: Some(Some(now.clone())),
+            resume_policy: Some(Some(ResumePolicy::Manual)),
             agent_session_id: None,
             agent_message_id: None,
-            last_activity_at: Some(Some(now.clone())),
+            last_activity_at: None,
+            last_progress_at: None,
             summary: None,
             logs_path: None,
             before_sha: None,
@@ -1204,11 +1398,25 @@ pub(crate) async fn fail_execution_daemon_disconnected(
             error: Some(Some(error_message)),
             executor_config_snapshot_json: None,
             updated_at: now,
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            correlation_id: None,
+            causation_id: None,
+            causation_depth: 0,
+            lease_disposition: ExecutionLeaseDisposition::Expire,
         },
     )
     .await?;
 
-    revoke_active_workspace_lease(db, &updated.task_id).await;
+    let ExecutionTerminalOutcome::Committed {
+        execution: updated, ..
+    } = outcome
+    else {
+        // Another terminal caller won the version/owner CAS. Its durable
+        // event, lease disposition, and Task cascade are authoritative; this
+        // stale daemon observation must not emit a second failure.
+        return Ok(None);
+    };
 
     event_bus.publish(ForgeEvent {
         event_type: "execution.daemon_disconnected".to_owned(),
@@ -1244,7 +1452,7 @@ pub(crate) async fn fail_execution_daemon_disconnected(
         }
     }
 
-    Ok(updated)
+    Ok(Some(updated))
 }
 
 pub(crate) const DAEMON_REPORT_RECONCILE_MIN_AGE: Duration = Duration::from_secs(60);
@@ -1273,7 +1481,7 @@ pub(crate) async fn reconcile_daemon_report_executions(
 
     let mut interrupted = 0_u64;
     for execution in executions {
-        fail_execution_daemon_disconnected(
+        let Some(_updated) = fail_execution_daemon_disconnected(
             db,
             event_bus,
             task_service,
@@ -1286,7 +1494,10 @@ pub(crate) async fn reconcile_daemon_report_executions(
                 reconciliation_reason: "daemon_disconnected",
             },
         )
-        .await?;
+        .await?
+        else {
+            continue;
+        };
         interrupted += 1;
     }
     Ok(interrupted)
@@ -1386,8 +1597,8 @@ mod tests {
         create_sqlite_pool, new_uuid_v4, run_migrations, AgentContextScopeRepo, AgentProfileRepo,
         AgentSession, CreateAgent, CreateAgentContextScope, CreateAgentProfile, CreateAgentSession,
         CreateExecution, CreateProject, CreateRepo, CreateTask, CreateTaskRoleAssignment,
-        DaemonRepo, DaemonStatus, RepoRepo, TaskRoleAssignmentRepo, TaskStatus, UpdateProject,
-        UpsertDaemon,
+        CreateWorkspaceLease, DaemonRepo, DaemonStatus, DomainEventRepo, RepoRepo,
+        TaskRoleAssignmentRepo, TaskStatus, UpdateProject, UpsertDaemon,
     };
     use executors::{ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError};
     use serde_json::Value;
@@ -2007,6 +2218,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_monitor_stale_busy_agent_does_not_cancel_healthy_quiet_execution() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(16));
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let agent = seed_agent(
+            &db,
+            AgentStatus::Busy,
+            Some("1970-01-01T00:00:00+00:00".to_owned()),
+        )
+        .await;
+        let task = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            "in_progress".to_owned(),
+            Some(agent.id.clone()),
+        )
+        .await;
+        let execution = seed_running_execution(&db, task.id.clone(), agent.id.clone(), None).await;
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let claimed = match ExecutionRepo::claim_lease(
+            &*db,
+            db::ClaimExecutionLease {
+                execution_id: execution.id.clone(),
+                expected_version: execution.execution_version,
+                owner: "quiet-owner".to_owned(),
+                lease_expires_at: (now + ChronoDuration::minutes(5)).to_rfc3339(),
+                hard_deadline_at: (now + ChronoDuration::hours(1)).to_rfc3339(),
+                now: now_text.clone(),
+            },
+        )
+        .await
+        .expect("execution lease claims")
+        {
+            db::ExecutionLeaseMutation::Updated(execution) => execution,
+            other => panic!("execution lease is not claimed: {other:?}"),
+        };
+        let renewed = match ExecutionRepo::renew_lease(
+            &*db,
+            db::RenewExecutionLease {
+                execution_id: claimed.id.clone(),
+                expected_version: claimed.execution_version,
+                owner: "quiet-owner".to_owned(),
+                lease_expires_at: (now + ChronoDuration::minutes(10)).to_rfc3339(),
+                now: now_text,
+            },
+        )
+        .await
+        .expect("execution lease renews")
+        {
+            db::ExecutionLeaseMutation::Updated(execution) => execution,
+            other => panic!("execution lease is not renewed: {other:?}"),
+        };
+
+        let monitor = HeartbeatMonitor::new(Arc::clone(&db), Arc::clone(&event_bus));
+        let timed_out = monitor.check_once().await.expect("monitor runs");
+        assert_eq!(timed_out, 1, "only the legacy agent timeout is observed");
+
+        let updated_agent = AgentRepo::get_by_id(&*db, &agent.id)
+            .await
+            .expect("agent loads")
+            .expect("agent exists");
+        assert_eq!(updated_agent.status, AgentStatus::Error);
+
+        let updated_execution = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("execution loads")
+            .expect("execution exists");
+        assert_eq!(updated_execution.status, ExecutionStatus::Running);
+        assert_eq!(
+            updated_execution.lease_owner.as_deref(),
+            Some("quiet-owner")
+        );
+        assert_eq!(
+            updated_execution.execution_version, renewed.execution_version,
+            "the stale agent path did not terminalize or mutate the healthy owner lease"
+        );
+        assert!(updated_execution
+            .lease_expires_at
+            .as_deref()
+            .is_some_and(|expires_at| rfc3339_is_after(expires_at, &now_rfc3339())));
+
+        let updated_task = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("task loads")
+            .expect("task exists");
+        assert!(updated_task.error_annotation.is_none());
+    }
+
+    #[tokio::test]
     async fn heartbeat_monitor_marks_stalled_executions_and_schedules_retry() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
@@ -2050,6 +2352,28 @@ mod tests {
         )
         .await
         .expect("execution activity updates");
+
+        let execution_for_claim = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("execution reloads")
+            .expect("execution exists");
+        let now = now_rfc3339();
+        assert!(matches!(
+            ExecutionRepo::claim_lease(
+                &*db,
+                db::ClaimExecutionLease {
+                    execution_id: execution.id.clone(),
+                    expected_version: execution_for_claim.execution_version,
+                    owner: "expired-owner".to_owned(),
+                    lease_expires_at: "1970-01-01T00:00:00+00:00".to_owned(),
+                    hard_deadline_at: (Utc::now() + ChronoDuration::hours(1)).to_rfc3339(),
+                    now,
+                },
+            )
+            .await
+            .expect("execution lease claims"),
+            db::ExecutionLeaseMutation::Updated(_)
+        ));
 
         let task_service = Arc::new(TaskService::new(Arc::clone(&db), Arc::clone(&event_bus)));
         let executor = Arc::new(RecordingCancelExecutor::default());
@@ -2100,6 +2424,187 @@ mod tests {
         assert!(event_types
             .iter()
             .any(|event| event == "task.execution_retry"));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_monitor_warns_on_live_stale_progress_without_terminalizing() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(32));
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (agent_id, _) = seed_agent_with_daemon(
+            &db,
+            &crate::embedded_daemon::embedded_machine_id(),
+            AgentStatus::Idle,
+        )
+        .await;
+        let task = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            "in_progress".to_owned(),
+            Some(agent_id.clone()),
+        )
+        .await;
+        let execution = seed_running_execution(&db, task.id.clone(), agent_id, None).await;
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let claimed = match ExecutionRepo::claim_lease(
+            &*db,
+            db::ClaimExecutionLease {
+                execution_id: execution.id.clone(),
+                expected_version: execution.execution_version,
+                owner: "live-owner".to_owned(),
+                lease_expires_at: (now + ChronoDuration::minutes(5)).to_rfc3339(),
+                hard_deadline_at: (now + ChronoDuration::hours(1)).to_rfc3339(),
+                now: now_text.clone(),
+            },
+        )
+        .await
+        .expect("execution lease claims")
+        {
+            db::ExecutionLeaseMutation::Updated(execution) => execution,
+            other => panic!("execution lease is not claimed: {other:?}"),
+        };
+        sqlx::query("UPDATE execution SET last_progress_at = ? WHERE id = ?")
+            .bind("1970-01-01T00:00:00+00:00")
+            .bind(&claimed.id)
+            .execute(db.pool())
+            .await
+            .expect("stale progress updates");
+
+        let monitor = HeartbeatMonitor::new(Arc::clone(&db), Arc::clone(&event_bus))
+            .with_execution_stall_timeout(Duration::from_secs(1));
+        let first = monitor.check_once().await.expect("first monitor pass");
+        let second = monitor.check_once().await.expect("second monitor pass");
+
+        assert_eq!(first, 1, "one bounded warning is emitted for the episode");
+        assert_eq!(
+            second, 0,
+            "the warning is deduplicated on subsequent passes"
+        );
+        let persisted = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("execution loads")
+            .expect("execution exists");
+        assert_eq!(persisted.status, ExecutionStatus::Running);
+        let persisted_task = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("task loads")
+            .expect("task exists");
+        assert!(persisted_task.error_annotation.is_none());
+        assert!(persisted_task.blocked_json.is_none());
+        let events = DomainEventRepo::list_events_after(&*db, 0, 100)
+            .await
+            .expect("domain events load");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.event_type == "execution.progress_warning" && event.entity_id == task.id
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_monitor_terminal_cas_race_emits_one_terminal_event() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(32));
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (agent_id, _) = seed_agent_with_daemon(
+            &db,
+            &crate::embedded_daemon::embedded_machine_id(),
+            AgentStatus::Idle,
+        )
+        .await;
+        let task = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            "in_progress".to_owned(),
+            Some(agent_id.clone()),
+        )
+        .await;
+        let execution = seed_running_execution(&db, task.id.clone(), agent_id, None).await;
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        let claimed = match ExecutionRepo::claim_lease(
+            &*db,
+            db::ClaimExecutionLease {
+                execution_id: execution.id.clone(),
+                expected_version: execution.execution_version,
+                owner: "race-owner".to_owned(),
+                lease_expires_at: (now - ChronoDuration::minutes(1)).to_rfc3339(),
+                hard_deadline_at: (now + ChronoDuration::hours(1)).to_rfc3339(),
+                now: now_text.clone(),
+            },
+        )
+        .await
+        .expect("execution lease claims")
+        {
+            db::ExecutionLeaseMutation::Updated(execution) => execution,
+            other => panic!("execution lease is not claimed: {other:?}"),
+        };
+
+        let monitor = HeartbeatMonitor::new(Arc::clone(&db), Arc::clone(&event_bus));
+        let db_for_completion = Arc::clone(&db);
+        let completion = db::TerminalizeExecution {
+            execution_id: claimed.id.clone(),
+            expected_version: claimed.execution_version,
+            lease_owner: claimed.lease_owner.clone(),
+            status: ExecutionStatus::Completed,
+            stop_reason: Some(Some(StopReason::LegacyUnknown)),
+            stopped_by: Some(Some("runner".to_owned())),
+            stopped_at: Some(Some(now_text.clone())),
+            resume_policy: Some(Some(ResumePolicy::None)),
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            last_progress_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            updated_at: now_text,
+            actor_type: "runner".to_owned(),
+            actor_id: None,
+            correlation_id: None,
+            causation_id: None,
+            causation_depth: 0,
+            lease_disposition: ExecutionLeaseDisposition::Revoke,
+        };
+        let (monitor_result, completion_result) = tokio::join!(monitor.check_once(), async move {
+            ExecutionRepo::terminalize(&*db_for_completion, completion).await
+        });
+        monitor_result.expect("monitor race pass");
+        completion_result.expect("completion race pass");
+
+        let persisted = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("execution loads")
+            .expect("execution exists");
+        assert!(matches!(
+            persisted.status,
+            ExecutionStatus::Completed | ExecutionStatus::Failed
+        ));
+        let events = DomainEventRepo::list_events_after(&*db, 0, 100)
+            .await
+            .expect("domain events load");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.event_type.starts_with("execution.")
+                        && event.entity_id == task.id
+                        && event.payload_json.contains(&execution.id)
+                })
+                .count(),
+            1,
+            "the monitor and completion race has one durable terminal event"
+        );
     }
 
     #[tokio::test]
@@ -2249,6 +2754,106 @@ mod tests {
         assert_eq!(
             cancelled[0].agent_session_id.as_deref(),
             Some("session-789")
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_task_cas_loss_does_not_revoke_successor_workspace_lease() {
+        let db = Arc::new(sqlite_db().await);
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let agent = seed_agent(&db, AgentStatus::Busy, Some(now_rfc3339())).await;
+        let task = seed_task(
+            &db,
+            project_id.clone(),
+            repo_id.clone(),
+            "in_progress".to_owned(),
+            Some(agent.id.clone()),
+        )
+        .await;
+
+        // Leave an active lease for a newer successor attempt. The successor
+        // is made terminal through a direct fixture update so the stale
+        // recovery calls below only race on the older running attempt; the
+        // lease remains the protected task-scoped grant.
+        let successor = seed_running_execution(&db, task.id.clone(), agent.id.clone(), None).await;
+        let now = Utc::now();
+        let successor_lease = WorkspaceLeaseRepo::issue(
+            &*db,
+            CreateWorkspaceLease {
+                id: new_uuid_v4(),
+                project_id,
+                task_id: task.id.clone(),
+                task_version: task.version,
+                execution_id: successor.id.clone(),
+                operation_idempotency_key: new_uuid_v4(),
+                repository_binding_id: repo_id,
+                base_ref: "main".to_owned(),
+                role: "worker".to_owned(),
+                capabilities_json: r#"["repository_write"]"#.to_owned(),
+                assigned_principal_type: "agent".to_owned(),
+                assigned_principal_id: agent.id.clone(),
+                capability_profile_revision: "forge.capability-profile/v1".to_owned(),
+                capability_profile_digest:
+                    "sha256:eeb061a14ab862e1a7b16989ef637293ba538f46122ff28b30313d330dbae4a8"
+                        .to_owned(),
+                issuing_principal_type: "system".to_owned(),
+                issuing_principal_id: "task-service-scheduler".to_owned(),
+                issued_at: (now - ChronoDuration::minutes(1)).to_rfc3339(),
+                expires_at: (now + ChronoDuration::hours(1)).to_rfc3339(),
+                created_at: now.to_rfc3339(),
+                updated_at: now.to_rfc3339(),
+            },
+        )
+        .await
+        .expect("successor lease issues");
+        sqlx::query("UPDATE execution SET status = 'completed', updated_at = ? WHERE id = ?")
+            .bind(now_rfc3339())
+            .bind(&successor.id)
+            .execute(db.pool())
+            .await
+            .expect("successor fixture terminalizes");
+
+        let stale_execution =
+            seed_running_execution(&db, task.id.clone(), agent.id.clone(), None).await;
+        let stale_task = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("stale task loads")
+            .expect("stale task exists");
+        let stopped_by = api_types::Actor::system(api_types::SystemComponent::CrashRecovery);
+        let stale_task_for_race = stale_task.clone();
+        let (first, second) = tokio::join!(
+            recover_task(&db, stale_task, StopReason::CrashRecovery, &stopped_by),
+            recover_task(
+                &db,
+                stale_task_for_race,
+                StopReason::CrashRecovery,
+                &stopped_by,
+            ),
+        );
+        let first = first.expect("first recovery race call");
+        let second = second.expect("second recovery race call");
+        assert_eq!(
+            [first.annotated, second.annotated]
+                .into_iter()
+                .filter(|annotated| *annotated)
+                .count(),
+            1,
+            "only the terminal-CAS winner cascades Task recovery"
+        );
+
+        let cancelled = ExecutionRepo::get_by_id(&*db, &stale_execution.id)
+            .await
+            .expect("raced execution loads")
+            .expect("raced execution exists");
+        assert_eq!(cancelled.status, ExecutionStatus::Cancelled);
+        let persisted_lease = WorkspaceLeaseRepo::get_by_id(&*db, &successor_lease.id)
+            .await
+            .expect("successor lease loads")
+            .expect("successor lease exists");
+        assert_eq!(persisted_lease.status, "active");
+        assert_eq!(
+            persisted_lease.version, successor_lease.version,
+            "a recovery caller that lost the terminal CAS is inert for successor leases"
         );
     }
 
@@ -2423,29 +3028,39 @@ mod tests {
         )
         .await;
         let execution = seed_running_execution(&db, task.id.clone(), agent.id, None).await;
-        ExecutionRepo::update(
+        let terminalized_at = now_rfc3339();
+        ExecutionRepo::terminalize(
             &*db,
-            UpdateExecution {
-                id: execution.id.clone(),
-                status: Some(ExecutionStatus::Cancelled),
+            TerminalizeExecution {
+                execution_id: execution.id.clone(),
+                expected_version: execution.execution_version,
+                lease_owner: execution.lease_owner.clone(),
+                status: ExecutionStatus::Cancelled,
                 stop_reason: Some(Some(StopReason::CrashRecovery)),
                 stopped_by: Some(Some("system:crash_recovery".to_owned())),
                 resume_policy: Some(Some(ResumePolicy::Manual)),
-                stopped_at: Some(Some(now_rfc3339())),
+                stopped_at: Some(Some(terminalized_at.clone())),
                 agent_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
+                last_progress_at: None,
                 summary: None,
                 logs_path: None,
                 before_sha: None,
                 after_sha: None,
                 error: Some(Some("Recovered".to_owned())),
                 executor_config_snapshot_json: None,
-                updated_at: now_rfc3339(),
+                updated_at: terminalized_at,
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                correlation_id: None,
+                causation_id: None,
+                causation_depth: 0,
+                lease_disposition: ExecutionLeaseDisposition::Revoke,
             },
         )
         .await
-        .expect("execution updates");
+        .expect("execution terminalizes");
         let annotated = stamp_recovery_annotation(&db, &task, Some(&execution.id)).await;
 
         let recovered = CrashRecovery::new(Arc::clone(&db), event_bus)
@@ -2772,6 +3387,28 @@ mod tests {
         .await
         .expect("execution activity updates");
 
+        let execution_for_claim = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("execution reloads")
+            .expect("execution exists");
+        let now = now_rfc3339();
+        assert!(matches!(
+            ExecutionRepo::claim_lease(
+                &*db,
+                db::ClaimExecutionLease {
+                    execution_id: execution.id.clone(),
+                    expected_version: execution_for_claim.execution_version,
+                    owner: "expired-owner".to_owned(),
+                    lease_expires_at: "1970-01-01T00:00:00+00:00".to_owned(),
+                    hard_deadline_at: (Utc::now() + ChronoDuration::hours(1)).to_rfc3339(),
+                    now,
+                },
+            )
+            .await
+            .expect("execution lease claims"),
+            db::ExecutionLeaseMutation::Updated(_)
+        ));
+
         let executor = Arc::new(RecordingCancelExecutor::default());
         let monitor = HeartbeatMonitor::new(Arc::clone(&db), Arc::clone(&event_bus))
             .with_task_executor(executor.clone())
@@ -2854,6 +3491,28 @@ mod tests {
         )
         .await
         .expect("execution activity updates");
+
+        let execution_for_claim = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("execution reloads")
+            .expect("execution exists");
+        let now = now_rfc3339();
+        assert!(matches!(
+            ExecutionRepo::claim_lease(
+                &*db,
+                db::ClaimExecutionLease {
+                    execution_id: execution.id.clone(),
+                    expected_version: execution_for_claim.execution_version,
+                    owner: "expired-owner".to_owned(),
+                    lease_expires_at: "1970-01-01T00:00:00+00:00".to_owned(),
+                    hard_deadline_at: (Utc::now() + ChronoDuration::hours(1)).to_rfc3339(),
+                    now,
+                },
+            )
+            .await
+            .expect("execution lease claims"),
+            db::ExecutionLeaseMutation::Updated(_)
+        ));
 
         let executor = Arc::new(RecordingCancelExecutor::default());
         let monitor = HeartbeatMonitor::new(Arc::clone(&db), Arc::clone(&event_bus))
@@ -3037,29 +3696,39 @@ mod tests {
         )
         .await;
         let execution = seed_running_execution(&db, task.id.clone(), agent.id, None).await;
-        ExecutionRepo::update(
+        let terminalized_at = now_rfc3339();
+        ExecutionRepo::terminalize(
             &*db,
-            UpdateExecution {
-                id: execution.id.clone(),
-                status: Some(ExecutionStatus::Completed),
+            TerminalizeExecution {
+                execution_id: execution.id.clone(),
+                expected_version: execution.execution_version,
+                lease_owner: execution.lease_owner.clone(),
+                status: ExecutionStatus::Completed,
                 stop_reason: None,
                 stopped_by: None,
                 resume_policy: None,
-                stopped_at: Some(Some(now_rfc3339())),
+                stopped_at: Some(Some(terminalized_at.clone())),
                 agent_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
+                last_progress_at: None,
                 summary: None,
                 logs_path: None,
                 before_sha: None,
                 after_sha: None,
                 error: None,
                 executor_config_snapshot_json: None,
-                updated_at: now_rfc3339(),
+                updated_at: terminalized_at,
+                actor_type: "system".to_owned(),
+                actor_id: None,
+                correlation_id: None,
+                causation_id: None,
+                causation_depth: 0,
+                lease_disposition: ExecutionLeaseDisposition::Revoke,
             },
         )
         .await
-        .expect("execution updates");
+        .expect("execution terminalizes");
         stamp_recovery_annotation(&db, &task, Some(&execution.id)).await;
 
         let recovered = CrashRecovery::new(Arc::clone(&db), event_bus)

@@ -106,6 +106,15 @@ impl TaskService {
                 "task_type must be task, planning_task, sub_task, or discovery",
             ));
         }
+        if let (Some(parent_task_id), Some(requested_governance)) =
+            (parent_task_id.as_deref(), governance.as_ref())
+        {
+            let parent = TaskRepo::get_by_id(&*self.db, parent_task_id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", parent_task_id.to_owned()))?;
+            self.validate_adaptive_child_governance(&parent, requested_governance, "split")
+                .await?;
+        }
         let prepared_governance = self
             .prepare_task_governance(&project, repo_id.as_ref(), &effective_task_type, governance)
             .await?;
@@ -344,7 +353,46 @@ impl TaskService {
             .ok_or_else(|| ServiceError::not_found("task", task.id))
     }
 
-    async fn assign_project_default_roles(&self, task: &Task) -> Result<()> {
+    /// Create a replacement through the same Task/governance materializer as
+    /// ordinary proposals. The replacement inherits the source's approved
+    /// baseline boundaries and records both origin and replacement links;
+    /// callers cannot supply a second risk, acceptance, or release contract.
+    pub async fn replace_task(
+        &self,
+        source_task_id: impl Into<String>,
+        title: impl Into<String>,
+        description: Option<String>,
+    ) -> Result<Task> {
+        let source_task_id = source_task_id.into();
+        let source = TaskRepo::get_by_id(&*self.db, &source_task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", source_task_id.clone()))?;
+        let board_revision = TaskBoardRepo::board_revision(&*self.db, &source.project_id).await?;
+        let result = self
+            .execute_adaptive_task_command(AdaptiveTaskCommand::system(
+                source.project_id.clone(),
+                source.id.clone(),
+                source.version,
+                board_revision,
+                AdaptiveTaskOperation::Replace {
+                    title: title.into(),
+                    description,
+                },
+                "Replace Task within the approved adaptive boundary",
+            ))
+            .await?;
+        result
+            .tasks
+            .into_iter()
+            .next()
+            .ok_or_else(|| ServiceError::Db(db::DbError::IdempotencyConflict))
+    }
+
+    pub(super) async fn project_default_role_assignments(
+        &self,
+        task: &Task,
+        mut covered_roles: HashSet<String>,
+    ) -> Result<Vec<CreateTaskRoleAssignment>> {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -353,7 +401,7 @@ impl TaskService {
                 ServiceError::invalid_operation(format!("invalid project settings: {error}"))
             })?;
         if settings.default_role_assignments.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
@@ -362,12 +410,7 @@ impl TaskService {
             .iter()
             .map(|role| role.name.as_str())
             .collect::<HashSet<_>>();
-        let mut covered_roles = TaskRoleAssignmentRepo::list_by_task(&*self.db, &task.id)
-            .await?
-            .into_iter()
-            .map(|assignment| assignment.role_name)
-            .collect::<HashSet<_>>();
-
+        let mut assignments = Vec::new();
         for assignment in settings.default_role_assignments {
             let role_name = assignment.role_name;
             if !workflow_roles.contains(role_name.as_str()) || covered_roles.contains(&role_name) {
@@ -409,22 +452,33 @@ impl TaskService {
                 .map_err(ServiceError::invalid_operation)?;
 
             let now = now_rfc3339();
-            TaskRoleAssignmentRepo::assign(
-                &*self.db,
-                CreateTaskRoleAssignment {
-                    id: new_uuid_v4(),
-                    task_id: task.id.clone(),
-                    role_name: role_name.clone(),
-                    assignee_type: Some(assignee_type),
-                    assignee_id: Some(assignee_id),
-                    created_at: now.clone(),
-                    updated_at: now,
-                },
-            )
-            .await?;
+            assignments.push(CreateTaskRoleAssignment {
+                id: new_uuid_v4(),
+                task_id: task.id.clone(),
+                role_name: role_name.clone(),
+                assignee_type: Some(assignee_type),
+                assignee_id: Some(assignee_id),
+                created_at: now.clone(),
+                updated_at: now,
+            });
             covered_roles.insert(role_name);
         }
 
+        Ok(assignments)
+    }
+
+    async fn assign_project_default_roles(&self, task: &Task) -> Result<()> {
+        let covered_roles = TaskRoleAssignmentRepo::list_by_task(&*self.db, &task.id)
+            .await?
+            .into_iter()
+            .map(|assignment| assignment.role_name)
+            .collect::<HashSet<_>>();
+        for assignment in self
+            .project_default_role_assignments(task, covered_roles)
+            .await?
+        {
+            TaskRoleAssignmentRepo::assign(&*self.db, assignment).await?;
+        }
         Ok(())
     }
 }

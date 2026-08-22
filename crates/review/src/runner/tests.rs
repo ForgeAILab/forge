@@ -240,6 +240,49 @@ fn request(seed: &SeededReview) -> ReviewRequest {
     }
 }
 
+#[tokio::test]
+async fn reviewer_execution_is_owner_bound_at_creation() {
+    let seed = seeded_review(Vec::new()).await;
+    let runner = ReviewRunner::new(
+        Arc::clone(&seed.db),
+        Arc::clone(&seed.event_bus),
+        Arc::new(AdapterRegistry::new()),
+    );
+    let workspace = WorkspaceRepo::get_by_task_id(&*seed.db, &seed.task_id.to_string())
+        .await
+        .expect("workspace lookup succeeds")
+        .expect("seed workspace exists");
+
+    let (execution, owner) = runner
+        .create_reviewer_execution(
+            &seed.task_id.to_string(),
+            &seed.executor_execution_id.to_string(),
+            workspace.id,
+            &request(&seed),
+        )
+        .await
+        .expect("reviewer execution creates with lease");
+
+    assert_eq!(execution.status, ExecutionStatus::Running);
+    assert_eq!(execution.lease_owner.as_deref(), Some(owner.as_str()));
+    assert!(execution.lease_expires_at.is_some());
+    assert!(execution.hard_deadline_at.is_some());
+}
+
+#[test]
+fn review_hard_deadline_uses_timeout_terminal_policy() {
+    let policy = review_terminal_policy(&ReviewError::ExecutionHardDeadline {
+        execution_id: "review-execution".to_owned(),
+    });
+
+    assert_eq!(policy.stop_reason, Some(db::StopReason::AgentTimeout));
+    assert_eq!(
+        policy.stopped_by.as_deref(),
+        Some("system:heartbeat_monitor")
+    );
+    assert_eq!(policy.resume_policy, Some(db::ResumePolicy::Manual));
+}
+
 struct MutatingAuditor;
 
 #[async_trait]
@@ -349,6 +392,81 @@ async fn assistant_entries_are_concatenated_for_verdict_text() {
         .unwrap();
 
     assert_eq!(message, "Verifying...\nAll clear.\n===REVIEW: PASS===");
+}
+
+#[tokio::test]
+async fn shell_auditor_stdout_marker_parses_as_passed() {
+    // A shell auditor has no assistant channel. Its verdict marker arrives as
+    // ordinary stdout, and reading only assistant text made every shell
+    // auditor fail as "verdict marker missing" while its own log contained
+    // the marker.
+    let tempdir = tempfile::tempdir().expect("tempdir creates");
+    let logs_path = tempdir.path().join("auditor.jsonl");
+    write_jsonl_log(
+        &logs_path,
+        vec![
+            (LogKind::Stdout, json!({ "line": "checked index.html" })),
+            (LogKind::Stdout, json!({ "line": "===REVIEW: PASS===" })),
+        ],
+    )
+    .await;
+
+    let message = last_assistant_message(logs_path.to_str().unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(auditor::parse_verdict(&message), AuditorVerdict::Passed);
+}
+
+#[tokio::test]
+async fn shell_auditor_stdout_fail_marker_keeps_its_reason() {
+    let tempdir = tempfile::tempdir().expect("tempdir creates");
+    let logs_path = tempdir.path().join("auditor.jsonl");
+    write_jsonl_log(
+        &logs_path,
+        vec![(
+            LogKind::Stdout,
+            json!({ "line": "===REVIEW: FAIL: no localStorage persistence===" }),
+        )],
+    )
+    .await;
+
+    let message = last_assistant_message(logs_path.to_str().unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        auditor::parse_verdict(&message),
+        AuditorVerdict::Failed {
+            reason: "no localStorage persistence".to_owned()
+        }
+    );
+}
+
+#[tokio::test]
+async fn stdout_lines_stay_separated_so_a_marker_cannot_be_glued_together() {
+    // Two stdout lines must not concatenate into a marker neither one printed.
+    let tempdir = tempfile::tempdir().expect("tempdir creates");
+    let logs_path = tempdir.path().join("auditor.jsonl");
+    write_jsonl_log(
+        &logs_path,
+        vec![
+            (LogKind::Stdout, json!({ "line": "===REVIEW: P" })),
+            (LogKind::Stdout, json!({ "line": "ASS===" })),
+        ],
+    )
+    .await;
+
+    let message = last_assistant_message(logs_path.to_str().unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        auditor::parse_verdict(&message),
+        AuditorVerdict::Failed {
+            reason: "verdict marker missing".to_owned()
+        }
+    );
 }
 
 #[tokio::test]
@@ -499,6 +617,12 @@ async fn codex_auditor_snapshot_carries_resume_thread_hint_for_codex_executor() 
         error: None,
         executor_config_snapshot_json: None,
         workspace_id: Some("workspace".to_owned()),
+        execution_version: 1,
+        lease_owner: None,
+        lease_expires_at: None,
+        hard_deadline_at: None,
+        last_heartbeat_at: None,
+        last_progress_at: None,
         created_at: now.clone(),
         updated_at: now,
     };

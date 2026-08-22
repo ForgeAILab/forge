@@ -141,10 +141,25 @@ async fn mcp_oauth_token_subject_is_used_for_membership() {
         "project membership failures must be JSON-RPC errors, not authentication failures"
     );
     let body = response_json(response).await;
+    assert_eq!(body["result"]["isError"], true);
+    assert_eq!(body["result"]["structuredContent"]["code"], "policy_denied");
+    assert_eq!(body["result"]["structuredContent"]["status"], "failed");
     assert_eq!(
-        body["error"]["message"].as_str(),
-        Some("project not accessible")
+        body["result"]["structuredContent"]["operation"],
+        "forge_list_tasks"
     );
+    assert_eq!(
+        body["result"]["structuredContent"]["scope"],
+        json!({
+            "scope_type": "project",
+            "scope_id": project.id,
+        })
+    );
+    assert_eq!(
+        body["result"]["structuredContent"]["safe_message"],
+        "the caller is not authorized for this operation"
+    );
+    assert!(!body.to_string().contains("project not accessible"));
 }
 
 #[tokio::test]

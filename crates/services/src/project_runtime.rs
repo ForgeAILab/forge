@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+use api_types::ProjectExecutionSetupResponse;
 use db::SqliteDb;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -44,11 +45,16 @@ pub struct ProjectEffectiveStateProjection {
     pub source_project_work_epoch: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectCurrentStateResponse {
     pub scope: String,
     pub effective_state: ProjectEffectiveStateProjection,
+    /// Canonical setup/readiness dimensions are exposed beside the broader
+    /// Project projection so current-state consumers cannot infer them from a
+    /// single readiness boolean.
+    #[serde(default)]
+    pub execution_setup: Option<ProjectExecutionSetupResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1512,6 +1518,7 @@ mod tests {
         let response = ProjectCurrentStateResponse {
             scope: "project".to_owned(),
             effective_state: projection,
+            execution_setup: None,
         };
         let value = serde_json::to_value(&response).expect("response serializes");
         assert_eq!(value["scope"], "project");

@@ -3,8 +3,8 @@ use serde_json::Value;
 use ts_rs::TS;
 
 use crate::{
-    project_hooks::ProjectHookRule, AuthorType, ReviewConfig, ReviewStatus, TaskResponse, WorkMode,
-    WorkflowDefinition,
+    project_hooks::ProjectHookRule, AuthorType, ProjectExecutionSetupResponse, ReviewConfig,
+    ReviewStatus, TaskResponse, WorkMode, WorkflowDefinition,
 };
 
 fn default_json_object() -> Value {
@@ -63,11 +63,13 @@ pub struct DiffEnvelope {
     pub data: DiffResponse,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct ProjectResponse {
     pub id: String,
     pub name: String,
     #[serde(default = "default_json_object")]
+    #[ts(type = "Record<string, unknown>")]
     pub settings: Value,
     #[serde(default)]
     pub project_hooks: Vec<ProjectHookRule>,
@@ -99,6 +101,11 @@ pub struct ProjectResponse {
     pub primary_milestone_id: Option<String>,
     #[serde(default = "default_project_version")]
     pub version: i64,
+    /// The current independent coordination/setup/baseline projection when a
+    /// Project creation command returns this response. Existing read/update
+    /// surfaces may omit it and use the canonical execution-setup endpoint.
+    #[serde(default)]
+    pub execution_setup: Option<ProjectExecutionSetupResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -139,7 +146,7 @@ pub struct UpdateProjectWorkflowRequest {
     pub definition: Option<WorkflowDefinition>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 pub struct RepoResponse {
     pub id: String,
@@ -155,7 +162,7 @@ pub struct RepoResponse {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 pub struct PrProviderStatus {
     pub provider_type: String,

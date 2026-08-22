@@ -306,14 +306,6 @@ pub struct ExecuteOrchestrationActionRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
-#[serde(deny_unknown_fields)]
-pub struct ExecuteTaskProposalRequest {
-    pub expected_version: i64,
-    pub idempotency_key: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
 pub struct ActionExecutionResponse {
     pub id: String,
     pub action_id: String,
@@ -331,9 +323,18 @@ pub struct ActionExecutionResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
-pub struct TaskProposalExecutionResponse {
-    pub action: AgentActionResponse,
-    pub execution: ActionExecutionResponse,
+pub struct TaskProposalCommandResponse {
+    pub operation: String,
+    pub status: String,
+    pub materialized: bool,
+    pub domain_committed: bool,
+    pub receipt_id: String,
+    pub event_id: String,
+    pub input_digest: String,
+    pub policy_result: String,
+    pub correlation_id: String,
+    pub replayed: bool,
+    pub requires_user_authorization: bool,
     pub task: TaskResponse,
 }
 
@@ -362,10 +363,6 @@ mod tests {
         assert_rejects_unknown_field::<ExecuteOrchestrationActionRequest>(json!({
             "expected_version": 1,
             "idempotency_key": "execute-1"
-        }));
-        assert_rejects_unknown_field::<ExecuteTaskProposalRequest>(json!({
-            "expected_version": 1,
-            "idempotency_key": "execute-task-1"
         }));
         assert_rejects_unknown_field::<TaskProposalRequest>(json!({
             "project_id": "project-1",

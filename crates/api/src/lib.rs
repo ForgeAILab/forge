@@ -212,6 +212,26 @@ pub fn api_router(state: AppState) -> Router {
                 .post(routes::execution_baseline::create_execution_baseline),
         )
         .route(
+            "/api/v1/projects/{id}/execution-setup",
+            get(routes::project_execution_setup::get_execution_setup),
+        )
+        .route(
+            "/api/v1/projects/{id}/execution-setup/worker",
+            post(routes::project_execution_setup::select_worker),
+        )
+        .route(
+            "/api/v1/projects/{id}/execution-setup/independent-reviewer",
+            post(routes::project_execution_setup::select_independent_reviewer),
+        )
+        .route(
+            "/api/v1/projects/{id}/execution-setup/repository",
+            post(routes::project_execution_setup::attach_primary_repository),
+        )
+        .route(
+            "/api/v1/projects/{id}/execution-setup/provisioning/retry",
+            post(routes::project_execution_setup::retry_provisioning),
+        )
+        .route(
             "/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions",
             post(routes::execution_baseline::save_execution_baseline_revision),
         )
@@ -912,10 +932,6 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/actions/{id}/execute-orchestration",
             post(routes::coordination::execute_orchestration_action),
-        )
-        .route(
-            "/api/v1/actions/{id}/execute-task",
-            post(routes::coordination::execute_task_proposal),
         )
         .route(
             "/api/v1/executor-types",

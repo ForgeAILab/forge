@@ -12,10 +12,18 @@ async fn subtask_managed_allows_manual_status_transition() {
     let workspace_root = common::TestDir::new("forge-subtask-managed-workspaces");
     let harness = common::test_app(workspace_root.path(), "forge-subtask-managed").await;
     let _ = &harness.state;
-    let (project_id, _repo_id) =
+    let (project_id, repo_id) =
         common::create_project_and_repo(&harness.app, "Subtask Managed", &repo_path).await;
-    let (agent_id, _) =
+    let (agent_id, reviewer_id) =
         common::create_shell_agents(&harness.app, workspace_root.path(), "subtask-managed").await;
+    common::configure_execution_test_setup(
+        &harness.state.db,
+        &project_id,
+        &repo_id,
+        &agent_id,
+        &reviewer_id,
+    )
+    .await;
 
     let root: TaskResponse = common::json_request(
         &harness.app,

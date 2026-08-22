@@ -4,14 +4,16 @@
 //! query.  IDs supplied by a caller are therefore lookup keys only; they are
 //! never treated as authority to cross a Project boundary.
 
+#[cfg(test)]
+use api_types::ProjectDocumentContent;
 use api_types::{
     ApproveDecisionCandidateRequest, ApproveProjectDocumentRequest, AuthorizationProvenance,
     CreateDecisionCandidateRequest, CreateProjectDocumentRequest, DecisionCandidate,
     DecisionCandidateContext, DecisionCandidateListResponse, DecisionClass, DecisionEditorState,
     DecisionRecord, DecisionRecordListResponse, DecisionRecordState, DocumentRevisionLifecycle,
     PrincipalKind, PrincipalRef, ProjectDocument, ProjectDocumentApproval,
-    ProjectDocumentApprovalPolicy, ProjectDocumentContent, ProjectDocumentKind,
-    ProjectDocumentListResponse, ProjectDocumentRevision, ProjectDocumentRevisionDiffResponse,
+    ProjectDocumentApprovalPolicy, ProjectDocumentKind, ProjectDocumentListResponse,
+    ProjectDocumentRevision, ProjectDocumentRevisionDiffResponse,
     ProjectDocumentRevisionListResponse, ProjectDocumentState, RejectDecisionCandidateRequest,
     RevisionProvenance, SaveProjectDocumentRevisionRequest,
 };
@@ -21,18 +23,21 @@ use axum::{
     Json,
 };
 use db::{
-    new_uuid_v4, now_rfc3339, CreateDomainEvent, DomainEventRepo, ProjectDecisionCandidateRecord,
-    ProjectDecisionRecord, ProjectDocumentRecord, ProjectDocumentRevisionRecord, ProjectMemberRepo,
-    ProjectOrchestrationRepo, ProjectRepo,
+    ProjectDecisionCandidateRecord, ProjectDecisionRecord, ProjectDocumentRecord,
+    ProjectDocumentRevisionRecord, ProjectMemberRepo, ProjectOrchestrationRepo, ProjectRepo,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
-use sqlx::{Row, Sqlite, Transaction};
+use serde_json::Value;
+use sqlx::Row;
 
 use crate::{
     errors::{ApiError, ApiResult},
-    routes::{auth::AuthenticatedUser, client_idempotency_key, scoped_idempotency_key},
+    routes::{auth::AuthenticatedUser, client_idempotency_key},
     state::AppState,
+};
+use services::{
+    ProjectArtifactCommandService, ProjectCommandAuthorization, ProjectDocumentApprovalCommand,
+    ProjectDocumentRevisionCommand,
 };
 
 const DOCUMENT_CREATE_ACTION: &str = "project.document.create";
@@ -41,8 +46,6 @@ const DOCUMENT_APPROVE_ACTION: &str = "project.document.approve";
 const DECISION_CANDIDATE_CREATE_ACTION: &str = "project.decision.candidate.create";
 const DECISION_CANDIDATE_APPROVE_ACTION: &str = "project.decision.candidate.approve";
 const DECISION_CANDIDATE_REJECT_ACTION: &str = "project.decision.candidate.reject";
-const DOCUMENT_SCHEMA_VERSION: &str = services::PROJECT_DOCUMENT_SCHEMA_VERSION;
-const DOCUMENT_RENDER_VERSION: &str = services::PROJECT_DOCUMENT_RENDER_VERSION;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -124,7 +127,6 @@ pub async fn create_project_document(
     Path(project_id): Path<String>,
     Json(request): Json<CreateProjectDocumentRequest>,
 ) -> ApiResult<(StatusCode, Json<ProjectDocument>)> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
     validate_authorization(
         &request.mutation.authorization,
         &user.user_id,
@@ -132,181 +134,37 @@ pub async fn create_project_document(
     )?;
     require_idempotency_key(&request.mutation.idempotency_key)?;
     let title = required_text(&request.title, "title")?;
-    let dedupe_key = format!(
-        "project.document.create:{project_id}:{}",
-        request.mutation.idempotency_key
-    );
-    if let Some(event) = DomainEventRepo::get_event_by_dedupe(&*state.db, &dedupe_key).await? {
-        let payload: Value = serde_json::from_str(&event.payload_json)
-            .map_err(|_| ApiError::internal("persisted document event is invalid"))?;
-        let document_id = payload
-            .get("document_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ApiError::internal("persisted document event is missing its document")
-            })?;
-        let document = scoped_document(&state, &project_id, document_id).await?;
-        if payload.get("kind").and_then(Value::as_str) != Some(document.kind.as_str())
-            || payload.get("title").and_then(Value::as_str) != Some(document.title.as_str())
-            || payload.get("approval_policy").and_then(Value::as_str)
-                != Some(document.approval_policy.as_str())
-            || payload
-                .get("expected_project_version")
-                .and_then(Value::as_i64)
-                != Some(request.mutation.expected_version)
-            || payload.get("principal_id").and_then(Value::as_str) != Some(user.user_id.as_str())
-            || payload
-                .get("authorization_event_id")
-                .and_then(Value::as_str)
-                != Some(request.mutation.authorization.event_id.as_str())
-            || payload.get("authorization_basis").and_then(Value::as_str)
-                != Some(request.mutation.authorization.authorization_basis.as_str())
-        {
-            return Err(ApiError::conflict_with_code(
-                "idempotency_conflict",
-                "the idempotency key was already used for a different Project Document",
-            ));
-        }
-        return Ok((StatusCode::OK, Json(document_to_api(document)?)));
-    }
-    // The document row and its replay ledger entry are one authoritative
-    // mutation.  A separate event transaction would leave an un-replayable
-    // document if the process stopped between the two commits.
-    let document_id = new_uuid_v4();
-    let now = now_rfc3339();
-    let kind = document_kind_name(request.kind).to_owned();
-    let approval_policy = approval_policy_name(request.approval_policy).to_owned();
-    let event_id = new_uuid_v4();
-    let mut tx = db::begin_immediate(state.db.pool()).await?;
-    // Lock the Project version before allocating the Document identity.  The
-    // expected version is the Project mutation token for creation, not a
-    // caller-supplied hint which can be ignored while another Project write
-    // races this one.
-    let locked = sqlx::query("UPDATE project SET version = version WHERE id = ? AND version = ?")
-        .bind(&project_id)
-        .bind(request.mutation.expected_version)
-        .execute(&mut *tx)
-        .await
-        .map_err(map_sql_error)?;
-    if locked.rows_affected() != 1 {
-        return Err(ApiError::conflict_with_code(
-            "version_conflict",
-            "the Project changed before the Document was created",
-        ));
-    }
-    let inserted = sqlx::query(
-        "INSERT INTO project_document (
-            id, project_id, kind, title, lifecycle, approval_policy,
-            current_draft_revision_id, current_approved_revision_id,
-            version, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, 'draft', ?, NULL, NULL, 1, ?, ?)",
-    )
-    .bind(&document_id)
-    .bind(&project_id)
-    .bind(&kind)
-    .bind(&title)
-    .bind(&approval_policy)
-    .bind(&now)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await
-    .map_err(map_sql_error)?;
-    if inserted.rows_affected() != 1 {
-        return Err(ApiError::internal("Project Document was not created"));
-    }
-    let project_updated = sqlx::query(
-        "UPDATE project SET version = version + 1, updated_at = ?
-         WHERE id = ? AND version = ?",
-    )
-    .bind(&now)
-    .bind(&project_id)
-    .bind(request.mutation.expected_version)
-    .execute(&mut *tx)
-    .await
-    .map_err(map_sql_error)?;
-    if project_updated.rows_affected() != 1 {
-        return Err(ApiError::conflict_with_code(
-            "version_conflict",
-            "the Project changed before the Document was created",
-        ));
-    }
-    let event = DomainEventRepo::append_event_in_tx(
-        &*state.db,
-        &mut tx,
-        &CreateDomainEvent {
-            id: event_id.clone(),
-            event_type: "project.document.created".to_owned(),
-            entity_type: "project_document".to_owned(),
-            entity_id: document_id.clone(),
-            actor_type: principal_kind_name(request.mutation.authorization.principal.kind)
-                .to_owned(),
-            actor_id: Some(request.mutation.authorization.principal.id.clone()),
-            scope_type: "project".to_owned(),
-            scope_id: project_id.clone(),
-            correlation_id: request.mutation.authorization.event_id.clone(),
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some(dedupe_key),
-            payload_json: json!({
-                "project_id": project_id,
-                "document_id": document_id,
-                "kind": kind,
-                "title": title,
-                "approval_policy": approval_policy,
-                "expected_project_version": request.mutation.expected_version,
-                "principal_id": user.user_id,
-                "authorization_event_id": request.mutation.authorization.event_id,
-                "authorization_basis": request.mutation.authorization.authorization_basis,
-            })
-            .to_string(),
-            created_at: now.clone(),
-        },
-    )
-    .await
-    .map_err(map_event_error)?;
-    // append_event_in_tx returns the existing event for an idempotent replay.
-    // If a concurrent request won the dedupe race, discard this transaction
-    // so it cannot create a second document for the first request's event.
-    if event.id != event_id {
-        tx.rollback().await?;
-        let payload: Value = serde_json::from_str(&event.payload_json)
-            .map_err(|_| ApiError::internal("persisted document event is invalid"))?;
-        let same_request = payload.get("project_id").and_then(Value::as_str)
-            == Some(project_id.as_str())
-            && payload.get("kind").and_then(Value::as_str) == Some(kind.as_str())
-            && payload.get("title").and_then(Value::as_str) == Some(title.as_str())
-            && payload.get("approval_policy").and_then(Value::as_str)
-                == Some(approval_policy.as_str())
-            && payload
-                .get("expected_project_version")
-                .and_then(Value::as_i64)
-                == Some(request.mutation.expected_version)
-            && payload.get("principal_id").and_then(Value::as_str) == Some(user.user_id.as_str())
-            && payload
-                .get("authorization_event_id")
-                .and_then(Value::as_str)
-                == Some(request.mutation.authorization.event_id.as_str())
-            && payload.get("authorization_basis").and_then(Value::as_str)
-                == Some(request.mutation.authorization.authorization_basis.as_str());
-        if !same_request {
-            return Err(ApiError::conflict_with_code(
-                "idempotency_conflict",
-                "the idempotency key was already used for a different Project Document",
-            ));
-        }
-        let existing_id = payload
-            .get("document_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ApiError::internal("persisted document event is missing its document")
-            })?;
-        let existing = scoped_document(&state, &project_id, existing_id).await?;
-        return Ok((StatusCode::OK, Json(document_to_api(existing)?)));
-    }
-    tx.commit().await?;
-    let document = ProjectOrchestrationRepo::get_project_document(&*state.db, &document_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project_document", document_id.clone()))?;
+    let authorization_json = serde_json::to_string(&request.mutation.authorization)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let document = ProjectArtifactCommandService::new(state.db.clone())
+        .create_document(
+            services::ProjectDocumentCreateCommand {
+                project_id,
+                kind: document_kind_name(request.kind).to_owned(),
+                title,
+                approval_policy: approval_policy_name(request.approval_policy).to_owned(),
+                expected_project_version: request.mutation.expected_version,
+                idempotency_key: request.mutation.idempotency_key.clone(),
+                authorization: ProjectCommandAuthorization {
+                    principal_type: "user".to_owned(),
+                    principal_id: user.user_id.clone(),
+                    policy_result: "allowed".to_owned(),
+                    policy_revision: None,
+                    policy_digest: None,
+                    requested_permission: Some(DOCUMENT_CREATE_ACTION.to_owned()),
+                    correlation_id: request.mutation.authorization.event_id.clone(),
+                    causation_id: None,
+                    causation_depth: 0,
+                    authorization_event_id: request.mutation.authorization.event_id.clone(),
+                    authorization_basis: request.mutation.authorization.authorization_basis.clone(),
+                    authorization_action: request.mutation.authorization.action.clone(),
+                    authorization_occurred_at: request.mutation.authorization.occurred_at.clone(),
+                    authorization_json,
+                },
+            },
+            None,
+        )
+        .await?;
     Ok((StatusCode::CREATED, Json(document_to_api(document)?)))
 }
 
@@ -440,329 +298,48 @@ pub async fn save_project_document_revision(
             "HTTP Project Document revisions must be authored by the authenticated user",
         ));
     }
+    let authorization_json = serde_json::to_string(&request.mutation.authorization)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let revision = ProjectArtifactCommandService::new(state.db.clone())
+        .save_document_revision(
+            ProjectDocumentRevisionCommand {
+                project_id: project_id.clone(),
+                document_id: document_id.clone(),
+                kind: None,
+                title: None,
+                approval_policy: None,
+                base_revision_id: request.base_revision_id.clone(),
+                lifecycle: request.lifecycle,
+                content: request.content.clone(),
+                change_summary: request.change_summary.clone(),
+                provenance: request.provenance.clone(),
+                expected_document_version: request.mutation.expected_version,
+                expected_digest: request.mutation.expected_digest.clone(),
+                idempotency_key: request.mutation.idempotency_key.clone(),
+                authorization: ProjectCommandAuthorization {
+                    principal_type: "user".to_owned(),
+                    principal_id: user.user_id.clone(),
+                    policy_result: "allowed".to_owned(),
+                    policy_revision: None,
+                    policy_digest: None,
+                    requested_permission: Some(DOCUMENT_REVISION_SAVE_ACTION.to_owned()),
+                    correlation_id: request.mutation.authorization.event_id.clone(),
+                    causation_id: None,
+                    causation_depth: 0,
+                    authorization_event_id: request.mutation.authorization.event_id.clone(),
+                    authorization_basis: request.mutation.authorization.authorization_basis.clone(),
+                    authorization_action: request.mutation.authorization.action.clone(),
+                    authorization_occurred_at: request.mutation.authorization.occurred_at.clone(),
+                    authorization_json,
+                },
+            },
+            None,
+        )
+        .await?;
     let document = scoped_document(&state, &project_id, &document_id).await?;
-    if !matches!(
-        request.lifecycle,
-        DocumentRevisionLifecycle::Draft | DocumentRevisionLifecycle::Proposed
-    ) {
-        return Err(ApiError::bad_request(
-            "a new Project Document revision must be draft or proposed",
-        ));
-    }
-    validate_content_kind(document_kind(&document)?, &request.content)?;
-    let rendered_view = services::render_project_document(
-        &document.title,
-        document_kind(&document)?,
-        &request.content,
-    );
-    let content_digest = services::document_content_digest(&request.content);
-    let render_digest = services::document_render_digest(DOCUMENT_RENDER_VERSION, &rendered_view);
-    // A Document whose policy is `none` has no approval gate.  Persisting its
-    // accepted revision as merely a draft would leave the artifact unusable
-    // forever because the approval endpoint correctly rejects that policy.
-    // The save therefore promotes that revision atomically; user/agent-gated
-    // policies retain the requested draft/proposed lifecycle.
-    let effective_lifecycle = if document.approval_policy == "none" {
-        "approved"
-    } else {
-        document_revision_lifecycle_name(request.lifecycle)
-    };
-    let source_refs_json = serde_json::to_string(&request.provenance.source_refs)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let dedupe_key = format!(
-        "project.document.revision:{project_id}:{document_id}:{}",
-        request.mutation.idempotency_key
-    );
-    if let Some(event) = DomainEventRepo::get_event_by_dedupe(&*state.db, &dedupe_key).await? {
-        let payload: Value = serde_json::from_str(&event.payload_json)
-            .map_err(|_| ApiError::internal("persisted document revision event is invalid"))?;
-        let same_request = payload.get("project_id").and_then(Value::as_str)
-            == Some(project_id.as_str())
-            && payload.get("document_id").and_then(Value::as_str) == Some(document_id.as_str())
-            && payload.get("content_digest").and_then(Value::as_str)
-                == Some(content_digest.as_str())
-            && payload.get("render_digest").and_then(Value::as_str) == Some(render_digest.as_str())
-            && payload.get("base_revision_id").and_then(Value::as_str)
-                == request.base_revision_id.as_deref()
-            && payload.get("lifecycle").and_then(Value::as_str) == Some(effective_lifecycle)
-            && payload
-                .get("expected_document_version")
-                .and_then(Value::as_i64)
-                == Some(request.mutation.expected_version)
-            && payload.get("expected_digest").and_then(Value::as_str)
-                == request.mutation.expected_digest.as_deref()
-            && payload.get("change_summary").and_then(Value::as_str)
-                == Some(request.change_summary.as_str())
-            && payload.get("source_refs_json").and_then(Value::as_str)
-                == Some(source_refs_json.as_str())
-            && payload.get("principal_id").and_then(Value::as_str) == Some(user.user_id.as_str())
-            && payload
-                .get("authorization_event_id")
-                .and_then(Value::as_str)
-                == Some(request.mutation.authorization.event_id.as_str())
-            && payload.get("authorization_basis").and_then(Value::as_str)
-                == Some(request.mutation.authorization.authorization_basis.as_str());
-        if !same_request {
-            return Err(ApiError::conflict_with_code(
-                "idempotency_conflict",
-                "the idempotency key was already used for a different Project Document revision",
-            ));
-        }
-        let revision_id = payload
-            .get("revision_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ApiError::internal("persisted document revision event is missing its revision")
-            })?;
-        let revision =
-            ProjectOrchestrationRepo::get_project_document_revision(&*state.db, revision_id)
-                .await?
-                .filter(|revision| revision.document_id == document.id)
-                .ok_or_else(|| {
-                    ApiError::not_found("project_document_revision", revision_id.to_owned())
-                })?;
-        return Ok((StatusCode::OK, Json(revision_to_api(&document, revision)?)));
-    }
-    let content_json = serde_json::to_string(&request.content)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let base_revision_id = request.base_revision_id.clone();
-    let revision_id = new_uuid_v4();
-    let created_at = now_rfc3339();
-    let event_id = new_uuid_v4();
-    let mut tx = db::begin_immediate(state.db.pool()).await?;
-    let document_row = sqlx::query(
-        "SELECT version, current_draft_revision_id
-         FROM project_document WHERE id = ? AND project_id = ?",
-    )
-    .bind(&document_id)
-    .bind(&project_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| ApiError::not_found("project_document", document_id.clone()))?;
-    let document_version: i64 = document_row.try_get("version")?;
-    if document_version != request.mutation.expected_version {
-        return Err(ApiError::conflict_with_code(
-            "version_conflict",
-            "the Project Document changed before this revision was saved",
-        ));
-    }
-    let current_draft_revision_id: Option<String> =
-        document_row.try_get("current_draft_revision_id")?;
-    let base_revision = if let Some(base_id) = base_revision_id.as_deref() {
-        let base = sqlx::query(
-            "SELECT revision FROM project_document_revision
-             WHERE id = ? AND document_id = ?",
-        )
-        .bind(base_id)
-        .bind(&document_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project_document_revision", base_id.to_owned()))?;
-        if current_draft_revision_id.as_deref() != Some(base_id) {
-            return Err(ApiError::conflict_with_code(
-                "version_conflict",
-                "the revision base is not the current draft",
-            ));
-        }
-        base.try_get("revision")?
-    } else {
-        if current_draft_revision_id.is_some() {
-            return Err(ApiError::conflict_with_code(
-                "version_conflict",
-                "a revision base is required after the first draft",
-            ));
-        }
-        0
-    };
-    if let Some(expected_digest) = request.mutation.expected_digest.as_deref() {
-        let actual = match current_draft_revision_id.as_deref() {
-            Some(current_id) => {
-                sqlx::query_scalar::<_, String>(
-                    "SELECT content_digest FROM project_document_revision WHERE id = ?",
-                )
-                .bind(current_id)
-                .fetch_optional(&mut *tx)
-                .await?
-            }
-            None => None,
-        };
-        if actual.as_deref() != Some(expected_digest) {
-            return Err(ApiError::conflict_with_code(
-                "digest_conflict",
-                "the current draft digest changed before this revision was saved",
-            ));
-        }
-    }
-    let revision: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(revision), 0) + 1
-         FROM project_document_revision WHERE document_id = ?",
-    )
-    .bind(&document_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    if effective_lifecycle == "approved" {
-        sqlx::query(
-            "UPDATE project_document_revision SET lifecycle = 'superseded'
-             WHERE document_id = ? AND lifecycle = 'approved'",
-        )
-        .bind(&document_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(map_sql_error)?;
-    }
-    sqlx::query(
-        "INSERT INTO project_document_revision (
-            id, document_id, revision, base_revision, base_revision_id, lifecycle,
-            schema_version, render_version, content_json, rendered_view,
-            change_summary, author_type, author_id, source_refs_json,
-            content_digest, rendered_digest, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&revision_id)
-    .bind(&document_id)
-    .bind(revision)
-    .bind(base_revision)
-    .bind(base_revision_id.as_deref())
-    .bind(effective_lifecycle)
-    .bind(DOCUMENT_SCHEMA_VERSION)
-    .bind(DOCUMENT_RENDER_VERSION)
-    .bind(&content_json)
-    .bind(&rendered_view)
-    .bind(&request.change_summary)
-    // HTTP revisions are always user-authored.  Agent/worker provenance is
-    // materialized through a separate Project-Agent service path.
-    .bind(principal_kind_name(PrincipalKind::User))
-    .bind(Some(user.user_id.as_str()))
-    .bind(&source_refs_json)
-    .bind(&content_digest)
-    .bind(&render_digest)
-    .bind(&created_at)
-    .execute(&mut *tx)
-    .await
-    .map_err(map_sql_error)?;
-    let updated = sqlx::query(
-        "UPDATE project_document
-         SET current_draft_revision_id = ?,
-             current_approved_revision_id = CASE WHEN ? = 'approved' THEN ? ELSE current_approved_revision_id END,
-             lifecycle = CASE WHEN ? = 'approved' THEN 'approved' ELSE lifecycle END,
-             version = version + 1, updated_at = ?
-         WHERE id = ? AND project_id = ? AND version = ?",
-    )
-    .bind(&revision_id)
-    .bind(effective_lifecycle)
-    .bind(&revision_id)
-    .bind(effective_lifecycle)
-    .bind(&created_at)
-    .bind(&document_id)
-    .bind(&project_id)
-    .bind(request.mutation.expected_version)
-    .execute(&mut *tx)
-    .await
-    .map_err(map_sql_error)?;
-    if updated.rows_affected() != 1 {
-        return Err(ApiError::conflict_with_code(
-            "version_conflict",
-            "the Project Document changed before this revision was saved",
-        ));
-    }
-    let event = DomainEventRepo::append_event_in_tx(
-        &*state.db,
-        &mut tx,
-        &CreateDomainEvent {
-            id: event_id.clone(),
-            event_type: "project.document.revision_created".to_owned(),
-            entity_type: "project_document_revision".to_owned(),
-            entity_id: revision_id.clone(),
-            actor_type: "user".to_owned(),
-            actor_id: Some(user.user_id.clone()),
-            scope_type: "project".to_owned(),
-            scope_id: project_id.clone(),
-            correlation_id: request.mutation.authorization.event_id.clone(),
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some(dedupe_key),
-            payload_json: json!({
-                "project_id": project_id,
-                "document_id": document_id,
-                "revision_id": revision_id,
-                "content_digest": content_digest,
-                "render_digest": render_digest,
-                "base_revision_id": base_revision_id,
-                "lifecycle": effective_lifecycle,
-                "auto_approved": effective_lifecycle == "approved"
-                    && document.approval_policy == "none",
-                "expected_document_version": request.mutation.expected_version,
-                "expected_digest": request.mutation.expected_digest,
-                "change_summary": request.change_summary,
-                "source_refs_json": source_refs_json,
-                "principal_id": user.user_id,
-                "authorization_event_id": request.mutation.authorization.event_id,
-                "authorization_basis": request.mutation.authorization.authorization_basis,
-            })
-            .to_string(),
-            created_at: created_at.clone(),
-        },
-    )
-    .await
-    .map_err(map_event_error)?;
-    if event.id != event_id {
-        tx.rollback().await?;
-        let payload: Value = serde_json::from_str(&event.payload_json)
-            .map_err(|_| ApiError::internal("persisted document revision event is invalid"))?;
-        let same_request = payload.get("project_id").and_then(Value::as_str)
-            == Some(project_id.as_str())
-            && payload.get("document_id").and_then(Value::as_str) == Some(document_id.as_str())
-            && payload.get("content_digest").and_then(Value::as_str)
-                == Some(content_digest.as_str())
-            && payload.get("render_digest").and_then(Value::as_str) == Some(render_digest.as_str())
-            && payload.get("base_revision_id").and_then(Value::as_str)
-                == base_revision_id.as_deref()
-            && payload.get("lifecycle").and_then(Value::as_str) == Some(effective_lifecycle)
-            && payload
-                .get("expected_document_version")
-                .and_then(Value::as_i64)
-                == Some(request.mutation.expected_version)
-            && payload.get("expected_digest").and_then(Value::as_str)
-                == request.mutation.expected_digest.as_deref()
-            && payload.get("change_summary").and_then(Value::as_str)
-                == Some(request.change_summary.as_str())
-            && payload.get("source_refs_json").and_then(Value::as_str)
-                == Some(source_refs_json.as_str())
-            && payload.get("principal_id").and_then(Value::as_str) == Some(user.user_id.as_str())
-            && payload
-                .get("authorization_event_id")
-                .and_then(Value::as_str)
-                == Some(request.mutation.authorization.event_id.as_str())
-            && payload.get("authorization_basis").and_then(Value::as_str)
-                == Some(request.mutation.authorization.authorization_basis.as_str());
-        if !same_request {
-            return Err(ApiError::conflict_with_code(
-                "idempotency_conflict",
-                "the idempotency key was already used for a different Project Document revision",
-            ));
-        }
-        let existing_id = payload
-            .get("revision_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ApiError::internal("persisted document revision event is missing its revision")
-            })?;
-        let existing =
-            ProjectOrchestrationRepo::get_project_document_revision(&*state.db, existing_id)
-                .await?
-                .filter(|revision| revision.document_id == document.id)
-                .ok_or_else(|| {
-                    ApiError::not_found("project_document_revision", existing_id.to_owned())
-                })?;
-        return Ok((StatusCode::OK, Json(revision_to_api(&document, existing)?)));
-    }
-    tx.commit().await?;
-    let record = ProjectOrchestrationRepo::get_project_document_revision(&*state.db, &revision_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project_document_revision", revision_id.clone()))?;
     Ok((
         StatusCode::CREATED,
-        Json(revision_to_api(&document, record)?),
+        Json(revision_to_api(&document, revision)?),
     ))
 }
 
@@ -779,98 +356,44 @@ pub async fn approve_project_document(
             "the approval document_id must match the path",
         ));
     }
-    let revision_id = request.revision_id.clone();
-    let document = scoped_document(&state, &project_id, &document_id).await?;
-    if document.approval_policy == "none" {
-        return Err(ApiError::conflict_with_code(
-            "document.approval_not_required",
-            "this Project Document does not have an approval policy",
-        ));
-    }
-    if document.approval_policy == "project_agent" {
-        return Err(ApiError::forbidden_with_code(
-            "document.approval_policy",
-            "this Project Document requires the bound Project Agent",
-        ));
-    }
-    let expected_document_version = request.mutation.expected_version;
-    let content_digest = request.content_digest.clone();
-    let render_digest = request.render_digest.clone();
-    let idempotency_key = request.mutation.idempotency_key.clone();
-    let storage_idempotency_key = scoped_idempotency_key(
-        "document-approval",
-        &project_id,
-        &user.user_id,
-        &idempotency_key,
-    );
-    let authorization = request.mutation.authorization.clone();
-    let principal_id = user.user_id.clone();
-    let now = now_rfc3339();
-    let dedupe_key =
-        format!("project.document.approve:{project_id}:{document_id}:{idempotency_key}");
-    let replay = DomainEventRepo::get_event_by_dedupe(&*state.db, &dedupe_key).await?;
-    if let Some(event) = replay.as_ref() {
-        let payload: Value = serde_json::from_str(&event.payload_json)
-            .map_err(|_| ApiError::internal("persisted document approval event is invalid"))?;
-        let same_request = document_approval_replay_matches(
-            &payload,
-            &project_id,
-            &document_id,
-            &revision_id,
-            &content_digest,
-            &render_digest,
-            expected_document_version,
-            &principal_id,
-            &authorization,
-        );
-        if !same_request {
-            return Err(ApiError::conflict_with_code(
-                "idempotency_conflict",
-                "the idempotency key was already used for a different Document approval",
-            ));
-        }
-    }
-    let mut tx = db::begin_immediate(state.db.pool()).await?;
-    if let Some(row) =
-        sqlx::query("SELECT * FROM project_document_approval WHERE idempotency_key = ?")
-            .bind(&storage_idempotency_key)
-            .fetch_optional(&mut *tx)
-            .await?
+    let authorization_json = serde_json::to_string(&request.mutation.authorization)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let command = ProjectDocumentApprovalCommand {
+        project_id: project_id.clone(),
+        document_id: document_id.clone(),
+        revision_id: request.revision_id.clone(),
+        content_digest: request.content_digest.clone(),
+        rendered_digest: request.render_digest.clone(),
+        expected_document_version: request.mutation.expected_version,
+        idempotency_key: request.mutation.idempotency_key.clone(),
+        authorization: ProjectCommandAuthorization {
+            principal_type: "user".to_owned(),
+            principal_id: user.user_id.clone(),
+            policy_result: "allowed".to_owned(),
+            policy_revision: None,
+            policy_digest: None,
+            requested_permission: Some(DOCUMENT_APPROVE_ACTION.to_owned()),
+            correlation_id: request.mutation.authorization.event_id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            authorization_event_id: request.mutation.authorization.event_id.clone(),
+            authorization_basis: request.mutation.authorization.authorization_basis.clone(),
+            authorization_action: request.mutation.authorization.action.clone(),
+            authorization_occurred_at: request.mutation.authorization.occurred_at.clone(),
+            authorization_json,
+        },
+    };
+    let service = ProjectArtifactCommandService::new(state.db.clone());
+    if let Some(approval) = service
+        .replay_document_approval_if_present(&command)
+        .await?
     {
-        let record = document_approval_record_from_row(row)?;
-        if record.document_id != document_id
-            || record.revision_id != revision_id
-            || record.content_digest != content_digest
-            || record.rendered_digest != render_digest
-            || record.principal_type != "user"
-            || record.principal_id != principal_id
-            || record.authorization_basis != authorization.authorization_basis
-            || record.authorization_action != authorization.action
-            || record.explicit_event != authorization.event_id
-            || record.authorization_occurred_at != authorization.occurred_at
-        {
-            return Err(ApiError::conflict_with_code(
-                "idempotency_conflict",
-                "the idempotency key was already used for a different Document approval",
-            ));
-        }
-        // A new approval and its event are committed together.  If a row is
-        // visible without the corresponding replay event, fail closed rather
-        // than inventing a compatibility repair for an invalid state.
-        if replay.is_none() {
-            return Err(ApiError::internal(
-                "persisted document approval is missing its replay event",
-            ));
-        }
-        tx.commit().await?;
         return Ok((
             StatusCode::OK,
-            Json(approval_to_api(record, expected_document_version)?),
-        ));
-    }
-    if replay.is_some() {
-        return Err(ApiError::internal(
-            "persisted document approval event is missing its approval",
+            Json(approval_to_api(
+                approval,
+                request.mutation.expected_version,
+            )?),
         ));
     }
     validate_authorization(
@@ -878,207 +401,17 @@ pub async fn approve_project_document(
         &user.user_id,
         DOCUMENT_APPROVE_ACTION,
     )?;
-    let document_row = sqlx::query(
-        "SELECT version FROM project_document
-         WHERE id = ? AND project_id = ?",
-    )
-    .bind(&document_id)
-    .bind(&project_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| ApiError::not_found("project_document", document_id.clone()))?;
-    let document_version: i64 = document_row.try_get("version")?;
-    if document_version != expected_document_version {
-        return Err(ApiError::conflict_with_code(
-            "version_conflict",
-            "the Project Document changed before approval",
-        ));
-    }
-    let target = sqlx::query(
-        "SELECT lifecycle FROM project_document_revision
-         WHERE id = ? AND document_id = ? AND content_digest = ?
-           AND rendered_digest = ?",
-    )
-    .bind(&revision_id)
-    .bind(&document_id)
-    .bind(&content_digest)
-    .bind(&render_digest)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| {
-        ApiError::conflict_with_code(
-            "digest_conflict",
-            "the approval digests do not match the target revision",
-        )
-    })?;
-    let target_lifecycle: String = target.try_get("lifecycle")?;
-    if matches!(
-        target_lifecycle.as_str(),
-        "rejected" | "withdrawn" | "superseded"
-    ) {
-        return Err(ApiError::conflict_with_code(
-            "document_revision.inactive",
-            "the target revision is no longer approvable",
-        ));
-    }
-    sqlx::query(
-        "UPDATE project_document_revision SET lifecycle = 'superseded'
-         WHERE document_id = ? AND lifecycle = 'approved' AND id != ?",
-    )
-    .bind(&document_id)
-    .bind(&revision_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(map_sql_error)?;
-    let approved = sqlx::query(
-        "UPDATE project_document_revision SET lifecycle = 'approved'
-         WHERE id = ? AND document_id = ? AND lifecycle != 'approved'",
-    )
-    .bind(&revision_id)
-    .bind(&document_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(map_sql_error)?;
-    if approved.rows_affected() != 1 {
-        return Err(ApiError::conflict_with_code(
-            "document_revision.conflict",
-            "the target revision changed before approval",
-        ));
-    }
-    let updated = sqlx::query(
-        "UPDATE project_document
-         SET current_approved_revision_id = ?, lifecycle = 'approved',
-             version = version + 1, updated_at = ?
-         WHERE id = ? AND project_id = ? AND version = ?",
-    )
-    .bind(&revision_id)
-    .bind(&now)
-    .bind(&document_id)
-    .bind(&project_id)
-    .bind(expected_document_version)
-    .execute(&mut *tx)
-    .await
-    .map_err(map_sql_error)?;
-    if updated.rows_affected() != 1 {
-        return Err(ApiError::conflict_with_code(
-            "version_conflict",
-            "the Project Document changed before approval",
-        ));
-    }
-    let approval_id = new_uuid_v4();
-    sqlx::query(
-        "INSERT INTO project_document_approval (
-            id, document_id, revision_id, principal_type, principal_id,
-            authorization_basis, authorization_action, explicit_event,
-            authorization_occurred_at, content_digest, rendered_digest,
-            lifecycle, idempotency_key, version, created_at, updated_at
-         ) VALUES (?, ?, ?, 'user', ?, ?, ?, ?, ?, ?, ?, 'active', ?, 1, ?, ?)",
-    )
-    .bind(&approval_id)
-    .bind(&document_id)
-    .bind(&revision_id)
-    .bind(&principal_id)
-    .bind(&authorization.authorization_basis)
-    .bind(&authorization.action)
-    .bind(&authorization.event_id)
-    .bind(&authorization.occurred_at)
-    .bind(&content_digest)
-    .bind(&render_digest)
-    .bind(&storage_idempotency_key)
-    .bind(&now)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await
-    .map_err(map_sql_error)?;
-    let event_id = new_uuid_v4();
-    let event = DomainEventRepo::append_event_in_tx(
-        &*state.db,
-        &mut tx,
-        &CreateDomainEvent {
-            id: event_id.clone(),
-            event_type: "project.document.approved".to_owned(),
-            entity_type: "project_document_approval".to_owned(),
-            entity_id: approval_id.clone(),
-            actor_type: "user".to_owned(),
-            actor_id: Some(principal_id.clone()),
-            scope_type: "project".to_owned(),
-            scope_id: project_id.clone(),
-            correlation_id: authorization.event_id.clone(),
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some(dedupe_key),
-            payload_json: json!({
-                "project_id": project_id,
-                "document_id": document_id,
-                "revision_id": revision_id,
-                "approval_id": approval_id,
-                "content_digest": content_digest,
-                "render_digest": render_digest,
-                "expected_document_version": expected_document_version,
-                "principal_id": principal_id,
-                "authorization_principal": authorization.principal,
-                "authorization_basis": authorization.authorization_basis,
-                "authorization_action": authorization.action,
-                "authorization_event_id": authorization.event_id,
-                "authorization_occurred_at": authorization.occurred_at,
-            })
-            .to_string(),
-            created_at: now.clone(),
-        },
-    )
-    .await
-    .map_err(map_event_error)?;
-    if event.id != event_id {
-        tx.rollback().await?;
-        let payload: Value = serde_json::from_str(&event.payload_json)
-            .map_err(|_| ApiError::internal("persisted document approval event is invalid"))?;
-        let same_request = document_approval_replay_matches(
-            &payload,
-            &project_id,
-            &document_id,
-            &revision_id,
-            &content_digest,
-            &render_digest,
-            expected_document_version,
-            &principal_id,
-            &authorization,
-        );
-        if !same_request {
-            return Err(ApiError::conflict_with_code(
-                "idempotency_conflict",
-                "the idempotency key was already used for a different Document approval",
-            ));
-        }
-        let existing_id = payload
-            .get("approval_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ApiError::internal("persisted approval event is missing its approval")
-            })?;
-        let existing = sqlx::query("SELECT * FROM project_document_approval WHERE id = ?")
-            .bind(existing_id)
-            .fetch_optional(state.db.pool())
-            .await?
-            .ok_or_else(|| {
-                ApiError::not_found("project_document_approval", existing_id.to_owned())
-            })?;
-        return Ok((
-            StatusCode::OK,
-            Json(approval_to_api(
-                document_approval_record_from_row(existing)?,
-                expected_document_version,
-            )?),
-        ));
-    }
-    let row = sqlx::query("SELECT * FROM project_document_approval WHERE id = ?")
-        .bind(&approval_id)
-        .fetch_one(&mut *tx)
-        .await?;
-    let record = document_approval_record_from_row(row)?;
-    tx.commit().await?;
+    let (approval, replayed) = service.approve_document_with_status(command, None).await?;
     Ok((
-        StatusCode::CREATED,
-        Json(approval_to_api(record, expected_document_version)?),
+        if replayed {
+            StatusCode::OK
+        } else {
+            StatusCode::CREATED
+        },
+        Json(approval_to_api(
+            approval,
+            request.mutation.expected_version,
+        )?),
     ))
 }
 
@@ -1142,237 +475,30 @@ pub async fn create_decision_candidate(
     )?;
     require_idempotency_key(&request.mutation.idempotency_key)?;
     let question = required_text(&request.question, "question")?;
-    let mut context = serde_json::to_value(&request.context)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    if !context.is_object() {
-        context = json!({ "summary": context });
-    }
-    context["decision_class"] =
-        Value::String(decision_class_name(request.decision_class).to_owned());
-    let context_json = context.to_string();
-    let options_json = serde_json::to_string(&request.options)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let source_refs_json = serde_json::to_string(&request.source_refs)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let dedupe_key = format!(
-        "project.decision.candidate.create:{project_id}:{}",
-        request.mutation.idempotency_key
-    );
-    if let Some(event) = DomainEventRepo::get_event_by_dedupe(&*state.db, &dedupe_key).await? {
-        let payload: Value = serde_json::from_str(&event.payload_json)
-            .map_err(|_| ApiError::internal("persisted decision candidate event is invalid"))?;
-        let same_request = payload.get("project_id").and_then(Value::as_str)
-            == Some(project_id.as_str())
-            && payload.get("question").and_then(Value::as_str) == Some(question.as_str())
-            && payload.get("decision_class").and_then(Value::as_str)
-                == Some(decision_class_name(request.decision_class))
-            && payload.get("context_json").and_then(Value::as_str) == Some(context_json.as_str())
-            && payload.get("options_json").and_then(Value::as_str) == Some(options_json.as_str())
-            && payload
-                .get("expected_project_version")
-                .and_then(Value::as_i64)
-                == Some(request.mutation.expected_version)
-            && payload
-                .get("selected_outcome")
-                .cloned()
-                .unwrap_or(Value::Null)
-                == request
-                    .selected_outcome
-                    .clone()
-                    .map(Value::String)
-                    .unwrap_or(Value::Null)
-            && payload.get("rationale").cloned().unwrap_or(Value::Null)
-                == request
-                    .rationale
-                    .clone()
-                    .map(Value::String)
-                    .unwrap_or(Value::Null)
-            && payload.get("source_refs_json").and_then(Value::as_str)
-                == Some(source_refs_json.as_str())
-            && payload.get("principal_id").and_then(Value::as_str) == Some(user.user_id.as_str())
-            && payload
-                .get("authorization_event_id")
-                .and_then(Value::as_str)
-                == Some(request.mutation.authorization.event_id.as_str())
-            && payload.get("authorization_basis").and_then(Value::as_str)
-                == Some(request.mutation.authorization.authorization_basis.as_str());
-        if !same_request {
-            return Err(ApiError::conflict_with_code(
-                "idempotency_conflict",
-                "the idempotency key was already used for a different Decision candidate",
-            ));
-        }
-        let candidate_id = payload
-            .get("candidate_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ApiError::internal("persisted decision candidate event is missing its candidate")
-            })?;
-        let candidate =
-            ProjectOrchestrationRepo::get_project_decision_candidate(&*state.db, candidate_id)
-                .await?
-                .filter(|candidate| candidate.project_id == project_id)
-                .ok_or_else(|| {
-                    ApiError::not_found("decision_candidate", candidate_id.to_owned())
-                })?;
-        return Ok((StatusCode::OK, Json(candidate_to_api(candidate)?)));
-    }
-    let now = now_rfc3339();
-    let candidate_id = new_uuid_v4();
-    let event_id = new_uuid_v4();
-    let mut tx = db::begin_immediate(state.db.pool()).await?;
-    let project = sqlx::query("SELECT version FROM project WHERE id = ?")
-        .bind(&project_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.clone()))?;
-    let project_version: i64 = project.try_get("version")?;
-    if project_version != request.mutation.expected_version {
-        return Err(ApiError::conflict_with_code(
-            "version_conflict",
-            "the Project changed before the Decision candidate was created",
-        ));
-    }
-    validate_decision_context_in_tx(&mut tx, &project_id, &context).await?;
-    sqlx::query(
-        "INSERT INTO project_decision_candidate (
-            id, project_id, lifecycle, question, context_json, options_json,
-            selected_outcome, rationale, principal_type, principal_id,
-            source_refs_json, expected_project_version, effective_decision_id,
-            version, created_at, updated_at
-         ) VALUES (?, ?, 'proposed', ?, ?, ?, ?, ?, 'user', ?, ?, ?, NULL, 1, ?, ?)",
-    )
-    .bind(&candidate_id)
-    .bind(&project_id)
-    .bind(&question)
-    .bind(&context_json)
-    .bind(&options_json)
-    .bind(request.selected_outcome.as_deref())
-    .bind(request.rationale.as_deref())
-    .bind(user.user_id.as_str())
-    .bind(&source_refs_json)
-    .bind(request.mutation.expected_version)
-    .bind(&now)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await
-    .map_err(map_sql_error)?;
-    let project_updated = sqlx::query(
-        "UPDATE project SET version = version + 1, updated_at = ?
-         WHERE id = ? AND version = ?",
-    )
-    .bind(&now)
-    .bind(&project_id)
-    .bind(request.mutation.expected_version)
-    .execute(&mut *tx)
-    .await
-    .map_err(map_sql_error)?;
-    if project_updated.rows_affected() != 1 {
-        return Err(ApiError::conflict_with_code(
-            "version_conflict",
-            "the Project changed before the Decision candidate was created",
-        ));
-    }
-    let event = DomainEventRepo::append_event_in_tx(
-        &*state.db,
-        &mut tx,
-        &CreateDomainEvent {
-            id: event_id.clone(),
-            event_type: "project.decision.candidate_created".to_owned(),
-            entity_type: "project_decision_candidate".to_owned(),
-            entity_id: candidate_id.clone(),
-            actor_type: "user".to_owned(),
-            actor_id: Some(user.user_id.clone()),
-            scope_type: "project".to_owned(),
-            scope_id: project_id.clone(),
-            correlation_id: request.mutation.authorization.event_id.clone(),
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some(dedupe_key),
-            payload_json: json!({
-                "project_id": project_id,
-                "candidate_id": candidate_id,
-                "question": question,
-                "decision_class": decision_class_name(request.decision_class),
-                "context_json": context_json,
-                "options_json": options_json,
-                "selected_outcome": request.selected_outcome,
-                "rationale": request.rationale,
-                "source_refs_json": source_refs_json,
-                "expected_project_version": request.mutation.expected_version,
-                "principal_id": user.user_id,
-                "authorization_event_id": request.mutation.authorization.event_id,
-                "authorization_basis": request.mutation.authorization.authorization_basis,
-            })
-            .to_string(),
-            created_at: now.clone(),
-        },
-    )
-    .await
-    .map_err(map_event_error)?;
-    if event.id != event_id {
-        tx.rollback().await?;
-        let payload: Value = serde_json::from_str(&event.payload_json)
-            .map_err(|_| ApiError::internal("persisted decision candidate event is invalid"))?;
-        let same_request = payload.get("project_id").and_then(Value::as_str)
-            == Some(project_id.as_str())
-            && payload.get("question").and_then(Value::as_str) == Some(question.as_str())
-            && payload.get("decision_class").and_then(Value::as_str)
-                == Some(decision_class_name(request.decision_class))
-            && payload.get("context_json").and_then(Value::as_str) == Some(context_json.as_str())
-            && payload.get("options_json").and_then(Value::as_str) == Some(options_json.as_str())
-            && payload.get("source_refs_json").and_then(Value::as_str)
-                == Some(source_refs_json.as_str())
-            && payload
-                .get("expected_project_version")
-                .and_then(Value::as_i64)
-                == Some(request.mutation.expected_version)
-            && payload
-                .get("selected_outcome")
-                .cloned()
-                .unwrap_or(Value::Null)
-                == request
-                    .selected_outcome
-                    .clone()
-                    .map(Value::String)
-                    .unwrap_or(Value::Null)
-            && payload.get("rationale").cloned().unwrap_or(Value::Null)
-                == request
-                    .rationale
-                    .clone()
-                    .map(Value::String)
-                    .unwrap_or(Value::Null)
-            && payload.get("principal_id").and_then(Value::as_str) == Some(user.user_id.as_str())
-            && payload
-                .get("authorization_event_id")
-                .and_then(Value::as_str)
-                == Some(request.mutation.authorization.event_id.as_str())
-            && payload.get("authorization_basis").and_then(Value::as_str)
-                == Some(request.mutation.authorization.authorization_basis.as_str());
-        if !same_request {
-            return Err(ApiError::conflict_with_code(
-                "idempotency_conflict",
-                "the idempotency key was already used for a different Decision candidate",
-            ));
-        }
-        let existing_id = payload
-            .get("candidate_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ApiError::internal("persisted decision event is missing its candidate")
-            })?;
-        let existing =
-            ProjectOrchestrationRepo::get_project_decision_candidate(&*state.db, existing_id)
-                .await?
-                .filter(|candidate| candidate.project_id == project_id)
-                .ok_or_else(|| ApiError::not_found("decision_candidate", existing_id.to_owned()))?;
-        return Ok((StatusCode::OK, Json(candidate_to_api(existing)?)));
-    }
-    tx.commit().await?;
-    let record =
-        ProjectOrchestrationRepo::get_project_decision_candidate(&*state.db, &candidate_id)
-            .await?
-            .ok_or_else(|| ApiError::not_found("decision_candidate", candidate_id.clone()))?;
+    let authorization = decision_authorization(
+        &request.mutation.authorization,
+        &user.user_id,
+        DECISION_CANDIDATE_CREATE_ACTION,
+    )?;
+    let record = services::ProjectDecisionCommandService::new(state.db.clone())
+        .create_candidate(
+            services::ProjectDecisionCandidateCommand {
+                project_id,
+                question,
+                context: request.context,
+                options: request.options,
+                selected_outcome: request.selected_outcome,
+                rationale: request.rationale,
+                decision_class: request.decision_class,
+                source_refs: request.source_refs,
+                expected_project_version: request.mutation.expected_version,
+                reconciliation_reason: None,
+                idempotency_key: request.mutation.idempotency_key,
+                authorization,
+            },
+            None,
+        )
+        .await?;
     Ok((StatusCode::CREATED, Json(candidate_to_api(record)?)))
 }
 
@@ -1403,294 +529,23 @@ pub async fn approve_decision_candidate(
         DECISION_CANDIDATE_APPROVE_ACTION,
     )?;
     require_idempotency_key(&request.mutation.idempotency_key)?;
-    let dedupe_key = format!(
-        "project.decision.approve:{project_id}:{candidate_id}:{}",
-        request.mutation.idempotency_key
-    );
-    if let Some(event) = DomainEventRepo::get_event_by_dedupe(&*state.db, &dedupe_key).await? {
-        let payload: Value = serde_json::from_str(&event.payload_json)
-            .map_err(|_| ApiError::internal("persisted decision approval event is invalid"))?;
-        let same_request = payload.get("project_id").and_then(Value::as_str)
-            == Some(project_id.as_str())
-            && payload.get("candidate_id").and_then(Value::as_str) == Some(candidate_id.as_str())
-            && payload
-                .get("expected_project_version")
-                .and_then(Value::as_i64)
-                == Some(request.mutation.expected_version)
-            && payload.get("authorization_basis").and_then(Value::as_str)
-                == Some(request.mutation.authorization.authorization_basis.as_str())
-            && payload
-                .get("authorization_event_id")
-                .and_then(Value::as_str)
-                == Some(request.mutation.authorization.event_id.as_str())
-            && payload.get("principal_id").and_then(Value::as_str) == Some(user.user_id.as_str());
-        if !same_request {
-            return Err(ApiError::conflict_with_code(
-                "idempotency_conflict",
-                "the idempotency key was already used for a different Decision approval",
-            ));
-        }
-        let decision_id = payload
-            .get("decision_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ApiError::internal("persisted decision approval event is missing its Decision")
-            })?;
-        let record = get_decision_record(&state, &project_id, decision_id).await?;
-        return Ok((StatusCode::OK, Json(decision_to_api(record)?)));
-    }
-    let now = now_rfc3339();
-    let mut tx = db::begin_immediate(state.db.pool()).await?;
-    let project =
-        sqlx::query("SELECT version, current_charter_revision_id FROM project WHERE id = ?")
-            .bind(&project_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| ApiError::not_found("project", project_id.clone()))?;
-    let project_version: i64 = project.try_get("version")?;
-    if project_version != request.mutation.expected_version {
-        return Err(ApiError::conflict_with_code(
-            "version_conflict",
-            "the Project changed before the decision was approved",
-        ));
-    }
-    let candidate = sqlx::query(
-        "SELECT * FROM project_decision_candidate
-         WHERE id = ? AND project_id = ?",
-    )
-    .bind(&candidate_id)
-    .bind(&project_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| ApiError::not_found("decision_candidate", candidate_id.clone()))?;
-    let lifecycle: String = candidate.try_get("lifecycle")?;
-    if !matches!(lifecycle.as_str(), "draft" | "proposed") {
-        return Err(ApiError::conflict_with_code(
-            "decision_candidate.inactive",
-            "the decision candidate is no longer awaiting approval",
-        ));
-    }
-    let question: String = candidate.try_get("question")?;
-    let context_json: String = candidate.try_get("context_json")?;
-    let options_json: String = candidate.try_get("options_json")?;
-    let selected_outcome: String = candidate
-        .try_get::<Option<String>, _>("selected_outcome")?
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            ApiError::conflict_with_code(
-                "decision_candidate.incomplete",
-                "selected_outcome is required",
-            )
-        })?;
-    let rationale: String = candidate
-        .try_get::<Option<String>, _>("rationale")?
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            ApiError::conflict_with_code("decision_candidate.incomplete", "rationale is required")
-        })?;
-    let context_value: Value = serde_json::from_str(&context_json)
-        .map_err(|_| ApiError::internal("persisted decision candidate context is invalid"))?;
-    let decision_class = context_value
-        .get("decision_class")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::internal("decision candidate is missing its decision class"))?
-        .to_owned();
-    if !matches!(
-        decision_class.as_str(),
-        "user_scope" | "project_implementation" | "policy" | "waiver"
-    ) {
-        return Err(ApiError::internal(
-            "decision candidate has an invalid decision class",
-        ));
-    }
-    validate_decision_context_in_tx(&mut tx, &project_id, &context_value).await?;
-    let supersedes_decision_id = context_value
-        .get("supersedes_decision_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned);
-    let invalidates_decision_id = context_value
-        .get("invalidates_decision_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned);
-    if supersedes_decision_id.is_some() && invalidates_decision_id.is_some() {
-        return Err(ApiError::bad_request(
-            "a Decision candidate may supersede or invalidate one Decision, not both",
-        ));
-    }
-    let invalidates = invalidates_decision_id.is_some();
-    let target_decision_id = supersedes_decision_id
-        .clone()
-        .or(invalidates_decision_id.clone());
-    if let Some(target_id) = target_decision_id.as_deref() {
-        let target_exists: Option<String> =
-            sqlx::query_scalar("SELECT id FROM project_decision WHERE id = ? AND project_id = ?")
-                .bind(target_id)
-                .bind(&project_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        if target_exists.is_none() {
-            return Err(ApiError::not_found("decision", target_id.to_owned()));
-        }
-    }
-    let source_refs_json: String = candidate.try_get("source_refs_json")?;
-    let affected_records_json = json!({
-        "artifact_refs": context_value
-            .get("affected_artifact_refs")
-            .cloned()
-            .unwrap_or_else(|| json!([])),
-        "task_ids": context_value
-            .get("affected_task_ids")
-            .cloned()
-            .unwrap_or_else(|| json!([])),
-        "milestone_ids": context_value
-            .get("affected_milestone_ids")
-            .cloned()
-            .unwrap_or_else(|| json!([])),
-    })
-    .to_string();
-    let charter_revision_id = context_value
-        .get("governing_charter_revision_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .or(project.try_get("current_charter_revision_id")?);
-    let baseline_revision_id = context_value
-        .get("governing_baseline_revision_id")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let decision_id = new_uuid_v4();
-    sqlx::query(
-        "INSERT INTO project_decision (
-            id, project_id, state, decision_class, question, context_json,
-            options_json, selected_outcome, rationale, principal_type,
-            principal_id, authority_basis, charter_revision_id,
-            baseline_revision_id, source_refs_json, affected_records_json,
-            supersedes_decision_id, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'user', ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&decision_id)
-    .bind(&project_id)
-    .bind(if invalidates { "invalidated" } else { "active" })
-    .bind(&decision_class)
-    .bind(&question)
-    .bind(&context_json)
-    .bind(&options_json)
-    .bind(&selected_outcome)
-    .bind(&rationale)
-    .bind(&user.user_id)
-    .bind(&request.mutation.authorization.authorization_basis)
-    .bind(charter_revision_id.as_deref())
-    .bind(baseline_revision_id.as_deref())
-    .bind(&source_refs_json)
-    .bind(&affected_records_json)
-    .bind(target_decision_id.as_deref())
-    .bind(&now)
-    .execute(&mut *tx)
-    .await
-    .map_err(map_sql_error)?;
-    let candidate_update = sqlx::query(
-        "UPDATE project_decision_candidate
-         SET lifecycle = 'approved', effective_decision_id = ?,
-             version = version + 1, updated_at = ?
-         WHERE id = ? AND project_id = ? AND lifecycle IN ('draft', 'proposed')",
-    )
-    .bind(&decision_id)
-    .bind(&now)
-    .bind(&candidate_id)
-    .bind(&project_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(map_sql_error)?;
-    if candidate_update.rows_affected() != 1 {
-        return Err(ApiError::conflict_with_code(
-            "decision_candidate.conflict",
-            "the decision candidate changed before approval",
-        ));
-    }
-    let project_update = sqlx::query(
-        "UPDATE project SET version = version + 1, updated_at = ?
-         WHERE id = ? AND version = ?",
-    )
-    .bind(&now)
-    .bind(&project_id)
-    .bind(project_version)
-    .execute(&mut *tx)
-    .await
-    .map_err(map_sql_error)?;
-    if project_update.rows_affected() != 1 {
-        return Err(ApiError::conflict_with_code(
-            "version_conflict",
-            "the Project changed before approval",
-        ));
-    }
-    let event_id = new_uuid_v4();
-    let event = DomainEventRepo::append_event_in_tx(
-        &*state.db,
-        &mut tx,
-        &CreateDomainEvent {
-            id: event_id.clone(),
-            event_type: "project.decision.approved".to_owned(),
-            entity_type: "project_decision".to_owned(),
-            entity_id: decision_id.clone(),
-            actor_type: "user".to_owned(),
-            actor_id: Some(user.user_id.clone()),
-            scope_type: "project".to_owned(),
-            scope_id: project_id.clone(),
-            correlation_id: request.mutation.authorization.event_id.clone(),
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some(dedupe_key),
-            payload_json: json!({
-                "project_id": project_id,
-                "candidate_id": candidate_id,
-                "decision_id": decision_id,
-                "expected_project_version": request.mutation.expected_version,
-                "principal_id": user.user_id,
-                "authorization_event_id": request.mutation.authorization.event_id,
-                "authorization_basis": request.mutation.authorization.authorization_basis,
-            })
-            .to_string(),
-            created_at: now,
-        },
-    )
-    .await
-    .map_err(map_event_error)?;
-    if event.id != event_id {
-        tx.rollback().await?;
-        let payload: Value = serde_json::from_str(&event.payload_json)
-            .map_err(|_| ApiError::internal("persisted decision approval event is invalid"))?;
-        let same_request = payload.get("project_id").and_then(Value::as_str)
-            == Some(project_id.as_str())
-            && payload.get("candidate_id").and_then(Value::as_str) == Some(candidate_id.as_str())
-            && payload
-                .get("expected_project_version")
-                .and_then(Value::as_i64)
-                == Some(request.mutation.expected_version)
-            && payload.get("authorization_basis").and_then(Value::as_str)
-                == Some(request.mutation.authorization.authorization_basis.as_str())
-            && payload
-                .get("authorization_event_id")
-                .and_then(Value::as_str)
-                == Some(request.mutation.authorization.event_id.as_str())
-            && payload.get("principal_id").and_then(Value::as_str) == Some(user.user_id.as_str());
-        if !same_request {
-            return Err(ApiError::conflict_with_code(
-                "idempotency_conflict",
-                "the idempotency key was already used for a different Decision approval",
-            ));
-        }
-        let decision_id = payload
-            .get("decision_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ApiError::internal("persisted decision approval event is missing its Decision")
-            })?;
-        let record = get_decision_record(&state, &project_id, decision_id).await?;
-        return Ok((StatusCode::OK, Json(decision_to_api(record)?)));
-    }
-    tx.commit().await?;
-    let record = get_decision_record(&state, &project_id, &decision_id).await?;
+    let authorization = decision_authorization(
+        &request.mutation.authorization,
+        &user.user_id,
+        DECISION_CANDIDATE_APPROVE_ACTION,
+    )?;
+    let record = services::ProjectDecisionCommandService::new(state.db.clone())
+        .approve_candidate(
+            services::ProjectDecisionApprovalCommand {
+                project_id,
+                candidate_id,
+                expected_project_version: request.mutation.expected_version,
+                idempotency_key: request.mutation.idempotency_key,
+                authorization,
+            },
+            None,
+        )
+        .await?;
     Ok((StatusCode::CREATED, Json(decision_to_api(record)?)))
 }
 
@@ -1708,178 +563,24 @@ pub async fn reject_decision_candidate(
     )?;
     require_idempotency_key(&request.mutation.idempotency_key)?;
     let reason = required_text(&request.reason, "reason")?;
-    let dedupe_key = format!(
-        "project.decision.reject:{project_id}:{candidate_id}:{}",
-        request.mutation.idempotency_key
-    );
-    if let Some(event) = DomainEventRepo::get_event_by_dedupe(&*state.db, &dedupe_key).await? {
-        let payload: Value = serde_json::from_str(&event.payload_json)
-            .map_err(|_| ApiError::internal("persisted decision rejection event is invalid"))?;
-        let same_request = payload.get("project_id").and_then(Value::as_str)
-            == Some(project_id.as_str())
-            && payload.get("candidate_id").and_then(Value::as_str) == Some(candidate_id.as_str())
-            && payload.get("reason").and_then(Value::as_str) == Some(reason.as_str())
-            && payload
-                .get("expected_project_version")
-                .and_then(Value::as_i64)
-                == Some(request.mutation.expected_version)
-            && payload.get("principal_id").and_then(Value::as_str) == Some(user.user_id.as_str())
-            && payload
-                .get("authorization_event_id")
-                .and_then(Value::as_str)
-                == Some(request.mutation.authorization.event_id.as_str())
-            && payload.get("authorization_basis").and_then(Value::as_str)
-                == Some(request.mutation.authorization.authorization_basis.as_str());
-        if !same_request {
-            return Err(ApiError::conflict_with_code(
-                "idempotency_conflict",
-                "the idempotency key was already used for a different Decision rejection",
-            ));
-        }
-        let candidate =
-            ProjectOrchestrationRepo::get_project_decision_candidate(&*state.db, &candidate_id)
-                .await?
-                .filter(|candidate| candidate.project_id == project_id)
-                .ok_or_else(|| ApiError::not_found("decision_candidate", candidate_id.clone()))?;
-        return Ok((StatusCode::OK, Json(candidate_to_api(candidate)?)));
-    }
-    let now = now_rfc3339();
-    let mut tx = db::begin_immediate(state.db.pool()).await?;
-    let project = sqlx::query("SELECT version FROM project WHERE id = ?")
-        .bind(&project_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.clone()))?;
-    let project_version: i64 = project.try_get("version")?;
-    if project_version != request.mutation.expected_version {
-        return Err(ApiError::conflict_with_code(
-            "version_conflict",
-            "the Project changed before rejection",
-        ));
-    }
-    let candidate = sqlx::query(
-        "SELECT context_json FROM project_decision_candidate
-         WHERE id = ? AND project_id = ? AND lifecycle IN ('draft', 'proposed')",
-    )
-    .bind(&candidate_id)
-    .bind(&project_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| ApiError::not_found("decision_candidate", candidate_id.clone()))?;
-    let mut context: Value = serde_json::from_str(&candidate.try_get::<String, _>("context_json")?)
-        .map_err(|_| ApiError::internal("persisted decision candidate context is invalid"))?;
-    if !context.is_object() {
-        context = json!({ "summary": context });
-    }
-    context["rejection_reason"] = Value::String(reason.clone());
-    let updated = sqlx::query(
-        "UPDATE project_decision_candidate
-         SET lifecycle = 'rejected', context_json = ?, version = version + 1, updated_at = ?
-         WHERE id = ? AND project_id = ? AND lifecycle IN ('draft', 'proposed')",
-    )
-    .bind(context.to_string())
-    .bind(&now)
-    .bind(&candidate_id)
-    .bind(&project_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(map_sql_error)?;
-    if updated.rows_affected() != 1 {
-        return Err(ApiError::conflict_with_code(
-            "decision_candidate.conflict",
-            "the candidate changed before rejection",
-        ));
-    }
-    let project_update = sqlx::query(
-        "UPDATE project SET version = version + 1, updated_at = ? WHERE id = ? AND version = ?",
-    )
-    .bind(&now)
-    .bind(&project_id)
-    .bind(project_version)
-    .execute(&mut *tx)
-    .await
-    .map_err(map_sql_error)?;
-    if project_update.rows_affected() != 1 {
-        return Err(ApiError::conflict_with_code(
-            "version_conflict",
-            "the Project changed before rejection",
-        ));
-    }
-    let event_id = new_uuid_v4();
-    let event = DomainEventRepo::append_event_in_tx(
-        &*state.db,
-        &mut tx,
-        &CreateDomainEvent {
-            id: event_id.clone(),
-            event_type: "project.decision.candidate_rejected".to_owned(),
-            entity_type: "project_decision_candidate".to_owned(),
-            entity_id: candidate_id.clone(),
-            actor_type: "user".to_owned(),
-            actor_id: Some(user.user_id.clone()),
-            scope_type: "project".to_owned(),
-            scope_id: project_id.clone(),
-            correlation_id: request.mutation.authorization.event_id.clone(),
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some(dedupe_key),
-            payload_json: json!({
-                "project_id": project_id,
-                "candidate_id": candidate_id,
-                "reason": reason,
-                "expected_project_version": request.mutation.expected_version,
-                "principal_id": user.user_id,
-                "authorization_event_id": request.mutation.authorization.event_id,
-                "authorization_basis": request.mutation.authorization.authorization_basis,
-            })
-            .to_string(),
-            created_at: now,
-        },
-    )
-    .await
-    .map_err(map_event_error)?;
-    if event.id != event_id {
-        tx.rollback().await?;
-        let payload: Value = serde_json::from_str(&event.payload_json)
-            .map_err(|_| ApiError::internal("persisted decision rejection event is invalid"))?;
-        let same_request = payload.get("project_id").and_then(Value::as_str)
-            == Some(project_id.as_str())
-            && payload.get("candidate_id").and_then(Value::as_str) == Some(candidate_id.as_str())
-            && payload.get("reason").and_then(Value::as_str) == Some(reason.as_str())
-            && payload
-                .get("expected_project_version")
-                .and_then(Value::as_i64)
-                == Some(request.mutation.expected_version)
-            && payload.get("principal_id").and_then(Value::as_str) == Some(user.user_id.as_str())
-            && payload
-                .get("authorization_event_id")
-                .and_then(Value::as_str)
-                == Some(request.mutation.authorization.event_id.as_str())
-            && payload.get("authorization_basis").and_then(Value::as_str)
-                == Some(request.mutation.authorization.authorization_basis.as_str());
-        if !same_request {
-            return Err(ApiError::conflict_with_code(
-                "idempotency_conflict",
-                "the idempotency key was already used for a different Decision rejection",
-            ));
-        }
-        let winner_id = payload
-            .get("candidate_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ApiError::internal("persisted decision rejection event is missing its candidate")
-            })?;
-        let candidate =
-            ProjectOrchestrationRepo::get_project_decision_candidate(&*state.db, winner_id)
-                .await?
-                .filter(|candidate| candidate.project_id == project_id)
-                .ok_or_else(|| ApiError::not_found("decision_candidate", winner_id.to_owned()))?;
-        return Ok((StatusCode::OK, Json(candidate_to_api(candidate)?)));
-    }
-    tx.commit().await?;
-    let candidate =
-        ProjectOrchestrationRepo::get_project_decision_candidate(&*state.db, &candidate_id)
-            .await?
-            .ok_or_else(|| ApiError::not_found("decision_candidate", candidate_id))?;
+    let authorization = decision_authorization(
+        &request.mutation.authorization,
+        &user.user_id,
+        DECISION_CANDIDATE_REJECT_ACTION,
+    )?;
+    let candidate = services::ProjectDecisionCommandService::new(state.db.clone())
+        .reject_candidate(
+            services::ProjectDecisionRejectionCommand {
+                project_id,
+                candidate_id,
+                reason,
+                expected_project_version: request.mutation.expected_version,
+                idempotency_key: request.mutation.idempotency_key,
+                authorization,
+            },
+            None,
+        )
+        .await?;
     Ok((StatusCode::OK, Json(candidate_to_api(candidate)?)))
 }
 
@@ -2010,155 +711,6 @@ async fn scoped_document(
     Ok(document)
 }
 
-/// Validate every Decision reference while the candidate/effective Decision
-/// transaction is open.  IDs are never looked up first and then disclosed:
-/// an unknown or another-Project reference receives the same typed not-found
-/// result, so a caller cannot probe another Project through this API.
-async fn validate_decision_context_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    project_id: &str,
-    context: &Value,
-) -> ApiResult<()> {
-    let mut typed_context = context.clone();
-    if let Some(object) = typed_context.as_object_mut() {
-        // The persisted candidate envelope adds this routing discriminator;
-        // it is not part of the closed context payload itself.
-        object.remove("decision_class");
-        object.remove("rejection_reason");
-    }
-    let typed_context: DecisionCandidateContext = serde_json::from_value(typed_context)
-        .map_err(|_| ApiError::bad_request("decision context contains an invalid reference"))?;
-
-    for artifact in &typed_context.affected_artifact_refs {
-        let row = sqlx::query(
-            "SELECT render_version, rendered_digest
-             FROM project_document_revision AS r
-             JOIN project_document AS d ON d.id = r.document_id
-             WHERE d.project_id = ? AND d.id = ? AND r.id = ? AND r.content_digest = ?
-             UNION ALL
-             SELECT r.render_version, r.rendered_digest
-             FROM project_charter_revision AS r
-             JOIN project_charter AS c ON c.id = r.charter_id
-             WHERE c.project_id = ? AND c.id = ? AND r.id = ? AND r.content_digest = ?
-             UNION ALL
-             SELECT r.render_version, r.rendered_digest
-             FROM project_execution_baseline_revision AS r
-             JOIN project_execution_baseline AS b ON b.id = r.baseline_id
-             WHERE b.project_id = ? AND b.id = ? AND r.id = ? AND r.content_digest = ?
-             UNION ALL
-             SELECT r.render_version, r.rendered_digest
-             FROM project_milestone_revision AS r
-             JOIN project_milestone AS m ON m.id = r.milestone_id
-             WHERE m.project_id = ? AND m.id = ? AND r.id = ? AND r.content_digest = ?
-             LIMIT 1",
-        )
-        .bind(project_id)
-        .bind(&artifact.artifact_id)
-        .bind(&artifact.revision_id)
-        .bind(&artifact.content_digest)
-        .bind(project_id)
-        .bind(&artifact.artifact_id)
-        .bind(&artifact.revision_id)
-        .bind(&artifact.content_digest)
-        .bind(project_id)
-        .bind(&artifact.artifact_id)
-        .bind(&artifact.revision_id)
-        .bind(&artifact.content_digest)
-        .bind(project_id)
-        .bind(&artifact.artifact_id)
-        .bind(&artifact.revision_id)
-        .bind(&artifact.content_digest)
-        .fetch_optional(&mut **tx)
-        .await?;
-        let Some(row) = row else {
-            return Err(ApiError::not_found(
-                "decision_reference",
-                artifact.revision_id.clone(),
-            ));
-        };
-        let render_version: String = row.try_get("render_version")?;
-        let render_digest: String = row.try_get("rendered_digest")?;
-        if artifact
-            .render_version
-            .as_deref()
-            .is_some_and(|value| value != render_version)
-            || artifact
-                .render_digest
-                .as_deref()
-                .is_some_and(|value| value != render_digest)
-        {
-            return Err(ApiError::conflict_with_code(
-                "decision_reference.digest_conflict",
-                "a Decision artifact reference is stale",
-            ));
-        }
-    }
-
-    for task_id in &typed_context.affected_task_ids {
-        let exists: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM task WHERE id = ? AND project_id = ? LIMIT 1")
-                .bind(task_id)
-                .bind(project_id)
-                .fetch_optional(&mut **tx)
-                .await?;
-        if exists.is_none() {
-            return Err(ApiError::not_found("decision_reference", task_id.clone()));
-        }
-    }
-    for milestone_id in &typed_context.affected_milestone_ids {
-        let exists: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM project_milestone WHERE id = ? AND project_id = ? LIMIT 1",
-        )
-        .bind(milestone_id)
-        .bind(project_id)
-        .fetch_optional(&mut **tx)
-        .await?;
-        if exists.is_none() {
-            return Err(ApiError::not_found(
-                "decision_reference",
-                milestone_id.clone(),
-            ));
-        }
-    }
-    if let Some(charter_revision_id) = typed_context.governing_charter_revision_id.as_deref() {
-        let exists: Option<i64> = sqlx::query_scalar(
-            "SELECT 1
-             FROM project_charter_revision AS r
-             JOIN project_charter AS c ON c.id = r.charter_id
-             WHERE r.id = ? AND c.project_id = ? LIMIT 1",
-        )
-        .bind(charter_revision_id)
-        .bind(project_id)
-        .fetch_optional(&mut **tx)
-        .await?;
-        if exists.is_none() {
-            return Err(ApiError::not_found(
-                "decision_reference",
-                charter_revision_id.to_owned(),
-            ));
-        }
-    }
-    if let Some(baseline_revision_id) = typed_context.governing_baseline_revision_id.as_deref() {
-        let exists: Option<i64> = sqlx::query_scalar(
-            "SELECT 1
-             FROM project_execution_baseline_revision AS r
-             JOIN project_execution_baseline AS b ON b.id = r.baseline_id
-             WHERE r.id = ? AND b.project_id = ? LIMIT 1",
-        )
-        .bind(baseline_revision_id)
-        .bind(project_id)
-        .fetch_optional(&mut **tx)
-        .await?;
-        if exists.is_none() {
-            return Err(ApiError::not_found(
-                "decision_reference",
-                baseline_revision_id.to_owned(),
-            ));
-        }
-    }
-    Ok(())
-}
-
 async fn has_more_documents(
     state: &AppState,
     project_id: &str,
@@ -2221,6 +773,30 @@ fn validate_authorization(
     Ok(())
 }
 
+fn decision_authorization(
+    authorization: &AuthorizationProvenance,
+    user_id: &str,
+    action: &str,
+) -> ApiResult<ProjectCommandAuthorization> {
+    Ok(ProjectCommandAuthorization {
+        principal_type: "user".to_owned(),
+        principal_id: user_id.to_owned(),
+        policy_result: "allowed".to_owned(),
+        policy_revision: None,
+        policy_digest: None,
+        requested_permission: Some(action.to_owned()),
+        correlation_id: authorization.event_id.clone(),
+        causation_id: None,
+        causation_depth: 0,
+        authorization_event_id: authorization.event_id.clone(),
+        authorization_basis: authorization.authorization_basis.clone(),
+        authorization_action: authorization.action.clone(),
+        authorization_occurred_at: authorization.occurred_at.clone(),
+        authorization_json: serde_json::to_string(authorization)
+            .map_err(|error| ApiError::bad_request(error.to_string()))?,
+    })
+}
+
 fn require_idempotency_key(value: &str) -> ApiResult<()> {
     if value.trim().is_empty() {
         return Err(ApiError::bad_request(
@@ -2238,46 +814,6 @@ fn required_text(value: &str, field: &str) -> ApiResult<String> {
     Ok(value.to_owned())
 }
 
-fn document_kind(document: &ProjectDocumentRecord) -> ApiResult<ProjectDocumentKind> {
-    parse_document_kind(&document.kind)
-        .ok_or_else(|| ApiError::internal("invalid persisted Project Document kind"))
-}
-
-fn validate_content_kind(
-    kind: ProjectDocumentKind,
-    content: &ProjectDocumentContent,
-) -> ApiResult<()> {
-    let matches = matches!(
-        (kind, content),
-        (
-            ProjectDocumentKind::Research,
-            ProjectDocumentContent::Research(_)
-        ) | (
-            ProjectDocumentKind::DeliveryBrief,
-            ProjectDocumentContent::DeliveryBrief(_)
-        ) | (
-            ProjectDocumentKind::ProductSpec,
-            ProjectDocumentContent::ProductSpec(_)
-        ) | (
-            ProjectDocumentKind::Design,
-            ProjectDocumentContent::Design(_)
-        ) | (
-            ProjectDocumentKind::Architecture,
-            ProjectDocumentContent::Architecture(_)
-        ) | (
-            ProjectDocumentKind::ExecutionPlan,
-            ProjectDocumentContent::ExecutionPlan(_)
-        )
-    );
-    if matches {
-        Ok(())
-    } else {
-        Err(ApiError::bad_request(
-            "document content kind does not match the Project Document kind",
-        ))
-    }
-}
-
 fn document_kind_name(kind: ProjectDocumentKind) -> &'static str {
     services::document_kind_name(kind)
 }
@@ -2288,17 +824,6 @@ fn approval_policy_name(policy: ProjectDocumentApprovalPolicy) -> &'static str {
         ProjectDocumentApprovalPolicy::ProjectAgent => "project_agent",
         ProjectDocumentApprovalPolicy::User => "user",
         ProjectDocumentApprovalPolicy::UserOrProjectAgent => "user_or_project_agent",
-    }
-}
-
-fn document_revision_lifecycle_name(lifecycle: DocumentRevisionLifecycle) -> &'static str {
-    match lifecycle {
-        DocumentRevisionLifecycle::Draft => "draft",
-        DocumentRevisionLifecycle::Proposed => "proposed",
-        DocumentRevisionLifecycle::Approved => "approved",
-        DocumentRevisionLifecycle::Rejected => "rejected",
-        DocumentRevisionLifecycle::Withdrawn => "withdrawn",
-        DocumentRevisionLifecycle::Superseded => "superseded",
     }
 }
 
@@ -2396,44 +921,6 @@ fn approval_to_api(
         approved_at: record.created_at,
         idempotency_key: client_idempotency_key(&record.idempotency_key),
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn document_approval_replay_matches(
-    payload: &Value,
-    project_id: &str,
-    document_id: &str,
-    revision_id: &str,
-    content_digest: &str,
-    render_digest: &str,
-    expected_document_version: i64,
-    principal_id: &str,
-    authorization: &AuthorizationProvenance,
-) -> bool {
-    payload.get("project_id").and_then(Value::as_str) == Some(project_id)
-        && payload.get("document_id").and_then(Value::as_str) == Some(document_id)
-        && payload.get("revision_id").and_then(Value::as_str) == Some(revision_id)
-        && payload.get("content_digest").and_then(Value::as_str) == Some(content_digest)
-        && payload.get("render_digest").and_then(Value::as_str) == Some(render_digest)
-        && payload
-            .get("expected_document_version")
-            .and_then(Value::as_i64)
-            == Some(expected_document_version)
-        && payload.get("principal_id").and_then(Value::as_str) == Some(principal_id)
-        && payload.get("authorization_principal")
-            == serde_json::to_value(&authorization.principal).ok().as_ref()
-        && payload.get("authorization_basis").and_then(Value::as_str)
-            == Some(authorization.authorization_basis.as_str())
-        && payload.get("authorization_action").and_then(Value::as_str)
-            == Some(authorization.action.as_str())
-        && payload
-            .get("authorization_event_id")
-            .and_then(Value::as_str)
-            == Some(authorization.event_id.as_str())
-        && payload
-            .get("authorization_occurred_at")
-            .and_then(Value::as_str)
-            == Some(authorization.occurred_at.as_str())
 }
 
 fn candidate_to_api(record: ProjectDecisionCandidateRecord) -> ApiResult<DecisionCandidate> {
@@ -2606,29 +1093,6 @@ fn document_revision_record_from_row(
     })
 }
 
-fn document_approval_record_from_row(
-    row: sqlx::sqlite::SqliteRow,
-) -> ApiResult<db::ProjectDocumentApprovalRecord> {
-    Ok(db::ProjectDocumentApprovalRecord {
-        id: row.try_get("id")?,
-        document_id: row.try_get("document_id")?,
-        revision_id: row.try_get("revision_id")?,
-        principal_type: row.try_get("principal_type")?,
-        principal_id: row.try_get("principal_id")?,
-        authorization_basis: row.try_get("authorization_basis")?,
-        authorization_action: row.try_get("authorization_action")?,
-        explicit_event: row.try_get("explicit_event")?,
-        authorization_occurred_at: row.try_get("authorization_occurred_at")?,
-        content_digest: row.try_get("content_digest")?,
-        rendered_digest: row.try_get("rendered_digest")?,
-        lifecycle: row.try_get("lifecycle")?,
-        idempotency_key: row.try_get("idempotency_key")?,
-        version: row.try_get("version")?,
-        created_at: row.try_get("created_at")?,
-        updated_at: row.try_get("updated_at")?,
-    })
-}
-
 fn candidate_record_from_row(
     row: sqlx::sqlite::SqliteRow,
 ) -> ApiResult<ProjectDecisionCandidateRecord> {
@@ -2708,30 +1172,6 @@ fn parse_decision_class(value: &str) -> ApiResult<DecisionClass> {
     }
 }
 
-fn decision_class_name(value: DecisionClass) -> &'static str {
-    match value {
-        DecisionClass::UserScope => "user_scope",
-        DecisionClass::ProjectImplementation => "project_implementation",
-        DecisionClass::Policy => "policy",
-        DecisionClass::Waiver => "waiver",
-    }
-}
-
-fn parse_document_kind(value: &str) -> Option<ProjectDocumentKind> {
-    services::parse_document_kind(value)
-}
-
-fn principal_kind_name(kind: PrincipalKind) -> &'static str {
-    match kind {
-        PrincipalKind::User => "user",
-        PrincipalKind::Agent => "agent",
-        PrincipalKind::Worker => "worker",
-        PrincipalKind::Reviewer => "reviewer",
-        PrincipalKind::Service => "service",
-        PrincipalKind::System => "system",
-    }
-}
-
 fn parse_principal_kind_strict(value: &str) -> ApiResult<PrincipalKind> {
     match value {
         "user" => Ok(PrincipalKind::User),
@@ -2747,18 +1187,6 @@ fn parse_principal_kind_strict(value: &str) -> ApiResult<PrincipalKind> {
 fn map_sql_error(error: sqlx::Error) -> ApiError {
     tracing::error!(error = %error, "Project artifact mutation failed");
     ApiError::internal("Project artifact mutation failed")
-}
-
-fn map_event_error(error: db::DbError) -> ApiError {
-    match error {
-        db::DbError::Check(message) if message.contains("dedupe key") => {
-            ApiError::conflict_with_code(
-                "idempotency_conflict",
-                "the idempotency key was already used for a different mutation",
-            )
-        }
-        other => other.into(),
-    }
 }
 
 impl From<sqlx::Error> for ApiError {
@@ -2815,28 +1243,6 @@ mod tests {
     }
 
     #[test]
-    fn document_content_must_match_document_kind() {
-        let content = ProjectDocumentContent::Research(api_types::ResearchDocumentContent {
-            question: "question".to_owned(),
-            decision_informed: "decision".to_owned(),
-            scope: "scope".to_owned(),
-            stopping_condition: "stop".to_owned(),
-            sources: Vec::new(),
-            findings: Vec::new(),
-            evidence: Vec::new(),
-            inferences: Vec::new(),
-            alternatives: Vec::new(),
-            recommendation: None,
-            uncertainty: Vec::new(),
-            unresolved_questions: Vec::new(),
-            affected_artifact_ids: Vec::new(),
-            affected_decision_ids: Vec::new(),
-        });
-        assert!(validate_content_kind(ProjectDocumentKind::Research, &content).is_ok());
-        assert!(validate_content_kind(ProjectDocumentKind::Architecture, &content).is_err());
-    }
-
-    #[test]
     fn revision_response_preserves_exact_base_revision_id() {
         let document = ProjectDocumentRecord {
             id: "document-1".to_owned(),
@@ -2858,8 +1264,8 @@ mod tests {
             base_revision: 1,
             base_revision_id: Some("immutable-base-uuid".to_owned()),
             lifecycle: "draft".to_owned(),
-            schema_version: DOCUMENT_SCHEMA_VERSION.to_owned(),
-            render_version: DOCUMENT_RENDER_VERSION.to_owned(),
+            schema_version: services::PROJECT_DOCUMENT_SCHEMA_VERSION.to_owned(),
+            render_version: services::PROJECT_DOCUMENT_RENDER_VERSION.to_owned(),
             content_json: serde_json::to_string(&ProjectDocumentContent::Research(
                 api_types::ResearchDocumentContent {
                     question: "question".to_owned(),
@@ -2961,65 +1367,5 @@ mod tests {
             created_at: "2026-08-13T00:00:00Z".to_owned(),
         };
         assert!(decision_to_api(record).is_err());
-    }
-
-    #[test]
-    fn document_approval_replay_requires_the_complete_authorization_provenance() {
-        let authorization = AuthorizationProvenance {
-            principal: PrincipalRef {
-                kind: PrincipalKind::User,
-                id: "user-1".to_owned(),
-                display_name: None,
-            },
-            authorization_basis: "explicit_user_approval".to_owned(),
-            action: DOCUMENT_APPROVE_ACTION.to_owned(),
-            event_id: "event-1".to_owned(),
-            occurred_at: "2026-08-13T00:00:00Z".to_owned(),
-        };
-        let payload = serde_json::json!({
-            "project_id": "project-1",
-            "document_id": "document-1",
-            "revision_id": "revision-1",
-            "content_digest": "content-1",
-            "render_digest": "render-1",
-            "expected_document_version": 2,
-            "principal_id": "user-1",
-            "authorization_principal": authorization.principal,
-            "authorization_basis": authorization.authorization_basis,
-            "authorization_action": authorization.action,
-            "authorization_event_id": authorization.event_id,
-            "authorization_occurred_at": authorization.occurred_at,
-        });
-        assert!(document_approval_replay_matches(
-            &payload,
-            "project-1",
-            "document-1",
-            "revision-1",
-            "content-1",
-            "render-1",
-            2,
-            "user-1",
-            &authorization,
-        ));
-        for field in [
-            "authorization_basis",
-            "authorization_action",
-            "authorization_event_id",
-            "authorization_occurred_at",
-        ] {
-            let mut tampered = payload.clone();
-            tampered[field] = Value::String("tampered".to_owned());
-            assert!(!document_approval_replay_matches(
-                &tampered,
-                "project-1",
-                "document-1",
-                "revision-1",
-                "content-1",
-                "render-1",
-                2,
-                "user-1",
-                &authorization,
-            ));
-        }
     }
 }

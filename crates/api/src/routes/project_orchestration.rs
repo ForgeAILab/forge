@@ -19,14 +19,13 @@ use axum::{
 use chrono::{DateTime, Utc};
 use db::{
     new_uuid_v4, now_rfc3339, AgentProfileRepo, AgentRepo, ApproveProjectCharter,
-    CreateProjectCharter, CreateProjectCharterRevision, CreateProjectCharterRevisionAtomically,
     ProjectCharterApprovalRecord, ProjectCharterRecord, ProjectCharterRevisionRecord,
     ProjectOrchestrationRepo,
 };
 use services::{
-    evaluate_project_charter_readiness, project_agent_policy_digest, render_and_digest_charter,
-    semantic_revision_diff, validate_charter_approval_candidate, CHARTER_READINESS_POLICY_VERSION,
-    PROJECT_CHARTER_RENDER_VERSION, PROJECT_OPERATING_SKILL_KEY,
+    evaluate_project_charter_readiness, project_agent_policy_digest,
+    validate_charter_approval_candidate, CHARTER_READINESS_POLICY_VERSION,
+    PROJECT_OPERATING_SKILL_KEY,
 };
 
 use crate::{
@@ -35,7 +34,6 @@ use crate::{
     state::AppState,
 };
 
-const CHARTER_SCHEMA_VERSION: &str = "forge.project-charter/v1";
 const PROJECT_AGENT_POLICY_REVISION: &str = "forge.project-agent-policy/v1";
 const MAX_AUTHORIZATION_CLOCK_SKEW_SECONDS: i64 = 48 * 60 * 60;
 
@@ -75,230 +73,37 @@ pub async fn save_genesis_charter_revision(
         &user.user_id,
         "project_charter.revision.save",
     )?;
-    let session = authorized_genesis(&state, &user.user_id, &session_id).await?;
-    if matches!(
-        session.lifecycle,
-        api_types::ProductGenesisLifecycle::HandedOff
-            | api_types::ProductGenesisLifecycle::Cancelled
-    ) {
-        return Err(ApiError::conflict_with_code(
-            "charter.attached",
-            "Genesis may not mutate a Charter after Project attachment",
-        ));
-    }
-    if request.maturity != session.maturity {
-        return Err(ApiError::conflict_with_code(
-            "charter_scope_conflict",
-            "Genesis Charter maturity must match the Product Genesis session",
-        ));
-    }
-    if request.provenance.author.kind != PrincipalKind::User
-        || request.provenance.author.id != user.user_id
-    {
-        return Err(ApiError::forbidden_with_code(
-            "authorization.invalid",
-            "Genesis Charter revisions must identify the authenticated user as author",
-        ));
-    }
-
-    let charter = match session.charter_id.as_deref() {
-        Some(charter_id) => {
-            if request.charter_id != charter_id {
-                return Err(ApiError::not_found(
-                    "project_charter",
-                    request.charter_id.clone(),
-                ));
-            }
-            let charter = ProjectOrchestrationRepo::get_project_charter_for_account(
-                &*state.db,
-                charter_id,
-                &user.user_id,
-            )
-            .await?
-            .ok_or_else(|| ApiError::not_found("project_charter", charter_id.to_owned()))?;
-            if charter.project_mode != request.project_mode.as_str()
-                || charter.maturity != request.maturity.as_str()
-            {
-                return Err(ApiError::conflict_with_code(
-                    "charter_scope_conflict",
-                    "Genesis Charter mode and maturity are immutable after draft creation",
-                ));
-            }
-            charter
-        }
-        None => {
-            if request.mutation.expected_version != 1 {
-                return Err(ApiError::conflict_with_code(
-                    "version_conflict",
-                    "the first Charter revision requires expected_version 1",
-                ));
-            }
-            if request.charter_id.trim().is_empty() {
-                return Err(ApiError::bad_request("charter_id is required"));
-            }
-            let now = now_rfc3339();
-            ProjectCharterRecord {
-                id: request.charter_id.clone(),
-                account_id: user.user_id.clone(),
-                genesis_session_id: Some(session.id.clone()),
-                project_id: None,
-                current_draft_revision_id: None,
-                current_approved_revision_id: None,
-                project_mode: project_mode_name(request.project_mode).to_owned(),
-                maturity: maturity_name(request.maturity).to_owned(),
-                lifecycle: "draft".to_owned(),
-                version: 1,
-                created_at: now.clone(),
-                updated_at: now,
-            }
-        }
-    };
-
-    let effective_expected_version = request.mutation.expected_version;
-    if effective_expected_version <= 0 {
-        return Err(ApiError::bad_request(
-            "mutation.expected_version must be a positive Charter version",
-        ));
-    }
-    if charter.version != effective_expected_version {
-        return Err(ApiError::conflict_with_code(
-            "version_conflict",
-            "the Charter changed before this revision was saved",
-        ));
-    }
-    let previous = match request.base_revision_id.as_deref() {
-        Some(base_id) => {
-            let revision =
-                ProjectOrchestrationRepo::get_project_charter_revision(&*state.db, base_id)
-                    .await?
-                    .filter(|revision| revision.charter_id == charter.id)
-                    .ok_or_else(|| {
-                        ApiError::not_found("project_charter_revision", base_id.to_owned())
-                    })?;
-            Some(api_revision(&charter, revision)?)
-        }
-        None => None,
-    };
-    if let Some(expected) = request.mutation.expected_digest.as_deref() {
-        let actual = previous
-            .as_ref()
-            .map(|revision| revision.content_digest.as_str())
-            .unwrap_or_default();
-        if expected != actual {
-            return Err(ApiError::conflict_with_code(
-                "digest_conflict",
-                "the Charter base digest changed before this revision was saved",
-            ));
-        }
-    }
-    if request.render_version != PROJECT_CHARTER_RENDER_VERSION {
-        return Err(ApiError::bad_request(
-            "render_version must name the current server Charter renderer",
-        ));
-    }
-    let rendered = render_and_digest_charter(&request.content);
-    if request.rendered_view != rendered.rendered_view {
-        return Err(ApiError::conflict_with_code(
-            "render_digest_conflict",
-            "rendered_view does not match the canonical server rendering",
-        ));
-    }
-    let created_at = now_rfc3339();
-    let readiness = evaluate_project_charter_readiness(
-        &request.content,
-        request.project_mode,
-        request.maturity,
-        CHARTER_READINESS_POLICY_VERSION,
-        &created_at,
-    );
-    let diff = semantic_revision_diff(
-        previous.as_ref().map(|revision| &revision.content),
-        &request.content,
-    );
-    let revision_input = CreateProjectCharterRevision {
-        id: new_uuid_v4(),
-        charter_id: charter.id.clone(),
-        expected_charter_version: effective_expected_version,
-        project_mode: project_mode_name(request.project_mode).to_owned(),
-        maturity: maturity_name(request.maturity).to_owned(),
-        base_revision: previous
-            .as_ref()
-            .map(|revision| revision.revision_number)
-            .unwrap_or(0),
-        base_revision_id: request.base_revision_id.clone(),
-        lifecycle: "proposed".to_owned(),
-        schema_version: CHARTER_SCHEMA_VERSION.to_owned(),
-        render_version: rendered.render_version,
-        content_json: serde_json::to_string(&request.content)
-            .map_err(|error| ApiError::bad_request(error.to_string()))?,
-        rendered_view: rendered.rendered_view,
-        change_summary: diff.change_summary(),
-        author_type: "user".to_owned(),
-        author_id: Some(user.user_id.clone()),
-        // A MainChat provenance reference identifies the chat, not a
-        // message row. Keep the typed source manifest and only populate
-        // the message FK when a message-specific source exists.
-        source_message_id: None,
-        source_turn_job_id: None,
-        source_refs_json: serde_json::to_string(&request.provenance.source_refs)
-            .map_err(|error| ApiError::bad_request(error.to_string()))?,
-        content_digest: rendered.content_digest,
-        rendered_digest: rendered.render_digest,
-        created_at,
-    };
-    let record = if effective_expected_version == 1
-        && previous.is_none()
-        && charter.genesis_session_id.as_deref() == Some(session.id.as_str())
-    {
-        ProjectOrchestrationRepo::create_project_charter_revision_atomically(
-            &*state.db,
-            CreateProjectCharterRevisionAtomically {
-                project_id: None,
-                genesis_session_id: Some(session.id.clone()),
-                account_id: user.user_id.clone(),
-                charter: CreateProjectCharter {
-                    id: charter.id.clone(),
-                    account_id: user.user_id.clone(),
-                    genesis_session_id: Some(session.id.clone()),
-                    project_mode: charter.project_mode.clone(),
-                    maturity: charter.maturity.clone(),
-                    created_at: charter.created_at.clone(),
-                    updated_at: charter.updated_at.clone(),
-                },
-                revision: revision_input,
+    let result = services::MainGenesisCommandService::new(state.db.clone())
+        .execute(services::MainGenesisDraftCommandInput {
+            principal: services::MainGenesisDraftPrincipal::User {
+                user_id: user.user_id.clone(),
             },
-        )
-        .await?
-    } else {
-        ProjectOrchestrationRepo::create_project_charter_revision(&*state.db, revision_input)
-            .await?
-    };
-    let mut revision = api_revision(
-        &ProjectOrchestrationRepo::get_project_charter(&*state.db, &charter.id)
-            .await?
-            .ok_or_else(|| ApiError::not_found("project_charter", charter.id.clone()))?,
-        record,
-    )?;
-    revision.readiness = Some(readiness);
-    // Durable, refresh-stable anchor in the Main Chat history; best-effort so
-    // the committed revision never fails on the chat write.
-    let (message_id, content) = services::charter_proposal_chat_message(
-        &revision.id,
-        revision.revision_number,
-        &revision.content.identity.working_name,
-        &revision.content.identity.one_line_vision,
-        Some(revision.provenance.change_summary.as_str()),
-    );
-    if let Err(error) = services::append_system_chat_message(
-        &state.db,
-        &session.main_chat_id,
-        &message_id,
-        &content,
-    )
-    .await
-    {
-        tracing::warn!(%error, revision_id = %revision.id, "Charter proposal chat anchor failed");
-    }
+            request: services::MainGenesisCharterDraftRequest {
+                genesis_session_id: Some(session_id),
+                charter_id: request.charter_id,
+                expected_charter_version: Some(request.mutation.expected_version),
+                base_revision_id: request.base_revision_id,
+                project_mode: request.project_mode,
+                maturity: request.maturity,
+                content: request.content,
+                change_summary: Some(request.provenance.change_summary.clone()),
+                source_refs: request.provenance.source_refs.clone(),
+                provenance: request.provenance,
+                rendered_view: Some(request.rendered_view),
+                render_version: Some(request.render_version),
+                content_digest: None,
+                render_digest: None,
+            },
+            idempotency_key: request.mutation.idempotency_key,
+            correlation_id: request.mutation.authorization.event_id.clone(),
+            causation_id: Some(request.mutation.authorization.event_id),
+            causation_depth: 0,
+            policy_result: "allowed".to_owned(),
+            requested_permission: "propose_discovery".to_owned(),
+        })
+        .await?;
+    let mut revision = api_revision(&result.charter, result.revision)?;
+    revision.readiness = Some(result.readiness);
     Ok((StatusCode::CREATED, Json(revision)))
 }
 
@@ -971,9 +776,5 @@ async fn current_project_agent_operating_skill_revision(state: &AppState) -> Api
 }
 
 fn project_mode_name(value: ProjectMode) -> &'static str {
-    value.as_str()
-}
-
-fn maturity_name(value: ProductMaturity) -> &'static str {
     value.as_str()
 }

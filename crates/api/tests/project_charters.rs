@@ -134,7 +134,11 @@ async fn failed_first_draft_does_not_leave_an_empty_attached_charter() {
                 content_digest: "content-digest".to_owned(),
                 rendered_digest: "rendered-digest".to_owned(),
                 created_at: now,
+                command_receipt: None,
+                action_execution: None,
             },
+            command_receipt: None,
+            action_execution: None,
         },
     )
     .await;

@@ -69,6 +69,48 @@ identity/profile, Main/Project Agent Chat, embedded-session, memory,
 commitment, and Attention-facing services. `AppState` is `Clone` (shared fields
 are `Arc`) and used as Axum state.
 
+### Shared command/query boundary
+
+For migrated Main/Project orchestration operations, REST, MCP (where a command
+is exposed), native Agent tools, user approval execution, and recovery jobs all
+use the same domain command/query services. The boundary is split by domain
+command family rather than implemented as one monolithic service:
+
+```text
+REST / MCP / native tool / approval / recovery
+                         |
+                 command/query adapter
+                         |
+             domain command or query service
+                         |
+                    SQLite transaction
+              /           |            \
+       domain rows   durable event   command receipt
+                                      + optional AgentAction outcome
+```
+
+Adapters authenticate or receive the principal, parse their transport
+envelope, call one service, and serialize its typed result. They do not issue
+domain SQL, perform lifecycle validation, invent Project scope from an input
+ID, choose a separate idempotency/approval rule, or maintain a second
+operation/permission catalog. The service derives the canonical principal and
+scope and owns authorization, validation, lifecycle, persistence, idempotency,
+and durable event creation. The pre-existing workflow-engine/legacy Task
+transition split remains outside this migrated orchestration boundary.
+
+Each mutating command carries a `CommandContext` containing the principal,
+canonical scope, operation, idempotency key, canonical input digest, expected
+versions/digests, authorization or action provenance, and correlation/
+causation metadata. Under the SQLite writer transaction, Forge first looks up
+the receipt: an identical key and digest return its frozen typed outcome, while
+changed input returns `idempotency_conflict`. A receipt miss re-authorizes the
+current references and expected state, applies the domain mutation, appends
+the durable event, persists the receipt and any action execution/outcome, and
+commits once. A failed commit exposes none of those writes. The in-process
+event bus is published only after commit; it is a live projection, not the
+replay or authority boundary. Consequently, response loss replays the same
+domain identifiers, receipt, event, and outcome without creating a duplicate.
+
 ### Identity, profiles, and explicit authority
 
 `agent_identity` is the stable account-owned product identity — the one
@@ -93,6 +135,24 @@ assignment cannot satisfy a Project Agent binding, and there is no
 role/`is_primary` combination to resolve. Connection health never grants
 Project, Task, or filesystem access; an identity appears in the chat switcher
 only when it is explicitly bound as Main or Project Agent.
+
+The singular role boundary is enforced by the authenticated binding and the
+Task scheduler, not by model instructions:
+
+| Principal | Canonical scope | Authority | Explicit boundary | Workspace |
+| --- | --- | --- | --- | --- |
+| Main Agent | Account / Main Chat | Genesis discovery, bounded research, Charter proposal/readiness, exact Project create/handoff, bounded portfolio projection | No Project-local Documents, Tasks, assignments, milestones, validation, waiver, release, or repository access | Denied |
+| Project Agent | One bound Project / Project Chat | Project Documents, Decisions, baseline draft/proposal, Task and assignment coordination, milestone/evidence/readiness/release-candidate proposals | No other Project, private Main history, credentials, repository/filesystem, self-validation, baseline approval/activation, waiver, or release | Denied |
+| Task Worker | One assigned Task / attempt | Work allowed by the scheduler-issued capability profile | No portfolio, Genesis, unrelated Project/Task, approval, or release authority | Task-scoped lease |
+| Reviewer/validator | One assigned review/check | Independent review or attestation allowed by policy | Read-only by default; remediation requires a separate Worker assignment and may not review its own work | Read-only by default |
+| Interactive user | Authorized account/Project | Exact approvals, setup choices, manual attestations/waivers, and release | Only existing authenticated user controls | Existing user controls |
+| System | Server policy | Readiness, scheduling, leases, recovery, and projections | Not a chat principal; cannot substitute for user approval | Internal only |
+
+Provider/model configuration may be reused across these rows, but principal,
+scope, history, assignment, lease, and attestation provenance are not reused.
+An active Main or Project Agent identity is never silently converted into a
+Task Worker or reviewer, and an independent reviewer is never the same
+identity as the Worker it reviews.
 
 Every persistent agent session binds to one canonical scope:
 
@@ -119,7 +179,10 @@ policies, arbitrary threads, or bounded multi-agent rounds.
 Creating an operational Project creates its Project Agent binding and Project
 Agent Chat atomically. A migrated Project with no single safe binding is
 explicitly `agent_setup_required` and keeps its Project/Task data readable, but
-cannot admit Project Agent turns until the user resolves the identity.
+cannot admit Project Agent turns until the user resolves the identity. When an
+approved adoption Charter resolves that setup binding, the same transaction
+installs the canonical Project-Agent permission ceiling before activating the
+binding; setup's empty ceiling never survives into an admitted Project Agent.
 
 User-message or handoff admission atomically appends the guarded immutable
 message, its durable domain event, and one queued turn job. A turn exposes the
@@ -133,6 +196,18 @@ current optimistic version and an idempotency key; stale or terminal
 cancellation attempts are rejected. Progressive output is transient; success or failure appends
 one immutable canonical assistant outcome with provenance, usage, duration,
 correlation, and causation metadata.
+
+Every new user-message, Main-to-Project handoff, autonomous wake, or baseline-
+activation turn goes through `AgentTurnAdmissionService`. Admission resolves
+the current owning binding, its identity, that identity's current Profile,
+operating-skill revision, policy/tool digests, and canonical scope, then freezes
+those values and the admission digest on the queued job. The shared
+`AgentChatTurnRunner` abstraction (the configured implementation is
+`FederatedAgentChatTurnRunner`) runs native or constrained CLI backends for
+all admitted turns. An explicit retry reclaims the same turn job and frozen
+provenance; it is not a second responder resolution or a new model admission.
+A Profile edit or binding replacement therefore affects the next admitted turn
+only, never an already queued/leased turn.
 
 The chat worker selects the session backend from the bound identity's profile.
 A native profile uses the embedded host and an Agent Chat-scoped continuity
@@ -215,7 +290,83 @@ worker, and task-worker aliases to persisted `worker`, while reviewers remain
 `reviewer`. No route, MCP tool, chat context, filesystem path, handle, or bearer
 token exposes the row.
 
-#### Charter, Documents, Decisions, and effective state
+### Project readiness and execution setup
+
+Project coordination, repository/role setup, and baseline execution are
+independent projections. A successful Project/Chat creation or a configured
+repository does not imply the other dimensions:
+
+| Dimension | States | Authority and consequence |
+| --- | --- | --- |
+| `coordination_state` | `setup_required`, `ready`, `unavailable` | Active singular Project-Agent binding plus a ready Project Chat; only `ready` admits a Project-Agent turn. |
+| `execution_setup_state` | `setup_required`, `provisioning`, `ready`, `failed`, `unavailable` | Durable provisioning operation, verified repository linkage/filesystem state, and required eligible Worker/reviewer assignments; implementation dispatch/write leases remain denied until `ready`. |
+| `execution_gate` | `pre_baseline_read_only`, `baseline_approval_required`, `active`, `reconciliation_required`, `unavailable` | Current baseline and reconciliation records; only `active`, together with ready setup and other Task guards, permits repository-mutating implementation. |
+
+The Genesis create/handoff transaction may commit a valid Project while
+execution setup is still `provisioning` or `setup_required`. Provisioning is a
+finite, leased, checkpointed, idempotent operation that reconciles the
+deterministic filesystem target, repository row, Project link, and role set;
+interruption resumes that operation rather than creating a second directory or
+repository. Required Worker and (when policy requires it) independent-reviewer
+roles are derived from the workflow/baseline, excluding active coordinator
+identities. Missing roles are typed setup requirements with a user/system retry
+or configuration action, not a best-effort executable success. Read-only
+planning/discovery may remain available under its explicit capability before an
+active baseline.
+
+### Execution liveness and terminal concurrency
+
+An execution attempt has its own owner-bound liveness contract. The
+`execution` row is authoritative for the attempt and carries
+`execution_version`, `lease_owner`, `lease_expires_at`, `hard_deadline_at`,
+`last_heartbeat_at`, and `last_progress_at`. Migration `V089` adds these
+fields without rewriting execution history: terminal rows are ownerless,
+existing running rows are made deterministically recoverable, and the legacy
+activity timestamp is preserved only as semantic progress. The migration never
+fabricates a live owner or heartbeat.
+
+Every running attempt is claimed by exactly one server-issued owner before
+provider work begins. Embedded execution uses a server-generated owner and a
+server-controlled heartbeat task. Remote execution binds the same lease model
+to the authenticated daemon connection incarnation (`daemon:<id>:connection:<n>`);
+the daemon id is only a routing identity. Reconnecting creates a new
+incarnation, so a stale socket cannot renew, report progress for, or
+terminalize the replacement's execution. The opaque `lease_owner` value is
+diagnostic metadata, never a credential or client capability.
+
+Lease claim, renewal, semantic progress, and terminalization are repository
+compare-and-swap operations. Renewal runs on a fixed server cadence and does
+not depend on `TurnEventSink`, JSONL output, text, reasoning, tool calls, or
+provider callbacks. Those events may advance `last_progress_at` and append a
+deduplicated `execution.progressed` event, but they do not prove ownership.
+A quiet provider/tool call therefore remains live while its owner lease is
+current. A stale-progress scan can append a distinct, atomically revalidated
+`execution.progress_warning` Attention event; it does not fail a live lease or
+turn a warning into owner death.
+
+`hard_deadline_at` is derived from the admitted profile/capability snapshot
+and is a fixed upper bound. Heartbeats are clamped to it and cannot extend
+the deadline. The monitor treats an expired owner lease and a reached hard
+deadline as different recovery causes (`execution.stalled` with an
+`execution_lease_expired` reconciliation reason versus
+`execution.hard_deadline_exceeded`) and never treats semantic silence alone as
+expiry.
+
+Runner completion, failure, cancellation, daemon-disconnect recovery, and
+monitor expiry all call the same terminal CAS with execution ID, expected
+`status = 'running'`, `execution_version`, and the current owner where
+applicable. The winning transaction writes the terminal metadata, clears the
+active execution owner/lease, disposes the matching `WorkspaceLease` (`revoked`
+or `expired`), and appends exactly one terminal domain event
+(`execution.completed`, `execution.failed`, or `execution.cancelled`). Only
+that committed winner cancels an executor, publishes reconciliation, or
+cascades Task state. A zero-row CAS is a concurrent winner, not a second
+failure: a late runner/daemon result is retained only as a bounded,
+deduplicated `execution.late_terminal_rejected` diagnostic (protected error
+text is truncated) and cannot overwrite execution, Task, lease, or readiness
+truth.
+
+### Charter, Documents, Decisions, and effective state
 
 Every Main Agent Chat turn carries a server-owned operating instruction.
 Outside an active Product Genesis session, the account baseline skill
@@ -354,19 +505,97 @@ message/turn, events, `handed_off` transition, and receipt consumption are one
 database transaction. A failure leaves Genesis `ready_for_project`, the exact
 approval receipt `active`, and no partial Project or handoff; retry with the
 same idempotency key returns the original committed result if one exists.
-After that transaction commits, `project_provisioning` makes the Project
-executable as a best-effort, idempotent step (retried on creation replay): it
-initializes a local git repository (first commit on `main`) under
-`<workspace_root>/repos/`, registers it as the primary repo, and seeds
-`default_role_assignments` (coder/reviewer) from the account's executor
-agents, preferring the Project Agent's provider family and never selecting
-Main/Project-bound identities. Agent `task.propose` executions on a
-charter-backed Project without an explicit governance envelope are bound
+
+Native operations are classified by one host-owned catalog before descriptor
+exposure and again at the service boundary. Queries use read services;
+automatically allowed Main/Project/Task coordination writes call their shared
+command service directly; approval-required or explicitly audited proposals
+create an `AgentAction`; denied operations are omitted and rejected. Direct
+commands commit their domain result, durable event, and frozen command receipt
+without an Action or ActionExecution row. Fresh Project and Task commands
+recheck the current identity, selected profile, active binding permission, and
+applicable Charter/governance state inside the same `BEGIN IMMEDIATE`
+transaction after receipt lookup and before mutation. Exact committed replays
+return the frozen result even if mutable authorization later changes. Mission
+Control projects these receipt-only commits separately from pending/approved
+approval Actions and never exposes an Action payload body.
+
+Each migrated operation has one canonical contract in the same catalog. The
+contract declares its native surface and exposure, setup availability,
+supported canonical scopes, command classification, scope-aware permission,
+input-contract family, and the shared output envelope. Provider JSON schemas
+and preparation-time structural checks are derived from that contract; service
+adapters look up the same operation and permission metadata and retain only
+domain/lifecycle validation in the command service. The current MCP registry
+contains no migrated dotted orchestration operation IDs, so its existing
+`forge_*` direct APIs remain explicitly separate. An invariant test prevents a
+migrated operation from entering MCP through a second manual descriptor; a
+future MCP projection must consume the canonical contract.
+
+Native and MCP orchestration adapters expose those command results through one
+typed `OrchestrationOutcome` envelope. It carries `code`, `status`,
+`operation`, canonical `scope`, optional `result`, `approval_target`,
+`setup_requirements`, `current_version_or_revision`, and `retry`, plus the
+always-present `safe_message`, `correlation_id`, and boolean `replayed`; a
+committed receipt/event may add `receipt_id` and `event_id`. The stable codes
+are `ok`, `approval_required`, `setup_required`, `version_conflict`,
+`digest_conflict`, `idempotency_conflict`, `policy_denied`, `not_found`,
+`transient_failure`, `internal_failure`, and `validation_error`. Status is
+`succeeded`, `approval_required`, `setup_required`, or `failed`; replay is
+represented only by `replayed`, never by a synthetic status. Approval and
+setup outcomes never claim a committed or executable domain success.
+
+The native adapter keeps safe domain failures in-band as a model-visible tool
+value with the runtime error marker, while MCP returns a known-tool failure as
+a JSON-RPC success result containing `isError: true`, `structuredContent`, and
+text `content`. JSON-RPC parse/invalid-request and method/protocol failures
+remain top-level errors. Both adapters redact protected persistence/runtime
+causes. A current version/revision or retry argument is emitted only after the
+canonical principal and scope have been authorized and only for state the
+caller may inspect; idempotency conflicts do not load current state. Models
+must use the stable code and typed fields rather than infer corrections from
+prose.
+
+After that transaction commits, `project_provisioning` reconciles execution
+setup as one durable, leased, finite, idempotent operation (also resumed on
+creation replay). Its checkpoints cover preflight, filesystem initialization,
+repository registration, Project linkage, and role assignment. It initializes
+or verifies a local git repository (first commit on `main`) under
+`<workspace_root>/repos/`, registers or reuses one matching logical repository,
+links it with Project-version CAS, and resolves canonical Worker and (when
+required) independent-reviewer assignments from current workflow/baseline
+policy. Main/Project-bound identities are never eligible. A missing Worker or
+reviewer is a typed `setup_required` blocker in the current setup projection;
+it is not an operator-only log or an executable success. Replays reuse the
+operation, checkpoint target path, directory, repository row, Project link,
+and role set. Agent `task.propose` executions on a
+Charter-backed Project without an explicit governance envelope are bound
 server-side to the active user-approved execution baseline; the proposal
 payload carries only `plan_item_id` (required for implementation Tasks),
 optional `milestone_id` (defaults to the baseline's primary milestone), and
-optional capability/risk classes. A
-release or media-pin failure leaves the milestone `ready_for_release` with no
+optional capability/risk classes. Task proposal execution commits the Task,
+governance projection, durable `task.created` event, and command receipt in one
+transaction; an exact response-loss replay returns the frozen Task snapshot.
+A ReadyOnly Project Agent may likewise invoke the native `task.adaptive`
+Coordination operation in the bound Project or its Project Agent Chat. The
+adapter accepts only the closed `split`, `sequence`, and `replace` payloads
+with explicit source-task/version and board-revision preconditions. Project,
+scope, actor, permission, governance, and fixed execution boundaries are
+server-derived; unknown fields and attempted overrides are rejected. The
+adapter calls `TaskService` directly, so no `AgentAction` or
+`AgentActionExecution` is created. Its bounded result carries the frozen
+receipt/event identity, source and affected Task ids, board revision, and
+`replayed`; receipt-first exact replay bypasses mutable governance checks,
+while a new command is authorized and validated inside the shared transaction.
+A Project's coordination/chat state, execution setup, and baseline gate remain
+independent projections. Each setup response carries per-dimension freshness;
+an unavailable source is returned with a bounded retry action and never
+converted into inferred readiness. V087 backfills only database-verifiable
+repository linkage and current workflow/baseline role eligibility. It records
+local repository initialization as skipped with `filesystem_verified=false`
+until a reconciler verifies the filesystem, and never fabricates identities or
+successful setup. A release or media-pin failure leaves the milestone
+`ready_for_release` with no
 partial manifest or pin. Migration failures leave legacy media references and
 bytes usable; physical cleanup is a separate guarded operation. These recovery
 rules make replay safe without inventing approval or silently substituting a
@@ -472,17 +701,44 @@ projection.  Its event-derived dedupe keys make a crash between projection
 and receipt checkpoint safe to replay.
 
 The `agent-wake-turns` consumer (also started by `forge-cli`) closes the wake
-loop: each `agent.wake.admitted` event becomes one system-authored message
-plus a queued turn job on the woken identity's Agent Chat, composed from the
-durable Attention incident. It also delivers
-`project.execution_baseline.activated` straight to the Project Agent chat as
-a "begin execution" turn — a user approval is its own deterministic admission
-and consumes no wake budget. Terminal execution outcomes are mirrored into
-the ledger by `ExecutionRepo::update` (`execution.failed` /
-`execution.completed`, Project-scoped) so failed dispatches project
-`execution_failed` incidents; Project-scoped incidents with no more specific
-responder wake the active Project Agent binding, whose default wake budget is
-10 admissions per hour.
+loop. Migration `V088` records an install-time cutover cursor, so events that
+commit after installation are evaluated even when the process has not polled
+yet; startup never derives a cursor from the runtime event maximum. Each
+claimed `agent.wake.*` candidate receives one durable current disposition:
+`turn_admitted`, `deterministically_suppressed`, `deferred`, or
+`setup_required`. The disposition, projection receipt, cursor advancement,
+lease release, and optional Agent Chat message/turn admission commit in one
+transaction. Deferred and setup-required incidents retain bounded retry or
+authoritative-state reconsideration lineage instead of disappearing as
+completed delivery. Claims and checkpoints are ordered by ascending
+`domain_event.sequence`; a live lease at the head is an ordering barrier, and
+the cursor cannot skip an undisposed sequence. A disposition replay is
+idempotent and advances the cursor at most once, only after its disposition
+and any admitted turn/message commit.
+
+Immediately before an admitted wake commits, the consumer revalidates the
+durable Attention version, status, digest, source, dedupe identity, and
+canonical scope. It then uses the same `AgentTurnAdmissionService` as user
+messages and handoffs. That service resolves the current owning binding,
+identity, selected Profile, operating-skill revision, permission/tool policy,
+and canonical scope, and freezes their exact versions/digests on the queued
+turn. Explicit retries and the turn runner continue from that persisted
+snapshot rather than substituting later binding or Profile state. A worker
+retry of a `retry_wait` job is not a new admission: it reclaims that same turn
+job and invokes the runner with the same frozen provenance, changing only
+lease/attempt metadata. The same admission path delivers
+`project.execution_baseline.activated` to the Project Agent chat as a distinct
+`baseline_activation` trigger; the user approval is its deterministic
+admission policy and consumes no autonomous wake budget.
+
+Execution terminal outcomes are written by the winning execution terminal CAS:
+the terminal row, active `WorkspaceLease` disposition, and one durable
+`execution.completed`, `execution.failed`, or `execution.cancelled` event are
+committed together. The Attention projection can derive an
+`execution_failed` incident from that event, while `execution.progressed` and
+`execution.progress_warning` remain separate semantic-progress signals.
+Project-scoped incidents with no more specific responder wake the active
+Project Agent binding, whose default wake budget is 10 admissions per hour.
 
 The `events` crate still wraps `tokio::sync::broadcast`, and the SSE endpoint at
 `/api/v1/events` still drives live clients. For durable events it is a
@@ -553,23 +809,28 @@ workspace sync or git handoff path.
 
 Remote daemons periodically report local CLI availability and, when connected
 over the command stream, their currently running managed execution ids via
-`POST /api/v1/daemons/{id}/report` (`active_execution_ids`). The server uses
-that snapshot to reconcile orphaned server-side `running` executions owned by
-the daemon: any execution older than 60 seconds that is missing from the report
-is failed with `stop_reason = daemon_disconnected` and manual recovery only.
+`POST /api/v1/daemons/{id}/report` (`active_execution_ids`). This report is a
+reconciliation input, not proof that output was emitted. A managed execution
+is claimed against the authenticated daemon connection incarnation before
+`execution.start` is dispatched; transport heartbeats renew that same
+owner-bound execution lease independently of log notifications.
 
-Separately, the server `HeartbeatMonitor` (10s tick) watches remote executions
-whose owning daemon has no live WebSocket connection. After a 120s grace period
-from the first observed disconnect, it fails the execution with
-`daemon_disconnected`, publishes `execution.daemon_disconnected`, and emits the
-same `reconciliation.event` used for stalled executions so tasks enter the
-blocked/recovery UX. Embedded-server executions are excluded from the
-disconnect check; only embedded-owned stalled executions are cancelled via the
-in-process executor.
+When a WebSocket disconnects, its connection-incarnation owner can no longer
+renew or terminalize the execution. The monitor reconciles the expired owner
+lease through the same execution terminal CAS and may publish the
+disconnect-specific `execution.daemon_disconnected`/`reconciliation.event`
+diagnostics. A replacement socket receives a new owner token, and late
+notifications from the old socket are rejected as concurrent outcomes. The
+terminal event, WorkspaceLease disposition, and Task-block cascade happen only
+if that CAS wins. Embedded-server executions use the equivalent in-process
+owner and heartbeat path.
 
-If a remote execution keeps running but stops emitting activity, the existing
-stall detector still fails it after `execution_stall_timeout` (default 300s)
-with `stop_reason = execution_stalled`.
+Remote output, reasoning, and tool notifications update semantic progress
+when accepted, but a quiet remote execution remains healthy while its lease is
+current. Stale semantic progress may create a separate
+`execution.progress_warning` Attention item. Only owner-lease expiry or the
+profile/capability hard deadline is an execution-liveness terminal condition;
+the hard deadline is not extended by heartbeat renewal.
 
 ### Task terminal sessions
 
@@ -834,12 +1095,22 @@ do not consume budget.
 
 ### Crash recovery
 
-`CrashRecovery` runs at server startup; `HeartbeatMonitor` applies the same
-recovery primitive on agent timeout. Both annotate a task with a
-`recovery_required` `error_annotation` only when they actually cancelled at
-least one running execution for that task, and publish `task.recovered` only in
-that case. Tasks whose assignee is a user are excluded from crash-recovery
-selection — agent-oriented recovery is not meaningful for human-driven tasks.
+`CrashRecovery` runs at server startup and deterministically reconciles
+ownerless or expired running executions left by an earlier process. Migration
+`V089` does not invent ownership for pre-existing rows: a running row without
+verifiable lease ownership is immediately eligible for this recovery pass.
+`HeartbeatMonitor` applies the same owner-lease terminal CAS on its periodic
+scan, while a separate semantic-progress scan emits warnings without
+terminalizing a live owner. Hard deadlines are recovered distinctly from
+ordinary owner-lease expiry.
+
+Both recovery paths annotate a task with a `recovery_required`
+`error_annotation` only when they actually win a terminal CAS for at least one
+running execution, and publish `task.recovered` only in that case. The winning
+CAS also closes the execution's active `WorkspaceLease`; a stale monitor or
+runner cannot annotate, cancel, or cascade a second time. Tasks whose assignee
+is a user are excluded from crash-recovery selection — agent-oriented recovery
+is not meaningful for human-driven tasks.
 
 After the orphan pass, startup runs a sweep that clears stale
 `recovery_required` annotations when `blocked_execution_id` is missing, refers
@@ -957,6 +1228,14 @@ immutable, preserves existing media identifiers/storage keys/file bytes, and
 does not move or duplicate files. Any later migration must be independently
 numbered and is outside this change's contract.
 
+The execution liveness contract is added by the forward-only
+`V089__execution_liveness.sql` migration. It preserves execution rows and
+copies legacy `last_activity_at` into semantic `last_progress_at` only;
+terminal rows remain ownerless, and pre-existing running rows receive no
+fabricated owner or heartbeat and are eligible for deterministic recovery.
+Lease/version CAS, progress-warning dedupe, and terminal event/WorkspaceLease
+disposition atomicity are repository guarantees layered on these fields.
+
 For tests, use `create_sqlite_pool("sqlite::memory:")` for an in-memory
 database.
 
@@ -979,13 +1258,16 @@ React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses
   emission, counter increments, `ReviewRunner` on `→ review`, `MergeService`
   on `review → merging`, `WorkspaceCleanupScheduler` on `→ done` /
   `→ cancelled`). Background tasks: `CrashRecovery` at startup (orphan
-  execution recovery and stale-annotation sweep), `HeartbeatMonitor`,
+  execution recovery and stale-annotation sweep), `HeartbeatMonitor` (owner
+  lease/deadline expiry plus separate semantic-progress warnings),
   `DaemonMonitor`, Agent Chat turn workers, durable event consumers, Attention
   projection, and `WorkspaceCleanupScheduler`.
 - **review** — `ReviewRunner` runs `task.review_config.ci_steps` as `bash -lc`
   commands in the worktree; empty steps auto-pass. Creates a `reviewer`-role
-  execution sharing the executor's workspace. Depends only on `db`, `events`,
-  `executors` — not on `api` or `services`.
+  execution sharing the executor's workspace, with the same owner heartbeat,
+  semantic-progress, hard-deadline, and terminal-CAS contract as Task
+  execution. Depends only on `db`, `events`, `executors` — not on `api` or
+  `services`.
 - **api** — Routes include projects, Tasks, Main/Project Agent bindings and
   chats, embedded agents/sessions, memory/context, commitments/actions, Mission Control,
   terminals, repos, executions, events, daemons, CLIs, and executor types.

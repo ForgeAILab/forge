@@ -18,6 +18,10 @@ pub enum AttentionCategory {
     HumanInputRequired,
     ValidationFailed,
     RunStalled,
+    /// The owner lease is healthy, but semantic progress has exceeded the
+    /// configured warning interval.  This is intentionally distinct from
+    /// `RunStalled`: silence is a visibility signal, not proof of owner death.
+    ProgressWarning,
     RetryExhausted,
     ReviewReady,
     ReviewRisk,
@@ -124,6 +128,31 @@ pub struct MissionControlRecentOutcome {
     pub occurred_at: String,
 }
 
+/// One bounded, authorized Mission Control audit activity.  Direct command
+/// receipts and approval-queue actions share this projection so the operator
+/// can see what was committed without exposing the action/command payload
+/// bodies.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[ts(export)]
+pub struct MissionControlCoordinationActivity {
+    pub id: String,
+    /// `direct_command` for a committed command receipt, or
+    /// `approval_action` for a pending/approved AgentAction.
+    pub activity_kind: String,
+    pub actor_type: String,
+    pub actor_id: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub operation: String,
+    pub input_digest: String,
+    pub policy_result: String,
+    pub status: String,
+    pub correlation_id: String,
+    #[ts(type = "Record<string, unknown> | null")]
+    pub outcome: Option<Value>,
+    pub occurred_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 pub struct MissionControlCapacity {
@@ -137,6 +166,7 @@ pub struct MissionControlCapacity {
 #[ts(export)]
 pub struct MissionControlHomeResponse {
     pub needs_attention: Vec<AttentionItem>,
+    pub coordination_activity: Vec<MissionControlCoordinationActivity>,
     pub review_ready: Vec<MissionControlWorkItem>,
     pub active_work: Vec<MissionControlWorkItem>,
     pub agent_health: Vec<MissionControlAgentHealth>,

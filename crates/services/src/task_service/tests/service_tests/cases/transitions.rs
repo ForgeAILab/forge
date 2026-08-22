@@ -249,6 +249,7 @@ async fn transition_to_review_runs_configured_review_runner() {
         TaskService::new(Arc::clone(&db), Arc::clone(&event_bus)).with_review_runner(runner);
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
+    crate::test_support::clear_project_execution_role_defaults(&db, &project_id).await;
     let task = service
         .create_task(
             project_id,

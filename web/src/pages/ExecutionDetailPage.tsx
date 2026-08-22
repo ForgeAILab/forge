@@ -605,8 +605,12 @@ export function ExecutionDetailPage({
                 actions={{
                   onStop: execution?.status === 'running' ? () => cancelExecution.mutate() : undefined,
                   stopPending: cancelExecution.isPending,
+                  onRefresh: execution?.status === 'running' ? () => void executionQuery.refetch() : undefined,
+                  refreshPending: executionQuery.isFetching,
                   onContinue: showRecoveryAction && executionAgentSessionId ? () => recoveryExecution.mutate() : undefined,
                   continuePending: recoveryExecution.isPending,
+                  onRetry: showRecoveryAction && !executionAgentSessionId ? () => recoveryExecution.mutate() : undefined,
+                  retryPending: recoveryExecution.isPending,
                 }}
               />
             </Panel>

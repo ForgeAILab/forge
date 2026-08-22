@@ -115,7 +115,7 @@ impl ApiError {
     fn invalid_operation(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
-            code: "invalid_operation",
+            code: "validation_error",
             message: message.into(),
             details: None,
         }
@@ -124,7 +124,7 @@ impl ApiError {
     pub fn invalid_operation_conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
-            code: "invalid_operation",
+            code: "validation_error",
             message: message.into(),
             details: None,
         }
@@ -222,6 +222,14 @@ impl From<ServiceError> for ApiError {
                 message: "task dependencies are not satisfied".to_owned(),
                 details: None,
             },
+            ServiceError::ExecutionSetupRequired {
+                message,
+                requirements,
+            } => Self::conflict_with_code_and_details(
+                "execution_setup_required",
+                message,
+                json!({ "setup_requirements": requirements }),
+            ),
             ServiceError::Db(error) => error.into(),
             ServiceError::Git(error) => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,

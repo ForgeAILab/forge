@@ -1,4 +1,6 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
+mod common;
+
 use std::{
     future::Future,
     path::{Path, PathBuf},
@@ -74,6 +76,14 @@ async fn failed_executor_does_not_auto_cascade_to_review() {
     )
     .await;
     assert_eq!(agent.effective_status.as_deref(), Some("active"));
+    common::configure_execution_test_setup(
+        &harness.state.db,
+        &project.id,
+        &repo.id,
+        &agent.id,
+        &agent.id,
+    )
+    .await;
 
     let created_task: TaskResponse = json_request(
         &harness.app,
@@ -216,6 +226,7 @@ impl CodingExecutorAdapter for FailingCodexAdapter {
 
 struct TestHarness {
     app: Router,
+    state: Arc<AppState>,
     event_bus: Arc<EventBus>,
     _web_dist_dir: TestDir,
 }
@@ -272,6 +283,7 @@ async fn test_app(
 
     TestHarness {
         app,
+        state,
         event_bus,
         _web_dist_dir: web_dist_dir,
     }

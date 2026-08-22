@@ -6,7 +6,69 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Added
+
+- Added the native ReadyOnly `task.adaptive` Project Agent operation for
+  bounded split, sequence, and replace Task commands. The operation is
+  Project/Project-chat scoped, requires `propose_task`, uses direct command
+  receipts without an `AgentAction`, and returns receipt-first replay metadata.
+
 ### Fixed
+
+- A Project can be deleted after its agents have run. `DELETE /api/v1/projects/{id}`
+  failed with "context manifests are immutable" for any Project whose agent had
+  produced a single context manifest. Project teardown already installs a
+  `project_deletion_guard` so append-only Project tables release their rows
+  once, but `context_manifest` and `context_manifest_source` never joined that
+  contract and aborted unconditionally — and they are reached by cascade, so
+  the whole transaction rolled back. `V090` relaxes both delete triggers to
+  abort only while their parent row still exists, which is exactly the
+  direct-delete case; update immutability is unchanged.
+
+- An agent can dispatch the execution it was just assigned. Role eligibility
+  required `EffectiveStatus::Active`, which requires spare concurrency — but
+  dispatch re-checks eligibility *after* the execution is running, so the
+  execution consumed its own agent's capacity. Any agent with
+  `max_concurrent_tasks = 1` failed every repository dispatch with "repository
+  execution identity is not active and Project-eligible". `Busy` is a
+  scheduling fact enforced when a Task is claimed, so it no longer strips an
+  identity of its Project role.
+
+- An embedded agent can serve as reviewer. The review path built its auditor
+  executor from the CLI adapter registry alone, so an embedded reviewer failed
+  with "No adapter registered for executor type: embedded". Reviews now
+  dispatch the auditor through the same routed executor the Task path uses.
+
+- A shell auditor's verdict is read. `===REVIEW: PASS===` was only looked for
+  in assistant-channel log entries, so a shell auditor — which writes ordinary
+  stdout — always failed as "verdict marker missing" even when its own log
+  contained the marker. Auditor stdout is now part of the verdict text, with
+  lines kept separate so two partial lines cannot be glued into a marker
+  neither printed.
+
+- A Worker can no longer become its own reviewer. Claiming into a state seeded
+  the claiming agent into that state's role, including the reviewer role, so a
+  Worker claiming its way into the review gate silently self-assigned the
+  review it was supposed to receive independently. A claim for the Project's
+  independent-reviewer role is now refused when the claimer is that Task's
+  Worker.
+
+- Two concurrent submissions of the same Project-creation command both return
+  the committed receipt. The loser of that race read the Charter approval
+  while it was still `active`, then validated Genesis state the winner had
+  already advanced, and failed with "Product Genesis does not point to this
+  exact active Charter approval" instead of replaying. A lost response is
+  normally retried, and the retry can overlap the original, so this turned an
+  ordinary retry into a spurious conflict. The loser now re-resolves exactly
+  once against the now-consumed approval; the retry is admitted only when that
+  approval is consumed *and* the committed handoff carries the caller's own
+  idempotency key, so a genuine conflict is never retried into success.
+
+- Approving a Project adoption Charter now installs the canonical Project-Agent
+  permission ceiling while activating an `agent_setup_required` binding. The
+  binding previously became active with setup's empty ceiling, so the newly
+  admitted Project Agent could read its Project but every direct command was
+  rejected at the transactional authorization boundary.
 
 - Conflict, authorization, and task-availability errors from the Forge
   coordination tools reach the model instead of collapsing into "Forge
@@ -59,6 +121,72 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   contract, pinning the Charter and Project versions observed during review.
 
 ### Breaking
+
+- Execution responses now expose the owner-bound liveness projection
+  (`execution_version`, opaque `lease_owner`, lease expiry, hard deadline,
+  heartbeat, semantic progress, owner health, and warnings). Output, reasoning,
+  and tool events are progress signals, not ownership heartbeats; clients must
+  not treat a quiet but leased execution as stalled or use `lease_owner` as a
+  credential. Terminal events are winner-only compare-and-swap outcomes, with
+  the matching `WorkspaceLease` disposition committed atomically. New
+  `execution.progressed`, `execution.progress_warning`, and
+  `execution.hard_deadline_exceeded` events distinguish progress, attention,
+  owner expiry, and hard deadline recovery.
+
+- Agent wake delivery now exposes durable typed outcomes for every claimed
+  wake candidate: `turn_admitted`, `deterministically_suppressed`, `deferred`,
+  or `setup_required`. The wake consumer resumes from a migration-recorded
+  cutover cursor and no longer fast-forwards to the runtime event maximum.
+  Event consumers and diagnostics must not assume every `agent.wake.*` event
+  immediately creates a turn or parse absence of a turn as successful
+  delivery.
+
+- Main/Project Agent user, handoff, retry, and wake turns now resolve the
+  identity's current Profile at admission and freeze that Profile/policy
+  provenance for the admitted turn. Binding-time Profile snapshots no longer
+  select later turns; a Profile edit affects the next admitted turn only.
+
+- REST `ServiceError::InvalidOperation` responses now use the stable
+  `validation_error` code, matching native orchestration failures. Clients
+  should branch on this code rather than the removed `invalid_operation` code.
+
+- Native and MCP orchestration tools now share a typed `OrchestrationOutcome`
+  envelope with stable `code`/`status`, canonical scope, correlation id,
+  explicit boolean `replayed`, and typed approval/setup/current-state/retry
+  fields. Native domain failures are model-facing in-band tool values; known
+  MCP tool failures are JSON-RPC success results with `isError`,
+  `structuredContent`, and `content`, while parse/method/protocol errors remain
+  top-level JSON-RPC errors. Callers must stop parsing free-form error prose;
+  protected causes remain redacted.
+
+- Project creation no longer implies executable readiness. Creation responses
+  include independent `coordination_state`, `execution_setup_state`, and
+  `execution_gate` truth through `execution_setup`; missing repository,
+  Worker, or independent-reviewer prerequisites remain visible as typed
+  `setup_required`/provisioning/failed states and block implementation
+  dispatch. Clients must use `GET /api/v1/projects/{id}/execution-setup` and
+  its canonical setup actions (select a Worker or reviewer, attach a
+  repository, or retry provisioning) rather than treating a committed
+  Project or repository row as ready; the old same-principal Worker/reviewer
+  fallback is gone.
+
+- `POST /api/v1/agents/{id}/task-proposals` now executes the admitted Task
+  command in one step and returns a durable command receipt with the Task. It
+  no longer creates an `AgentAction`/`AgentActionExecution`, and the obsolete
+  `/api/v1/actions/{id}/execute-task` endpoint and its request/response types
+  have been removed. Historical action rows remain readable.
+
+- Native Main Charter drafts and catalog-admitted safe Project coordination
+  commands now return committed command-receipt outcomes directly. They no
+  longer manufacture an automatically executed `AgentAction` or
+  `AgentActionExecution`, so callers must use the returned receipt/event fields
+  instead of Action ids, versions, or execution ids. Approval-required
+  operations, including Project creation and release requests, remain Actions.
+
+- Project Agent `project.evidence` proposals now require the positive
+  `expected_milestone_version` from the current Project state. Omitting it or
+  sending zero no longer defaults to the live milestone version; stale native
+  proposals fail the same compare-and-swap check as REST requests.
 
 - `project.charter.adoption` treats `charter_id` as a reference, not as the id
   to store under. The field is now optional: omit it to start the Project's
@@ -124,6 +252,24 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     rendered server-side.
 
 ### Breaking
+
+- Execution-baseline REST writes now use the shared command boundary and an
+  explicit `operation`: the collection `POST` saves a first `draft` candidate
+  instead of creating a shell, revision writes choose `save_draft` or
+  `propose_for_approval`, and activation must include the exact
+  `expected_baseline_version`. Proposal responses include the frozen
+  `approval_target` and `requires_user_authorization`; old shell/proposed
+  request bodies are rejected.
+- Project Agent `project.execution_baseline` actions now require the canonical
+  rendered view/version and content/render digests. `draft_revision` and
+  `revise` persist lifecycle `draft`; only `propose_approval` persists
+  `proposed` and returns an exact approval target requiring user authorization.
+  The former weaker native payload and its implicit promotion are removed.
+- `task.propose` execution now reports the real executing principal (`user` for
+  REST, `agent` for native Project-Agent execution) instead of the internal
+  Task service label. Its Task, governance, roles, durable event, command
+  receipt, and Action outcome commit atomically, and exact response-loss
+  retries return the original frozen Task rather than materializing another.
 
 - Project Agent typed actions no longer trust an agent-supplied id when
   creating a Project Document (`project.document` with a `draft_revision`
@@ -200,12 +346,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `repo.kind`, review CI columns from an older schema draft), failing
   every `POST /projects/{id}/milestones/{milestone_id}/readiness` on a
   repository-backed project.
-- The heartbeat stall monitor no longer kills healthy embedded executions.
-  Native turn events (tool calls, reasoning, text) now bump the execution's
-  `last_activity_at` (throttled), and dispatches queued behind a busy agent
-  heartbeat while they wait — previously embedded executions never reported
-  activity after launch, so any turn or queue-wait longer than the stall
-  window was culled as "Execution stalled: no activity".
+- Execution liveness no longer infers ownership from output. Embedded and
+  remote attempts renew a server-owned lease independently of turn/log events;
+  text, reasoning, and tool boundaries update semantic `last_progress_at` only.
+  A quiet but leased provider remains live until its fixed profile/capability
+  hard deadline, while stale semantic progress produces a distinct Attention
+  warning instead of a false owner-death failure.
 - The Attention projection no longer wedges permanently on a dedupe-key
   conflict. `agent.wake.admitted` dedupe keys now include the triggering
   event id (re-admitting the same incident after lease expiry is a new
@@ -369,18 +515,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Previously every embedded Task execution failed with "protected values
   cannot be stored in context manifest policy_revision".
 
-- Product Genesis projects are now executable end-to-end. Previously every
-  Task an agent proposed after handoff landed in the backlog and stayed
-  there forever: the project had no repository (the dispatcher silently
-  skips repo-less tasks), no default role assignments (no agent to
-  dispatch to), and the proposal carried no baseline provenance (the task
-  was never `runnable`). Now:
-  - Project creation from a Charter approval provisions a local git
-    repository under `<workspace_root>/repos/` (initialized with a first
-    commit on `main`) and registers it as the primary repo.
-  - It also seeds `default_role_assignments` (coder/reviewer) from the
-    account's executor agents, preferring the Project Agent's provider
-    family and excluding Main/Project-bound identities.
+- Product Genesis project setup is now a durable, truthful operation. Project
+  creation commits the Project and its handoff even when repository or role
+  setup is incomplete, while a leased finite operation/checkpoint projection
+  records the current state and typed retry/setup action. Replays reuse the
+  same operation, target directory, repository row, primary link, and role
+  assignments; a missing Worker or independent reviewer remains
+  `setup_required` instead of becoming a log-only or self-reviewing success.
+  When eligible principals exist, provisioning initializes or verifies one
+  local git repository under `<workspace_root>/repos/` (first commit on
+  `main`), registers/reuses its logical row, links it with Project-version
+  CAS, and resolves canonical Worker/reviewer defaults while excluding
+  Main/Project-bound identities.
   - `task.propose` binds the created Task to the project's active
     user-approved execution baseline server-side when the payload names a
     plan item but does not carry a full governance envelope; the payload

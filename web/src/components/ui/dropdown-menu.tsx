@@ -127,6 +127,7 @@ export function DropdownMenuContent({
     <div
       ref={ref}
       style={style}
+      data-drawer-owned-overlay
       className={cn(
         'min-w-[8rem] overflow-hidden rounded-lg border border-border-subtle bg-popover p-1 text-popover-foreground shadow-float animate-slide-in',
         className,

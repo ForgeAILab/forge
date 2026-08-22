@@ -14,6 +14,7 @@ use super::{helpers, TaskDispatcher};
 #[derive(Debug)]
 pub(super) struct InitialScheduleTarget {
     pub(super) transition_to: String,
+    pub(super) role: String,
     pub(super) agent_id: String,
 }
 
@@ -95,6 +96,11 @@ impl TaskDispatcher {
         if helpers::has_blocking_annotation(task) {
             return Ok(false);
         }
+        // Keep dispatch admission on the same centralized Task gate used by
+        // claim/launch/lease issuance. It loads persisted capability/risk,
+        // canonical setup projection, and the exact baseline rather than
+        // reconstructing authority from Task kind or repository presence.
+        self.task_service.ensure_task_runnable(task).await?;
         if task.repo_id.is_none() {
             return Ok(false);
         }
@@ -104,6 +110,13 @@ impl TaskDispatcher {
         if compute_effective_status(&self.db, &agent).await? != EffectiveStatus::Active {
             return Ok(false);
         }
+        crate::ensure_execution_role_principal(
+            &self.db,
+            &task.project_id,
+            &target.role,
+            &target.agent_id,
+        )
+        .await?;
 
         self.task_service
             .transition(
@@ -156,6 +169,7 @@ impl TaskDispatcher {
                 {
                     return Ok(Some(InitialScheduleTarget {
                         transition_to,
+                        role: role_name.to_owned(),
                         agent_id: assignment.assignee_id.expect("checked by match guard"),
                     }));
                 }

@@ -15,6 +15,8 @@ mod recovery;
 mod runner;
 pub(in crate::task_service) mod subtasks;
 
+pub(super) use runner::{bounded_lease_expiry, execution_deadline_seconds, rfc3339_after};
+
 pub(super) use cascade::should_block_task_for_failed_execution;
 
 pub(super) fn publish_terminal_execution_event(service: &TaskService, execution: &Execution) {

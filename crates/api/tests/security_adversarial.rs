@@ -50,7 +50,7 @@ async fn embedded_surfaces_redact_credentials_and_health_is_not_scope_authority(
             StatusCode::BAD_REQUEST,
         )
         .await;
-        assert_eq!(error.code, "invalid_operation");
+        assert_eq!(error.code, "validation_error");
         assert_json_does_not_contain_secret(
             &serde_json::to_value(&error).expect("URL error serializes"),
             PROVIDER_SECRET,
@@ -73,7 +73,7 @@ async fn embedded_surfaces_redact_credentials_and_health_is_not_scope_authority(
             StatusCode::BAD_REQUEST,
         )
         .await;
-        assert_eq!(legacy_embedded.code, "invalid_operation");
+        assert_eq!(legacy_embedded.code, "validation_error");
     }
 
     let adversarial_entry = common::create_provider_entry(
@@ -122,7 +122,7 @@ async fn embedded_surfaces_redact_credentials_and_health_is_not_scope_authority(
             StatusCode::BAD_REQUEST,
         )
         .await;
-        assert_eq!(error.code, "invalid_operation");
+        assert_eq!(error.code, "validation_error");
         assert_json_does_not_contain_secret(
             &serde_json::to_value(&error).expect("policy error serializes"),
             "placeholder",
@@ -239,7 +239,7 @@ async fn embedded_surfaces_redact_credentials_and_health_is_not_scope_authority(
         StatusCode::BAD_REQUEST,
     )
     .await;
-    assert_eq!(profile_error.code, "invalid_operation");
+    assert_eq!(profile_error.code, "validation_error");
     assert_json_does_not_contain_secret(
         &serde_json::to_value(&profile_error).expect("profile error serializes"),
         "placeholder-profile",
@@ -440,7 +440,7 @@ async fn agent_chats_reject_protected_content_and_opaque_cross_chat_references()
             StatusCode::BAD_REQUEST,
         )
         .await;
-        assert_eq!(error.code, "invalid_operation", "content: {protected}");
+        assert_eq!(error.code, "validation_error", "content: {protected}");
     }
 
     let _: api_types::SendAgentChatMessageResponse = common::json_request_with_bearer(

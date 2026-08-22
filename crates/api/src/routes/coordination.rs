@@ -4,9 +4,9 @@ use api_types::{
     ActionExecutionResponse, AgentActionResponse, AnswerQuestionRequest, ApproveActionRequest,
     AskQuestionRequest, CommitmentEvidenceResponse, CommitmentResponse, CompleteCommitmentRequest,
     CoordinationListQuery, CreateCommitmentRequest, ExecuteActionRequest,
-    ExecuteOrchestrationActionRequest, ExecuteTaskProposalRequest, InboxItemResponse,
-    ProposeActionRequest, QuestionResponse, TaskProposalExecutionResponse, TaskProposalRequest,
-    TransferCommitmentRequest, UpdateCommitmentRequest, UpdateInboxItemRequest,
+    ExecuteOrchestrationActionRequest, InboxItemResponse, ProposeActionRequest, QuestionResponse,
+    TaskProposalCommandResponse, TaskProposalRequest, TransferCommitmentRequest,
+    UpdateCommitmentRequest, UpdateInboxItemRequest,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -20,14 +20,14 @@ use db::{
     AgentInboxListQuery, AgentInboxStatus, AgentQuestion, AgentQuestionListQuery,
     AgentQuestionStatus, AgentRepo, ProjectAgentBindingRepo, TaskRepo, TaskRoleAssignmentRepo,
 };
+use forge_agent_host::{is_project_orchestration_operation, MAIN_PROJECT_CREATE_OPERATION};
 use serde_json::Value;
 use services::{
-    is_main_orchestration_operation, is_project_orchestration_operation, ApproveActionInput,
-    AskQuestionInput, CommitmentEvidenceInput, CompleteCommitmentInput, CreateCommitmentInput,
-    ExecuteActionInput, ExecuteMainOrchestrationActionInput,
-    ExecuteProjectOrchestrationActionInput, ExecuteTaskProposalInput,
+    ApproveActionInput, AskQuestionInput, CommitmentEvidenceInput, CompleteCommitmentInput,
+    CreateCommitmentInput, DirectTaskProposalInput, ExecuteActionInput,
+    ExecuteMainOrchestrationActionInput, ExecuteProjectOrchestrationActionInput,
     MainOrchestrationActionService, ProjectOrchestrationActionService, ProposeActionInput,
-    TransferCommitmentInput, UpdateCommitmentInput,
+    TaskProposalPayload, TransferCommitmentInput, UpdateCommitmentInput,
 };
 
 use crate::{
@@ -513,15 +513,13 @@ pub async fn propose_task(
     user: AuthenticatedUser,
     Path(identity_id): Path<String>,
     Json(request): Json<TaskProposalRequest>,
-) -> ApiResult<(StatusCode, Json<AgentActionResponse>)> {
-    require_identity_scope(
-        &state,
-        &identity_id,
-        "project",
-        &request.project_id,
-        &user.user_id,
-    )
-    .await?;
+) -> ApiResult<(StatusCode, Json<TaskProposalCommandResponse>)> {
+    // The command service owns active-binding authorization and receipt-first
+    // replay.  Keep only stable route authentication here so a response-loss
+    // retry can still resolve its frozen receipt after a binding is paused or
+    // rotated.
+    require_owned_identity(&state, &identity_id, &user.user_id).await?;
+    authorize_scope_member(&state, "project", &request.project_id, &user.user_id).await?;
     let task_type = request.task_type.map(|task_type| {
         match task_type {
             api_types::TaskType::Task => "task",
@@ -542,26 +540,63 @@ pub async fn propose_task(
         "role_assignments": request.role_assignments,
         "governance": request.governance,
     });
-    let action = state
+    let payload_json = payload.to_string();
+    let payload: TaskProposalPayload = serde_json::from_value(payload).map_err(|error| {
+        ApiError::bad_request(format!("invalid task proposal payload: {error}"))
+    })?;
+    let (policy_result, policy_reason) = state
         .agent_action_service
-        .propose(ProposeActionInput {
-            id: None,
+        .evaluate_direct_command_policy(
+            &identity_id,
+            "project",
+            &request.project_id,
+            "propose_task",
+            "task.propose",
+            Some(&payload_json),
+        )
+        .await?;
+    let result = state
+        .task_service
+        .execute_task_proposal_direct(DirectTaskProposalInput {
             actor_identity_id: identity_id,
-            scope_type: "project".to_owned(),
-            scope_id: request.project_id.clone(),
-            operation: "task.propose".to_owned(),
-            payload_json: payload.to_string(),
-            dedupe_key: request.dedupe_key,
+            executor_type: "user".to_owned(),
+            executor_id: user.user_id,
+            source_scope_type: "project".to_owned(),
+            source_scope_id: request.project_id.clone(),
+            project_id: request.project_id,
+            payload,
+            idempotency_key: request.dedupe_key,
             correlation_id: request.correlation_id,
             causation_id: request.causation_id,
             causation_depth: request.causation_depth.unwrap_or(0),
+            policy_result: "allowed".to_owned(),
+            preflight_policy_result: Some(policy_result.to_string()),
+            preflight_policy_reason: policy_reason,
+            policy_revision: None,
+            policy_digest: None,
             requested_permission: "propose_task".to_owned(),
-            policy_reason: None,
-            target_type: Some("project".to_owned()),
-            target_id: Some(request.project_id),
         })
         .await?;
-    Ok((StatusCode::CREATED, Json(action_response(action))))
+    let status = if result.replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    let response = TaskProposalCommandResponse {
+        operation: "task.propose".to_owned(),
+        status: "succeeded".to_owned(),
+        materialized: true,
+        domain_committed: true,
+        receipt_id: result.receipt.id,
+        event_id: result.receipt.event_id,
+        input_digest: result.receipt.input_digest,
+        policy_result: result.receipt.policy_result,
+        correlation_id: result.receipt.correlation_id,
+        replayed: result.replayed,
+        requires_user_authorization: false,
+        task: crate::routes::task_response(&state.db, result.task).await?,
+    };
+    Ok((status, Json(response)))
 }
 
 pub async fn get_action(
@@ -635,7 +670,7 @@ pub async fn execute_orchestration_action(
 ) -> ApiResult<Json<ActionExecutionResponse>> {
     let action = state.agent_action_service.get(&id).await?;
     authorize_action_mutation(&state, &action, &user.user_id).await?;
-    let execution = if is_main_orchestration_operation(&action.operation) {
+    let execution = if action.operation == MAIN_PROJECT_CREATE_OPERATION {
         MainOrchestrationActionService::new(state.db.clone())
             .execute(ExecuteMainOrchestrationActionInput {
                 action_id: id,
@@ -661,38 +696,6 @@ pub async fn execute_orchestration_action(
         ));
     };
     Ok(Json(execution_response(execution)))
-}
-
-pub async fn execute_task_proposal(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(id): Path<String>,
-    Json(request): Json<ExecuteTaskProposalRequest>,
-) -> ApiResult<Json<TaskProposalExecutionResponse>> {
-    let action = state.agent_action_service.get(&id).await?;
-    authorize_action_mutation(&state, &action, &user.user_id).await?;
-    let executed = state
-        .agent_action_service
-        .execute_task_proposal(
-            &state.task_service,
-            ExecuteTaskProposalInput {
-                action_id: id,
-                expected_version: request.expected_version,
-                executed_by_id: user.user_id,
-                idempotency_key: request.idempotency_key,
-            },
-        )
-        .await?;
-    Ok(Json(TaskProposalExecutionResponse {
-        action: action_response(
-            state
-                .agent_action_service
-                .get(&executed.execution.action_id)
-                .await?,
-        ),
-        execution: execution_response(executed.execution),
-        task: crate::routes::task_response(&state.db, executed.task).await?,
-    }))
 }
 
 async fn require_owned_identity(
@@ -1243,7 +1246,7 @@ fn action_materialized(
             .and_then(Value::as_str)
             .is_some_and(|value| !value.is_empty());
     }
-    if is_main_orchestration_operation(operation) || is_project_orchestration_operation(operation) {
+    if operation == MAIN_PROJECT_CREATE_OPERATION || is_project_orchestration_operation(operation) {
         return outcome
             .get("operation")
             .and_then(Value::as_str)

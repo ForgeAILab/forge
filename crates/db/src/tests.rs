@@ -1,23 +1,25 @@
 use crate::{
-    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, validate_uuid_v4,
-    AgentContextScopeRepo, AgentListQuery, AgentProfileRepo, AgentRepo, AgentSessionRepo,
-    AgentStatus, AgentTaskListQuery, ArchiveTask, ClaimDomainEvents, ClaimTask, CompareAndMoveTask,
-    CompleteDomainEvent, CreateAgent, CreateAgentContextScope, CreateAgentIdentity,
-    CreateAgentProfile, CreateAgentSession, CreateDomainEvent, CreateExecution, CreateProject,
-    CreateProjectAgentBinding, CreateProjectCharter, CreateProjectCharterRevision,
-    CreateProjectCharterRevisionAtomically, CreateProjectMember,
-    CreateProviderAuthorizationOperation, CreateRepo, CreateReview, CreateSkill, CreateTask,
-    CreateTaskRoleAssignment, CreateTerminalSession, CreateWorkspace, CreateWorkspaceLease,
-    CredentialHandleRepo, DaemonRepo, DaemonStatus, DbError, DomainEventRepo, ExecutionRepo,
-    ExecutionStatus, MemoryAccessQuery, MemoryConfidence, MemoryGetQuery, MemoryItem, MemoryKind,
-    MemoryRepository, MemoryScopeGrant, MemorySourceType, MoveTaskIdentity, MoveTaskPersistence,
-    NotificationListQuery, NotificationRepo, PageRequest, ProjectAgentBindingRepo,
-    ProjectMemberRepo, ProjectOrchestrationRepo, ProjectRepo, ProviderAuthorizationRepo, RepoRepo,
-    ReviewRepo, ReviewStatus, RotateAgentSession, ScopedMemoryRepository, SelectAgentProfile,
-    SkillRepo, SortBy, SortOrder, SqliteDb, Task, TaskBoardRepo, TaskDependencyRepo, TaskListQuery,
-    TaskRepo, TaskRoleAssignmentRepo, TerminalSessionRepo, TerminalSessionStatus, UpdateAgent,
-    UpdateExecution, UpdateProject, UpdateProviderAuthorizationOperation, UpdateRepo, UpdateSkill,
-    UpdateTask, UpdateTaskStatus, UpdateTerminalSessionStatus, UpsertDaemon, WorkMode,
+    create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, run_migrations_from,
+    validate_uuid_v4, AgentContextScopeRepo, AgentListQuery, AgentProfileRepo, AgentRepo,
+    AgentSessionRepo, AgentStatus, AgentTaskListQuery, ArchiveTask, ClaimDomainEvents,
+    ClaimExecutionLease, ClaimTask, CompareAndMoveTask, CompleteDomainEvent, CreateAgent,
+    CreateAgentContextScope, CreateAgentIdentity, CreateAgentProfile, CreateAgentSession,
+    CreateDomainEvent, CreateExecution, CreateProject, CreateProjectAgentBinding,
+    CreateProjectCharter, CreateProjectCharterRevision, CreateProjectCharterRevisionAtomically,
+    CreateProjectMember, CreateProviderAuthorizationOperation, CreateRepo, CreateReview,
+    CreateSkill, CreateTask, CreateTaskRoleAssignment, CreateTerminalSession, CreateWorkspace,
+    CreateWorkspaceLease, CredentialHandleRepo, DaemonRepo, DaemonStatus, DbError, DomainEventRepo,
+    ExecutionLeaseDisposition, ExecutionLeaseMutation, ExecutionProgressWarningOutcome,
+    ExecutionRepo, ExecutionStatus, MemoryAccessQuery, MemoryConfidence, MemoryGetQuery,
+    MemoryItem, MemoryKind, MemoryRepository, MemoryScopeGrant, MemorySourceType, MoveTaskIdentity,
+    MoveTaskPersistence, NotificationListQuery, NotificationRepo, PageRequest,
+    ProjectAgentBindingRepo, ProjectMemberRepo, ProjectOrchestrationRepo, ProjectRepo,
+    ProviderAuthorizationRepo, RecordExecutionProgress, RenewExecutionLease, RepoRepo, ReviewRepo,
+    ReviewStatus, RotateAgentSession, ScopedMemoryRepository, SelectAgentProfile, SkillRepo,
+    SortBy, SortOrder, SqliteDb, Task, TaskBoardRepo, TaskDependencyRepo, TaskListQuery, TaskRepo,
+    TaskRoleAssignmentRepo, TerminalSessionRepo, TerminalSessionStatus, TerminalizeExecution,
+    UpdateAgent, UpdateExecution, UpdateProject, UpdateProviderAuthorizationOperation, UpdateRepo,
+    UpdateSkill, UpdateTask, UpdateTaskStatus, UpdateTerminalSessionStatus, UpsertDaemon, WorkMode,
     WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use crate::{RefreshToken, RefreshTokenRepo, User, UserRepo};
@@ -39,6 +41,17 @@ async fn sqlite_db() -> SqliteDb {
         .expect("pool creates");
     run_migrations(&pool).await.expect("migrations run");
     SqliteDb::new(pool)
+}
+
+fn pending_claim_lease(execution_id: &str, now: &str) -> ClaimExecutionLease {
+    ClaimExecutionLease {
+        execution_id: execution_id.to_owned(),
+        expected_version: 1,
+        owner: format!("dispatch-pending:{execution_id}"),
+        lease_expires_at: now.to_owned(),
+        hard_deadline_at: "2099-01-01T00:00:00Z".to_owned(),
+        now: now.to_owned(),
+    }
 }
 
 #[tokio::test]
@@ -291,7 +304,11 @@ async fn atomic_first_charter_revision_rolls_back_new_ownership_on_failure() {
                 content_digest: "content-digest".to_owned(),
                 rendered_digest: "rendered-digest".to_owned(),
                 created_at: now,
+                command_receipt: None,
+                action_execution: None,
             },
+            command_receipt: None,
+            action_execution: None,
         },
     )
     .await;
@@ -2854,6 +2871,655 @@ async fn migration_runner_is_idempotent() {
 }
 
 #[tokio::test]
+async fn execution_liveness_migration_preserves_history_and_does_not_fabricate_owner() {
+    let migration_root =
+        std::env::temp_dir().join(format!("forge-db-migrations-{}", new_uuid_v4()));
+    std::fs::create_dir_all(&migration_root).expect("migration temp directory creates");
+    let source_root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"));
+    for entry in std::fs::read_dir(source_root)
+        .expect("migration source directory reads")
+        .flatten()
+    {
+        let path = entry.path();
+        let Some(filename) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if filename == "V089__execution_liveness.sql" {
+            continue;
+        }
+        std::fs::copy(&path, migration_root.join(filename)).expect("migration copies");
+    }
+
+    let database_path =
+        std::env::temp_dir().join(format!("forge-execution-liveness-{}.sqlite", new_uuid_v4()));
+    let database_url = format!("sqlite://{}", database_path.display());
+    let pool = create_sqlite_pool(&database_url)
+        .await
+        .expect("pool creates");
+    run_migrations_from(&pool, &migration_root)
+        .await
+        .expect("pre-liveness migrations run");
+    let now = "2026-08-21T00:00:00Z";
+    let project_id = new_uuid_v4();
+    let repo_id = new_uuid_v4();
+    let task_id = new_uuid_v4();
+    let terminal_id = new_uuid_v4();
+    let running_id = new_uuid_v4();
+    sqlx::query(
+        "INSERT INTO project (id, name, settings, created_at, updated_at)
+         VALUES (?, 'migration-test', '{}', ?, ?)",
+    )
+    .bind(&project_id)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("project inserts");
+    sqlx::query(
+        "INSERT INTO repo (id, project_id, name, remote_url, local_path, work_mode, default_branch, created_at, updated_at)
+         VALUES (?, ?, 'migration-repo', '/tmp/migration-repo', '/tmp/migration-repo', 'direct_merge', 'main', ?, ?)",
+    )
+    .bind(&repo_id)
+    .bind(&project_id)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("repo inserts");
+    sqlx::query(
+        "INSERT INTO task (id, project_id, repo_id, title, status, created_at, updated_at)
+         VALUES (?, ?, ?, 'migration task', 'done', ?, ?)",
+    )
+    .bind(&task_id)
+    .bind(&project_id)
+    .bind(&repo_id)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("task inserts");
+    sqlx::query(
+        "INSERT INTO execution (id, task_id, role, status, stopped_at, summary, logs_path, error, created_at, updated_at)
+         VALUES (?, ?, 'executor', 'completed', '2026-08-21T00:00:01Z', 'historical summary',
+                 'logs/historical.jsonl', 'historical error', ?, ?)",
+    )
+    .bind(&terminal_id)
+    .bind(&task_id)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("terminal execution inserts");
+    sqlx::query(
+        "INSERT INTO execution (id, task_id, role, status, summary, logs_path, created_at, updated_at)
+         VALUES (?, ?, 'executor', 'running', 'running summary', 'logs/running.jsonl', ?, ?)",
+    )
+    .bind(&running_id)
+    .bind(&task_id)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("running execution inserts");
+
+    let liveness_path = source_root.join("V089__execution_liveness.sql");
+    std::fs::copy(
+        &liveness_path,
+        migration_root.join("V089__execution_liveness.sql"),
+    )
+    .expect("liveness migration copies");
+    run_migrations_from(&pool, &migration_root)
+        .await
+        .expect("liveness migration runs");
+
+    let terminal = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
+    >(
+        "SELECT status, summary, logs_path, error, lease_owner, hard_deadline_at
+         FROM execution WHERE id = ?",
+    )
+    .bind(&terminal_id)
+    .fetch_one(&pool)
+    .await
+    .expect("terminal execution loads");
+    assert_eq!(terminal.0, "completed");
+    assert_eq!(terminal.1, "historical summary");
+    assert_eq!(terminal.2, "logs/historical.jsonl");
+    assert_eq!(terminal.3.as_deref(), Some("historical error"));
+    assert!(terminal.4.is_none());
+    assert!(terminal.5.is_none());
+
+    let running =
+        sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>, i64)>(
+            "SELECT updated_at, lease_owner, last_heartbeat_at, hard_deadline_at, execution_version
+         FROM execution WHERE id = ?",
+        )
+        .bind(&running_id)
+        .fetch_one(&pool)
+        .await
+        .expect("running execution loads");
+    assert_eq!(running.1, None);
+    assert_eq!(running.2, None);
+    assert_eq!(running.3.as_deref(), Some(now));
+    assert_eq!(running.4, 1);
+
+    drop(pool);
+    let reopened = create_sqlite_pool(&database_url)
+        .await
+        .expect("file-backed database reopens");
+    let reopened_execution: (String, Option<String>, Option<String>, Option<String>) =
+        sqlx::query_as(
+            "SELECT status, lease_owner, last_heartbeat_at, hard_deadline_at
+             FROM execution WHERE id = ?",
+        )
+        .bind(&running_id)
+        .fetch_one(&reopened)
+        .await
+        .expect("reopened running execution loads");
+    assert_eq!(reopened_execution.0, "running");
+    assert!(reopened_execution.1.is_none());
+    assert!(reopened_execution.2.is_none());
+    assert_eq!(reopened_execution.3.as_deref(), Some(now));
+    drop(reopened);
+    std::fs::remove_file(&database_path).expect("database file removes");
+    std::fs::remove_file(format!("{}-wal", database_path.display())).ok();
+    std::fs::remove_file(format!("{}-shm", database_path.display())).ok();
+    std::fs::remove_dir_all(&migration_root).expect("migration temp directory removes");
+}
+
+#[tokio::test]
+async fn execution_lease_and_terminal_cas_are_single_winner_and_preserve_deadline() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "Execution liveness CAS",
+    )
+    .await;
+    let execution_id = new_uuid_v4();
+    let now = "2026-08-21T00:00:00Z";
+    let claimed = ExecutionRepo::create_with_lease(
+        &db,
+        CreateExecution {
+            id: execution_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: Some(agent_id.clone()),
+            role: "executor".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.to_owned(),
+            updated_at: now.to_owned(),
+        },
+        ClaimExecutionLease {
+            execution_id: execution_id.clone(),
+            expected_version: 1,
+            owner: "embedded:test-owner".to_owned(),
+            lease_expires_at: "2026-08-21T00:00:30Z".to_owned(),
+            hard_deadline_at: "2026-08-21T01:00:00Z".to_owned(),
+            now: now.to_owned(),
+        },
+    )
+    .await
+    .expect("initial lease claim commits");
+    assert_eq!(claimed.execution_version, 2);
+    assert_eq!(claimed.lease_owner.as_deref(), Some("embedded:test-owner"));
+    assert_eq!(
+        claimed.hard_deadline_at.as_deref(),
+        Some("2026-08-21T01:00:00Z")
+    );
+    let competing_claim = ExecutionRepo::claim_lease(
+        &db,
+        ClaimExecutionLease {
+            execution_id: execution_id.clone(),
+            expected_version: claimed.execution_version,
+            owner: "remote:competing-owner".to_owned(),
+            lease_expires_at: "2026-08-21T00:00:40Z".to_owned(),
+            hard_deadline_at: "2026-08-21T01:00:00Z".to_owned(),
+            now: "2026-08-21T00:00:10Z".to_owned(),
+        },
+    )
+    .await
+    .expect("live owner rejects competing claim");
+    assert!(matches!(
+        competing_claim,
+        ExecutionLeaseMutation::Concurrent { .. }
+    ));
+    let task = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task lookup before workspace lease succeeds")
+        .expect("task exists before workspace lease");
+    let workspace_lease =
+        WorkspaceLeaseRepo::issue(
+            &db,
+            CreateWorkspaceLease {
+                id: new_uuid_v4(),
+                project_id: project_id.clone(),
+                task_id: task_id.clone(),
+                task_version: task.version,
+                execution_id: execution_id.clone(),
+                operation_idempotency_key: new_uuid_v4(),
+                repository_binding_id: repo_id.clone(),
+                base_ref: "main".to_owned(),
+                role: "worker".to_owned(),
+                capabilities_json: r#"["repository_write"]"#.to_owned(),
+                assigned_principal_type: "agent".to_owned(),
+                assigned_principal_id: agent_id,
+                capability_profile_revision: "forge.capability-profile/v1".to_owned(),
+                capability_profile_digest:
+                    "sha256:eeb061a14ab862e1a7b16989ef637293ba538f46122ff28b30313d330dbae4a8"
+                        .to_owned(),
+                issuing_principal_type: "system".to_owned(),
+                issuing_principal_id: "task-service-scheduler".to_owned(),
+                issued_at: now.to_owned(),
+                expires_at: "2026-08-21T00:00:45Z".to_owned(),
+                created_at: now.to_owned(),
+                updated_at: now.to_owned(),
+            },
+        )
+        .await
+        .expect("workspace lease issues");
+    assert_eq!(workspace_lease.status, "active");
+
+    let progressed = ExecutionRepo::record_progress(
+        &db,
+        RecordExecutionProgress {
+            execution_id: execution_id.clone(),
+            expected_version: claimed.execution_version,
+            owner: "embedded:test-owner".to_owned(),
+            progress_at: "2026-08-21T00:00:05Z".to_owned(),
+            now: "2026-08-21T00:00:05Z".to_owned(),
+        },
+    )
+    .await
+    .expect("semantic progress commits");
+    let progressed = match progressed {
+        ExecutionLeaseMutation::Updated(execution) => execution,
+        other => panic!("unexpected semantic progress result: {other:?}"),
+    };
+    assert_eq!(progressed.execution_version, claimed.execution_version + 1);
+    let progress_event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type = 'execution.progressed' AND entity_id = ?",
+    )
+    .bind(&task_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("progress event count reads");
+    assert_eq!(progress_event_count, 1);
+
+    let out_of_order_progress = ExecutionRepo::record_progress(
+        &db,
+        RecordExecutionProgress {
+            execution_id: execution_id.clone(),
+            expected_version: progressed.execution_version,
+            owner: "embedded:test-owner".to_owned(),
+            progress_at: "2026-08-21T00:00:04Z".to_owned(),
+            now: "2026-08-21T00:00:06Z".to_owned(),
+        },
+    )
+    .await
+    .expect("out-of-order progress is classified as a no-op");
+    let out_of_order_execution = match out_of_order_progress {
+        ExecutionLeaseMutation::Updated(execution) => execution,
+        other => panic!("unexpected out-of-order progress result: {other:?}"),
+    };
+    assert_eq!(
+        out_of_order_execution.last_progress_at.as_deref(),
+        Some("2026-08-21T00:00:05Z")
+    );
+    let duplicate_progress = ExecutionRepo::record_progress(
+        &db,
+        RecordExecutionProgress {
+            execution_id: execution_id.clone(),
+            expected_version: progressed.execution_version,
+            owner: "embedded:test-owner".to_owned(),
+            progress_at: "2026-08-21T00:00:05Z".to_owned(),
+            now: "2026-08-21T00:00:07Z".to_owned(),
+        },
+    )
+    .await
+    .expect("duplicate progress is classified as a no-op");
+    let duplicate_progress = match duplicate_progress {
+        ExecutionLeaseMutation::Updated(execution) => execution,
+        other => panic!("unexpected duplicate progress result: {other:?}"),
+    };
+    assert_eq!(
+        duplicate_progress.execution_version,
+        progressed.execution_version
+    );
+    let progress_event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type = 'execution.progressed' AND entity_id = ?",
+    )
+    .bind(&task_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("progress event count after duplicate reads");
+    assert_eq!(progress_event_count, 1);
+
+    let renewed = ExecutionRepo::renew_lease(
+        &db,
+        RenewExecutionLease {
+            execution_id: execution_id.clone(),
+            expected_version: progressed.execution_version,
+            owner: "embedded:test-owner".to_owned(),
+            lease_expires_at: "2026-08-21T00:00:45Z".to_owned(),
+            now: "2026-08-21T00:00:10Z".to_owned(),
+        },
+    )
+    .await
+    .expect("owner heartbeat commits");
+    let renewed = match renewed {
+        ExecutionLeaseMutation::Updated(execution) => execution,
+        other => panic!("unexpected heartbeat result: {other:?}"),
+    };
+    assert_eq!(renewed.execution_version, progressed.execution_version + 1);
+    assert_eq!(
+        renewed.last_progress_at.as_deref(),
+        Some("2026-08-21T00:00:05Z")
+    );
+
+    let warning = ExecutionRepo::record_progress_warning(
+        &db,
+        crate::RecordExecutionProgressWarning {
+            execution_id: execution_id.clone(),
+            expected_version: renewed.execution_version,
+            owner: "embedded:test-owner".to_owned(),
+            expected_last_progress_at: renewed.last_progress_at.clone(),
+            stale_before: "2026-08-21T00:00:06Z".to_owned(),
+            now: "2026-08-21T00:00:10Z".to_owned(),
+        },
+    )
+    .await
+    .expect("progress warning commits");
+    let warned = match warning {
+        ExecutionProgressWarningOutcome::Committed { execution, event } => {
+            assert_eq!(event.event_type, "execution.progress_warning");
+            execution
+        }
+        other => panic!("unexpected progress warning result: {other:?}"),
+    };
+    assert_eq!(
+        warned.execution_version, renewed.execution_version,
+        "warning projection must not invalidate the owner's heartbeat CAS"
+    );
+
+    let renewed_again = match ExecutionRepo::renew_lease(
+        &db,
+        RenewExecutionLease {
+            execution_id: execution_id.clone(),
+            expected_version: warned.execution_version,
+            owner: "embedded:test-owner".to_owned(),
+            lease_expires_at: "2026-08-21T00:00:55Z".to_owned(),
+            now: "2026-08-21T00:00:20Z".to_owned(),
+        },
+    )
+    .await
+    .expect("heartbeat after warning commits")
+    {
+        ExecutionLeaseMutation::Updated(execution) => execution,
+        other => panic!("unexpected heartbeat-after-warning result: {other:?}"),
+    };
+    let replayed_warning = ExecutionRepo::record_progress_warning(
+        &db,
+        crate::RecordExecutionProgressWarning {
+            execution_id: execution_id.clone(),
+            expected_version: renewed_again.execution_version,
+            owner: "embedded:test-owner".to_owned(),
+            expected_last_progress_at: renewed_again.last_progress_at.clone(),
+            stale_before: "2026-08-21T00:00:21Z".to_owned(),
+            now: "2026-08-21T00:00:20Z".to_owned(),
+        },
+    )
+    .await
+    .expect("repeated progress warning is classified");
+    assert!(matches!(
+        replayed_warning,
+        ExecutionProgressWarningOutcome::Replayed { .. }
+    ));
+    let stale_progress =
+        ExecutionRepo::list_stale_progress(&db, "2026-08-21T00:00:20Z", "2026-08-21T00:00:06Z", 10)
+            .await
+            .expect("stale live progress query succeeds");
+    assert_eq!(stale_progress.len(), 1);
+    assert_eq!(stale_progress[0].id, execution_id);
+    let hard_deadline_renewal = ExecutionRepo::renew_lease(
+        &db,
+        RenewExecutionLease {
+            execution_id: execution_id.clone(),
+            expected_version: renewed_again.execution_version,
+            owner: "embedded:test-owner".to_owned(),
+            lease_expires_at: "2026-08-21T01:01:00Z".to_owned(),
+            now: "2026-08-21T01:00:00Z".to_owned(),
+        },
+    )
+    .await
+    .expect("hard deadline renewal is classified");
+    assert!(matches!(
+        hard_deadline_renewal,
+        ExecutionLeaseMutation::HardDeadline { .. }
+    ));
+
+    let terminal_input = TerminalizeExecution {
+        execution_id: execution_id.clone(),
+        expected_version: renewed_again.execution_version,
+        lease_owner: renewed_again.lease_owner.clone(),
+        status: ExecutionStatus::Completed,
+        stop_reason: Some(None),
+        stopped_by: Some(Some("embedded:test-owner".to_owned())),
+        stopped_at: Some(Some("2026-08-21T00:00:11Z".to_owned())),
+        resume_policy: Some(Some(crate::ResumePolicy::None)),
+        agent_session_id: Some(None),
+        agent_message_id: Some(None),
+        last_activity_at: Some(None),
+        last_progress_at: Some(Some("2026-08-21T00:00:05Z".to_owned())),
+        summary: Some(Some("complete".to_owned())),
+        logs_path: Some(None),
+        before_sha: Some(None),
+        after_sha: Some(Some("after-sha".to_owned())),
+        error: Some(None),
+        executor_config_snapshot_json: Some(None),
+        updated_at: "2026-08-21T00:00:11Z".to_owned(),
+        actor_type: "system".to_owned(),
+        actor_id: None,
+        correlation_id: None,
+        causation_id: None,
+        causation_depth: 0,
+        lease_disposition: ExecutionLeaseDisposition::Expire,
+    };
+
+    // A conflicting terminal dedupe key makes the event append fail after the
+    // execution UPDATE.  The repository must roll the UPDATE back, proving
+    // that terminal status and its durable event are one transaction.
+    let conflict_event_id = new_uuid_v4();
+    DomainEventRepo::append_event(
+        &db,
+        CreateDomainEvent {
+            id: conflict_event_id.clone(),
+            event_type: "execution.conflict".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: task_id.clone(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "project".to_owned(),
+            scope_id: project_id.clone(),
+            correlation_id: conflict_event_id.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("execution-terminal:{}:completed", execution_id)),
+            payload_json: "{}".to_owned(),
+            created_at: "2026-08-21T00:00:10Z".to_owned(),
+        },
+    )
+    .await
+    .expect("conflicting terminal event inserts");
+    let failed_terminal = ExecutionRepo::terminalize(&db, terminal_input.clone()).await;
+    assert!(
+        failed_terminal.is_err(),
+        "event conflict must abort terminal CAS"
+    );
+    let rolled_back = ExecutionRepo::get_by_id(&db, &execution_id)
+        .await
+        .expect("execution lookup after rollback succeeds")
+        .expect("execution remains present after rollback");
+    assert_eq!(rolled_back.status, ExecutionStatus::Running);
+    assert_eq!(
+        rolled_back.execution_version,
+        terminal_input.expected_version
+    );
+    assert_eq!(rolled_back.lease_owner, terminal_input.lease_owner);
+    assert_eq!(
+        rolled_back.lease_expires_at.as_deref(),
+        Some("2026-08-21T00:00:55Z")
+    );
+    assert_eq!(
+        rolled_back.hard_deadline_at.as_deref(),
+        Some("2026-08-21T01:00:00Z")
+    );
+    let rolled_back_workspace_lease = WorkspaceLeaseRepo::get_by_id(&db, &workspace_lease.id)
+        .await
+        .expect("workspace lease lookup after rollback succeeds")
+        .expect("workspace lease remains after rollback");
+    assert_eq!(rolled_back_workspace_lease.status, "active");
+    assert_eq!(rolled_back_workspace_lease.version, workspace_lease.version);
+    sqlx::query("DELETE FROM domain_event WHERE id = ?")
+        .bind(conflict_event_id)
+        .execute(db.pool())
+        .await
+        .expect("conflicting event removes for successful retry");
+
+    let committed = ExecutionRepo::terminalize(&db, terminal_input)
+        .await
+        .expect("terminal completion commits");
+    let committed_execution = match committed {
+        crate::ExecutionTerminalOutcome::Committed {
+            execution,
+            event,
+            workspace_lease_id,
+            workspace_lease_status,
+        } => {
+            assert_eq!(event.event_type, "execution.completed");
+            assert_eq!(
+                workspace_lease_id.as_deref(),
+                Some(workspace_lease.id.as_str())
+            );
+            assert_eq!(workspace_lease_status.as_deref(), Some("expired"));
+            let payload: serde_json::Value =
+                serde_json::from_str(&event.payload_json).expect("terminal payload is JSON");
+            assert_eq!(
+                payload["previous_lease_owner"].as_str(),
+                Some("embedded:test-owner")
+            );
+            execution
+        }
+        other => panic!("unexpected terminal result: {other:?}"),
+    };
+    assert_eq!(committed_execution.status, ExecutionStatus::Completed);
+    assert!(committed_execution.lease_owner.is_none());
+    assert!(committed_execution.lease_expires_at.is_none());
+    assert_eq!(
+        committed_execution.hard_deadline_at.as_deref(),
+        Some("2026-08-21T01:00:00Z")
+    );
+    let expired_workspace_lease = WorkspaceLeaseRepo::get_by_id(&db, &workspace_lease.id)
+        .await
+        .expect("expired workspace lease loads")
+        .expect("workspace lease remains historical");
+    assert_eq!(expired_workspace_lease.status, "expired");
+    assert_eq!(
+        expired_workspace_lease.revoked_at.as_deref(),
+        Some("2026-08-21T00:00:11Z")
+    );
+
+    let stale_renewal = ExecutionRepo::renew_lease(
+        &db,
+        RenewExecutionLease {
+            execution_id: execution_id.clone(),
+            expected_version: renewed_again.execution_version,
+            owner: "embedded:test-owner".to_owned(),
+            lease_expires_at: "2026-08-21T00:00:55Z".to_owned(),
+            now: "2026-08-21T00:00:12Z".to_owned(),
+        },
+    )
+    .await
+    .expect("stale renewal is classified");
+    assert!(matches!(
+        stale_renewal,
+        ExecutionLeaseMutation::Concurrent { .. }
+    ));
+    let stale_terminal = ExecutionRepo::terminalize(
+        &db,
+        TerminalizeExecution {
+            execution_id: execution_id.clone(),
+            expected_version: renewed_again.execution_version,
+            lease_owner: Some("embedded:test-owner".to_owned()),
+            status: ExecutionStatus::Failed,
+            stop_reason: Some(Some(crate::StopReason::ExecutionStalled)),
+            stopped_by: Some(Some("monitor".to_owned())),
+            stopped_at: Some(Some("2026-08-21T00:00:12Z".to_owned())),
+            resume_policy: Some(Some(crate::ResumePolicy::Manual)),
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            last_progress_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: Some(Some("late monitor".to_owned())),
+            executor_config_snapshot_json: None,
+            updated_at: "2026-08-21T00:00:12Z".to_owned(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            correlation_id: None,
+            causation_id: None,
+            causation_depth: 0,
+            lease_disposition: ExecutionLeaseDisposition::Expire,
+        },
+    )
+    .await
+    .expect("stale terminal is classified");
+    assert!(matches!(
+        stale_terminal,
+        crate::ExecutionTerminalOutcome::Concurrent { .. }
+    ));
+    let terminal_event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event
+         WHERE dedupe_key LIKE ? AND entity_id = ?",
+    )
+    .bind(format!("execution-terminal:{execution_id}:%"))
+    .bind(&task_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("terminal event count reads");
+    assert_eq!(terminal_event_count, 1);
+}
+
+#[tokio::test]
 async fn task_board_revision_migration_preserves_tasks_and_tracks_board_changes() {
     let pool = create_sqlite_pool("sqlite::memory:")
         .await
@@ -3520,7 +4186,7 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
     )
     .await
     .expect("execution creates");
-    let execution = ExecutionRepo::update(
+    let rejected_update = ExecutionRepo::update(
         &db,
         UpdateExecution {
             id: execution_id.clone(),
@@ -3541,8 +4207,44 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
             updated_at: now.clone(),
         },
     )
+    .await;
+    assert!(matches!(rejected_update, Err(DbError::InvalidTransition)));
+    let execution = match ExecutionRepo::terminalize(
+        &db,
+        TerminalizeExecution {
+            execution_id: execution_id.clone(),
+            expected_version: 1,
+            lease_owner: None,
+            status: ExecutionStatus::Completed,
+            stop_reason: Some(None),
+            stopped_by: Some(Some("system".to_owned())),
+            stopped_at: Some(Some(now.clone())),
+            resume_policy: Some(Some(crate::ResumePolicy::None)),
+            agent_session_id: Some(Some("session".to_owned())),
+            agent_message_id: Some(None),
+            last_activity_at: Some(None),
+            last_progress_at: Some(None),
+            summary: Some(Some("done".to_owned())),
+            logs_path: None,
+            before_sha: None,
+            after_sha: Some(Some("abc123".to_owned())),
+            error: None,
+            executor_config_snapshot_json: None,
+            updated_at: now.clone(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            correlation_id: None,
+            causation_id: None,
+            causation_depth: 0,
+            lease_disposition: ExecutionLeaseDisposition::Revoke,
+        },
+    )
     .await
-    .expect("execution updates");
+    .expect("terminal execution commits")
+    {
+        crate::ExecutionTerminalOutcome::Committed { execution, .. } => execution,
+        other => panic!("unexpected terminal execution result: {other:?}"),
+    };
     assert_eq!(execution.status, ExecutionStatus::Completed);
     assert_eq!(execution.prompt.as_deref(), Some("initial prompt"));
     assert_eq!(execution.summary.as_deref(), Some("done"));
@@ -3594,29 +4296,42 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
     )
     .await
     .expect("failing execution creates");
-    ExecutionRepo::update(
+    let failed = ExecutionRepo::terminalize(
         &db,
-        UpdateExecution {
-            id: failed_execution_id.clone(),
-            status: Some(ExecutionStatus::Failed),
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            agent_session_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: None,
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
+        TerminalizeExecution {
+            execution_id: failed_execution_id.clone(),
+            expected_version: 1,
+            lease_owner: None,
+            status: ExecutionStatus::Failed,
+            stop_reason: Some(Some(crate::StopReason::ExecutorFailed)),
+            stopped_by: Some(Some("system".to_owned())),
+            stopped_at: Some(Some(now.clone())),
+            resume_policy: Some(Some(crate::ResumePolicy::Manual)),
+            agent_session_id: Some(None),
+            agent_message_id: Some(None),
+            last_activity_at: Some(None),
+            last_progress_at: Some(None),
+            summary: Some(None),
+            logs_path: Some(None),
+            before_sha: Some(None),
+            after_sha: Some(None),
             error: Some(Some("executor exploded".to_owned())),
-            executor_config_snapshot_json: None,
+            executor_config_snapshot_json: Some(None),
             updated_at: now.clone(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            correlation_id: None,
+            causation_id: None,
+            causation_depth: 0,
+            lease_disposition: ExecutionLeaseDisposition::Revoke,
         },
     )
     .await
     .expect("execution fails");
+    assert!(matches!(
+        failed,
+        crate::ExecutionTerminalOutcome::Committed { .. }
+    ));
     let failed_event: (String, String, String) = sqlx::query_as(
         "SELECT event_type, entity_id, payload_json FROM domain_event WHERE dedupe_key = ?",
     )
@@ -3627,6 +4342,75 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
     assert_eq!(failed_event.0, "execution.failed");
     assert_eq!(failed_event.1, task_id.clone());
     assert!(failed_event.2.contains("executor exploded"));
+
+    let cancelled_execution_id = new_uuid_v4();
+    ExecutionRepo::create(
+        &db,
+        CreateExecution {
+            id: cancelled_execution_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: Some(agent_id.clone()),
+            role: "executor".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("cancelled execution creates");
+    let cancelled = ExecutionRepo::terminalize(
+        &db,
+        TerminalizeExecution {
+            execution_id: cancelled_execution_id,
+            expected_version: 1,
+            lease_owner: None,
+            status: ExecutionStatus::Cancelled,
+            stop_reason: Some(Some(crate::StopReason::UserCancelled)),
+            stopped_by: Some(Some("user".to_owned())),
+            stopped_at: Some(Some(now.clone())),
+            resume_policy: Some(Some(crate::ResumePolicy::Manual)),
+            agent_session_id: Some(None),
+            agent_message_id: Some(None),
+            last_activity_at: Some(None),
+            last_progress_at: Some(None),
+            summary: Some(None),
+            logs_path: Some(None),
+            before_sha: Some(None),
+            after_sha: Some(None),
+            error: Some(None),
+            executor_config_snapshot_json: Some(None),
+            updated_at: now.clone(),
+            actor_type: "user".to_owned(),
+            actor_id: Some("user-1".to_owned()),
+            correlation_id: None,
+            causation_id: None,
+            causation_depth: 0,
+            lease_disposition: ExecutionLeaseDisposition::Revoke,
+        },
+    )
+    .await
+    .expect("cancelled execution commits");
+    match cancelled {
+        crate::ExecutionTerminalOutcome::Committed { event, .. } => {
+            assert_eq!(event.event_type, "execution.cancelled");
+        }
+        other => panic!("unexpected cancelled execution result: {other:?}"),
+    }
 
     let review_id = new_uuid_v4();
     ReviewRepo::create(
@@ -3770,7 +4554,7 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
             .unwrap()
             .items
             .len(),
-        2
+        3
     );
     assert_eq!(
         ReviewRepo::list_by_task(&db, &task_id).await.unwrap().len(),
@@ -4149,6 +4933,7 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
     let mut tx = crate::begin_immediate(db.pool())
         .await
         .expect("transaction starts");
+    let execution_id = new_uuid_v4();
     let claimed = TaskRepo::claim(
         &db,
         &mut tx,
@@ -4169,7 +4954,7 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
                 "merging".to_owned(),
             ],
             execution: CreateExecution {
-                id: new_uuid_v4(),
+                id: execution_id.clone(),
                 task_id: task_id.clone(),
                 agent_id: Some(agent_id.clone()),
                 role: "executor".to_string(),
@@ -4192,6 +4977,7 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },
+            execution_lease: pending_claim_lease(&execution_id, &now),
             max_concurrent_tasks: 1,
             claimed_at: now.clone(),
         },
@@ -4200,6 +4986,13 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
     .expect("task claims");
     tx.commit().await.expect("claim commits");
     assert_eq!(claimed.task.status, "in_progress".to_string());
+    assert_eq!(
+        claimed.execution.lease_owner.as_deref(),
+        Some(format!("dispatch-pending:{execution_id}").as_str())
+    );
+    assert_eq!(claimed.execution.execution_version, 2);
+    assert!(claimed.execution.lease_expires_at.is_some());
+    assert!(claimed.execution.hard_deadline_at.is_some());
     assert_eq!(
         AgentRepo::count_active_tasks(&db, &agent_id).await.unwrap(),
         1
@@ -4396,6 +5189,7 @@ async fn task_claim_rejects_active_entry_barrier() {
     let mut tx = crate::begin_immediate(db.pool())
         .await
         .expect("transaction starts");
+    let execution_id = new_uuid_v4();
     let result = TaskRepo::claim(
         &db,
         &mut tx,
@@ -4408,7 +5202,7 @@ async fn task_claim_rejects_active_entry_barrier() {
             target_status: "in_progress".to_owned(),
             capacity_statuses: vec!["in_progress".to_owned()],
             execution: CreateExecution {
-                id: new_uuid_v4(),
+                id: execution_id.clone(),
                 task_id,
                 agent_id: Some(agent_id),
                 role: "executor".to_string(),
@@ -4431,6 +5225,7 @@ async fn task_claim_rejects_active_entry_barrier() {
                 created_at: now.clone(),
                 updated_at: now,
             },
+            execution_lease: pending_claim_lease(&execution_id, "2026-08-21T00:00:00Z"),
             max_concurrent_tasks: 1,
             claimed_at: now_rfc3339(),
         },
@@ -4605,6 +5400,7 @@ async fn test_dependency_gate_blocks_non_context_holder() {
     let mut tx = crate::begin_immediate(db.pool())
         .await
         .expect("transaction starts");
+    let execution_id = new_uuid_v4();
     let result = TaskRepo::claim(
         &db,
         &mut tx,
@@ -4621,7 +5417,7 @@ async fn test_dependency_gate_blocks_non_context_holder() {
                 "merging".to_owned(),
             ],
             execution: CreateExecution {
-                id: new_uuid_v4(),
+                id: execution_id.clone(),
                 task_id,
                 agent_id: Some(other_agent_id),
                 role: "executor".to_string(),
@@ -4644,6 +5440,7 @@ async fn test_dependency_gate_blocks_non_context_holder() {
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },
+            execution_lease: pending_claim_lease(&execution_id, &now),
             max_concurrent_tasks: 1,
             claimed_at: now,
         },
@@ -5726,6 +6523,7 @@ async fn stale_execution_baseline_cannot_mint_a_running_execution_after_read_gat
     let mut claim_transaction = crate::begin_immediate(db.pool())
         .await
         .expect("claim transaction begins");
+    let execution_id = new_uuid_v4();
     let claim = TaskRepo::claim(
         &db,
         &mut claim_transaction,
@@ -5738,7 +6536,7 @@ async fn stale_execution_baseline_cannot_mint_a_running_execution_after_read_gat
             target_status: "in_progress".to_owned(),
             capacity_statuses: vec!["in_progress".to_owned()],
             execution: CreateExecution {
-                id: new_uuid_v4(),
+                id: execution_id.clone(),
                 task_id: task_id.clone(),
                 agent_id: Some(agent_id.clone()),
                 role: "executor".to_owned(),
@@ -5761,6 +6559,7 @@ async fn stale_execution_baseline_cannot_mint_a_running_execution_after_read_gat
                 created_at: now.clone(),
                 updated_at: now.clone(),
             },
+            execution_lease: pending_claim_lease(&execution_id, &now),
             max_concurrent_tasks: 1,
             claimed_at: now.clone(),
         },

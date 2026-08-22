@@ -6,15 +6,44 @@
 //! the current Charter, baseline, approval, and Project-local artifact rows.
 
 use super::*;
-use api_types::TaskGovernanceRequest;
+use crate::execution_setup::{
+    canonical_task_capability, classify_task_execution, is_read_only_capability,
+    TaskExecutionClass, SUPPORTED_CAPABILITY_PROFILES,
+};
+use api_types::{
+    AdaptiveEnvelope, ExecutionGate, ExecutionSetupState, RetryAction, SetupRequirement,
+    TaskGovernanceRequest,
+};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use db::{CreateProjectCanonicalConflict, CreateProjectReconciliation, ProjectOrchestrationRepo};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, Transaction};
 
-const IMPLEMENTATION_CAPABILITY_TYPES: &[&str] = &["task", "sub_task"];
 const WORKSPACE_LEASE_SECONDS: i64 = 15 * 60;
 const CAPABILITY_PROFILE_REVISION: &str = "forge.capability-profile/v1";
+const FIXED_BOUNDARY_DIGEST_SCHEMA: &str = "forge.task-governance/fixed-boundary/v1";
+const ADAPTIVE_ENVELOPE_DIGEST_SCHEMA: &str = "forge.task-governance/adaptive-envelope/v1";
+
+/// Immutable governance facts inherited by an adaptive Task reshape.
+///
+/// The baseline revision is the authority for the envelope and its fixed
+/// boundaries.  A split/sequence/replace operation may only reuse this
+/// snapshot; it cannot manufacture a new one from caller text.
+#[derive(Debug, Clone)]
+pub(crate) struct AdaptiveTaskGovernance {
+    pub charter_revision_id: Option<String>,
+    pub baseline_id: Option<String>,
+    pub baseline_revision_id: Option<String>,
+    pub plan_item_id: Option<String>,
+    pub milestone_id: Option<String>,
+    pub document_revisions_json: String,
+    pub capability_class: Option<String>,
+    pub risk_class: Option<String>,
+    pub provenance_json: String,
+    pub adaptive_envelope_json: Option<String>,
+    pub baseline_content_digest: Option<String>,
+}
 
 #[derive(Debug)]
 pub(super) struct PreparedTaskGovernance {
@@ -27,6 +56,7 @@ pub(super) struct PreparedTaskGovernance {
     pub capability_class: Option<String>,
     pub risk_class: Option<String>,
     pub runnable: bool,
+    pub replacement_of_task_id: Option<String>,
     pub provenance_json: String,
 }
 
@@ -44,11 +74,393 @@ struct BaselineContext {
     capability_classes_json: String,
     risk_classes_json: String,
     adaptive_envelope_json: String,
+    elevated_operations_json: String,
+    release_policy_revision: String,
+    release_policy_digest: String,
     content_digest: String,
     rendered_digest: String,
 }
 
+fn parse_adaptive_task_envelope(value: &str) -> Result<AdaptiveEnvelope> {
+    let value: Value = serde_json::from_str(value).map_err(|error| {
+        ServiceError::Conflict(format!(
+            "reconciliation_required: governing adaptive envelope is invalid: {error}"
+        ))
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        ServiceError::Conflict(
+            "reconciliation_required: governing adaptive envelope must be an object".to_owned(),
+        )
+    })?;
+    const FIELDS: [&str; 6] = [
+        "allowed_task_operations",
+        "fixed_outcomes",
+        "fixed_acceptance",
+        "fixed_risk_classes",
+        "forbidden_side_effects",
+        "elevated_operations",
+    ];
+    if object.len() != FIELDS.len() || FIELDS.iter().any(|field| !object.contains_key(*field)) {
+        return Err(ServiceError::Conflict(
+            "reconciliation_required: governing adaptive envelope is incomplete".to_owned(),
+        ));
+    }
+    if FIELDS.iter().any(|field| {
+        !object.get(*field).is_some_and(Value::is_array)
+            || object
+                .get(*field)
+                .and_then(Value::as_array)
+                .is_some_and(|values| values.iter().any(|value| !value.is_string()))
+    }) {
+        return Err(ServiceError::Conflict(
+            "reconciliation_required: governing adaptive envelope contains a non-string boundary"
+                .to_owned(),
+        ));
+    }
+    serde_json::from_value(value).map_err(|error| {
+        ServiceError::Conflict(format!(
+            "reconciliation_required: governing adaptive envelope is invalid: {error}"
+        ))
+    })
+}
+
 impl TaskService {
+    /// Load the immutable governance projection that adaptive Task operations
+    /// are allowed to inherit.  The baseline join is intentionally read from
+    /// the current row rather than from caller-provided provenance.
+    pub(crate) async fn adaptive_task_governance(
+        &self,
+        task: &db::Task,
+    ) -> Result<Option<AdaptiveTaskGovernance>> {
+        let row = sqlx::query(
+            "SELECT g.project_id, g.charter_revision_id,
+                    g.baseline_id, g.baseline_revision_id, g.plan_item_id,
+                    g.milestone_id, g.document_revisions_json,
+                    g.capability_class, g.risk_class, g.runnable,
+                    g.provenance_json,
+                    r.adaptive_envelope_json,
+                    r.content_digest AS baseline_content_digest
+             FROM project_task_governance g
+             LEFT JOIN project_execution_baseline_revision r
+               ON r.id = g.baseline_revision_id
+              AND r.baseline_id = g.baseline_id
+             WHERE g.task_id = ? AND g.project_id = ?",
+        )
+        .bind(&task.id)
+        .bind(&task.project_id)
+        .fetch_optional(self.db.pool())
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(AdaptiveTaskGovernance {
+            charter_revision_id: row.get("charter_revision_id"),
+            baseline_id: row.get("baseline_id"),
+            baseline_revision_id: row.get("baseline_revision_id"),
+            plan_item_id: row.get("plan_item_id"),
+            milestone_id: row.get("milestone_id"),
+            document_revisions_json: row.get("document_revisions_json"),
+            capability_class: row.get("capability_class"),
+            risk_class: row.get("risk_class"),
+            provenance_json: row.get("provenance_json"),
+            adaptive_envelope_json: row.get("adaptive_envelope_json"),
+            baseline_content_digest: row.get("baseline_content_digest"),
+        }))
+    }
+
+    /// Admit one adaptive operation at the shared TaskService boundary.
+    /// Legacy Tasks have no governing baseline and retain their historical
+    /// behavior.  Charter-backed Tasks require an active envelope entry and
+    /// an empty reconciliation projection before they can be reshaped.
+    pub(crate) async fn authorize_adaptive_task_operation(
+        &self,
+        task: &db::Task,
+        operation: &str,
+    ) -> Result<Option<AdaptiveTaskGovernance>> {
+        if operation.trim().is_empty() {
+            return Err(ServiceError::invalid_operation(
+                "adaptive Task operation is required",
+            ));
+        }
+        let Some(governance) = self.adaptive_task_governance(task).await? else {
+            return Ok(None);
+        };
+        // A pre-baseline planning row is not an executable adaptive envelope.
+        // Keep it on the existing planning path; repository-capable reshaping
+        // still requires the exact baseline references below.
+        let Some(baseline_id) = governance.baseline_id.as_deref() else {
+            return Ok(Some(governance));
+        };
+        let Some(baseline_revision_id) = governance.baseline_revision_id.as_deref() else {
+            return Ok(Some(governance));
+        };
+        let admitted: i64 = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM project p
+                 JOIN project_execution_baseline b
+                   ON b.id = ? AND b.project_id = p.id
+                 JOIN project_execution_baseline_revision r
+                   ON r.id = ? AND r.baseline_id = b.id
+                 WHERE p.id = ?
+                   AND p.current_charter_revision_id = ?
+                   AND b.lifecycle = 'active'
+                   AND b.current_revision_id = r.id
+                   AND r.lifecycle = 'approved'
+                   AND EXISTS (
+                       SELECT 1
+                       FROM project_execution_baseline_approval a
+                       WHERE a.baseline_id = b.id AND a.revision_id = r.id
+                         AND a.principal_type = 'user'
+                         AND a.authorization_action = 'project.execution_baseline.approve'
+                         AND a.content_digest = r.content_digest
+                         AND a.rendered_digest = r.rendered_digest
+                         AND a.lifecycle IN ('active', 'consumed')
+                   )
+             )",
+        )
+        .bind(baseline_id)
+        .bind(baseline_revision_id)
+        .bind(&task.project_id)
+        .bind(governance.charter_revision_id.as_deref())
+        .fetch_one(self.db.pool())
+        .await?;
+        if admitted != 1 {
+            let reason =
+                "adaptive Task operation references a stale or unapproved execution baseline";
+            self.record_adaptive_boundary_reconciliation(
+                task,
+                &governance,
+                baseline_id,
+                baseline_revision_id,
+                operation,
+                reason,
+            )
+            .await?;
+            return Err(ServiceError::Conflict(format!(
+                "reconciliation_required: {reason}"
+            )));
+        }
+        let unresolved: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM project_reconciliation_record
+             WHERE project_id = ? AND state = 'required'",
+        )
+        .bind(&task.project_id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if unresolved > 0 {
+            return Err(ServiceError::Conflict(
+                "reconciliation_required: resolve the Project's active adaptive boundary conflict before reshaping Tasks"
+                    .to_owned(),
+            ));
+        }
+        let envelope_json = governance
+            .adaptive_envelope_json
+            .as_deref()
+            .ok_or_else(|| {
+                ServiceError::Conflict(
+                    "reconciliation_required: governing baseline adaptive envelope is unavailable"
+                        .to_owned(),
+                )
+            })?;
+        let envelope = parse_adaptive_task_envelope(envelope_json)?;
+        if envelope
+            .allowed_task_operations
+            .iter()
+            .any(|allowed| allowed == operation)
+        {
+            return Ok(Some(governance));
+        }
+        let reason =
+            format!("adaptive Task operation '{operation}' is outside the approved envelope");
+        self.record_adaptive_boundary_reconciliation(
+            task,
+            &governance,
+            baseline_id,
+            baseline_revision_id,
+            operation,
+            &reason,
+        )
+        .await?;
+        Err(ServiceError::Conflict(format!(
+            "reconciliation_required: {reason}"
+        )))
+    }
+
+    /// A child/replacement must inherit the source Task's immutable
+    /// governance references.  Caller-provided risk/capability or baseline
+    /// changes are a boundary crossing, not an adaptive implementation
+    /// choice, and are recorded as reconciliation-required.
+    pub(crate) async fn validate_adaptive_child_governance(
+        &self,
+        source: &db::Task,
+        requested: &TaskGovernanceRequest,
+        operation: &str,
+    ) -> Result<()> {
+        let Some(governance) = self
+            .authorize_adaptive_task_operation(source, operation)
+            .await?
+        else {
+            return Ok(());
+        };
+        let Some(baseline_id) = governance.baseline_id.as_deref() else {
+            return Ok(());
+        };
+        let source_provenance: Value =
+            serde_json::from_str(&governance.provenance_json).map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "Task governance provenance is invalid: {error}"
+                ))
+            })?;
+        let requested_provenance = requested.provenance.as_ref();
+        const FIXED_BOUNDARY_FIELDS: [&str; 8] = [
+            "fixed_outcomes",
+            "fixed_acceptance",
+            "fixed_risk_classes",
+            "forbidden_side_effects",
+            "release_policy_revision",
+            "release_policy_digest",
+            "elevated_operations",
+            "fixed_boundary_digest",
+        ];
+        let provenance_boundary_mismatch = requested_provenance
+            .and_then(Value::as_object)
+            .is_some_and(|requested| {
+                FIXED_BOUNDARY_FIELDS.iter().any(|field| {
+                    requested.get(*field).is_some()
+                        && source_provenance.get(*field) != requested.get(*field)
+                })
+            });
+        let boundary_mismatch = requested.baseline_id.as_deref() != Some(baseline_id)
+            || requested.baseline_revision_id.as_deref()
+                != governance.baseline_revision_id.as_deref()
+            || requested.charter_revision_id.as_deref()
+                != governance.charter_revision_id.as_deref()
+            || requested.plan_item_id.as_deref() != governance.plan_item_id.as_deref()
+            || requested.milestone_id.as_deref() != governance.milestone_id.as_deref()
+            || serde_json::to_string(&requested.document_revision_ids)
+                .ok()
+                .as_deref()
+                != Some(governance.document_revisions_json.as_str())
+            || requested.capability_class.as_deref() != governance.capability_class.as_deref()
+            || requested.risk_class.as_deref() != governance.risk_class.as_deref()
+            || provenance_boundary_mismatch;
+        if !boundary_mismatch {
+            return Ok(());
+        }
+        let reason = format!(
+            "adaptive Task {operation} changes an approved outcome, acceptance, risk, side-effect, release, or elevated-operation boundary"
+        );
+        self.record_adaptive_boundary_reconciliation(
+            source,
+            &governance,
+            baseline_id,
+            governance
+                .baseline_revision_id
+                .as_deref()
+                .unwrap_or("unknown"),
+            operation,
+            &reason,
+        )
+        .await?;
+        Err(ServiceError::Conflict(format!(
+            "reconciliation_required: {reason}"
+        )))
+    }
+
+    async fn record_adaptive_boundary_reconciliation(
+        &self,
+        task: &db::Task,
+        governance: &AdaptiveTaskGovernance,
+        baseline_id: &str,
+        baseline_revision_id: &str,
+        operation: &str,
+        reason: &str,
+    ) -> Result<()> {
+        use sha2::{Digest, Sha256};
+
+        let task_digest = hex::encode(Sha256::digest(governance.provenance_json.as_bytes()));
+        let idempotency_key = format!(
+            "adaptive-boundary:{}:{}:{}:{}",
+            task.project_id, task.id, operation, task_digest
+        );
+        let now = now_rfc3339();
+        let conflict = ProjectOrchestrationRepo::create_project_canonical_conflict(
+            &*self.db,
+            CreateProjectCanonicalConflict {
+                id: new_uuid_v4(),
+                project_id: task.project_id.clone(),
+                domain: "execution".to_owned(),
+                governing_record_type: "execution_baseline".to_owned(),
+                governing_record_id: baseline_id.to_owned(),
+                governing_record_revision: baseline_revision_id.to_owned(),
+                governing_record_digest: governance
+                    .baseline_content_digest
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                conflicting_record_type: "task".to_owned(),
+                conflicting_record_id: task.id.clone(),
+                conflicting_record_revision: task.version.to_string(),
+                conflicting_record_digest: task_digest.clone(),
+                affected_paths_json: serde_json::json!([
+                    "outcome",
+                    "acceptance",
+                    "risk_class",
+                    "side_effects",
+                    "release_policy",
+                    "elevated_operations"
+                ])
+                .to_string(),
+                conflict_code: "adaptive_task_boundary_crossed".to_owned(),
+                description: reason.to_owned(),
+                detected_by_type: "system".to_owned(),
+                detected_by_id: Some("task-service".to_owned()),
+                authorization_basis: "adaptive_task_boundary".to_owned(),
+                authorization_action: "task.adaptive.reject".to_owned(),
+                explicit_event: format!("task.adaptive.{operation}.rejected"),
+                authorization_occurred_at: now.clone(),
+                idempotency_key,
+                created_at: now.clone(),
+            },
+        )
+        .await?;
+        let existing =
+            ProjectOrchestrationRepo::list_project_reconciliations(&*self.db, &task.project_id)
+                .await?
+                .into_iter()
+                .find(|record| {
+                    record.conflict_id == conflict.id
+                        && record.record_type == "task"
+                        && record.record_id == task.id
+                        && record.state == "required"
+                });
+        if existing.is_none() {
+            ProjectOrchestrationRepo::create_project_reconciliation(
+                &*self.db,
+                CreateProjectReconciliation {
+                    id: new_uuid_v4(),
+                    project_id: task.project_id.clone(),
+                    conflict_id: conflict.id,
+                    record_type: "task".to_owned(),
+                    record_id: task.id.clone(),
+                    record_revision: task.version.to_string(),
+                    record_digest: task_digest,
+                    governing_record_type: "execution_baseline".to_owned(),
+                    governing_record_id: baseline_id.to_owned(),
+                    governing_record_revision: baseline_revision_id.to_owned(),
+                    governing_record_digest: governance
+                        .baseline_content_digest
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Reject orchestration identities before any repository workspace is
     /// prepared. The in-transaction lease guard repeats this check at the
     /// authority boundary, but callers use this preflight to avoid leaving a
@@ -75,6 +487,28 @@ impl TaskService {
                 "Main and Project Agent identities cannot receive repository WorkspaceLeases",
             ));
         }
+        let charter_backed: i64 = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM project
+                 WHERE id = ? AND charter_status = 'charter_backed'
+                   AND charter_setup_required = 0
+             )",
+        )
+        .bind(project_id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if charter_backed == 1
+            && !crate::is_eligible_execution_identity(&self.db, project_id, principal_id).await?
+        {
+            let mut requirement = SetupRequirement::new("role_assignment");
+            requirement.role = Some("worker".to_owned());
+            requirement.capability = Some("repository_write".to_owned());
+            requirement.action = Some(RetryAction::SelectWorker);
+            return Err(ServiceError::execution_setup_required(
+                "repository WorkspaceLease requires an active Project-eligible execution identity",
+                vec![requirement],
+            ));
+        }
         Ok(())
     }
 
@@ -91,12 +525,19 @@ impl TaskService {
         requested: Option<TaskGovernanceRequest>,
     ) -> Result<Option<PreparedTaskGovernance>> {
         // A repository binding is capability-bearing regardless of the task
-        // label.  Planning/discovery labels only constrain the executor to a
-        // read-only profile; they must not bypass the baseline admission gate
-        // or receive a workspace as an accidental side effect.
+        // label. Planning/discovery labels may use the explicit pre-baseline
+        // read-only branch, but they never infer a write profile or receive a
+        // repository lease as an accidental side effect.
+        let requested_capability = requested
+            .as_ref()
+            .and_then(|request| request.capability_class.as_deref());
+        let execution_class = classify_task_execution(task_type, requested_capability)?;
         let repository_capable = repo_id.is_some();
-        let implementation =
-            repository_capable && IMPLEMENTATION_CAPABILITY_TYPES.contains(&task_type);
+        let implementation = execution_class == TaskExecutionClass::Implementation;
+        // Implementation intent remains governed even while repository setup
+        // is incomplete. A missing primary_repo_id must not downgrade it to
+        // an ungoverned planning Task.
+        let requires_execution_governance = implementation || repository_capable;
         let charter_backed = project.charter_status == "charter_backed"
             && !project.charter_setup_required
             && project.current_charter_revision_id.is_some();
@@ -107,6 +548,7 @@ impl TaskService {
             return Ok(None);
         }
 
+        let default_capability = canonical_task_capability(task_type, requested_capability)?;
         let mut requested = requested.unwrap_or_else(|| TaskGovernanceRequest {
             // Mainstream Task creation surfaces do not carry an orchestration
             // envelope.  Bind those Tasks to the current Charter and keep
@@ -119,11 +561,23 @@ impl TaskService {
             plan_item_id: None,
             milestone_id: None,
             document_revision_ids: Vec::new(),
-            capability_class: (repository_capable && !implementation)
-                .then(|| "repository_read".to_owned()),
-            risk_class: (repository_capable && !implementation).then(|| "low".to_owned()),
+            capability_class: (!implementation).then_some(default_capability.clone()),
+            risk_class: (!implementation).then(|| "low".to_owned()),
             provenance: None,
         });
+        if requested
+            .capability_class
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            // Preserve the historical null capability for an implementation
+            // plan while keeping the canonical server default available to
+            // the classifier and lease boundary. Read-only intent must carry
+            // its explicit non-mutating profile in durable governance.
+            if !implementation {
+                requested.capability_class = Some(default_capability);
+            }
+        }
 
         let current_charter_revision_id =
             project.current_charter_revision_id.clone().ok_or_else(|| {
@@ -150,8 +604,9 @@ impl TaskService {
                             r.milestone_definition_revision_ids_json,
                             r.primary_milestone_id,
                             r.capability_classes_json, r.risk_classes_json,
-                            r.adaptive_envelope_json, r.content_digest,
-                            r.rendered_digest
+                            r.adaptive_envelope_json, r.elevated_operations_json,
+                            r.release_policy_revision, r.release_policy_digest,
+                            r.content_digest, r.rendered_digest
                      FROM project_execution_baseline b
                      JOIN project_execution_baseline_revision r
                        ON r.baseline_id = b.id
@@ -177,6 +632,9 @@ impl TaskService {
                     capability_classes_json: row.get("capability_classes_json"),
                     risk_classes_json: row.get("risk_classes_json"),
                     adaptive_envelope_json: row.get("adaptive_envelope_json"),
+                    elevated_operations_json: row.get("elevated_operations_json"),
+                    release_policy_revision: row.get("release_policy_revision"),
+                    release_policy_digest: row.get("release_policy_digest"),
                     content_digest: row.get("content_digest"),
                     rendered_digest: row.get("rendered_digest"),
                 });
@@ -261,7 +719,7 @@ impl TaskService {
 
         if repository_capable
             && baseline.is_none()
-            && matches!(task_type, "planning_task" | "discovery")
+            && execution_class == TaskExecutionClass::ReadOnlyPlanning
         {
             if let Some(capability_class) = requested.capability_class.as_deref() {
                 if !is_read_only_capability(capability_class) {
@@ -311,7 +769,7 @@ impl TaskService {
                 false
             };
 
-        if let Some(baseline) = baseline.as_ref().filter(|_| repository_capable) {
+        if let Some(baseline) = baseline.as_ref().filter(|_| requires_execution_governance) {
             require_allowed_class(
                 requested.capability_class.as_deref(),
                 &baseline.capability_classes_json,
@@ -335,12 +793,31 @@ impl TaskService {
         // capability profile immediately before workspace preparation.
         let runnable = repository_capable && baseline_active && approval_matches;
         let provenance_json = build_provenance(
-            requested.provenance,
+            requested.provenance.clone(),
             requested.plan_item_id.as_deref(),
             requested.baseline_id.as_deref(),
             requested.baseline_revision_id.as_deref(),
             baseline.as_ref(),
         )?;
+        let replacement_of_task_id = requested
+            .provenance
+            .as_ref()
+            .and_then(|value| value.get("replacement_of_task_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some(replacement_of_task_id) = replacement_of_task_id.as_deref() {
+            let owning_project: Option<String> = sqlx::query_scalar(
+                "SELECT project_id FROM task WHERE id = ? AND deleted_at IS NULL",
+            )
+            .bind(replacement_of_task_id)
+            .fetch_optional(self.db.pool())
+            .await?;
+            if owning_project.as_deref() != Some(project.id.as_str()) {
+                return Err(ServiceError::invalid_operation(
+                    "Task replacement provenance must reference a Task in the same Project",
+                ));
+            }
+        }
 
         Ok(Some(PreparedTaskGovernance {
             charter_revision_id: requested.charter_revision_id,
@@ -353,6 +830,7 @@ impl TaskService {
             capability_class: requested.capability_class,
             risk_class: requested.risk_class,
             runnable,
+            replacement_of_task_id,
             provenance_json,
         }))
     }
@@ -434,108 +912,47 @@ impl TaskService {
         governance: PreparedTaskGovernance,
         now: &str,
     ) -> Result<()> {
-        if governance.runnable {
-            let (Some(charter_revision_id), Some(baseline_id), Some(baseline_revision_id)) = (
-                governance.charter_revision_id.as_deref(),
-                governance.baseline_id.as_deref(),
-                governance.baseline_revision_id.as_deref(),
-            ) else {
-                return Err(ServiceError::invalid_operation(
-                    "runnable Task governance is missing its governing references",
-                ));
-            };
-            // The preparation query runs before the Task transaction starts.
-            // Repeat the exact approval predicate here so a baseline
-            // supersession between preparation and insertion cannot create a
-            // runnable governance row that was never user-approved.
-            let admitted: i64 = sqlx::query_scalar(
-                "SELECT EXISTS (
-                     SELECT 1
-                     FROM project p
-                     JOIN project_execution_baseline b
-                       ON b.id = ? AND b.project_id = p.id
-                     JOIN project_execution_baseline_revision r
-                       ON r.id = ? AND r.baseline_id = b.id
-                     WHERE p.id = ?
-                       AND p.charter_status = 'charter_backed'
-                       AND p.charter_setup_required = 0
-                       AND p.current_charter_revision_id = ?
-                       AND b.lifecycle = 'active'
-                       AND b.current_revision_id = r.id
-                       AND r.lifecycle = 'approved'
-                       AND r.charter_revision_id = p.current_charter_revision_id
-                       AND EXISTS (
-                           SELECT 1
-                           FROM project_execution_baseline_approval a
-                           WHERE a.baseline_id = b.id
-                             AND a.revision_id = r.id
-                             AND a.principal_type = 'user'
-                             AND a.authorization_action = 'project.execution_baseline.approve'
-                             AND length(trim(a.authorization_basis)) > 0
-                             AND length(trim(a.authorization_occurred_at)) > 0
-                             AND length(trim(a.explicit_event)) > 0
-                             AND a.content_digest = r.content_digest
-                             AND a.rendered_digest = r.rendered_digest
-                             AND a.lifecycle IN ('active', 'consumed')
-                       )
-                 )",
-            )
-            .bind(baseline_id)
-            .bind(baseline_revision_id)
-            .bind(project_id)
-            .bind(charter_revision_id)
-            .fetch_one(&mut **transaction)
-            .await?;
-            if admitted != 1 {
-                return Err(ServiceError::invalid_operation(
-                    "runnable Task requires the exact active user-approved execution baseline",
-                ));
-            }
-        }
-        sqlx::query(
-            "INSERT INTO project_task_governance
-             (task_id, project_id, charter_revision_id, baseline_id,
-              baseline_revision_id, plan_item_id, milestone_id,
-              document_revisions_json, capability_class, risk_class,
-              runnable, provenance_json, version, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+        let governance = db::CreateProjectTaskGovernance {
+            task_id: task_id.to_owned(),
+            project_id: project_id.to_owned(),
+            charter_revision_id: governance.charter_revision_id,
+            baseline_id: governance.baseline_id,
+            baseline_revision_id: governance.baseline_revision_id,
+            plan_item_id: governance.plan_item_id,
+            milestone_id: governance.milestone_id,
+            document_revisions_json: governance.document_revisions_json,
+            capability_class: governance.capability_class,
+            risk_class: governance.risk_class,
+            runnable: governance.runnable,
+            replacement_of_task_id: governance.replacement_of_task_id,
+            provenance_json: governance.provenance_json,
+            created_at: now.to_owned(),
+            updated_at: now.to_owned(),
+        };
+        db::ProjectOrchestrationRepo::insert_project_task_governance_in_tx(
+            &*self.db,
+            transaction,
+            governance,
         )
-        .bind(task_id)
-        .bind(project_id)
-        .bind(governance.charter_revision_id.as_deref())
-        .bind(governance.baseline_id.as_deref())
-        .bind(governance.baseline_revision_id.as_deref())
-        .bind(governance.plan_item_id.as_deref())
-        .bind(governance.milestone_id.as_deref())
-        .bind(governance.document_revisions_json)
-        .bind(governance.capability_class.as_deref())
-        .bind(governance.risk_class.as_deref())
-        .bind(if governance.runnable { 1_i64 } else { 0_i64 })
-        .bind(governance.provenance_json)
-        .bind(now)
-        .bind(now)
-        .execute(&mut **transaction)
-        .await?;
-        Ok(())
+        .await
+        .map_err(ServiceError::from)
     }
 
     /// Fail closed immediately before any path can prepare a repository
     /// workspace.  This keeps claim, manual launch, role dispatch, retry, and
     /// follow-up execution behind the same gate.
-    pub(super) async fn ensure_task_runnable(&self, task: &db::Task) -> Result<()> {
-        if task.repo_id.is_none() {
-            return Ok(());
-        }
+    pub(crate) async fn ensure_task_runnable(&self, task: &db::Task) -> Result<()> {
         let row = sqlx::query(
             "SELECT p.charter_status, p.charter_setup_required,
                     p.current_charter_revision_id,
                     t.task_type,
                     g.runnable, g.charter_revision_id,
                     g.baseline_id, g.baseline_revision_id,
-                    g.capability_class,
+                    g.capability_class, g.risk_class,
                     b.lifecycle, b.current_revision_id,
-                    r.charter_revision_id AS baseline_charter_revision_id,
-                    (SELECT COUNT(*) FROM project_execution_baseline_approval a
+                            r.charter_revision_id AS baseline_charter_revision_id,
+                            r.capability_classes_json, r.risk_classes_json,
+                            (SELECT COUNT(*) FROM project_execution_baseline_approval a
                      WHERE a.baseline_id = g.baseline_id
                        AND a.revision_id = g.baseline_revision_id
                        AND a.principal_type = 'user'
@@ -569,21 +986,70 @@ impl TaskService {
             return Ok(());
         }
         let task_type: String = row.get("task_type");
-        if matches!(task_type.as_str(), "planning_task" | "discovery")
+        let capability_class = row
+            .get::<Option<String>, _>("capability_class")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(canonical_task_capability(&task_type, None)?);
+        let execution_class = classify_task_execution(&task_type, Some(&capability_class))?;
+        let prebaseline_read_only = execution_class == TaskExecutionClass::ReadOnlyPlanning
             && row.get::<Option<String>, _>("baseline_id").is_none()
             && row
                 .get::<Option<String>, _>("baseline_revision_id")
                 .is_none()
-            && row
-                .get::<Option<String>, _>("capability_class")
-                .as_deref()
-                .is_some_and(is_read_only_capability)
-        {
-            // Before baseline approval, only bounded read-only discovery and
-            // planning work may run.  The executor snapshot independently
-            // carries the read-only marker; this check prevents a caller from
-            // swapping in an ungoverned capability at admission time.
+            && is_read_only_capability(&capability_class);
+
+        if prebaseline_read_only {
+            // Before baseline approval, bounded discovery/planning remains
+            // admissible even when repository setup is incomplete. The Task
+            // may be recorded or handled by a non-repository planning path,
+            // but no WorkspaceLease can be issued without a repo binding.
             return Ok(());
+        }
+
+        if execution_class == TaskExecutionClass::Implementation {
+            // The canonical Project setup projection is the authority for
+            // durable repository/role readiness. A primary_repo_id check by
+            // itself is insufficient: an active coordinator identity or a
+            // failed provisioning operation must not receive a write lease.
+            let setup = crate::load_project_execution_setup(&self.db, &task.project_id).await?;
+            if setup.execution_setup_state != ExecutionSetupState::Ready
+                || setup.primary_repo.is_none()
+            {
+                let mut requirements = setup.setup_requirements.clone();
+                if setup.primary_repo.is_none()
+                    && !requirements
+                        .iter()
+                        .any(|requirement| requirement.requirement_type == "repository")
+                {
+                    let mut requirement = SetupRequirement::new("repository");
+                    requirement.capability = Some("repository_write".to_owned());
+                    requirement.action = Some(RetryAction::AttachRepository);
+                    requirements.push(requirement);
+                }
+                if requirements.is_empty() {
+                    requirements.push(SetupRequirement::new("execution_setup"));
+                }
+                return Err(ServiceError::execution_setup_required(
+                    "repository implementation Task is not runnable: Project execution setup is incomplete",
+                    requirements,
+                ));
+            }
+            if setup.execution_gate != ExecutionGate::Active {
+                return Err(ServiceError::invalid_operation(
+                    "repository implementation Task is not runnable: an active user-approved execution baseline is required",
+                ));
+            }
+        }
+
+        if let Some(allowed) = row.get::<Option<String>, _>("capability_classes_json") {
+            require_allowed_class(Some(&capability_class), &allowed, "capability_class")?;
+        }
+        if let Some(allowed) = row.get::<Option<String>, _>("risk_classes_json") {
+            require_allowed_class(
+                row.get::<Option<String>, _>("risk_class").as_deref(),
+                &allowed,
+                "risk_class",
+            )?;
         }
         let runnable: Option<i64> = row.get("runnable");
         let admitted = runnable == Some(1)
@@ -872,14 +1338,9 @@ impl TaskService {
         .await?
         .flatten()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
-            if matches!(task_type.as_str(), "planning_task" | "discovery") {
-                "repository_read".to_owned()
-            } else {
-                "repository_write".to_owned()
-            }
-        });
-        if matches!(task_type.as_str(), "planning_task" | "discovery")
+        .map_or_else(|| canonical_task_capability(&task_type, None), Ok)?;
+        let execution_class = classify_task_execution(&task_type, Some(&capability_class))?;
+        if execution_class == TaskExecutionClass::ReadOnlyPlanning
             && !is_read_only_capability(&capability_class)
         {
             return Err(ServiceError::invalid_operation(
@@ -925,7 +1386,7 @@ impl TaskService {
         let charter_backed = gate.get::<String, _>("charter_status") == "charter_backed"
             && gate.get::<i64, _>("charter_setup_required") == 0;
         let prebaseline_read_only = charter_backed
-            && matches!(task_type.as_str(), "planning_task" | "discovery")
+            && execution_class == TaskExecutionClass::ReadOnlyPlanning
             && gate.get::<Option<String>, _>("baseline_id").is_none()
             && gate
                 .get::<Option<String>, _>("baseline_revision_id")
@@ -1118,20 +1579,15 @@ impl TaskService {
         .await?
         .flatten()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
-            if matches!(task.task_type.as_str(), "planning_task" | "discovery") {
-                "repository_read".to_owned()
-            } else {
-                "repository_write".to_owned()
-            }
-        });
+        .map_or_else(|| canonical_task_capability(&task.task_type, None), Ok)?;
+        let execution_class = classify_task_execution(&task.task_type, Some(&capability_class))?;
         if !is_supported_capability_profile(&capability_class) {
             return Err(ServiceError::invalid_operation(format!(
                 "Task capability profile '{}' is not server-approved",
                 capability_class
             )));
         }
-        if matches!(task.task_type.as_str(), "planning_task" | "discovery")
+        if execution_class == TaskExecutionClass::ReadOnlyPlanning
             && !is_read_only_capability(&capability_class)
         {
             return Err(ServiceError::invalid_operation(
@@ -1159,8 +1615,16 @@ impl TaskService {
                     "WorkspaceLease requires an assigned Task Worker or reviewer",
                 )
             })?;
+        let canonical_role = self.canonical_execution_role_for_task(task, role).await?;
         self.ensure_repository_worker_identity(&task.project_id, principal_id)
             .await?;
+        crate::ensure_execution_role_principal(
+            &self.db,
+            &task.project_id,
+            &canonical_role,
+            principal_id,
+        )
+        .await?;
         let charter_backed: i64 = sqlx::query_scalar(
             "SELECT EXISTS (
                  SELECT 1 FROM project
@@ -1196,29 +1660,48 @@ impl TaskService {
         Ok(principal_id.to_owned())
     }
 
-    pub(super) async fn revoke_active_workspace_lease_for_execution(
+    async fn canonical_execution_role_for_task(
         &self,
-        task_id: &str,
-        execution_id: &str,
-    ) {
-        match WorkspaceLeaseRepo::get_active_for_task(&*self.db, task_id).await {
-            Ok(Some(lease)) if lease.execution_id == execution_id => {
-                self.revoke_workspace_lease(&lease).await
-            }
-            Ok(Some(lease)) => {
-                // A concurrent retry may already own the Task's active
-                // lease. Never revoke another execution's authority while
-                // terminalizing this attempt.
-                tracing::debug!(
-                    task_id,
-                    execution_id,
-                    active_execution_id = %lease.execution_id,
-                    "leaving another execution's WorkspaceLease active"
-                );
-            }
-            Ok(None) => {}
-            Err(error) => tracing::warn!(%error, task_id, "failed to load terminal WorkspaceLease"),
+        task: &db::Task,
+        requested_role: &str,
+    ) -> Result<String> {
+        let requested_role = requested_role.trim();
+        if requested_role.is_empty() {
+            return Err(ServiceError::invalid_operation(
+                "WorkspaceLease requires a non-empty execution role",
+            ));
         }
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            task,
+            &project.workflow_definition,
+            &api_types::Actor::system(api_types::SystemComponent::Executor),
+        );
+        if workflow
+            .states
+            .iter()
+            .any(|state| crate::workflow::effective_role(state) == Some(requested_role))
+        {
+            return Ok(requested_role.to_owned());
+        }
+
+        // Interactive/executor launch APIs carry a transport role rather than
+        // a workflow role. Resolve it to the current state before checking the
+        // canonical Project Worker/reviewer assignment.
+        if matches!(requested_role, "interactive" | "executor") {
+            if let Some(state) = workflow
+                .states
+                .iter()
+                .find(|state| state.name == task.status)
+            {
+                if let Some(role) = crate::workflow::effective_role(state) {
+                    return Ok(role.to_owned());
+                }
+            }
+        }
+        Ok(requested_role.to_owned())
     }
 
     pub(super) async fn verify_execution_workspace_authority(
@@ -1404,14 +1887,6 @@ fn capability_profile_digest(capability_class: &str) -> String {
 /// WorkspaceLease. Baselines may author narrower subsets, but nothing outside
 /// this list is ever dispatchable, so Task admission validates against it up
 /// front (`require_server_approved_capability_class`).
-const SUPPORTED_CAPABILITY_PROFILES: &[&str] = &[
-    "repository_read",
-    "repository_write",
-    "read_only",
-    "discovery_read",
-    "planning_read",
-];
-
 fn is_supported_capability_profile(capability_class: &str) -> bool {
     SUPPORTED_CAPABILITY_PROFILES.contains(&capability_class)
 }
@@ -1536,13 +2011,6 @@ fn require_allowed_class(requested: Option<&str>, allowed_json: &str, field: &st
     Ok(())
 }
 
-fn is_read_only_capability(value: &str) -> bool {
-    matches!(
-        value,
-        "repository_read" | "read_only" | "discovery_read" | "planning_read"
-    )
-}
-
 fn build_provenance(
     requested: Option<Value>,
     plan_item_id: Option<&str>,
@@ -1559,6 +2027,11 @@ fn build_provenance(
             ));
         }
     };
+    if map.contains_key("fixed_risk_class") {
+        return Err(ServiceError::invalid_operation(
+            "singular fixed_risk_class provenance is unsupported",
+        ));
+    }
     let required = [
         ("origin_plan_item_id", plan_item_id),
         ("governing_baseline_id", baseline_id),
@@ -1577,18 +2050,104 @@ fn build_provenance(
         }
     }
     if let Some(baseline) = baseline {
-        map.insert(
-            "governing_baseline_content_digest".to_owned(),
-            Value::String(baseline.content_digest.clone()),
-        );
-        map.insert(
-            "governing_baseline_rendered_digest".to_owned(),
-            Value::String(baseline.rendered_digest.clone()),
-        );
-        map.insert(
-            "adaptive_envelope_digest".to_owned(),
-            Value::String(sha256_hex(baseline.adaptive_envelope_json.as_bytes())),
-        );
+        let envelope = parse_adaptive_task_envelope(&baseline.adaptive_envelope_json)?;
+        let baseline_elevated_operations: Value =
+            serde_json::from_str(&baseline.elevated_operations_json).map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "invalid baseline elevated operations: {error}"
+                ))
+            })?;
+        if baseline_elevated_operations != serde_json::json!(envelope.elevated_operations) {
+            return Err(ServiceError::conflict(
+                "baseline elevated operations differ from its adaptive envelope",
+            ));
+        }
+        let envelope_value = serde_json::to_value(&envelope)
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        let adaptive_envelope_digest = api_types::canonical_digest_with_schema(
+            ADAPTIVE_ENVELOPE_DIGEST_SCHEMA,
+            &envelope_value,
+        )
+        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        let fixed_boundary = serde_json::json!({
+            "fixed_outcomes": &envelope.fixed_outcomes,
+            "fixed_acceptance": &envelope.fixed_acceptance,
+            "fixed_risk_classes": &envelope.fixed_risk_classes,
+            "forbidden_side_effects": &envelope.forbidden_side_effects,
+            "release_policy_revision": &baseline.release_policy_revision,
+            "release_policy_digest": &baseline.release_policy_digest,
+            "elevated_operations": &envelope.elevated_operations,
+        });
+        let fixed_boundary_digest =
+            api_types::canonical_digest_with_schema(FIXED_BOUNDARY_DIGEST_SCHEMA, &fixed_boundary)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        let authoritative = [
+            (
+                "fixed_outcomes",
+                serde_json::json!(&envelope.fixed_outcomes),
+            ),
+            (
+                "fixed_acceptance",
+                serde_json::json!(&envelope.fixed_acceptance),
+            ),
+            (
+                "fixed_risk_classes",
+                serde_json::json!(&envelope.fixed_risk_classes),
+            ),
+            (
+                "forbidden_side_effects",
+                serde_json::json!(&envelope.forbidden_side_effects),
+            ),
+            (
+                "release_policy_revision",
+                Value::String(baseline.release_policy_revision.clone()),
+            ),
+            (
+                "release_policy_digest",
+                Value::String(baseline.release_policy_digest.clone()),
+            ),
+            (
+                "elevated_operations",
+                serde_json::json!(&envelope.elevated_operations),
+            ),
+            (
+                "fixed_boundary_digest",
+                Value::String(fixed_boundary_digest),
+            ),
+            (
+                "adaptive_envelope_digest",
+                Value::String(adaptive_envelope_digest),
+            ),
+        ];
+        for (field, value) in authoritative {
+            if let Some(existing) = map.get(field) {
+                if existing != &value {
+                    return Err(ServiceError::conflict(format!(
+                        "Task governance provenance {field} does not match the authoritative baseline"
+                    )));
+                }
+            }
+            map.insert(field.to_owned(), value);
+        }
+        for (field, value) in [
+            (
+                "governing_baseline_content_digest",
+                Value::String(baseline.content_digest.clone()),
+            ),
+            (
+                "governing_baseline_rendered_digest",
+                Value::String(baseline.rendered_digest.clone()),
+            ),
+        ] {
+            if let Some(existing) = map.get(field) {
+                if existing != &value {
+                    return Err(ServiceError::conflict(format!(
+                        "Task governance provenance {field} does not match the authoritative baseline"
+                    )));
+                }
+            }
+            map.insert(field.to_owned(), value);
+        }
         let milestone_definition_revision_ids: Value = serde_json::from_str(
             &baseline.milestone_definition_revision_ids_json,
         )
@@ -1610,12 +2169,6 @@ fn build_provenance(
     );
     serde_json::to_string(&Value::Object(map))
         .map_err(|error| ServiceError::invalid_operation(error.to_string()))
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
 }
 
 fn json_contains_identifier(value: &str, identifier: &str) -> bool {
@@ -1692,7 +2245,10 @@ mod tests {
             primary_milestone_id: None,
             capability_classes_json: "[]".to_owned(),
             risk_classes_json: "[]".to_owned(),
-            adaptive_envelope_json: r#"{"allowed_task_operations":["split"]}"#.to_owned(),
+            adaptive_envelope_json: r#"{"allowed_task_operations":["split"],"fixed_outcomes":[],"fixed_acceptance":[],"fixed_risk_classes":[],"forbidden_side_effects":[],"elevated_operations":[]}"#.to_owned(),
+            elevated_operations_json: "[]".to_owned(),
+            release_policy_revision: "policy-r1".to_owned(),
+            release_policy_digest: "policy-digest".to_owned(),
             content_digest: "content".to_owned(),
             rendered_digest: "rendered".to_owned(),
         };

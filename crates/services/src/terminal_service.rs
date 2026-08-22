@@ -1591,6 +1591,7 @@ mod tests {
         async fn handle_log(
             &self,
             _daemon_id: &str,
+            _connection_id: u64,
             _notification: api_types::ExecutionLogNotification,
         ) -> Result<(), ServiceError> {
             Ok(())
@@ -1599,6 +1600,7 @@ mod tests {
         async fn handle_terminal(
             &self,
             _daemon_id: &str,
+            _connection_id: u64,
             _notification: api_types::ExecutionTerminalNotification,
         ) -> Result<(), ServiceError> {
             Ok(())

@@ -33,6 +33,46 @@ impl ProjectRepo for SqliteDb {
             .execute(&mut *transaction)
             .await?;
 
+        // V087 makes execution setup a durable Project concern. Keep the
+        // operation and its finite checkpoint set in the same transaction as
+        // Project creation so a fresh Project cannot become visible without
+        // a recoverable operation.
+        let operation_id = new_uuid_v4();
+        sqlx::query(
+            "INSERT INTO project_provisioning_operation (
+                id, project_id, idempotency_key, status, current_checkpoint,
+                attempt_count, max_attempts, retryable, created_at, updated_at, version
+             ) VALUES (?, ?, ?, 'setup_required', 'preflight', 0, 3, 1, ?, ?, 1)",
+        )
+        .bind(&operation_id)
+        .bind(&input.id)
+        .bind(format!("project-provisioning:{}", input.id))
+        .bind(&input.created_at)
+        .bind(&input.updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        for checkpoint in [
+            "preflight",
+            "repository_initialized",
+            "repository_registered",
+            "repository_linked",
+            "roles_assigned",
+        ] {
+            sqlx::query(
+                "INSERT INTO project_provisioning_checkpoint (
+                    id, operation_id, checkpoint, status, attempt_count,
+                    details_json, created_at, updated_at, version
+                 ) VALUES (?, ?, ?, 'pending', 0, '{}', ?, ?, 1)",
+            )
+            .bind(new_uuid_v4())
+            .bind(&operation_id)
+            .bind(checkpoint)
+            .bind(&input.created_at)
+            .bind(&input.updated_at)
+            .execute(&mut *transaction)
+            .await?;
+        }
+
         if let (Some(identity_id), Some(profile_id)) = (identity_id, profile_id) {
             let current: (String, i64) = sqlx::query_as(
                 "UPDATE project_agent_binding

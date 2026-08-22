@@ -5,6 +5,8 @@ export function getApiErrorMessage(error: unknown, fallback = 'Request failed'):
   if (error instanceof ApiError) {
     let message = error.message || fallback
     let requestId = error.requestId
+    if (error.response?.message) message = error.response.message
+    if (error.response?.request_id) requestId = error.response.request_id
     try {
       const parsed = JSON.parse(error.message) as {
         message?: unknown
@@ -27,6 +29,7 @@ export function getApiErrorMessage(error: unknown, fallback = 'Request failed'):
 
 export function getApiErrorCode(error: unknown): string | undefined {
   if (!(error instanceof ApiError)) return undefined
+  if (error.code) return error.code
   try {
     const parsed = JSON.parse(error.message) as { code?: unknown }
     return typeof parsed.code === 'string' ? parsed.code : undefined
@@ -44,6 +47,7 @@ function isRecord(value: unknown): value is ApiConflictDetails {
 /** Return server-provided conflict metadata without exposing arbitrary error bodies in the UI. */
 export function getApiConflictDetails(error: unknown): ApiConflictDetails | undefined {
   if (!(error instanceof ApiError)) return undefined
+  if (isRecord(error.details)) return error.details
   try {
     const parsed = JSON.parse(error.message) as { details?: unknown }
     return isRecord(parsed.details) ? parsed.details : undefined

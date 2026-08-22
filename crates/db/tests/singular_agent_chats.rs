@@ -216,6 +216,17 @@ fn turn(
         triggering_message_id: message_id.to_owned(),
         responder_identity_id: identity_id.to_owned(),
         profile_id: profile_id.to_owned(),
+        responder_binding_id: None,
+        responder_binding_version: None,
+        responder_identity_version: None,
+        profile_version: None,
+        operating_skill_revision_id: None,
+        policy_revision: None,
+        policy_digest: None,
+        permission_policy_digest: None,
+        tool_policy_digest: None,
+        admission_digest: None,
+        canonical_scope_provenance_json: None,
         canonical_scope_type: "agent_chat".to_owned(),
         canonical_scope_id: chat_id.to_owned(),
         dedupe_key: dedupe.to_owned(),
@@ -786,6 +797,7 @@ async fn response_and_handoff_replays_are_single_ledger_outcomes() {
             handoff: handoff.clone(),
             target_message: target_message.clone(),
             target_turn: target_turn.clone(),
+            source_responder_provenance_json: None,
         },
     )
     .await
@@ -796,6 +808,7 @@ async fn response_and_handoff_replays_are_single_ledger_outcomes() {
             handoff,
             target_message,
             target_turn,
+            source_responder_provenance_json: None,
         },
     )
     .await

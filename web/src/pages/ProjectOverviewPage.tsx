@@ -23,6 +23,7 @@ import { ConflictDetails } from '@/components/conflict-details'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { ProjectCharterAdoptionBanner } from '@/features/project-charter/ProjectCharterAdoptionBanner'
+import { ProjectExecutionSetupPanel } from '@/features/project-execution/ProjectExecutionSetupPanel'
 import { isApiStatus } from '@/lib/api-error'
 import type {
   AcceptanceCheckSummary,
@@ -991,6 +992,8 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
       />
 
       {setupRequired ? <ProjectCharterAdoptionBanner projectId={projectId} /> : null}
+
+      <ProjectExecutionSetupPanel projectId={projectId} />
 
       <div className="grid min-w-0 gap-5 xl:grid-cols-[minmax(0,1.45fr)_minmax(300px,0.75fr)]">
         <section

@@ -7,4 +7,5 @@ mod helpers;
 mod override_merge_tests;
 mod recovery_events;
 mod recovery_reset_retry_window;
+mod remote_terminal;
 mod service_tests;

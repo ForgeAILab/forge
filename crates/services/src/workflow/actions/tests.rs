@@ -334,7 +334,7 @@ async fn seed_agent_with_max(db: &SqliteDb, agent_id: &str, max_concurrent_tasks
             config_json: "{}".to_owned(),
             credential_ref: None,
             daemon_id: Some(daemon_id),
-            max_concurrent_tasks,
+            max_concurrent_tasks: max_concurrent_tasks + 1,
             heartbeat_interval_seconds: 30,
             max_missed_heartbeats: 3,
             status: AgentStatus::Idle,
@@ -517,6 +517,18 @@ async fn assign_agent_role(db: &SqliteDb, task_id: &str, role: &str, agent_id: &
     )
     .await
     .expect("role assignment creates");
+    let project_id: String = sqlx::query_scalar("SELECT project_id FROM task WHERE id = ?")
+        .bind(task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("task project lookup");
+    crate::test_support::configure_project_execution_test_setup(
+        db,
+        &project_id,
+        agent_id,
+        agent_id,
+    )
+    .await;
 }
 
 async fn build_test_ctx(
@@ -1056,6 +1068,7 @@ async fn run_ci_steps_keeps_review_running_when_reviewer_at_capacity() {
     assign_agent_role(&ctx.db, other_task_id, default_roles::REVIEWER, agent_id).await;
     seed_running_execution_for_task(&ctx.db, other_task_id, agent_id, default_roles::REVIEWER)
         .await;
+    crate::test_support::set_test_agent_capacity(&ctx.db, agent_id, 1).await;
 
     let ci_result = RunCiSteps.execute(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
@@ -1539,6 +1552,7 @@ async fn dispatch_role_agent_initial_dispatch_skips_at_capacity() {
     .expect("other task creates");
     assign_agent_role(&ctx.db, other_task_id, default_roles::CODER, agent_id).await;
     seed_running_execution_for_task(&ctx.db, other_task_id, agent_id, default_roles::CODER).await;
+    crate::test_support::set_test_agent_capacity(&ctx.db, agent_id, 1).await;
 
     let result = DispatchRoleAgent.execute(&ctx).await;
 
@@ -1976,6 +1990,7 @@ async fn reviewer_at_capacity_ci_runs_dispatch_queues() {
         default_roles::REVIEWER,
     )
     .await;
+    crate::test_support::set_test_agent_capacity(&ctx.db, reviewer_id, 1).await;
 
     let ci_result = RunCiSteps.execute(&ctx).await;
     assert!(

@@ -110,11 +110,19 @@ async fn running_task_continues_after_pause() {
     let repo_path = common::setup_git_repo(repo_dir.path());
     let workspace_root = common::TestDir::new("pause-claim-running-workspaces");
     let harness = common::test_app(workspace_root.path(), "pause-claim-running").await;
-    let (project_id, _repo_id) =
+    let (project_id, repo_id) =
         common::create_project_and_repo(&harness.app, "Pause Claim Running", &repo_path).await;
-    let (agent_id, _) =
+    let (agent_id, reviewer_id) =
         common::create_shell_agents(&harness.app, workspace_root.path(), "pause-claim-running")
             .await;
+    common::configure_execution_test_setup(
+        &harness.state.db,
+        &project_id,
+        &repo_id,
+        &agent_id,
+        &reviewer_id,
+    )
+    .await;
 
     let task = create_task(&harness, &project_id, "Running task").await;
 

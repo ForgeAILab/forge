@@ -14,11 +14,13 @@ use axum::{
     http::{header, Method, Request, StatusCode},
     Router,
 };
+use chrono::{Duration as ChronoDuration, Utc};
 use db::{
-    AgentRepo, AgentStatus, AssigneeKind, CreateAgent, CreateExecution, CreateProject, CreateRepo,
-    CreateTask, CreateTaskRoleAssignment, CreateWorkspace, CreateWorkspaceLease, DaemonRepo,
-    DaemonStatus, Execution, ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo, TaskRepo,
-    TaskRoleAssignmentRepo, UpsertDaemon, UserRepo, WorkMode, WorkspaceLeaseRepo, WorkspaceRepo,
+    AgentRepo, AgentStatus, AssigneeKind, ClaimExecutionLease, CreateAgent, CreateExecution,
+    CreateProject, CreateRepo, CreateTask, CreateTaskRoleAssignment, CreateWorkspace,
+    CreateWorkspaceLease, DaemonRepo, DaemonStatus, Execution, ExecutionLeaseMutation,
+    ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo, TaskRepo, TaskRoleAssignmentRepo,
+    UpdateDaemonReport, UpsertDaemon, UserRepo, WorkMode, WorkspaceLeaseRepo, WorkspaceRepo,
     WorkspaceStatus,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -506,7 +508,7 @@ pub async fn seed_running_execution_for_daemon(state: &AppState, daemon_id: &str
     )
     .await
     .expect("agent creates");
-    ExecutionRepo::create(
+    let execution = ExecutionRepo::create(
         &*state.db,
         CreateExecution {
             id: uuid::Uuid::new_v4().to_string(),
@@ -534,7 +536,34 @@ pub async fn seed_running_execution_for_daemon(state: &AppState, daemon_id: &str
         },
     )
     .await
-    .expect("execution creates")
+    .expect("execution creates");
+
+    // Remote execution notifications are authorized by the authenticated
+    // socket incarnation's lease owner.  Keep this fixture explicit about
+    // that scheduler-owned fact so it exercises the owner boundary rather
+    // than relying on the removed mutable Agent daemon binding fallback.
+    let connection = state
+        .daemon_connections
+        .get(daemon_id)
+        .expect("daemon connection is registered before seeding execution");
+    let now = Utc::now();
+    let mutation = ExecutionRepo::claim_lease(
+        &*state.db,
+        ClaimExecutionLease {
+            execution_id: execution.id.clone(),
+            expected_version: execution.execution_version,
+            owner: services::execution_lease_owner(daemon_id, connection.id()),
+            lease_expires_at: (now + ChronoDuration::seconds(30)).to_rfc3339(),
+            hard_deadline_at: (now + ChronoDuration::minutes(5)).to_rfc3339(),
+            now: now.to_rfc3339(),
+        },
+    )
+    .await
+    .expect("remote execution lease claims");
+    let ExecutionLeaseMutation::Updated(execution) = mutation else {
+        panic!("remote execution lease claim unexpectedly lost");
+    };
+    execution
 }
 
 pub struct StartableExecutionFixture {
@@ -560,6 +589,25 @@ pub async fn seed_startable_execution_for_daemon(
         .join("execution-start")
         .join(&task_id);
     std::fs::create_dir_all(&workspace_path).expect("workspace path creates");
+
+    // A startable remote execution needs the same daemon onboarding fact as
+    // production setup: the pinned daemon has reported an authenticated
+    // shell adapter.  Registration alone intentionally does not imply this.
+    let report_at = db::now_rfc3339();
+    DaemonRepo::update_report(
+        &*state.db,
+        UpdateDaemonReport {
+            id: daemon_id.to_owned(),
+            last_report_at: report_at.clone(),
+            status: DaemonStatus::Online,
+            detected_clis_json:
+                r#"[{"kind":"shell","availability":"authenticated","path":"/bin/sh"}]"#.to_owned(),
+            labels_json: None,
+            updated_at: report_at,
+        },
+    )
+    .await
+    .expect("remote daemon shell report updates");
 
     ProjectRepo::create(
         &*state.db,
@@ -632,7 +680,9 @@ pub async fn seed_startable_execution_for_daemon(
             config_json: "{}".to_owned(),
             credential_ref: None,
             daemon_id: Some(daemon_id.to_owned()),
-            max_concurrent_tasks: 1,
+            // The fixture already has the running execution visible when
+            // lease admission re-checks identity capacity.
+            max_concurrent_tasks: 2,
             heartbeat_interval_seconds: 30,
             max_missed_heartbeats: 3,
             status: AgentStatus::Busy,

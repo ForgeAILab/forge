@@ -34,7 +34,21 @@ use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use tokio::process::Command;
 
-use crate::{AgentHostError, CanonicalScope, CanonicalScopeType, WorkspaceAccess};
+use crate::{
+    AgentHostError, CanonicalScope, CanonicalScopeType, WorkspaceAccess,
+    operation_catalog::{
+        MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
+        MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION,
+        MAIN_CHARTER_READINESS_OPERATION, OperationExposure, OperationSurface,
+        PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
+        operation_names_for_surface,
+    },
+    operation_contract::{
+        coordination_payload_guidance, coordination_payload_properties,
+        orchestration_proposal_schema, orchestration_read_schema, portable_const_schema,
+        string_or_null_schema, validate_orchestration_proposal_arguments,
+    },
+};
 
 /// Host-defined permission for a read-only Forge domain operation.
 pub const FORGE_SCOPE_READ_PERMISSION: &str = "forge.scope.read";
@@ -51,34 +65,6 @@ pub const FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL: &str = "forge_main_orchestratio
 pub const FORGE_PROJECT_ORCHESTRATION_READ_TOOL: &str = "forge_project_orchestration_read";
 /// Stable native tool name for Project Agent orchestration proposals.
 pub const FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL: &str = "forge_project_orchestration_propose";
-
-// These operation identifiers are intentionally role-neutral.  The host
-// derives the role-specific tool surface from the persisted canonical scope;
-// a model cannot turn a Project operation into a Main operation by changing a
-// string in its arguments.
-pub const MAIN_CHARTER_READ_OPERATION: &str = "charter.read";
-pub const MAIN_CHARTER_DRAFT_OPERATION: &str = "charter.draft";
-pub const MAIN_CHARTER_READINESS_OPERATION: &str = "charter.readiness";
-pub const MAIN_CHARTER_DIFF_OPERATION: &str = "charter.diff";
-pub const MAIN_CHARTER_APPROVAL_TARGET_OPERATION: &str = "charter.approval_target";
-pub const MAIN_PROJECT_CREATE_OPERATION: &str = "project.create";
-pub const PROJECT_CURRENT_STATE_OPERATION: &str = "project.current_state";
-/// Setup-only Project Agent operation for drafting a legacy adoption Charter.
-/// The current Project binding and setup state are server-derived; the action
-/// is an unapproved candidate and cannot attach, approve, or apply a Charter.
-pub const PROJECT_CHARTER_ADOPTION_OPERATION: &str = "project.charter.adoption";
-pub const PROJECT_DOCUMENT_OPERATION: &str = "project.document";
-pub const PROJECT_DECISION_OPERATION: &str = "project.decision";
-/// Project Agent execution-baseline drafts/proposals. Approval and activation
-/// remain user-only operations outside the native Project Agent surface.
-pub const PROJECT_EXECUTION_BASELINE_OPERATION: &str = "project.execution_baseline";
-pub const PROJECT_MILESTONE_OPERATION: &str = "project.milestone";
-pub const PROJECT_EVIDENCE_OPERATION: &str = "project.evidence";
-pub const PROJECT_READINESS_OPERATION: &str = "project.readiness";
-/// Project Agent release candidates are requests only.  Final release is a
-/// separate user-authorized Forge transaction and is never a native Agent
-/// Runtime operation.
-pub const PROJECT_RELEASE_OPERATION: &str = "project.release.request";
 
 const MAX_FILE_READ_BYTES: usize = 128 * 1024;
 const MAX_FILE_WRITE_BYTES: usize = 1024 * 1024;
@@ -435,8 +421,16 @@ impl ScopeToolComposition {
                     if let Some(surface) =
                         orchestration_surface(scope.scope_type, project_chat.is_project_agent_chat)
                     {
-                        let (orchestration_reads, orchestration_proposals) =
-                            orchestration_operations(surface, project_chat.charter_setup_required);
+                        let orchestration_reads = operation_names_for_surface(
+                            surface,
+                            project_chat.charter_setup_required,
+                            OperationExposure::TypedRead,
+                        );
+                        let orchestration_proposals = operation_names_for_surface(
+                            surface,
+                            project_chat.charter_setup_required,
+                            OperationExposure::TypedProposal,
+                        );
                         let orchestration_reads = filter_operations(
                             scope.scope_type,
                             &orchestration_reads,
@@ -575,13 +569,12 @@ fn non_task_operations(
                 "commitments.read".to_owned(),
                 "delivery.read".to_owned(),
             ];
-            let proposals = if project_charter_setup_required {
+            let mut proposals = if project_charter_setup_required {
                 // Legacy setup is intentionally limited to conversation. The
                 // typed adoption operation is exposed separately below.
                 vec!["message.send".to_owned()]
             } else {
                 vec![
-                    "task.propose".to_owned(),
                     "message.send".to_owned(),
                     "commitment.update".to_owned(),
                     "memory.publish".to_owned(),
@@ -590,6 +583,11 @@ fn non_task_operations(
                     "session.action".to_owned(),
                 ]
             };
+            proposals.extend(operation_names_for_surface(
+                OperationSurface::Coordination,
+                project_charter_setup_required,
+                OperationExposure::GenericProposal,
+            ));
             (reads, proposals)
         }
         CanonicalScopeType::AgentChat => {
@@ -613,9 +611,13 @@ fn non_task_operations(
                         "memory.publish".to_owned(),
                         "memory.supersede".to_owned(),
                         "session.action".to_owned(),
-                        "task.propose".to_owned(),
                     ]);
                 }
+                operations.extend(operation_names_for_surface(
+                    OperationSurface::Coordination,
+                    project_charter_setup_required,
+                    OperationExposure::GenericProposal,
+                ));
             } else {
                 // A Main Chat receives the global portfolio/discovery
                 // surface.  Message, memory, commitment, session,
@@ -666,885 +668,38 @@ fn public_search_permission(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OrchestrationSurface {
-    Main,
-    Project,
-}
-
 fn orchestration_surface(
     scope_type: CanonicalScopeType,
     project_agent_chat: bool,
-) -> Option<OrchestrationSurface> {
+) -> Option<OperationSurface> {
     match scope_type {
-        CanonicalScopeType::Account => Some(OrchestrationSurface::Main),
-        CanonicalScopeType::Project => Some(OrchestrationSurface::Project),
+        CanonicalScopeType::Account => Some(OperationSurface::MainOrchestration),
+        CanonicalScopeType::Project => Some(OperationSurface::ProjectOrchestration),
         CanonicalScopeType::AgentChat => Some(if project_agent_chat {
-            OrchestrationSurface::Project
+            OperationSurface::ProjectOrchestration
         } else {
-            OrchestrationSurface::Main
+            OperationSurface::MainOrchestration
         }),
         CanonicalScopeType::Task => None,
     }
 }
 
-fn orchestration_operations(
-    surface: OrchestrationSurface,
-    project_charter_setup_required: bool,
-) -> (Vec<String>, Vec<String>) {
-    match surface {
-        OrchestrationSurface::Main => (
-            vec![MAIN_CHARTER_READ_OPERATION.to_owned()],
-            vec![
-                MAIN_CHARTER_DRAFT_OPERATION.to_owned(),
-                MAIN_CHARTER_READINESS_OPERATION.to_owned(),
-                MAIN_CHARTER_DIFF_OPERATION.to_owned(),
-                MAIN_CHARTER_APPROVAL_TARGET_OPERATION.to_owned(),
-                MAIN_PROJECT_CREATE_OPERATION.to_owned(),
-            ],
-        ),
-        OrchestrationSurface::Project => (
-            vec![PROJECT_CURRENT_STATE_OPERATION.to_owned()],
-            if project_charter_setup_required {
-                vec![PROJECT_CHARTER_ADOPTION_OPERATION.to_owned()]
-            } else {
-                vec![
-                    PROJECT_DOCUMENT_OPERATION.to_owned(),
-                    PROJECT_DECISION_OPERATION.to_owned(),
-                    PROJECT_EXECUTION_BASELINE_OPERATION.to_owned(),
-                    PROJECT_MILESTONE_OPERATION.to_owned(),
-                    PROJECT_EVIDENCE_OPERATION.to_owned(),
-                    PROJECT_READINESS_OPERATION.to_owned(),
-                    PROJECT_RELEASE_OPERATION.to_owned(),
-                ]
-            },
-        ),
-    }
-}
-
 fn orchestration_descriptor(
-    surface: OrchestrationSurface,
+    surface: OperationSurface,
 ) -> (&'static str, &'static str, &'static str) {
     match surface {
-        OrchestrationSurface::Main => (
+        OperationSurface::MainOrchestration => (
             FORGE_MAIN_ORCHESTRATION_READ_TOOL,
             FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL,
             "the authenticated global Main Agent account/Chat scope",
         ),
-        OrchestrationSurface::Project => (
+        OperationSurface::ProjectOrchestration => (
             FORGE_PROJECT_ORCHESTRATION_READ_TOOL,
             FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL,
             "the authenticated single-Project Project Agent scope",
         ),
+        OperationSurface::Coordination => unreachable!("coordination has no typed descriptor"),
     }
-}
-
-fn object_schema(properties: Value, required: &[&str]) -> Value {
-    json!({
-        "type": "object",
-        "properties": properties,
-        "required": required,
-        "additionalProperties": false,
-    })
-}
-
-fn described_object_schema(properties: Value, required: &[&str], description: &str) -> Value {
-    let mut schema = object_schema(properties, required);
-    schema["description"] = Value::String(description.to_owned());
-    schema
-}
-
-fn string_array_schema() -> Value {
-    json!({"type":"array","items":{"type":"string"}})
-}
-
-fn string_or_null_schema() -> Value {
-    json!({"type":["string","null"]})
-}
-
-fn principal_ref_schema() -> Value {
-    object_schema(
-        json!({
-            "kind": {"type":"string","enum":["user","agent","worker","reviewer","service","system"]},
-            "id": {"type":"string","minLength":1},
-            "display_name": string_or_null_schema(),
-        }),
-        &["kind", "id"],
-    )
-}
-
-fn provenance_ref_schema() -> Value {
-    object_schema(
-        json!({
-            "source_kind": {"type":"string","enum":["user","main_chat","project_chat","research","task","validation","document","decision","milestone","release","system"]},
-            "source_id": {"type":"string","minLength":1},
-            "revision_id": string_or_null_schema(),
-            "digest": string_or_null_schema(),
-            "label": string_or_null_schema(),
-            "observed_at": string_or_null_schema(),
-        }),
-        &["source_kind", "source_id"],
-    )
-}
-
-fn artifact_ref_schema() -> Value {
-    object_schema(
-        json!({
-            "artifact_id": {"type":"string","minLength":1},
-            "revision_id": {"type":"string","minLength":1},
-            "content_digest": {"type":"string","minLength":1},
-            "render_version": string_or_null_schema(),
-            "render_digest": string_or_null_schema(),
-        }),
-        &["artifact_id", "revision_id", "content_digest"],
-    )
-}
-
-fn revision_provenance_schema() -> Value {
-    object_schema(
-        json!({
-            "author": principal_ref_schema(),
-            "profile_revision": string_or_null_schema(),
-            "operating_skill_revision": string_or_null_schema(),
-            "source_refs": {"type":"array","items":provenance_ref_schema()},
-            "change_summary": {"type":"string","minLength":1},
-            "material_diff": string_or_null_schema(),
-        }),
-        &["author", "change_summary"],
-    )
-}
-
-fn charter_risk_schema() -> Value {
-    object_schema(
-        json!({
-            "id": {"type":"string","minLength":1},
-            "description": {"type":"string","minLength":1},
-            "impact": string_or_null_schema(),
-            "treatment": string_or_null_schema(),
-            "revisit_trigger": string_or_null_schema(),
-            "owner": {"oneOf":[principal_ref_schema(), {"type":"null"}]},
-        }),
-        &["id", "description"],
-    )
-}
-
-fn charter_knowledge_item_schema() -> Value {
-    object_schema(
-        json!({
-            "id": {"type":"string","minLength":1},
-            "statement": {"type":"string","minLength":1},
-            "kind": {"type":"string","enum":["observed_fact","user_decision","research_finding","assumption","hypothesis","open_decision","research_queue"]},
-            "normative": {"type":"boolean"},
-            "transfer_approved": {"type":"boolean"},
-            "provenance": {"type":"array","items":provenance_ref_schema()},
-            "confidence": {"type":["string","null"],"enum":["low","medium","high","not_applicable",null]},
-            "observed_at": string_or_null_schema(),
-            "freshness_expires_at": string_or_null_schema(),
-            "impact": string_or_null_schema(),
-            "owner": {"oneOf":[principal_ref_schema(), {"type":"null"}]},
-            "default_value": string_or_null_schema(),
-            "revisit_trigger": string_or_null_schema(),
-            "falsification_evidence": string_or_null_schema(),
-            "blocking": {"type":"boolean"},
-        }),
-        &["id", "statement", "kind", "normative", "transfer_approved"],
-    )
-}
-
-fn charter_content_schema() -> Value {
-    object_schema(
-        json!({
-            "identity": object_schema(json!({
-                "working_name": {"type":"string","minLength":1},
-                "slug_proposal": string_or_null_schema(),
-                "one_line_vision": {"type":"string","minLength":1},
-                "maturity": {"type":"string","enum":["prototype","mvp","production","critical"]},
-                "lifecycle_intent": string_or_null_schema(),
-                "project_type": string_or_null_schema(),
-                "value_proposition": string_or_null_schema(),
-            }), &["working_name", "one_line_vision", "maturity"]),
-            "problem_and_people": object_schema(json!({
-                "problem_or_opportunity": {"type":"string","minLength":1},
-                "target_users": string_array_schema(),
-                "beneficiaries": string_array_schema(),
-                "jobs_pains_opportunity": string_array_schema(),
-                "current_alternatives": string_array_schema(),
-                "stakeholders": string_array_schema(),
-                "excluded_audiences": string_array_schema(),
-            }), &["problem_or_opportunity"]),
-            "core_experience": object_schema(json!({
-                "primary_outcome": {"type":"string","minLength":1},
-                "core_loop": string_or_null_schema(),
-                "principal_journeys": string_array_schema(),
-            }), &["primary_outcome"]),
-            "scope": object_schema(json!({
-                "must_have_outcomes": string_array_schema(),
-                "required_deliverables": string_array_schema(),
-                "later_possibilities": string_array_schema(),
-                "explicit_non_goals": string_array_schema(),
-            }), &[]),
-            "success": object_schema(json!({
-                "qualitative_outcome": string_or_null_schema(),
-                "success_signals": string_array_schema(),
-                "acceptance_statements": string_array_schema(),
-                "required_evidence": string_array_schema(),
-                "non_claims": string_array_schema(),
-            }), &[]),
-            "constraints_and_risks": object_schema(json!({
-                "product": string_array_schema(),
-                "time_and_budget": string_array_schema(),
-                "technology": string_array_schema(),
-                "data": string_array_schema(),
-                "integrations": string_array_schema(),
-                "security_privacy_compliance": string_array_schema(),
-                "accessibility": string_array_schema(),
-                "operations": string_array_schema(),
-                "migration": string_array_schema(),
-                "launch": string_array_schema(),
-                "agent_authority": string_array_schema(),
-                "risks": {"type":"array","items":charter_risk_schema()},
-            }), &[]),
-            "knowledge_ledger": object_schema(json!({
-                "items": {"type":"array","items":charter_knowledge_item_schema()},
-            }), &[]),
-            "handoff_note": {"oneOf":[object_schema(json!({
-                "recommended_first_action": string_or_null_schema(),
-                "bounded_summary": string_or_null_schema(),
-                "unresolved_item_ids": string_array_schema(),
-            }), &[]), {"type":"null"}]},
-        }),
-        &[
-            "identity",
-            "problem_and_people",
-            "core_experience",
-            "scope",
-            "success",
-            "constraints_and_risks",
-            "knowledge_ledger",
-        ],
-    )
-}
-
-fn document_content_schema() -> Value {
-    json!({
-        "oneOf": [
-            object_schema(json!({
-                "question":{"type":"string","minLength":1},
-                "decision_informed":{"type":"string","minLength":1},
-                "scope":{"type":"string","minLength":1},
-                "stopping_condition":{"type":"string","minLength":1},
-                "sources":{"type":"array","items":object_schema(json!({
-                    "id":{"type":"string","minLength":1},"url":{"type":"string","minLength":1},"title":{"type":"string","minLength":1},"retrieved_at":{"type":"string","minLength":1},"quality":string_or_null_schema(),"claim":{"type":"string","minLength":1},"is_inference":{"type":"boolean"}
-                }), &["id","url","title","retrieved_at","claim","is_inference"])},
-                "findings":string_array_schema(),"evidence":string_array_schema(),"inferences":string_array_schema(),"alternatives":string_array_schema(),"recommendation":string_or_null_schema(),"uncertainty":string_array_schema(),"unresolved_questions":string_array_schema(),"affected_artifact_ids":string_array_schema(),"affected_decision_ids":string_array_schema()
-            }), &["question","decision_informed","scope","stopping_condition"]),
-            object_schema(json!({
-                "intended_deliverables":string_array_schema(),"boundaries":string_array_schema(),"plan_items":{"type":"array","items":object_schema(json!({"id":{"type":"string","minLength":1},"outcome":{"type":"string","minLength":1},"dependencies":string_array_schema(),"task_ids":string_array_schema()}), &["id","outcome"])},"acceptance_matrix":{"type":"array","items":object_schema(json!({"id":{"type":"string","minLength":1},"statement":{"type":"string","minLength":1},"evidence":string_array_schema(),"required":{"type":"boolean"}}), &["id","statement","required"])},"risks":{"type":"array","items":charter_risk_schema()},"rollback_and_recovery":string_array_schema(),"adaptive_envelope":string_array_schema(),"governing_charter_revision_id":string_or_null_schema()
-            }), &[]),
-            object_schema(json!({
-                "problem_and_outcome":{"type":"string","minLength":1},"actors":string_array_schema(),"journeys_and_flows":string_array_schema(),"functional_requirements":string_array_schema(),"loading_empty_error_recovery_states":string_array_schema(),"acceptance_scenarios":{"type":"array"},"non_functional_and_safety_requirements":string_array_schema(),"out_of_scope":string_array_schema(),"traceability":{"type":"array","items":artifact_ref_schema()}
-            }), &["problem_and_outcome"]),
-            object_schema(json!({"experience_principles":string_array_schema(),"information_architecture":string_array_schema(),"flows":string_array_schema(),"design_tokens_reference":string_or_null_schema(),"component_states":string_array_schema(),"responsive_behavior":string_array_schema(),"accessibility":string_array_schema(),"prototype_or_evidence_links":string_array_schema(),"open_decisions":string_array_schema()}), &[]),
-            object_schema(json!({"context_and_constraints":{"type":"string","minLength":1},"system_boundary":string_array_schema(),"components_and_data":string_array_schema(),"interfaces":string_array_schema(),"security_and_privacy":string_array_schema(),"concurrency":string_array_schema(),"failure_and_recovery":string_array_schema(),"observability_and_operations":string_array_schema(),"migrations":string_array_schema(),"alternatives_and_tradeoffs":string_array_schema(),"validation_plan":string_array_schema()}), &["context_and_constraints"]),
-            object_schema(json!({"ordered_milestone_outcomes":string_array_schema(),"dependencies":string_array_schema(),"risks":{"type":"array","items":charter_risk_schema()},"linked_artifact_refs":{"type":"array","items":artifact_ref_schema()},"task_queries_or_ids":string_array_schema(),"acceptance_evidence_contract":{"type":"array"},"release_notes":string_array_schema(),"known_issues":string_array_schema()}), &[]),
-        ]
-    })
-}
-
-fn execution_baseline_release_policy_schema() -> Value {
-    object_schema(
-        json!({
-            "schema_version": {"type":"string","const":"forge.execution-baseline-release-policy/v1"},
-            "revision": {"type":"string","minLength":1},
-            "required_check_definition_revisions": string_array_schema(),
-            "reviewer_independence_rules": string_array_schema(),
-            "manual_attestation_rules": string_array_schema(),
-            "waiver_rules": string_array_schema(),
-            "evidence_kinds": string_array_schema(),
-            "evidence_contexts": string_array_schema(),
-            "evidence_freshness_rules": string_array_schema(),
-            "dependency_rules": string_array_schema(),
-            "stale_input_rules": string_array_schema(),
-            "forbidden_side_effects": string_array_schema(),
-            "known_issue_rules": string_array_schema(),
-            "correction_rules": string_array_schema(),
-            "purge_rules": string_array_schema()
-        }),
-        &[
-            "schema_version",
-            "revision",
-            "required_check_definition_revisions",
-            "reviewer_independence_rules",
-            "manual_attestation_rules",
-            "waiver_rules",
-            "evidence_kinds",
-            "evidence_contexts",
-            "evidence_freshness_rules",
-            "dependency_rules",
-            "stale_input_rules",
-            "forbidden_side_effects",
-            "known_issue_rules",
-            "correction_rules",
-            "purge_rules",
-        ],
-    )
-}
-
-fn execution_baseline_content_schema() -> Value {
-    object_schema(
-        json!({
-            "charter_revision": artifact_ref_schema(),
-            "document_revisions": {"type":"array","items":artifact_ref_schema()},
-            "plan_item_ids": string_array_schema(),
-            "milestone_ids": string_array_schema(),
-            "milestone_definition_revision_ids": string_array_schema(),
-            "primary_milestone_id": string_or_null_schema(),
-            "release_policy_revision": {"type":"string","minLength":1},
-            "release_policy_digest": {"type":"string","minLength":1,"description":"Omit. The server derives the digest from the frozen release_policy; provide only to round-trip an exact server value."},
-            "release_policy": execution_baseline_release_policy_schema(),
-            "acceptance_evidence_matrix": {"type":"array","items":object_schema(json!({
-                "id":{"type":"string","minLength":1},
-                "description":{"type":"string","minLength":1},
-                "required":{"type":"boolean"},
-                "evidence_kind":string_or_null_schema(),
-                "check_definition_revision":string_or_null_schema()
-            }), &["id","description","required"])},
-            "capability_classes": string_array_schema(),
-            "risk_classes": string_array_schema(),
-            "reviewer_independence_rules": string_array_schema(),
-            "elevated_operations": string_array_schema(),
-            "adaptive_envelope": object_schema(json!({
-                "allowed_task_operations":string_array_schema(),
-                "fixed_outcomes":string_array_schema(),
-                "fixed_acceptance":string_array_schema(),
-                "fixed_risk_classes":string_array_schema(),
-                "forbidden_side_effects":string_array_schema(),
-                "elevated_operations":string_array_schema()
-            }), &[]),
-            "rollback_and_recovery": string_array_schema(),
-            "exclusions": string_array_schema()
-        }),
-        // `release_policy_digest` stays optional: the server derives it from
-        // the caller's own frozen policy, so requiring it forces the model to
-        // compute a SHA-256 it cannot produce.
-        &[
-            "charter_revision",
-            "document_revisions",
-            "plan_item_ids",
-            "milestone_ids",
-            "milestone_definition_revision_ids",
-            "release_policy_revision",
-            "release_policy",
-            "adaptive_envelope",
-        ],
-    )
-}
-
-fn orchestration_payload_schema(operation: &str) -> Value {
-    match operation {
-        MAIN_CHARTER_DRAFT_OPERATION => object_schema(
-            json!({
-                "action":{"const":"save_revision"},"charter_id":{"type":"string","minLength":1},"base_revision_id":string_or_null_schema(),"project_mode":{"type":"string","enum":["compact","standard"]},"maturity":{"type":"string","enum":["prototype","mvp","production","critical"]},"content":charter_content_schema(),"rendered_view":{"type":"string","minLength":1,"description":"Omit. The server renders the canonical view from content; provide only to round-trip an exact server-rendered value."},"render_version":{"type":"string","minLength":1,"description":"Omit. The server stamps its own render version; provide only to round-trip an exact server value."},"provenance":revision_provenance_schema()
-            }),
-            // `rendered_view`/`render_version` stay optional: the server
-            // renders the canonical view itself and only verifies these
-            // fields when a caller round-trips them. Requiring them forces
-            // the model to reproduce the server renderer byte-for-byte,
-            // which always fails.
-            &[
-                "action",
-                "charter_id",
-                "project_mode",
-                "maturity",
-                "content",
-                "provenance",
-            ],
-        ),
-        MAIN_CHARTER_READINESS_OPERATION => object_schema(
-            json!({"action":{"const":"evaluate"},"charter_id":{"type":"string","minLength":1},"revision_id":{"type":"string","minLength":1},"content_digest":{"type":"string","minLength":1},"render_digest":{"type":"string","minLength":1},"expected_charter_version":{"type":"integer","minimum":1}}),
-            &[
-                "action",
-                "charter_id",
-                "revision_id",
-                "content_digest",
-                "render_digest",
-                "expected_charter_version",
-            ],
-        ),
-        MAIN_CHARTER_DIFF_OPERATION => object_schema(
-            json!({"action":{"const":"compare_revisions"},"charter_id":{"type":"string","minLength":1},"base_revision_id":{"type":"string","minLength":1},"candidate_revision_id":{"type":"string","minLength":1}}),
-            &[
-                "action",
-                "charter_id",
-                "base_revision_id",
-                "candidate_revision_id",
-            ],
-        ),
-        MAIN_CHARTER_APPROVAL_TARGET_OPERATION => object_schema(
-            json!({"action":{"const":"present"},"charter_id":{"type":"string","minLength":1},"revision_id":{"type":"string","minLength":1},"content_digest":{"type":"string","minLength":1},"render_digest":{"type":"string","minLength":1},"expected_charter_version":{"type":"integer","minimum":1},"approved_project_name":{"type":"string","minLength":1},"approved_project_slug":string_or_null_schema(),"project_mode":{"type":"string","enum":["compact","standard"]},"selected_project_agent_identity_id":{"type":"string","minLength":1},"selected_project_agent_profile_revision_id":{"type":"string","minLength":1},"selected_project_agent_operating_skill_revision":{"type":"string","minLength":1},"selected_project_agent_policy_digest":{"type":"string","minLength":1}}),
-            &[
-                "action",
-                "charter_id",
-                "revision_id",
-                "content_digest",
-                "render_digest",
-                "expected_charter_version",
-                "approved_project_name",
-                "project_mode",
-                "selected_project_agent_identity_id",
-                "selected_project_agent_profile_revision_id",
-                "selected_project_agent_operating_skill_revision",
-                "selected_project_agent_policy_digest",
-            ],
-        ),
-        MAIN_PROJECT_CREATE_OPERATION => object_schema(
-            json!({"action":{"const":"create_from_approval"},"approval_id":{"type":"string","minLength":1}}),
-            &["action", "approval_id"],
-        ),
-        PROJECT_CHARTER_ADOPTION_OPERATION => described_object_schema(
-            json!({
-                "action":{"const":"draft_revision"},
-                "charter_id":{"type":"string","minLength":1,"description":"Omit to start the Project's adoption Charter. The server mints the id and returns it; supply it only to revise the Charter it already returned."},
-                "base_revision_id":string_or_null_schema(),
-                "expected_charter_version":{"type":"integer","minimum":0,"description":"0 to start the Project's adoption Charter. To revise an existing draft, send the charter_version returned by your previous action result; a conflict names the value to send."},
-                "project_mode":{"type":"string","enum":["compact","standard"]},
-                "maturity":{"type":"string","enum":["prototype","mvp","production","critical"]},
-                "content":charter_content_schema(),
-                "rendered_view":{"type":"string","minLength":1,"description":"Omit. The server renders the canonical view from content; provide only to round-trip an exact server-rendered value."},
-                "render_version":{"type":"string","minLength":1,"description":"Omit. The server stamps its own render version; provide only to round-trip an exact server value."},
-                "provenance":revision_provenance_schema()
-            }),
-            // `rendered_view`/`render_version` stay optional for the same
-            // reason as the Main Charter draft: the render is derived from
-            // `content`, and a model cannot reproduce the server renderer
-            // byte-for-byte.
-            &[
-                "action",
-                "expected_charter_version",
-                "project_mode",
-                "maturity",
-                "content",
-                "provenance",
-            ],
-            "Setup-only Project Agent adoption Charter draft. The bound Project may have no current Charter; this creates an unapproved candidate only and cannot approve, attach, apply, or authorize execution.",
-        ),
-        PROJECT_DOCUMENT_OPERATION => {
-            let document_kinds = json!({
-                "type":"string",
-                "enum":["research","delivery_brief","product_spec","design","architecture","execution_plan"]
-            });
-            let identity = json!({
-                "document_id":{"type":"string","minLength":1},
-                "kind":document_kinds,
-                "title":{"type":"string","minLength":1},
-            });
-            let draft_properties = {
-                let mut properties = identity.clone();
-                properties["action"] = json!({"enum":["draft_revision","propose_approval"]});
-                properties["base_revision_id"] = string_or_null_schema();
-                properties["expected_document_version"] = json!({"type":"integer","minimum":1});
-                properties["content"] = document_content_schema();
-                properties
-            };
-            let draft = object_schema(
-                draft_properties,
-                &[
-                    "action",
-                    "document_id",
-                    "kind",
-                    "title",
-                    "expected_document_version",
-                    "content",
-                ],
-            );
-            let approval = object_schema(
-                {
-                    let mut properties = identity;
-                    properties["action"] = json!({"const":"approve"});
-                    properties["revision_id"] = json!({"type":"string","minLength":1});
-                    properties["content_digest"] = json!({"type":"string","minLength":1});
-                    properties["render_digest"] = json!({"type":"string","minLength":1});
-                    properties["expected_document_version"] = json!({"type":"integer","minimum":1});
-                    properties["baseline_id"] = string_or_null_schema();
-                    properties["baseline_revision_id"] = string_or_null_schema();
-                    properties["envelope_digest"] = string_or_null_schema();
-                    properties
-                },
-                &[
-                    "action",
-                    "document_id",
-                    "kind",
-                    "title",
-                    "revision_id",
-                    "content_digest",
-                    "render_digest",
-                    "expected_document_version",
-                ],
-            );
-            // Keep the operation-level property contract discoverable for
-            // clients that inspect `action.enum`, while the closed oneOf
-            // variants make draft/proposal versus policy-scoped approval
-            // payloads exact and disallow cross-action fields.
-            json!({
-                "type":"object",
-                "required":["action","document_id","kind","title","expected_document_version"],
-                "properties":{
-                    "action":{"type":"string","enum":["draft_revision","propose_approval","approve"]},
-                    "document_id":{"type":"string","minLength":1},
-                    "kind":{"type":"string","enum":["research","delivery_brief","product_spec","design","architecture","execution_plan"]},
-                    "title":{"type":"string","minLength":1},
-                    "base_revision_id":string_or_null_schema(),
-                    "revision_id":{"type":"string","minLength":1},
-                    "expected_document_version":{"type":"integer","minimum":1},
-                    "content":document_content_schema(),
-                    "content_digest":{"type":"string","minLength":1},
-                    "render_digest":{"type":"string","minLength":1},
-                    "baseline_id":string_or_null_schema(),
-                    "baseline_revision_id":string_or_null_schema(),
-                    "envelope_digest":string_or_null_schema()
-                },
-                "oneOf":[draft, approval],
-                "additionalProperties":false
-            })
-        }
-        PROJECT_DECISION_OPERATION => described_object_schema(
-            json!({"action":{"enum":["record_candidate","record_effective"]},"question":{"type":"string","minLength":1},"options":string_array_schema(),"selected_outcome":string_or_null_schema(),"rationale":string_or_null_schema(),"decision_class":{"const":"project_implementation"},"baseline_id":{"type":"string","minLength":1},"baseline_revision_id":{"type":"string","minLength":1},"expected_project_version":{"type":"integer","minimum":1},"decision_id":string_or_null_schema(),"affected_artifact_refs":{"type":"array","items":artifact_ref_schema()},"affected_task_ids":string_array_schema(),"affected_milestone_ids":string_array_schema()}),
-            &[
-                "action",
-                "question",
-                "decision_class",
-                "baseline_id",
-                "baseline_revision_id",
-                "expected_project_version",
-            ],
-            "Project Agent decisions are limited to implementation choices inside the current active execution baseline. User-scope decisions, policy decisions, waivers, and manual approvals are user-only actions outside this tool.",
-        ),
-        PROJECT_EXECUTION_BASELINE_OPERATION => described_object_schema(
-            json!({
-                "action":{"enum":["draft_revision","revise","propose_approval"]},
-                "baseline_id":{"type":["string","null"],"minLength":1,"description":"Omit when drafting a new execution baseline — the server mints the id and returns it. Required for revise/propose_approval: the id of an existing baseline from the Project current state."},
-                "base_revision_id":string_or_null_schema(),
-                "expected_baseline_version":{"type":"integer","minimum":1,"description":"The baseline's current version from the Project current state; use 1 when drafting a new baseline."},
-                "charter_revision_id":{"type":"string","minLength":1},
-                "content":execution_baseline_content_schema(),
-                "schema_version":{"type":"string","minLength":1},
-                "render_version":{"type":"string","minLength":1},
-                "rendered_view":{"type":"string","minLength":1},
-                "content_digest":{"type":"string","minLength":1},
-                "render_digest":{"type":"string","minLength":1},
-                "provenance":revision_provenance_schema()
-            }),
-            &[
-                "action",
-                "expected_baseline_version",
-                "charter_revision_id",
-                "content",
-                "schema_version",
-                "render_version",
-                "rendered_view",
-                "content_digest",
-                "render_digest",
-                "provenance",
-            ],
-            "Project Agent may draft or propose an execution baseline revision inside the active Project. Omit baseline_id to draft a new baseline (the server mints its id); name an existing baseline_id to revise or propose approval. Approval and activation are user-only and never exposed here.",
-        ),
-        PROJECT_MILESTONE_OPERATION => object_schema(
-            json!({"action":{"enum":["define","revise","set_primary"]},"milestone_id":string_or_null_schema(),"display_label":string_or_null_schema(),"expected_milestone_version":{"type":"integer","minimum":1},"primary_milestone_id":string_or_null_schema(),"content":{"type":"object","properties":{"name":{"type":"string","minLength":1},"outcome":{"type":"string","minLength":1},"included_scope":string_array_schema(),"excluded_scope":string_array_schema(),"charter_revision":{"oneOf":[artifact_ref_schema(),{"type":"null"}]},"document_revisions":{"type":"array","items":artifact_ref_schema()},"task_ids":string_array_schema(),"dependencies":string_array_schema(),"risks":{"type":"array","items":charter_risk_schema()},"acceptance_checks":{"type":"array"},"evidence_requirements":{"type":"array"},"known_issues":string_array_schema(),"target_date":string_or_null_schema()},"additionalProperties":false}}),
-            &["action", "expected_milestone_version"],
-        ),
-        PROJECT_EVIDENCE_OPERATION => object_schema(
-            json!({"action":{"const":"attach"},"milestone_id":{"type":"string","minLength":1},"asset_id":{"type":"string","minLength":1},"task_id":string_or_null_schema(),"acceptance_check_ids":string_array_schema(),"caption":{"type":"string","minLength":1},"kind":{"type":"string","enum":["screenshot","walkthrough_video","log","report","other"]},"checksum":{"type":"string","minLength":1}}),
-            &[
-                "action",
-                "milestone_id",
-                "asset_id",
-                "caption",
-                "kind",
-                "checksum",
-            ],
-        ),
-        PROJECT_READINESS_OPERATION => object_schema(
-            json!({"action":{"const":"evaluate"},"milestone_id":{"type":"string","minLength":1},"milestone_version":{"type":"integer","minimum":1},"baseline_id":{"type":"string","minLength":1},"baseline_revision_id":{"type":"string","minLength":1},"release_policy_revision":{"type":"string","minLength":1}}),
-            &[
-                "action",
-                "milestone_id",
-                "milestone_version",
-                "baseline_id",
-                "baseline_revision_id",
-                "release_policy_revision",
-            ],
-        ),
-        PROJECT_RELEASE_OPERATION => described_object_schema(
-            json!({
-                "action":{"const":"propose_candidate"},
-                "milestone_id":{"type":"string","minLength":1},
-                "milestone_version":{"type":"integer","minimum":1},
-                "readiness_snapshot_id":{"type":"string","minLength":1},
-                "readiness_digest":{"type":"string","minLength":1}
-            }),
-            &[
-                "action",
-                "milestone_id",
-                "milestone_version",
-                "readiness_snapshot_id",
-                "readiness_digest",
-            ],
-            "Project Agent release candidate only. This submits a user-release request; it never approves, executes, or creates a final release manifest.",
-        ),
-        _ => object_schema(json!({}), &[]),
-    }
-}
-
-/// Adds `type`/`enum` beside every string `const` in a JSON schema (and a
-/// `type` beside bare string enums). JSON Schema `const` alone falls outside
-/// the OpenAPI-style subset some provider function-calling APIs accept —
-/// Gemini drops the constraint entirely and models then emit `{}` for the
-/// field — so every string const also carries the equivalent one-value enum.
-fn portable_const_schema(mut schema: Value) -> Value {
-    fn walk(value: &mut Value) {
-        match value {
-            Value::Object(map) => {
-                if let Some(constant) = map.get("const").and_then(Value::as_str).map(str::to_owned)
-                {
-                    map.entry("type").or_insert_with(|| json!("string"));
-                    map.entry("enum").or_insert_with(|| json!([constant]));
-                } else if !map.contains_key("type") {
-                    let all_strings =
-                        map.get("enum")
-                            .and_then(Value::as_array)
-                            .is_some_and(|options| {
-                                !options.is_empty() && options.iter().all(Value::is_string)
-                            });
-                    if all_strings {
-                        map.insert("type".to_owned(), json!("string"));
-                    }
-                }
-                for entry in map.values_mut() {
-                    walk(entry);
-                }
-            }
-            Value::Array(values) => values.iter_mut().for_each(walk),
-            _ => {}
-        }
-    }
-    walk(&mut schema);
-    schema
-}
-
-/// Summarizes one operation's payload contract as a guidance line for the
-/// declared tool schema. Handles both single-variant payload schemas and
-/// `oneOf` payloads (e.g. document draft vs. approval).
-fn orchestration_payload_summary(schema: &Value) -> String {
-    fn variant_summary(variant: &Value) -> Option<String> {
-        let properties = variant.get("properties")?;
-        let action = properties.get("action").map(|action| {
-            action
-                .get("const")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| {
-                    action.get("enum").and_then(Value::as_array).map(|values| {
-                        values
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .collect::<Vec<_>>()
-                            .join("|")
-                    })
-                })
-                .unwrap_or_default()
-        });
-        let required = variant
-            .get("required")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_default();
-        Some(match action {
-            Some(action) if !action.is_empty() => {
-                format!("action={action}; required: [{required}]")
-            }
-            _ => format!("required: [{required}]"),
-        })
-    }
-    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array) {
-        return variants
-            .iter()
-            .filter_map(variant_summary)
-            .collect::<Vec<_>>()
-            .join(" OR ");
-    }
-    variant_summary(schema).unwrap_or_default()
-}
-
-/// Payload guidance for the generic coordination proposal surface. The
-/// payload stays a free-form object at the schema level (provider
-/// function-calling APIs only reliably deliver flat object schemas), so the
-/// contract for operations with a typed server-side executor is carried in
-/// the property description; the exact shape stays enforced server-side and
-/// errors return to the model in-turn.
-fn coordination_payload_guidance(operations: &BTreeSet<String>) -> String {
-    let mut lines = Vec::new();
-    if operations.contains("task.propose") {
-        lines.push(concat!(
-            "task.propose — create a Task in the bound Project. Fields: ",
-            "title (required); description (outcome plus acceptance criteria); ",
-            "priority (integer, higher runs sooner); ",
-            "task_type (\"task\" implementation default, \"planning_task\", or \"discovery\"); ",
-            "plan_item_id (REQUIRED for implementation Tasks once an execution baseline is ",
-            "active — the stable plan-item id from that baseline, for example \"pi-2\"; ",
-            "proposals missing it, naming an id outside the active baseline, or naming a ",
-            "plan item that already has a non-cancelled Task are rejected); ",
-            "milestone_id (optional, defaults to the active baseline's primary milestone); ",
-            "capability_class (when supplied it must be one of the server-approved profiles: ",
-            "\"repository_read\", \"repository_write\", \"read_only\", \"discovery_read\", ",
-            "\"planning_read\" — and, when the baseline declares allowed classes, also one of ",
-            "those); risk_class (only when the baseline declares allowed classes). ",
-            "Forge binds the Task to the Project's active user-approved baseline revision ",
-            "itself; never echo baseline ids or digests.",
-        ));
-    }
-    if lines.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "Payload shape by operation (exact contract enforced server-side):\n- {}",
-            lines.join("\n- ")
-        )
-    }
-}
-
-/// Declared payload properties for the generic coordination proposal
-/// surface. Several provider function-calling APIs (notably Gemini) surface
-/// only declared properties to the model, so the `task.propose` field
-/// contract — most importantly `plan_item_id`, which governs whether the
-/// created Task can ever run — must be visible as real schema properties,
-/// not only as description prose. The payload deliberately keeps
-/// `additionalProperties` open because every admitted operation shares this
-/// one envelope; each description names its owning operation.
-fn coordination_payload_properties(operations: &BTreeSet<String>) -> Option<Value> {
-    if !operations.contains("task.propose") {
-        return None;
-    }
-    Some(json!({
-        "title": {
-            "type": ["string", "null"],
-            "description": "task.propose: required Task title."
-        },
-        "description": {
-            "type": ["string", "null"],
-            "description": "task.propose: outcome plus acceptance criteria."
-        },
-        "priority": {
-            "type": ["integer", "null"],
-            "description": "task.propose: integer; higher runs sooner."
-        },
-        "task_type": {
-            "type": ["string", "null"],
-            "description": "task.propose: \"task\" (implementation default), \"planning_task\", or \"discovery\"."
-        },
-        "plan_item_id": {
-            "type": ["string", "null"],
-            "description": concat!(
-                "task.propose: REQUIRED for implementation Tasks (task_type \"task\") ",
-                "whenever the Project has an active user-approved execution baseline — ",
-                "a proposal without it is rejected because the Task could never become ",
-                "runnable. Use the stable plan-item id from that active baseline (for ",
-                "example \"pi-2\"); valid ids are the baseline's plan_item_ids, visible ",
-                "in the Project current-state read. Each plan item admits exactly one ",
-                "non-cancelled Task — never re-propose a plan item that already has one."
-            )
-        },
-        "milestone_id": {
-            "type": ["string", "null"],
-            "description": "task.propose: optional; defaults to the active baseline's primary milestone."
-        },
-        "capability_class": {
-            "type": ["string", "null"],
-            "description": "task.propose: optional server-approved capability profile (e.g. \"repository_write\", \"repository_read\")."
-        },
-        "risk_class": {
-            "type": ["string", "null"],
-            "description": "task.propose: optional; only when the baseline declares allowed risk classes."
-        }
-    }))
-}
-
-// The declared envelope is a plain `type: object` schema: several provider
-// function-calling APIs (notably Gemini) accept only an OpenAPI-style object
-// at the parameters root and silently drop `oneOf`, leaving the model blind
-// to the envelope — it then emits flattened payload fields and the whole
-// attempt dies at provider-side schema validation. Per-operation payload
-// shapes are summarized in the description instead, and the exact contracts
-// stay enforced by `validate_orchestration_proposal_arguments` plus the
-// server-side validators, whose errors return to the model in-turn.
-fn orchestration_proposal_schema(operations: &BTreeSet<String>) -> Value {
-    let mut guidance =
-        vec!["Payload shape by operation (exact contract enforced server-side):".to_owned()];
-    for operation in operations {
-        let summary = orchestration_payload_summary(&orchestration_payload_schema(operation));
-        guidance.push(format!("- {operation}: {summary}"));
-    }
-    json!({
-        "type":"object",
-        "required":["operation","payload","dedupe_key","correlation_id"],
-        "properties":{
-            "operation":{"type":"string","enum":operations.iter().collect::<Vec<_>>()},
-            "payload":{"type":"object","description":guidance.join("\n")},
-            "dedupe_key":{"type":"string","minLength":1},
-            "correlation_id":{"type":"string","minLength":1},
-            "causation_id":string_or_null_schema(),
-            "causation_depth":{"type":"integer","minimum":0,"maximum":8},
-        },
-        "additionalProperties":false,
-    })
-}
-
-fn orchestration_read_arguments_schema(operation: &str) -> Value {
-    match operation {
-        MAIN_CHARTER_READ_OPERATION => object_schema(
-            json!({"charter_id":string_or_null_schema(),"revision_id":string_or_null_schema(),"genesis_session_id":string_or_null_schema()}),
-            &[],
-        ),
-        PROJECT_CURRENT_STATE_OPERATION => described_object_schema(
-            json!({
-                "limit":{"type":"integer","minimum":1,"maximum":64}
-            }),
-            &[],
-            "Returns the server-derived closed EffectiveProjectState projection for the bound Project, including Charter/baseline references, approved Documents, Decisions, reconciliation/conflict records, Task/validation summaries, milestones/readiness, releases, unreleased changes, and source watermark/version. The response is scope-bound and never accepts a Project or authority selector.",
-        ),
-        _ => object_schema(json!({}), &[]),
-    }
-}
-
-fn orchestration_read_schema(operations: &BTreeSet<String>) -> Value {
-    let mut guidance = vec!["Arguments by operation:".to_owned()];
-    for operation in operations {
-        let arguments = orchestration_read_arguments_schema(operation);
-        let keys = arguments
-            .get("properties")
-            .and_then(Value::as_object)
-            .map(|map| map.keys().cloned().collect::<Vec<_>>().join(", "))
-            .unwrap_or_default();
-        guidance.push(if keys.is_empty() {
-            format!("- {operation}: no arguments")
-        } else {
-            format!("- {operation}: optional {{{keys}}}")
-        });
-    }
-    json!({
-        "type":"object",
-        "required":["operation"],
-        "properties":{
-            "operation":{"type":"string","enum":operations.iter().collect::<Vec<_>>()},
-            "arguments":{"type":"object","description":guidance.join("\n")},
-        },
-        "additionalProperties":false,
-    })
 }
 
 fn task_operations(_role: TaskToolRole) -> (Vec<String>, Vec<String>) {
@@ -1574,73 +729,15 @@ fn filter_operations(
     operations
         .iter()
         .filter(|operation| {
-            allowed_permissions.contains(operation_permission(scope_type, operation.as_str()))
+            let descriptor =
+                crate::operation_catalog::descriptor(scope_type, operation.as_str(), None);
+            descriptor.is_exposed()
+                && descriptor
+                    .required_permission
+                    .is_some_and(|permission| allowed_permissions.contains(permission))
         })
         .cloned()
         .collect()
-}
-
-/// Maps a public native operation to the persisted Forge permission ceiling.
-/// The Agent Runtime only sees the single typed tool permission; this mapping
-/// keeps the more detailed Forge policy from being flattened into an
-/// all-or-nothing provider grant.
-fn operation_permission(scope_type: CanonicalScopeType, operation: &str) -> &'static str {
-    match (scope_type, operation) {
-        (CanonicalScopeType::Account, MAIN_CHARTER_READ_OPERATION) => "read_account",
-        (CanonicalScopeType::AgentChat, MAIN_CHARTER_READ_OPERATION) => "read_agent_chat",
-        (
-            CanonicalScopeType::Account | CanonicalScopeType::AgentChat,
-            MAIN_CHARTER_DRAFT_OPERATION
-            | MAIN_CHARTER_READINESS_OPERATION
-            | MAIN_CHARTER_DIFF_OPERATION
-            | MAIN_CHARTER_APPROVAL_TARGET_OPERATION,
-        ) => "propose_discovery",
-        (
-            CanonicalScopeType::Account | CanonicalScopeType::AgentChat,
-            MAIN_PROJECT_CREATE_OPERATION,
-        ) => "propose_project",
-        (CanonicalScopeType::Project, PROJECT_CURRENT_STATE_OPERATION) => "read_project",
-        (CanonicalScopeType::AgentChat, PROJECT_CURRENT_STATE_OPERATION) => "read_agent_chat",
-        (
-            CanonicalScopeType::Project | CanonicalScopeType::AgentChat,
-            PROJECT_CHARTER_ADOPTION_OPERATION
-            | PROJECT_DOCUMENT_OPERATION
-            | PROJECT_DECISION_OPERATION
-            | PROJECT_EXECUTION_BASELINE_OPERATION
-            | PROJECT_MILESTONE_OPERATION
-            | PROJECT_EVIDENCE_OPERATION
-            | PROJECT_READINESS_OPERATION
-            | PROJECT_RELEASE_OPERATION,
-        ) => "propose_project",
-        (
-            CanonicalScopeType::Account,
-            "account.summary" | "discovery.read" | "portfolio.read" | "inbox.read"
-            | "commitments.read" | "delivery.read",
-        ) => "read_account",
-        (
-            CanonicalScopeType::Project,
-            "project.summary" | "work.read" | "events.read" | "inbox.read" | "commitments.read"
-            | "delivery.read",
-        ) => "read_project",
-        (
-            CanonicalScopeType::AgentChat,
-            "agent_chat.summary" | "discovery.read" | "portfolio.read" | "project.summary"
-            | "events.read" | "inbox.read" | "commitments.read" | "delivery.read",
-        ) => "read_agent_chat",
-        (
-            CanonicalScopeType::Task,
-            "task.summary" | "work.read" | "events.read" | "inbox.read" | "commitments.read"
-            | "delivery.read",
-        ) => "read_task",
-        (_, "memory.read" | "decisions.read") => "read_memory",
-        (_, "task.propose") => "propose_task",
-        (_, "message.propose" | "message.send") => "propose_message",
-        (_, "commitment.propose" | "commitment.update") => "propose_commitment",
-        (_, "memory.publish" | "memory.supersede") => "propose_memory",
-        (_, "review.propose" | "review.request") => "propose_review",
-        (_, "session.action") => "propose_session",
-        _ => "__unknown_forge_permission__",
-    }
 }
 
 #[derive(Debug)]
@@ -1845,12 +942,11 @@ impl Tool for ForgeScopeReadTool {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| Value::Object(Map::new()));
-        let output = self
-            .provider
-            .read(&self.actor_identity_id, &self.scope, operation, input)
-            .await
-            .map_err(host_error_to_runtime)?;
-        Ok(ToolOutcome::json(output))
+        provider_result_to_tool_outcome(
+            self.provider
+                .read(&self.actor_identity_id, &self.scope, operation, input)
+                .await,
+        )
     }
 }
 
@@ -2115,21 +1211,6 @@ impl Tool for ForgeScopeProposeTool {
                 payload.remove("render_version");
             }
         }
-        if operation == PROJECT_EXECUTION_BASELINE_OPERATION {
-            // The release-policy digest, rendered view, and revision digests
-            // are derived server-side from this same payload; model-echoed
-            // values can only ever produce false conflicts. They may appear
-            // at the payload top level or inside a full `content` object.
-            if let Some(payload) = arguments.get_mut("payload").and_then(Value::as_object_mut) {
-                payload.remove("release_policy_digest");
-                payload.remove("rendered_view");
-                payload.remove("content_digest");
-                payload.remove("render_digest");
-                if let Some(content) = payload.get_mut("content").and_then(Value::as_object_mut) {
-                    content.remove("release_policy_digest");
-                }
-            }
-        }
         for field in ["dedupe_key", "correlation_id"] {
             if required_string(&arguments, field)?.trim().is_empty() {
                 return Err(RuntimeError::tool(format!("{field} cannot be empty")));
@@ -2163,166 +1244,17 @@ impl Tool for ForgeScopeProposeTool {
         prepared: PreparedToolCall,
         _ctx: &InvocationContext,
     ) -> Result<ToolOutcome, RuntimeError> {
-        let output = self
-            .provider
-            .propose(
-                &self.actor_identity_id,
-                &self.scope,
-                required_string(prepared.arguments(), "operation")?,
-                prepared.arguments().clone(),
-            )
-            .await
-            .map_err(host_error_to_runtime)?;
-        Ok(ToolOutcome::json(output))
+        provider_result_to_tool_outcome(
+            self.provider
+                .propose(
+                    &self.actor_identity_id,
+                    &self.scope,
+                    required_string(prepared.arguments(), "operation")?,
+                    prepared.arguments().clone(),
+                )
+                .await,
+        )
     }
-}
-
-/// Apply the closed discriminant portion of the named orchestration schema at
-/// preparation time as well as in the provider.  Runtime model tool calls do
-/// not necessarily pass through a JSON-Schema validator, so accepting a
-/// mismatched operation/action pair here would make the registry appear more
-/// permissive than its advertised contract.
-fn validate_orchestration_proposal_arguments(
-    operation: &str,
-    arguments: &Value,
-) -> Result<(), RuntimeError> {
-    let object = arguments
-        .as_object()
-        .ok_or_else(|| RuntimeError::tool("Forge orchestration proposal must be an object"))?;
-    const ALLOWED_FIELDS: &[&str] = &[
-        "operation",
-        "payload",
-        "dedupe_key",
-        "correlation_id",
-        "causation_id",
-        "causation_depth",
-    ];
-    if let Some(field) = object
-        .keys()
-        .find(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
-    {
-        return Err(RuntimeError::tool(format!(
-            "Forge orchestration proposal field `{field}` is not admitted"
-        )));
-    }
-    let payload = object
-        .get("payload")
-        .and_then(Value::as_object)
-        .ok_or_else(|| RuntimeError::tool("Forge orchestration payload must be an object"))?;
-    let action = payload
-        .get("action")
-        .and_then(Value::as_str)
-        .ok_or_else(|| RuntimeError::tool("Forge orchestration payload action is required"))?;
-    let schema = orchestration_payload_schema(operation);
-    let action_schema = schema
-        .get("properties")
-        .and_then(|properties| properties.get("action"))
-        .ok_or_else(|| RuntimeError::tool("Forge orchestration action schema is unavailable"))?;
-    if let Some(expected) = action_schema.get("const").and_then(Value::as_str) {
-        if action != expected {
-            return Err(RuntimeError::tool(format!(
-                "Forge orchestration action must be {expected}"
-            )));
-        }
-    } else if let Some(actions) = action_schema.get("enum").and_then(Value::as_array) {
-        if !actions
-            .iter()
-            .any(|candidate| candidate.as_str() == Some(action))
-        {
-            return Err(RuntimeError::tool(
-                "Forge orchestration action is outside this typed contract",
-            ));
-        }
-    } else {
-        return Err(RuntimeError::tool(
-            "Forge orchestration action schema is not closed",
-        ));
-    }
-    if operation == PROJECT_DOCUMENT_OPERATION && action == "approve" {
-        const APPROVAL_FIELDS: &[&str] = &[
-            "action",
-            "document_id",
-            "kind",
-            "title",
-            "revision_id",
-            "content_digest",
-            "render_digest",
-            "expected_document_version",
-            "baseline_id",
-            "baseline_revision_id",
-            "envelope_digest",
-        ];
-        if let Some(field) = payload
-            .keys()
-            .find(|field| !APPROVAL_FIELDS.contains(&field.as_str()))
-        {
-            return Err(RuntimeError::tool(format!(
-                "Project Document approval field `{field}` is not admitted"
-            )));
-        }
-        for field in [
-            "document_id",
-            "kind",
-            "title",
-            "revision_id",
-            "content_digest",
-            "render_digest",
-        ] {
-            if payload
-                .get(field)
-                .and_then(Value::as_str)
-                .is_none_or(|value| value.trim().is_empty())
-            {
-                return Err(RuntimeError::tool(format!(
-                    "Project Document approval field `{field}` is required"
-                )));
-            }
-        }
-        let expected_version = payload
-            .get("expected_document_version")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| RuntimeError::tool("expected_document_version must be an integer"))?;
-        if expected_version < 1 {
-            return Err(RuntimeError::tool(
-                "expected_document_version must be at least 1",
-            ));
-        }
-        for field in ["baseline_id", "baseline_revision_id", "envelope_digest"] {
-            if let Some(value) = payload.get(field) {
-                if !value.is_null() && value.as_str().is_none_or(|value| value.trim().is_empty()) {
-                    return Err(RuntimeError::tool(format!(
-                        "Project Document approval field `{field}` must be a non-empty string or null"
-                    )));
-                }
-            }
-        }
-        let baseline_fields = ["baseline_id", "baseline_revision_id", "envelope_digest"];
-        let supplied = baseline_fields
-            .iter()
-            .map(|field| payload.get(*field).is_some_and(|value| !value.is_null()))
-            .collect::<Vec<_>>();
-        if supplied.iter().any(|present| *present) && supplied.iter().any(|present| !present) {
-            return Err(RuntimeError::tool(
-                "Project Document approval baseline_id, baseline_revision_id, and envelope_digest must be supplied together",
-            ));
-        }
-    }
-    if let Some(value) = object.get("causation_id") {
-        if !value.is_null() && !value.is_string() {
-            return Err(RuntimeError::tool("causation_id must be a string or null"));
-        }
-    }
-    if let Some(value) = object.get("causation_depth") {
-        let depth = value
-            .as_i64()
-            .ok_or_else(|| RuntimeError::tool("causation_depth must be an integer"))?;
-        if !(0..=8).contains(&depth) {
-            return Err(RuntimeError::tool(
-                "causation_depth must be between 0 and 8",
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -2670,6 +1602,28 @@ fn validate_orchestration_read_arguments(
             .ok_or_else(|| RuntimeError::tool("Forge read arguments must be an object"))?;
         let nested_allowed: &[&str] = match operation {
             MAIN_CHARTER_READ_OPERATION => &["charter_id", "revision_id", "genesis_session_id"],
+            MAIN_CHARTER_READINESS_OPERATION => &[
+                "charter_id",
+                "revision_id",
+                "content_digest",
+                "render_digest",
+                "expected_charter_version",
+                "genesis_session_id",
+            ],
+            MAIN_CHARTER_DIFF_OPERATION => &[
+                "charter_id",
+                "base_revision_id",
+                "candidate_revision_id",
+                "genesis_session_id",
+            ],
+            MAIN_CHARTER_APPROVAL_TARGET_OPERATION => &[
+                "charter_id",
+                "revision_id",
+                "content_digest",
+                "render_digest",
+                "expected_charter_version",
+                "genesis_session_id",
+            ],
             PROJECT_CURRENT_STATE_OPERATION => &["limit"],
             _ => &[],
         };
@@ -2819,6 +1773,45 @@ fn scope_type_name(scope_type: CanonicalScopeType) -> &'static str {
     }
 }
 
+/// Preserve a provider's typed Forge outcome as an in-band runtime result.
+///
+/// `RuntimeError` is reserved for malformed calls and runtime failures.  A
+/// command/query service can instead return a safe, structured domain outcome
+/// (for example a version conflict with an authorized retry snapshot).  The
+/// model must receive that envelope unchanged with `is_error = true`, so it
+/// can branch on `code` and typed corrective fields rather than parse prose.
+fn provider_result_to_tool_outcome(
+    result: Result<Value, AgentHostError>,
+) -> Result<ToolOutcome, RuntimeError> {
+    match result {
+        Ok(value) => Ok(ToolOutcome::json(value)),
+        Err(AgentHostError::StructuredOutcome(outcome)) => {
+            // Every field in `OrchestrationOutcome` is JSON-compatible, so
+            // this normally cannot fail.  Keep even the defensive fallback
+            // in-band and redacted if a future field adds a fallible
+            // serializer; a domain error must never become RuntimeError
+            // prose at this boundary.
+            let value = serde_json::to_value(outcome.as_ref()).unwrap_or_else(|_| {
+                json!({
+                    "code": "internal_failure",
+                    "status": "failed",
+                    "operation": outcome.operation,
+                    "scope": outcome.scope,
+                    "safe_message": "The command could not be completed.",
+                    "correlation_id": outcome.correlation_id,
+                    "replayed": false,
+                })
+            });
+            Ok(ToolOutcome {
+                value,
+                content: Default::default(),
+                is_error: true,
+            })
+        }
+        Err(error) => Err(host_error_to_runtime(error)),
+    }
+}
+
 fn host_error_to_runtime(error: AgentHostError) -> RuntimeError {
     match error {
         AgentHostError::Authority(message)
@@ -2836,6 +1829,13 @@ fn host_error_to_runtime(error: AgentHostError) -> RuntimeError {
         AgentHostError::Runtime(message) => {
             RuntimeError::tool(format!("Forge tool provider failed: {message}"))
         }
+        AgentHostError::StructuredOutcome(_) => {
+            // ForgeScope read/propose consume this variant through
+            // `provider_result_to_tool_outcome`.  Keep any unrelated call
+            // site opaque if it ever receives one rather than serializing a
+            // potentially sensitive domain payload into runtime prose.
+            RuntimeError::tool("Forge tool provider returned a structured outcome")
+        }
         AgentHostError::ProtectedPersistence => RuntimeError::tool("Forge tool provider failed"),
     }
 }
@@ -2843,7 +1843,16 @@ fn host_error_to_runtime(error: AgentHostError) -> RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operation_catalog::{
+        MAIN_PROJECT_CREATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
+        PROJECT_EVIDENCE_OPERATION, PROJECT_EXECUTION_BASELINE_OPERATION,
+        PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
+    };
+    use crate::operation_contract::{
+        orchestration_payload_schema, orchestration_read_arguments_schema,
+    };
     use agent_runtime::core::{ids::ToolCallId, tool::Tool};
+    use api_types::{CanonicalScopeRef, OrchestrationOutcome, OutcomeCode, OutcomeScopeType};
 
     #[test]
     fn portable_const_schema_adds_type_and_enum_for_provider_compatibility() {
@@ -3323,6 +2332,33 @@ mod tests {
                     .any(|value| value == field)
             );
         }
+        let evidence = orchestration_payload_schema(PROJECT_EVIDENCE_OPERATION);
+        for field in [
+            "action",
+            "milestone_id",
+            "expected_milestone_version",
+            "asset_id",
+            "caption",
+            "kind",
+            "checksum",
+        ] {
+            assert!(
+                evidence["required"]
+                    .as_array()
+                    .expect("evidence required fields")
+                    .iter()
+                    .any(|value| value == field),
+                "evidence schema must require {field}"
+            );
+        }
+        assert_eq!(
+            evidence["properties"]["expected_milestone_version"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            evidence["properties"]["expected_milestone_version"]["minimum"],
+            1
+        );
         let release = orchestration_payload_schema(PROJECT_RELEASE_OPERATION);
         assert_eq!(
             release["properties"]["action"]["const"],
@@ -3689,6 +2725,212 @@ mod tests {
             .prepare(json!({"path":"../task-2/file"}), &context)
             .await;
         assert!(parent.is_err());
+    }
+
+    #[tokio::test]
+    async fn forge_scope_read_preserves_structured_provider_errors_in_band() {
+        let tool = ForgeScopeReadTool::new(
+            "identity-1".to_owned(),
+            scope(CanonicalScopeType::Account, WorkspaceAccess::Deny),
+            vec!["account.summary".to_owned()],
+            Arc::new(StructuredOutcomeProvider),
+        );
+        let prepared = tool
+            .prepare(
+                json!({"operation":"account.summary"}),
+                &test_preparation_context("read-call"),
+            )
+            .await
+            .expect("read call prepares");
+        let expected = structured_version_conflict();
+        let outcome = tool
+            .invoke(prepared, &test_invocation_context("read-call"))
+            .await
+            .expect("domain errors remain in-band tool outcomes");
+
+        assert!(outcome.is_error);
+        assert_eq!(outcome.value, serde_json::to_value(expected).unwrap());
+        assert_eq!(outcome.value["code"], "version_conflict");
+        assert_eq!(outcome.value["current_version_or_revision"]["version"], 7);
+        assert!(!outcome.value.to_string().contains("sqlx::Error"));
+        assert!(!outcome.value.to_string().contains("secret-provider-detail"));
+    }
+
+    #[tokio::test]
+    async fn forge_scope_propose_preserves_structured_provider_errors_in_band() {
+        let tool = ForgeScopeProposeTool::new(
+            "identity-1".to_owned(),
+            scope(CanonicalScopeType::Project, WorkspaceAccess::Deny),
+            vec!["message.send".to_owned()],
+            Arc::new(StructuredOutcomeProvider),
+        );
+        let prepared = tool
+            .prepare(
+                json!({
+                    "operation":"message.send",
+                    "payload": null,
+                    "dedupe_key":"dedupe-1",
+                    "correlation_id":"corr-1"
+                }),
+                &test_preparation_context("propose-call"),
+            )
+            .await
+            .expect("proposal prepares");
+        let expected = structured_version_conflict();
+        let outcome = tool
+            .invoke(prepared, &test_invocation_context("propose-call"))
+            .await
+            .expect("domain errors remain in-band tool outcomes");
+
+        assert!(outcome.is_error);
+        assert_eq!(outcome.value, serde_json::to_value(expected).unwrap());
+        assert_eq!(outcome.value["code"], "version_conflict");
+        assert_eq!(outcome.value["retry"]["action"], "refresh_and_retry");
+        assert!(!outcome.value.to_string().contains("secret-provider-detail"));
+    }
+
+    #[tokio::test]
+    async fn forge_scope_read_keeps_already_structured_success_json_unchanged() {
+        let tool = ForgeScopeReadTool::new(
+            "identity-1".to_owned(),
+            scope(CanonicalScopeType::Account, WorkspaceAccess::Deny),
+            vec!["account.summary".to_owned()],
+            Arc::new(StructuredSuccessProvider),
+        );
+        let prepared = tool
+            .prepare(
+                json!({"operation":"account.summary"}),
+                &test_preparation_context("success-call"),
+            )
+            .await
+            .expect("read call prepares");
+        let expected = serde_json::to_value(OrchestrationOutcome::succeeded(
+            "account.summary",
+            CanonicalScopeRef::new(OutcomeScopeType::Account, "scope-1"),
+            "corr-success",
+            Some(json!({"account_id":"account-1"})),
+        ))
+        .unwrap();
+        let outcome = tool
+            .invoke(prepared, &test_invocation_context("success-call"))
+            .await
+            .expect("structured success is a normal tool result");
+
+        assert!(!outcome.is_error);
+        assert_eq!(outcome.value, expected);
+    }
+
+    fn structured_version_conflict() -> OrchestrationOutcome {
+        let mut outcome = OrchestrationOutcome::failed(
+            OutcomeCode::VersionConflict,
+            "account.summary",
+            CanonicalScopeRef::new(OutcomeScopeType::Account, "scope-1"),
+            "corr-structured",
+            "The account changed; refresh and retry.",
+        );
+        outcome.current_version_or_revision = Some(api_types::CurrentVersionOrRevision {
+            resource_type: "account".to_owned(),
+            resource_id: "scope-1".to_owned(),
+            version: Some(7),
+            revision_id: None,
+            revision: None,
+            content_digest: None,
+            rendered_digest: None,
+        });
+        outcome.retry = Some(api_types::RetryInstruction::new(
+            api_types::RetryAction::RefreshAndRetry,
+            true,
+        ));
+        outcome
+    }
+
+    fn test_preparation_context(call_id: &str) -> PreparationContext {
+        PreparationContext {
+            session: agent_runtime::core::ids::SessionId::new("session"),
+            turn: None,
+            call_id: ToolCallId::new(call_id),
+            request: agent_runtime::core::ids::RequestId::new("request"),
+            workspace: Arc::new(agent_runtime::core::workspace::DenyAllWorkspace),
+            clock: Arc::new(agent_runtime::core::clock::SystemClock),
+            cancel: agent_runtime::core::cancel::Cancellation::new(),
+            deadline: agent_runtime::core::clock::Deadline::never(),
+        }
+    }
+
+    fn test_invocation_context(call_id: &str) -> InvocationContext {
+        InvocationContext {
+            session: agent_runtime::core::ids::SessionId::new("session"),
+            turn: None,
+            call_id: ToolCallId::new(call_id),
+            request: agent_runtime::core::ids::RequestId::new("request"),
+            workspace: Arc::new(agent_runtime::core::workspace::DenyAllWorkspace),
+            clock: Arc::new(agent_runtime::core::clock::SystemClock),
+            cancel: agent_runtime::core::cancel::Cancellation::new(),
+            deadline: agent_runtime::core::clock::Deadline::never(),
+            output_limit: 4096,
+        }
+    }
+
+    #[derive(Debug)]
+    struct StructuredOutcomeProvider;
+
+    #[async_trait]
+    impl ForgeToolProvider for StructuredOutcomeProvider {
+        async fn read(
+            &self,
+            _actor_identity_id: &str,
+            _scope: &CanonicalScope,
+            _operation: &str,
+            _arguments: Value,
+        ) -> Result<Value, AgentHostError> {
+            Err(AgentHostError::StructuredOutcome(Box::new(
+                structured_version_conflict(),
+            )))
+        }
+
+        async fn propose(
+            &self,
+            _actor_identity_id: &str,
+            _scope: &CanonicalScope,
+            _operation: &str,
+            _arguments: Value,
+        ) -> Result<Value, AgentHostError> {
+            Err(AgentHostError::StructuredOutcome(Box::new(
+                structured_version_conflict(),
+            )))
+        }
+    }
+
+    #[derive(Debug)]
+    struct StructuredSuccessProvider;
+
+    #[async_trait]
+    impl ForgeToolProvider for StructuredSuccessProvider {
+        async fn read(
+            &self,
+            _actor_identity_id: &str,
+            _scope: &CanonicalScope,
+            _operation: &str,
+            _arguments: Value,
+        ) -> Result<Value, AgentHostError> {
+            Ok(serde_json::to_value(OrchestrationOutcome::succeeded(
+                "account.summary",
+                CanonicalScopeRef::new(OutcomeScopeType::Account, "scope-1"),
+                "corr-success",
+                Some(json!({"account_id":"account-1"})),
+            ))
+            .unwrap())
+        }
+
+        async fn propose(
+            &self,
+            _actor_identity_id: &str,
+            _scope: &CanonicalScope,
+            _operation: &str,
+            _arguments: Value,
+        ) -> Result<Value, AgentHostError> {
+            Ok(Value::Null)
+        }
     }
 
     #[derive(Debug)]

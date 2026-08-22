@@ -6,7 +6,9 @@ import {
   Brain,
   CheckCircle,
   Clock,
+  Command,
   Gauge,
+  Gavel,
   Pulse,
   Question,
   WarningCircle,
@@ -20,6 +22,7 @@ import type {
   AgentHealthItem,
   AttentionConsumerHealth,
   AttentionItem,
+  CoordinationActivityItem,
   MissionControlResponse,
   MissionControlWorkItem,
   OutcomeItem,
@@ -47,22 +50,51 @@ function humanize(value: string | null | undefined): string {
   return value.replaceAll('_', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase())
 }
 
+function attentionTaskId(item: AttentionItem): string | null {
+  if (item.scope_type === 'task' && item.scope_id.trim()) return item.scope_id
+
+  const entityType = item.details?.entity_type
+  const entityId = item.details?.entity_id
+  if (entityType === 'task' && typeof entityId === 'string' && entityId.trim()) {
+    return entityId
+  }
+  return null
+}
+
+function attentionActionLabel(value: string | null | undefined): string {
+  const normalized = value?.trim().toLowerCase().replaceAll(' ', '_')
+  if (normalized === 'inspect_run') return 'Inspect run'
+  return humanize(value)
+}
+
+function isInspectRunAction(value: string | null | undefined): boolean {
+  return value?.trim().toLowerCase().replaceAll(' ', '_') === 'inspect_run'
+}
+
 function count(value: bigint | number): number {
   return typeof value === 'bigint' ? Number(value) : value
 }
 
 function attentionTone(item: AttentionItem): string {
   if (
-    ['validation_failed', 'run_stalled', 'retry_exhausted', 'runtime_offline'].includes(
-      item.category,
-    )
+    [
+      'validation_failed',
+      'run_stalled',
+      'retry_exhausted',
+      'execution_failed',
+      'runtime_offline',
+    ].includes(item.category)
   ) {
     return 'border-destructive/30 bg-destructive/5'
   }
   if (
-    ['human_input_required', 'review_risk', 'budget_threshold', 'commitment_overdue'].includes(
-      item.category,
-    )
+    [
+      'human_input_required',
+      'review_risk',
+      'budget_threshold',
+      'commitment_overdue',
+      'progress_warning',
+    ].includes(item.category)
   ) {
     return 'border-warning/30 bg-warning/5'
   }
@@ -70,24 +102,57 @@ function attentionTone(item: AttentionItem): string {
 }
 
 function AttentionCard({ item }: { item: AttentionItem }) {
+  const isProgressWarning = item.category === 'progress_warning'
+  const taskId = isProgressWarning ? attentionTaskId(item) : null
   return (
-    <article className={`rounded-lg border p-4 ${attentionTone(item)}`}>
+    <article
+      className={`rounded-lg border p-4 ${attentionTone(item)}`}
+      role={isProgressWarning ? 'status' : undefined}
+      aria-live={isProgressWarning ? 'polite' : undefined}
+    >
       <div className="flex items-start gap-3">
-        <WarningCircle size={18} className="mt-0.5 shrink-0 text-warning" aria-hidden />
+        {isProgressWarning ? (
+          <Clock size={18} className="mt-0.5 shrink-0 text-warning" aria-hidden />
+        ) : (
+          <WarningCircle size={18} className="mt-0.5 shrink-0 text-warning" aria-hidden />
+        )}
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <h3 className="text-sm font-semibold text-foreground">{item.summary}</h3>
+            <h3 className="text-sm font-semibold text-foreground">
+              {isProgressWarning ? 'Waiting for semantic progress' : item.summary}
+            </h3>
             <StateBadge status={item.lifecycle} />
           </div>
-          <p className="mt-1 text-xs leading-5 text-muted-foreground">{humanize(item.category)}</p>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">
+            {isProgressWarning ? (
+              <>
+                <span>{item.summary}</span> · owner health is reported separately
+              </>
+            ) : (
+              humanize(item.category)
+            )}
+          </p>
           <p className="mt-3 font-mono text-micro text-muted-foreground">
             {humanize(item.scope_type)} · {item.scope_id.slice(0, 8)} · priority {item.priority} ·
             event {item.source_event_id.slice(0, 8)}
           </p>
           {item.recommended_action ? (
-            <p className="mt-2 text-xs font-medium text-foreground">
-              Next: {item.recommended_action}
-            </p>
+            <div className="mt-3 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-2 text-xs font-medium text-foreground">
+              <span>Next: </span>
+              {isProgressWarning && taskId && isInspectRunAction(item.recommended_action) ? (
+                <Link
+                  to="/tasks/$taskId/$tab"
+                  params={{ taskId, tab: 'executions' }}
+                  className="inline-flex min-h-8 w-full items-center justify-center gap-1 rounded-md border border-warning/40 bg-card px-2.5 py-1.5 text-xs font-semibold text-foreground transition-colors hover:border-warning hover:bg-warning/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 sm:w-auto"
+                  aria-label="Inspect run"
+                >
+                  {attentionActionLabel(item.recommended_action)}
+                  <ArrowUpRight size={14} aria-hidden />
+                </Link>
+              ) : (
+                <span>{attentionActionLabel(item.recommended_action)}</span>
+              )}
+            </div>
           ) : null}
         </div>
       </div>
@@ -257,6 +322,170 @@ function OutcomeRow({ item }: { item: OutcomeItem }) {
   )
 }
 
+function ActivityMetadata({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <dt className="font-mono text-micro font-semibold uppercase tracking-[0.8px] text-muted-foreground">
+        {label}
+      </dt>
+      <dd className="mt-1 min-w-0 break-all font-mono text-micro text-foreground" title={value}>
+        {value}
+      </dd>
+    </div>
+  )
+}
+
+function CoordinationActivityRow({ item }: { item: CoordinationActivityItem }) {
+  const isDirectCommand = item.activity_kind === 'direct_command'
+  const kindLabel = isDirectCommand ? 'Direct command receipt' : 'Approval action'
+  return (
+    <article
+      className={`min-w-0 rounded-lg border p-4 ${
+        isDirectCommand
+          ? 'border-ember-border bg-ember-surface'
+          : 'border-border-subtle bg-background'
+      }`}
+    >
+      <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <span className="rounded-full border border-border-subtle bg-card px-2 py-0.5 font-mono text-micro font-semibold uppercase tracking-[0.7px] text-muted-foreground">
+              {kindLabel}
+            </span>
+            <StateBadge status={item.status} label={humanize(item.status)} />
+            <span className="font-mono text-micro text-muted-foreground">
+              policy {humanize(item.policy_result)}
+            </span>
+          </div>
+          <h4 className="mt-2 break-all text-sm font-semibold text-foreground">{item.operation}</h4>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">
+            {isDirectCommand
+              ? 'Committed through the shared command boundary with a replayable receipt.'
+              : 'Authorization remains a separate step from the eventual domain command.'}
+          </p>
+        </div>
+        <time
+          dateTime={item.occurred_at}
+          className="shrink-0 font-mono text-micro text-muted-foreground"
+        >
+          {formatDate(item.occurred_at)}
+        </time>
+      </div>
+      <dl className="mt-4 grid min-w-0 gap-x-4 gap-y-3 border-t border-border-subtle pt-3 xl:grid-cols-4">
+        <ActivityMetadata label="Actor" value={`${humanize(item.actor_type)} · ${item.actor_id}`} />
+        <ActivityMetadata label="Scope" value={`${humanize(item.scope_type)} · ${item.scope_id}`} />
+        <ActivityMetadata label="Input digest" value={item.input_digest} />
+        <ActivityMetadata label="Correlation" value={item.correlation_id} />
+      </dl>
+      {item.outcome ? (
+        <p className="mt-3 border-t border-border-subtle pt-2 font-mono text-micro text-muted-foreground">
+          Outcome recorded; payload details are withheld from Mission Control.
+        </p>
+      ) : null}
+    </article>
+  )
+}
+
+function CoordinationActivityGroup({
+  id,
+  title,
+  description,
+  items,
+  icon,
+  emptyLabel,
+}: {
+  id: string
+  title: string
+  description: string
+  items: CoordinationActivityItem[]
+  icon: ReactNode
+  emptyLabel: string
+}) {
+  return (
+    <section
+      aria-labelledby={id}
+      className="min-w-0 rounded-lg border border-border-subtle bg-card p-3 sm:p-4"
+    >
+      <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
+        <div className="flex min-w-0 items-start gap-2">
+          <span className="mt-0.5 shrink-0 text-primary" aria-hidden>
+            {icon}
+          </span>
+          <div className="min-w-0">
+            <h3 id={id} className="text-sm font-semibold text-foreground">
+              {title}
+            </h3>
+            <p className="mt-1 max-w-2xl text-xs leading-5 text-muted-foreground">{description}</p>
+          </div>
+        </div>
+        <span className="rounded-full bg-muted px-2 py-0.5 font-mono text-micro text-muted-foreground">
+          {items.length}
+        </span>
+      </div>
+      {items.length > 0 ? (
+        <div className="mt-3 space-y-2">
+          {items.map((item) => (
+            <CoordinationActivityRow key={item.id} item={item} />
+          ))}
+        </div>
+      ) : (
+        <p className="mt-3 rounded-md border border-dashed border-border-subtle bg-muted/30 px-3 py-3 text-xs text-muted-foreground">
+          {emptyLabel}
+        </p>
+      )}
+    </section>
+  )
+}
+
+function CoordinationActivitySection({
+  items,
+  allScopesQuiet,
+}: {
+  items: CoordinationActivityItem[]
+  allScopesQuiet: boolean
+}) {
+  const directCommands = items.filter((item) => item.activity_kind === 'direct_command')
+  const approvalActions = items.filter((item) => item.activity_kind === 'approval_action')
+
+  return (
+    <ProjectionSection
+      title="Coordination activity"
+      count={items.length}
+      icon={<Command size={16} />}
+    >
+      {items.length === 0 ? (
+        <div className="p-4" role="status" aria-live="polite">
+          <p className="text-sm font-medium text-foreground">No coordination activity recorded</p>
+          <p className="mt-1 max-w-2xl text-xs leading-5 text-muted-foreground">
+            {allScopesQuiet
+              ? 'All scopes are quiet. Durable direct-command receipts and approval actions will appear here after the server commits them.'
+              : 'No durable direct-command receipts or approval actions are currently projected.'}
+          </p>
+        </div>
+      ) : (
+        <div className="space-y-4 p-3 sm:p-4">
+          <CoordinationActivityGroup
+            id="mission-control-direct-command-receipts"
+            title="Durable direct-command receipts"
+            description="Commands admitted by policy and committed with a durable, replayable receipt."
+            items={directCommands}
+            icon={<CheckCircle size={16} />}
+            emptyLabel="No direct-command receipts are currently projected."
+          />
+          <CoordinationActivityGroup
+            id="mission-control-approval-actions"
+            title="Pending and approved approval actions"
+            description="Approval-required operations retain their source provenance; approval does not apply the domain effect by itself."
+            items={approvalActions}
+            icon={<Gavel size={16} />}
+            emptyLabel="No pending or approved approval actions are currently projected."
+          />
+        </div>
+      )}
+    </ProjectionSection>
+  )
+}
+
 function Capacity({ data }: { data: MissionControlResponse }) {
   const capacity = data.capacity
   return (
@@ -400,12 +629,14 @@ function MissionContent({
         entry.kind === 'main' ? 'Main Agent' : `${entry.project_name ?? 'Project'} Agent`,
       ]),
   )
+  const coordinationActivity = data.coordination_activity
   const hasAny =
     attention.length +
       data.review_ready.length +
       data.active_work.length +
       relevantAgentHealth.length +
-      data.recent_outcomes.length >
+      data.recent_outcomes.length +
+      coordinationActivity.length >
     0
 
   return (
@@ -462,13 +693,7 @@ function MissionContent({
           </ProjectionSection>
         ) : null}
       </div>
-      {!hasAny ? (
-        <EmptyPanel
-          title="All scopes are quiet"
-          description="Mission Control will surface attention, review-ready work, and agent health as durable projections change."
-          icon={<CheckCircle size={19} />}
-        />
-      ) : null}
+      <CoordinationActivitySection items={coordinationActivity} allScopesQuiet={!hasAny} />
       {otherAttention.length > 0 ? (
         <ProjectionSection
           title="Needs attention"

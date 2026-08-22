@@ -1,7 +1,203 @@
 use super::*;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 const EXECUTION_LOG_BATCH_MAX_ENTRIES: usize = 50;
 const EXECUTION_LOG_BATCH_MAX_WAIT: Duration = Duration::from_millis(500);
+const EMBEDDED_EXECUTION_LEASE_SECONDS: i64 = 60;
+const EMBEDDED_EXECUTION_HEARTBEAT_SECONDS: u64 = 20;
+/// A bounded fallback is required for snapshots that predate explicit
+/// execution-time policy.  Provider/profile configuration may choose a
+/// shorter window, but no embedded execution is admitted without a deadline.
+const DEFAULT_EXECUTION_HARD_DEADLINE_SECONDS: u64 = 30 * 60;
+const MAX_EXECUTION_HARD_DEADLINE_SECONDS: u64 = 24 * 60 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddedLeaseSignal {
+    OwnerLost,
+    HardDeadline,
+}
+
+pub(crate) fn execution_deadline_seconds(snapshot: &Value) -> u64 {
+    const KEYS: &[&str] = &[
+        "hard_deadline_seconds",
+        "execution_hard_deadline_seconds",
+        "deadline_seconds",
+        "execution_deadline_seconds",
+        "max_duration_seconds",
+        "max_execution_seconds",
+        "max_execution_duration_seconds",
+        "timeout_seconds",
+    ];
+
+    let mut candidates = Vec::new();
+    for object in [
+        snapshot,
+        snapshot.get("config").unwrap_or(&Value::Null),
+        snapshot.get("capabilities").unwrap_or(&Value::Null),
+        snapshot.get("profile").unwrap_or(&Value::Null),
+        snapshot.get("policy").unwrap_or(&Value::Null),
+    ] {
+        for key in KEYS {
+            if let Some(seconds) = object.get(*key).and_then(Value::as_u64) {
+                if seconds > 0 {
+                    candidates.push(seconds);
+                }
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .min()
+        .unwrap_or(DEFAULT_EXECUTION_HARD_DEADLINE_SECONDS)
+        .clamp(1, MAX_EXECUTION_HARD_DEADLINE_SECONDS)
+}
+
+pub(crate) fn rfc3339_after(now: &str, seconds: i64) -> String {
+    DateTime::parse_from_rfc3339(now)
+        .map(|value| (value + ChronoDuration::seconds(seconds)).to_rfc3339())
+        .unwrap_or_else(|_| (Utc::now() + ChronoDuration::seconds(seconds)).to_rfc3339())
+}
+
+pub(crate) fn bounded_lease_expiry(now: &str, hard_deadline_at: &str) -> String {
+    let proposed = rfc3339_after(now, EMBEDDED_EXECUTION_LEASE_SECONDS);
+    match (
+        DateTime::parse_from_rfc3339(&proposed),
+        DateTime::parse_from_rfc3339(hard_deadline_at),
+    ) {
+        (Ok(proposed), Ok(deadline)) => proposed.min(deadline).to_rfc3339(),
+        _ => proposed,
+    }
+}
+
+fn late_terminal_diagnostic(
+    execution_id: &str,
+    task_id: &str,
+    project_id: &str,
+    attempted_status: &ExecutionStatus,
+    attempted_error: Option<&str>,
+    current: &Execution,
+) -> db::CreateDomainEvent {
+    let dedupe_key = format!(
+        "execution-late-terminal-rejected:{}:{}:{}",
+        execution_id, current.execution_version, attempted_status
+    );
+    db::CreateDomainEvent {
+        id: db::new_uuid_v4(),
+        event_type: "execution.late_terminal_rejected".to_owned(),
+        entity_type: "task".to_owned(),
+        entity_id: task_id.to_owned(),
+        actor_type: "system".to_owned(),
+        actor_id: Some("embedded-runner".to_owned()),
+        scope_type: "project".to_owned(),
+        scope_id: project_id.to_owned(),
+        correlation_id: execution_id.to_owned(),
+        causation_id: None,
+        causation_depth: 0,
+        dedupe_key: Some(dedupe_key),
+        payload_json: json!({
+            "execution_id": execution_id,
+            "attempted_status": attempted_status.to_string(),
+            "attempted_error": attempted_error
+                .map(|error| error.chars().take(500).collect::<String>()),
+            "current_status": current.status.to_string(),
+            "current_execution_version": current.execution_version,
+        })
+        .to_string(),
+        created_at: now_rfc3339(),
+    }
+}
+
+async fn append_late_terminal_diagnostic(
+    db: &SqliteDb,
+    execution_id: &str,
+    task_id: &str,
+    project_id: &str,
+    attempted_status: &ExecutionStatus,
+    attempted_error: Option<&str>,
+    current: &Execution,
+) {
+    let diagnostic = late_terminal_diagnostic(
+        execution_id,
+        task_id,
+        project_id,
+        attempted_status,
+        attempted_error,
+        current,
+    );
+    if let Err(error) = db::DomainEventRepo::append_event(db, diagnostic).await {
+        tracing::warn!(
+            execution_id = %execution_id,
+            %error,
+            "failed to persist late embedded terminal diagnostic"
+        );
+    }
+}
+
+fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+}
+
+async fn embedded_execution_heartbeat(
+    lease: Arc<crate::embedded_task_executor::EmbeddedExecutionLease>,
+    hard_deadline_at: String,
+    stop: CancellationToken,
+    signal_tx: mpsc::UnboundedSender<EmbeddedLeaseSignal>,
+) {
+    embedded_execution_heartbeat_with_clock(
+        lease,
+        hard_deadline_at,
+        stop,
+        signal_tx,
+        Arc::new(now_rfc3339),
+    )
+    .await;
+}
+
+async fn embedded_execution_heartbeat_with_clock(
+    lease: Arc<crate::embedded_task_executor::EmbeddedExecutionLease>,
+    hard_deadline_at: String,
+    stop: CancellationToken,
+    signal_tx: mpsc::UnboundedSender<EmbeddedLeaseSignal>,
+    now: Arc<dyn Fn() -> String + Send + Sync>,
+) {
+    let mut ticker =
+        tokio::time::interval(Duration::from_secs(EMBEDDED_EXECUTION_HEARTBEAT_SECONDS));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = stop.cancelled() => break,
+            _ = ticker.tick() => {
+                let now = now();
+                let lease_expires_at = bounded_lease_expiry(&now, &hard_deadline_at);
+                if lease_expires_at <= now {
+                    let _ = signal_tx.send(EmbeddedLeaseSignal::HardDeadline);
+                    break;
+                }
+                match lease.renew(lease_expires_at, now).await {
+                    Ok(db::ExecutionLeaseMutation::Updated(_)) => {}
+                    Ok(db::ExecutionLeaseMutation::HardDeadline { .. }) => {
+                        let _ = signal_tx.send(EmbeddedLeaseSignal::HardDeadline);
+                        break;
+                    }
+                    Ok(db::ExecutionLeaseMutation::Concurrent { .. }) => {
+                        let _ = signal_tx.send(EmbeddedLeaseSignal::OwnerLost);
+                        break;
+                    }
+                    Err(error) => {
+                        // A transient database failure is not proof of owner
+                        // death. The expiry monitor remains the authority if
+                        // renewal cannot recover before the lease expires.
+                        tracing::warn!(%error, "embedded execution lease renewal failed");
+                    }
+                }
+            }
+        }
+    }
+}
 
 impl TaskService {
     pub async fn start_execution(
@@ -52,6 +248,57 @@ impl TaskService {
                 .execution_provider_for_agent(agent.as_ref(), &execution.id)
                 .await?;
             let params = self.execution_start_params(&execution).await?;
+            if let Some(lease_owner) = provider.execution_lease_owner() {
+                let now = Utc::now();
+                let preclaimed = execution.lease_owner.as_deref() == Some(lease_owner.as_str())
+                    && execution
+                        .lease_expires_at
+                        .as_deref()
+                        .and_then(parse_rfc3339)
+                        .is_some_and(|expires_at| expires_at > now)
+                    && execution
+                        .hard_deadline_at
+                        .as_deref()
+                        .and_then(parse_rfc3339)
+                        .is_none_or(|deadline| deadline > now);
+                if !preclaimed {
+                    let lease_claimed_at = now_rfc3339();
+                    let hard_deadline_at = rfc3339_after(
+                        &lease_claimed_at,
+                        i64::try_from(execution_deadline_seconds(&params.executor_config))
+                            .unwrap_or(i64::MAX),
+                    );
+                    let lease_expires_at =
+                        bounded_lease_expiry(&lease_claimed_at, &hard_deadline_at);
+                    match ExecutionRepo::claim_lease(
+                        &*self.db,
+                        db::ClaimExecutionLease {
+                            execution_id: execution.id.clone(),
+                            expected_version: execution.execution_version,
+                            owner: lease_owner,
+                            lease_expires_at,
+                            hard_deadline_at,
+                            now: lease_claimed_at,
+                        },
+                    )
+                    .await?
+                    {
+                        db::ExecutionLeaseMutation::Updated(_) => {}
+                        db::ExecutionLeaseMutation::Concurrent { current }
+                        | db::ExecutionLeaseMutation::HardDeadline { current } => {
+                            tracing::info!(
+                                execution_id = %execution.id,
+                                status = ?current.as_ref().map(|execution| &execution.status),
+                                "remote execution dispatch lost its lease claim"
+                            );
+                            return Ok(api_types::ExecutionStartResult {
+                                execution_id: execution.id.clone(),
+                                accepted: false,
+                            });
+                        }
+                    }
+                }
+            }
             provider.start(params).await
         }
         .await;
@@ -261,6 +508,75 @@ impl TaskService {
             return Err(error);
         }
 
+        // The scheduler owns the execution lease. Creation normally installs
+        // the deterministic embedded owner atomically; older/ownerless rows
+        // are claimed here immediately before launch. Every heartbeat,
+        // progress update, and terminal CAS then presents the same tuple.
+        let deterministic_owner = format!("embedded-execution:{}", execution_before_launch.id);
+        let lease_claimed_at = now_rfc3339();
+        let requested_hard_deadline_at = rfc3339_after(
+            &lease_claimed_at,
+            i64::try_from(execution_deadline_seconds(&agent_config)).unwrap_or(i64::MAX),
+        );
+        let lease_execution = if execution_before_launch.lease_owner.as_deref()
+            == Some(deterministic_owner.as_str())
+            && execution_before_launch.hard_deadline_at.is_some()
+            && execution_before_launch
+                .lease_expires_at
+                .as_deref()
+                .is_some_and(|expires_at| expires_at > lease_claimed_at.as_str())
+        {
+            execution_before_launch.clone()
+        } else {
+            match ExecutionRepo::claim_lease(
+                &*self.db,
+                db::ClaimExecutionLease {
+                    execution_id: execution_before_launch.id.clone(),
+                    expected_version: execution_before_launch.execution_version,
+                    owner: deterministic_owner,
+                    lease_expires_at: bounded_lease_expiry(
+                        &lease_claimed_at,
+                        &requested_hard_deadline_at,
+                    ),
+                    hard_deadline_at: requested_hard_deadline_at,
+                    now: lease_claimed_at,
+                },
+            )
+            .await?
+            {
+                db::ExecutionLeaseMutation::Updated(execution) => execution,
+                db::ExecutionLeaseMutation::Concurrent { current }
+                | db::ExecutionLeaseMutation::HardDeadline { current } => {
+                    let current = current.ok_or_else(|| {
+                        ServiceError::not_found("execution", execution_before_launch.id.clone())
+                    })?;
+                    tracing::info!(
+                        execution_id = %current.id,
+                        status = %current.status,
+                        "execution dispatch lost lease claim before adapter launch"
+                    );
+                    return Ok(current);
+                }
+            }
+        };
+        let hard_deadline_at = lease_execution.hard_deadline_at.clone().ok_or_else(|| {
+            ServiceError::invalid_operation("execution lease claim returned no hard deadline")
+        })?;
+        let lease_owner = lease_execution
+            .lease_owner
+            .clone()
+            .ok_or_else(|| ServiceError::invalid_operation("execution lease has no owner"))?;
+        let lease = Arc::new(crate::embedded_task_executor::EmbeddedExecutionLease::new(
+            Arc::clone(&self.db),
+            lease_execution.id.clone(),
+            lease_owner,
+            lease_execution.execution_version,
+        ));
+        crate::embedded_task_executor::register_execution_lease(
+            execution_before_launch.id.clone(),
+            Arc::clone(&lease),
+        );
+
         let description = execution_description(&execution, &task, &agent_config);
 
         let (log_tx, mut log_rx) = tokio::sync::mpsc::unbounded_channel::<executors::LogEntry>();
@@ -271,15 +587,14 @@ impl TaskService {
 
         // Spawn a task that forwards log entries to the event bus
         let event_bus = self.event_bus.clone();
-        let activity_db = Arc::clone(&self.db);
+        let progress_lease = Arc::clone(&lease);
         let cancellation_executor = self.task_executor.clone();
         let sse_execution_id = execution_id.clone();
         let sse_task_id = task.id.clone();
         let log_max_turns = max_turns;
         let log_max_turns_exceeded = Arc::clone(&max_turns_exceeded);
         let log_assistant_turn_count = Arc::clone(&assistant_turn_count);
-        tokio::spawn(async move {
-            let mut last_db_update: Option<std::time::Instant> = None;
+        let log_task = tokio::spawn(async move {
             let mut assistant_turn_count = 0_u32;
             let mut pending_batch: Vec<executors::LogEntry> = Vec::new();
             let mut flush_deadline: Option<tokio::time::Instant> = None;
@@ -330,24 +645,15 @@ impl TaskService {
                     break;
                 };
 
-                if last_db_update
-                    .map(|instant| instant.elapsed() >= Duration::from_secs(30))
-                    .unwrap_or(true)
-                {
-                    if let Err(error) = ExecutionRepo::update_last_activity_at(
-                        &*activity_db,
-                        &sse_execution_id,
-                        &entry.timestamp,
-                    )
+                if let Err(error) = progress_lease
+                    .record_progress(entry.timestamp.clone(), db::now_rfc3339())
                     .await
-                    {
-                        tracing::warn!(
-                            execution_id = %sse_execution_id,
-                            %error,
-                            "failed to update execution activity timestamp"
-                        );
-                    }
-                    last_db_update = Some(std::time::Instant::now());
+                {
+                    tracing::debug!(
+                        execution_id = %sse_execution_id,
+                        %error,
+                        "failed to record execution semantic progress"
+                    );
                 }
                 if entry.kind == executors::LogKind::Assistant {
                     assistant_turn_count = assistant_turn_count.saturating_add(1);
@@ -390,7 +696,16 @@ impl TaskService {
         });
 
         let read_only_head = if executors::is_worktree_read_only(&agent_config) {
-            Some(git::get_current_sha(std::path::Path::new(&workspace.worktree_path)).await?)
+            match git::get_current_sha(std::path::Path::new(&workspace.worktree_path)).await {
+                Ok(head) => Some(head),
+                Err(error) => {
+                    crate::embedded_task_executor::unregister_execution_lease(
+                        &execution_id,
+                        &lease,
+                    );
+                    return Err(ServiceError::from(error));
+                }
+            }
         } else {
             None
         };
@@ -417,19 +732,139 @@ impl TaskService {
         } else {
             None
         };
-        let execution_result = executor
-            .execute(ExecutionContext {
-                task_id: task.id.clone(),
-                execution_id: execution_id.clone(),
-                worktree_path: workspace.worktree_path.clone(),
-                description,
-                agent_config,
-                logs_path: logs_path.clone(),
-                heartbeat_interval_seconds: 30,
-                max_turns,
-                log_sender: Some(log_tx),
-            })
+        let heartbeat_stop = CancellationToken::new();
+        let (heartbeat_signal_tx, mut heartbeat_signal_rx) = mpsc::unbounded_channel();
+        let heartbeat_task = tokio::spawn(embedded_execution_heartbeat(
+            Arc::clone(&lease),
+            hard_deadline_at.clone(),
+            heartbeat_stop.clone(),
+            heartbeat_signal_tx,
+        ));
+        let execution_future = executor.execute(ExecutionContext {
+            task_id: task.id.clone(),
+            execution_id: execution_id.clone(),
+            worktree_path: workspace.worktree_path.clone(),
+            description,
+            agent_config,
+            logs_path: logs_path.clone(),
+            heartbeat_interval_seconds: 30,
+            max_turns,
+            log_sender: Some(log_tx),
+        });
+        tokio::pin!(execution_future);
+        let mut hard_deadline_exceeded = false;
+        let mut lease_owner_lost = false;
+        let execution_result = tokio::select! {
+            result = &mut execution_future => result,
+            signal = heartbeat_signal_rx.recv() => {
+                if let Some(signal) = signal {
+                    match signal {
+                        EmbeddedLeaseSignal::HardDeadline => {
+                            hard_deadline_exceeded = true;
+                            tracing::warn!(
+                                execution_id = %execution_id,
+                                hard_deadline_at = %hard_deadline_at,
+                                "embedded execution reached its hard deadline"
+                            );
+                        }
+                        EmbeddedLeaseSignal::OwnerLost => {
+                            lease_owner_lost = true;
+                            tracing::warn!(
+                                execution_id = %execution_id,
+                                "embedded execution lost its owner lease"
+                            );
+                        }
+                    }
+                    // The runner owns the executor reference and therefore
+                    // performs cancellation after the heartbeat reports the
+                    // typed lease decision.
+                    match tokio::time::timeout(
+                        Duration::from_secs(5),
+                        executor.cancel(&execution_id),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => tracing::warn!(
+                            execution_id = %execution_id,
+                            %error,
+                            "failed to cancel embedded execution after lease loss"
+                        ),
+                        Err(_) => tracing::warn!(
+                            execution_id = %execution_id,
+                            "embedded execution cancellation timed out after lease loss"
+                        ),
+                    }
+                }
+                match tokio::time::timeout(Duration::from_secs(5), &mut execution_future).await {
+                    Ok(result) => result,
+                    Err(_) => Err(executors::ExecutorError::Other(
+                        "executor did not stop after the execution lease decision".to_owned(),
+                    )),
+                }
+            }
+        };
+        heartbeat_stop.cancel();
+        if let Err(error) = heartbeat_task.await {
+            tracing::debug!(%error, "embedded execution heartbeat task stopped with an error");
+        }
+        if parse_rfc3339(&hard_deadline_at).is_some_and(|deadline| deadline <= Utc::now()) {
+            hard_deadline_exceeded = true;
+        }
+        crate::embedded_task_executor::unregister_execution_lease(&execution_id, &lease);
+        // Drain semantic events before the terminal CAS.  The forwarding task
+        // owns the only progress writer, so joining it ensures no late event
+        // can race the final owner/version read.
+        let mut log_task = log_task;
+        match tokio::time::timeout(Duration::from_secs(1), &mut log_task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "execution log forwarding task stopped with an error");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    execution_id = %execution_id,
+                    "execution log forwarding task did not drain after executor completion"
+                );
+                log_task.abort();
+                let _ = log_task.await;
+            }
+        }
+        if lease_owner_lost {
+            let current = ExecutionRepo::get_by_id(&*self.db, &execution_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("execution", execution_id.clone()))?;
+            let (attempted_status, attempted_error) = match &execution_result {
+                Ok(result) => (
+                    match &result.status {
+                        ExecutionOutcome::Completed => ExecutionStatus::Completed,
+                        ExecutionOutcome::Failed => ExecutionStatus::Failed,
+                        ExecutionOutcome::Cancelled => ExecutionStatus::Cancelled,
+                    },
+                    result.error.clone(),
+                ),
+                Err(error) => (
+                    ExecutionStatus::Failed,
+                    Some(format!("executor error after lease loss: {error}")),
+                ),
+            };
+            append_late_terminal_diagnostic(
+                &self.db,
+                &execution_id,
+                &task.id,
+                &task.project_id,
+                &attempted_status,
+                attempted_error.as_deref(),
+                &current,
+            )
             .await;
+            tracing::info!(
+                execution_id = %execution_id,
+                status = %current.status,
+                "embedded execution outcome discarded after losing its lease owner"
+            );
+            return Ok(current);
+        }
         let mut discarded_read_only_changes = false;
         let restore_result = if let Some(head) = read_only_head.as_deref() {
             let worktree_path = std::path::Path::new(&workspace.worktree_path);
@@ -442,7 +877,18 @@ impl TaskService {
         } else {
             Ok(())
         };
-        let mut result = execution_result?;
+        let mut result = match execution_result {
+            Ok(result) => result,
+            Err(error) if hard_deadline_exceeded => executors::ExecutionResult {
+                status: ExecutionOutcome::Failed,
+                error: Some(format!(
+                    "execution hard deadline exceeded at {hard_deadline_at}: {error}"
+                )),
+                failure_class: Some(executors::ExecutionFailureClass::TaskFailed),
+                ..executors::ExecutionResult::default()
+            },
+            Err(error) => return Err(error.into()),
+        };
         restore_result?;
         if let Some(head) = read_only_head {
             result.after_sha = Some(head);
@@ -486,6 +932,12 @@ impl TaskService {
                 None => "max turns exceeded".to_owned(),
             });
         }
+        if hard_deadline_exceeded {
+            result.status = ExecutionOutcome::Failed;
+            result.error = Some(format!(
+                "execution hard deadline exceeded at {hard_deadline_at}"
+            ));
+        }
         // A write-capable implementation execution that "completes" while
         // leaving the repository untouched and firing no workflow transition
         // has done nothing the pipeline can advance on — the task would sit
@@ -526,6 +978,21 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", execution_id.clone()))?;
         if current_execution.status != ExecutionStatus::Running {
+            let attempted_status = match &result.status {
+                ExecutionOutcome::Completed => ExecutionStatus::Completed,
+                ExecutionOutcome::Failed => ExecutionStatus::Failed,
+                ExecutionOutcome::Cancelled => ExecutionStatus::Cancelled,
+            };
+            append_late_terminal_diagnostic(
+                &self.db,
+                &execution_id,
+                &task.id,
+                &task.project_id,
+                &attempted_status,
+                result.error.as_deref(),
+                &current_execution,
+            )
+            .await;
             tracing::info!(
                 %execution_id,
                 status = %current_execution.status,
@@ -570,25 +1037,25 @@ impl TaskService {
         };
 
         let now = now_rfc3339();
-        let (status, stop_reason, stopped_by, resume_policy, stopped_at) = match result.status {
+        let (status, stop_reason, stopped_by, stopped_at, resume_policy) = match result.status {
             ExecutionOutcome::Completed => (ExecutionStatus::Completed, None, None, None, None),
             ExecutionOutcome::Failed => (
                 ExecutionStatus::Failed,
-                Some(Some(db::StopReason::ExecutorFailed)),
-                Some(Some(
-                    api_types::Actor::system(api_types::SystemComponent::Executor).display(),
-                )),
-                Some(Some(db::ResumePolicy::Manual)),
-                Some(Some(now.clone())),
+                Some(if hard_deadline_exceeded {
+                    db::StopReason::AgentTimeout
+                } else {
+                    db::StopReason::ExecutorFailed
+                }),
+                Some(api_types::Actor::system(api_types::SystemComponent::Executor).display()),
+                Some(now.clone()),
+                Some(db::ResumePolicy::Manual),
             ),
             ExecutionOutcome::Cancelled => (
                 ExecutionStatus::Cancelled,
-                Some(Some(db::StopReason::ExecutorCancelled)),
-                Some(Some(
-                    api_types::Actor::system(api_types::SystemComponent::Executor).display(),
-                )),
-                Some(Some(db::ResumePolicy::Manual)),
-                Some(Some(now.clone())),
+                Some(db::StopReason::ExecutorCancelled),
+                Some(api_types::Actor::system(api_types::SystemComponent::Executor).display()),
+                Some(now.clone()),
+                Some(db::ResumePolicy::Manual),
             ),
         };
         tracing::info!(
@@ -599,31 +1066,82 @@ impl TaskService {
             "execution dispatch completed"
         );
 
-        let updated = ExecutionRepo::update(
-            &*self.db,
-            db::UpdateExecution {
-                id: execution_id,
-                status: Some(status),
-                stop_reason,
-                stopped_by,
-                resume_policy,
-                stopped_at,
-                agent_session_id: Some(result.agent_session_id),
-                agent_message_id: None,
-                last_activity_at: Some(Some(now.clone())),
-                summary: Some(result.summary),
-                logs_path: Some(Some(logs_path)),
-                before_sha: None,
-                after_sha: Some(result.after_sha),
-                error: Some(result.error),
-                executor_config_snapshot_json: snapshot_update.map(Some),
-                updated_at: now_rfc3339(),
-            },
-        )
-        .await?;
-
-        self.revoke_active_workspace_lease_for_execution(&task.id, &updated.id)
-            .await;
+        let (lease_owner, mut expected_version) = lease.owner_and_version().await;
+        // Renewal and semantic-progress tasks are stopped above.  A progress
+        // write can still have won the last CAS immediately before the stop,
+        // so allow one bounded re-read/retry when the row is still running
+        // under this same owner.  A terminal row is a definitive late-result
+        // rejection and must never be overwritten.
+        let mut terminal_attempt = 0;
+        let terminal = loop {
+            let terminal = ExecutionRepo::terminalize(
+                &*self.db,
+                db::TerminalizeExecution {
+                    execution_id: execution_id.clone(),
+                    expected_version,
+                    lease_owner: Some(lease_owner.clone()),
+                    status: status.clone(),
+                    stop_reason: stop_reason.clone().map(Some),
+                    stopped_by: stopped_by.clone().map(Some),
+                    stopped_at: stopped_at.clone().map(Some),
+                    resume_policy: resume_policy.clone().map(Some),
+                    agent_session_id: Some(result.agent_session_id.clone()),
+                    agent_message_id: None,
+                    last_activity_at: Some(Some(now.clone())),
+                    last_progress_at: None,
+                    summary: Some(result.summary.clone()),
+                    logs_path: Some(Some(logs_path.clone())),
+                    before_sha: None,
+                    after_sha: Some(result.after_sha.clone()),
+                    error: Some(result.error.clone()),
+                    executor_config_snapshot_json: snapshot_update.clone().map(Some),
+                    updated_at: now.clone(),
+                    actor_type: "system".to_owned(),
+                    actor_id: None,
+                    correlation_id: None,
+                    causation_id: None,
+                    causation_depth: 0,
+                    lease_disposition: db::ExecutionLeaseDisposition::Revoke,
+                },
+            )
+            .await?;
+            match terminal {
+                db::ExecutionTerminalOutcome::Concurrent {
+                    current: Some(current),
+                } if terminal_attempt == 0
+                    && current.status == ExecutionStatus::Running
+                    && current.lease_owner.as_deref() == Some(lease_owner.as_str()) =>
+                {
+                    terminal_attempt += 1;
+                    expected_version = current.execution_version;
+                    continue;
+                }
+                terminal => break terminal,
+            }
+        };
+        let updated = match terminal {
+            db::ExecutionTerminalOutcome::Committed { execution, .. } => execution,
+            db::ExecutionTerminalOutcome::Concurrent { current } => {
+                let current = current
+                    .ok_or_else(|| ServiceError::not_found("execution", execution_id.clone()))?;
+                append_late_terminal_diagnostic(
+                    &self.db,
+                    &execution_id,
+                    &task.id,
+                    &task.project_id,
+                    &status,
+                    result.error.as_deref(),
+                    &current,
+                )
+                .await;
+                tracing::info!(
+                    execution_id = %execution_id,
+                    status = %current.status,
+                    "late embedded execution outcome rejected by terminal CAS"
+                );
+                return Ok(current);
+            }
+        };
 
         if let Some(token_usage) = result.usage {
             let model = token_usage
@@ -773,6 +1291,300 @@ impl TaskService {
         }
 
         Ok(updated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use db::{
+        AgentRepo, AgentStatus, CreateAgent, CreateExecution, CreateProject, CreateRepo,
+        CreateTask, ExecutionRepo, ProjectRepo, RepoRepo, TaskRepo, WorkMode,
+    };
+
+    const T0: &str = "2025-01-01T00:00:00+00:00";
+    const T1: &str = "2025-01-01T00:00:01+00:00";
+    const T20: &str = "2025-01-01T00:00:20+00:00";
+
+    async fn heartbeat_fixture() -> (
+        Arc<db::SqliteDb>,
+        String,
+        Arc<crate::embedded_task_executor::EmbeddedExecutionLease>,
+    ) {
+        let pool = db::create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite pool");
+        db::run_migrations(&pool).await.expect("migrations run");
+        let db = Arc::new(db::SqliteDb::new(pool));
+        let project_id = db::new_uuid_v4();
+        ProjectRepo::create(
+            &*db,
+            CreateProject {
+                id: project_id.clone(),
+                name: "embedded heartbeat test".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: T0.to_owned(),
+                updated_at: T0.to_owned(),
+            },
+        )
+        .await
+        .expect("project creates");
+        let repo_id = db::new_uuid_v4();
+        RepoRepo::create(
+            &*db,
+            CreateRepo {
+                id: repo_id.clone(),
+                project_id: project_id.clone(),
+                name: "heartbeat-test".to_owned(),
+                remote_url: "https://example.invalid/heartbeat.git".to_owned(),
+                local_path: None,
+                work_mode: WorkMode::DirectMerge,
+                default_branch: "main".to_owned(),
+                created_at: T0.to_owned(),
+                updated_at: T0.to_owned(),
+            },
+        )
+        .await
+        .expect("repo creates");
+        let agent_id = db::new_uuid_v4();
+        AgentRepo::create(
+            &*db,
+            CreateAgent {
+                id: agent_id.clone(),
+                name: "heartbeat-agent".to_owned(),
+                description: None,
+                executor_type: "embedded".to_owned(),
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "[]".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: None,
+                daemon_id: None,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 20,
+                max_missed_heartbeats: 3,
+                status: AgentStatus::Idle,
+                last_heartbeat_at: None,
+                is_default: false,
+                paused: false,
+                owner_id: None,
+                visibility: "global".to_owned(),
+                created_at: T0.to_owned(),
+                updated_at: T0.to_owned(),
+            },
+        )
+        .await
+        .expect("agent creates");
+        let task_id = db::new_uuid_v4();
+        TaskRepo::create(
+            &*db,
+            CreateTask {
+                id: task_id.clone(),
+                project_id,
+                repo_id: Some(repo_id),
+                parent_task_id: None,
+                assignee_type: Some("agent".to_owned()),
+                assignee_id: Some(agent_id.clone()),
+                title: "heartbeat test".to_owned(),
+                description: None,
+                task_type: "task".to_owned(),
+                status: "in_progress".to_owned(),
+                is_automation: false,
+                priority: 0,
+                subtask_order: None,
+                task_state_config: None,
+                merge_config: None,
+                plan: None,
+                created_at: T0.to_owned(),
+                updated_at: T0.to_owned(),
+            },
+        )
+        .await
+        .expect("task creates");
+        let execution_id = db::new_uuid_v4();
+        ExecutionRepo::create(
+            &*db,
+            CreateExecution {
+                id: execution_id.clone(),
+                task_id,
+                agent_id: Some(agent_id),
+                role: "executor".to_owned(),
+                status: db::ExecutionStatus::Running,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                workspace_id: None,
+                created_at: T0.to_owned(),
+                updated_at: T0.to_owned(),
+            },
+        )
+        .await
+        .expect("execution creates");
+        let claimed = match ExecutionRepo::claim_lease(
+            &*db,
+            db::ClaimExecutionLease {
+                execution_id: execution_id.clone(),
+                expected_version: 1,
+                owner: "embedded-heartbeat-test".to_owned(),
+                lease_expires_at: "2025-01-01T00:00:05+00:00".to_owned(),
+                hard_deadline_at: T20.to_owned(),
+                now: T0.to_owned(),
+            },
+        )
+        .await
+        .expect("execution claims")
+        {
+            db::ExecutionLeaseMutation::Updated(execution) => execution,
+            other => panic!("claim must succeed, got {other:?}"),
+        };
+        let lease = Arc::new(crate::embedded_task_executor::EmbeddedExecutionLease::new(
+            Arc::clone(&db),
+            execution_id.clone(),
+            claimed.lease_owner.expect("owner persisted"),
+            claimed.execution_version,
+        ));
+        (db, execution_id, lease)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn embedded_heartbeat_renews_without_semantic_progress_then_stops_at_deadline() {
+        // sqlx's pool acquisition timeout uses Tokio time; create the fixture
+        // on the real clock, then pause the scheduler for heartbeat cadence.
+        tokio::time::resume();
+        let (db, execution_id, lease) = heartbeat_fixture().await;
+        tokio::time::pause();
+        let first_stop = CancellationToken::new();
+        let (first_signal_tx, _first_signal_rx) = mpsc::unbounded_channel();
+        let first_task = tokio::spawn(embedded_execution_heartbeat_with_clock(
+            Arc::clone(&lease),
+            T20.to_owned(),
+            first_stop.clone(),
+            first_signal_tx,
+            Arc::new(|| T1.to_owned()),
+        ));
+
+        // `interval` ticks immediately, then follows the fixed server cadence.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(20)).await;
+        tokio::task::yield_now().await;
+        first_stop.cancel();
+        first_task.await.expect("heartbeat task joins");
+
+        // Read on the real clock for the same reason the fixture is built on
+        // it: a paused scheduler makes sqlx's pool-acquire deadline expire
+        // instantly whenever a connection is not already idle.
+        tokio::time::resume();
+        let renewed = ExecutionRepo::get_by_id(&*db, &execution_id)
+            .await
+            .expect("execution reads")
+            .expect("execution exists");
+        tokio::time::pause();
+        assert_eq!(renewed.last_heartbeat_at.as_deref(), Some(T1));
+        assert_eq!(renewed.last_progress_at, None);
+        let renewed_version = renewed.execution_version;
+
+        // Move the paused scheduler to the immutable hard deadline. The next
+        // server tick must report the typed deadline without another renewal.
+        tokio::time::advance(Duration::from_secs(20)).await;
+        let stop = CancellationToken::new();
+        let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(embedded_execution_heartbeat_with_clock(
+            Arc::clone(&lease),
+            T20.to_owned(),
+            stop.clone(),
+            signal_tx,
+            Arc::new(|| T20.to_owned()),
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            signal_rx.recv().await,
+            Some(EmbeddedLeaseSignal::HardDeadline)
+        );
+        task.await.expect("heartbeat task joins");
+        stop.cancel();
+
+        tokio::time::resume();
+        let at_deadline = ExecutionRepo::get_by_id(&*db, &execution_id)
+            .await
+            .expect("execution reads")
+            .expect("execution exists");
+        assert_eq!(at_deadline.execution_version, renewed_version);
+        assert_eq!(at_deadline.last_heartbeat_at.as_deref(), Some(T1));
+        assert_eq!(at_deadline.last_progress_at, None);
+    }
+
+    #[test]
+    fn execution_deadline_prefers_shortest_snapshot_policy_and_clamps_fallback() {
+        let snapshot = serde_json::json!({
+            "config": {"timeout_seconds": 900},
+            "capabilities": {"max_execution_seconds": 120},
+            "hard_deadline_seconds": 3600,
+        });
+        assert_eq!(execution_deadline_seconds(&snapshot), 120);
+        assert_eq!(
+            execution_deadline_seconds(&serde_json::json!({"timeout_seconds": 0})),
+            DEFAULT_EXECUTION_HARD_DEADLINE_SECONDS
+        );
+    }
+
+    #[tokio::test]
+    async fn late_terminal_diagnostic_is_bounded_and_deduped_by_current_version() {
+        let (db, execution_id, _lease) = heartbeat_fixture().await;
+        let current = ExecutionRepo::get_by_id(&*db, &execution_id)
+            .await
+            .expect("execution reads")
+            .expect("execution exists");
+        let error = "x".repeat(2_000);
+        let event = late_terminal_diagnostic(
+            &execution_id,
+            &current.task_id,
+            "project-id",
+            &ExecutionStatus::Completed,
+            Some(&error),
+            &current,
+        );
+        let expected_dedupe = format!(
+            "execution-late-terminal-rejected:{}:{}:completed",
+            execution_id, current.execution_version
+        );
+        assert_eq!(event.dedupe_key.as_deref(), Some(expected_dedupe.as_str()));
+        let payload: Value = serde_json::from_str(&event.payload_json).expect("valid payload");
+        assert_eq!(payload["attempted_status"], "completed");
+        assert_eq!(payload["current_status"], "running");
+        assert_eq!(payload["attempted_error"].as_str().map(str::len), Some(500));
+        db::DomainEventRepo::append_event(&*db, event.clone())
+            .await
+            .expect("late terminal diagnostic appends");
+        db::DomainEventRepo::append_event(&*db, event)
+            .await
+            .expect("duplicate late terminal diagnostic dedupes");
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'execution.late_terminal_rejected' AND dedupe_key = ?",
+        )
+        .bind(expected_dedupe)
+        .fetch_one(db.pool())
+        .await
+        .expect("late terminal diagnostic count");
+        assert_eq!(count, 1);
     }
 }
 

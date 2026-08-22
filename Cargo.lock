@@ -1169,6 +1169,7 @@ name = "forge-agent-host"
 version = "0.8.0"
 dependencies = [
  "agent-runtime",
+ "api-types",
  "async-trait",
  "chacha20poly1305",
  "db",
@@ -1949,11 +1950,14 @@ dependencies = [
  "db",
  "events",
  "executors",
+ "forge-agent-host",
  "futures-util",
  "serde",
  "serde_json",
  "services",
+ "sqlx",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -2553,6 +2557,7 @@ name = "review"
 version = "0.8.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "db",
  "events",
  "executors",
@@ -2840,6 +2845,7 @@ dependencies = [
 name = "services"
 version = "0.8.0"
 dependencies = [
+ "agent-runtime",
  "api-types",
  "async-trait",
  "base64",

@@ -6,7 +6,7 @@
 //! subsequent Project Agent admission cannot validate its source, target,
 //! Charter, approval, and redaction provenance.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use api_types::{
     AuthorizationProvenance, CharterKnowledgeKind, PrincipalKind, ProjectCharterContent,
@@ -14,6 +14,7 @@ use api_types::{
 use chrono::{DateTime, Utc};
 use db::{
     new_uuid_v4, now_rfc3339, AgentChatRepo, AgentHandoffRepo, AgentProfileRepo, AgentRepo,
+    CommandReceipt, CommandReceiptRepo, CreateAgentActionExecution, CreateCommandReceipt,
     CreateProject, CreateProjectFromCharterApproval, CreatedProjectFromCharterApproval,
     ProjectAgentBindingRepo, ProjectOrchestrationRepo, ProjectRepo, SqliteDb,
 };
@@ -22,9 +23,15 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 
-use crate::{render_project_charter, Result, ServiceError, PROJECT_OPERATING_SKILL_KEY};
+use crate::{
+    render_project_charter, AuthorizationProvenance as CommandAuthorizationProvenance,
+    CommandContext, CommandPrincipal, CommandScope, CommandScopeType, ExpectedCommandState,
+    NewCommandContext, Result, ServiceError, PROJECT_OPERATING_SKILL_KEY,
+};
 
 const CREATE_FROM_CHARTER_ACTION: &str = "product_genesis.create_project_from_approval";
+const DIRECT_PROJECT_CREATE_STATE_SCHEMA: &str = "forge.project-create-approval-state/v1";
+const DIRECT_PROJECT_CREATE_DIGEST_CORRELATION: &str = "forge.project-create.direct";
 const HANDOFF_SCHEMA_VERSION: &str = "forge.project-charter-handoff/v1";
 const MAX_HANDOFF_CHARS: usize = 12_000;
 const REQUIRED_REDACTION_CATEGORIES: [&str; 6] = [
@@ -80,20 +87,152 @@ pub struct CreateProjectFromCharterApprovalInput {
     pub authorization: CreateProjectAuthorization,
     pub correlation_id: String,
     pub causation_depth: i64,
+    /// Main command finalization is carried into the existing atomic
+    /// Project/Chat/binding/handoff transaction. For an authenticated REST
+    /// call the service fills these from a server-owned CommandContext before
+    /// the domain transaction begins; callers never provide a receipt.
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
 }
 
 /// Execute the one canonical Charter approval → Project/binding/chat/handoff
 /// transaction.  The DB repository remains the atomic commit boundary; this
 /// service owns the cross-record checks and constructs the exact handoff
 /// packet consumed by Project Agent startup.
+///
+/// Two concurrent submissions of the same command are a supported case: a
+/// lost response is normally retried, and the retry can overlap the original.
+/// The loser of that race reads the approval while it is still `active`, then
+/// validates Genesis/approval state that the winner has since advanced. Those
+/// pre-transaction reads are a genuine time-of-check race, not a caller
+/// error, so the loser re-resolves exactly once against the now-consumed
+/// approval and returns the committed receipt. The retry is admitted only
+/// when the approval is consumed *and* the committed handoff carries this
+/// exact idempotency key, so a real conflict is never retried into success.
 pub async fn create_project_from_charter_approval(
     db: Arc<SqliteDb>,
     input: CreateProjectFromCharterApprovalInput,
 ) -> Result<CreatedProjectFromCharterApproval> {
+    let retry_input = input.clone();
+    match create_project_from_charter_approval_attempt(Arc::clone(&db), input).await {
+        Err(ServiceError::Conflict(message)) => {
+            if concurrent_create_receipt_committed(&db, &retry_input).await? {
+                create_project_from_charter_approval_attempt(db, retry_input).await
+            } else {
+                Err(ServiceError::Conflict(message))
+            }
+        }
+        other => other,
+    }
+}
+
+/// Report whether another submission committed this exact command while the
+/// caller was validating. Both the consumed approval and the committed
+/// handoff key must match, so this can only ever redirect a caller onto its
+/// own durable receipt.
+async fn concurrent_create_receipt_committed(
+    db: &Arc<SqliteDb>,
+    input: &CreateProjectFromCharterApprovalInput,
+) -> Result<bool> {
+    let Some(approval) =
+        ProjectOrchestrationRepo::get_project_charter_approval(&**db, &input.approval_id).await?
+    else {
+        return Ok(false);
+    };
+    if approval.lifecycle != "consumed" {
+        return Ok(false);
+    }
+    let stored_approval_id = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT json_extract(source_revisions_json, '$.approval_id')
+         FROM agent_handoff WHERE dedupe_key = ? LIMIT 1",
+    )
+    .bind(&input.idempotency_key)
+    .fetch_optional(db.pool())
+    .await?
+    .flatten();
+    Ok(stored_approval_id.as_deref() == Some(input.approval_id.as_str()))
+}
+
+async fn create_project_from_charter_approval_attempt(
+    db: Arc<SqliteDb>,
+    input: CreateProjectFromCharterApprovalInput,
+) -> Result<CreatedProjectFromCharterApproval> {
+    let mut input = input;
     let approval_id = required("approval_id", &input.approval_id)?;
     let idempotency_key = required("idempotency_key", &input.idempotency_key)?;
     let account_id = required("account_id", &input.account_id)?;
-    let correlation_id = required("correlation_id", &input.correlation_id)?;
+    let mut replayed_receipt: Option<CommandReceipt> = None;
+
+    // An approved Main action may have committed this exact composite before
+    // its caller received the response. Resolve that immutable receipt before
+    // any approval, binding, handoff, or authorization row is re-read.
+    if let Some(requested_receipt) = input.command_receipt.as_ref() {
+        if let Some(existing) = CommandReceiptRepo::get_command_receipt(
+            &*db,
+            &requested_receipt.principal_type,
+            &requested_receipt.principal_id,
+            &requested_receipt.scope_type,
+            &requested_receipt.scope_id,
+            &requested_receipt.operation,
+            &requested_receipt.idempotency_key,
+            &requested_receipt.input_digest,
+        )
+        .await?
+        {
+            if existing.agent_action_execution_id.is_some() != input.action_execution.is_some() {
+                return Err(ServiceError::Db(db::DbError::IdempotencyConflict));
+            }
+            replayed_receipt = Some(existing);
+        }
+    }
+
+    // REST/user execution is a directly allowed command. The transport only
+    // supplies the authenticated account, request key, approval id, and
+    // explicit authorization provenance; this service derives the canonical
+    // account scope/principal and digest. Resolve a durable receipt before
+    // reading or validating mutable approval state so replay cannot be
+    // diverted by the consumed approval lifecycle (or by changed authority).
+    let direct_user_command = input.command_receipt.is_none();
+    let correlation_id = if direct_user_command {
+        // Correlation is transport/runtime provenance, not user input. Keep
+        // its allocation inside the shared service so REST cannot choose the
+        // command identity that is persisted with the domain event.
+        new_uuid_v4()
+    } else {
+        required("correlation_id", &input.correlation_id)?
+    };
+    if direct_user_command {
+        let receipt = direct_project_create_receipt(
+            &approval_id,
+            &idempotency_key,
+            &account_id,
+            &input.authorization,
+            &correlation_id,
+            input.causation_depth,
+        )?;
+        if let Some(existing) = CommandReceiptRepo::get_command_receipt(
+            &*db,
+            "user",
+            &account_id,
+            "account",
+            &account_id,
+            CREATE_FROM_CHARTER_ACTION,
+            &idempotency_key,
+            &receipt.input_digest,
+        )
+        .await?
+        {
+            if existing.agent_action_execution_id.is_some() {
+                return Err(ServiceError::Db(db::DbError::IdempotencyConflict));
+            }
+            replayed_receipt = Some(existing);
+        } else {
+            input.command_receipt = Some(receipt);
+        }
+    }
+    if let Some(receipt) = replayed_receipt.as_ref() {
+        input.command_receipt = Some(create_command_receipt_input(receipt));
+    }
 
     // Resolve an already-published handoff before validating the current
     // authorization envelope.  A retry with the same key is an immutable
@@ -120,8 +259,12 @@ pub async fn create_project_from_charter_approval(
         .ok_or_else(|| ServiceError::not_found("project_charter_approval", approval_id.clone()))?;
     if approval.approving_principal_type != "user" || approval.approving_principal_id != account_id
     {
-        return Err(ServiceError::invalid_operation(
-            "only the approving account user may create this Project",
+        // Keep account visibility at the shared service boundary. REST and
+        // Main must not grow separate approval-enumeration SQL just to hide
+        // another account's Genesis receipt.
+        return Err(ServiceError::not_found(
+            "project_charter_approval",
+            approval_id.clone(),
         ));
     }
 
@@ -224,6 +367,32 @@ pub async fn create_project_from_charter_approval(
             .selected_policy_digest
             .clone()
             .ok_or_else(|| ServiceError::conflict("the consumed approval policy is missing"))?;
+        let revision =
+            ProjectOrchestrationRepo::get_project_charter_revision(&*db, &approval.revision_id)
+                .await?
+                .filter(|revision| revision.charter_id == approval.charter_id)
+                .ok_or_else(|| ServiceError::Db(db::DbError::IdempotencyConflict))?;
+        let content: ProjectCharterContent = serde_json::from_str(&revision.content_json)
+            .map_err(|_| ServiceError::Db(db::DbError::IdempotencyConflict))?;
+        let transfer = charter_transfer_projection(&content);
+        let expected_handoff_content = charter_handoff_content(
+            &transfer.content,
+            &approval.id,
+            &approval.revision_id,
+            &transfer.redacted_knowledge_item_ids,
+        );
+        let expected_content_guard = serde_json::json!({
+            "schema_version": "forge.content-guard/v1",
+            "classification": "approved_project_charter",
+            "authority": "data_only",
+            "redactions": transfer.redacted_knowledge_item_ids,
+        })
+        .to_string();
+        if handoff.content != expected_handoff_content
+            || handoff.content_guard_json != expected_content_guard
+        {
+            return Err(ServiceError::Db(db::DbError::IdempotencyConflict));
+        }
         let created = create_atomic(
             &db,
             &approval,
@@ -268,7 +437,7 @@ pub async fn create_project_from_charter_approval(
             handoff.correlation_id.clone(),
         )
         .await?;
-        provision_after_create(&db, &created).await;
+        provision_after_create(&db, &created).await?;
         return Ok(created);
     }
     if approval.lifecycle != "active" {
@@ -599,7 +768,7 @@ pub async fn create_project_from_charter_approval(
         correlation_id,
     )
     .await?;
-    provision_after_create(&db, &created).await;
+    provision_after_create(&db, &created).await?;
     // Durable Main Chat record of the completed handoff; best-effort because
     // the Project and handoff are already committed.
     let (message_id, content) = (
@@ -618,20 +787,149 @@ pub async fn create_project_from_charter_approval(
     Ok(created)
 }
 
-/// Best-effort executable provisioning (repository + default role
-/// assignments) after the atomic create commits. The Project itself is
-/// already durable, so a provisioning failure is logged rather than turned
-/// into a create failure; a creation replay retries it.
-async fn provision_after_create(db: &Arc<SqliteDb>, created: &CreatedProjectFromCharterApproval) {
-    if let Err(error) =
-        crate::project_provisioning::provision_genesis_project(db, &created.project.id).await
-    {
-        tracing::warn!(
-            project_id = %created.project.id,
-            %error,
-            "Genesis Project provisioning failed; attach a repository or role defaults manually"
-        );
+#[derive(Debug, Serialize)]
+struct DirectProjectCreateDigestInput<'a> {
+    approval_id: &'a str,
+    authorization: &'a CreateProjectAuthorization,
+}
+
+fn create_command_receipt_input(receipt: &CommandReceipt) -> CreateCommandReceipt {
+    CreateCommandReceipt {
+        id: receipt.id.clone(),
+        principal_type: receipt.principal_type.clone(),
+        principal_id: receipt.principal_id.clone(),
+        scope_type: receipt.scope_type.clone(),
+        scope_id: receipt.scope_id.clone(),
+        operation: receipt.operation.clone(),
+        idempotency_key: receipt.idempotency_key.clone(),
+        input_digest: receipt.input_digest.clone(),
+        policy_result: receipt.policy_result.clone(),
+        correlation_id: receipt.correlation_id.clone(),
+        causation_id: receipt.causation_id.clone(),
+        causation_depth: receipt.causation_depth,
+        event_id: receipt.event_id.clone(),
+        agent_action_execution_id: receipt.agent_action_execution_id.clone(),
+        outcome_json: receipt.outcome_json.clone(),
+        committed_at: receipt.committed_at.clone(),
     }
+}
+
+fn direct_project_create_receipt(
+    approval_id: &str,
+    idempotency_key: &str,
+    account_id: &str,
+    authorization: &CreateProjectAuthorization,
+    correlation_id: &str,
+    causation_depth: i64,
+) -> Result<CreateCommandReceipt> {
+    let approval_digest =
+        api_types::canonical_digest_with_schema(DIRECT_PROJECT_CREATE_STATE_SCHEMA, &approval_id)
+            .map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "serialize Project-create approval state digest: {error}"
+            ))
+        })?;
+    let expected_state = ExpectedCommandState {
+        // There is no caller-supplied mutable version on this approval-
+        // consumption endpoint. This stable contract version records the
+        // expected command state without making a replay depend on the
+        // approval's post-consumption version.
+        versions: BTreeMap::from([("project_charter_approval_contract".to_owned(), 1)]),
+        digests: BTreeMap::from([("approval_id".to_owned(), approval_digest)]),
+    };
+    let command_context = CommandContext::from_authorized_input(
+        NewCommandContext {
+            principal: CommandPrincipal {
+                principal_type: "user".to_owned(),
+                principal_id: account_id.to_owned(),
+            },
+            canonical_scope: CommandScope {
+                scope_type: CommandScopeType::Account,
+                scope_id: account_id.to_owned(),
+            },
+            operation: CREATE_FROM_CHARTER_ACTION.to_owned(),
+            idempotency_key: idempotency_key.to_owned(),
+            expected_state,
+            authorization_provenance: Some(CommandAuthorizationProvenance {
+                policy_result: "allowed".to_owned(),
+                policy_revision: None,
+                policy_digest: None,
+                requested_permission: Some("propose_project".to_owned()),
+            }),
+            action_provenance: None,
+            // Correlation is a server/runtime value and must not make two
+            // exact submissions hash differently before the DB transaction.
+            correlation_id: DIRECT_PROJECT_CREATE_DIGEST_CORRELATION.to_owned(),
+            causation_id: Some(authorization.event_id.clone()),
+            causation_depth,
+        },
+        &DirectProjectCreateDigestInput {
+            approval_id,
+            authorization,
+        },
+    )
+    .map_err(|error| {
+        ServiceError::invalid_operation(format!(
+            "serialize Project-create command input digest: {error}"
+        ))
+    })?;
+
+    Ok(CreateCommandReceipt {
+        id: new_uuid_v4(),
+        principal_type: command_context.principal.principal_type,
+        principal_id: command_context.principal.principal_id,
+        scope_type: command_context
+            .canonical_scope
+            .scope_type
+            .as_str()
+            .to_owned(),
+        scope_id: command_context.canonical_scope.scope_id,
+        operation: command_context.operation,
+        idempotency_key: command_context.idempotency_key,
+        input_digest: command_context.input_digest,
+        policy_result: command_context
+            .authorization_provenance
+            .as_ref()
+            .map(|provenance| provenance.policy_result.clone())
+            .unwrap_or_else(|| "allowed".to_owned()),
+        correlation_id: correlation_id.to_owned(),
+        causation_id: command_context.causation_id,
+        causation_depth: command_context.causation_depth,
+        // The authoritative Project event id is generated inside the
+        // composite transaction and filled by the DB finalizer.
+        event_id: String::new(),
+        agent_action_execution_id: None,
+        // The DB finalizer replaces this valid placeholder with the exact
+        // Project/binding/chat/handoff result once the chat id exists.
+        outcome_json: serde_json::json!({
+            "operation": CREATE_FROM_CHARTER_ACTION,
+            "status": "pending",
+        })
+        .to_string(),
+        committed_at: now_rfc3339(),
+    })
+}
+
+/// Durable executable provisioning (repository + default role assignments)
+/// after the atomic create commits. The Project itself is already durable, so
+/// setup blockers remain in the provisioning operation and a creation replay
+/// reconciles them. Expected reconciliation failures are finalized by the
+/// durable operation itself, so this boundary never reports a failed
+/// provisioning attempt as operational success.
+async fn provision_after_create(
+    db: &Arc<SqliteDb>,
+    created: &CreatedProjectFromCharterApproval,
+) -> Result<()> {
+    let operation =
+        crate::project_provisioning::provision_genesis_project(db, &created.project.id).await?;
+    tracing::debug!(
+        project_id = %created.project.id,
+        operation_id = %operation.id,
+        status = %operation.status,
+        checkpoint = %operation.current_checkpoint,
+        "Genesis Project provisioning reconciled"
+    );
+    Ok(())
 }
 
 struct CreateProjectBuild {
@@ -691,6 +989,36 @@ async fn create_atomic(
         created_at: now.clone(),
         updated_at: now.clone(),
     });
+    let project_agent_binding_id = build.project_agent_binding_id.unwrap_or_else(new_uuid_v4);
+    let handoff_id = build.handoff_id.unwrap_or_else(new_uuid_v4);
+    let target_message_id = build.target_message_id.unwrap_or_else(new_uuid_v4);
+    let target_turn_id = build.target_turn_id.unwrap_or_else(new_uuid_v4);
+    let operation = input
+        .command_receipt
+        .as_ref()
+        .map(|receipt| receipt.operation.clone())
+        .unwrap_or_else(|| CREATE_FROM_CHARTER_ACTION.to_owned());
+    let outcome_json = serde_json::json!({
+        "operation": operation,
+        "project_id": project.id,
+        "project_agent_binding_id": project_agent_binding_id,
+        "project_chat_id": serde_json::Value::Null,
+        "charter_id": approval.charter_id,
+        "charter_revision_id": approval.revision_id,
+        "handoff_id": handoff_id,
+        "target_message_id": target_message_id,
+        "target_turn_id": target_turn_id,
+    })
+    .to_string();
+    let command_receipt = input.command_receipt.clone().map(|mut receipt| {
+        receipt.outcome_json = outcome_json.clone();
+        receipt
+    });
+    let action_execution = input.action_execution.clone().map(|mut execution| {
+        execution.result_json = Some(outcome_json.clone());
+        execution.action_outcome_json = Some(outcome_json.clone());
+        execution
+    });
     ProjectOrchestrationRepo::create_project_from_charter_approval(
         db,
         CreateProjectFromCharterApproval {
@@ -698,10 +1026,10 @@ async fn create_atomic(
             idempotency_key,
             account_id: account_id.clone(),
             project,
-            project_agent_binding_id: build.project_agent_binding_id.unwrap_or_else(new_uuid_v4),
-            handoff_id: build.handoff_id.unwrap_or_else(new_uuid_v4),
-            target_message_id: build.target_message_id.unwrap_or_else(new_uuid_v4),
-            target_turn_id: build.target_turn_id.unwrap_or_else(new_uuid_v4),
+            project_agent_binding_id,
+            handoff_id,
+            target_message_id,
+            target_turn_id,
             source_identity_id: build.source_identity_id,
             source_profile_id: build.source_profile_id,
             source_instruction_revision_id: build.source_instruction_revision_id,
@@ -722,9 +1050,12 @@ async fn create_atomic(
                 .or_else(|| Some(input.authorization.event_id.clone())),
             causation_depth: input.causation_depth.max(0),
             max_attempts: 3,
+            provisioning_operation_id: new_uuid_v4(),
             policy_revision: build.policy_revision,
             policy_digest: build.policy_digest,
             member_id: new_uuid_v4(),
+            command_receipt,
+            action_execution,
         },
     )
     .await

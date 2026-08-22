@@ -1,13 +1,19 @@
 use db::{
-    create_sqlite_pool, run_migrations, ActivateProjectExecutionBaseline, AgentRepo, AgentStatus,
-    ApproveProjectExecutionBaseline, CreateAgentIdentity, CreateAgentProfile, CreateProject,
-    CreateProjectCanonicalConflict, CreateProjectCharter, CreateProjectCharterRevision,
-    CreateProjectExecutionBaseline, CreateProjectExecutionBaselineRevision,
-    CreateProjectFromCharterApproval, CreateProjectReconciliation, DbError,
-    ProjectOrchestrationRepo, ResolveProjectReconciliation, SqliteDb, User, UserRepo,
+    create_sqlite_pool, run_migrations, ActivateProjectExecutionBaseline, AgentActionPolicyResult,
+    AgentActionRepo, AgentActionStatus, AgentRepo, AgentStatus, ApproveProjectExecutionBaseline,
+    CreateAgentAction, CreateAgentActionExecution, CreateAgentIdentity, CreateAgentProfile,
+    CreateCommandReceipt, CreateProject, CreateProjectCanonicalConflict, CreateProjectCharter,
+    CreateProjectCharterRevision, CreateProjectExecutionBaseline,
+    CreateProjectExecutionBaselineRevision, CreateProjectFromCharterApproval,
+    CreateProjectReconciliation, DbError, ProjectOrchestrationRepo, ResolveProjectReconciliation,
+    SqliteDb, User, UserRepo,
 };
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+use std::{
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 const ACCOUNT_ID: &str = "orchestration-account";
 const MAIN_IDENTITY_ID: &str = "orchestration-main-identity";
@@ -18,12 +24,6 @@ const PROJECT_SKILL_KEY: &str = "forge.project.orchestration/v1";
 const PROJECT_POLICY_REVISION: &str = "policy@1";
 const PROJECT_POLICY_DIGEST: &str =
     "289884035ab841815b521543c9b203dfb06e9a5c2bd787aeb0ce51936586d44e";
-
-async fn database() -> SqliteDb {
-    let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
-    run_migrations(&pool).await.expect("migrations");
-    SqliteDb::new(pool)
-}
 
 fn digest(value: &str) -> String {
     Sha256::digest(value.as_bytes())
@@ -56,7 +56,13 @@ async fn project_skill_revision_id(db: &SqliteDb) -> String {
 }
 
 async fn fixture() -> (SqliteDb, String, String, String) {
-    let db = database().await;
+    fixture_with_url("sqlite::memory:").await
+}
+
+async fn fixture_with_url(url: &str) -> (SqliteDb, String, String, String) {
+    let pool = create_sqlite_pool(url).await.expect("pool");
+    run_migrations(&pool).await.expect("migrations");
+    let db = SqliteDb::new(pool);
     let now = "2026-08-13T00:00:00.000Z";
     UserRepo::create_user(
         &db,
@@ -187,6 +193,20 @@ async fn fixture() -> (SqliteDb, String, String, String) {
     (db, genesis_id.to_owned(), main_chat_id, now.to_owned())
 }
 
+async fn file_fixture() -> (SqliteDb, String, String, String, PathBuf) {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time is after epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "forge-project-create-race-{}-{nanos}.db",
+        std::process::id()
+    ));
+    let (db, genesis_id, main_chat_id, now) =
+        fixture_with_url(&format!("sqlite://{}", path.display())).await;
+    (db, genesis_id, main_chat_id, now, path)
+}
+
 async fn approval_fixture(db: &SqliteDb, genesis_id: &str, now: &str) -> (String, String) {
     let charter_id = "orchestration-charter";
     ProjectOrchestrationRepo::create_project_charter(
@@ -231,6 +251,8 @@ async fn approval_fixture(db: &SqliteDb, genesis_id: &str, now: &str) -> (String
             content_digest: digest(content_json),
             rendered_digest: digest(rendered_view),
             created_at: now.to_owned(),
+            command_receipt: None,
+            action_execution: None,
         },
     )
     .await
@@ -320,9 +342,38 @@ fn create_input(
         causation_id: Some("orchestration-cause".to_owned()),
         causation_depth: 0,
         max_attempts: 3,
+        provisioning_operation_id: db::new_uuid_v4(),
         policy_revision: PROJECT_POLICY_REVISION.to_owned(),
         policy_digest: PROJECT_POLICY_DIGEST.to_owned(),
         member_id: "orchestration-member".to_owned(),
+        command_receipt: None,
+        action_execution: None,
+    }
+}
+
+fn project_create_receipt(
+    id: &str,
+    main_chat_id: &str,
+    input_digest: &str,
+    outcome: serde_json::Value,
+) -> CreateCommandReceipt {
+    CreateCommandReceipt {
+        id: id.to_owned(),
+        principal_type: "user".to_owned(),
+        principal_id: ACCOUNT_ID.to_owned(),
+        scope_type: "agent_chat".to_owned(),
+        scope_id: main_chat_id.to_owned(),
+        operation: "product_genesis.create_project_from_approval".to_owned(),
+        idempotency_key: "project-create-key".to_owned(),
+        input_digest: input_digest.to_owned(),
+        policy_result: "allowed".to_owned(),
+        correlation_id: "orchestration-race-correlation".to_owned(),
+        causation_id: Some("orchestration-race-causation".to_owned()),
+        causation_depth: 0,
+        event_id: String::new(),
+        agent_action_execution_id: None,
+        outcome_json: outcome.to_string(),
+        committed_at: "2026-08-13T00:00:00.000Z".to_owned(),
     }
 }
 
@@ -348,6 +399,60 @@ async fn charter_approval_create_is_atomic_and_replay_safe() {
     assert_eq!(created.charter_revision_id, revision_id);
     assert_eq!(created.project.id, "project-1");
     assert!(created.project.primary_milestone_id.is_some());
+    let frozen_turn = sqlx::query(
+        "SELECT responder_binding_id, responder_binding_version,
+                responder_identity_version, profile_version,
+                operating_skill_revision_id, policy_revision, policy_digest,
+                permission_policy_digest, tool_policy_digest, admission_digest,
+                canonical_scope_provenance_json, canonical_scope_id
+         FROM agent_chat_turn_job WHERE id = ?",
+    )
+    .bind(&created.target_turn_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("Genesis target turn provenance");
+    assert_eq!(
+        frozen_turn
+            .try_get::<String, _>("responder_binding_id")
+            .expect("binding id"),
+        created.project_agent_binding_id
+    );
+    for column in [
+        "operating_skill_revision_id",
+        "policy_revision",
+        "policy_digest",
+        "permission_policy_digest",
+        "tool_policy_digest",
+        "admission_digest",
+        "canonical_scope_provenance_json",
+    ] {
+        assert!(
+            !frozen_turn
+                .try_get::<Option<String>, _>(column)
+                .expect("frozen provenance column")
+                .is_none(),
+            "Genesis target turn must freeze {column}"
+        );
+    }
+    for column in [
+        "responder_binding_version",
+        "responder_identity_version",
+        "profile_version",
+    ] {
+        assert!(
+            !frozen_turn
+                .try_get::<Option<i64>, _>(column)
+                .expect("frozen provenance version")
+                .is_none(),
+            "Genesis target turn must freeze {column}"
+        );
+    }
+    assert_eq!(
+        frozen_turn
+            .try_get::<String, _>("canonical_scope_id")
+            .expect("canonical scope id"),
+        created.project_chat_id
+    );
     let milestone_lifecycle: String = sqlx::query_scalar(
         "SELECT lifecycle FROM project_milestone WHERE project_id = ? AND milestone_key = 'M001'",
     )
@@ -517,6 +622,292 @@ async fn charter_approval_create_is_atomic_and_replay_safe() {
     .expect("explicit reconciliation");
     assert_eq!(resolved.state, "retained");
     assert!(resolved.current_resolution_id.is_some());
+}
+
+#[tokio::test]
+async fn main_project_create_finalizes_action_and_receipt_in_the_composite_transaction() {
+    let (db, genesis_id, main_chat_id, now) = fixture().await;
+    let (charter_id, revision_id) = approval_fixture(&db, &genesis_id, &now).await;
+    let source = r#"{"schema_version":"forge.project-charter-handoff/v1","project":{"id":"project-command","name":"Compact Orchestration Project","mode":"compact"},"target":{},"source":{"identity_id":"orchestration-main-identity","profile_revision_id":"orchestration-main-profile"}}"#;
+    let mut input = create_input(
+        "orchestration-approval",
+        "project-command",
+        "orchestration-command-handoff",
+        "orchestration-command-target-message",
+        "orchestration-command-target-turn",
+        &now,
+        source,
+    );
+    let action_id = "orchestration-main-project-action";
+    let action = AgentActionRepo::create_action(
+        &db,
+        CreateAgentAction {
+            id: action_id.to_owned(),
+            actor_identity_id: MAIN_IDENTITY_ID.to_owned(),
+            scope_type: "agent_chat".to_owned(),
+            scope_id: main_chat_id.clone(),
+            operation: "product_genesis.create_project_from_approval".to_owned(),
+            payload_json: r#"{"approval_id":"orchestration-approval"}"#.to_owned(),
+            payload_hash: "command-payload-digest".to_owned(),
+            dedupe_key: "orchestration-main-project-action-dedupe".to_owned(),
+            correlation_id: "orchestration-command-correlation".to_owned(),
+            causation_id: None,
+            causation_depth: 0,
+            requested_permission: "propose_project".to_owned(),
+            policy_result: AgentActionPolicyResult::Allowed,
+            policy_reason: None,
+            status: AgentActionStatus::Proposed,
+            target_type: Some("project".to_owned()),
+            target_id: Some("project-command".to_owned()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Main project action");
+    let placeholder =
+        r#"{"operation":"product_genesis.create_project_from_approval","pending":true}"#;
+    let execution_id = "orchestration-main-project-execution";
+    input.action_execution = Some(CreateAgentActionExecution {
+        id: execution_id.to_owned(),
+        action_id: action.id.clone(),
+        expected_action_version: action.version,
+        attempt: 1,
+        status: db::AgentActionExecutionStatus::Succeeded,
+        result_json: Some(placeholder.to_owned()),
+        error: None,
+        executed_by_type: "user".to_owned(),
+        executed_by_id: ACCOUNT_ID.to_owned(),
+        idempotency_key: input.idempotency_key.clone(),
+        action_status: AgentActionStatus::Executed,
+        action_outcome_json: Some(placeholder.to_owned()),
+        created_at: now.clone(),
+        completed_at: Some(now.clone()),
+        updated_at: now.clone(),
+    });
+    input.command_receipt = Some(CreateCommandReceipt {
+        id: "orchestration-main-project-receipt".to_owned(),
+        principal_type: "user".to_owned(),
+        principal_id: ACCOUNT_ID.to_owned(),
+        scope_type: "agent_chat".to_owned(),
+        scope_id: main_chat_id,
+        operation: "product_genesis.create_project_from_approval".to_owned(),
+        idempotency_key: input.idempotency_key.clone(),
+        input_digest: "canonical-command-digest".to_owned(),
+        policy_result: "allowed".to_owned(),
+        correlation_id: "orchestration-command-correlation".to_owned(),
+        causation_id: None,
+        causation_depth: 0,
+        event_id: String::new(),
+        agent_action_execution_id: Some(execution_id.to_owned()),
+        outcome_json: placeholder.to_owned(),
+        committed_at: now.clone(),
+    });
+
+    let created =
+        ProjectOrchestrationRepo::create_project_from_charter_approval(&db, input.clone())
+            .await
+            .expect("atomic Main project command");
+    let expected = serde_json::json!({
+        "operation": "product_genesis.create_project_from_approval",
+        "project_id": created.project.id,
+        "project_agent_binding_id": created.project_agent_binding_id,
+        "project_chat_id": created.project_chat_id,
+        "charter_id": charter_id,
+        "charter_revision_id": revision_id,
+        "handoff_id": created.handoff_id,
+        "target_message_id": created.target_message_id,
+        "target_turn_id": created.target_turn_id,
+    });
+    let (stored_outcome, stored_event_id, stored_execution_id): (String, String, String) =
+        sqlx::query_as(
+            "SELECT outcome_json, event_id, agent_action_execution_id
+             FROM command_receipt WHERE id = 'orchestration-main-project-receipt'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("Main project receipt");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stored_outcome).expect("outcome JSON"),
+        expected
+    );
+    assert_eq!(stored_execution_id, execution_id);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM domain_event WHERE id = ?")
+            .bind(stored_event_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("project event"),
+        1
+    );
+    let (execution_result, execution_status): (String, String) =
+        sqlx::query_as("SELECT result_json, status FROM agent_action_execution WHERE id = ?")
+            .bind(execution_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("project execution");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&execution_result).unwrap(),
+        expected
+    );
+    assert_eq!(execution_status, "succeeded");
+
+    let replay = ProjectOrchestrationRepo::create_project_from_charter_approval(&db, input)
+        .await
+        .expect("response-loss replay");
+    assert_eq!(replay.project.id, created.project.id);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM project WHERE id = 'project-command'",)
+            .fetch_one(db.pool())
+            .await
+            .expect("one project"),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM agent_action_execution WHERE action_id = ?",
+        )
+        .bind(action_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("one execution"),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_main_project_create_replay_uses_the_first_frozen_ids() {
+    let (db, genesis_id, main_chat_id, now, path) = file_fixture().await;
+    let (charter_id, revision_id) = approval_fixture(&db, &genesis_id, &now).await;
+    let source = r#"{"schema_version":"forge.project-charter-handoff/v1","project":{"name":"Compact Orchestration Project","mode":"compact"},"target":{},"source":{"identity_id":"orchestration-main-identity","profile_revision_id":"orchestration-main-profile"}}"#;
+    let outcome = |project_id: &str,
+                   binding_id: &str,
+                   chat_id: &str,
+                   handoff_id: &str,
+                   message_id: &str,
+                   turn_id: &str| {
+        serde_json::json!({
+            "operation": "product_genesis.create_project_from_approval",
+            "project_id": project_id,
+            "project_agent_binding_id": binding_id,
+            "project_chat_id": chat_id,
+            "charter_id": charter_id,
+            "charter_revision_id": revision_id,
+            "handoff_id": handoff_id,
+            "target_message_id": message_id,
+            "target_turn_id": turn_id,
+        })
+    };
+    let mut first = create_input(
+        "orchestration-approval",
+        "race-project-first",
+        "race-handoff-first",
+        "race-message-first",
+        "race-turn-first",
+        &now,
+        source,
+    );
+    first.command_receipt = Some(project_create_receipt(
+        "race-receipt-first",
+        &main_chat_id,
+        "project-create-race-digest",
+        outcome(
+            "race-project-first",
+            "race-binding-first",
+            "race-chat-first",
+            "race-handoff-first",
+            "race-message-first",
+            "race-turn-first",
+        ),
+    ));
+    let mut second = create_input(
+        "orchestration-approval",
+        "race-project-second",
+        "race-handoff-second",
+        "race-message-second",
+        "race-turn-second",
+        &now,
+        source,
+    );
+    second.project_agent_binding_id = "race-binding-second".to_owned();
+    second.command_receipt = Some(project_create_receipt(
+        "race-receipt-second",
+        &main_chat_id,
+        "project-create-race-digest",
+        outcome(
+            "race-project-second",
+            "race-binding-second",
+            "race-chat-second",
+            "race-handoff-second",
+            "race-message-second",
+            "race-turn-second",
+        ),
+    ));
+
+    let first_retry = first.clone();
+    let second_retry = second.clone();
+    let (first_result, second_result) = tokio::join!(
+        ProjectOrchestrationRepo::create_project_from_charter_approval(&db, first),
+        ProjectOrchestrationRepo::create_project_from_charter_approval(&db, second),
+    );
+    let first_result = first_result.expect("first concurrent Main Project-create");
+    let second_result = second_result.expect("second concurrent Main Project-create replay");
+    assert_eq!(first_result.project, second_result.project);
+    assert_eq!(
+        first_result.project_agent_binding_id,
+        second_result.project_agent_binding_id
+    );
+    assert_eq!(first_result.project_chat_id, second_result.project_chat_id);
+    assert_eq!(first_result.handoff_id, second_result.handoff_id);
+    assert_eq!(
+        first_result.target_message_id,
+        second_result.target_message_id
+    );
+    assert_eq!(first_result.target_turn_id, second_result.target_turn_id);
+    assert_eq!(first_result.charter_id, charter_id);
+    assert_eq!(first_result.charter_revision_id, revision_id);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM project")
+            .fetch_one(db.pool())
+            .await
+            .expect("one Project"),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_handoff")
+            .fetch_one(db.pool())
+            .await
+            .expect("one handoff"),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_chat_message")
+            .fetch_one(db.pool())
+            .await
+            .expect("one target message"),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_chat_turn_job")
+            .fetch_one(db.pool())
+            .await
+            .expect("one target turn"),
+        1
+    );
+
+    let mut changed = first_retry;
+    changed
+        .command_receipt
+        .as_mut()
+        .expect("Main receipt")
+        .input_digest = "project-create-changed-digest".to_owned();
+    assert!(matches!(
+        ProjectOrchestrationRepo::create_project_from_charter_approval(&db, changed).await,
+        Err(DbError::IdempotencyConflict)
+    ));
+    let _ = second_retry;
+    db.pool().close().await;
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]

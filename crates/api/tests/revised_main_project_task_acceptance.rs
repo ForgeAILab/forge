@@ -76,6 +76,13 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
         ],
     )
     .await;
+    let reviewer = connect_embedded(
+        app,
+        &token,
+        "acceptance-reviewer",
+        &["read_project", "read_task", "task_read", "approve_actions"],
+    )
+    .await;
 
     let main_identity = required_string(&main, &["agent", "id"]);
     let main_profile = required_string(&main, &["profile", "id"]);
@@ -83,6 +90,29 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
     let project_profile = required_string(&project_agent, &["profile", "id"]);
     let worker_identity = required_string(&worker, &["agent", "id"]);
     let worker_profile = required_string(&worker, &["profile", "id"]);
+    let reviewer_identity = required_string(&reviewer, &["agent", "id"]);
+    let reviewer_profile = required_string(&reviewer, &["profile", "id"]);
+
+    // The acceptance test deliberately uses a non-routable provider endpoint
+    // because it claims through TaskService directly.  Mark the two
+    // repository identities' connection health explicitly so the setup
+    // fixture models an active execution identity without probing a network.
+    for profile_id in [&worker_profile, &reviewer_profile] {
+        let now = db::now_rfc3339();
+        db::AgentConnectionHealthRepo::upsert_connection_health(
+            &*harness.state.db,
+            db::UpsertAgentConnectionHealth {
+                profile_id: profile_id.clone(),
+                status: "healthy".to_owned(),
+                capability_status_json: "{}".to_owned(),
+                checked_at: Some(now.clone()),
+                error_code: None,
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("acceptance execution profile health creates");
+    }
 
     let main_binding = request_json(
         app,
@@ -317,21 +347,30 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
     )
     .await;
     let provisioned_path = required_string(&repos["items"][0], &["local_path"]);
+    let provisioned_repo_id = required_string(&repos["items"][0], &["id"]);
     assert_eq!(
         git_default_branch(std::path::Path::new(&provisioned_path)),
         "main",
         "provisioned Project repository is initialized on main"
     );
+    common::configure_execution_test_setup(
+        &harness.state.db,
+        &project_id,
+        &provisioned_repo_id,
+        &worker_identity,
+        &reviewer_identity,
+    )
+    .await;
 
-    // The autonomous_v1 template has a canonical Worker role, which lets the
-    // native Task session prove task_write without pretending that Project
-    // Chat itself has repository authority.
+    // The default template has distinct Worker and Reviewer roles, which lets
+    // the native Task session prove task_write while the execution setup
+    // keeps the required independent reviewer separate.
     let _workflow = request_json(
         app,
         Method::PUT,
         &format!("/api/v1/projects/{project_id}/workflow"),
         &token,
-        json!({ "template_name": "autonomous_v1" }),
+        json!({ "template_name": "default" }),
         &[StatusCode::OK],
     )
     .await;
@@ -434,8 +473,9 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
         "denial must not create an action"
     );
 
-    // Project Agent Task proposal remains an action envelope until the
-    // existing approval/TaskService path commits the authoritative Task.
+    // Project Agent Task proposal is an admitted direct command.  The Task
+    // and receipt are committed in this one request; no approval/execution
+    // Action envelope is created for the automatically allowed operation.
     let proposal = request_json(
         app,
         Method::POST,
@@ -452,52 +492,20 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
     )
     .await;
     assert_eq!(required_string(&proposal, &["operation"]), "task.propose");
-    let proposal_id = required_string(&proposal, &["id"]);
-    let mut proposal_version = proposal
-        .get("version")
-        .and_then(Value::as_i64)
-        .expect("proposal version");
-
-    if proposal.get("status").and_then(Value::as_str) == Some("pending_approval") {
-        let approved = request_json(
-            app,
-            Method::POST,
-            &format!("/api/v1/actions/{proposal_id}/approve"),
-            &token,
-            json!({
-                "expected_version": proposal_version,
-                "approver_identity_id": worker_identity,
-                "decision": "approved",
-                "reason": "acceptance worker approval"
-            }),
-            &[StatusCode::OK],
-        )
-        .await;
-        proposal_version = approved
-            .get("version")
-            .and_then(Value::as_i64)
-            .expect("approved proposal version");
-    }
-
-    let executed = request_json(
-        app,
-        Method::POST,
-        &format!("/api/v1/actions/{proposal_id}/execute-task"),
-        &token,
-        json!({
-            "expected_version": proposal_version,
-            "idempotency_key": "revised-acceptance-task-execution"
-        }),
-        &[StatusCode::OK],
-    )
-    .await;
-    let task_id = required_string(&executed, &["task", "id"]);
+    assert_eq!(proposal["status"], "succeeded");
+    assert_eq!(proposal["materialized"], true);
+    assert_eq!(proposal["domain_committed"], true);
+    assert_eq!(proposal["requires_user_authorization"], false);
+    assert!(proposal["receipt_id"].as_str().is_some());
+    assert!(proposal["input_digest"].as_str().is_some());
+    let executed = &proposal;
+    let task_id = required_string(executed, &["task", "id"]);
     assert_eq!(
         executed["task"]["task_state_config"]["review"]["ci_steps"][0], "python3 -m unittest -v",
         "typed Task proposals must inherit the Project review policy just like direct Task creation"
     );
     assert_eq!(
-        required_string(&executed, &["task", "project_id"]),
+        required_string(executed, &["task", "project_id"]),
         project_id
     );
 
@@ -576,35 +584,6 @@ async fn create_active_execution_baseline(
     let project_version = project["version"]
         .as_i64()
         .expect("baseline Project version");
-    let proposed = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/execution-baseline",
-            authority.project_id
-        ),
-        token,
-        json!({
-            "mutation": {
-                "expected_version": project_version,
-                "idempotency_key": "revised-acceptance-baseline-propose",
-                "authorization": user_authorization(
-                    "project.execution_baseline.propose",
-                    "revised-acceptance-baseline-propose-event"
-                )
-            }
-        }),
-        &[StatusCode::CREATED, StatusCode::OK],
-    )
-    .await;
-    // The baseline shell id is server-minted; clients read it back from the
-    // proposal response.
-    let baseline_id = required_string(&proposed, &["baseline", "id"]);
-    let baseline_id = baseline_id.as_str();
-    let baseline_version = proposed["baseline"]["version"]
-        .as_i64()
-        .expect("proposed baseline version");
-
     let release_policy: api_types::ExecutionBaselineReleasePolicy = serde_json::from_value(json!({
         "schema_version": services::EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA,
         "revision": "revised-acceptance-policy-r1",
@@ -668,6 +647,43 @@ async fn create_active_execution_baseline(
         serde_json::from_value(content.clone()).expect("baseline content parses");
     let rendered =
         services::render_execution_baseline(&typed_content).expect("execution baseline renders");
+    let draft = request_json(
+        app,
+        Method::POST,
+        &format!(
+            "/api/v1/projects/{}/execution-baseline",
+            authority.project_id
+        ),
+        token,
+        json!({
+            "mutation": {
+                "expected_version": 0,
+                "idempotency_key": "revised-acceptance-baseline-draft",
+                "authorization": user_authorization(
+                    "project.execution_baseline.save_draft",
+                    "revised-acceptance-baseline-draft-event"
+                )
+            },
+            "operation": "save_draft",
+            "base_revision_id": null,
+            "content": content.clone(),
+            "rendered_view": rendered.rendered_view.clone(),
+            "render_version": services::EXECUTION_BASELINE_RENDER_VERSION,
+            "content_digest": rendered.content_digest.clone(),
+            "render_digest": rendered.render_digest.clone(),
+            "provenance": user_provenance("Revised acceptance baseline draft")
+        }),
+        &[StatusCode::CREATED, StatusCode::OK],
+    )
+    .await;
+    assert_eq!(draft["baseline"]["lifecycle"], json!("draft"));
+    assert_eq!(draft["requires_user_authorization"], json!(false));
+    let baseline_id = required_string(&draft, &["baseline", "id"]);
+    let baseline_id = baseline_id.as_str();
+    let baseline_version = draft["baseline"]["version"]
+        .as_i64()
+        .expect("draft baseline version");
+    let draft_revision_id = required_string(&draft, &["current_revision", "id"]);
     let saved = request_json(
         app,
         Method::POST,
@@ -681,22 +697,28 @@ async fn create_active_execution_baseline(
                 "expected_version": baseline_version,
                 "idempotency_key": "revised-acceptance-baseline-revision",
                 "authorization": user_authorization(
-                    "project.execution_baseline.revise",
+                    "project.execution_baseline.propose_for_approval",
                     "revised-acceptance-baseline-revision-event"
                 )
             },
-            "base_revision_id": null,
-            "content": content,
-            "rendered_view": rendered.rendered_view,
+            "operation": "propose_for_approval",
+            "base_revision_id": draft_revision_id,
+            "content": content.clone(),
+            "rendered_view": rendered.rendered_view.clone(),
             "render_version": services::EXECUTION_BASELINE_RENDER_VERSION,
-            "content_digest": rendered.content_digest,
-            "render_digest": rendered.render_digest,
+            "content_digest": rendered.content_digest.clone(),
+            "render_digest": rendered.render_digest.clone(),
             "provenance": user_provenance("Todo execution baseline")
         }),
         &[StatusCode::CREATED, StatusCode::OK],
     )
     .await;
-    let baseline_revision_id = required_string(&saved, &["current_revision", "id"]);
+    assert_eq!(saved["requires_user_authorization"], json!(true));
+    assert_eq!(
+        saved["approval_target"]["requires_user_authorization"],
+        json!(true)
+    );
+    let baseline_revision_id = required_string(&saved, &["approval_target", "revision_id"]);
     let revised_version = saved["baseline"]["version"]
         .as_i64()
         .expect("revised baseline version");
@@ -720,7 +742,7 @@ async fn create_active_execution_baseline(
             "revision_id": baseline_revision_id,
             "content_digest": rendered.content_digest,
             "render_digest": rendered.render_digest,
-            "expected_project_version": project_version + 1
+            "expected_project_version": project_version
         }),
         &[StatusCode::CREATED, StatusCode::OK],
     )
@@ -736,7 +758,7 @@ async fn create_active_execution_baseline(
         token,
         json!({
             "mutation": {
-                "expected_version": project_version + 1,
+                "expected_version": project_version,
                 "idempotency_key": "revised-acceptance-baseline-activate",
                 "authorization": user_authorization(
                     "project.execution_baseline.activate",
@@ -746,8 +768,9 @@ async fn create_active_execution_baseline(
             "baseline_id": baseline_id,
             "revision_id": baseline_revision_id,
             "approval_id": approval_id,
-            "content_digest": rendered.content_digest,
-            "render_digest": rendered.render_digest
+            "expected_baseline_version": approved["baseline"]["version"],
+            "content_digest": rendered.content_digest.clone(),
+            "render_digest": rendered.render_digest.clone()
         }),
         &[StatusCode::OK],
     )
@@ -806,7 +829,7 @@ fn task_proposal_body(
         "title": title,
         "description": "Acceptance task",
         "role_assignments": [{
-            "role_name": "worker",
+            "role_name": "coder",
             "assignee_type": "agent",
             "assignee_id": worker_id
         }],

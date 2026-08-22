@@ -7,8 +7,10 @@ pub mod agent_chat_service;
 pub mod agent_chat_turn_policy;
 pub mod agent_chat_turn_worker;
 pub mod agent_service;
+pub mod agent_turn_admission;
 pub mod attention_service;
 pub mod auth_service;
+pub mod command_boundary;
 pub mod context_manifest;
 pub mod coordination_consumer;
 pub mod coordination_service;
@@ -24,11 +26,14 @@ pub mod embedded_agent_service;
 pub mod embedded_daemon;
 pub mod embedded_task_executor;
 pub mod execution_baseline;
+pub mod execution_setup;
 pub mod external_api;
 pub mod external_sync;
 pub mod integration_service;
 pub mod lifecycle;
+pub mod main_genesis_commands;
 pub mod main_orchestration_actions;
+pub mod main_orchestration_queries;
 pub mod memory;
 pub mod memory_source;
 pub mod merge_service;
@@ -40,15 +45,22 @@ pub mod oauth_service;
 pub mod operating_skills;
 pub mod operator_status;
 pub mod operator_status_emitter;
+pub mod orchestration_authorization;
 pub mod plan_artifact;
 pub mod pr_service;
 pub mod product_genesis;
 pub mod project_agent_actions;
 pub mod project_agent_selection;
+pub mod project_artifact_commands;
+pub mod project_charter_commands;
 pub mod project_creation;
+pub mod project_decision_commands;
 pub mod project_documents;
+pub mod project_execution_setup;
+pub mod project_execution_setup_projection;
 pub mod project_hooks;
 pub mod project_member_service;
+pub mod project_milestone_commands;
 pub mod project_orchestration;
 pub mod project_provisioning;
 pub mod project_runtime;
@@ -66,6 +78,16 @@ pub mod wake_turn_consumer;
 pub mod workflow;
 pub mod workspace_cleanup;
 pub mod workspace_execution_lock;
+
+// Test-only failpoints used by the Gate A characterization suite.  These are
+// compiled out of normal library builds; they let the suite model a process
+// stop after a domain transaction commits but before the legacy action receipt
+// transaction starts.
+#[cfg(test)]
+pub(crate) mod test_support;
+
+#[cfg(test)]
+mod receipt_characterization_tests;
 
 pub use agent_chat_memory_consumer::{
     memory_consumer_lease_owner, memory_consumer_name, AgentChatMemoryConsumer,
@@ -88,11 +110,18 @@ pub use agent_chat_turn_worker::{
     FederatedAgentChatTurnRunner,
 };
 pub use agent_service::AgentService;
+pub use agent_turn_admission::{
+    admission_digest, content_digest, handoff_admission_digest, handoff_content_digest,
+    handoff_content_digest_with_sources, AgentResponderStore, AgentTurnAdmissionInput,
+    AgentTurnAdmissionService, AgentTurnAdmitInput, AgentTurnPrepareInput, AgentTurnReadiness,
+    AgentTurnTrigger, PreparedAgentTurnAdmission, ResolvedAgentResponder,
+};
 pub use attention_service::{
-    AttentionProjectionRun, AttentionService, WakeAdmissionRequest, WakeAdmissionResult,
-    WakeSuppressionReason,
+    wake_attention_incident_digest, AttentionProjectionRun, AttentionService, WakeAdmissionRequest,
+    WakeAdmissionResult, WakeSetupReason, WakeSuppressionReason, MAX_WAKE_REACTION_DEPTH,
 };
 pub use auth_service::AuthService;
+pub use command_boundary::*;
 pub use context_manifest::{
     fragment_fingerprint, ContextManifestInput, ContextManifestService, ContextSourceInput,
 };
@@ -111,7 +140,7 @@ pub use daemon_service::{
     DaemonRegisterInput, DaemonRegistration, DaemonReportInput, DaemonService,
 };
 pub use daemon_transport::{
-    select_execution_provider, select_filesystem_provider, DaemonConnection,
+    execution_lease_owner, select_execution_provider, select_filesystem_provider, DaemonConnection,
     DaemonConnectionRegistry, EmbeddedExecutionProvider, EmbeddedFilesystemProvider,
     ExecutionProvider, FilesystemProvider, RemoteExecutionProvider, RemoteFilesystemProvider,
 };
@@ -123,16 +152,35 @@ pub use embedded_agent_service::{EmbeddedAgentService, ProviderEntryTestOutcome}
 pub use embedded_daemon::EmbeddedDaemon;
 pub use embedded_task_executor::{EmbeddedTaskExecutor, TaskExecutorRouter};
 pub use execution_baseline::{
-    baseline_column_json, render_execution_baseline, validate_execution_baseline_policy,
-    BaselineColumnJson, ExecutionBaselineRender, EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA,
-    EXECUTION_BASELINE_RENDER_VERSION, EXECUTION_BASELINE_SCHEMA_VERSION,
+    baseline_column_json, release_policy_digest, render_execution_baseline,
+    validate_execution_baseline_policy, ActivateExecutionBaselineCommand,
+    ApproveExecutionBaselineCommand, BaselineColumnJson, ExecutionBaselineApprovalTarget,
+    ExecutionBaselineCommandOutcome, ExecutionBaselineCommandService,
+    ExecutionBaselineQueryService, ExecutionBaselineRender,
+    ProposeExecutionBaselineForApprovalCommand, SaveExecutionBaselineDraftCommand,
+    EXECUTION_BASELINE_ACTIVATE_COMMAND, EXECUTION_BASELINE_APPROVE_COMMAND,
+    EXECUTION_BASELINE_PROPOSE_COMMAND, EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA,
+    EXECUTION_BASELINE_RENDER_VERSION, EXECUTION_BASELINE_SAVE_DRAFT_COMMAND,
+    EXECUTION_BASELINE_SCHEMA_VERSION,
+};
+pub use execution_setup::{
+    canonical_task_capability, classify_task_execution, eligible_project_execution_agents,
+    ensure_execution_role_principal, is_eligible_execution_identity, is_read_only_capability,
+    required_execution_roles, resolve_project_execution_roles,
+    resolve_project_execution_roles_for_provisioning, ExecutionRoleResolution,
+    RequiredExecutionRoles, TaskExecutionClass, READ_ONLY_CAPABILITY_PROFILES,
+    SUPPORTED_CAPABILITY_PROFILES,
 };
 pub use external_sync::ExternalSyncService;
 pub use integration_service::IntegrationService;
-pub use main_orchestration_actions::{
-    is_main_orchestration_operation, ExecuteMainOrchestrationActionInput,
-    MainOrchestrationActionService,
+pub use main_genesis_commands::{
+    MainGenesisCharterDraftRequest, MainGenesisCharterDraftResult, MainGenesisCommandService,
+    MainGenesisDraftCommandInput, MainGenesisDraftPrincipal,
 };
+pub use main_orchestration_actions::{
+    ExecuteMainOrchestrationActionInput, MainOrchestrationActionService,
+};
+pub use main_orchestration_queries::MainOrchestrationQueryService;
 pub use memory::{
     BackfillSummary, BackfillTypeResult, MemoryAccessContext, MemoryCreator, MemoryItemInput,
     MemoryLifecycleInput, MemoryPublicationInput, MemoryReferences, MemorySearchResult,
@@ -173,6 +221,7 @@ pub use operating_skills::{
 };
 pub use operator_status::OperatorStatusService;
 pub use operator_status_emitter::OperatorStatusEmitter;
+pub use orchestration_authorization::OrchestrationAuthorizationService;
 pub use product_genesis::{
     charter_approval_chat_message, charter_proposal_chat_message, render_product_genesis_prompt,
     validate_genesis_transition, GenesisLifecycleError, GenesisPromptContext,
@@ -180,16 +229,32 @@ pub use product_genesis::{
     SqliteProductGenesisStore, TransitionProductGenesis, PRODUCT_GENESIS_PROMPT_VERSION,
 };
 pub use project_agent_actions::{
-    is_project_orchestration_operation, ExecuteProjectOrchestrationActionInput,
-    ProjectOrchestrationActionService,
+    DirectProjectCommandResult, ExecuteDirectProjectCommandInput,
+    ExecuteProjectOrchestrationActionInput, ProjectOrchestrationActionService,
 };
 pub use project_agent_selection::{
     current_project_agent_operating_skill_revision, project_agent_policy_digest,
     resolve_genesis_project_agent, GenesisAgentSelection,
 };
+pub use project_artifact_commands::{
+    ProjectArtifactCommandService, ProjectCommandAuthorization, ProjectDocumentApprovalCommand,
+    ProjectDocumentCreateCommand, ProjectDocumentRevisionCommand, ProjectEvidenceCommand,
+    PROJECT_EVIDENCE_COMMAND,
+};
+pub use project_charter_commands::{
+    ProjectCharterApprovalCommand, ProjectCharterApprovalCommandOutcome,
+    ProjectCharterCommandService, ProjectCharterRevisionCommand,
+    ProjectCharterRevisionCommandOutcome, PROJECT_CHARTER_APPROVAL_COMMAND,
+};
 pub use project_creation::{
     create_project_from_charter_approval, CreateProjectAuthorization,
     CreateProjectFromCharterApprovalInput,
+};
+pub use project_decision_commands::{
+    ProjectDecisionApprovalCommand, ProjectDecisionCandidateCommand, ProjectDecisionCommandService,
+    ProjectDecisionEffectiveCommand, ProjectDecisionRejectionCommand,
+    PROJECT_DECISION_CANDIDATE_APPROVE_COMMAND, PROJECT_DECISION_CANDIDATE_CREATE_COMMAND,
+    PROJECT_DECISION_CANDIDATE_REJECT_COMMAND, PROJECT_DECISION_EFFECTIVE_COMMAND,
 };
 pub use project_documents::{
     diff_project_document_views, document_content_digest, document_kind_name,
@@ -197,8 +262,15 @@ pub use project_documents::{
     render_project_document, render_project_document_json, PROJECT_DOCUMENT_RENDER_VERSION,
     PROJECT_DOCUMENT_SCHEMA_VERSION,
 };
+pub use project_execution_setup::{ExecutionPrincipalRole, ProjectExecutionSetupService};
+pub use project_execution_setup_projection::load_project_execution_setup;
 pub use project_hooks::ProjectHookService;
 pub use project_member_service::ProjectMemberService;
+pub use project_milestone_commands::{
+    ProjectMilestoneCommandService, ProjectMilestoneDefinitionCommand,
+    ProjectPrimaryMilestoneCommand, ProjectReadinessRequestCommand, ProjectReleaseRequestCommand,
+    PROJECT_MILESTONE_COMMAND, PROJECT_READINESS_COMMAND, PROJECT_RELEASE_REQUEST_COMMAND,
+};
 pub use project_orchestration::{
     charter_change_summary, charter_content_digest, charter_render_digest, compute_charter_digests,
     diff_project_charter_content, evaluate_charter_readiness, evaluate_project_charter_readiness,
@@ -218,7 +290,10 @@ pub use recovery::{CrashRecovery, HeartbeatMonitor};
 pub use shared_media_cleanup::SharedMediaCleanupScheduler;
 pub use shutdown::GracefulShutdown;
 pub use task_dispatcher::TaskDispatcher;
-pub use task_service::{NewSubtaskInput, TaskService};
+pub use task_service::{
+    AdaptiveTaskCommand, AdaptiveTaskCommandResult, DirectTaskProposalInput, NewSubtaskInput,
+    TaskProposalCommandResult, TaskService,
+};
 pub use terminal_service::{TerminalActivityTracker, TerminalService};
 pub use types::Assignee;
 pub use wake_turn_consumer::{
@@ -234,6 +309,12 @@ pub type Result<T> = std::result::Result<T, ServiceError>;
 pub enum ServiceError {
     #[error("dependency gate")]
     DependencyGate,
+
+    #[error("execution setup required: {message}")]
+    ExecutionSetupRequired {
+        message: String,
+        requirements: Vec<api_types::SetupRequirement>,
+    },
 
     #[error(transparent)]
     Db(db::DbError),
@@ -399,6 +480,16 @@ impl ServiceError {
     pub(crate) fn invalid_operation(message: impl Into<String>) -> Self {
         Self::InvalidOperation {
             message: message.into(),
+        }
+    }
+
+    pub(crate) fn execution_setup_required(
+        message: impl Into<String>,
+        requirements: Vec<api_types::SetupRequirement>,
+    ) -> Self {
+        Self::ExecutionSetupRequired {
+            message: message.into(),
+            requirements,
         }
     }
 

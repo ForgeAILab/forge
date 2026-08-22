@@ -23,6 +23,7 @@ import {
 import type { AgentChatEntry } from '@/features/agent-chat/types'
 import { BaselineApprovalCard } from '@/features/agent-chat/BaselineApprovalCard'
 import { ProjectCharterApprovalCard } from '@/features/project-charter/ProjectCharterApprovalCard'
+import { ProjectExecutionSetupPanel } from '@/features/project-execution/ProjectExecutionSetupPanel'
 import { useChatSelection } from '@/stores/chat'
 import { useProjectsInfiniteQuery } from '@/api/hooks'
 
@@ -200,6 +201,11 @@ export function ChatPage({ projectId }: { projectId?: string }) {
         </div>
       </header>
       <div className="flex min-h-0 flex-1 flex-col">
+        {projectId ? (
+          <div className="max-h-[min(42vh,32rem)] shrink-0 overflow-y-auto border-b border-border-subtle bg-muted/10 p-3 sm:p-4">
+            <ProjectExecutionSetupPanel projectId={projectId} compact />
+          </div>
+        ) : null}
         {chatsQuery.isLoading || (activeChatId && chatQuery.isLoading) ? (
           <LoadingPanel label="Loading Agent Chat" />
         ) : chatsQuery.isError ? (
@@ -229,18 +235,40 @@ export function ChatPage({ projectId }: { projectId?: string }) {
                 replaced, revoked, or archived. Forge will not admit a turn until the authorized
                 binding is restored.
               </p>
-              <Link
-                to="/agents"
-                search={projectId ? { project: projectId } : { tab: 'bindings' }}
-                className="mt-5 inline-flex items-center gap-1.5 text-xs font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                Open Agent settings <ArrowUpRight size={13} aria-hidden />
-              </Link>
+              {projectId ? (
+                <p className="mt-5 text-xs leading-5 text-muted-foreground" role="status">
+                  Use the single Project Agent action in Execution readiness above to restore this
+                  binding.
+                </p>
+              ) : (
+                <Link
+                  to="/agents"
+                  search={{ tab: 'bindings' }}
+                  className="mt-5 inline-flex items-center gap-1.5 text-xs font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  Open Agent settings <ArrowUpRight size={13} aria-hidden />
+                </Link>
+              )}
             </section>
           </div>
         ) : chatNeedsSetup || !chatQuery.data ? (
           <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto p-4 sm:p-6">
-            <ChatSetupRequired projectId={projectId} />
+            {projectId ? (
+              <section
+                className="mx-auto w-full max-w-xl rounded-xl border border-warning/30 bg-warning/5 p-5"
+                role="status"
+              >
+                <h2 className="text-base font-semibold text-foreground">
+                  Project Chat setup required
+                </h2>
+                <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                  Use the single Project Agent action in Execution readiness above. Forge will not
+                  admit a Project Chat turn until its authorized binding is ready.
+                </p>
+              </section>
+            ) : (
+              <ChatSetupRequired projectId={projectId} />
+            )}
           </div>
         ) : (
           <>

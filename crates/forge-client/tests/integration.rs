@@ -285,6 +285,7 @@ async fn create_project_route(
         current_charter_version: 0,
         primary_milestone_id: None,
         version: 1,
+        execution_setup: None,
     };
     data.projects.insert(project.id.clone(), project.clone());
     Json(project)

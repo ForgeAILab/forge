@@ -509,7 +509,18 @@ async fn connected_remote_daemon_receives_execution_start_request() {
     let starter: tokio::task::JoinHandle<services::Result<api_types::ExecutionStartResult>> =
         tokio::spawn(async move { service.start_execution(execution_id).await });
 
-    let frame = outbound.recv().await.expect("server sends execution start");
+    let frame = match tokio::time::timeout(std::time::Duration::from_secs(2), outbound.recv()).await
+    {
+        Ok(Some(frame)) => frame,
+        Ok(None) => {
+            starter.abort();
+            panic!("daemon request channel closed before execution start")
+        }
+        Err(_) => {
+            starter.abort();
+            panic!("server did not send execution start within two seconds")
+        }
+    };
     let DaemonFrame::Request { id, method, params } = frame else {
         panic!("expected daemon request frame");
     };
@@ -559,7 +570,18 @@ async fn remote_execution_start_error_marks_execution_failed() {
     let starter: tokio::task::JoinHandle<services::Result<api_types::ExecutionStartResult>> =
         tokio::spawn(async move { service.start_execution(execution_id).await });
 
-    let frame = outbound.recv().await.expect("server sends execution start");
+    let frame = match tokio::time::timeout(std::time::Duration::from_secs(2), outbound.recv()).await
+    {
+        Ok(Some(frame)) => frame,
+        Ok(None) => {
+            starter.abort();
+            panic!("daemon request channel closed before execution start")
+        }
+        Err(_) => {
+            starter.abort();
+            panic!("server did not send execution start within two seconds")
+        }
+    };
     let DaemonFrame::Request { id, method, .. } = frame else {
         panic!("expected daemon request frame");
     };

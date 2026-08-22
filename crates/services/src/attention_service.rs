@@ -5,7 +5,8 @@ use api_types::{
     AgentBindingSummary, AgentContinuityHealth, AgentDetailResponse, AgentScopeSummary,
     AgentSessionSummary, AgentUsageSummary, AttentionCategory, AttentionConsumerHealthResponse,
     AttentionItem, AttentionLifecycle, MissionControlAgentHealth, MissionControlCapacity,
-    MissionControlHomeResponse, MissionControlRecentOutcome, MissionControlWorkItem,
+    MissionControlCoordinationActivity, MissionControlHomeResponse, MissionControlRecentOutcome,
+    MissionControlWorkItem,
 };
 use chrono::{DateTime, Duration, Utc};
 use db::{
@@ -16,6 +17,7 @@ use db::{
     UpdateAttentionLifecycle, UpsertAttentionConsumerHealth,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use sqlx::{sqlite::SqliteRow, Row, Sqlite, Transaction};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -29,6 +31,10 @@ const MAX_ATTENTION_SUMMARY_LEN: usize = 160;
 const PROJECTION_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
 const WAKE_LEASE_SECONDS: i64 = 60;
 const WAKE_COOLDOWN_SECONDS: i64 = 300;
+/// Maximum causal hop count for an admitted autonomous wake.  A wake decision
+/// consumes the next hop, so depth 8 is terminally suppressed rather than
+/// admitted with a lease depth the next turn would exceed.
+pub const MAX_WAKE_REACTION_DEPTH: i64 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttentionProjectionRun {
@@ -63,6 +69,9 @@ pub enum WakeAdmissionResult {
     Suppressed {
         reason: WakeSuppressionReason,
     },
+    SetupRequired {
+        reason: WakeSetupReason,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,7 +81,60 @@ pub enum WakeSuppressionReason {
     BudgetExhausted,
     ReactionDepthExceeded,
     SelfEvent,
+    RecursiveAgentResponse,
     IneligibleScope,
+    ResolvedIncident,
+}
+
+impl WakeSuppressionReason {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::DuplicateIncident => "duplicate_incident",
+            Self::Cooldown => "cooldown",
+            Self::BudgetExhausted => "budget_exhausted",
+            Self::ReactionDepthExceeded => "reaction_depth_exceeded",
+            Self::SelfEvent => "self_event",
+            Self::RecursiveAgentResponse => "retry_exhausted_same_chat",
+            Self::IneligibleScope => "ineligible_scope",
+            Self::ResolvedIncident => "resolved_incident",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeSetupReason {
+    ResponderBindingMissing,
+}
+
+impl WakeSetupReason {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::ResponderBindingMissing => "responder_binding_missing",
+        }
+    }
+}
+
+/// Context carried from the Attention projection into a wake decision.  The
+/// decision event is the wake consumer's source event; these references point
+/// back to the incident/source that caused it and never contain incident
+/// details or model content.
+#[derive(Debug, Clone, Default)]
+struct WakeDecisionContext {
+    attention_id: Option<String>,
+    source_event_id: Option<String>,
+    incident_digest: Option<String>,
+    attention_status: Option<String>,
+    attention_version: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+enum WakeDecisionEvent {
+    Admitted {
+        leased_until: String,
+        cooldown_until: String,
+    },
+    Suppressed(WakeSuppressionReason),
+    SetupRequired(WakeSetupReason),
 }
 
 #[derive(Clone)]
@@ -245,38 +307,144 @@ impl AttentionService {
         })
     }
 
-    /// Apply deterministic wake admission after an Attention projection.  No
-    /// model/job is created here: callers receive a durable incident lease
-    /// only when the scope budget, cooldown, causation depth, and self-event
-    /// rules all pass in one SQLite transaction.
+    /// Apply deterministic wake admission after an Attention projection.
+    /// This is a *pre-admission* decision: an `agent.wake.admitted` event
+    /// reserves one analysis lease and consumes one budget unit, but creates
+    /// no model job.  The wake consumer records the final `turn_admitted`,
+    /// `deterministically_suppressed`, `deferred`, or `setup_required`
+    /// disposition for that decision event before advancing its cursor.
     pub async fn admit_wake(&self, request: WakeAdmissionRequest) -> Result<WakeAdmissionResult> {
-        if request.reaction_depth > 8 {
-            return Ok(WakeAdmissionResult::Suppressed {
-                reason: WakeSuppressionReason::ReactionDepthExceeded,
-            });
+        let context = self.wake_decision_context_for_incident(&request).await?;
+        // Projection requests with no current binding carry an empty identity
+        // deliberately.  Preserve that configuration failure as a durable
+        // setup decision rather than classifying it as an ineligible identity
+        // (and never consult or consume a budget for it).
+        if request.identity_id.trim().is_empty() {
+            if let Some(reason) = wake_pre_admission_suppression_reason(&request) {
+                return self
+                    .persist_suppressed_wake(&request, &context, reason)
+                    .await;
+            }
+            if context.attention_id.is_some() {
+                return self.persist_setup_required_wake(&request, &context).await;
+            }
         }
-        if request.reaction_depth > 0
-            && request.caused_by_identity_id.as_deref() == Some(request.identity_id.as_str())
+        self.admit_wake_with_context(request, context).await
+    }
+
+    async fn wake_decision_context_for_incident(
+        &self,
+        request: &WakeAdmissionRequest,
+    ) -> Result<WakeDecisionContext> {
+        let row = sqlx::query(
+            "SELECT id, attention_type, scope_type, scope_id, status,
+                    source_event_id, source_sequence, details_json,
+                    recommended_action, version
+             FROM attention_projection WHERE dedupe_key = ?",
+        )
+        .bind(&request.incident_key)
+        .fetch_optional(self.db.pool())
+        .await?;
+        let Some(row) = row else {
+            return Ok(WakeDecisionContext::default());
+        };
+        let id: String = row.try_get("id")?;
+        let attention_type: String = row.try_get("attention_type")?;
+        let scope_type: String = row.try_get("scope_type")?;
+        let scope_id: String = row.try_get("scope_id")?;
+        let status: String = row.try_get("status")?;
+        let source_event_id: String = row.try_get("source_event_id")?;
+        let source_sequence: Option<i64> = row.try_get("source_sequence")?;
+        let details_json: String = row.try_get("details_json")?;
+        let recommended_action: String = row.try_get("recommended_action")?;
+        let version: i64 = row.try_get("version")?;
+        Ok(WakeDecisionContext {
+            attention_id: Some(id),
+            source_event_id: Some(source_event_id.clone()),
+            incident_digest: Some(wake_attention_state_digest(
+                &attention_type,
+                &scope_type,
+                &scope_id,
+                &status,
+                &source_event_id,
+                source_sequence,
+                &details_json,
+                &recommended_action,
+                version,
+            )),
+            attention_status: Some(status),
+            attention_version: Some(version),
+        })
+    }
+
+    async fn admit_wake_with_context(
+        &self,
+        request: WakeAdmissionRequest,
+        context: WakeDecisionContext,
+    ) -> Result<WakeAdmissionResult> {
+        if let Some(reason) = wake_pre_admission_suppression_reason(&request) {
+            return self
+                .persist_suppressed_wake(&request, &context, reason)
+                .await;
+        }
+        // A projection crash can replay the same source event after the
+        // lease/event transaction committed. Context-bearing projection calls
+        // are idempotent at the pre-admission boundary: return the original
+        // lease metadata instead of consuming budget again or turning one
+        // source event into an admitted event followed by a duplicate
+        // suppression.
+        if context.source_event_id.is_some() {
+            let dedupe_key = wake_admitted_dedupe_key(&request, &context);
+            if let Some(event) =
+                DomainEventRepo::get_event_by_dedupe(&*self.db, &dedupe_key).await?
+            {
+                let payload =
+                    serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
+                let leased_until = payload
+                    .get("leased_until")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let cooldown_until = payload
+                    .get("cooldown_until")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let budget_remaining = payload.get("budget_remaining").and_then(Value::as_i64);
+                return Ok(WakeAdmissionResult::Admitted {
+                    leased_until,
+                    cooldown_until,
+                    budget_remaining,
+                });
+            }
+        }
+        if matches!(request.scope_type.as_str(), "project" | "agent_chat")
+            && !self
+                .wake_responder_is_configured(&request.scope_type, &request.scope_id, None)
+                .await?
         {
-            return Ok(WakeAdmissionResult::Suppressed {
-                reason: WakeSuppressionReason::SelfEvent,
-            });
+            if context.attention_id.is_some() {
+                return self.persist_setup_required_wake(&request, &context).await;
+            }
+            return self
+                .persist_suppressed_wake(&request, &context, WakeSuppressionReason::IneligibleScope)
+                .await;
         }
         if !matches!(
             request.scope_type.as_str(),
             "account" | "project" | "agent_chat" | "task"
         ) {
-            return Ok(WakeAdmissionResult::Suppressed {
-                reason: WakeSuppressionReason::IneligibleScope,
-            });
+            return self
+                .persist_suppressed_wake(&request, &context, WakeSuppressionReason::IneligibleScope)
+                .await;
         }
         if !self
             .wake_identity_is_eligible(&request.identity_id, &request.scope_type, &request.scope_id)
             .await?
         {
-            return Ok(WakeAdmissionResult::Suppressed {
-                reason: WakeSuppressionReason::IneligibleScope,
-            });
+            return self
+                .persist_suppressed_wake(&request, &context, WakeSuppressionReason::IneligibleScope)
+                .await;
         }
 
         let now = parse_rfc3339(&request.now).unwrap_or_else(Utc::now);
@@ -287,6 +455,40 @@ impl AttentionService {
         let now = now.to_rfc3339();
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
 
+        // Attention is authoritative at the admission boundary.  A source
+        // event can be delivered after an operator resolves its incident;
+        // that event receives a terminal suppression rather than waking a
+        // stale responder.
+        let attention_status = if let Some(attention_id) = context.attention_id.as_deref() {
+            sqlx::query_scalar::<_, String>("SELECT status FROM attention_projection WHERE id = ?")
+                .bind(attention_id)
+                .fetch_optional(&mut *transaction)
+                .await?
+        } else {
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM attention_projection WHERE dedupe_key = ?",
+            )
+            .bind(&request.incident_key)
+            .fetch_optional(&mut *transaction)
+            .await?
+        };
+        if attention_status.as_deref() == Some("resolved") {
+            self.append_wake_decision_in_tx(
+                &mut transaction,
+                &request,
+                &context,
+                WakeDecisionEvent::Suppressed(WakeSuppressionReason::ResolvedIncident),
+                None,
+                None,
+                &now,
+            )
+            .await?;
+            transaction.commit().await?;
+            return Ok(WakeAdmissionResult::Suppressed {
+                reason: WakeSuppressionReason::ResolvedIncident,
+            });
+        }
+
         let (budget, budget_scope_type, budget_scope_id) = self
             .wake_budget_in_tx(
                 &mut transaction,
@@ -295,8 +497,101 @@ impl AttentionService {
                 &request.scope_id,
             )
             .await?;
-        if budget == Some(0) {
+
+        // The historical lease primary key includes identity_id.  Keep that
+        // immutable schema, but make the active policy incident-global by
+        // rejecting any live lease/cooldown for the canonical scope before
+        // budget accounting.  This closes the binding-replacement race where
+        // a new identity could otherwise analyse the same incident in
+        // parallel with the old identity.
+        let existing_lease = sqlx::query(
+            "SELECT identity_id, leased_until, cooldown_until
+             FROM agent_wake_lease
+             WHERE scope_type = ? AND scope_id = ? AND incident_key = ?
+               AND (leased_until > ? OR cooldown_until > ?)
+             ORDER BY leased_until DESC, identity_id ASC
+             LIMIT 1",
+        )
+        .bind(&budget_scope_type)
+        .bind(&budget_scope_id)
+        .bind(&request.incident_key)
+        .bind(&now)
+        .bind(&now)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some(row) = existing_lease {
+            let leased_until_existing: String = row.try_get("leased_until")?;
+            let cooldown_until_existing: Option<String> = row.try_get("cooldown_until")?;
+            let reason = if leased_until_existing > now {
+                WakeSuppressionReason::DuplicateIncident
+            } else if cooldown_until_existing
+                .as_deref()
+                .is_some_and(|value| value > now.as_str())
+            {
+                WakeSuppressionReason::Cooldown
+            } else {
+                WakeSuppressionReason::DuplicateIncident
+            };
+            self.append_wake_decision_in_tx(
+                &mut transaction,
+                &request,
+                &context,
+                WakeDecisionEvent::Suppressed(reason.clone()),
+                budget,
+                Some((&budget_scope_type, &budget_scope_id)),
+                &now,
+            )
+            .await?;
+            transaction.commit().await?;
+            return Ok(WakeAdmissionResult::Suppressed { reason });
+        }
+
+        // Direct callers may not carry an Attention row (and therefore miss
+        // the context-bearing replay check above).  Once an existing lease or
+        // cooldown is ruled out, a matching admitted decision still means the
+        // source was already pre-admitted; return its metadata rather than
+        // incrementing the budget a second time before the domain-event
+        // dedupe turns the append into a no-op.
+        let dedupe_key = wake_admitted_dedupe_key(&request, &context);
+        let admitted_payload = sqlx::query_scalar::<_, String>(
+            "SELECT payload_json FROM domain_event WHERE dedupe_key = ?",
+        )
+        .bind(&dedupe_key)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some(payload_json) = admitted_payload {
+            let payload = serde_json::from_str::<Value>(&payload_json).unwrap_or(Value::Null);
+            let leased_until = payload
+                .get("leased_until")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let cooldown_until = payload
+                .get("cooldown_until")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let budget_remaining = payload.get("budget_remaining").and_then(Value::as_i64);
             transaction.rollback().await?;
+            return Ok(WakeAdmissionResult::Admitted {
+                leased_until,
+                cooldown_until,
+                budget_remaining,
+            });
+        }
+
+        if budget == Some(0) {
+            self.append_wake_decision_in_tx(
+                &mut transaction,
+                &request,
+                &context,
+                WakeDecisionEvent::Suppressed(WakeSuppressionReason::BudgetExhausted),
+                budget,
+                Some((&budget_scope_type, &budget_scope_id)),
+                &now,
+            )
+            .await?;
+            transaction.commit().await?;
             return Ok(WakeAdmissionResult::Suppressed {
                 reason: WakeSuppressionReason::BudgetExhausted,
             });
@@ -324,7 +619,17 @@ impl AttentionService {
                 .transpose()?
                 .unwrap_or((0, false));
             if in_window && admitted_count >= budget {
-                transaction.rollback().await?;
+                self.append_wake_decision_in_tx(
+                    &mut transaction,
+                    &request,
+                    &context,
+                    WakeDecisionEvent::Suppressed(WakeSuppressionReason::BudgetExhausted),
+                    Some(0),
+                    Some((&budget_scope_type, &budget_scope_id)),
+                    &now,
+                )
+                .await?;
+                transaction.commit().await?;
                 return Ok(WakeAdmissionResult::Suppressed {
                     reason: WakeSuppressionReason::BudgetExhausted,
                 });
@@ -388,12 +693,12 @@ impl AttentionService {
                     OR agent_wake_lease.cooldown_until <= excluded.updated_at)",
         )
         .bind(&request.identity_id)
-        .bind(&request.scope_type)
-        .bind(&request.scope_id)
+        .bind(&budget_scope_type)
+        .bind(&budget_scope_id)
         .bind(&request.incident_key)
         .bind(&request.lease_owner)
         .bind(&leased_until)
-        .bind(request.reaction_depth)
+        .bind(request.reaction_depth.clamp(0, 8))
         .bind(&now)
         .bind(&cooldown_until)
         .bind(&now)
@@ -402,69 +707,33 @@ impl AttentionService {
         .execute(&mut *transaction)
         .await?;
         if lease_result.rows_affected() == 0 {
+            // This is normally covered by the global pre-check.  Keep the
+            // compare-and-swap result authoritative for same-transaction
+            // replays and classify an expired lease/cooldown conservatively.
             transaction.rollback().await?;
-            return Ok(WakeAdmissionResult::Suppressed {
-                reason: WakeSuppressionReason::DuplicateIncident,
-            });
+            return self
+                .persist_suppressed_wake(
+                    &request,
+                    &context,
+                    WakeSuppressionReason::DuplicateIncident,
+                )
+                .await;
         }
 
-        // The lease and the wake action share one transaction.  A projection
-        // replay can therefore leave either both durable records or neither;
-        // it can never admit a wake that has no durable action for a later
-        // worker to consume.  This is an explicit domain action, not model
-        // work, and its payload contains only bounded identifiers/metadata.
-        // The key must be unique per admission, not per incident: the same
-        // incident key legitimately re-admits after its lease expires, and a
-        // key that omits the triggering event would collide with the earlier
-        // admission's event (same key, different lease/cooldown payload) and
-        // permanently wedge the projection on a dedupe conflict. The
-        // causation event id is replay-stable, so re-projecting the same
-        // source event still deduplicates.
-        let wake_action_dedupe = format!(
-            "agent-wake-admitted:{}:{}:{}:{}:{}",
-            request.identity_id,
-            request.scope_type,
-            request.scope_id,
-            request.incident_key,
-            request
-                .causation_id
-                .as_deref()
-                .unwrap_or(request.correlation_id.as_str())
-        );
-        let budget_json = budget_remaining
-            .map(|remaining| remaining.to_string())
-            .unwrap_or_else(|| "null".to_owned());
-        DomainEventRepo::append_event_in_tx(
-            &*self.db,
+        // The lease, budget increment, and pre-admitted wake event share one
+        // transaction.  No budget is consumed for suppressed/setup-required
+        // decision events.
+        self.append_wake_decision_in_tx(
             &mut transaction,
-            &CreateDomainEvent {
-                id: new_uuid_v4(),
-                event_type: "agent.wake.admitted".to_owned(),
-                entity_type: "agent_wake".to_owned(),
-                entity_id: request.incident_key.clone(),
-                actor_type: "attention_projection".to_owned(),
-                actor_id: None,
-                scope_type: request.scope_type.clone(),
-                scope_id: request.scope_id.clone(),
-                correlation_id: request.correlation_id.clone(),
-                causation_id: request.causation_id.clone(),
-                causation_depth: (request.reaction_depth + 1).min(16),
-                dedupe_key: Some(wake_action_dedupe),
-                payload_json: json!({
-                    "action": "wake_admitted",
-                    "identity_id": request.identity_id,
-                    "scope_type": request.scope_type,
-                    "scope_id": request.scope_id,
-                    "incident_key": request.incident_key,
-                    "lease_owner": request.lease_owner,
-                    "leased_until": leased_until.clone(),
-                    "cooldown_until": cooldown_until.clone(),
-                    "budget_remaining": serde_json::from_str::<Value>(&budget_json)
-                        .unwrap_or(Value::Null),
-                })
-                .to_string(),
-                created_at: now.clone(),
+            &request,
+            &context,
+            WakeDecisionEvent::Admitted {
+                leased_until: leased_until.clone(),
+                cooldown_until: cooldown_until.clone(),
             },
+            budget_remaining,
+            Some((&budget_scope_type, &budget_scope_id)),
+            &now,
         )
         .await?;
         transaction.commit().await?;
@@ -473,6 +742,207 @@ impl AttentionService {
             cooldown_until,
             budget_remaining,
         })
+    }
+
+    async fn persist_suppressed_wake(
+        &self,
+        request: &WakeAdmissionRequest,
+        context: &WakeDecisionContext,
+        reason: WakeSuppressionReason,
+    ) -> Result<WakeAdmissionResult> {
+        let now = parse_rfc3339(&request.now)
+            .unwrap_or_else(Utc::now)
+            .to_rfc3339();
+        let mut transaction = db::begin_immediate(self.db.pool()).await?;
+        self.append_wake_decision_in_tx(
+            &mut transaction,
+            request,
+            context,
+            WakeDecisionEvent::Suppressed(reason.clone()),
+            None,
+            None,
+            &now,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(WakeAdmissionResult::Suppressed { reason })
+    }
+
+    async fn persist_setup_required_wake(
+        &self,
+        request: &WakeAdmissionRequest,
+        context: &WakeDecisionContext,
+    ) -> Result<WakeAdmissionResult> {
+        let now = parse_rfc3339(&request.now)
+            .unwrap_or_else(Utc::now)
+            .to_rfc3339();
+        let mut transaction = db::begin_immediate(self.db.pool()).await?;
+        self.append_wake_decision_in_tx(
+            &mut transaction,
+            request,
+            context,
+            WakeDecisionEvent::SetupRequired(WakeSetupReason::ResponderBindingMissing),
+            None,
+            None,
+            &now,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(WakeAdmissionResult::SetupRequired {
+            reason: WakeSetupReason::ResponderBindingMissing,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn append_wake_decision_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        request: &WakeAdmissionRequest,
+        context: &WakeDecisionContext,
+        decision: WakeDecisionEvent,
+        budget_remaining: Option<i64>,
+        lease_scope: Option<(&str, &str)>,
+        now: &str,
+    ) -> Result<DomainEvent> {
+        let source_event_id = context
+            .source_event_id
+            .as_deref()
+            .or(request.causation_id.as_deref());
+        let incident_digest = context
+            .incident_digest
+            .clone()
+            .unwrap_or_else(|| wake_incident_digest(&request.incident_key, source_event_id));
+        let attention_id = context.attention_id.clone();
+        let safe_incident_key = bounded_wake_ref(&request.incident_key);
+        let safe_source_event_id = source_event_id.map(bounded_wake_ref);
+        let identity_id = (!request.identity_id.trim().is_empty())
+            .then(|| bounded_wake_ref(&request.identity_id));
+        let (
+            event_type,
+            decision_code,
+            reason_code,
+            admission_phase,
+            lease_owner,
+            leased_until,
+            cooldown_until,
+        ) = match &decision {
+            WakeDecisionEvent::Admitted {
+                leased_until,
+                cooldown_until,
+            } => (
+                "agent.wake.admitted",
+                "turn_admitted",
+                "pre_admitted",
+                "pre_admitted",
+                Some(bounded_wake_ref(&request.lease_owner)),
+                Some(leased_until.clone()),
+                Some(cooldown_until.clone()),
+            ),
+            WakeDecisionEvent::Suppressed(reason) => (
+                "agent.wake.suppressed",
+                "deterministically_suppressed",
+                reason.code(),
+                "policy",
+                None,
+                None,
+                None,
+            ),
+            WakeDecisionEvent::SetupRequired(reason) => (
+                "agent.wake.setup_required",
+                "setup_required",
+                reason.code(),
+                "configuration",
+                None,
+                None,
+                None,
+            ),
+        };
+        let source_key = source_event_id.unwrap_or(request.correlation_id.as_str());
+        let decision_dedupe = if event_type == "agent.wake.admitted" {
+            wake_admitted_dedupe_key(request, context)
+        } else {
+            format!(
+                "agent-wake-decision:{}:{}",
+                event_type.replace('.', "-"),
+                wake_incident_digest(
+                    &format!(
+                        "{}:{}:{}:{}:{}:{}:{}",
+                        request.scope_type,
+                        request.scope_id,
+                        request.incident_key,
+                        source_key,
+                        reason_code,
+                        event_type,
+                        incident_digest,
+                    ),
+                    None,
+                )
+            )
+        };
+        let causation_depth = (request.reaction_depth.max(0) + 1).min(16);
+        let payload_json = json!({
+            "decision": decision_code,
+            // Keep the historical admitted action token while the consumer
+            // migrates to the explicit decision/phase contract.
+            "action": (event_type == "agent.wake.admitted").then_some("wake_admitted"),
+            "reason": reason_code,
+            "admission_phase": admission_phase,
+            "identity_id": identity_id,
+            "scope_type": bounded_wake_ref(&request.scope_type),
+            "scope_id": bounded_wake_ref(&request.scope_id),
+            "incident_key": safe_incident_key,
+            "incident_digest": incident_digest,
+            "attention_id": attention_id,
+            "attention_status": context.attention_status.as_deref(),
+            "attention_version": context.attention_version,
+            "source_event_id": safe_source_event_id,
+            "correlation_id": bounded_wake_ref(&request.correlation_id),
+            "causation_id": request.causation_id.as_deref().map(bounded_wake_ref),
+            "causation_depth": causation_depth,
+            "reaction_depth": request.reaction_depth.clamp(0, 16),
+            "budget_remaining": budget_remaining,
+            "lease_scope_type": lease_scope.map(|value| value.0),
+            "lease_scope_id": lease_scope.map(|value| value.1),
+            "lease_owner": lease_owner,
+            "leased_until": leased_until,
+            "cooldown_until": cooldown_until,
+        })
+        .to_string();
+        let event_scope_type = if matches!(
+            request.scope_type.as_str(),
+            "account" | "project" | "room" | "task" | "system" | "agent_chat"
+        ) {
+            request.scope_type.clone()
+        } else {
+            "system".to_owned()
+        };
+        let event_scope_id = if event_scope_type == request.scope_type {
+            request.scope_id.clone()
+        } else {
+            wake_incident_digest(&request.scope_id, None)
+        };
+        DomainEventRepo::append_event_in_tx(
+            &*self.db,
+            transaction,
+            &CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: event_type.to_owned(),
+                entity_type: "agent_wake".to_owned(),
+                entity_id: safe_incident_key,
+                actor_type: "attention_projection".to_owned(),
+                actor_id: None,
+                scope_type: event_scope_type,
+                scope_id: event_scope_id,
+                correlation_id: request.correlation_id.clone(),
+                causation_id: request.causation_id.clone(),
+                causation_depth,
+                dedupe_key: Some(decision_dedupe),
+                payload_json,
+                created_at: now.to_owned(),
+            },
+        )
+        .await
+        .map_err(ServiceError::from)
     }
 
     async fn wake_budget_in_tx(
@@ -693,6 +1163,9 @@ impl AttentionService {
                 },
             )
             .await?;
+        let coordination_activity = self
+            .coordination_activity(user_id, project_id, limit)
+            .await?;
         let review_ready = self
             .work_items(user_id, project_id, &["review"], limit)
             .await?;
@@ -708,6 +1181,7 @@ impl AttentionService {
                 .into_iter()
                 .map(attention_item)
                 .collect::<Result<Vec<_>>>()?,
+            coordination_activity,
             review_ready,
             active_work,
             agent_health,
@@ -716,6 +1190,112 @@ impl AttentionService {
             consumer_health: health,
             computed_at: now_rfc3339(),
         })
+    }
+
+    /// Project the two operator-visible coordination histories into one
+    /// bounded feed. Direct command receipts are the committed history; only
+    /// pending/approved approval actions are included from the action queue.
+    /// The queries deliberately select digests and typed outcomes, never the
+    /// action payload body. Visibility is enforced in SQL so an unauthorized
+    /// project row cannot be loaded and filtered after the fact.
+    async fn coordination_activity(
+        &self,
+        user_id: &str,
+        project_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<MissionControlCoordinationActivity>> {
+        let (predicate, values) =
+            self.coordination_scope_visibility_predicate(user_id, project_id, "r");
+
+        let direct_sql = format!(
+            "SELECT r.id, r.principal_type, r.principal_id, r.scope_type, r.scope_id,
+                    r.operation, r.input_digest, r.policy_result, r.correlation_id,
+                    r.outcome_json, r.committed_at
+             FROM command_receipt r
+             WHERE r.agent_action_execution_id IS NULL
+               AND {predicate}
+             ORDER BY r.committed_at DESC, r.id DESC
+             LIMIT ?"
+        );
+        let mut direct_query = sqlx::query(&direct_sql);
+        for value in &values {
+            direct_query = direct_query.bind(value);
+        }
+        let direct_rows = direct_query.bind(limit).fetch_all(self.db.pool()).await?;
+
+        let mut activities = direct_rows
+            .into_iter()
+            .map(|row| {
+                let outcome_json: Option<String> = row.try_get("outcome_json")?;
+                Ok(MissionControlCoordinationActivity {
+                    id: row.try_get("id")?,
+                    activity_kind: "direct_command".to_owned(),
+                    actor_type: row.try_get("principal_type")?,
+                    actor_id: row.try_get("principal_id")?,
+                    scope_type: row.try_get("scope_type")?,
+                    scope_id: row.try_get("scope_id")?,
+                    operation: row.try_get("operation")?,
+                    input_digest: row.try_get("input_digest")?,
+                    policy_result: row.try_get("policy_result")?,
+                    status: "committed".to_owned(),
+                    correlation_id: row.try_get("correlation_id")?,
+                    outcome: outcome_json.and_then(|value| serde_json::from_str(&value).ok()),
+                    occurred_at: row.try_get("committed_at")?,
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, sqlx::Error>>()
+            .map_err(ServiceError::from)?;
+
+        let (action_predicate, action_values) =
+            self.coordination_scope_visibility_predicate(user_id, project_id, "a");
+        let action_sql = format!(
+            "SELECT a.id, a.actor_identity_id, a.scope_type, a.scope_id, a.operation,
+                    a.payload_hash, a.policy_result, a.status, a.correlation_id,
+                    a.outcome_json, a.updated_at
+             FROM agent_action a
+             WHERE a.policy_result = 'approval_required'
+               AND a.status IN ('pending_approval', 'approved')
+               AND {action_predicate}
+             ORDER BY a.updated_at DESC, a.id DESC
+             LIMIT ?"
+        );
+        let mut action_query = sqlx::query(&action_sql);
+        for value in &action_values {
+            action_query = action_query.bind(value);
+        }
+        let action_rows = action_query.bind(limit).fetch_all(self.db.pool()).await?;
+        activities.extend(
+            action_rows
+                .into_iter()
+                .map(|row| {
+                    let outcome_json: Option<String> = row.try_get("outcome_json")?;
+                    Ok(MissionControlCoordinationActivity {
+                        id: row.try_get("id")?,
+                        activity_kind: "approval_action".to_owned(),
+                        actor_type: "agent".to_owned(),
+                        actor_id: row.try_get("actor_identity_id")?,
+                        scope_type: row.try_get("scope_type")?,
+                        scope_id: row.try_get("scope_id")?,
+                        operation: row.try_get("operation")?,
+                        input_digest: row.try_get("payload_hash")?,
+                        policy_result: row.try_get("policy_result")?,
+                        status: row.try_get("status")?,
+                        correlation_id: row.try_get("correlation_id")?,
+                        outcome: outcome_json.and_then(|value| serde_json::from_str(&value).ok()),
+                        occurred_at: row.try_get("updated_at")?,
+                    })
+                })
+                .collect::<std::result::Result<Vec<_>, sqlx::Error>>()?,
+        );
+
+        activities.sort_by(|left, right| {
+            parse_rfc3339(&right.occurred_at)
+                .cmp(&parse_rfc3339(&left.occurred_at))
+                .then_with(|| right.occurred_at.cmp(&left.occurred_at))
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        activities.truncate(limit as usize);
+        Ok(activities)
     }
 
     pub async fn agent_detail(
@@ -959,11 +1539,17 @@ impl AttentionService {
     async fn project_event(&self, event: &DomainEvent) -> Result<()> {
         if let Some(category) = classify_event(event) {
             let (scope_type, scope_id) = self.event_scope(event).await?;
+            // Attention's historical materialization table accepts the
+            // account/project scope vocabulary, while Agent Chat events use
+            // the chat as their canonical wake scope.  Keep the raw chat
+            // scope in the incident key and wake payload (so delivery can
+            // route to that chat), but materialize the Attention row under
+            // its owning account/project scope.
+            let (attention_scope_type, attention_scope_id) = self
+                .attention_projection_scope(&scope_type, &scope_id)
+                .await?;
             let identity_id = self.wake_identity_for_event(event).await?;
-            let incident_key = format!(
-                "attention:{category}:{scope_type}:{scope_id}:{}:{}",
-                event.entity_type, event.entity_id
-            );
+            let incident_key = attention_incident_key(category, event, &scope_type, &scope_id);
             let (priority, summary, recommended_action) = category_metadata(category);
             let details_json = serde_json::to_string(&json!({
                 "source_event_id": event.id,
@@ -974,13 +1560,13 @@ impl AttentionService {
                 "scope_id": scope_id,
             }))
             .map_err(|error| ServiceError::Domain(error.to_string()))?;
-            AttentionRepo::insert_attention(
+            let attention = AttentionRepo::insert_attention(
                 &*self.db,
                 CreateAttentionProjection {
                     id: new_uuid_v4(),
                     attention_type: category.to_owned(),
-                    scope_type: scope_type.clone(),
-                    scope_id: scope_id.clone(),
+                    scope_type: attention_scope_type,
+                    scope_id: attention_scope_id,
                     identity_id: identity_id.clone(),
                     source_event_id: event.id.clone(),
                     priority,
@@ -1000,43 +1586,84 @@ impl AttentionService {
             )
             .await?;
 
+            let decision_context = WakeDecisionContext {
+                attention_id: Some(attention.id.clone()),
+                source_event_id: Some(event.id.clone()),
+                incident_digest: Some(wake_attention_incident_digest(&attention)),
+                attention_status: Some(attention.status.clone()),
+                attention_version: Some(attention.version),
+            };
+
             // Wake admission happens only after the rebuildable Attention row
             // is durable.  Eligibility is checked independently of the
             // projection so a visible incident cannot grant an identity a
             // Project/Agent Chat/Task wake authority it does not already possess.
-            if let Some(identity_id) = identity_id {
-                if self
-                    .wake_identity_is_eligible(&identity_id, &scope_type, &scope_id)
-                    .await?
-                {
-                    let _ = self
-                        .admit_wake(WakeAdmissionRequest {
-                            identity_id,
-                            scope_type: scope_type.clone(),
-                            scope_id: scope_id.clone(),
-                            incident_key,
-                            lease_owner: new_uuid_v4(),
-                            correlation_id: event.correlation_id.clone(),
-                            causation_id: Some(event.id.clone()),
-                            caused_by_identity_id: (event.actor_type == "agent")
-                                .then(|| event.actor_id.clone())
-                                .flatten(),
-                            reaction_depth: event.causation_depth,
-                            now: now_rfc3339(),
-                            lease_seconds: WAKE_LEASE_SECONDS,
-                            cooldown_seconds: WAKE_COOLDOWN_SECONDS,
-                        })
-                        .await?;
+            let request = WakeAdmissionRequest {
+                identity_id: identity_id.clone().unwrap_or_default(),
+                scope_type: scope_type.clone(),
+                scope_id: scope_id.clone(),
+                incident_key: incident_key.clone(),
+                lease_owner: new_uuid_v4(),
+                correlation_id: event.correlation_id.clone(),
+                causation_id: Some(event.id.clone()),
+                caused_by_identity_id: (event.actor_type == "agent")
+                    .then(|| event.actor_id.clone())
+                    .flatten(),
+                reaction_depth: event.causation_depth,
+                now: now_rfc3339(),
+                lease_seconds: WAKE_LEASE_SECONDS,
+                cooldown_seconds: WAKE_COOLDOWN_SECONDS,
+            };
+            // Policy terminal states are checked before responder setup.  In
+            // particular, a retry-exhausted Agent Chat event must be recorded
+            // as recursive suppression even when its binding has already
+            // disappeared; setup-required would otherwise hide a recursion
+            // decision behind a missing responder.
+            if let Some(reason) = wake_pre_admission_suppression_reason(&request) {
+                let _ = self
+                    .persist_suppressed_wake(&request, &decision_context, reason)
+                    .await?;
+            } else {
+                let responder_configured = self
+                    .wake_responder_is_configured(&scope_type, &scope_id, None)
+                    .await?;
+                let identity_eligible = match identity_id.as_deref() {
+                    Some(identity_id) => {
+                        self.wake_responder_is_configured(&scope_type, &scope_id, Some(identity_id))
+                            .await?
+                            && self
+                                .wake_identity_is_eligible(identity_id, &scope_type, &scope_id)
+                                .await?
+                    }
+                    None => false,
+                };
+                match identity_id {
+                    Some(_) if responder_configured && identity_eligible => {
+                        let _ = self
+                            .admit_wake_with_context(request, decision_context)
+                            .await?;
+                    }
+                    Some(_) if responder_configured => {
+                        let _ = self
+                            .persist_suppressed_wake(
+                                &request,
+                                &decision_context,
+                                WakeSuppressionReason::IneligibleScope,
+                            )
+                            .await?;
+                    }
+                    _ => {
+                        let _ = self
+                            .persist_setup_required_wake(&request, &decision_context)
+                            .await?;
+                    }
                 }
             }
         }
 
         for category in resolution_categories(event) {
             let (scope_type, scope_id) = self.event_scope(event).await?;
-            let incident_key = format!(
-                "attention:{category}:{scope_type}:{scope_id}:{}:{}",
-                event.entity_type, event.entity_id
-            );
+            let incident_key = attention_incident_key(category, event, &scope_type, &scope_id);
             AttentionRepo::resolve_attention_by_dedupe(
                 &*self.db,
                 &incident_key,
@@ -1046,6 +1673,39 @@ impl AttentionService {
             .await?;
         }
         Ok(())
+    }
+
+    async fn attention_projection_scope(
+        &self,
+        scope_type: &str,
+        scope_id: &str,
+    ) -> Result<(String, String)> {
+        if scope_type != "agent_chat" {
+            return Ok((scope_type.to_owned(), scope_id.to_owned()));
+        }
+        let Some(row) =
+            sqlx::query("SELECT kind, account_id, project_id FROM agent_chat WHERE id = ?")
+                .bind(scope_id)
+                .fetch_optional(self.db.pool())
+                .await?
+        else {
+            // Keep the raw scope for the existing projection error path when
+            // an event references a chat that no longer exists.  Valid Chat
+            // events always resolve to one of the accepted material scopes.
+            return Ok((scope_type.to_owned(), scope_id.to_owned()));
+        };
+        let kind: String = row.try_get("kind")?;
+        match kind.as_str() {
+            "account_main" => row
+                .try_get::<Option<String>, _>("account_id")
+                .map(|account_id| ("account".to_owned(), account_id.unwrap_or_default()))
+                .map_err(ServiceError::from),
+            "project" => row
+                .try_get::<Option<String>, _>("project_id")
+                .map(|project_id| ("project".to_owned(), project_id.unwrap_or_default()))
+                .map_err(ServiceError::from),
+            _ => Ok((scope_type.to_owned(), scope_id.to_owned())),
+        }
     }
 
     async fn event_scope(&self, event: &DomainEvent) -> Result<(String, String)> {
@@ -1091,6 +1751,75 @@ impl AttentionService {
     }
 
     async fn wake_identity_for_event(&self, event: &DomainEvent) -> Result<Option<String>> {
+        // Resolve the current owner before looking at the source actor.  An
+        // unresolved incident survives binding replacement and must wake the
+        // replacement identity, never the stale identity that authored the
+        // original event.
+        let (scope_type, scope_id) = self.event_scope(event).await?;
+        match scope_type.as_str() {
+            "project" => {
+                return Ok(sqlx::query_scalar::<_, String>(
+                    "SELECT identity_id FROM project_agent_binding
+                     WHERE project_id = ? AND state = 'active' AND identity_id IS NOT NULL",
+                )
+                .bind(&scope_id)
+                .fetch_optional(self.db.pool())
+                .await?);
+            }
+            "account" => {
+                return Ok(sqlx::query_scalar::<_, String>(
+                    "SELECT identity_id FROM account_main_agent_binding
+                     WHERE account_id = ? AND state = 'active'",
+                )
+                .bind(&scope_id)
+                .fetch_optional(self.db.pool())
+                .await?);
+            }
+            "agent_chat" => {
+                let chat =
+                    sqlx::query("SELECT kind, account_id, project_id FROM agent_chat WHERE id = ?")
+                        .bind(&scope_id)
+                        .fetch_optional(self.db.pool())
+                        .await?;
+                if let Some(chat) = chat {
+                    let kind: String = chat.try_get("kind")?;
+                    if kind == "account_main" {
+                        return Ok(sqlx::query_scalar::<_, String>(
+                            "SELECT identity_id FROM account_main_agent_binding
+                             WHERE account_id = ? AND state = 'active'",
+                        )
+                        .bind(chat.try_get::<Option<String>, _>("account_id")?)
+                        .fetch_optional(self.db.pool())
+                        .await?);
+                    }
+                    if kind == "project" {
+                        return Ok(sqlx::query_scalar::<_, String>(
+                            "SELECT identity_id FROM project_agent_binding
+                             WHERE project_id = ? AND state = 'active' AND identity_id IS NOT NULL",
+                        )
+                        .bind(chat.try_get::<Option<String>, _>("project_id")?)
+                        .fetch_optional(self.db.pool())
+                        .await?);
+                    }
+                }
+                return Ok(None);
+            }
+            "task" => {
+                return Ok(sqlx::query_scalar::<_, String>(
+                    "SELECT assignee_id FROM task
+                     WHERE id = ? AND assignee_type = 'agent' AND assignee_id IS NOT NULL",
+                )
+                .bind(&scope_id)
+                .fetch_optional(self.db.pool())
+                .await?);
+            }
+            _ => {}
+        }
+
+        // Non-canonical/legacy scopes have no current Main/Project responder
+        // to resolve.  Keep the source actor as provenance only for these
+        // scopes; callers will record a setup-required decision when it is
+        // not eligible.
         if let Some(identity_id) = self.event_identity(event).await? {
             return Ok(Some(identity_id));
         }
@@ -1114,56 +1843,147 @@ impl AttentionService {
                 return Ok(Some(identity_id.to_owned()));
             }
         }
-        // Only a task-scoped wake can admit the task assignee (scope
-        // eligibility matches on the assignment). A task event carried at
-        // project scope must wake the Project Agent instead — the assignee
-        // has no Project binding, so admission would only be suppressed.
-        if event.scope_type == "task" {
-            let assignee = sqlx::query_scalar::<_, String>(
-                "SELECT assignee_id FROM task
-                 WHERE id = ? AND assignee_type = 'agent' AND assignee_id IS NOT NULL",
-            )
-            .bind(&event.scope_id)
-            .fetch_optional(self.db.pool())
-            .await?;
-            if assignee.is_some() {
-                return Ok(assignee);
-            }
-        }
-        // Project-scoped incidents with no more specific responder wake the
-        // Project Agent: it supervises the Project and is the identity that
-        // can act on review-ready work, failed dispatches, and stalls.
-        let project_id = match event.scope_type.as_str() {
-            "project" => Some(event.scope_id.clone()),
-            _ => {
-                let task_id = if event.entity_type == "task" {
-                    Some(event.entity_id.as_str())
-                } else if event.scope_type == "task" {
-                    Some(event.scope_id.as_str())
+        Ok(None)
+    }
+
+    /// Check whether a current Main/Project binding exists for this canonical
+    /// scope.  `identity_id` is optional so projection can distinguish a
+    /// missing responder (setup-required) from a configured responder that is
+    /// ineligible for the particular event (deterministic suppression).
+    async fn wake_responder_is_configured(
+        &self,
+        scope_type: &str,
+        scope_id: &str,
+        identity_id: Option<&str>,
+    ) -> Result<bool> {
+        let count = match scope_type {
+            "account" => {
+                if let Some(identity_id) = identity_id {
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM account_main_agent_binding
+                         WHERE account_id = ? AND identity_id = ? AND state = 'active'",
+                    )
+                    .bind(scope_id)
+                    .bind(identity_id)
+                    .fetch_one(self.db.pool())
+                    .await?
                 } else {
-                    None
-                };
-                match task_id {
-                    Some(task_id) => {
-                        sqlx::query_scalar::<_, String>("SELECT project_id FROM task WHERE id = ?")
-                            .bind(task_id)
-                            .fetch_optional(self.db.pool())
-                            .await?
-                    }
-                    None => None,
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM account_main_agent_binding
+                         WHERE account_id = ? AND state = 'active'",
+                    )
+                    .bind(scope_id)
+                    .fetch_one(self.db.pool())
+                    .await?
                 }
             }
+            "project" => {
+                if let Some(identity_id) = identity_id {
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM project_agent_binding
+                         WHERE project_id = ? AND identity_id = ? AND state = 'active'",
+                    )
+                    .bind(scope_id)
+                    .bind(identity_id)
+                    .fetch_one(self.db.pool())
+                    .await?
+                } else {
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM project_agent_binding
+                         WHERE project_id = ? AND state = 'active' AND identity_id IS NOT NULL",
+                    )
+                    .bind(scope_id)
+                    .fetch_one(self.db.pool())
+                    .await?
+                }
+            }
+            "agent_chat" => {
+                let chat =
+                    sqlx::query("SELECT kind, account_id, project_id FROM agent_chat WHERE id = ?")
+                        .bind(scope_id)
+                        .fetch_optional(self.db.pool())
+                        .await?;
+                let Some(chat) = chat else {
+                    return Ok(false);
+                };
+                let kind: String = chat.try_get("kind")?;
+                let account_id: Option<String> = chat.try_get("account_id")?;
+                let project_id: Option<String> = chat.try_get("project_id")?;
+                let configured = match kind.as_str() {
+                    "account_main" => {
+                        let Some(account_id) = account_id else {
+                            return Ok(false);
+                        };
+                        if let Some(identity_id) = identity_id {
+                            sqlx::query_scalar::<_, i64>(
+                                "SELECT COUNT(*) FROM account_main_agent_binding
+                                 WHERE account_id = ? AND identity_id = ? AND state = 'active'",
+                            )
+                            .bind(account_id)
+                            .bind(identity_id)
+                            .fetch_one(self.db.pool())
+                            .await?
+                        } else {
+                            sqlx::query_scalar::<_, i64>(
+                                "SELECT COUNT(*) FROM account_main_agent_binding
+                                 WHERE account_id = ? AND state = 'active'",
+                            )
+                            .bind(account_id)
+                            .fetch_one(self.db.pool())
+                            .await?
+                        }
+                    }
+                    "project" => {
+                        let Some(project_id) = project_id else {
+                            return Ok(false);
+                        };
+                        if let Some(identity_id) = identity_id {
+                            sqlx::query_scalar::<_, i64>(
+                                "SELECT COUNT(*) FROM project_agent_binding
+                                 WHERE project_id = ? AND identity_id = ? AND state = 'active'",
+                            )
+                            .bind(project_id)
+                            .bind(identity_id)
+                            .fetch_one(self.db.pool())
+                            .await?
+                        } else {
+                            sqlx::query_scalar::<_, i64>(
+                                "SELECT COUNT(*) FROM project_agent_binding
+                                 WHERE project_id = ? AND state = 'active'
+                                   AND identity_id IS NOT NULL",
+                            )
+                            .bind(project_id)
+                            .fetch_one(self.db.pool())
+                            .await?
+                        }
+                    }
+                    _ => 0,
+                };
+                configured
+            }
+            "task" => {
+                if let Some(identity_id) = identity_id {
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM task
+                         WHERE id = ? AND assignee_type = 'agent' AND assignee_id = ?",
+                    )
+                    .bind(scope_id)
+                    .bind(identity_id)
+                    .fetch_one(self.db.pool())
+                    .await?
+                } else {
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM task
+                         WHERE id = ? AND assignee_type = 'agent' AND assignee_id IS NOT NULL",
+                    )
+                    .bind(scope_id)
+                    .fetch_one(self.db.pool())
+                    .await?
+                }
+            }
+            _ => 0,
         };
-        if let Some(project_id) = project_id {
-            return Ok(sqlx::query_scalar::<_, String>(
-                "SELECT identity_id FROM project_agent_binding
-                 WHERE project_id = ? AND state = 'active' AND identity_id IS NOT NULL",
-            )
-            .bind(&project_id)
-            .fetch_optional(self.db.pool())
-            .await?);
-        }
-        Ok(None)
+        Ok(count > 0)
     }
 
     async fn wake_identity_is_eligible(
@@ -1756,6 +2576,104 @@ impl AttentionService {
         }
     }
 
+    fn coordination_scope_visibility_predicate(
+        &self,
+        user_id: &str,
+        project_id: Option<&str>,
+        scope_alias: &str,
+    ) -> (String, Vec<String>) {
+        match project_id {
+            Some(project_id) => (
+                format!(
+                    "(({scope_alias}.scope_type = 'project' AND {scope_alias}.scope_id = ?
+                       AND EXISTS (
+                           SELECT 1 FROM project p
+                           WHERE p.id = {scope_alias}.scope_id
+                             AND (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (
+                                 SELECT 1 FROM project_member pm
+                                 WHERE pm.project_id = p.id AND pm.user_id = ?
+                             ))
+                       ))
+                      OR ({scope_alias}.scope_type = 'agent_chat' AND EXISTS (
+                           SELECT 1 FROM agent_chat c
+                           JOIN project p ON p.id = c.project_id
+                           WHERE c.id = {scope_alias}.scope_id
+                             AND c.kind = 'project'
+                             AND c.project_id = ?
+                             AND (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (
+                                 SELECT 1 FROM project_member pm
+                                 WHERE pm.project_id = p.id AND pm.user_id = ?
+                             ))
+                       ))
+                      OR ({scope_alias}.scope_type = 'task' AND EXISTS (
+                           SELECT 1 FROM task t
+                           JOIN project p ON p.id = t.project_id
+                           WHERE t.id = {scope_alias}.scope_id
+                             AND t.project_id = ?
+                             AND (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (
+                                 SELECT 1 FROM project_member pm
+                                 WHERE pm.project_id = p.id AND pm.user_id = ?
+                             ))
+                       )))"
+                ),
+                vec![
+                    project_id.to_owned(),
+                    user_id.to_owned(),
+                    user_id.to_owned(),
+                    project_id.to_owned(),
+                    user_id.to_owned(),
+                    user_id.to_owned(),
+                    project_id.to_owned(),
+                    user_id.to_owned(),
+                    user_id.to_owned(),
+                ],
+            ),
+            None => (
+                format!(
+                    "(({scope_alias}.scope_type = 'account' AND {scope_alias}.scope_id = ?)
+                      OR ({scope_alias}.scope_type = 'project' AND EXISTS (
+                           SELECT 1 FROM project p
+                           WHERE p.id = {scope_alias}.scope_id
+                             AND (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (
+                                 SELECT 1 FROM project_member pm
+                                 WHERE pm.project_id = p.id AND pm.user_id = ?
+                             ))
+                       ))
+                      OR ({scope_alias}.scope_type = 'agent_chat' AND EXISTS (
+                           SELECT 1 FROM agent_chat c
+                           LEFT JOIN project p ON p.id = c.project_id
+                           WHERE c.id = {scope_alias}.scope_id
+                             AND ((c.kind = 'account_main' AND c.account_id = ?)
+                               OR (c.kind = 'project' AND p.id IS NOT NULL AND
+                                   (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (
+                                       SELECT 1 FROM project_member pm
+                                       WHERE pm.project_id = p.id AND pm.user_id = ?
+                                   ))))
+                       ))
+                      OR ({scope_alias}.scope_type = 'task' AND EXISTS (
+                           SELECT 1 FROM task t
+                           JOIN project p ON p.id = t.project_id
+                           WHERE t.id = {scope_alias}.scope_id
+                             AND (p.owner_id IS NULL OR p.owner_id = ? OR EXISTS (
+                                 SELECT 1 FROM project_member pm
+                                 WHERE pm.project_id = p.id AND pm.user_id = ?
+                             ))
+                       )))"
+                ),
+                vec![
+                    user_id.to_owned(),
+                    user_id.to_owned(),
+                    user_id.to_owned(),
+                    user_id.to_owned(),
+                    user_id.to_owned(),
+                    user_id.to_owned(),
+                    user_id.to_owned(),
+                    user_id.to_owned(),
+                ],
+            ),
+        }
+    }
+
     fn agent_visibility_predicate(
         &self,
         user_id: &str,
@@ -1785,6 +2703,49 @@ impl AttentionService {
     }
 }
 
+/// Return the stable incident identity for one Attention category.
+///
+/// Most Attention categories are scoped to the source entity.  Progress
+/// warnings are different: a healthy executor may publish more than one
+/// warning event while it waits, and those events must update one durable
+/// incident rather than create a new item per heartbeat.  Execution rows are
+/// one attempt/episode, so the execution id is the authoritative dedupe
+/// identity for this category.  Terminal and semantic-progress events carry
+/// the same id and therefore resolve the warning even when their source event
+/// ids differ.
+fn attention_incident_key(
+    category: &str,
+    event: &DomainEvent,
+    scope_type: &str,
+    scope_id: &str,
+) -> String {
+    if category == "progress_warning" {
+        let execution_id = serde_json::from_str::<Value>(&event.payload_json)
+            .ok()
+            .and_then(|payload| {
+                payload
+                    .get("execution_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| event.entity_id.clone());
+        return format!("attention:{category}:{scope_type}:{scope_id}:execution:{execution_id}");
+    }
+
+    format!(
+        "attention:{category}:{scope_type}:{scope_id}:{}:{}",
+        event.entity_type, event.entity_id
+    )
+}
+
+fn is_execution_progress_warning_event(event_type: &str) -> bool {
+    event_type == "execution.progress_warning"
+}
+
+fn is_execution_semantic_progress_event(event_type: &str) -> bool {
+    event_type == "execution.progressed"
+}
+
 fn classify_event(event: &DomainEvent) -> Option<&'static str> {
     let event_type = event.event_type.to_ascii_lowercase();
     if event_type == "project_release.candidate_requested" {
@@ -1808,6 +2769,12 @@ fn classify_event(event: &DomainEvent) -> Option<&'static str> {
         && (event_type.contains("fail") || event_type.contains("error"))
     {
         return Some("validation_failed");
+    }
+    // A stale semantic-progress warning is deliberately checked before the
+    // generic stall classifier.  It describes a live owner waiting on model
+    // or tool work and must never become a `run_stalled` incident.
+    if is_execution_progress_warning_event(&event_type) {
+        return Some("progress_warning");
     }
     if event_type.contains("stalled") || event_type.contains("stall") {
         return Some("run_stalled");
@@ -1895,6 +2862,19 @@ fn payload_status(event: &DomainEvent) -> Option<String> {
 fn resolution_categories(event: &DomainEvent) -> Vec<&'static str> {
     let event_type = event.event_type.to_ascii_lowercase();
     let mut categories = Vec::new();
+    if is_execution_semantic_progress_event(&event_type)
+        || matches!(
+            event_type.as_str(),
+            "execution.completed"
+                | "execution.failed"
+                | "execution.cancelled"
+                | "execution.stalled"
+                | "execution.lease_expired"
+                | "execution.hard_deadline_exceeded"
+        )
+    {
+        categories.push("progress_warning");
+    }
     if event_type == "task.transitioned" {
         let state = serde_json::from_str::<Value>(&event.payload_json)
             .ok()
@@ -1908,6 +2888,7 @@ fn resolution_categories(event: &DomainEvent) -> Vec<&'static str> {
             categories.extend([
                 "validation_failed",
                 "run_stalled",
+                "progress_warning",
                 "retry_exhausted",
                 "review_ready",
                 "review_risk",
@@ -1946,6 +2927,11 @@ fn category_metadata(category: &str) -> (i64, &'static str, &'static str) {
         "human_input_required" => (95, "Human input is required", "answer"),
         "validation_failed" => (80, "Validation failed", "inspect_validation"),
         "run_stalled" => (85, "Run appears stalled", "inspect_run"),
+        "progress_warning" => (
+            65,
+            "Execution is waiting for semantic progress",
+            "inspect_run",
+        ),
         "retry_exhausted" => (90, "Retry budget exhausted", "review_retry"),
         "review_ready" => (55, "Work is ready for review", "review"),
         "review_risk" => (85, "Review reported a risk", "inspect_review"),
@@ -1962,6 +2948,7 @@ pub fn attention_item(item: AttentionProjection) -> Result<AttentionItem> {
         "human_input_required" => AttentionCategory::HumanInputRequired,
         "validation_failed" => AttentionCategory::ValidationFailed,
         "run_stalled" => AttentionCategory::RunStalled,
+        "progress_warning" => AttentionCategory::ProgressWarning,
         "retry_exhausted" => AttentionCategory::RetryExhausted,
         "review_ready" => AttentionCategory::ReviewReady,
         "review_risk" => AttentionCategory::ReviewRisk,
@@ -2069,6 +3056,124 @@ fn bounded_text(value: String) -> String {
         .collect::<String>()
 }
 
+const MAX_WAKE_REF_CHARS: usize = 256;
+
+fn bounded_wake_ref(value: &str) -> String {
+    value.chars().take(MAX_WAKE_REF_CHARS).collect()
+}
+
+/// Return terminal policy reasons that must be decided before responder
+/// configuration or budget lookup.  Keeping these checks in one helper makes
+/// the projection path and direct admission path agree, including the
+/// system-authored `agent_chat.turn.failed` retry-exhausted event that has no
+/// actor identity for the ordinary self-event check.
+fn wake_pre_admission_suppression_reason(
+    request: &WakeAdmissionRequest,
+) -> Option<WakeSuppressionReason> {
+    if request.reaction_depth >= MAX_WAKE_REACTION_DEPTH {
+        return Some(WakeSuppressionReason::ReactionDepthExceeded);
+    }
+    if request.reaction_depth > 0
+        && request.caused_by_identity_id.as_deref() == Some(request.identity_id.as_str())
+    {
+        return Some(WakeSuppressionReason::SelfEvent);
+    }
+    if request.scope_type == "agent_chat" && request.incident_key.contains(":retry_exhausted:") {
+        return Some(WakeSuppressionReason::RecursiveAgentResponse);
+    }
+    None
+}
+
+/// Digest only the canonical, bounded Attention projection state.  This is
+/// deliberately metadata-only: a wake consumer can compare it with a fresh
+/// projection before reconsidering an incident without receiving details from
+/// an inaccessible scope.
+/// Return the canonical redaction-safe Attention digest used by wake decision
+/// events.  Wake delivery/reconsideration can call this helper on the freshly
+/// loaded projection instead of reimplementing the material-state contract.
+pub fn wake_attention_incident_digest(attention: &AttentionProjection) -> String {
+    wake_attention_state_digest(
+        &attention.attention_type,
+        &attention.scope_type,
+        &attention.scope_id,
+        &attention.status,
+        &attention.source_event_id,
+        attention.source_sequence,
+        &attention.details_json,
+        &attention.recommended_action,
+        attention.version,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wake_attention_state_digest(
+    attention_type: &str,
+    scope_type: &str,
+    scope_id: &str,
+    status: &str,
+    source_event_id: &str,
+    source_sequence: Option<i64>,
+    details_json: &str,
+    recommended_action: &str,
+    version: i64,
+) -> String {
+    let details_digest = wake_incident_digest(&canonical_attention_details(details_json), None);
+    let canonical = format!(
+        "type={};scope_type={};scope_id={};status={};source_event_id={};source_sequence={source_sequence:?};details_digest={};recommended_action={};version={version}",
+        bounded_wake_ref(attention_type),
+        bounded_wake_ref(scope_type),
+        bounded_wake_ref(scope_id),
+        bounded_wake_ref(status),
+        bounded_wake_ref(source_event_id),
+        details_digest,
+        bounded_wake_ref(recommended_action),
+    );
+    wake_incident_digest(&canonical, None)
+}
+
+/// Canonicalize only the bounded Attention details used for the digest.  The
+/// details themselves never enter the wake event payload; this helper hashes
+/// a normalized JSON representation so semantically identical object key
+/// orderings cannot create a new incident admission.  Invalid legacy JSON is
+/// retained as bounded text, preserving a deterministic digest while keeping
+/// the projection observable without leaking its contents.
+fn canonical_attention_details(details_json: &str) -> String {
+    let bounded = details_json.chars().take(8_192).collect::<String>();
+    serde_json::from_str::<Value>(&bounded)
+        .map(|value| value.to_string())
+        .unwrap_or(bounded)
+}
+
+fn wake_admitted_dedupe_key(
+    request: &WakeAdmissionRequest,
+    context: &WakeDecisionContext,
+) -> String {
+    let source_key = context
+        .source_event_id
+        .as_deref()
+        .or(request.causation_id.as_deref())
+        .unwrap_or(request.correlation_id.as_str());
+    format!(
+        "agent-wake-admitted:{}:{}:{}:{}:{}:{}",
+        request.identity_id,
+        request.scope_type,
+        request.scope_id,
+        request.incident_key,
+        source_key,
+        context.incident_digest.as_deref().unwrap_or("none")
+    )
+}
+
+fn wake_incident_digest(incident_key: &str, source_event_id: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(incident_key.as_bytes());
+    hasher.update([0]);
+    if let Some(source_event_id) = source_event_id {
+        hasher.update(source_event_id.as_bytes());
+    }
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
 fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .ok()
@@ -2144,6 +3249,7 @@ mod tests {
             vec![
                 "validation_failed",
                 "run_stalled",
+                "progress_warning",
                 "retry_exhausted",
                 "review_ready",
                 "review_risk",
@@ -2158,10 +3264,94 @@ mod tests {
             classify_event(&event("execution.failed", r#"{"error":"boom"}"#)),
             Some("execution_failed")
         );
+        assert_eq!(
+            classify_event(&event(
+                "execution.progress_warning",
+                r#"{"execution_id":"execution-1"}"#
+            )),
+            Some("progress_warning")
+        );
+        assert_eq!(
+            classify_event(&event(
+                "execution.stalled",
+                r#"{"execution_id":"execution-1"}"#
+            )),
+            Some("run_stalled")
+        );
         assert_eq!(classify_event(&event("execution.completed", "{}")), None);
         assert_eq!(
             resolution_categories(&event("execution.completed", "{}")),
-            vec!["execution_failed"]
+            vec!["progress_warning", "execution_failed"]
+        );
+        assert_eq!(
+            resolution_categories(&event(
+                "execution.failed",
+                r#"{"execution_id":"execution-1"}"#
+            )),
+            vec!["progress_warning"]
+        );
+        assert_eq!(
+            resolution_categories(&event(
+                "execution.progressed",
+                r#"{"execution_id":"execution-1"}"#
+            )),
+            vec!["progress_warning"]
+        );
+    }
+
+    #[test]
+    fn progress_warning_incident_is_deduped_by_execution_episode() {
+        let first = event(
+            "execution.progress_warning",
+            r#"{"execution_id":"execution-1","episode_id":"episode-1"}"#,
+        );
+        let mut replay = first.clone();
+        replay.id = "event-2".to_owned();
+        replay.sequence = 2;
+        assert_eq!(
+            attention_incident_key("progress_warning", &first, "project", "project-1"),
+            attention_incident_key("progress_warning", &replay, "project", "project-1")
+        );
+
+        let mut next_execution = replay;
+        next_execution.id = "event-3".to_owned();
+        next_execution.sequence = 3;
+        next_execution.payload_json =
+            r#"{"execution_id":"execution-2","episode_id":"episode-2"}"#.to_owned();
+        assert_ne!(
+            attention_incident_key("progress_warning", &first, "project", "project-1"),
+            attention_incident_key("progress_warning", &next_execution, "project", "project-1")
+        );
+    }
+
+    #[test]
+    fn progress_warning_projection_maps_to_typed_attention_category() {
+        let item = AttentionProjection {
+            id: "attention-1".to_owned(),
+            attention_type: "progress_warning".to_owned(),
+            scope_type: "project".to_owned(),
+            scope_id: "project-1".to_owned(),
+            identity_id: None,
+            source_event_id: "event-1".to_owned(),
+            priority: 65,
+            status: "open".to_owned(),
+            summary: "Execution is waiting for semantic progress".to_owned(),
+            details_json: "{}".to_owned(),
+            dedupe_key: "attention:progress_warning:project:project-1:execution:execution-1"
+                .to_owned(),
+            occurred_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            version: 1,
+            acknowledged_at: None,
+            snoozed_until: None,
+            resolved_at: None,
+            updated_by_user_id: None,
+            recommended_action: "inspect_run".to_owned(),
+            source_sequence: Some(1),
+        };
+        assert_eq!(
+            attention_item(item).unwrap().category,
+            AttentionCategory::ProgressWarning
         );
     }
 

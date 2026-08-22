@@ -141,6 +141,159 @@ pub async fn create_project_and_repo(
     (project.id, repo.id)
 }
 
+/// Complete the repository execution facts that legacy API fixtures create
+/// directly.  The production setup flow records these facts through its
+/// command endpoints; tests that exercise the older project/task routes need
+/// to make the same worker, role, and repository choices explicit.
+pub async fn configure_execution_test_setup(
+    db: &db::SqliteDb,
+    project_id: &str,
+    repo_id: &str,
+    worker_id: &str,
+    reviewer_id: &str,
+) {
+    let worker = db::AgentRepo::get_by_id(db, worker_id)
+        .await
+        .expect("test worker lookup")
+        .expect("test worker exists");
+    assert_eq!(
+        services::agent_service::compute_effective_status(db, &worker)
+            .await
+            .expect("test worker effective status"),
+        services::agent_service::EffectiveStatus::Active,
+        "test worker must be active before execution setup is configured"
+    );
+    if reviewer_id != worker_id {
+        let reviewer = db::AgentRepo::get_by_id(db, reviewer_id)
+            .await
+            .expect("test reviewer lookup")
+            .expect("test reviewer exists");
+        assert_eq!(
+            services::agent_service::compute_effective_status(db, &reviewer)
+                .await
+                .expect("test reviewer effective status"),
+            services::agent_service::EffectiveStatus::Active,
+            "test reviewer must be active before execution setup is configured"
+        );
+    }
+
+    // Lease admission re-checks effective status after the execution row is
+    // visible. Leave one slot free so the fixture identity remains active
+    // during that check (the production default of one slot would report it
+    // as busy and make a valid fixture look unconfigured).
+    for identity_id in [worker_id, reviewer_id] {
+        sqlx::query(
+            "UPDATE agent_identity
+             SET max_concurrent_tasks = 2, updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(db::now_rfc3339())
+        .bind(identity_id)
+        .execute(db.pool())
+        .await
+        .expect("test execution identity capacity update");
+    }
+
+    let repo_project_id: String = sqlx::query_scalar("SELECT project_id FROM repo WHERE id = ?")
+        .bind(repo_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("test repository lookup");
+    assert_eq!(
+        repo_project_id, project_id,
+        "test primary repository belongs to the configured project"
+    );
+
+    let existing_settings: Option<String> =
+        sqlx::query_scalar("SELECT settings FROM project WHERE id = ?")
+            .bind(project_id)
+            .fetch_optional(db.pool())
+            .await
+            .expect("test project settings lookup");
+    let mut settings = existing_settings
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    settings["default_role_assignments"] = json!([
+        {
+            "role_name": "planner",
+            "assignee_type": "agent",
+            "assignee_id": worker_id
+        },
+        {
+            "role_name": "coder",
+            "assignee_type": "agent",
+            "assignee_id": worker_id
+        },
+        {
+            "role_name": "reviewer",
+            "assignee_type": "agent",
+            "assignee_id": reviewer_id
+        },
+        {
+            "role_name": "worker",
+            "assignee_type": "agent",
+            "assignee_id": worker_id
+        }
+    ]);
+    let now = db::now_rfc3339();
+    sqlx::query(
+        "UPDATE project
+         SET settings = ?, primary_repo_id = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(settings.to_string())
+    .bind(repo_id)
+    .bind(&now)
+    .bind(project_id)
+    .execute(db.pool())
+    .await
+    .expect("test project execution setup update");
+
+    let operation_id: String =
+        sqlx::query_scalar("SELECT id FROM project_provisioning_operation WHERE project_id = ?")
+            .bind(project_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("test project provisioning operation lookup");
+    sqlx::query(
+        "UPDATE project_provisioning_operation
+         SET status = 'ready', current_checkpoint = 'completed',
+             lease_owner = NULL, lease_expires_at = NULL, next_retry_at = NULL,
+             retryable = 0, completed_at = ?, updated_at = ?, version = version + 1
+         WHERE id = ? AND project_id = ?",
+    )
+    .bind(&now)
+    .bind(&now)
+    .bind(&operation_id)
+    .bind(project_id)
+    .execute(db.pool())
+    .await
+    .expect("test project provisioning operation ready update");
+    for checkpoint in [
+        "preflight",
+        "repository_initialized",
+        "repository_registered",
+        "repository_linked",
+        "roles_assigned",
+    ] {
+        sqlx::query(
+            "UPDATE project_provisioning_checkpoint
+             SET status = 'completed', completed_at = ?, updated_at = ?,
+                 version = version + 1
+             WHERE operation_id = ? AND checkpoint = ?",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(&operation_id)
+        .bind(checkpoint)
+        .execute(db.pool())
+        .await
+        .expect("test project provisioning checkpoint ready update");
+    }
+}
+
 pub async fn create_shell_agents(
     app: &Router,
     workspace_root: &Path,

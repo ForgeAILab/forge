@@ -512,6 +512,20 @@ impl TaskRepo for SqliteDb {
         if task.entry_barrier_json.is_some() {
             return Err(DbError::InvalidTransition);
         }
+        if input.execution.status != ExecutionStatus::Running {
+            return Err(DbError::InvalidTransition);
+        }
+        let initial_lease = &input.execution_lease;
+        if initial_lease.execution_id != input.execution.id
+            || initial_lease.expected_version != 1
+            || initial_lease.owner.trim().is_empty()
+            || initial_lease.lease_expires_at > initial_lease.hard_deadline_at
+            || initial_lease.hard_deadline_at <= initial_lease.now
+        {
+            return Err(DbError::Check(
+                "task claim requires a valid bounded initial execution lease".to_owned(),
+            ));
+        }
         // Claim and its Running execution are one transaction. Re-check the
         // active baseline here, before mutating Task assignment/status; the
         // service's earlier read gate is only an optimization for avoiding
@@ -618,7 +632,37 @@ impl TaskRepo for SqliteDb {
         task.entry_barrier_json = None;
         task.version += 1;
         task.updated_at = input.claimed_at;
-        let execution = Self::create_execution_in_tx(transaction, &input.execution).await?;
+        let mut execution = Self::create_execution_in_tx(transaction, &input.execution).await?;
+        let lease_result = sqlx::query(
+            "UPDATE execution
+             SET lease_owner = ?,
+                 lease_expires_at = MIN(?, ?),
+                 hard_deadline_at = ?,
+                 last_heartbeat_at = ?,
+                 execution_version = execution_version + 1,
+                 updated_at = ?
+             WHERE id = ? AND status = 'running'
+               AND execution_version = ? AND lease_owner IS NULL",
+        )
+        .bind(&initial_lease.owner)
+        .bind(&initial_lease.lease_expires_at)
+        .bind(&initial_lease.hard_deadline_at)
+        .bind(&initial_lease.hard_deadline_at)
+        .bind(&initial_lease.now)
+        .bind(&initial_lease.now)
+        .bind(&initial_lease.execution_id)
+        .bind(initial_lease.expected_version)
+        .execute(&mut **transaction)
+        .await?;
+        if lease_result.rows_affected() != 1 {
+            return Err(DbError::VersionConflict);
+        }
+        execution.execution_version += 1;
+        execution.lease_owner = Some(initial_lease.owner.clone());
+        execution.lease_expires_at = Some(initial_lease.lease_expires_at.clone());
+        execution.hard_deadline_at = Some(initial_lease.hard_deadline_at.clone());
+        execution.last_heartbeat_at = Some(initial_lease.now.clone());
+        execution.updated_at = initial_lease.now.clone();
         Ok(ClaimedTask { task, execution })
     }
 

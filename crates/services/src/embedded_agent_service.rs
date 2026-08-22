@@ -24,6 +24,7 @@ use forge_agent_host::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use sqlx::Row;
 
 use crate::{
     agent_chat_policy::guard_runtime_content,
@@ -127,6 +128,26 @@ pub struct CreateScopedSession {
     pub actor_user_id: String,
     pub identity_id: String,
     pub profile_id: Option<String>,
+    pub scope: RequestedCanonicalScope,
+}
+
+/// Internal session input used by the Agent Chat turn runner after admission
+/// has persisted a complete responder snapshot.  Unlike the interactive
+/// session path, this input names the historical binding and Profile
+/// revision directly; the runner must never resolve an active replacement for
+/// an already-admitted turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CreateFrozenAgentChatSession {
+    pub actor_user_id: String,
+    pub identity_id: String,
+    pub profile_id: String,
+    pub profile_version: i64,
+    pub binding_id: String,
+    pub binding_version: i64,
+    pub policy_revision: String,
+    pub policy_digest: String,
+    pub permission_policy_digest: String,
+    pub tool_policy_digest: String,
     pub scope: RequestedCanonicalScope,
 }
 
@@ -838,6 +859,201 @@ impl EmbeddedAgentService {
             canonical_task_id(&input.scope),
             canonical_task_role(&input.scope),
             scope_authority_json(&input.actor_user_id, &input.scope),
+        )
+        .await
+    }
+
+    /// Create or resume the session for an already-admitted Agent Chat turn.
+    ///
+    /// Interactive callers must continue through [`Self::authorize_scope`],
+    /// which resolves the current binding.  A queued turn is different: its
+    /// binding and Profile were selected at admission, so resolving the
+    /// active replacement here would mix authority revisions.  This narrow
+    /// internal path validates the retained historical row instead and only
+    /// permits a replacement whose version transition is the one produced by
+    /// the binding repository.  Runtime command/tool authorization remains
+    /// current and therefore can still reject a withdrawn Project ceiling.
+    pub(crate) async fn create_or_resume_frozen_chat_session(
+        &self,
+        input: CreateFrozenAgentChatSession,
+    ) -> Result<AgentSession> {
+        let RequestedCanonicalScope::AgentChat { chat_id } = &input.scope else {
+            return Err(ServiceError::invalid_operation(
+                "frozen Agent Chat sessions require an Agent Chat scope",
+            ));
+        };
+        let identity = self
+            .require_owned_identity(&input.identity_id, &input.actor_user_id)
+            .await?;
+        if identity.paused {
+            return Err(ServiceError::AgentPaused {
+                agent_id: identity.id,
+            });
+        }
+        let profile = AgentProfileRepo::get_profile(&*self.db, &input.profile_id)
+            .await?
+            .filter(|profile| profile.identity_id == identity.id)
+            .ok_or_else(|| ServiceError::not_found("agent_profile", input.profile_id.clone()))?;
+        if profile.version != input.profile_version {
+            return Err(ServiceError::invalid_operation(
+                "frozen Agent Chat Profile revision is no longer available",
+            ));
+        }
+        if input.permission_policy_digest.trim().is_empty()
+            || input.tool_policy_digest.trim().is_empty()
+        {
+            return Err(ServiceError::invalid_operation(
+                "frozen Agent Chat policy provenance is incomplete",
+            ));
+        }
+
+        let chat = AgentChatRepo::get_agent_chat(&*self.db, chat_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent_chat", chat_id.clone()))?;
+        let project_id = match chat.kind.as_str() {
+            "account_main" => {
+                if chat.account_id.as_deref() != Some(input.actor_user_id.as_str())
+                    || chat.project_id.is_some()
+                {
+                    return Err(ServiceError::not_found("agent_chat", chat_id.clone()));
+                }
+                let binding =
+                    AccountMainAgentBindingRepo::get_main_binding(&*self.db, &input.binding_id)
+                        .await?
+                        .filter(|binding| {
+                            binding.account_id == input.actor_user_id
+                                && binding.identity_id == identity.id
+                        })
+                        .ok_or_else(|| {
+                            ServiceError::invalid_operation(
+                                "frozen Main Agent binding history is unavailable",
+                            )
+                        })?;
+                validate_frozen_binding_state(
+                    &binding.state,
+                    binding.version,
+                    input.binding_version,
+                )?;
+                if binding.tool_policy_revision != input.policy_revision {
+                    return Err(ServiceError::invalid_operation(
+                        "frozen Main Agent policy revision changed after admission",
+                    ));
+                }
+                if crate::agent_turn_admission::policy_digest(&binding.autonomy_policy_json)?
+                    != input.policy_digest
+                {
+                    return Err(ServiceError::invalid_operation(
+                        "frozen Main Agent policy changed after admission",
+                    ));
+                }
+                None
+            }
+            "project" => {
+                if chat.account_id.is_some() {
+                    return Err(ServiceError::not_found("agent_chat", chat_id.clone()));
+                }
+                let project_id = chat.project_id.clone().ok_or_else(|| {
+                    ServiceError::invalid_operation("Project Agent Chat has no Project scope")
+                })?;
+                ProjectMemberRepo::get_member(&*self.db, &project_id, &input.actor_user_id)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("project", project_id.clone()))?;
+                let binding =
+                    ProjectAgentBindingRepo::get_project_binding(&*self.db, &input.binding_id)
+                        .await?
+                        .filter(|binding| {
+                            binding.project_id == project_id
+                                && binding.identity_id.as_deref() == Some(identity.id.as_str())
+                        })
+                        .ok_or_else(|| {
+                            ServiceError::invalid_operation(
+                                "frozen Project Agent binding history is unavailable",
+                            )
+                        })?;
+                validate_frozen_binding_state(
+                    &binding.state,
+                    binding.version,
+                    input.binding_version,
+                )?;
+                let policy_row = sqlx::query(
+                    "SELECT policy_revision, policy_digest
+                     FROM project_agent_binding WHERE id = ? AND project_id = ?",
+                )
+                .bind(&input.binding_id)
+                .bind(&project_id)
+                .fetch_one(self.db.pool())
+                .await?;
+                let policy_revision: String = policy_row.try_get("policy_revision")?;
+                let stored_policy_digest: String = policy_row.try_get("policy_digest")?;
+                if policy_revision != input.policy_revision
+                    || stored_policy_digest != input.policy_digest
+                {
+                    return Err(ServiceError::invalid_operation(
+                        "frozen Project Agent policy changed after admission",
+                    ));
+                }
+                if crate::agent_turn_admission::policy_digest(&binding.permission_ceiling_json)?
+                    != input.permission_policy_digest
+                {
+                    return Err(ServiceError::invalid_operation(
+                        "frozen Project Agent permission policy changed after admission",
+                    ));
+                }
+                Some(project_id)
+            }
+            _ => {
+                return Err(ServiceError::invalid_operation(
+                    "Agent Chat has an unsupported canonical kind",
+                ));
+            }
+        };
+        if crate::agent_turn_admission::policy_digest(&profile.tool_policy_json)?
+            != input.tool_policy_digest
+        {
+            return Err(ServiceError::invalid_operation(
+                "frozen Agent Chat Profile policy changed after admission",
+            ));
+        }
+
+        let canonical = CanonicalScope {
+            scope_type: CanonicalScopeType::AgentChat,
+            scope_id: chat_id.clone(),
+            workspace_access: WorkspaceAccess::Deny,
+        };
+        canonical
+            .validate()
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        let mut authority = scope_authority_json(&input.actor_user_id, &input.scope);
+        if let Some(object) = authority.as_object_mut() {
+            object.insert("frozen_binding_id".to_owned(), json!(input.binding_id));
+            object.insert(
+                "frozen_binding_version".to_owned(),
+                json!(input.binding_version),
+            );
+            object.insert("frozen_profile_id".to_owned(), json!(input.profile_id));
+            object.insert(
+                "frozen_profile_version".to_owned(),
+                json!(input.profile_version),
+            );
+            object.insert(
+                "frozen_policy_revision".to_owned(),
+                json!(input.policy_revision),
+            );
+            object.insert(
+                "frozen_policy_digest".to_owned(),
+                json!(input.policy_digest),
+            );
+            object.insert(
+                "frozen_permission_policy_digest".to_owned(),
+                json!(input.permission_policy_digest),
+            );
+            object.insert(
+                "frozen_tool_policy_digest".to_owned(),
+                json!(input.tool_policy_digest),
+            );
+        }
+        self.persist_authorized_session(
+            identity, profile, canonical, project_id, None, None, authority,
         )
         .await
     }
@@ -1977,6 +2193,26 @@ fn scope_authority_json(user_id: &str, scope: &RequestedCanonicalScope) -> Value
     })
 }
 
+fn validate_frozen_binding_state(
+    state: &str,
+    current_version: i64,
+    admitted_version: i64,
+) -> Result<()> {
+    let version_matches = current_version == admitted_version
+        || (state == "replaced" && current_version == admitted_version + 1);
+    if !version_matches {
+        return Err(ServiceError::invalid_operation(
+            "frozen Agent Chat binding revision is no longer available",
+        ));
+    }
+    if !matches!(state, "active" | "replaced") {
+        return Err(ServiceError::invalid_operation(
+            "frozen Agent Chat binding is no longer executable",
+        ));
+    }
+    Ok(())
+}
+
 fn permission_set(value: &str) -> BTreeSet<String> {
     let Ok(value) = serde_json::from_str::<Value>(value) else {
         return BTreeSet::new();
@@ -2109,6 +2345,12 @@ fn redacted_host_error(error: forge_agent_host::AgentHostError) -> ServiceError 
         forge_agent_host::AgentHostError::Runtime(_) => {
             ServiceError::Domain("embedded runtime failed".to_owned())
         }
+        // Structured outcomes are consumed in-band by Forge's typed native
+        // tools. If one escapes to the session boundary, keep its model-facing
+        // payload out of this generic service error path.
+        forge_agent_host::AgentHostError::StructuredOutcome(_) => {
+            ServiceError::Domain("embedded runtime returned a command outcome".to_owned())
+        }
         forge_agent_host::AgentHostError::ProtectedPersistence => {
             ServiceError::Domain("protected runtime persistence failed".to_owned())
         }
@@ -2130,6 +2372,22 @@ fn task_role_admitted_by_workflow(active_role: Option<&str>, requested_role: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frozen_binding_accepts_the_retained_replacement_version_only() {
+        assert!(validate_frozen_binding_state("active", 3, 3).is_ok());
+        assert!(validate_frozen_binding_state("replaced", 4, 3).is_ok());
+        assert!(validate_frozen_binding_state("replaced", 3, 3).is_ok());
+        assert!(validate_frozen_binding_state("replaced", 5, 3).is_err());
+        assert!(validate_frozen_binding_state("active", 4, 3).is_err());
+    }
+
+    #[test]
+    fn frozen_binding_rejects_withdrawn_authority_even_with_matching_version() {
+        for state in ["paused", "revoked", "agent_setup_required"] {
+            assert!(validate_frozen_binding_state(state, 3, 3).is_err());
+        }
+    }
 
     #[test]
     fn permission_intersection_never_expands_authority() {

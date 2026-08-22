@@ -4,6 +4,8 @@ mod interaction;
 mod lcm;
 mod manifest;
 mod native;
+pub mod operation_catalog;
+pub(crate) mod operation_contract;
 mod protected_store;
 mod transport;
 mod typed_tools;
@@ -40,6 +42,23 @@ pub use manifest::{
     RuntimeLosslessSummaryLink, RuntimeSummaryCoverageLink,
 };
 pub use native::NativeAgentRuntimeBackend;
+pub use operation_catalog::{
+    MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
+    MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION, MAIN_CHARTER_READINESS_OPERATION,
+    MAIN_PROJECT_CREATE_OPERATION, MIGRATED_OPERATION_CONTRACTS, OperationClassification,
+    OperationContract, OperationDescriptor, OperationExposure, OperationInputContract,
+    OperationOutputContract, OperationPermission, OperationSetupExposure, OperationSurface,
+    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
+    PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION,
+    PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
+    PROJECT_RELEASE_OPERATION, SHARED_ORCHESTRATION_OUTCOME, TASK_ADAPTIVE_OPERATION,
+    TASK_PROPOSE_OPERATION, classify_operation, contains_adaptive_authority_override,
+    contains_authority_override, descriptor as operation_descriptor,
+    is_allowed_project_direct_payload, is_approval_required_operation, is_denied_operation,
+    is_project_orchestration_operation, is_query_operation, operation_contract,
+    operation_contract_permission, operation_names_for_surface, operation_permission,
+    operation_supported_in_scope,
+};
 pub use protected_store::{
     CreateOAuthCredential, CredentialRevocationOutcome, OAuthCredentialBundle,
     SqliteProtectedRuntimeStore,
@@ -48,13 +67,8 @@ pub use typed_tools::{
     FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL, FORGE_MAIN_ORCHESTRATION_READ_TOOL,
     FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL, FORGE_PROJECT_ORCHESTRATION_READ_TOOL,
     FORGE_PUBLIC_WEB_SEARCH_TOOL, FORGE_SCOPE_PROPOSE_PERMISSION, FORGE_SCOPE_READ_PERMISSION,
-    ForgeToolProvider, MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
-    MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION, MAIN_CHARTER_READINESS_OPERATION,
-    MAIN_PROJECT_CREATE_OPERATION, PROJECT_CHARTER_ADOPTION_OPERATION,
-    PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
-    PROJECT_EVIDENCE_OPERATION, PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION,
-    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, ProjectChatToolContext,
-    PublicSearchScope, ScopeToolComposition, TaskToolRole,
+    ForgeToolProvider, ProjectChatToolContext, PublicSearchScope, ScopeToolComposition,
+    TaskToolRole,
 };
 
 /// The immutable revision Forge is built and tested against.
@@ -250,6 +264,12 @@ pub enum AgentHostError {
     VersionConflict,
     #[error("runtime operation unsupported: {0}")]
     Unsupported(String),
+    /// A provider-side Forge command/query result that is already safe and
+    /// structured for model-facing transport.  Native typed tools must return
+    /// this as an in-band, `is_error` tool outcome rather than flattening it
+    /// into `RuntimeError` prose.
+    #[error("structured Forge outcome")]
+    StructuredOutcome(Box<api_types::OrchestrationOutcome>),
     #[error("runtime failed: {0}")]
     Runtime(String),
     #[error("protected persistence failed")]

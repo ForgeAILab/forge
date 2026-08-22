@@ -7,8 +7,129 @@
 //! converting between the two layers and for policy authorization.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 
-use crate::{CreateProject, Project, Result};
+use crate::{
+    CommandReceipt, CreateAgentActionExecution, CreateCommandReceipt, CreateProject, CreateTask,
+    CreateTaskRoleAssignment, Project, Result, Task,
+};
+
+/// Recursively sort object keys while preserving array order for the
+/// immutable Project handoff contract.  The handoff is assembled in two
+/// places (the SQLite create transaction and the Project Agent turn worker),
+/// so both sides must use the same canonical JSON projection.
+pub fn canonicalize_project_handoff_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(object) => {
+            let sorted = object
+                .iter()
+                .map(|(key, value)| (key.clone(), canonicalize_project_handoff_json(value)))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            serde_json::Value::Object(sorted.into_iter().collect())
+        }
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(canonicalize_project_handoff_json)
+                .collect(),
+        ),
+        scalar => scalar.clone(),
+    }
+}
+
+/// Remove only values allocated by the Project-create transaction from a
+/// handoff packet.  Charter/approval/policy/authorization and semantic
+/// content remain part of the immutable request identity; transport IDs and
+/// delivery timestamps are filled by the transaction and therefore are not.
+pub fn normalize_project_handoff_request(
+    value: &serde_json::Value,
+) -> std::result::Result<serde_json::Value, String> {
+    let mut normalized = value.clone();
+    let object = normalized
+        .as_object_mut()
+        .ok_or_else(|| "handoff source_revisions_json must be a JSON object".to_owned())?;
+    object.remove("approval_id");
+    object.remove("handoff_id");
+    object.remove("correlation_id");
+    object.remove("created_at");
+    if let Some(project) = object
+        .get_mut("project")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        project.remove("id");
+    }
+    if let Some(request) = object
+        .get_mut("request")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        request.remove("policy_revision");
+        request.remove("policy_digest");
+        request.remove("source_revisions_digest");
+        request.remove("authorization");
+    }
+    if let Some(target) = object
+        .get_mut("target")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        target.insert("chat_id".to_owned(), serde_json::Value::Null);
+        target.remove("binding_id");
+        target.remove("message_id");
+        target.remove("turn_id");
+    }
+    if let Some(delivery) = object
+        .get_mut("delivery")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        delivery.insert("delivered_at".to_owned(), serde_json::Value::Null);
+    }
+    if let Some(source) = object
+        .get_mut("source")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        source.remove("message_id");
+    }
+    Ok(normalized)
+}
+
+/// Compute the immutable handoff request fingerprint used by both the
+/// SQLite Project-create transaction and the Project Agent turn worker.
+/// `source_revisions_json` is passed separately because the initial create
+/// request does not yet contain the server-added `request` envelope.
+pub fn project_handoff_request_fingerprint(
+    value: &serde_json::Value,
+    source_revisions_json: &str,
+    authorization: &serde_json::Value,
+) -> std::result::Result<String, String> {
+    let mut normalized = normalize_project_handoff_request(value)?;
+    let object = normalized
+        .as_object_mut()
+        .ok_or_else(|| "handoff source_revisions_json must be a JSON object".to_owned())?;
+    let request = object
+        .entry("request".to_owned())
+        .or_insert_with(|| serde_json::json!({}));
+    let request = request
+        .as_object_mut()
+        .ok_or_else(|| "handoff request must be a JSON object".to_owned())?;
+    let source_value: serde_json::Value = serde_json::from_str(source_revisions_json)
+        .map_err(|error| format!("handoff source_revisions_json is invalid: {error}"))?;
+    let source_value = normalize_project_handoff_request(&source_value)?;
+    let source_revisions_json =
+        serde_json::to_string(&canonicalize_project_handoff_json(&source_value))
+            .map_err(|error| format!("handoff source_revisions_json is invalid: {error}"))?;
+    request.insert(
+        "source_revisions_json".to_owned(),
+        serde_json::Value::String(source_revisions_json),
+    );
+    request.insert(
+        "authorization".to_owned(),
+        canonicalize_project_handoff_json(authorization),
+    );
+    let canonical = canonicalize_project_handoff_json(&normalized);
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|error| format!("handoff request is invalid: {error}"))?;
+    Ok(hex::encode(sha2::Sha256::digest(&bytes)))
+}
 
 /// A durable Project Charter (the identity record, not a revision).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +205,11 @@ pub struct CreateProjectCharterRevision {
     pub content_digest: String,
     pub rendered_digest: String,
     pub created_at: String,
+    /// Optional command finalization owned by the same SQLite transaction as
+    /// the revision and its durable event.  Ordinary REST/Project-Agent
+    /// callers leave this unset; the Main command boundary supplies it.
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
 }
 
 /// Atomically create (or claim) an owned Charter and append its first
@@ -98,6 +224,25 @@ pub struct CreateProjectCharterRevisionAtomically {
     pub account_id: String,
     pub charter: CreateProjectCharter,
     pub revision: CreateProjectCharterRevision,
+    /// Optional command finalization owned by the same SQLite transaction as
+    /// the Charter shell, first revision, and durable event.
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
+}
+
+/// Finalize a semantically equivalent first-Charter-revision retry without
+/// inserting another immutable revision.  The command receipt and replay
+/// event remain part of the same transaction as the current-draft checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizeProjectCharterRevisionNoop {
+    pub account_id: String,
+    pub project_id: String,
+    pub charter_id: String,
+    pub revision_id: String,
+    pub content_digest: String,
+    pub rendered_digest: String,
+    pub command_receipt: CreateCommandReceipt,
+    pub action_execution: Option<CreateAgentActionExecution>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,6 +423,58 @@ pub struct ApproveProjectCharter {
     pub updated_at: String,
 }
 
+/// Apply a user-approved Charter to an existing Project.  This command owns
+/// the complete adoption/amendment boundary: the immutable approval target,
+/// Project pointer/version CAS, Project Agent binding rotation, Project Chat
+/// bootstrap (for legacy adoption), amendment provenance, and all command
+/// finalization are committed by one SQLite transaction.
+///
+/// The service layer supplies server-minted IDs for the replacement binding,
+/// bootstrap message, and amendment row before constructing the command so
+/// those IDs can be part of the frozen command outcome.  `None` is accepted
+/// for the optional rows only where the operation does not need that row (an
+/// amendment has no bootstrap message; an adoption has no amendment row).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyProjectCharterApprovalCommand {
+    pub approval: ApproveProjectCharter,
+    pub project_id: String,
+    pub expected_project_version: i64,
+    pub expected_current_charter_revision_id: Option<String>,
+    pub existing_binding_id: String,
+    pub replacement_binding_id: Option<String>,
+    pub bootstrap_message_id: Option<String>,
+    pub bootstrap_content: Option<String>,
+    pub bootstrap_content_guard_json: Option<String>,
+    pub bootstrap_author_id: Option<String>,
+    pub bootstrap_correlation_id: Option<String>,
+    pub bootstrap_source_metadata_json: Option<String>,
+    pub amendment_id: Option<String>,
+    pub amendment_rationale: Option<String>,
+    pub amendment_material_diff_json: Option<String>,
+    pub amendment_affected_records_json: Option<String>,
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
+}
+
+/// The frozen domain identity returned by the Charter adoption/amendment
+/// composite.  The full wire outcome is owned by the command service and is
+/// persisted in `command_receipt.outcome_json`; this record lets repository
+/// callers verify every row which the composite touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedProjectCharterApprovalRecord {
+    pub approval: ProjectCharterApprovalRecord,
+    pub project_id: String,
+    pub project_version: i64,
+    pub project_charter_status: String,
+    pub project_charter_setup_required: bool,
+    pub project_charter_id: String,
+    pub project_charter_revision_id: String,
+    pub project_agent_binding_id: String,
+    pub project_chat_id: String,
+    pub bootstrap_message_id: Option<String>,
+    pub amendment_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectDocumentRecord {
     pub id: String,
@@ -357,6 +554,38 @@ pub struct CreateProjectDocumentAtomically {
     pub revision: CreateProjectDocumentRevision,
 }
 
+/// A command-aware Project Document shell creation.  The shell is kept as a
+/// separate public operation because the REST contract creates the typed
+/// Document before its first revision is submitted.  The command receipt and
+/// domain event are finalized in the same transaction as the Project CAS and
+/// shell row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateProjectDocumentShellCommand {
+    pub document: CreateProjectDocument,
+    pub expected_project_version: i64,
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
+}
+
+/// A command-aware first Project Document revision.  The nested domain
+/// inputs intentionally remain the same records used by the historical
+/// repository methods; the command envelope is an additional transaction
+/// boundary rather than a replacement for those low-level contracts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateProjectDocumentCommand {
+    pub document: CreateProjectDocument,
+    pub revision: CreateProjectDocumentRevision,
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendProjectDocumentRevisionCommand {
+    pub revision: CreateProjectDocumentRevision,
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectDocumentApprovalRecord {
     pub id: String,
@@ -397,6 +626,13 @@ pub struct ApproveProjectDocument {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApproveProjectDocumentCommand {
+    pub approval: ApproveProjectDocument,
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectDecisionCandidateRecord {
     pub id: String,
     pub project_id: String,
@@ -432,6 +668,13 @@ pub struct CreateProjectDecisionCandidate {
     pub expected_project_version: i64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateProjectDecisionCandidateCommand {
+    pub candidate: CreateProjectDecisionCandidate,
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -483,6 +726,45 @@ pub struct CreateProjectDecision {
     pub affected_records_json: String,
     pub supersedes_decision_id: Option<String>,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendProjectDecisionCommand {
+    pub decision: CreateProjectDecision,
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
+}
+
+/// Approve one current Decision candidate and append its immutable effective
+/// Decision in one command transaction.  The candidate id/version is kept
+/// separate from the Decision input because candidate approval changes both
+/// records and must compare-and-swap each one before the event/receipt is
+/// finalized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApproveProjectDecisionCandidateCommand {
+    pub candidate_id: String,
+    pub expected_candidate_version: i64,
+    pub decision: CreateProjectDecision,
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectProjectDecisionCandidateCommand {
+    pub candidate_id: String,
+    pub project_id: String,
+    pub expected_project_version: i64,
+    pub expected_candidate_version: i64,
+    pub reason: String,
+    pub principal_type: String,
+    pub principal_id: String,
+    pub authorization_basis: String,
+    pub authorization_action: String,
+    pub explicit_event: String,
+    pub authorization_occurred_at: String,
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -622,6 +904,99 @@ pub struct ActivateProjectExecutionBaseline {
     pub updated_at: String,
 }
 
+/// Transactional command input for saving or proposing an execution-baseline
+/// revision.  The service owns the lifecycle/validation decision; SQLite
+/// owns the shell, immutable revision, event, receipt, and optional action
+/// execution composite.  `baseline_id` is optional because the first shell is
+/// server-minted and a replay must resolve its authoritative id from the
+/// frozen command receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveProjectExecutionBaselineRevisionCommand {
+    pub project_id: String,
+    pub baseline_id: Option<String>,
+    pub revision_id: String,
+    pub expected_baseline_version: Option<i64>,
+    pub base_revision: i64,
+    pub base_revision_id: Option<String>,
+    pub lifecycle: String,
+    pub charter_revision_id: String,
+    pub document_revisions_json: String,
+    pub plan_items_json: String,
+    pub milestone_id: Option<String>,
+    pub milestone_ids_json: String,
+    pub milestone_definition_revision_ids_json: String,
+    pub primary_milestone_id: Option<String>,
+    pub release_policy_json: String,
+    pub release_policy_revision: String,
+    pub release_policy_digest: String,
+    pub acceptance_matrix_json: String,
+    pub capability_classes_json: String,
+    pub risk_classes_json: String,
+    pub adaptive_envelope_json: String,
+    pub elevated_operations_json: String,
+    pub exclusions_json: String,
+    pub rollback_recovery_json: String,
+    pub schema_version: String,
+    pub render_version: String,
+    pub rendered_view: String,
+    pub content_digest: String,
+    pub rendered_digest: String,
+    pub source_refs_json: String,
+    pub created_at: String,
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
+}
+
+/// Approval command composite.  The service has already validated the exact
+/// persisted review target and interactive-user authorization; this record
+/// keeps those claims in the same transaction as the baseline lifecycle and
+/// command receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApproveProjectExecutionBaselineCommand {
+    pub id: String,
+    pub baseline_id: String,
+    pub revision_id: String,
+    pub expected_baseline_version: i64,
+    pub expected_project_version: i64,
+    pub principal_type: String,
+    pub principal_id: String,
+    pub authorization_basis: String,
+    pub authorization_action: String,
+    pub authorization_occurred_at: String,
+    pub explicit_event: String,
+    pub content_digest: String,
+    pub rendered_digest: String,
+    pub idempotency_key: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
+}
+
+/// Activation command composite.  The paired milestone/definition manifests
+/// are supplied by the service after it has revalidated the frozen manifest;
+/// SQLite rechecks ownership/currentness while holding its write lock before
+/// promoting milestones and Task governance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivateProjectExecutionBaselineCommand {
+    pub project_id: String,
+    pub baseline_id: String,
+    pub revision_id: String,
+    pub approval_id: String,
+    pub expected_baseline_version: i64,
+    pub expected_project_version: i64,
+    pub charter_revision_id: String,
+    pub milestone_ids: Vec<String>,
+    pub milestone_definition_revision_ids: Vec<String>,
+    pub primary_milestone_id: Option<String>,
+    pub content_digest: String,
+    pub rendered_digest: String,
+    pub idempotency_key: String,
+    pub updated_at: String,
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectMilestoneRecord {
     pub id: String,
@@ -727,6 +1102,57 @@ pub struct CreateProjectMilestoneRevision {
 pub struct CreateProjectMilestoneAtomically {
     pub milestone: CreateProjectMilestone,
     pub revision: CreateProjectMilestoneRevision,
+}
+
+/// Command-aware first milestone definition.  The shell, first immutable
+/// definition, domain event, and optional command finalization are committed
+/// by one SQLite transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateProjectMilestoneCommand {
+    pub milestone: CreateProjectMilestone,
+    pub revision: CreateProjectMilestoneRevision,
+    /// Allocate the next Project-local milestone sequence while holding the
+    /// command transaction's Project write lock.  Transport-neutral command
+    /// services set this for new milestones so concurrent distinct commands
+    /// cannot race on a pre-read `MAX(sequence) + 1` value.
+    pub allocate_project_sequence: bool,
+    /// Acceptance-check definitions materialized with a non-draft revision.
+    /// These rows are part of the same receipt/event transaction.
+    pub check_definitions: Vec<CreateProjectMilestoneCheck>,
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
+}
+
+/// Command-aware append of one immutable milestone definition revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendProjectMilestoneRevisionCommand {
+    pub revision: CreateProjectMilestoneRevision,
+    /// Acceptance-check definitions materialized with a non-draft revision.
+    /// Draft revisions intentionally leave the current check projection
+    /// unchanged until they are proposed.
+    pub check_definitions: Vec<CreateProjectMilestoneCheck>,
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
+}
+
+/// Command-aware update of the Project's explicit primary milestone pointer.
+/// `primary_milestone_id = None` is allowed only when no active milestone
+/// remains, matching the authoritative Project lifecycle rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetPrimaryProjectMilestoneCommand {
+    pub project_id: String,
+    pub primary_milestone_id: Option<String>,
+    pub expected_project_version: i64,
+    pub principal_type: String,
+    pub principal_id: String,
+    pub authorization_basis: String,
+    pub authorization_action: String,
+    pub authorization_occurred_at: String,
+    pub explicit_event: String,
+    pub idempotency_key: String,
+    pub updated_at: String,
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -876,6 +1302,16 @@ pub struct CreateProjectReadinessSnapshot {
     pub created_at: String,
 }
 
+/// Command-aware readiness evaluation result.  The pure readiness evaluator
+/// lives above the database; this input contains its complete frozen output
+/// and this wrapper gives the persistence layer one atomic command boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateProjectReadinessSnapshotCommand {
+    pub snapshot: CreateProjectReadinessSnapshot,
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectReleaseRecord {
     pub id: String,
@@ -955,6 +1391,186 @@ pub struct CreateProjectRelease {
     pub created_at: String,
 }
 
+/// Command-aware immutable release manifest creation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateProjectReleaseCommand {
+    pub release: CreateProjectRelease,
+    pub references: Vec<CreateProjectReleaseReference>,
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
+}
+
+/// A Project Agent release-candidate request is not itself an authoritative
+/// release manifest.  It is an immutable domain event which records the exact
+/// ready snapshot presented for user approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateProjectReleaseRequest {
+    pub event_id: String,
+    pub project_id: String,
+    pub milestone_id: String,
+    pub expected_milestone_version: i64,
+    pub readiness_snapshot_id: String,
+    pub readiness_digest: String,
+    pub status: String,
+    pub idempotency_key: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectReleaseRequestRecord {
+    pub event_id: String,
+    pub project_id: String,
+    pub milestone_id: String,
+    pub expected_milestone_version: i64,
+    pub readiness_snapshot_id: String,
+    pub readiness_digest: String,
+    pub status: String,
+    pub idempotency_key: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateProjectReleaseRequestCommand {
+    pub request: CreateProjectReleaseRequest,
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
+}
+
+/// The immutable governance projection written alongside a Task proposal.
+/// Services derive these values from the current Project Charter/baseline;
+/// SQLite owns the final scope, runnable, and uniqueness checks while holding
+/// the command write lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateProjectTaskGovernance {
+    pub task_id: String,
+    pub project_id: String,
+    pub charter_revision_id: Option<String>,
+    pub baseline_id: Option<String>,
+    pub baseline_revision_id: Option<String>,
+    pub plan_item_id: Option<String>,
+    pub milestone_id: Option<String>,
+    pub document_revisions_json: String,
+    pub capability_class: Option<String>,
+    pub risk_class: Option<String>,
+    pub runnable: bool,
+    pub replacement_of_task_id: Option<String>,
+    pub provenance_json: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Atomic Task proposal composite.  The Task row, optional immutable
+/// governance projection, explicit/default role assignments, durable
+/// `task.created` event, command receipt, and optional AgentAction execution
+/// are committed by one SQLite transaction.  The command receipt is optional
+/// only for repository-level characterization callers; the service command
+/// always supplies it.
+#[derive(Debug, Clone)]
+pub struct CreateTaskProposalCommand {
+    pub task: CreateTask,
+    pub governance: Option<CreateProjectTaskGovernance>,
+    pub role_assignments: Vec<CreateTaskRoleAssignment>,
+    pub metadata_json: Option<String>,
+    /// Present only for an approval/audit-backed execution. Directly allowed
+    /// commands intentionally leave these unset and therefore cannot create
+    /// an AgentActionExecution row.
+    pub source_action_id: Option<String>,
+    pub expected_action_version: Option<i64>,
+    /// Frozen authorization provenance shared by action-backed and direct
+    /// transports. SQLite rechecks the mutable binding/action facts under
+    /// BEGIN IMMEDIATE before inserting the Task.
+    pub source_actor_identity_id: String,
+    pub source_scope_type: String,
+    pub source_scope_id: String,
+    pub source_target_type: Option<String>,
+    pub source_target_id: Option<String>,
+    pub source_operation: String,
+    pub source_requested_permission: String,
+    pub source_policy_result: String,
+    pub source_policy_revision: Option<String>,
+    pub source_policy_digest: Option<String>,
+    pub source_payload_hash: String,
+    pub executor_type: String,
+    pub executor_id: String,
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
+}
+
+/// One bounded child payload for an adaptive Task split.  The payload is
+/// intentionally smaller than `CreateTask`: adaptive reshaping inherits the
+/// source Task's repository, workflow, governance, capability, and risk
+/// facts.  Callers can only supply the child text (and the historical
+/// optional assignee hint).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdaptiveTaskChild {
+    pub title: String,
+    pub description: Option<String>,
+    pub assignee_id: Option<String>,
+}
+
+/// The closed set of adaptive Task mutations.  Keeping split/sequence/
+/// replace in one enum prevents transport adapters from reaching separate
+/// persistence paths with subtly different governance checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AdaptiveTaskOperation {
+    Split {
+        items: Vec<AdaptiveTaskChild>,
+    },
+    Sequence {
+        ordered_task_ids: Vec<String>,
+    },
+    Replace {
+        title: String,
+        description: Option<String>,
+    },
+}
+
+impl AdaptiveTaskOperation {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Split { .. } => "split",
+            Self::Sequence { .. } => "sequence",
+            Self::Replace { .. } => "replace",
+        }
+    }
+}
+
+/// Transactional command input for bounded Task reshaping.  The receipt is
+/// the command identity and replay boundary; the database repeats every
+/// mutable baseline/envelope/CAS check while holding `BEGIN IMMEDIATE`.
+#[derive(Debug, Clone)]
+pub struct ApplyAdaptiveTaskCommand {
+    pub project_id: String,
+    pub source_task_id: String,
+    pub expected_task_version: i64,
+    pub expected_board_revision: i64,
+    pub operation: AdaptiveTaskOperation,
+    pub rationale: String,
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
+}
+
+/// Frozen result of one adaptive command.  On replay, all Task snapshots and
+/// the board revision come from the immutable receipt outcome rather than
+/// from mutable live rows.
+#[derive(Debug, Clone)]
+pub struct AppliedAdaptiveTaskCommand {
+    pub source_task: Task,
+    pub tasks: Vec<Task>,
+    pub board_revision: i64,
+    pub receipt: CommandReceipt,
+    pub replayed: bool,
+}
+
+/// The task snapshot returned by the command composite.  It is intentionally
+/// separate from the live Task query: a replay can return the exact frozen
+/// receipt snapshot even if a later workflow transition changed the row.
+#[derive(Debug, Clone)]
+pub struct CreatedTaskProposal {
+    pub task: crate::Task,
+    pub replayed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectReleaseReferenceRecord {
     pub release_id: String,
@@ -1016,9 +1632,18 @@ pub struct CreateProjectFromCharterApproval {
     pub causation_id: Option<String>,
     pub causation_depth: i64,
     pub max_attempts: i64,
+    /// Operation identity allocated with the Genesis Project-create
+    /// composite so a post-commit process stop still leaves recoverable
+    /// provisioning work under a stable row id.
+    pub provisioning_operation_id: String,
     pub policy_revision: String,
     pub policy_digest: String,
     pub member_id: String,
+    /// Optional Main command finalization. When present, the action outcome
+    /// and command receipt are committed with the existing Project/Chat/
+    /// binding/handoff transaction rather than in a post-commit path.
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1035,6 +1660,45 @@ pub struct CreatedProjectFromCharterApproval {
 
 #[async_trait]
 pub trait ProjectOrchestrationRepo: Send + Sync {
+    /// Atomically apply one bounded split/sequence/replace Task command.
+    /// Implementations must resolve the command receipt before mutable reads,
+    /// then perform the exact adaptive-baseline gate, source Task/version CAS,
+    /// board CAS, governance insertion, event, and receipt in one writer
+    /// transaction.
+    async fn apply_adaptive_task_command(
+        &self,
+        input: ApplyAdaptiveTaskCommand,
+    ) -> Result<AppliedAdaptiveTaskCommand> {
+        let _ = input;
+        Err(crate::DbError::Check(
+            "Adaptive Task command persistence is not wired".to_owned(),
+        ))
+    }
+    /// Insert the immutable Task governance projection through the same
+    /// scope/runnable/replacement checks used by adaptive materialization.
+    /// Callers must already own the surrounding writer transaction.
+    async fn insert_project_task_governance_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        governance: CreateProjectTaskGovernance,
+    ) -> Result<()> {
+        let _ = (transaction, governance);
+        Err(crate::DbError::Check(
+            "Task governance persistence is not wired".to_owned(),
+        ))
+    }
+    /// Atomically materialize a `task.propose` command.  The implementation
+    /// must resolve the command receipt before applying current authorization
+    /// or lifecycle checks so a response-loss retry is replay-exact.
+    async fn create_task_proposal_command(
+        &self,
+        input: CreateTaskProposalCommand,
+    ) -> Result<CreatedTaskProposal> {
+        let _ = input;
+        Err(crate::DbError::Check(
+            "Task proposal command persistence is not wired".to_owned(),
+        ))
+    }
     async fn get_project_charter(&self, id: &str) -> Result<Option<ProjectCharterRecord>>;
     /// The adoption Charter a Project already owns, if any. A Project holds at
     /// most one Charter (`idx_project_charter_project`), so this resolves the
@@ -1068,6 +1732,10 @@ pub trait ProjectOrchestrationRepo: Send + Sync {
         &self,
         input: CreateProjectCharterRevisionAtomically,
     ) -> Result<ProjectCharterRevisionRecord>;
+    async fn finalize_project_charter_revision_noop(
+        &self,
+        input: FinalizeProjectCharterRevisionNoop,
+    ) -> Result<ProjectCharterRevisionRecord>;
     async fn get_project_charter_approval(
         &self,
         id: &str,
@@ -1076,6 +1744,18 @@ pub trait ProjectOrchestrationRepo: Send + Sync {
         &self,
         input: ApproveProjectCharter,
     ) -> Result<ProjectCharterApprovalRecord>;
+    /// Atomically apply a user-approved adoption or amendment to an existing
+    /// Project.  Genesis `project_creation` approvals intentionally continue
+    /// through the separate Project-create composite below.
+    async fn apply_project_charter_approval_command(
+        &self,
+        input: ApplyProjectCharterApprovalCommand,
+    ) -> Result<AppliedProjectCharterApprovalRecord> {
+        let _ = input;
+        Err(crate::DbError::Check(
+            "Project Charter adoption/amendment command persistence is not wired".to_owned(),
+        ))
+    }
     async fn create_project_from_charter_approval(
         &self,
         input: CreateProjectFromCharterApproval,
@@ -1143,6 +1823,39 @@ pub trait ProjectOrchestrationRepo: Send + Sync {
             "Project document persistence is not wired".to_owned(),
         ))
     }
+    /// Execute Project CAS, shell creation, the shell-created domain event,
+    /// and optional command finalization in one transaction.
+    async fn create_project_document_shell_command(
+        &self,
+        input: CreateProjectDocumentShellCommand,
+    ) -> Result<ProjectDocumentRecord> {
+        let _ = input;
+        Err(crate::DbError::Check(
+            "Project document command persistence is not wired".to_owned(),
+        ))
+    }
+    /// Execute first-Document creation, its first immutable revision, the
+    /// domain event, and optional command finalization in one transaction.
+    async fn create_project_document_command(
+        &self,
+        input: CreateProjectDocumentCommand,
+    ) -> Result<ProjectDocumentRevisionRecord> {
+        let _ = input;
+        Err(crate::DbError::Check(
+            "Project document command persistence is not wired".to_owned(),
+        ))
+    }
+    /// Append one immutable Document revision and finalize its command in the
+    /// same transaction as the Document pointer/version update and event.
+    async fn append_project_document_revision_command(
+        &self,
+        input: AppendProjectDocumentRevisionCommand,
+    ) -> Result<ProjectDocumentRevisionRecord> {
+        let _ = input;
+        Err(crate::DbError::Check(
+            "Project document command persistence is not wired".to_owned(),
+        ))
+    }
     async fn approve_project_document(
         &self,
         input: ApproveProjectDocument,
@@ -1150,6 +1863,15 @@ pub trait ProjectOrchestrationRepo: Send + Sync {
         let _ = input;
         Err(crate::DbError::Check(
             "Project document persistence is not wired".to_owned(),
+        ))
+    }
+    async fn approve_project_document_command(
+        &self,
+        input: ApproveProjectDocumentCommand,
+    ) -> Result<ProjectDocumentApprovalRecord> {
+        let _ = input;
+        Err(crate::DbError::Check(
+            "Project document command persistence is not wired".to_owned(),
         ))
     }
 
@@ -1181,6 +1903,15 @@ pub trait ProjectOrchestrationRepo: Send + Sync {
             "Project decision persistence is not wired".to_owned(),
         ))
     }
+    async fn create_project_decision_candidate_command(
+        &self,
+        input: CreateProjectDecisionCandidateCommand,
+    ) -> Result<ProjectDecisionCandidateRecord> {
+        let _ = input;
+        Err(crate::DbError::Check(
+            "Project decision command persistence is not wired".to_owned(),
+        ))
+    }
     async fn get_project_decision_candidate(
         &self,
         id: &str,
@@ -1197,6 +1928,33 @@ pub trait ProjectOrchestrationRepo: Send + Sync {
         let _ = input;
         Err(crate::DbError::Check(
             "Project decision persistence is not wired".to_owned(),
+        ))
+    }
+    async fn append_project_decision_command(
+        &self,
+        input: AppendProjectDecisionCommand,
+    ) -> Result<ProjectDecisionRecord> {
+        let _ = input;
+        Err(crate::DbError::Check(
+            "Project decision command persistence is not wired".to_owned(),
+        ))
+    }
+    async fn approve_project_decision_candidate_command(
+        &self,
+        input: ApproveProjectDecisionCandidateCommand,
+    ) -> Result<ProjectDecisionRecord> {
+        let _ = input;
+        Err(crate::DbError::Check(
+            "Project decision candidate command persistence is not wired".to_owned(),
+        ))
+    }
+    async fn reject_project_decision_candidate_command(
+        &self,
+        input: RejectProjectDecisionCandidateCommand,
+    ) -> Result<ProjectDecisionCandidateRecord> {
+        let _ = input;
+        Err(crate::DbError::Check(
+            "Project decision candidate command persistence is not wired".to_owned(),
         ))
     }
     async fn list_project_decision_candidates(
@@ -1236,11 +1994,41 @@ pub trait ProjectOrchestrationRepo: Send + Sync {
             "Execution baseline persistence is not wired".to_owned(),
         ))
     }
+    /// Resolve the Project's authoritative baseline projection target. The
+    /// lifecycle ordering is part of the repository query contract so every
+    /// transport observes the same current candidate.
+    async fn get_project_execution_baseline_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<ProjectExecutionBaselineRecord>> {
+        let _ = project_id;
+        Err(crate::DbError::Check(
+            "Execution baseline persistence is not wired".to_owned(),
+        ))
+    }
     async fn get_project_execution_baseline_revision(
         &self,
         id: &str,
     ) -> Result<Option<ProjectExecutionBaselineRevisionRecord>> {
         let _ = id;
+        Err(crate::DbError::Check(
+            "Execution baseline persistence is not wired".to_owned(),
+        ))
+    }
+    async fn list_project_execution_baseline_revisions(
+        &self,
+        baseline_id: &str,
+    ) -> Result<Vec<ProjectExecutionBaselineRevisionRecord>> {
+        let _ = baseline_id;
+        Err(crate::DbError::Check(
+            "Execution baseline persistence is not wired".to_owned(),
+        ))
+    }
+    async fn list_project_execution_baseline_approvals(
+        &self,
+        baseline_id: &str,
+    ) -> Result<Vec<ProjectExecutionBaselineApprovalRecord>> {
+        let _ = baseline_id;
         Err(crate::DbError::Check(
             "Execution baseline persistence is not wired".to_owned(),
         ))
@@ -1272,6 +2060,31 @@ pub trait ProjectOrchestrationRepo: Send + Sync {
             "Execution baseline persistence is not wired".to_owned(),
         ))
     }
+    /// Atomically append a draft baseline revision (and, for a first draft,
+    /// its server-minted baseline shell) with its durable event/receipt.
+    async fn save_project_execution_baseline_draft_command(
+        &self,
+        input: SaveProjectExecutionBaselineRevisionCommand,
+    ) -> Result<ProjectExecutionBaselineRevisionRecord>;
+    /// Atomically append a complete proposed baseline revision with its
+    /// durable event/receipt. The service has already applied the stricter
+    /// approval-target validation; the repository repeats CAS/scope guards.
+    async fn propose_project_execution_baseline_command(
+        &self,
+        input: SaveProjectExecutionBaselineRevisionCommand,
+    ) -> Result<ProjectExecutionBaselineRevisionRecord>;
+    /// Atomically persist the exact user approval receipt and advance the
+    /// baseline's approval projection.
+    async fn approve_project_execution_baseline_command(
+        &self,
+        input: ApproveProjectExecutionBaselineCommand,
+    ) -> Result<ProjectExecutionBaselineApprovalRecord>;
+    /// Atomically consume the exact approval receipt, activate the baseline,
+    /// promote milestones/Task governance, and append event/command receipt.
+    async fn activate_project_execution_baseline_command(
+        &self,
+        input: ActivateProjectExecutionBaselineCommand,
+    ) -> Result<ProjectExecutionBaselineRecord>;
 
     async fn create_project_milestone(
         &self,
@@ -1289,6 +2102,15 @@ pub trait ProjectOrchestrationRepo: Send + Sync {
         let _ = input;
         Err(crate::DbError::Check(
             "Milestone persistence is not wired".to_owned(),
+        ))
+    }
+    async fn create_project_milestone_command(
+        &self,
+        input: CreateProjectMilestoneCommand,
+    ) -> Result<ProjectMilestoneRevisionRecord> {
+        let _ = input;
+        Err(crate::DbError::Check(
+            "Milestone command persistence is not wired".to_owned(),
         ))
     }
     async fn list_project_milestones(
@@ -1327,6 +2149,24 @@ pub trait ProjectOrchestrationRepo: Send + Sync {
             "Milestone persistence is not wired".to_owned(),
         ))
     }
+    async fn append_project_milestone_revision_command(
+        &self,
+        input: AppendProjectMilestoneRevisionCommand,
+    ) -> Result<ProjectMilestoneRevisionRecord> {
+        let _ = input;
+        Err(crate::DbError::Check(
+            "Milestone command persistence is not wired".to_owned(),
+        ))
+    }
+    async fn set_primary_project_milestone_command(
+        &self,
+        input: SetPrimaryProjectMilestoneCommand,
+    ) -> Result<Project> {
+        let _ = input;
+        Err(crate::DbError::Check(
+            "Milestone command persistence is not wired".to_owned(),
+        ))
+    }
     async fn get_project_milestone(&self, id: &str) -> Result<Option<ProjectMilestoneRecord>> {
         let _ = id;
         Err(crate::DbError::Check(
@@ -1360,6 +2200,15 @@ pub trait ProjectOrchestrationRepo: Send + Sync {
             "Readiness persistence is not wired".to_owned(),
         ))
     }
+    async fn create_project_readiness_snapshot_command(
+        &self,
+        input: CreateProjectReadinessSnapshotCommand,
+    ) -> Result<ProjectReadinessSnapshotRecord> {
+        let _ = input;
+        Err(crate::DbError::Check(
+            "Readiness command persistence is not wired".to_owned(),
+        ))
+    }
     async fn create_project_release(
         &self,
         input: CreateProjectRelease,
@@ -1368,6 +2217,24 @@ pub trait ProjectOrchestrationRepo: Send + Sync {
         let _ = (input, references);
         Err(crate::DbError::Check(
             "Release persistence is not wired".to_owned(),
+        ))
+    }
+    async fn create_project_release_command(
+        &self,
+        input: CreateProjectReleaseCommand,
+    ) -> Result<ProjectReleaseRecord> {
+        let _ = input;
+        Err(crate::DbError::Check(
+            "Release command persistence is not wired".to_owned(),
+        ))
+    }
+    async fn create_project_release_request_command(
+        &self,
+        input: CreateProjectReleaseRequestCommand,
+    ) -> Result<ProjectReleaseRequestRecord> {
+        let _ = input;
+        Err(crate::DbError::Check(
+            "Release request command persistence is not wired".to_owned(),
         ))
     }
     async fn list_project_release_references(

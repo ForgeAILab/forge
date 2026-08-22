@@ -1,7 +1,11 @@
 use std::{fmt, str::FromStr};
 
 use crate::pagination::PageRequest;
+use crate::repository::{
+    AdmitAgentChatTurn, CompleteDomainEvent, CreateAgentActionExecution, CreateCommandReceipt,
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{sqlite::SqliteRow, Row};
 
 /// Hourly wake-admission budget a Project Agent binding starts with. Zero
@@ -33,6 +37,183 @@ pub struct Project {
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Durable, retryable work that reconciles a Project's repository and
+/// Workspace-capable role setup.  The status is deliberately independent of
+/// the Project Agent binding/chat state and the execution-baseline gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectProvisioningOperation {
+    pub id: String,
+    pub project_id: String,
+    pub idempotency_key: String,
+    pub status: String,
+    pub current_checkpoint: String,
+    pub attempt_count: i64,
+    pub max_attempts: i64,
+    pub lease_owner: Option<String>,
+    pub lease_expires_at: Option<String>,
+    pub next_retry_at: Option<String>,
+    pub retryable: bool,
+    pub last_error_code: Option<String>,
+    pub last_error_message: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+    pub version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateProjectProvisioningOperation {
+    pub id: String,
+    pub project_id: String,
+    pub idempotency_key: String,
+    pub status: String,
+    pub current_checkpoint: String,
+    pub max_attempts: i64,
+    pub lease_owner: Option<String>,
+    pub lease_expires_at: Option<String>,
+    pub next_retry_at: Option<String>,
+    pub retryable: bool,
+    pub last_error_code: Option<String>,
+    pub last_error_message: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateProjectProvisioningOperation {
+    pub id: String,
+    pub expected_version: i64,
+    pub status: Option<String>,
+    pub current_checkpoint: Option<String>,
+    pub attempt_count: Option<i64>,
+    pub max_attempts: Option<i64>,
+    pub lease_owner: Option<Option<String>>,
+    pub lease_expires_at: Option<Option<String>>,
+    pub next_retry_at: Option<Option<String>>,
+    pub retryable: Option<bool>,
+    pub last_error_code: Option<Option<String>>,
+    pub last_error_message: Option<Option<String>>,
+    pub completed_at: Option<Option<String>>,
+    pub updated_at: String,
+}
+
+/// Atomic Project execution-setup mutation plus durable command receipt.
+/// `bump_project_version` is false for actions whose durable effect is the
+/// provisioning operation rather than the Project row itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyProjectExecutionSetupCommand {
+    pub project_id: String,
+    pub expected_project_version: Option<i64>,
+    pub settings: Option<String>,
+    pub primary_repo_id: Option<Option<String>>,
+    pub bump_project_version: bool,
+    pub provisioning_retry: Option<ScheduleProjectProvisioningRetry>,
+    pub provisioning_metadata: Option<ReconcileProjectProvisioningMetadata>,
+    pub receipt: CreateCommandReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleProjectProvisioningRetry {
+    pub operation_id: String,
+    pub expected_version: i64,
+    pub lease_owner: String,
+    pub lease_expires_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileProjectProvisioningMetadata {
+    pub operation_id: String,
+    pub expected_version: i64,
+    pub status: String,
+    pub current_checkpoint: String,
+    pub retryable: bool,
+    pub completed_at: Option<String>,
+    pub updated_at: String,
+    /// Checkpoint evidence is prepared from the authoritative repository and
+    /// role view, then applied by the same SQLite transaction as the Project
+    /// mutation, operation metadata, domain event, and command receipt.
+    pub checkpoints: Vec<ReconcileProjectProvisioningCheckpoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileProjectProvisioningCheckpoint {
+    pub id: String,
+    pub operation_id: String,
+    pub checkpoint: String,
+    pub status: String,
+    pub attempt_count: i64,
+    pub details_json: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub created_at: String,
+    pub expected_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedProjectExecutionSetupCommand {
+    pub project: Project,
+    pub receipt: CommandReceipt,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectProvisioningCheckpoint {
+    pub id: String,
+    pub operation_id: String,
+    pub checkpoint: String,
+    pub status: String,
+    pub attempt_count: i64,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub details_json: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpsertProjectProvisioningCheckpoint {
+    pub id: String,
+    pub operation_id: String,
+    pub checkpoint: String,
+    pub status: String,
+    pub attempt_count: i64,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub details_json: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectProvisioningError {
+    pub id: String,
+    pub operation_id: String,
+    pub checkpoint_id: Option<String>,
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    pub attempt_count: i64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateProjectProvisioningError {
+    pub id: String,
+    pub operation_id: String,
+    pub checkpoint_id: Option<String>,
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    pub attempt_count: i64,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -502,6 +683,154 @@ pub struct DomainEvent {
     pub created_at: String,
 }
 
+/// The only terminal/processable outcomes a wake consumer may persist for a
+/// claimed source event.  Deferred and setup-required outcomes are durable
+/// retry points, not cursor-completion shortcuts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentWakeDispositionKind {
+    TurnAdmitted,
+    DeterministicallySuppressed,
+    Deferred,
+    SetupRequired,
+}
+
+impl fmt::Display for AgentWakeDispositionKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::TurnAdmitted => "turn_admitted",
+            Self::DeterministicallySuppressed => "deterministically_suppressed",
+            Self::Deferred => "deferred",
+            Self::SetupRequired => "setup_required",
+        })
+    }
+}
+
+impl FromStr for AgentWakeDispositionKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "turn_admitted" => Ok(Self::TurnAdmitted),
+            "deterministically_suppressed" => Ok(Self::DeterministicallySuppressed),
+            "deferred" => Ok(Self::Deferred),
+            "setup_required" => Ok(Self::SetupRequired),
+            other => Err(format!("unknown wake disposition: {other}")),
+        }
+    }
+}
+
+/// One immutable wake-disposition attempt.  Retries append a new row and
+/// advance `AgentWakeDispositionCurrent`; no prior identity/profile or
+/// incident provenance is rewritten.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentWakeDisposition {
+    pub id: String,
+    pub consumer_name: String,
+    pub source_event_id: String,
+    pub source_event_sequence: i64,
+    pub attempt_number: i64,
+    pub max_attempts: i64,
+    pub disposition: AgentWakeDispositionKind,
+    pub reason: String,
+    pub turn_job_id: Option<String>,
+    pub attention_id: Option<String>,
+    pub retry_at: Option<String>,
+    pub incident_key: Option<String>,
+    pub incident_digest: Option<String>,
+    pub binding_id: Option<String>,
+    pub binding_version: Option<i64>,
+    pub profile_id: Option<String>,
+    pub profile_version: Option<i64>,
+    pub provenance_json: Option<String>,
+    pub parent_disposition_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateAgentWakeDisposition {
+    pub id: String,
+    pub consumer_name: String,
+    pub source_event_id: String,
+    pub source_event_sequence: i64,
+    pub attempt_number: i64,
+    pub max_attempts: i64,
+    pub disposition: AgentWakeDispositionKind,
+    pub reason: String,
+    pub turn_job_id: Option<String>,
+    pub attention_id: Option<String>,
+    pub retry_at: Option<String>,
+    pub incident_key: Option<String>,
+    pub incident_digest: Option<String>,
+    pub binding_id: Option<String>,
+    pub binding_version: Option<i64>,
+    pub profile_id: Option<String>,
+    pub profile_version: Option<i64>,
+    pub provenance_json: Option<String>,
+    pub parent_disposition_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Atomically persists the first disposition for a claimed event, its
+/// current-pointer row, and the event projection receipt/cursor checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompleteClaimedWake {
+    pub disposition: CreateAgentWakeDisposition,
+    pub completion: CompleteDomainEvent,
+    /// Required for `turn_admitted`.  The DB inserts/replays this message and
+    /// turn inside the same transaction as the disposition and source-event
+    /// checkpoint, closing the crash seam between admission and delivery.
+    pub admission: Option<AdmitAgentChatTurn>,
+    /// Snapshot of the Attention that was used to prepare `admission`.  The
+    /// repository re-reads this row under the same IMMEDIATE transaction
+    /// before inserting the turn, so a material projection update cannot be
+    /// admitted from stale resolver input.
+    pub expected_attention: Option<ExpectedAttentionSnapshot>,
+}
+
+/// Append a later deferred/setup-required disposition attempt after the
+/// authoritative source event has already been checkpointed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryAgentWakeDisposition {
+    pub disposition: CreateAgentWakeDisposition,
+    pub expected_parent_id: String,
+    pub now: String,
+    /// Required when the retry advances from deferred/setup-required to
+    /// `turn_admitted`; it is committed with the new immutable attempt.
+    pub admission: Option<AdmitAgentChatTurn>,
+    /// Optional Attention snapshot used when a retry advances to a turn.
+    pub expected_attention: Option<ExpectedAttentionSnapshot>,
+}
+
+/// Immutable Attention evidence captured while preparing one wake admission.
+/// The scope/source fields are intentionally explicit: checking only a
+/// projection version is unsafe because legacy upserts did not always bump
+/// that version for material source changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedAttentionSnapshot {
+    pub id: String,
+    pub version: i64,
+    pub digest: Option<String>,
+    pub status: String,
+    pub canonical_scope_type: String,
+    pub canonical_scope_id: String,
+    pub source_event_id: String,
+    pub source_sequence: Option<i64>,
+    pub dedupe_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentWakeDispositionCurrent {
+    pub consumer_name: String,
+    pub source_event_id: String,
+    pub disposition_id: String,
+    pub attempt_number: i64,
+    pub updated_at: String,
+    pub version: i64,
+}
+
 /// Rebuildable, durable Attention materialization.  The source event and
 /// dedupe key keep this row derived; the lifecycle columns are the only
 /// operator-owned state and use optimistic versions for concurrent clients.
@@ -527,6 +856,46 @@ pub struct AttentionProjection {
     pub updated_by_user_id: Option<String>,
     pub recommended_action: String,
     pub source_sequence: Option<i64>,
+}
+
+/// Canonical, redaction-safe digest used to bind a wake decision to the exact
+/// Attention materialization it observed.  Keep this in `db` so the atomic
+/// admission transaction can validate a snapshot without depending on the
+/// services crate.
+pub fn canonical_attention_incident_digest(attention: &AttentionProjection) -> String {
+    let bounded_details = attention
+        .details_json
+        .chars()
+        .take(8_192)
+        .collect::<String>();
+    let canonical_details = serde_json::from_str::<serde_json::Value>(&bounded_details)
+        .map(|value| value.to_string())
+        .unwrap_or(bounded_details);
+    let details_digest = wake_incident_digest(&canonical_details);
+    let canonical = format!(
+        "type={};scope_type={};scope_id={};status={};source_event_id={};source_sequence={:?};details_digest={};recommended_action={};version={}",
+        bounded_wake_ref(&attention.attention_type),
+        bounded_wake_ref(&attention.scope_type),
+        bounded_wake_ref(&attention.scope_id),
+        bounded_wake_ref(&attention.status),
+        bounded_wake_ref(&attention.source_event_id),
+        attention.source_sequence,
+        details_digest,
+        bounded_wake_ref(&attention.recommended_action),
+        attention.version,
+    );
+    wake_incident_digest(&canonical)
+}
+
+fn bounded_wake_ref(value: &str) -> String {
+    value.chars().take(256).collect()
+}
+
+fn wake_incident_digest(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    hasher.update([0]);
+    format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -611,6 +980,14 @@ pub struct EventConsumerCursor {
     pub last_sequence: i64,
     pub version: i64,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventConsumerCutover {
+    pub consumer_name: String,
+    pub cutover_sequence: i64,
+    pub reason: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -880,6 +1257,14 @@ pub struct Execution {
     pub error: Option<String>,
     pub executor_config_snapshot_json: Option<String>,
     pub workspace_id: Option<String>,
+    /// Monotonic compare-and-swap version for the owner lease and terminal
+    /// lifecycle.  This is deliberately separate from Task/version state.
+    pub execution_version: i64,
+    pub lease_owner: Option<String>,
+    pub lease_expires_at: Option<String>,
+    pub hard_deadline_at: Option<String>,
+    pub last_heartbeat_at: Option<String>,
+    pub last_progress_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1032,6 +1417,19 @@ pub struct AgentChatTurnJob {
     pub triggering_message_id: String,
     pub responder_identity_id: Option<String>,
     pub profile_id: Option<String>,
+    /// Immutable admission provenance.  Legacy queued rows are nullable and
+    /// are handled conservatively until re-admitted by the current resolver.
+    pub responder_binding_id: Option<String>,
+    pub responder_binding_version: Option<i64>,
+    pub responder_identity_version: Option<i64>,
+    pub profile_version: Option<i64>,
+    pub operating_skill_revision_id: Option<String>,
+    pub policy_revision: Option<String>,
+    pub policy_digest: Option<String>,
+    pub permission_policy_digest: Option<String>,
+    pub tool_policy_digest: Option<String>,
+    pub admission_digest: Option<String>,
+    pub canonical_scope_provenance_json: Option<String>,
     pub canonical_scope_type: String,
     pub canonical_scope_id: String,
     pub status: AgentChatTurnState,
@@ -1363,6 +1761,134 @@ pub enum ResumePolicy {
     None,
 }
 
+/// Scheduler-owned lease claim.  A claim is valid only for the expected
+/// execution version and either an unowned/expired lease.  The first claim
+/// establishes the immutable hard deadline for the attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimExecutionLease {
+    pub execution_id: String,
+    pub expected_version: i64,
+    pub owner: String,
+    pub lease_expires_at: String,
+    pub hard_deadline_at: String,
+    pub now: String,
+}
+
+/// Fixed-cadence owner heartbeat.  Renewal changes only liveness metadata and
+/// never extends the profile/capability hard deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenewExecutionLease {
+    pub execution_id: String,
+    pub expected_version: i64,
+    pub owner: String,
+    pub lease_expires_at: String,
+    pub now: String,
+}
+
+/// Semantic progress is intentionally not a heartbeat.  The owner/version
+/// compare-and-swap prevents a late runner from mutating current execution
+/// truth after losing its lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordExecutionProgress {
+    pub execution_id: String,
+    pub expected_version: i64,
+    pub owner: String,
+    pub progress_at: String,
+    pub now: String,
+}
+
+/// Atomically claim the right to publish one stale-progress warning.  The
+/// expected progress value is part of the CAS so a semantic event that arrives
+/// concurrently wins over the monitor and suppresses a stale warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordExecutionProgressWarning {
+    pub execution_id: String,
+    pub expected_version: i64,
+    pub owner: String,
+    pub expected_last_progress_at: Option<String>,
+    pub stale_before: String,
+    pub now: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionLeaseDisposition {
+    Revoke,
+    Expire,
+}
+
+/// One terminal transition input shared by runner, cancellation, and monitor
+/// callers.  The optional owner is a compare-and-swap predicate when supplied;
+/// monitor and runner callers should always provide it, while an authorized
+/// user cancellation may intentionally rely on the execution version alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalizeExecution {
+    pub execution_id: String,
+    pub expected_version: i64,
+    pub lease_owner: Option<String>,
+    pub status: ExecutionStatus,
+    pub stop_reason: Option<Option<StopReason>>,
+    pub stopped_by: Option<Option<String>>,
+    pub stopped_at: Option<Option<String>>,
+    pub resume_policy: Option<Option<ResumePolicy>>,
+    pub agent_session_id: Option<Option<String>>,
+    pub agent_message_id: Option<Option<String>>,
+    pub last_activity_at: Option<Option<String>>,
+    pub last_progress_at: Option<Option<String>>,
+    pub summary: Option<Option<String>>,
+    pub logs_path: Option<Option<String>>,
+    pub before_sha: Option<Option<String>>,
+    pub after_sha: Option<Option<String>>,
+    pub error: Option<Option<String>>,
+    pub executor_config_snapshot_json: Option<Option<String>>,
+    pub updated_at: String,
+    pub actor_type: String,
+    pub actor_id: Option<String>,
+    pub correlation_id: Option<String>,
+    pub causation_id: Option<String>,
+    pub causation_depth: i64,
+    pub lease_disposition: ExecutionLeaseDisposition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionLeaseMutation {
+    Updated(Execution),
+    Concurrent { current: Option<Execution> },
+    HardDeadline { current: Option<Execution> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionProgressWarningOutcome {
+    Committed {
+        execution: Execution,
+        event: DomainEvent,
+    },
+    Replayed {
+        execution: Execution,
+        event: DomainEvent,
+    },
+    Concurrent {
+        current: Option<Execution>,
+    },
+}
+
+/// The terminal CAS result is deliberately not represented by
+/// `DbError::VersionConflict`: callers must be able to distinguish a winning
+/// committed identity from a concurrent loser without performing a stale
+/// read.  Only `Committed` is allowed to cascade Task state or publish a
+/// terminal event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionTerminalOutcome {
+    Committed {
+        execution: Execution,
+        event: Box<DomainEvent>,
+        workspace_lease_id: Option<String>,
+        workspace_lease_status: Option<String>,
+    },
+    Concurrent {
+        current: Option<Execution>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Review {
     pub id: String,
@@ -1570,6 +2096,12 @@ pub struct CreateProjectMediaAttachmentMutation {
     pub idempotency_key: String,
     pub mutation_fingerprint: String,
     pub authorization_event_id: String,
+    /// Optional shared-command provenance.  When present, the attachment,
+    /// event, frozen receipt, and (for approved AgentActions) execution are
+    /// committed by one transaction.  Legacy callers leave these fields
+    /// unset while they are migrated to the command boundary.
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2262,6 +2794,30 @@ pub struct AgentActionExecution {
     pub idempotency_key: String,
     pub created_at: String,
     pub completed_at: Option<String>,
+}
+
+/// The frozen outcome of one mutating application command.  A receipt is
+/// immutable in both the Rust repository surface and the SQLite schema so an
+/// identical retry can return the original result without rerunning a domain
+/// mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandReceipt {
+    pub id: String,
+    pub principal_type: String,
+    pub principal_id: String,
+    pub scope_type: String,
+    pub scope_id: String,
+    pub operation: String,
+    pub idempotency_key: String,
+    pub input_digest: String,
+    pub policy_result: String,
+    pub correlation_id: String,
+    pub causation_id: Option<String>,
+    pub causation_depth: i64,
+    pub event_id: String,
+    pub agent_action_execution_id: Option<String>,
+    pub outcome_json: String,
+    pub committed_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
