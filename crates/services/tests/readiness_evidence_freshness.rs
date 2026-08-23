@@ -194,6 +194,7 @@ fn input(evidence: Vec<EvidenceAttachment>) -> ReadinessEvaluationInput {
         commit_build_check_context: vec![
             serde_json::to_string(&current_context).expect("readiness context serializes")
         ],
+        baseline_contract_reasons: Vec::new(),
         authorization: AuthorizationProvenance {
             principal: principal(PrincipalKind::User, "user-1"),
             authorization_basis: "release-review".to_owned(),

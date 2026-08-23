@@ -8118,16 +8118,13 @@ impl ProjectOrchestrationRepo for SqliteDb {
             let updated = sqlx::query(
                 "UPDATE project_milestone
                  SET lifecycle = ?, blocker_reason_json = ?, stale_reason_json = ?,
-                     version = version + 1, updated_at = ?
+                     reconciliation_reason_json = ?, version = version + 1, updated_at = ?
                  WHERE id = ? AND project_id = ? AND version = ?",
             )
             .bind(lifecycle)
-            .bind(&input.blocking_reasons_json)
-            .bind(if input.outcome == "stale" {
-                &input.blocking_reasons_json
-            } else {
-                "[]"
-            })
+            .bind(&input.blocker_projection_json)
+            .bind(&input.stale_projection_json)
+            .bind(&input.reconciliation_projection_json)
             .bind(&input.created_at)
             .bind(&input.milestone_id)
             .bind(&input.project_id)
@@ -8323,16 +8320,13 @@ impl ProjectOrchestrationRepo for SqliteDb {
             let updated = sqlx::query(
                 "UPDATE project_milestone
                  SET lifecycle = ?, blocker_reason_json = ?, stale_reason_json = ?,
-                     version = version + 1, updated_at = ?
+                     reconciliation_reason_json = ?, version = version + 1, updated_at = ?
                  WHERE id = ? AND project_id = ? AND version = ?",
             )
             .bind(lifecycle)
-            .bind(&input.blocking_reasons_json)
-            .bind(if input.outcome == "stale" {
-                &input.blocking_reasons_json
-            } else {
-                "[]"
-            })
+            .bind(&input.blocker_projection_json)
+            .bind(&input.stale_projection_json)
+            .bind(&input.reconciliation_projection_json)
             .bind(&input.created_at)
             .bind(&input.milestone_id)
             .bind(&input.project_id)

@@ -67,38 +67,62 @@ struct ActiveBaselineInputs {
     baseline_digest: String,
     stored_policy_revision: String,
     release_policy_digest: String,
+    required_check_definition_revisions: Vec<String>,
     milestone_ids: Vec<String>,
     milestone_definition_revision_ids: Vec<String>,
     acceptance_matrix: Vec<AcceptanceEvidenceRequirement>,
 }
 
-fn validate_baseline_definition_contract(
+fn baseline_definition_contract_reasons(
     milestone_id: &str,
     definition: &MilestoneDefinitionRevision,
     baseline: &ActiveBaselineInputs,
-) -> crate::Result<()> {
+) -> Vec<ReadinessReason> {
+    let reason = |code: &str, message: String, source_ids: Vec<String>| ReadinessReason {
+        code: code.to_owned(),
+        message,
+        blocking: true,
+        check_id: None,
+        source_ids,
+    };
+
     if baseline.milestone_ids.len() != baseline.milestone_definition_revision_ids.len() {
-        return Err(crate::ServiceError::conflict(
-            "reconciliation_required: the active baseline milestone manifest is malformed",
-        ));
+        return vec![reason(
+            "baseline_manifest_reconciliation_required",
+            "reconciliation_required: the active baseline milestone manifest is malformed"
+                .to_owned(),
+            vec![milestone_id.to_owned()],
+        )];
     }
-    let Some(index) = baseline
+    let matching_indices = baseline
         .milestone_ids
         .iter()
-        .position(|candidate| candidate == milestone_id)
-    else {
-        return Err(crate::ServiceError::conflict(
-            "reconciliation_required: the readiness milestone is not governed by the active baseline",
-        ));
+        .enumerate()
+        .filter_map(|(index, candidate)| (candidate == milestone_id).then_some(index))
+        .collect::<Vec<_>>();
+    let [index] = matching_indices.as_slice() else {
+        return vec![reason(
+            "baseline_milestone_reconciliation_required",
+            "reconciliation_required: the readiness milestone is not governed exactly once by the active baseline"
+                .to_owned(),
+            vec![milestone_id.to_owned()],
+        )];
     };
-    if baseline.milestone_definition_revision_ids[index] != definition.id {
-        return Err(crate::ServiceError::conflict(
-            "reconciliation_required: the active baseline does not pin the milestone's current definition revision",
-        ));
+    if baseline.milestone_definition_revision_ids[*index] != definition.id {
+        return vec![reason(
+            "baseline_definition_reconciliation_required",
+            "reconciliation_required: the active baseline does not pin the milestone's current definition revision"
+                .to_owned(),
+            vec![
+                milestone_id.to_owned(),
+                baseline.milestone_definition_revision_ids[*index].clone(),
+                definition.id.clone(),
+            ],
+        )];
     }
 
-    let pinned_revisions = baseline
-        .milestone_definition_revision_ids
+    let required_check_revisions = baseline
+        .required_check_definition_revisions
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
@@ -114,37 +138,97 @@ fn validate_baseline_definition_contract(
         .iter()
         .map(|requirement| requirement.id.as_str())
         .collect::<HashSet<_>>();
-    let mut matrix_ids = HashSet::new();
+    let mut reasons = Vec::new();
+    let mut matrix_ids = HashSet::<String>::new();
     for requirement in &baseline.acceptance_matrix {
-        let definition_revision = requirement
+        let requirement_id = requirement.id.trim();
+        let check_definition_revision = requirement
             .check_definition_revision
             .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                crate::ServiceError::conflict(
-                    "reconciliation_required: every active-baseline acceptance/evidence item must name its exact milestone definition revision",
-                )
-            })?;
-        if requirement.id.trim().is_empty()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if requirement_id.is_empty()
             || requirement.description.trim().is_empty()
-            || !matrix_ids.insert((definition_revision, requirement.id.as_str()))
-            || !pinned_revisions.contains(definition_revision)
+            || !matrix_ids.insert(requirement_id.to_owned())
         {
-            return Err(crate::ServiceError::conflict(
-                "reconciliation_required: the active-baseline acceptance/evidence matrix is malformed or references an unpinned definition",
+            reasons.push(reason(
+                "baseline_matrix_reconciliation_required",
+                "reconciliation_required: the active-baseline acceptance/evidence matrix contains an empty or duplicate requirement"
+                    .to_owned(),
+                vec![requirement.id.clone()],
             ));
         }
-        if definition_revision == definition.id
-            && !acceptance_ids.contains(requirement.id.as_str())
-            && !evidence_ids.contains(requirement.id.as_str())
-        {
-            return Err(crate::ServiceError::conflict(format!(
-                "reconciliation_required: active-baseline requirement '{}' is absent from the current milestone definition",
-                requirement.id
-            )));
+        match check_definition_revision {
+            Some(revision) if required_check_revisions.contains(revision) => {}
+            Some(revision) => reasons.push(reason(
+                "baseline_check_definition_reconciliation_required",
+                format!(
+                    "reconciliation_required: active-baseline requirement '{}' references check definition '{}' outside the release policy",
+                    requirement.id, revision
+                ),
+                vec![requirement.id.clone(), revision.to_owned()],
+            )),
+            None => reasons.push(reason(
+                "baseline_check_definition_reconciliation_required",
+                format!(
+                    "reconciliation_required: active-baseline requirement '{}' does not name a check definition revision",
+                    requirement.id
+                ),
+                vec![requirement.id.clone()],
+            )),
         }
     }
-    Ok(())
+
+    let mut definition_ids = definition
+        .content
+        .acceptance_checks
+        .iter()
+        .filter(|check| check.required)
+        .map(|check| check.id.clone())
+        .chain(
+            definition
+                .content
+                .evidence_requirements
+                .iter()
+                .filter(|requirement| requirement.required)
+                .map(|requirement| requirement.id.clone()),
+        )
+        .collect::<Vec<_>>();
+    definition_ids.sort();
+    definition_ids.dedup();
+    let mut definition_only = definition_ids
+        .iter()
+        .filter(|id| !matrix_ids.contains(id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut matrix_only = if baseline.milestone_ids.len() == 1 {
+        matrix_ids
+            .iter()
+            .filter(|id| {
+                !acceptance_ids.contains(id.as_str()) && !evidence_ids.contains(id.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    definition_only.sort();
+    matrix_only.sort();
+    if !definition_only.is_empty() || !matrix_only.is_empty() {
+        let mut source_ids = definition_only.clone();
+        source_ids.extend(matrix_only.clone());
+        reasons.push(reason(
+            "baseline_requirement_reconciliation_required",
+            format!(
+                "reconciliation_required: active-baseline requirement IDs do not match the pinned milestone definition (definition-only: [{}]; matrix-only: [{}])",
+                definition_only.join(", "),
+                matrix_only.join(", ")
+            ),
+            source_ids,
+        ));
+    }
+
+    reasons
 }
 
 #[derive(Debug, Clone)]
@@ -384,7 +468,8 @@ impl MilestoneRuntime {
                 release_policy_revision,
             )
             .await?;
-        validate_baseline_definition_contract(milestone_id, &definition, &baseline)?;
+        let baseline_contract_reasons =
+            baseline_definition_contract_reasons(milestone_id, &definition, &baseline);
         let baseline_digest = baseline.baseline_digest;
         let release_policy_digest = baseline.release_policy_digest;
         let check_results = self
@@ -453,6 +538,7 @@ impl MilestoneRuntime {
             task_states,
             document_states,
             commit_build_check_context,
+            baseline_contract_reasons,
             authorization: authorization.clone(),
         })
         .map_err(map_orchestration_error)?;
@@ -591,7 +677,8 @@ impl MilestoneRuntime {
                 release_policy_revision,
             )
             .await?;
-        validate_baseline_definition_contract(milestone_id, &definition, &baseline)?;
+        let baseline_contract_reasons =
+            baseline_definition_contract_reasons(milestone_id, &definition, &baseline);
         let baseline_digest = baseline.baseline_digest;
         let release_policy_digest = baseline.release_policy_digest;
         let check_results = self
@@ -660,6 +747,7 @@ impl MilestoneRuntime {
             task_states: task_states.clone(),
             document_states: document_states.clone(),
             commit_build_check_context,
+            baseline_contract_reasons,
             authorization: authorization.clone(),
         })
         .map_err(map_orchestration_error)?;
@@ -686,7 +774,7 @@ impl MilestoneRuntime {
             expected_milestone_version,
         )
         .await?;
-        let projection_reasons = projection_reasons(&evaluation);
+        let projection_reasons = projection_reasons(&evaluation.reasons);
         let (next_lifecycle, blocker, stale, reconciliation) = if milestone.lifecycle == "released"
         {
             // Correction readiness is observational only for an immutable
@@ -1715,6 +1803,7 @@ impl MilestoneRuntime {
             baseline_digest: row.try_get("content_digest")?,
             stored_policy_revision,
             release_policy_digest: row.try_get("release_policy_digest")?,
+            required_check_definition_revisions: policy.required_check_definition_revisions,
             milestone_ids: parse_json_required(
                 &row.try_get::<String, _>("milestone_ids_json")?,
                 "execution baseline milestone ids",
@@ -2702,7 +2791,8 @@ impl MilestoneRuntime {
                 &release_policy_revision,
             )
             .await?;
-        validate_baseline_definition_contract(milestone_id, &definition, &baseline)?;
+        let baseline_contract_reasons =
+            baseline_definition_contract_reasons(milestone_id, &definition, &baseline);
         if baseline.stored_policy_revision != release_policy_revision
             || baseline.baseline_digest != candidate.baseline_digest
             || baseline.release_policy_digest != candidate.release_policy_digest
@@ -2805,6 +2895,7 @@ impl MilestoneRuntime {
             task_states: task_states.clone(),
             document_states: document_states.clone(),
             commit_build_check_context,
+            baseline_contract_reasons,
             authorization: candidate_snapshot.authorization.clone(),
         })
         .map_err(map_orchestration_error)?;
@@ -3359,15 +3450,15 @@ impl MilestoneRuntime {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
-struct ProjectionReasons {
-    blockers: Vec<MilestoneProjectionReason>,
-    stale: Vec<MilestoneProjectionReason>,
-    reconciliation: Vec<MilestoneProjectionReason>,
+pub(crate) struct ProjectionReasons {
+    pub(crate) blockers: Vec<MilestoneProjectionReason>,
+    pub(crate) stale: Vec<MilestoneProjectionReason>,
+    pub(crate) reconciliation: Vec<MilestoneProjectionReason>,
 }
 
-fn projection_reasons(evaluation: &ReadinessEvaluation) -> ProjectionReasons {
+pub(crate) fn projection_reasons(reasons: &[ReadinessReason]) -> ProjectionReasons {
     let mut result = ProjectionReasons::default();
-    for reason in &evaluation.reasons {
+    for reason in reasons {
         let kind = if reason.code.contains("stale") || reason.code.contains("policy") {
             MilestoneProjectionReasonKind::Stale
         } else if reason.code.contains("reconcil") {

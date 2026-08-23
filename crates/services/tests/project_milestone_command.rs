@@ -305,22 +305,26 @@ async fn fixture_with_acceptance_matrix(acceptance_matrix_json: &str) -> Arc<Sql
 }
 
 #[tokio::test]
-async fn readiness_fails_closed_when_baseline_matrix_is_absent_from_current_definition() {
+async fn readiness_persists_reconciliation_when_baseline_matrix_is_absent_from_current_definition()
+{
     let matrix = json!([{
         "id": "missing-check",
         "description": "A check the approved baseline requires",
         "required": true,
         "evidence_kind": "test-report",
-        "check_definition_revision": MILESTONE_REVISION_ID,
+        "check_definition_revision": "check-1",
     }]);
     let db = fixture_with_acceptance_matrix(&matrix.to_string()).await;
-    let error = ProjectMilestoneCommandService::new(Arc::clone(&db))
+    let snapshot = ProjectMilestoneCommandService::new(Arc::clone(&db))
         .request_readiness(readiness_command("inconsistent-baseline"), None)
         .await
-        .expect_err("an inconsistent active baseline cannot produce readiness");
+        .expect("an inconsistent baseline must produce a canonical non-ready snapshot");
 
-    assert!(error.to_string().contains("reconciliation_required"));
-    assert!(error.to_string().contains("missing-check"));
+    assert_eq!(snapshot.outcome, "blocked");
+    assert!(snapshot
+        .blocking_reasons_json
+        .contains("reconciliation_required"));
+    assert!(snapshot.blocking_reasons_json.contains("missing-check"));
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM project_readiness_snapshot WHERE project_id = ?",
@@ -329,7 +333,19 @@ async fn readiness_fails_closed_when_baseline_matrix_is_absent_from_current_defi
         .fetch_one(db.pool())
         .await
         .expect("readiness snapshot count"),
-        0
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE scope_type = 'project' AND scope_id = ?
+               AND event_type = 'milestone.readiness.evaluated'",
+        )
+        .bind(PROJECT_ID)
+        .fetch_one(db.pool())
+        .await
+        .expect("readiness event count"),
+        1
     );
     let lifecycle: String =
         sqlx::query_scalar("SELECT lifecycle FROM project_milestone WHERE id = ?")
@@ -338,6 +354,14 @@ async fn readiness_fails_closed_when_baseline_matrix_is_absent_from_current_defi
             .await
             .expect("milestone lifecycle");
     assert_eq!(lifecycle, "active");
+    let reconciliation: String =
+        sqlx::query_scalar("SELECT reconciliation_reason_json FROM project_milestone WHERE id = ?")
+            .bind(MILESTONE_ID)
+            .fetch_one(db.pool())
+            .await
+            .expect("milestone reconciliation projection");
+    assert!(reconciliation.contains("reconciliation_required"));
+    assert!(reconciliation.contains("missing-check"));
 }
 
 struct ReceiptInput<'a> {
@@ -648,6 +672,9 @@ fn readiness_snapshot(id: &str, key: &str) -> CreateProjectReadinessSnapshotComm
             event_watermark: "watermark-1".to_owned(),
             outcome: "ready".to_owned(),
             blocking_reasons_json: "[]".to_owned(),
+            blocker_projection_json: "[]".to_owned(),
+            stale_projection_json: "[]".to_owned(),
+            reconciliation_projection_json: "[]".to_owned(),
             check_results_json: "[]".to_owned(),
             waiver_manifest_json: "[]".to_owned(),
             evidence_manifest_json: "[]".to_owned(),

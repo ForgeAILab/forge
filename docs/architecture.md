@@ -467,14 +467,16 @@ history. Forge release is an internal frozen evidence snapshot, not a merge,
 tag, deployment, or external publication.
 
 Before evaluating or recomputing readiness, Forge checks that the active
-baseline pins the milestone's current definition and that every baseline
-acceptance/evidence matrix item governing that milestone names the pinned
-definition revision containing the same stable requirement ID. A malformed
-or drifted contract fails closed as `reconciliation_required`; it cannot
-produce a ready snapshot from an empty or unrelated definition. Live validation
-summaries and Project Overview check counts likewise include only rows belonging
-to each milestone's current definition revision, never checks or results left
-behind by a superseded definition.
+baseline milestone manifest pins the milestone's current definition. Required
+stable requirement IDs in that definition must be represented by the
+baseline's acceptance/evidence matrix, and each matrix row's
+`check_definition_revision` must be one of the check-definition revisions
+frozen by the release policy. A malformed or drifted contract fails closed as
+a persisted non-ready snapshot with typed `reconciliation_required` reasons;
+it cannot produce a ready snapshot from an empty or unrelated definition. Live
+validation summaries and Project Overview check counts likewise include only
+rows belonging to each milestone's current definition revision, never checks
+or results left behind by a superseded definition.
 
 A Project Agent readiness action invokes the same `MilestoneRuntime`
 evaluation as the authenticated REST route and returns the committed snapshot;

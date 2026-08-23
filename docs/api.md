@@ -438,8 +438,11 @@ milestone is `active`; planned and `ready_for_release` milestones do not require
 it. `ReadinessSnapshot` is an immutable candidate, not a release: standalone
 readiness creates no evidence pins. A ready snapshot moves an unreleased active
 milestone to `ready_for_release`; non-ready or stale results leave it active
-with typed reasons. Project Agent readiness actions execute that same Forge
-evaluation immediately and return the committed snapshot. Project Agent
+with typed reasons. Baseline/definition drift is recorded as a canonical
+non-ready snapshot and milestone `reconciliation_required` projection rather
+than rejected before the readiness event can commit. Project Agent readiness
+actions execute that same Forge evaluation immediately and return the committed
+snapshot. Project Agent
 release-candidate actions validate the exact ready snapshot and surface a human
 attention item; they never perform the user-only release.
 

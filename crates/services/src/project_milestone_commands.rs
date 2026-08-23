@@ -1327,6 +1327,9 @@ fn readiness_input(
     command: &ProjectReadinessRequestCommand,
     authorization: &api_types::AuthorizationProvenance,
 ) -> Result<CreateProjectReadinessSnapshot> {
+    let projection_reasons = crate::milestone_runtime::projection_reasons(&snapshot.reasons);
+    let reconciliation_projection_json = serde_json::to_string(&projection_reasons.reconciliation)
+        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
     Ok(CreateProjectReadinessSnapshot {
         id: snapshot.id.clone(),
         project_id: snapshot.project_id.clone(),
@@ -1343,6 +1346,11 @@ fn readiness_input(
         outcome: readiness_result_name(snapshot.result).to_owned(),
         blocking_reasons_json: serde_json::to_string(&snapshot.reasons)
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+        blocker_projection_json: serde_json::to_string(&projection_reasons.blockers)
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+        stale_projection_json: serde_json::to_string(&projection_reasons.stale)
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+        reconciliation_projection_json,
         check_results_json: serde_json::to_string(&snapshot.check_results)
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
         waiver_manifest_json: serde_json::to_string(&snapshot.waiver_ids)

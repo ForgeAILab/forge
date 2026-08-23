@@ -335,6 +335,11 @@ pub struct ReadinessEvaluationInput {
     /// by a cached overview projection.
     pub document_states: Vec<ReadinessDocumentState>,
     pub commit_build_check_context: Vec<String>,
+    /// Reconciliation blockers discovered while joining the active baseline
+    /// to the milestone definition. These are governed readiness inputs, not
+    /// transport errors: they must be digested and persisted in a non-ready
+    /// snapshot so operators can reconcile the exact conflict.
+    pub baseline_contract_reasons: Vec<ReadinessReason>,
     /// The authority receipt is part of the candidate identity. A caller
     /// cannot replay the same idempotency key with different provenance.
     pub authorization: AuthorizationProvenance,
@@ -473,10 +478,10 @@ pub fn evaluate_readiness(
     let mut commit_build_check_context = input.commit_build_check_context;
     commit_build_check_context.sort();
 
-    let mut reasons = Vec::new();
+    let mut reasons = input.baseline_contract_reasons;
     let mut has_failed = false;
     let mut has_stale = false;
-    let mut has_blocked = false;
+    let mut has_blocked = !reasons.is_empty();
 
     for task in &input.task_states {
         if task.state != "done" {
@@ -1503,6 +1508,7 @@ mod tests {
                 observed_at: "2026-08-13T00:00:00Z".to_owned(),
             }],
             commit_build_check_context: vec!["commit:abc".to_owned()],
+            baseline_contract_reasons: Vec::new(),
             authorization: AuthorizationProvenance {
                 principal: principal(PrincipalKind::User, "user-1"),
                 authorization_basis: "release-review".to_owned(),
