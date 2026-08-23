@@ -188,6 +188,32 @@ impl AgentChatTurnRunner for FailingWakeRunner {
     }
 }
 
+struct ProseOnlyWakeRunner;
+
+#[async_trait]
+impl AgentChatTurnRunner for ProseOnlyWakeRunner {
+    async fn run_turn(
+        &self,
+        job: &db::AgentChatTurnJob,
+        _cancellation: CancellationToken,
+    ) -> services::Result<CompletedAgentChatTurn> {
+        Ok(CompletedAgentChatTurn {
+            identity_id: job
+                .responder_identity_id
+                .clone()
+                .expect("admitted identity"),
+            profile_id: job.profile_id.clone().expect("admitted Profile"),
+            session_id: "prose-only-wake-session".to_owned(),
+            model: Some("test".to_owned()),
+            content: "Everything is complete and ready to release.".to_owned(),
+            token_usage_json: None,
+            duration_ms: 1,
+            context_manifest_id: None,
+            pending_interaction_id: None,
+        })
+    }
+}
+
 async fn chat_turn_fixture() -> ChatTurnFixture {
     let db = database().await;
     let account_id = new_uuid_v4();
@@ -873,6 +899,67 @@ async fn append_project_attention_wake(
     wake_event_id
 }
 
+async fn append_project_delivery_attention_wake(
+    db: &SqliteDb,
+    identity_id: &str,
+    project_id: &str,
+    incident_key: &str,
+) -> String {
+    let source_event = new_uuid_v4();
+    append_event(
+        db,
+        CreateDomainEvent {
+            id: source_event.clone(),
+            event_type: "task.completed".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: new_uuid_v4(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "project".to_owned(),
+            scope_id: project_id.to_owned(),
+            correlation_id: source_event.clone(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!("delivery-wake-test-source:{source_event}")),
+            payload_json: r#"{"to_state":"done"}"#.to_owned(),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO attention_projection (
+            id, attention_type, scope_type, scope_id, identity_id, source_event_id,
+            priority, status, summary, details_json, dedupe_key, occurred_at,
+            updated_at, recommended_action, source_sequence
+         ) VALUES (?, 'delivery_followup', 'project', ?, ?, ?, 70, 'open',
+                   'Task completed; reconcile validation, evidence, and readiness',
+                   ?, ?, ?, ?, 'reconcile_delivery',
+                   (SELECT sequence FROM domain_event WHERE id = ?))",
+    )
+    .bind(new_uuid_v4())
+    .bind(project_id)
+    .bind(identity_id)
+    .bind(&source_event)
+    .bind(
+        serde_json::json!({
+            "scope_type": "project",
+            "scope_id": project_id,
+        })
+        .to_string(),
+    )
+    .bind(incident_key)
+    .bind(now_rfc3339())
+    .bind(now_rfc3339())
+    .bind(&source_event)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let wake_event = wake_event_for_attention(db, identity_id, project_id, incident_key).await;
+    let wake_event_id = wake_event.id.clone();
+    append_event(db, wake_event).await;
+    wake_event_id
+}
+
 async fn wake_event_for_attention_in_scope(
     db: &SqliteDb,
     identity_id: &str,
@@ -1025,6 +1112,120 @@ async fn admitted_wake_becomes_a_project_agent_turn() {
     .await
     .unwrap();
     assert_eq!(turn_count, 1, "replay must reuse the deduped turn");
+}
+
+#[tokio::test]
+async fn delivery_followup_requires_newer_readiness_before_turn_success() {
+    let db = database().await;
+    let identity_id = new_uuid_v4();
+    let profile_id = identity_with_profile(&db, &identity_id).await;
+    let (project_id, chat_id) = bound_project(&db, &identity_id, &profile_id).await;
+    let consumer = WakeTurnConsumer::new(Arc::clone(&db), "delivery-postcondition-consumer");
+    consumer.run_once(100).await.unwrap();
+
+    let incident_key = format!("attention:delivery_followup:project:{project_id}:task:done");
+    let wake_event_id =
+        append_project_delivery_attention_wake(&db, &identity_id, &project_id, &incident_key).await;
+    let wake_event_sequence: i64 =
+        sqlx::query_scalar("SELECT sequence FROM domain_event WHERE id = ?")
+            .bind(&wake_event_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let admitted = consumer.run_once(100).await.unwrap();
+    assert_eq!(admitted.delivered_turns, 1);
+
+    let (turn_id, content, source_metadata_json): (String, String, String) = sqlx::query_as(
+        "SELECT job.id, message.content, message.source_metadata_json
+         FROM agent_chat_turn_job AS job
+         JOIN agent_chat_message AS message ON message.id = job.triggering_message_id
+         WHERE job.chat_id = ? AND job.dedupe_key = ?",
+    )
+    .bind(&chat_id)
+    .bind(format!("wake-turn:{wake_event_id}"))
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(content.contains("cannot complete from narration"));
+    assert!(content.contains("project.readiness"));
+    let source_metadata: serde_json::Value = serde_json::from_str(&source_metadata_json).unwrap();
+    assert_eq!(
+        source_metadata["turn_postcondition"]["schema_version"],
+        "forge.delivery-followup-postcondition/v1"
+    );
+    assert_eq!(
+        source_metadata["turn_postcondition"]["after_event_sequence"],
+        wake_event_sequence
+    );
+
+    let worker = AgentChatTurnWorker::with_runner(
+        Arc::clone(&db),
+        Arc::new(ProseOnlyWakeRunner) as Arc<dyn AgentChatTurnRunner>,
+    );
+    assert_eq!(worker.run_once().await.unwrap(), 1);
+    let first = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.status, AgentChatTurnState::RetryWait);
+    assert_eq!(
+        first.error_code.as_deref(),
+        Some("delivery_followup_postcondition_failed")
+    );
+    let agent_responses: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_chat_message
+         WHERE chat_id = ? AND author_type = 'agent'",
+    )
+    .bind(&chat_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        agent_responses, 0,
+        "prose-only success must not be committed"
+    );
+
+    let readiness_event_id = new_uuid_v4();
+    append_event(
+        &db,
+        CreateDomainEvent {
+            id: readiness_event_id.clone(),
+            event_type: "milestone.readiness.evaluated".to_owned(),
+            entity_type: "project_milestone".to_owned(),
+            entity_id: "milestone-test".to_owned(),
+            actor_type: "project_agent".to_owned(),
+            actor_id: Some(identity_id),
+            scope_type: "project".to_owned(),
+            scope_id: project_id,
+            correlation_id: readiness_event_id.clone(),
+            causation_id: Some(turn_id.clone()),
+            causation_depth: 1,
+            dedupe_key: Some(format!("delivery-readiness:{readiness_event_id}")),
+            payload_json: r#"{"result":"blocked"}"#.to_owned(),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await;
+    sqlx::query(
+        "UPDATE agent_chat_turn_job
+         SET next_attempt_at = '1970-01-01T00:00:00Z',
+             version = version + 1, updated_at = ?
+         WHERE id = ? AND status = 'retry_wait'",
+    )
+    .bind(now_rfc3339())
+    .bind(&turn_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(worker.run_once().await.unwrap(), 1);
+    let completed = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.status, AgentChatTurnState::Succeeded);
+    assert_eq!(completed.attempt_count, 2);
+    assert!(completed.response_message_id.is_some());
 }
 
 #[tokio::test]

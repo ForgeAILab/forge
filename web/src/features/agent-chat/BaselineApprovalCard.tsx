@@ -6,6 +6,7 @@ import { ApiError, apiFetch } from '@/api/client'
 import { useProjectQuery } from '@/api/hooks'
 import { useAuthStore } from '@/stores/auth'
 import { Button } from '@/components/ui/button'
+import { cn } from '@/lib/cn'
 import {
   Dialog,
   DialogContent,
@@ -97,7 +98,13 @@ function approvalErrorMessage(cause: unknown): string {
  * the chat, with a review dialog and a one-click approve-and-activate that
  * writes the durable approval receipt through the normal REST contract.
  */
-export function BaselineApprovalCard({ projectId }: { projectId: string }) {
+export function BaselineApprovalCard({
+  projectId,
+  className,
+}: {
+  projectId: string
+  className?: string
+}) {
   const queryClient = useQueryClient()
   const [reviewOpen, setReviewOpen] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
@@ -112,9 +119,7 @@ export function BaselineApprovalCard({ projectId }: { projectId: string }) {
   const data = baselineQuery.data
   const revision = data?.proposed_revision ?? data?.current_revision ?? null
   const approval =
-    data?.approval && revision && data.approval.revision_id === revision.id
-      ? data.approval
-      : null
+    data?.approval && revision && data.approval.revision_id === revision.id ? data.approval : null
   const step: 'approve' | 'activate' | null = !revision
     ? null
     : revision.lifecycle === 'proposed'
@@ -209,7 +214,10 @@ export function BaselineApprovalCard({ projectId }: { projectId: string }) {
 
   return (
     <section
-      className="mx-4 mt-3 min-w-0 rounded-lg border border-ember-border bg-card p-3 shadow-xs sm:mx-6 sm:p-4"
+      className={cn(
+        'mx-4 mt-3 min-w-0 rounded-lg border border-ember-border bg-card p-3 shadow-xs sm:mx-6 sm:p-4',
+        className,
+      )}
       aria-labelledby="baseline-approval-heading"
     >
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
@@ -239,8 +247,8 @@ export function BaselineApprovalCard({ projectId }: { projectId: string }) {
         </div>
       </div>
       <p className="mt-1.5 max-w-2xl text-xs leading-5 text-muted-foreground">
-        Approving this exact revision is the moment autonomous execution starts. Nothing runs
-        until you approve and activate it.
+        Approving this exact revision is the moment autonomous execution starts. Nothing runs until
+        you approve and activate it.
       </p>
       {actionError ? (
         <p className="mt-2 text-xs leading-5 text-destructive" role="alert">

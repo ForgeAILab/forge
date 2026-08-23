@@ -42,6 +42,9 @@ const LEASE_SECONDS: i64 = 60;
 const POLL_INTERVAL: TokioDuration = TokioDuration::from_secs(1);
 const MAX_TURN_ATTEMPTS: i64 = 3;
 const MAX_DETAIL_CHARS: usize = 2_000;
+pub(crate) const DELIVERY_FOLLOWUP_POSTCONDITION_SCHEMA: &str =
+    "forge.delivery-followup-postcondition/v1";
+pub(crate) const DELIVERY_FOLLOWUP_READINESS_EVENT: &str = "milestone.readiness.evaluated";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeTurnRun {
@@ -868,7 +871,8 @@ impl WakeTurnConsumer {
                 }));
             }
         };
-        let admission = self.build_turn_admission(event, chat, content, prepared.clone())?;
+        let admission =
+            self.build_turn_admission(event, chat, content, prepared.clone(), Some(&attention))?;
         let mut disposition = self.disposition(DispositionSpec {
             event,
             attempt,
@@ -1049,7 +1053,7 @@ impl WakeTurnConsumer {
                 }))
             }
         };
-        let admission = self.build_turn_admission(event, chat, content, prepared.clone())?;
+        let admission = self.build_turn_admission(event, chat, content, prepared.clone(), None)?;
         let mut disposition = self.disposition(DispositionSpec {
             event,
             attempt,
@@ -1081,6 +1085,7 @@ impl WakeTurnConsumer {
         chat: AgentChat,
         content: String,
         prepared: PreparedAgentTurnAdmission,
+        attention: Option<&db::AttentionProjection>,
     ) -> Result<AdmitAgentChatTurn> {
         let message_id = deterministic_uuid(&format!("{}:message", prepared.dedupe_key));
         let turn_id = deterministic_uuid(&format!("{}:turn", prepared.dedupe_key));
@@ -1113,6 +1118,25 @@ impl WakeTurnConsumer {
             updated_at: now.clone(),
         };
         let turn = prepared.apply_to_turn(base_turn)?;
+        let source_metadata_json =
+            match attention.filter(|attention| attention.attention_type == "delivery_followup") {
+                Some(attention) => json!({
+                    "wake_event_id": event.id,
+                    "wake_event_type": event.event_type,
+                    "turn_postcondition": {
+                        "schema_version": DELIVERY_FOLLOWUP_POSTCONDITION_SCHEMA,
+                        "attention_id": attention.id,
+                        "required_event_type": DELIVERY_FOLLOWUP_READINESS_EVENT,
+                        "required_scope_type": attention.scope_type,
+                        "required_scope_id": attention.scope_id,
+                        "after_event_sequence": event.sequence,
+                    }
+                }),
+                None => json!({
+                    "wake_event_id": event.id,
+                    "wake_event_type": event.event_type
+                }),
+            };
         let message = CreateAgentChatMessage {
             id: message_id,
             chat_id: chat.id,
@@ -1140,11 +1164,7 @@ impl WakeTurnConsumer {
             source_room_id: None,
             source_conversation_id: None,
             source_sequence: Some(event.sequence),
-            source_metadata_json: json!({
-                "wake_event_id": event.id,
-                "wake_event_type": event.event_type
-            })
-            .to_string(),
+            source_metadata_json: source_metadata_json.to_string(),
             created_at: now,
         };
         Ok(AdmitAgentChatTurn { message, turn })
@@ -1462,13 +1482,18 @@ fn wake_content(attention: &db::AttentionProjection) -> String {
     } else {
         format!("\nDetails: {}\n", attention.details_json)
     };
+    let delivery_requirement = if attention.attention_type == "delivery_followup" {
+        "\nThis delivery follow-up cannot complete from narration. Before replying, invoke `project.readiness` for the applicable milestone even when the canonical result will be blocked, failed, or stale. Do not infer validation, evidence, readiness, or release from Task completion alone.\n"
+    } else {
+        ""
+    };
     format!(
         "### Attention wake: {}\n\nCategory: {} — recommended action: {}.\nIncident: {}{}\nAssess the current state with your tools and take the action this incident requires. If a decision genuinely belongs to the user, ask for it; otherwise proceed.",
         attention.summary,
         attention.attention_type,
         attention.recommended_action,
         attention.dedupe_key,
-        details
+        format_args!("{details}{delivery_requirement}")
     )
 }
 

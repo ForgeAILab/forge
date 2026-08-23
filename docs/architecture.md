@@ -209,6 +209,17 @@ provenance; it is not a second responder resolution or a new model admission.
 A Profile edit or binding replacement therefore affects the next admitted turn
 only, never an already queued/leased turn.
 
+An autonomous `delivery_followup` admission also freezes a typed postcondition
+on its server-authored trigger: a Project-scoped
+`milestone.readiness.evaluated` event must commit at a sequence newer than the
+wake event before the worker may append the assistant response and mark the
+turn `succeeded`. Prose alone fails that attempt without committing an agent
+message. The same frozen job moves through the ordinary finite `retry_wait`
+budget, and its retry receives a server-owned corrective instruction to invoke
+`project.readiness`. A canonical `blocked`, `failed`, or `stale` readiness
+result satisfies the reconciliation boundary; it does not imply validation or
+authorize the user-only release action.
+
 The chat worker selects the session backend from the bound identity's profile.
 A native profile uses the embedded host and an Agent Chat-scoped continuity
 timeline; a safely migrated CLI profile may use an explicit constrained chat
@@ -818,11 +829,16 @@ Every terminal `done` Task transition also creates a `delivery_followup`
 Attention incident for that Project Agent. The follow-up asks it to reconcile
 the Task outcome into authoritative validation, evidence, and milestone
 readiness; the Task transition itself supplies none of those facts and never
-authorizes a release. A committed readiness evaluation resolves the pending
-delivery follow-ups even when the evaluation remains blocked.
+authorizes a release. The admitted follow-up cannot succeed from narration: it
+must commit a newer Project-scoped readiness evaluation or retry/fail under the
+existing finite turn budget. A committed readiness evaluation resolves the
+pending delivery follow-ups even when the evaluation remains blocked.
 When upgrading from an older Attention consumer, migration `V093` appends one
 deduplicated follow-up event for each Project whose latest completed Task has no
 later readiness evaluation, so already-checkpointed delivery is reconciled too.
+Migration `V094` similarly replays one event per Project whose follow-up
+Attention remained open after a pre-guard prose-only turn, allowing the normal
+durable wake path to recover those existing incidents after restart.
 
 The `events` crate still wraps `tokio::sync::broadcast`, and the SSE endpoint at
 `/api/v1/events` still drives live clients. For durable events it is a

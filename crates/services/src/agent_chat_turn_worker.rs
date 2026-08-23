@@ -59,6 +59,9 @@ use crate::{
         PROJECT_OPERATING_SKILL_SCHEMA_VERSION,
     },
     project_runtime::{load_effective_project_state, ProjectEffectiveStateProjection},
+    wake_turn_consumer::{
+        DELIVERY_FOLLOWUP_POSTCONDITION_SCHEMA, DELIVERY_FOLLOWUP_READINESS_EVENT,
+    },
     EmbeddedAgentService, Result, ServiceError,
 };
 
@@ -72,6 +75,20 @@ const MAX_CLI_ASSISTANT_CHARS: usize = 500;
 const PROJECT_HANDOFF_SCHEMA_VERSION: &str = "forge.project-charter-handoff/v1";
 const PROJECT_CONTEXT_DIGEST_SCHEMA_VERSION: &str = "forge.project-context-reference/v1";
 const MAX_HANDOFF_BOUNDED_CHARS: usize = 12_000;
+const DELIVERY_FOLLOWUP_POSTCONDITION_FAILED: &str = "delivery_followup_postcondition_failed";
+const DELIVERY_FOLLOWUP_POSTCONDITION_MESSAGE: &str =
+    "Delivery follow-up returned without committing a newer milestone readiness evaluation";
+const DELIVERY_FOLLOWUP_RETRY_INSTRUCTION: &str = r#"
+
+## SERVER-OWNED DELIVERY FOLLOW-UP RETRY
+Your prior attempt returned text without committing the required milestone
+readiness evaluation. Narration cannot complete this turn. Before replying,
+invoke `project.readiness` for the applicable milestone in this bound Project,
+even when the authoritative result will be blocked, failed, or stale. Report
+only the committed canonical result and its blockers. Task completion or a
+passing review is live progress, not validation, readiness, or release. Do not
+self-attest, waive a check, or release the milestone.
+"#;
 // Setup keeps the existing Project proposal ceiling but the host exposes only
 // the typed adoption operation while this server-derived state is active.
 // The candidate is still committed only through the authenticated Project
@@ -152,6 +169,16 @@ struct LoadedAgentChatTurn {
     /// the authenticated bounded Project state.  These are appended to the
     /// runtime context manifest when the backend returns one.
     operating_context_sources: Vec<ContextSourceInput>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct DeliveryFollowupPostcondition {
+    schema_version: String,
+    attention_id: String,
+    required_event_type: String,
+    required_scope_type: String,
+    required_scope_id: String,
+    after_event_sequence: i64,
 }
 
 /// Authority-bearing values copied into a turn job at admission.  Binding
@@ -939,7 +966,7 @@ impl FederatedAgentChatTurnRunner {
         // any model call.  A Project Chat is never allowed to fall back to a
         // profile-only prompt, an old handoff overlay, or a legacy Project
         // binding when its Charter pointers cannot be proven current.
-        let (operating_instruction, operating_context_sources) = match chat.kind.as_str() {
+        let (mut operating_instruction, operating_context_sources) = match chat.kind.as_str() {
             "account_main" => {
                 if chat.project_id.is_some() {
                     return Err(ServiceError::invalid_operation(
@@ -1296,6 +1323,11 @@ impl FederatedAgentChatTurnRunner {
                 ));
             }
         };
+        append_delivery_followup_retry_instruction(
+            job.error_code.as_deref(),
+            delivery_followup_postcondition(&input)?.is_some(),
+            &mut operating_instruction,
+        )?;
         let owner_user_id = agent
             .owner_id
             .clone()
@@ -3655,17 +3687,50 @@ impl AgentChatTurnWorker {
                             )
                             .await;
                     }
-                } else if let Err(error) = self.commit_success(&commit_job, turn).await {
-                    tracing::warn!(job_id = %commit_job.id, error = %error, "Agent Chat response commit failed");
-                    let _ = self
-                        .chat_service
-                        .append_failure(
-                            &commit_job,
-                            &self.lease_owner,
-                            "response_commit_failed",
-                            "Agent Chat response could not be committed",
-                        )
-                        .await;
+                } else {
+                    match self.turn_postcondition_satisfied(&commit_job).await {
+                        Ok(true) => {
+                            if let Err(error) = self.commit_success(&commit_job, turn).await {
+                                tracing::warn!(job_id = %commit_job.id, error = %error, "Agent Chat response commit failed");
+                                let _ = self
+                                    .chat_service
+                                    .append_failure(
+                                        &commit_job,
+                                        &self.lease_owner,
+                                        "response_commit_failed",
+                                        "Agent Chat response could not be committed",
+                                    )
+                                    .await;
+                            }
+                        }
+                        Ok(false) => {
+                            tracing::warn!(
+                                job_id = %commit_job.id,
+                                "Agent Chat delivery follow-up postcondition was not committed"
+                            );
+                            let _ = self
+                                .chat_service
+                                .append_failure(
+                                    &commit_job,
+                                    &self.lease_owner,
+                                    DELIVERY_FOLLOWUP_POSTCONDITION_FAILED,
+                                    DELIVERY_FOLLOWUP_POSTCONDITION_MESSAGE,
+                                )
+                                .await;
+                        }
+                        Err(error) => {
+                            tracing::warn!(job_id = %commit_job.id, error = %error, "Agent Chat turn postcondition check failed");
+                            let _ = self
+                                .chat_service
+                                .append_failure(
+                                    &commit_job,
+                                    &self.lease_owner,
+                                    "turn_postcondition_check_failed",
+                                    "Agent Chat turn postcondition could not be verified",
+                                )
+                                .await;
+                        }
+                    }
                 }
             }
             Err(error) => {
@@ -3751,6 +3816,70 @@ impl AgentChatTurnWorker {
             .await
     }
 
+    async fn turn_postcondition_satisfied(&self, job: &AgentChatTurnJob) -> Result<bool> {
+        let message =
+            AgentChatMessageRepo::get_agent_chat_message(&*self.db, &job.triggering_message_id)
+                .await?
+                .filter(|message| message.chat_id == job.chat_id)
+                .ok_or_else(|| {
+                    ServiceError::not_found("agent_chat_message", job.triggering_message_id.clone())
+                })?;
+        let Some(postcondition) = delivery_followup_postcondition(&message)? else {
+            return Ok(true);
+        };
+        let source_event_id = message.source_id.as_deref().ok_or_else(|| {
+            ServiceError::invalid_operation("Delivery follow-up has no source wake event")
+        })?;
+        if job.causation_id.as_deref() != Some(source_event_id) {
+            return Err(ServiceError::invalid_operation(
+                "Delivery follow-up turn is not caused by its source wake event",
+            ));
+        }
+        let canonical_wake_event = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM domain_event
+             WHERE id = ? AND sequence = ? AND event_type = 'agent.wake.admitted'
+               AND scope_type = 'project' AND scope_id = ?",
+        )
+        .bind(source_event_id)
+        .bind(postcondition.after_event_sequence)
+        .bind(&postcondition.required_scope_id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .is_some();
+        if !canonical_wake_event {
+            return Err(ServiceError::invalid_operation(
+                "Delivery follow-up postcondition does not match its source wake event",
+            ));
+        }
+        let canonical_project_chat = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM agent_chat
+             WHERE id = ? AND kind = 'project' AND project_id = ?",
+        )
+        .bind(&job.chat_id)
+        .bind(&postcondition.required_scope_id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .is_some();
+        if !canonical_project_chat {
+            return Err(ServiceError::invalid_operation(
+                "Delivery follow-up postcondition does not match its canonical Project Chat",
+            ));
+        }
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM domain_event
+             WHERE event_type = ? AND scope_type = ? AND scope_id = ?
+               AND sequence > ?
+             ORDER BY sequence ASC LIMIT 1",
+        )
+        .bind(&postcondition.required_event_type)
+        .bind(&postcondition.required_scope_type)
+        .bind(&postcondition.required_scope_id)
+        .bind(postcondition.after_event_sequence)
+        .fetch_optional(self.db.pool())
+        .await?
+        .is_some())
+    }
+
     fn spawn_lease_renewal(
         &self,
         job_id: String,
@@ -3825,6 +3954,61 @@ fn runtime_history(history: &[AgentChatMessage]) -> Vec<Message> {
             AgentChatMessageAuthorType::System => Message::system(message.content.clone()),
         })
         .collect()
+}
+
+fn delivery_followup_postcondition(
+    message: &AgentChatMessage,
+) -> Result<Option<DeliveryFollowupPostcondition>> {
+    if message.author_type != AgentChatMessageAuthorType::System || message.source_type != "native"
+    {
+        return Ok(None);
+    }
+    let metadata = serde_json::from_str::<Value>(&message.source_metadata_json)
+        .map_err(|_| ServiceError::invalid_operation("Agent Chat source metadata is invalid"))?;
+    let Some(value) = metadata.get("turn_postcondition") else {
+        return Ok(None);
+    };
+    if message.source_id.as_deref().is_none_or(str::is_empty) {
+        return Err(ServiceError::invalid_operation(
+            "Agent Chat turn postcondition is not server-authored",
+        ));
+    }
+    let postcondition = serde_json::from_value::<DeliveryFollowupPostcondition>(value.clone())
+        .map_err(|_| {
+            ServiceError::invalid_operation("Agent Chat turn postcondition is malformed")
+        })?;
+    if postcondition.schema_version != DELIVERY_FOLLOWUP_POSTCONDITION_SCHEMA
+        || postcondition.attention_id.trim().is_empty()
+        || postcondition.required_event_type != DELIVERY_FOLLOWUP_READINESS_EVENT
+        || postcondition.required_scope_type != "project"
+        || postcondition.required_scope_id.trim().is_empty()
+        || postcondition.after_event_sequence < 1
+        || message.source_sequence != Some(postcondition.after_event_sequence)
+    {
+        return Err(ServiceError::invalid_operation(
+            "Agent Chat turn postcondition is not a valid delivery follow-up contract",
+        ));
+    }
+    Ok(Some(postcondition))
+}
+
+fn append_delivery_followup_retry_instruction(
+    error_code: Option<&str>,
+    has_delivery_followup_postcondition: bool,
+    operating_instruction: &mut Option<String>,
+) -> Result<()> {
+    if error_code != Some(DELIVERY_FOLLOWUP_POSTCONDITION_FAILED)
+        || !has_delivery_followup_postcondition
+    {
+        return Ok(());
+    }
+    let instruction = operating_instruction.as_mut().ok_or_else(|| {
+        ServiceError::invalid_operation(
+            "Delivery follow-up retry has no Project operating instruction",
+        )
+    })?;
+    instruction.push_str(DELIVERY_FOLLOWUP_RETRY_INSTRUCTION);
+    Ok(())
 }
 
 fn build_cli_prompt(
@@ -4967,6 +5151,26 @@ mod tests {
         );
         assert!(prompt.contains("SERVER-OWNED OPERATING INSTRUCTION"));
         assert!(prompt.contains("continue discovery"));
+    }
+
+    #[test]
+    fn delivery_followup_retry_adds_server_owned_corrective_instruction() {
+        let mut instruction = Some("Project operating instruction".to_owned());
+        append_delivery_followup_retry_instruction(
+            Some(DELIVERY_FOLLOWUP_POSTCONDITION_FAILED),
+            true,
+            &mut instruction,
+        )
+        .expect("delivery follow-up retry instruction");
+        let instruction = instruction.expect("Project operating instruction remains available");
+        assert!(instruction.contains("SERVER-OWNED DELIVERY FOLLOW-UP RETRY"));
+        assert!(instruction.contains("invoke `project.readiness`"));
+        assert!(instruction.contains("Narration cannot complete this turn"));
+
+        let mut ordinary = Some("Project operating instruction".to_owned());
+        append_delivery_followup_retry_instruction(Some("backend_failed"), true, &mut ordinary)
+            .expect("ordinary retries are unchanged");
+        assert_eq!(ordinary.as_deref(), Some("Project operating instruction"));
     }
 
     #[test]

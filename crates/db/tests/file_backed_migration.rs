@@ -217,6 +217,114 @@ async fn delivery_followup_backfill_replays_latest_unreconciled_done_task_after_
 }
 
 #[tokio::test]
+async fn delivery_followup_postcondition_recovery_replays_open_incident_once() {
+    let migration_dir = unique_temp_path("delivery-followup-postcondition-migrations");
+    fs::create_dir_all(&migration_dir).expect("temp migration dir creates");
+    copy_migrations_up_to(93, &migration_dir);
+
+    let db_path = unique_temp_path("delivery-followup-postcondition-db").with_extension("db");
+    let url = format!("sqlite://{}", db_path.display());
+    let pool = create_sqlite_pool(&url).await.expect("pool");
+    run_migrations_from(&pool, &migration_dir)
+        .await
+        .expect("pre-V094 migrations apply");
+
+    let now = "2026-08-23T04:00:00Z";
+    sqlx::query(
+        "INSERT INTO project (
+            id, name, settings, workflow_definition, created_at, updated_at
+         ) VALUES ('postcondition-project', 'Postcondition', '{}', '{}', ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("project inserts");
+    sqlx::query(
+        "INSERT INTO task (
+            id, project_id, title, status, created_at, updated_at
+         ) VALUES ('postcondition-task', 'postcondition-project',
+                   'Delivered task', 'done', ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("done task inserts");
+    sqlx::query(
+        "INSERT INTO domain_event (
+            id, event_type, entity_type, entity_id, actor_type, actor_id,
+            scope_type, scope_id, correlation_id, causation_depth,
+            dedupe_key, payload_json, created_at
+         ) VALUES ('postcondition-done-event', 'task.transitioned', 'task',
+                   'postcondition-task', 'system', 'workflow', 'task',
+                   'postcondition-task', 'postcondition-correlation', 0,
+                   'postcondition-done-dedupe', '{\"to_state\":\"done\"}', ?)",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("done transition event inserts");
+    let source_sequence: i64 = sqlx::query_scalar(
+        "SELECT sequence FROM domain_event WHERE id = 'postcondition-done-event'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("done event sequence loads");
+    sqlx::query(
+        "INSERT INTO attention_projection (
+            id, attention_type, scope_type, scope_id, source_event_id,
+            priority, status, summary, details_json, dedupe_key, occurred_at,
+            updated_at, recommended_action, source_sequence
+         ) VALUES ('postcondition-attention', 'delivery_followup', 'project',
+                   'postcondition-project', 'postcondition-done-event', 70,
+                   'open', 'Reconcile delivery',
+                   '{\"scope_type\":\"project\",\"scope_id\":\"postcondition-project\"}',
+                   'postcondition-incident', ?, ?, 'reconcile_delivery', ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(source_sequence)
+    .execute(&pool)
+    .await
+    .expect("open delivery Attention inserts");
+
+    run_migrations(&pool)
+        .await
+        .expect("V094 postcondition recovery applies");
+    let recovered: (String, String, i64) = sqlx::query_as(
+        "SELECT entity_id, dedupe_key, sequence
+         FROM domain_event
+         WHERE event_type = 'task.completed'
+           AND actor_id = 'V094__delivery_followup_postcondition_recovery'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("one recovery event is appended");
+    assert_eq!(recovered.0, "postcondition-task");
+    assert!(recovered
+        .1
+        .starts_with("migration:delivery-followup-postcondition:v1:postcondition-project:"));
+    assert!(recovered.2 > source_sequence);
+
+    run_migrations(&pool)
+        .await
+        .expect("V094 replay remains idempotent");
+    let recovered_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event
+         WHERE event_type = 'task.completed'
+           AND actor_id = 'V094__delivery_followup_postcondition_recovery'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("recovery count loads");
+    assert_eq!(recovered_count, 1);
+
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(migration_dir);
+}
+
+#[tokio::test]
 async fn wake_cutover_advances_existing_lagging_cursor_but_preserves_ahead_cursor() {
     let (lagging_sequence, lagging_version, cutover) = migrate_wake_cursor_from_v087(0).await;
     assert_eq!(lagging_sequence, cutover);

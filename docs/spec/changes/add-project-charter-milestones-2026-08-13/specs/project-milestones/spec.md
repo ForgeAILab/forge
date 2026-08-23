@@ -64,6 +64,14 @@ Forge SHALL evaluate required milestone checks from authoritative Task validatio
 - **THEN** Forge persists the immutable non-ready `ReadinessSnapshot` and leaves the unreleased milestone `active`
 - **AND** it exposes typed blocker, stale, or `reconciliation_required` reasons rather than changing the lifecycle to a diagnostic alias
 
+#### Scenario: Delivery follow-up returns narration without readiness
+
+- **GIVEN** Task delivery admitted an autonomous `delivery_followup` Project Agent turn
+- **WHEN** the turn returns prose without committing a newer Project-scoped `milestone.readiness.evaluated` event
+- **THEN** Forge commits no agent response and does not mark that turn successful
+- **AND** it retries the same frozen turn with a server-owned corrective instruction under the existing finite retry budget
+- **AND** a committed `blocked`, `failed`, or `stale` readiness evaluation satisfies reconciliation truthfully, while release remains an explicit user-only action
+
 #### Scenario: Readiness evaluates a released correction
 
 - **GIVEN** a milestone lifecycle is `released` and corrected inputs are proposed

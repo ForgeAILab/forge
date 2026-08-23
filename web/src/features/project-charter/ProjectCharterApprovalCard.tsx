@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Scroll } from '@phosphor-icons/react'
 
 import { Button } from '@/components/ui/button'
+import { cn } from '@/lib/cn'
 
 import { useProjectCharterApproval } from './hooks'
 import { ProjectCharterReviewDialog } from './ProjectCharterReviewDialog'
@@ -14,7 +15,13 @@ import { ProjectCharterReviewDialog } from './ProjectCharterReviewDialog'
  * request where the user is already working, next to the conversation that
  * produced it.
  */
-export function ProjectCharterApprovalCard({ projectId }: { projectId: string }) {
+export function ProjectCharterApprovalCard({
+  projectId,
+  className,
+}: {
+  projectId: string
+  className?: string
+}) {
   const approval = useProjectCharterApproval(projectId)
   const [reviewOpen, setReviewOpen] = useState(false)
 
@@ -23,7 +30,10 @@ export function ProjectCharterApprovalCard({ projectId }: { projectId: string })
 
   return (
     <section
-      className="mx-4 mt-3 min-w-0 rounded-lg border border-ember-border bg-card p-3 shadow-xs sm:mx-6 sm:p-4"
+      className={cn(
+        'mx-4 mt-3 min-w-0 rounded-lg border border-ember-border bg-card p-3 shadow-xs sm:mx-6 sm:p-4',
+        className,
+      )}
       aria-labelledby="project-charter-approval-heading"
     >
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
@@ -57,8 +67,8 @@ export function ProjectCharterApprovalCard({ projectId }: { projectId: string })
         </div>
       </div>
       <p className="mt-1.5 max-w-2xl text-xs leading-5 text-muted-foreground">
-        Approving this exact revision makes it Project truth and unblocks planning and release.
-        The Project Agent drafted it; only you can adopt it.
+        Approving this exact revision makes it Project truth and unblocks planning and release. The
+        Project Agent drafted it; only you can adopt it.
       </p>
       {blockedReason ? (
         <p className="mt-2 text-xs leading-5 text-warning" role="status">

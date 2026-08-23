@@ -1,6 +1,6 @@
 ---
 created_at: 2026-08-13T19:04:05Z
-updated_at: 2026-08-23T02:53:30Z
+updated_at: 2026-08-23T05:41:03Z
 ---
 
 ## 1. Approval and dependency gate
@@ -80,6 +80,7 @@ Frozen on 2026-08-13 with no deviations from `design.md`: document kinds are `re
 - [x] 9.5 Require the release request to name the exact candidate `ReadinessSnapshot` ID/digest; re-authorize the user, recompute the exact same readiness digest, and re-check every readiness-covered source version inside the release transaction. On a match, atomically create the immutable release manifest `Mxxx-rN`, release-scoped evidence pins, lifecycle transition, and events; do not create another readiness snapshot. Keep `released` terminal and implement audited privacy/security evidence tombstones plus `evidence_unavailable` after purge.
 - [ ] 9.6 Test definition-revision and milestone lifecycle edges, readiness freshness, active/non-ready/released-correction projections, failure between manifest/pin/event operations, duplicate release replay, self-release denial, immutable historic reads, waiver visibility, and source mutation after release.
 - [x] 9.7 Fail closed when an active baseline's acceptance/evidence matrix does not match its pinned current milestone definition; exclude superseded-definition checks from live projections; and wake the bound Project Agent after current or already-checkpointed Task delivery to reconcile validation, evidence, and readiness without auto-release.
+- [x] 9.8 Require an autonomous delivery-followup turn to commit a newer Project-scoped readiness evaluation before it may succeed; retry the same frozen turn with a server-owned corrective instruction when it returns prose only, exhaust the existing finite turn budget visibly, and preserve blocked/stale readiness plus user-only release semantics.
 
 ## 10. Shared media and evidence lifecycle
 

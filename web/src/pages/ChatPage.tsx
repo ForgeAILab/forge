@@ -26,6 +26,7 @@ import { ProjectCharterApprovalCard } from '@/features/project-charter/ProjectCh
 import { ProjectExecutionSetupPanel } from '@/features/project-execution/ProjectExecutionSetupPanel'
 import { useChatSelection } from '@/stores/chat'
 import { useProjectsInfiniteQuery } from '@/api/hooks'
+import { cn } from '@/lib/cn'
 
 const PROJECTS_PAGE_SIZE = 100
 
@@ -207,95 +208,116 @@ export function ChatPage({ projectId }: { projectId?: string }) {
           ) : null}
         </div>
       </header>
-      <div className="flex min-h-0 flex-1 flex-col">
+      <div
+        className={cn(
+          'min-h-0 flex-1',
+          projectId
+            ? 'grid grid-rows-[auto_minmax(0,1fr)] xl:grid-cols-[minmax(0,1fr)_20rem] xl:grid-rows-[minmax(0,1fr)]'
+            : 'flex flex-col',
+        )}
+      >
         {projectId ? (
-          <div className="max-h-[min(42vh,32rem)] shrink-0 overflow-y-auto border-b border-border-subtle bg-muted/10 p-3 sm:p-4">
+          <aside
+            className="order-1 min-h-0 min-w-0 max-h-[min(42vh,32rem)] overflow-y-auto border-b border-border-subtle bg-muted/10 p-3 sm:p-4 xl:order-2 xl:max-h-none xl:border-b-0 xl:border-l xl:p-3"
+            aria-label="Project status and approvals"
+          >
             <ProjectExecutionSetupPanel projectId={projectId} compact />
-          </div>
+            <ProjectCharterApprovalCard
+              projectId={projectId}
+              className="mx-0 mt-3 sm:mx-0 sm:p-3"
+            />
+            <BaselineApprovalCard projectId={projectId} className="mx-0 mt-3 sm:mx-0 sm:p-3" />
+          </aside>
         ) : null}
-        {chatsQuery.isLoading || (activeChatId && chatQuery.isLoading) ? (
-          <LoadingPanel label="Loading Agent Chat" />
-        ) : chatsQuery.isError ? (
-          <ErrorPanel
-            title="Agent Chat unavailable"
-            description="Forge could not load the authorized chat switcher. No chat is created or forked while it is unavailable."
-            onRetry={() => void chatsQuery.refetch()}
-          />
-        ) : chatQuery.isError ? (
-          <ErrorPanel
-            title="Chat details unavailable"
-            description="Forge could not load this existing Agent Chat. Try again before admitting a turn."
-            onRetry={() => void chatQuery.refetch()}
-          />
-        ) : chatUnavailable ? (
-          <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto p-4 sm:p-6">
-            <section
-              className="mx-auto flex w-full max-w-xl flex-col items-start rounded-xl border border-destructive/30 bg-destructive/5 p-5 sm:p-6"
-              role="alert"
-              aria-labelledby="chat-unavailable-heading"
-            >
-              <h2 id="chat-unavailable-heading" className="text-base font-semibold text-foreground">
-                Agent Chat unavailable
-              </h2>
-              <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                This durable chat exists, but its owning Agent binding is currently paused,
-                replaced, revoked, or archived. Forge will not admit a turn until the authorized
-                binding is restored.
-              </p>
-              {projectId ? (
-                <p className="mt-5 text-xs leading-5 text-muted-foreground" role="status">
-                  Use the single Project Agent action in Execution readiness above to restore this
-                  binding.
-                </p>
-              ) : (
-                <Link
-                  to="/agents"
-                  search={{ tab: 'bindings' }}
-                  className="mt-5 inline-flex items-center gap-1.5 text-xs font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  Open Agent settings <ArrowUpRight size={13} aria-hidden />
-                </Link>
-              )}
-            </section>
-          </div>
-        ) : chatNeedsSetup || !chatQuery.data ? (
-          <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto p-4 sm:p-6">
-            {projectId ? (
+        <div
+          className={cn(
+            'min-h-0 min-w-0 flex-col',
+            projectId ? 'order-2 flex xl:order-1' : 'flex flex-1',
+          )}
+        >
+          {chatsQuery.isLoading || (activeChatId && chatQuery.isLoading) ? (
+            <LoadingPanel label="Loading Agent Chat" />
+          ) : chatsQuery.isError ? (
+            <ErrorPanel
+              title="Agent Chat unavailable"
+              description="Forge could not load the authorized chat switcher. No chat is created or forked while it is unavailable."
+              onRetry={() => void chatsQuery.refetch()}
+            />
+          ) : chatQuery.isError ? (
+            <ErrorPanel
+              title="Chat details unavailable"
+              description="Forge could not load this existing Agent Chat. Try again before admitting a turn."
+              onRetry={() => void chatQuery.refetch()}
+            />
+          ) : chatUnavailable ? (
+            <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto p-4 sm:p-6">
               <section
-                className="mx-auto w-full max-w-xl rounded-xl border border-warning/30 bg-warning/5 p-5"
-                role="status"
+                className="mx-auto flex w-full max-w-xl flex-col items-start rounded-xl border border-destructive/30 bg-destructive/5 p-5 sm:p-6"
+                role="alert"
+                aria-labelledby="chat-unavailable-heading"
               >
-                <h2 className="text-base font-semibold text-foreground">
-                  Project Chat setup required
+                <h2
+                  id="chat-unavailable-heading"
+                  className="text-base font-semibold text-foreground"
+                >
+                  Agent Chat unavailable
                 </h2>
                 <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                  Use the single Project Agent action in Execution readiness above. Forge will not
-                  admit a Project Chat turn until its authorized binding is ready.
+                  This durable chat exists, but its owning Agent binding is currently paused,
+                  replaced, revoked, or archived. Forge will not admit a turn until the authorized
+                  binding is restored.
                 </p>
+                {projectId ? (
+                  <p className="mt-5 text-xs leading-5 text-muted-foreground" role="status">
+                    Use the single Project Agent action in the Project status rail to restore this
+                    binding.
+                  </p>
+                ) : (
+                  <Link
+                    to="/agents"
+                    search={{ tab: 'bindings' }}
+                    className="mt-5 inline-flex items-center gap-1.5 text-xs font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    Open Agent settings <ArrowUpRight size={13} aria-hidden />
+                  </Link>
+                )}
               </section>
-            ) : (
-              <ChatSetupRequired projectId={projectId} />
-            )}
-          </div>
-        ) : (
-          <>
-            {/* Pinned above the timeline so it never trails new messages and
-                the approval actions stay reachable while the chat streams. */}
-            {!projectId ? <ProductGenesisCharterCard ref={charterCard} /> : null}
-            {projectId ? <ProjectCharterApprovalCard projectId={projectId} /> : null}
-            {projectId ? <BaselineApprovalCard projectId={projectId} /> : null}
-            <AgentChatTimeline
-              chat={chatQuery.data}
-              agentName={activeAgentName}
-              projectId={projectId}
-              handoffProjectIds={handoffProjectIdsForScope(projectId, projectSources)}
-              isSending={sendMutation.isPending}
-              onSend={sendMessage}
-              onCancelTurn={cancelTurn}
-              commands={commands}
-            />
-          </>
-        )}
+            </div>
+          ) : chatNeedsSetup || !chatQuery.data ? (
+            <div className="flex min-h-0 flex-1 items-center justify-center overflow-y-auto p-4 sm:p-6">
+              {projectId ? (
+                <section
+                  className="mx-auto w-full max-w-xl rounded-xl border border-warning/30 bg-warning/5 p-5"
+                  role="status"
+                >
+                  <h2 className="text-base font-semibold text-foreground">
+                    Project Chat setup required
+                  </h2>
+                  <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                    Use the single Project Agent action in the Project status rail. Forge will not
+                    admit a Project Chat turn until its authorized binding is ready.
+                  </p>
+                </section>
+              ) : (
+                <ChatSetupRequired projectId={projectId} />
+              )}
+            </div>
+          ) : (
+            <>
+              {!projectId ? <ProductGenesisCharterCard ref={charterCard} /> : null}
+              <AgentChatTimeline
+                chat={chatQuery.data}
+                agentName={activeAgentName}
+                projectId={projectId}
+                handoffProjectIds={handoffProjectIdsForScope(projectId, projectSources)}
+                isSending={sendMutation.isPending}
+                onSend={sendMessage}
+                onCancelTurn={cancelTurn}
+                commands={commands}
+              />
+            </>
+          )}
+        </div>
       </div>
     </div>
   )
