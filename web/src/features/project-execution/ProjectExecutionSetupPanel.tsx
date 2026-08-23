@@ -172,13 +172,17 @@ function ReadinessRow({
   label,
   value,
   description,
+  compact = false,
 }: {
   label: string
   value: string
   description: string
+  compact?: boolean
 }) {
   return (
-    <div className="flex min-w-0 items-start gap-3 rounded-md border border-border-subtle bg-background px-3 py-3">
+    <li
+      className={`flex min-w-0 items-start rounded-md border border-border-subtle bg-background px-3 ${compact ? 'gap-2 py-2.5' : 'gap-3 py-3'}`}
+    >
       <StateIcon value={value} />
       <div className="min-w-0 flex-1">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -187,7 +191,7 @@ function ReadinessRow({
         </div>
         <p className="mt-1 break-words text-xs leading-5 text-muted-foreground">{description}</p>
       </div>
-    </div>
+    </li>
   )
 }
 
@@ -211,6 +215,7 @@ function ActionSelect({
   pending,
   onSubmit,
   icon,
+  compact = false,
 }: {
   id: string
   label: string
@@ -221,13 +226,16 @@ function ActionSelect({
   pending: boolean
   onSubmit: () => void
   icon: ReactNode
+  compact?: boolean
 }) {
   return (
     <div className="min-w-0">
       <label htmlFor={id} className="text-xs font-medium text-foreground">
         {label}
       </label>
-      <div className="mt-2 flex min-w-0 flex-col gap-2 xl:flex-row xl:items-center">
+      <div
+        className={`mt-2 flex min-w-0 flex-col gap-2 ${compact ? '' : 'xl:flex-row xl:items-center'}`}
+      >
         <select
           id={id}
           value={value}
@@ -244,7 +252,7 @@ function ActionSelect({
         <Button
           type="button"
           size="sm"
-          className="w-full shrink-0 sm:w-auto"
+          className={`w-full shrink-0 ${compact ? '' : 'sm:w-auto'}`}
           onClick={onSubmit}
           disabled={!value || pending}
         >
@@ -273,12 +281,14 @@ function RepositorySelect({
   onChange,
   pending,
   onSubmit,
+  compact = false,
 }: {
   projectId: string
   value: string
   onChange: (value: string) => void
   pending: boolean
   onSubmit: () => void
+  compact?: boolean
 }) {
   const reposQuery = useReposQuery(projectId, { enabled: true })
   const repos = reposQuery.data?.items ?? []
@@ -328,7 +338,9 @@ function RepositorySelect({
       <label htmlFor="execution-primary-repository" className="text-xs font-medium text-foreground">
         Primary repository
       </label>
-      <div className="mt-2 flex min-w-0 flex-col gap-2 xl:flex-row xl:items-center">
+      <div
+        className={`mt-2 flex min-w-0 flex-col gap-2 ${compact ? '' : 'xl:flex-row xl:items-center'}`}
+      >
         <select
           id="execution-primary-repository"
           value={value}
@@ -347,7 +359,7 @@ function RepositorySelect({
         <Button
           type="button"
           size="sm"
-          className="w-full shrink-0 sm:w-auto"
+          className={`w-full shrink-0 ${compact ? '' : 'sm:w-auto'}`}
           onClick={onSubmit}
           disabled={!value || pending}
         >
@@ -388,6 +400,7 @@ function ActionArea({
   repositoryMutation,
   retryMutation,
   onRefresh,
+  compact = false,
 }: {
   action: SetupAction | null
   data: ProjectExecutionSetupResponse
@@ -403,6 +416,7 @@ function ActionArea({
   repositoryMutation: ReturnType<typeof useAttachPrimaryRepositoryMutation>
   retryMutation: ReturnType<typeof useRetryProvisioningMutation>
   onRefresh: () => void
+  compact?: boolean
 }) {
   const attemptKeys = useRef<Record<string, { fingerprint: string; key: string }>>({})
   const expectedProjectVersion = asNumber(data.project_version)
@@ -540,6 +554,7 @@ function ActionArea({
           pending={workerMutation.isPending}
           onSubmit={submitWorker}
           icon={<UserCircle size={14} aria-hidden />}
+          compact={compact}
         />
       )
     }
@@ -567,6 +582,7 @@ function ActionArea({
           pending={reviewerMutation.isPending}
           onSubmit={submitReviewer}
           icon={<ShieldCheck size={14} aria-hidden />}
+          compact={compact}
         />
       )
     }
@@ -579,6 +595,7 @@ function ActionArea({
           onChange={setRepositorySelection}
           pending={repositoryMutation.isPending}
           onSubmit={submitRepository}
+          compact={compact}
         />
       )
     }
@@ -787,10 +804,16 @@ export function ProjectExecutionSetupPanel({
             />
             Loading execution readiness…
           </div>
-          <div className="mt-4 grid gap-2 xl:grid-cols-3" aria-hidden>
-            <div className="h-16 animate-pulse motion-reduce:animate-none rounded-md bg-muted" />
-            <div className="h-16 animate-pulse motion-reduce:animate-none rounded-md bg-muted" />
-            <div className="h-16 animate-pulse motion-reduce:animate-none rounded-md bg-muted" />
+          <div className={`mt-4 grid gap-2 ${compact ? '' : 'xl:grid-cols-3'}`} aria-hidden>
+            <div
+              className={`${compact ? 'h-12' : 'h-16'} animate-pulse motion-reduce:animate-none rounded-md bg-muted`}
+            />
+            <div
+              className={`${compact ? 'h-12' : 'h-16'} animate-pulse motion-reduce:animate-none rounded-md bg-muted`}
+            />
+            <div
+              className={`${compact ? 'h-12' : 'h-16'} animate-pulse motion-reduce:animate-none rounded-md bg-muted`}
+            />
           </div>
         </Card>
       </section>
@@ -835,7 +858,7 @@ export function ProjectExecutionSetupPanel({
     if (requirement.requirement_type === 'provisioning') return 'provisioning'
     return humanize(requirement.requirement_type)
   })
-  const contentSpacing = compact ? 'gap-3' : 'gap-4'
+  const contentSpacing = compact ? 'gap-2' : 'gap-4'
   const headingId = `execution-readiness-${projectId}`
 
   return (
@@ -846,40 +869,50 @@ export function ProjectExecutionSetupPanel({
         {stateLabel(data.execution_gate)}.
       </p>
       <Card
-        className={`min-w-0 border-border-subtle bg-card p-4 sm:p-5 ${compact ? '' : 'shadow-sm'}`}
+        className={`min-w-0 border-border-subtle bg-card ${compact ? 'p-4' : 'p-4 shadow-sm sm:p-5'}`}
       >
         <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
             <p className="font-mono text-micro font-semibold uppercase tracking-[0.12em] text-muted-foreground">
               Project execution
             </p>
-            <h2 id={headingId} className="mt-1 break-words text-base font-semibold text-foreground">
+            <h2
+              id={headingId}
+              className={`mt-1 break-words font-semibold text-foreground ${compact ? 'text-sm' : 'text-base'}`}
+            >
               Execution readiness
             </h2>
             <p className="mt-1 max-w-3xl break-words text-xs leading-5 text-muted-foreground">
-              Coordination, repository setup, and the execution baseline are independent gates. A
-              ready Project Agent Chat does not imply operational execution.
+              {compact
+                ? 'Three independent gates determine whether this Project can execute.'
+                : 'Coordination, repository setup, and the execution baseline are independent gates. A ready Project Agent Chat does not imply operational execution.'}
             </p>
           </div>
         </div>
 
-        <div className={`mt-4 grid min-w-0 ${contentSpacing} xl:grid-cols-3`}>
+        <ul
+          aria-label="Execution status gates"
+          className={`mt-4 grid min-w-0 ${contentSpacing} ${compact ? '' : 'xl:grid-cols-3'}`}
+        >
           <ReadinessRow
             label="Coordination"
             value={data.coordination_state}
             description={stateDescription('coordination', data.coordination_state)}
+            compact={compact}
           />
           <ReadinessRow
             label="Execution setup"
             value={data.execution_setup_state}
             description={stateDescription('setup', data.execution_setup_state)}
+            compact={compact}
           />
           <ReadinessRow
             label="Execution gate"
             value={data.execution_gate}
             description={stateDescription('gate', data.execution_gate)}
+            compact={compact}
           />
-        </div>
+        </ul>
 
         {data.execution_setup_state === 'provisioning' && provisioning ? (
           <div
@@ -904,7 +937,9 @@ export function ProjectExecutionSetupPanel({
                   {asNumber(provisioning.attempt_count)} of {asNumber(provisioning.max_attempts)}.
                   The Project is not executable until the server reports ready.
                 </p>
-                <dl className="mt-3 grid min-w-0 gap-x-4 gap-y-2 text-micro xl:grid-cols-2">
+                <dl
+                  className={`mt-3 grid min-w-0 gap-x-4 gap-y-2 text-micro ${compact ? '' : 'xl:grid-cols-2'}`}
+                >
                   <div className="min-w-0">
                     <dt className="font-mono uppercase tracking-[0.08em] text-muted-foreground">
                       Operation
@@ -985,6 +1020,7 @@ export function ProjectExecutionSetupPanel({
             repositoryMutation={repositoryMutation}
             retryMutation={retryMutation}
             onRefresh={() => void setupQuery.refetch()}
+            compact={compact}
           />
         </div>
       </Card>

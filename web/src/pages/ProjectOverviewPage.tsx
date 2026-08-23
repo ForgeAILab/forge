@@ -1465,11 +1465,9 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
 
       {setupRequired ? <ProjectCharterAdoptionBanner projectId={projectId} /> : null}
 
-      <ProjectExecutionSetupPanel projectId={projectId} />
-
       <div className="grid min-w-0 gap-5 xl:grid-cols-[minmax(0,1.45fr)_minmax(300px,0.75fr)]">
         <section
-          className="order-2 min-w-0 space-y-5 xl:order-1 xl:col-start-1"
+          className="order-3 min-w-0 space-y-5 xl:order-1 xl:col-start-1"
           aria-label="Project progress"
         >
           <div id="milestones" className="scroll-mt-24">
@@ -1537,18 +1535,21 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
           aria-label="Project Overview supporting information"
         >
           <div className="order-1 min-w-0 xl:order-none">
+            <ProjectExecutionSetupPanel projectId={projectId} compact />
+          </div>
+          <div className="order-2 min-w-0 xl:order-none">
             <NextActionCard projectId={projectId} nextAction={overview.next_action} />
           </div>
-          <div id="documents" className="order-3 min-w-0 scroll-mt-24 xl:order-none">
+          <div id="documents" className="order-4 min-w-0 scroll-mt-24 xl:order-none">
             <DocumentFreshnessPanel documents={overview.document_freshness} />
           </div>
-          <div id="decisions" className="order-4 min-w-0 scroll-mt-24 xl:order-none">
+          <div id="decisions" className="order-5 min-w-0 scroll-mt-24 xl:order-none">
             <DecisionsAndRisks overview={overview} />
           </div>
-          <div id="evidence" className="order-5 min-w-0 scroll-mt-24 xl:order-none">
+          <div id="evidence" className="order-6 min-w-0 scroll-mt-24 xl:order-none">
             <EvidenceGallery projectId={projectId} evidence={overview.evidence} />
           </div>
-          <div id="releases" className="order-6 min-w-0 scroll-mt-24 xl:order-none">
+          <div id="releases" className="order-7 min-w-0 scroll-mt-24 xl:order-none">
             <ReleaseHistory projectId={projectId} releases={overview.releases} />
           </div>
         </aside>

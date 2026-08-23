@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { render, screen, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { useReposQuery } from '@/api/hooks'
@@ -118,6 +118,17 @@ describe('ProjectExecutionSetupPanel', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mockPanel(baseSetup)
+  })
+
+  it('renders compact readiness as a vertical status list for a side rail', () => {
+    render(<ProjectExecutionSetupPanel projectId="project-1" compact />)
+
+    const statusList = screen.getByRole('list', { name: 'Execution status gates' })
+    expect(statusList.className).not.toContain('xl:grid-cols-3')
+    expect(within(statusList).getAllByRole('listitem')).toHaveLength(3)
+    expect(
+      screen.getByText('Three independent gates determine whether this Project can execute.'),
+    ).toBeTruthy()
   })
 
   it('offers exactly one create-Worker action when no eligible Worker exists', () => {

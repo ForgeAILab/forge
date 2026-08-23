@@ -36,7 +36,11 @@ vi.mock('@/api/hooks', () => ({
 }))
 
 vi.mock('@/features/project-execution/ProjectExecutionSetupPanel', () => ({
-  ProjectExecutionSetupPanel: () => null,
+  ProjectExecutionSetupPanel: ({ compact }: { compact?: boolean }) => (
+    <section data-testid="execution-readiness" data-compact={compact ? 'true' : 'false'}>
+      Execution readiness
+    </section>
+  ),
 }))
 
 const mediaFetch = vi.hoisted(() => vi.fn())
@@ -309,6 +313,13 @@ describe('ProjectOverviewPage', () => {
 
     expect(screen.getByRole('heading', { name: 'Forge Project' })).toBeTruthy()
     expect(screen.getByRole('heading', { name: 'Current outcome' })).toBeTruthy()
+    const supportingRail = screen.getByRole('complementary', {
+      name: 'Project Overview supporting information',
+    })
+    expect(within(supportingRail).getByTestId('execution-readiness')).toBeTruthy()
+    expect(
+      within(supportingRail).getByTestId('execution-readiness').getAttribute('data-compact'),
+    ).toBe('true')
     expect(screen.getByText('Primary milestone ID milestone-1')).toBeTruthy()
     expect(screen.getByText('Evidence coverage')).toBeTruthy()
     expect(screen.getByText('0/0 available')).toBeTruthy()
