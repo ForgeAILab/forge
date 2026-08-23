@@ -763,6 +763,15 @@ typed tools, and scope-derived workspaces. Forge does not depend on the sibling
 TUI and does not add a Smith-native backend; Smith remains an existing CLI Task
 executor/profile.
 
+Agent Runtime terminal limits retain their typed cause across the host boundary:
+`provider_attempts`, `tool_steps`, `time`, or `output`. These are distinct from
+the Task workflow's optional `max_turns` policy. Exhausted provider attempts on
+a native Task are classified as `ExecutorUnavailable`, use the ordinary
+provider cooldown when no retry hint survives the runtime boundary, and defer
+every execution role (including planner/reviewer) without consuming the Task's
+execution retry budget. Output, tool-step, and runtime-time limits remain Task
+execution failures and preserve their exact limit in the execution error.
+
 Lossless Context Memory continuity is keyed by `(identity_id, scope_type,
 scope_id)`, never by a replaceable runtime session. Main/Project Agent Chats
 use their own canonical timelines and native Task work uses a Task timeline.

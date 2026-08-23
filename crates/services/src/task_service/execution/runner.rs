@@ -1225,10 +1225,7 @@ impl TaskService {
                     "failed to block task after max turns exceeded"
                 );
             }
-        } else if updated.status == ExecutionStatus::Failed
-            && executor_unavailable
-            && should_block_task_for_failed_execution(&updated)
-        {
+        } else if updated.status == ExecutionStatus::Failed && executor_unavailable {
             let attempts = serde_json::Value::Array(
                 route_outcome
                     .attempts

@@ -23,6 +23,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Native Agent Runtime provider exhaustion is no longer reported as the
+  misleading `invalid operation: ... turn limit reached`. Forge now preserves
+  whether the runtime exhausted provider attempts, tool steps, elapsed time,
+  or output. Provider-attempt exhaustion is handled as executor unavailability
+  with a deferred retry that does not consume the Task retry budget, including
+  for planner and reviewer executions; the other runtime limits remain exact
+  execution failures. This is separate from the optional Task `max_turns`
+  policy.
+
 - The Main and Project Agents can see the shape of the payload they must send.
   The generic orchestration proposal tool declares `payload` as a plain object
   (provider function-calling APIs only reliably deliver flat schemas), and its

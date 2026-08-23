@@ -16,13 +16,13 @@ use std::{
 use async_trait::async_trait;
 use db::{AgentProfileRepo, AgentRepo, ExecutionRepo, ExecutionStatus, SqliteDb};
 use executors::{
-    ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError, LogKind, LogStream,
-    LogWriter, TaskExecutor, TokenUsage,
+    ExecutionContext, ExecutionFailureClass, ExecutionOutcome, ExecutionResult, ExecutorError,
+    LogKind, LogStream, LogWriter, TaskExecutor, TokenUsage,
 };
 use forge_agent_host::{
-    AgentSessionBackend, AgentTurnRequest, CanonicalScope, CanonicalScopeType,
-    NativeAgentRuntimeBackend, NativeProviderConfig, RuntimeContextManifestLink, TurnEventSink,
-    WorkspaceAccess,
+    AgentHostError, AgentSessionBackend, AgentTurnLimit, AgentTurnRequest, CanonicalScope,
+    CanonicalScopeType, NativeAgentRuntimeBackend, NativeProviderConfig,
+    RuntimeContextManifestLink, TurnEventSink, WorkspaceAccess,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
@@ -407,6 +407,9 @@ impl EmbeddedTaskExecutor {
                     status: ExecutionOutcome::Cancelled,
                     ..ExecutionResult::default()
                 });
+            }
+            Err(AgentHostError::TurnLimitReached { limit }) => {
+                return Ok(native_turn_limit_result(runtime_session_id, limit));
             }
             Err(error) => return Err(ServiceError::invalid_operation(error.to_string())),
         };
@@ -954,6 +957,26 @@ fn default_max_output_tokens() -> u32 {
     16_000
 }
 
+fn native_turn_limit_result(runtime_session_id: String, limit: AgentTurnLimit) -> ExecutionResult {
+    let provider_unavailable = limit == AgentTurnLimit::ProviderAttempts;
+    ExecutionResult {
+        status: ExecutionOutcome::Failed,
+        agent_session_id: Some(runtime_session_id),
+        error: Some(if provider_unavailable {
+            format!("provider unavailable after exhausting runtime retry attempts ({limit})")
+        } else {
+            format!("native runtime turn limit reached: {limit}")
+        }),
+        failure_class: Some(if provider_unavailable {
+            ExecutionFailureClass::ExecutorUnavailable
+        } else {
+            ExecutionFailureClass::TaskFailed
+        }),
+        retry_after: provider_unavailable.then_some(executors::DEFAULT_ACCOUNT_COOLDOWN),
+        ..ExecutionResult::default()
+    }
+}
+
 fn canonical_task_role(role: &str) -> Result<&'static str> {
     match role {
         "worker" | "coder" => Ok("worker"),
@@ -1110,6 +1133,45 @@ mod tests {
         });
         set_task_role_marker(&mut config, "coder");
         assert_eq!(config[TASK_ROLE_MARKER], "coder");
+    }
+
+    #[test]
+    fn provider_attempt_limit_is_executor_unavailability() {
+        let result = native_turn_limit_result(
+            "runtime-session".to_owned(),
+            AgentTurnLimit::ProviderAttempts,
+        );
+
+        assert_eq!(result.status, ExecutionOutcome::Failed);
+        assert_eq!(
+            result.failure_class,
+            Some(ExecutionFailureClass::ExecutorUnavailable)
+        );
+        assert_eq!(
+            result.retry_after,
+            Some(executors::DEFAULT_ACCOUNT_COOLDOWN)
+        );
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("provider_attempts"));
+    }
+
+    #[test]
+    fn output_limit_remains_a_task_execution_failure() {
+        let result = native_turn_limit_result("runtime-session".to_owned(), AgentTurnLimit::Output);
+
+        assert_eq!(result.status, ExecutionOutcome::Failed);
+        assert_eq!(
+            result.failure_class,
+            Some(ExecutionFailureClass::TaskFailed)
+        );
+        assert_eq!(result.retry_after, None);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("native runtime turn limit reached: output")
+        );
     }
 
     #[tokio::test]

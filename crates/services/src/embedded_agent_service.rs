@@ -2345,6 +2345,9 @@ fn redacted_host_error(error: forge_agent_host::AgentHostError) -> ServiceError 
         forge_agent_host::AgentHostError::Runtime(_) => {
             ServiceError::Domain("embedded runtime failed".to_owned())
         }
+        forge_agent_host::AgentHostError::TurnLimitReached { limit } => {
+            ServiceError::Domain(format!("embedded runtime {limit} limit reached"))
+        }
         // Structured outcomes are consumed in-band by Forge's typed native
         // tools. If one escapes to the session boundary, keep its model-facing
         // payload out of this generic service error path.

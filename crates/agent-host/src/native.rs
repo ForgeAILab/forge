@@ -333,8 +333,10 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             TurnFinish::Cancelled { .. } => {
                 return Err(AgentHostError::Runtime("turn cancelled".to_owned()));
             }
-            TurnFinish::LimitReached { .. } => {
-                return Err(AgentHostError::Runtime("turn limit reached".to_owned()));
+            TurnFinish::LimitReached { limit } => {
+                return Err(AgentHostError::TurnLimitReached {
+                    limit: limit.into(),
+                });
             }
             TurnFinish::Failed => {
                 return Err(AgentHostError::Runtime(match last_turn_error {

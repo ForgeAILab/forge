@@ -75,6 +75,28 @@ impl TaskExecutor for UncommittedWorktreeFailureExecutor {
     }
 }
 
+struct ExecutorUnavailableExecutor;
+
+#[async_trait]
+impl TaskExecutor for ExecutorUnavailableExecutor {
+    async fn execute(
+        &self,
+        _ctx: ExecutionContext,
+    ) -> std::result::Result<ExecutionResult, ExecutorError> {
+        Ok(ExecutionResult {
+            status: ExecutionOutcome::Failed,
+            error: Some("provider unavailable after exhausting runtime retry attempts".to_owned()),
+            failure_class: Some(executors::ExecutionFailureClass::ExecutorUnavailable),
+            retry_after: Some(std::time::Duration::from_secs(60)),
+            ..ExecutionResult::default()
+        })
+    }
+
+    async fn cancel(&self, _execution_id: &str) -> std::result::Result<(), ExecutorError> {
+        Ok(())
+    }
+}
+
 struct BurstLogExecutor {
     count: u64,
 }

@@ -1719,6 +1719,7 @@ impl CoordinationToolProvider {
             AgentHostError::VersionConflict => "version_conflict",
             AgentHostError::Unsupported(_) => "unsupported",
             AgentHostError::Runtime(_) => "runtime",
+            AgentHostError::TurnLimitReached { .. } => "turn_limit_reached",
             AgentHostError::ProtectedPersistence => "protected_persistence",
         };
         tracing::warn!(
@@ -1817,6 +1818,13 @@ impl CoordinationToolProvider {
                 outcome_scope(scope),
                 &correlation_id,
                 "the Forge operation could not complete",
+            ),
+            AgentHostError::TurnLimitReached { .. } => OrchestrationOutcome::failed(
+                OutcomeCode::TransientFailure,
+                operation,
+                outcome_scope(scope),
+                &correlation_id,
+                "the Forge operation reached a runtime limit; retry later",
             ),
             AgentHostError::ProtectedPersistence => OrchestrationOutcome::failed(
                 OutcomeCode::InternalFailure,

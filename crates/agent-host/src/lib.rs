@@ -71,6 +71,43 @@ pub use typed_tools::{
     TaskToolRole,
 };
 
+/// The concrete Agent Runtime guard that ended a provider-backed turn.
+///
+/// This is intentionally distinct from Forge's Task-level `max_turns`
+/// policy. A runtime turn can stop because provider retries, tool steps,
+/// elapsed time, or model output were exhausted even when the Task has no
+/// configured turn budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTurnLimit {
+    ProviderAttempts,
+    ToolSteps,
+    Time,
+    Output,
+}
+
+impl fmt::Display for AgentTurnLimit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ProviderAttempts => "provider_attempts",
+            Self::ToolSteps => "tool_steps",
+            Self::Time => "time",
+            Self::Output => "output",
+        })
+    }
+}
+
+impl From<agent_runtime::core::event::LimitKind> for AgentTurnLimit {
+    fn from(limit: agent_runtime::core::event::LimitKind) -> Self {
+        match limit {
+            agent_runtime::core::event::LimitKind::ProviderAttempts => Self::ProviderAttempts,
+            agent_runtime::core::event::LimitKind::ToolSteps => Self::ToolSteps,
+            agent_runtime::core::event::LimitKind::Time => Self::Time,
+            agent_runtime::core::event::LimitKind::Output => Self::Output,
+        }
+    }
+}
+
 /// The immutable revision Forge is built and tested against.
 pub const AGENT_RUNTIME_REVISION: &str = "b3f966b0e108e6d4683c0a9c94055aaa6aa7d919";
 pub const AGENT_RUNTIME_MINIMUM_RUST: &str = "1.86";
@@ -270,8 +307,33 @@ pub enum AgentHostError {
     /// into `RuntimeError` prose.
     #[error("structured Forge outcome")]
     StructuredOutcome(Box<api_types::OrchestrationOutcome>),
+    #[error("runtime turn limit reached: {limit}")]
+    TurnLimitReached { limit: AgentTurnLimit },
     #[error("runtime failed: {0}")]
     Runtime(String),
     #[error("protected persistence failed")]
     ProtectedPersistence,
+}
+
+#[cfg(test)]
+mod turn_limit_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_turn_limit_keeps_the_typed_guard() {
+        let error = AgentHostError::TurnLimitReached {
+            limit: AgentTurnLimit::ProviderAttempts,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "runtime turn limit reached: provider_attempts"
+        );
+        assert!(matches!(
+            error,
+            AgentHostError::TurnLimitReached {
+                limit: AgentTurnLimit::ProviderAttempts
+            }
+        ));
+    }
 }

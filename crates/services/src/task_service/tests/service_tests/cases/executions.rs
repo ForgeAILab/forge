@@ -187,6 +187,74 @@ async fn workflow_dispatched_commitless_completion_fails_and_schedules_retry() {
 }
 
 #[tokio::test]
+async fn reviewer_provider_unavailability_defers_without_consuming_task_retry_budget() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = service
+        .create_task(
+            project_id,
+            "Review after provider recovery",
+            Some("review the current worktree".to_owned()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("task creates");
+    let claimed = service
+        .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
+        .await
+        .expect("task claims");
+    sqlx::query("UPDATE execution SET role = 'reviewer' WHERE id = ?")
+        .bind(&claimed.execution.id)
+        .execute(db.pool())
+        .await
+        .expect("execution becomes reviewer-scoped");
+
+    let updated = service
+        .run_execution(claimed.execution.id.clone(), &ExecutorUnavailableExecutor)
+        .await
+        .expect("provider unavailability is persisted");
+
+    assert_eq!(updated.status, ExecutionStatus::Failed);
+    assert_eq!(updated.role, "reviewer");
+    assert!(updated
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("provider unavailable"));
+
+    let execution_after = ExecutionRepo::get_by_id(&*db, &claimed.execution.id)
+        .await
+        .expect("execution reloads")
+        .expect("execution exists");
+    assert_eq!(execution_after.resume_policy, Some(db::ResumePolicy::Auto));
+
+    let task_after = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    let metadata: serde_json::Value =
+        serde_json::from_str(task_after.metadata_json.as_deref().unwrap_or("{}"))
+            .expect("task metadata parses");
+    assert!(
+        metadata.get("deferred_dispatch").is_some(),
+        "reviewer execution should wait for provider recovery: {metadata}"
+    );
+    assert!(
+        metadata.get("execution_retry_count").is_none(),
+        "provider availability must not spend Task retry budget: {metadata}"
+    );
+    assert!(task_after.blocked_json.is_none());
+}
+
+#[tokio::test]
 async fn uncommitted_native_worker_failure_prompts_a_retry_and_preserves_the_diff() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
