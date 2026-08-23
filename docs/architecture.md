@@ -251,6 +251,16 @@ derives read models from those records. Authority is scoped by domain:
 | Outcome and release | milestone definition, `ReadinessSnapshot`, and immutable `Mxxx-rN` release manifest | Project Agent proposes; Forge evaluates; user alone releases |
 | Context and continuity | authorized `ContextManifest`, LCM timeline, and scoped memory references | Forge authorizes sources; Runtime stores continuity; neither chat nor memory can promote authority |
 
+On the native Project Agent baseline-authoring path, the model selects the
+governing Charter with `charter_revision.revision_id`. Forge reauthorizes that
+revision inside the bound Project and rehydrates `artifact_id`,
+`content_digest`, `render_version`, and `render_digest` from the immutable
+persisted revision before rendering the baseline. Those echo fields are not
+authority and are optional in the native tool contract. REST baseline commands
+retain strict exact-reference validation; a mismatch reports the individual
+field plus its expected and received values after Project ownership has been
+established.
+
 The Main Agent owns global discovery and portfolio routing only. It can draft a
 Genesis Charter and publish one bounded handoff, but it cannot manage a Project
 or revise its Charter after attachment. The Project Agent owns planning and

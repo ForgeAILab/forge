@@ -102,6 +102,19 @@ pub(crate) fn execution_baseline_artifact_ref_schema() -> Value {
     )
 }
 
+fn execution_baseline_charter_ref_schema() -> Value {
+    object_schema(
+        json!({
+            "artifact_id": {"type":"string","minLength":1,"description":"Omit. The server resolves the Charter id from revision_id."},
+            "revision_id": {"type":"string","minLength":1,"description":"The exact Project Charter revision to authorize and reference."},
+            "content_digest": {"type":"string","minLength":1,"description":"Omit. The server loads this from the persisted Charter revision."},
+            "render_version": {"type":"string","minLength":1,"description":"Omit. The server loads this from the persisted Charter revision."},
+            "render_digest": {"type":"string","minLength":1,"description":"Omit. The server loads this from the persisted Charter revision."},
+        }),
+        &["revision_id"],
+    )
+}
+
 pub(crate) fn revision_provenance_schema() -> Value {
     object_schema(
         json!({
@@ -295,14 +308,14 @@ pub(crate) fn execution_baseline_release_policy_schema() -> Value {
 pub(crate) fn execution_baseline_content_schema() -> Value {
     object_schema(
         json!({
-            "charter_revision": execution_baseline_artifact_ref_schema(),
+            "charter_revision": execution_baseline_charter_ref_schema(),
             "document_revisions": {"type":"array","items":execution_baseline_artifact_ref_schema()},
             "plan_item_ids": string_array_schema(),
             "milestone_ids": string_array_schema(),
             "milestone_definition_revision_ids": string_array_schema(),
             "primary_milestone_id": string_or_null_schema(),
             "release_policy_revision": {"type":"string","minLength":1},
-            "release_policy_digest": {"type":"string","minLength":1},
+            "release_policy_digest": {"type":"string","minLength":1,"description":"Omit. The server computes this from release_policy."},
             "release_policy": execution_baseline_release_policy_schema(),
             "acceptance_evidence_matrix": {"type":"array","items":object_schema(json!({
                 "id":{"type":"string","minLength":1},
@@ -333,7 +346,6 @@ pub(crate) fn execution_baseline_content_schema() -> Value {
             "milestone_ids",
             "milestone_definition_revision_ids",
             "release_policy_revision",
-            "release_policy_digest",
             "release_policy",
             "adaptive_envelope",
         ],
@@ -534,21 +546,17 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
                 "base_revision_id":string_or_null_schema(),
                 "expected_baseline_version":{"type":"integer","minimum":0,"description":"The baseline's current version from the Project current state; use 0 for a first REST/native draft and the current positive version when revising or proposing an existing baseline."},
                 "content":execution_baseline_content_schema(),
-                "render_version":{"type":"string","minLength":1},
-                "rendered_view":{"type":"string","minLength":1},
-                "content_digest":{"type":"string","minLength":1},
-                "render_digest":{"type":"string","minLength":1},
+                "render_version":{"type":"string","minLength":1,"description":"Omit. The server stamps its own render version."},
+                "rendered_view":{"type":"string","minLength":1,"description":"Omit. The server renders the canonical review target from content."},
+                "content_digest":{"type":"string","minLength":1,"description":"Omit. The server computes this from content."},
+                "render_digest":{"type":"string","minLength":1,"description":"Omit. The server computes this from its own render."},
                 "provenance":revision_provenance_schema()
             }),
-            &[
-                "action",
-                "content",
-                "render_version",
-                "rendered_view",
-                "content_digest",
-                "render_digest",
-                "provenance",
-            ],
+            // `rendered_view`/`render_version`/`content_digest`/`render_digest`
+            // stay optional for the same reason as the Charter draft: they are
+            // derived from `content`, and a model cannot reproduce the server
+            // renderer byte-for-byte or recompute its digests.
+            &["action", "content", "provenance"],
             "Project Agent may save a draft (draft_revision or revise) or propose a complete execution baseline for user approval (propose_approval). The shared command service validates exact Project-owned ArtifactRefs, versions, digests, milestones, policy, and reconciliation state. Approval and activation are user-only and never exposed here.",
         ),
         PROJECT_MILESTONE_OPERATION => object_schema(

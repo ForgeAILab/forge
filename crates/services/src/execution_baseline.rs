@@ -241,15 +241,22 @@ fn validate_literal_rules(
     required: bool,
 ) -> std::result::Result<(), String> {
     if required && values.is_empty() {
-        return Err(format!("release policy field '{field}' must not be empty"));
+        return Err(format!(
+            "release policy field '{field}' must not be empty; supported: {}",
+            supported.join(", ")
+        ));
     }
     let mut seen = HashSet::new();
     let mut previous: Option<&str> = None;
     for value in values {
         let trimmed = value.trim();
         if trimmed.is_empty() || trimmed != value || !supported.contains(&trimmed) {
+            // These are small closed vocabularies. Naming the offender without
+            // naming the alternatives leaves a caller guessing at a fixed list
+            // it cannot see, so the supported values travel with the error.
             return Err(format!(
-                "release policy field '{field}' contains unsupported rule '{value}'"
+                "release policy field '{field}' contains unsupported rule '{value}'; supported: {}",
+                supported.join(", ")
             ));
         }
         if !seen.insert(trimmed) {
@@ -1760,18 +1767,19 @@ async fn validate_artifact_ref_db(
     charter: bool,
     require_approved: bool,
 ) -> Result<()> {
-    if reference.artifact_id.trim().is_empty()
-        || reference.revision_id.trim().is_empty()
-        || reference.content_digest.trim().is_empty()
-        || reference
-            .render_version
-            .as_deref()
-            .is_none_or(str::is_empty)
-        || reference.render_digest.as_deref().is_none_or(str::is_empty)
-    {
-        return Err(ServiceError::invalid_operation(
-            "execution baseline ArtifactRef fields must be non-empty",
-        ));
+    let artifact_kind = if charter { "Charter" } else { "Document" };
+    for (field, value) in [
+        ("artifact_id", Some(reference.artifact_id.as_str())),
+        ("revision_id", Some(reference.revision_id.as_str())),
+        ("content_digest", Some(reference.content_digest.as_str())),
+        ("render_version", reference.render_version.as_deref()),
+        ("render_digest", reference.render_digest.as_deref()),
+    ] {
+        if value.is_none_or(str::is_empty) {
+            return Err(ServiceError::invalid_operation(format!(
+                "{artifact_kind} ArtifactRef {field} must be non-empty"
+            )));
+        }
     }
     let sql = if charter {
         "SELECT c.id AS artifact_id, r.content_digest, r.render_version,
@@ -1803,17 +1811,61 @@ async fn validate_artifact_ref_db(
     let render_version: String = row.try_get("render_version")?;
     let render_digest: String = row.try_get("rendered_digest")?;
     let lifecycle: String = row.try_get("lifecycle")?;
-    if artifact_id != reference.artifact_id
-        || content_digest != reference.content_digest
-        || reference.render_version.as_deref() != Some(render_version.as_str())
-        || reference.render_digest.as_deref() != Some(render_digest.as_str())
-        || (require_approved && lifecycle != "approved")
-    {
-        return Err(ServiceError::conflict(if charter {
-            "Charter ArtifactRef does not match its approved persisted revision"
-        } else {
-            "Document ArtifactRef does not match its approved persisted revision"
-        }));
+    let persisted = api_types::ArtifactRef {
+        artifact_id,
+        revision_id: reference.revision_id.clone(),
+        content_digest,
+        render_version: Some(render_version),
+        render_digest: Some(render_digest),
+    };
+    validate_persisted_artifact_ref(
+        reference,
+        artifact_kind,
+        &persisted,
+        &lifecycle,
+        require_approved,
+    )
+}
+
+fn validate_persisted_artifact_ref(
+    reference: &api_types::ArtifactRef,
+    artifact_kind: &str,
+    persisted: &api_types::ArtifactRef,
+    lifecycle: &str,
+    require_approved: bool,
+) -> Result<()> {
+    if require_approved && lifecycle != "approved" {
+        return Err(ServiceError::conflict(format!(
+            "{artifact_kind} revision lifecycle mismatch: expected \"approved\", got {lifecycle:?}"
+        )));
+    }
+    for (field, expected, received) in [
+        (
+            "artifact_id",
+            persisted.artifact_id.as_str(),
+            reference.artifact_id.as_str(),
+        ),
+        (
+            "content_digest",
+            persisted.content_digest.as_str(),
+            reference.content_digest.as_str(),
+        ),
+        (
+            "render_version",
+            persisted.render_version.as_deref().unwrap_or_default(),
+            reference.render_version.as_deref().unwrap_or_default(),
+        ),
+        (
+            "render_digest",
+            persisted.render_digest.as_deref().unwrap_or_default(),
+            reference.render_digest.as_deref().unwrap_or_default(),
+        ),
+    ] {
+        if expected != received {
+            return Err(ServiceError::conflict(format!(
+                "{artifact_kind} ArtifactRef {field} mismatch: expected {expected:?}, got {received:?}"
+            )));
+        }
     }
     Ok(())
 }
@@ -2042,5 +2094,28 @@ mod tests {
         assert!(validate_execution_baseline_policy(&duplicate)
             .expect_err("duplicate rule must fail closed")
             .contains("duplicate"));
+    }
+
+    #[test]
+    fn artifact_ref_mismatch_names_the_exact_field_and_values() {
+        let persisted = ArtifactRef {
+            artifact_id: "charter-quicklist".to_owned(),
+            revision_id: "charter-r1".to_owned(),
+            content_digest: "fda40eb7".to_owned(),
+            render_version: Some("forge.project-charter/v1".to_owned()),
+            render_digest: Some("d3e1bba0".to_owned()),
+        };
+        let mut received = persisted.clone();
+        received.render_version = Some("forge.charter-render/v1".to_owned());
+        let error =
+            validate_persisted_artifact_ref(&received, "Charter", &persisted, "approved", true)
+                .expect_err("the mismatched render version must fail closed");
+        let ServiceError::Conflict(message) = error else {
+            panic!("expected a conflict diagnostic")
+        };
+        assert_eq!(
+            message,
+            "Charter ArtifactRef render_version mismatch: expected \"forge.project-charter/v1\", got \"forge.charter-render/v1\""
+        );
     }
 }

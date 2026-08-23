@@ -41,7 +41,7 @@ use crate::{
         MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION,
         MAIN_CHARTER_READINESS_OPERATION, OperationExposure, OperationSurface,
         PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
-        operation_names_for_surface,
+        PROJECT_EXECUTION_BASELINE_OPERATION, operation_names_for_surface,
     },
     operation_contract::{
         coordination_payload_guidance, coordination_payload_properties,
@@ -1211,6 +1211,38 @@ impl Tool for ForgeScopeProposeTool {
                 payload.remove("render_version");
             }
         }
+        if operation == PROJECT_EXECUTION_BASELINE_OPERATION {
+            // Same reason as the Charter, plus the two digests: every one of
+            // these is derived from `content`, so a model-supplied copy only
+            // ever disagrees with the server's own render.
+            if let Some(payload) = arguments.get_mut("payload").and_then(Value::as_object_mut) {
+                payload.remove("rendered_view");
+                payload.remove("render_version");
+                payload.remove("content_digest");
+                payload.remove("render_digest");
+                // The policy digest is a hash of `content.release_policy`, which
+                // no model can compute; the server derives it.
+                if let Some(content) = payload.get_mut("content").and_then(Value::as_object_mut) {
+                    content.remove("release_policy_digest");
+                    // `revision_id` is the lookup key. The server reauthorizes
+                    // it in the bound Project and rehydrates every other
+                    // Charter ArtifactRef field from the persisted revision.
+                    if let Some(charter) = content
+                        .get_mut("charter_revision")
+                        .and_then(Value::as_object_mut)
+                    {
+                        for field in [
+                            "artifact_id",
+                            "content_digest",
+                            "render_version",
+                            "render_digest",
+                        ] {
+                            charter.remove(field);
+                        }
+                    }
+                }
+            }
+        }
         for field in ["dedupe_key", "correlation_id"] {
             if required_string(&arguments, field)?.trim().is_empty() {
                 return Err(RuntimeError::tool(format!("{field} cannot be empty")));
@@ -2301,6 +2333,21 @@ mod tests {
                     || payload["properties"]["action"].get("const").is_some()
             );
         }
+        let baseline = orchestration_payload_schema(PROJECT_EXECUTION_BASELINE_OPERATION);
+        let charter_ref = &baseline["properties"]["content"]["properties"]["charter_revision"];
+        assert_eq!(charter_ref["required"], json!(["revision_id"]));
+        let document_ref =
+            &baseline["properties"]["content"]["properties"]["document_revisions"]["items"];
+        assert_eq!(
+            document_ref["required"],
+            json!([
+                "artifact_id",
+                "revision_id",
+                "content_digest",
+                "render_version",
+                "render_digest"
+            ])
+        );
         let decision = orchestration_payload_schema(PROJECT_DECISION_OPERATION);
         assert_eq!(
             decision["properties"]["decision_class"]["const"],

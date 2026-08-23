@@ -11,8 +11,8 @@ use std::{collections::BTreeMap, sync::Arc};
 #[cfg(test)]
 use api_types::canonical_digest_with_schema;
 use api_types::{
-    CurrentVersionOrRevision, ExecutionBaselineContent, PrincipalKind, ProjectCharterContent,
-    ProjectDocumentContent, ProjectDocumentKind, RevisionProvenance,
+    ArtifactRef, CurrentVersionOrRevision, ExecutionBaselineContent, PrincipalKind,
+    ProjectCharterContent, ProjectDocumentContent, ProjectDocumentKind, RevisionProvenance,
 };
 use db::{
     new_uuid_v4, now_rfc3339, AgentAction, AgentActionExecution, AgentActionExecutionStatus,
@@ -1198,12 +1198,25 @@ impl ProjectOrchestrationActionService {
             )
         })?;
         let action_name = string(payload, "action")?;
-        let content: ExecutionBaselineContent = from_value(payload, "content")?;
+        let content = self
+            .native_execution_baseline_content(project_id, payload)
+            .await?;
         let provenance: RevisionProvenance = from_value(payload, "provenance")?;
-        let rendered_view = string(payload, "rendered_view")?;
-        let render_version = string(payload, "render_version")?;
-        let content_digest = string(payload, "content_digest")?;
-        let render_digest = string(payload, "render_digest")?;
+        // The review target is derived from `content`, never echoed by the
+        // agent. Requiring the model to reproduce the server renderer
+        // byte-for-byte and recompute both digests is a contract it cannot
+        // satisfy, and it failed every baseline the Project Agent authored.
+        // The REST route keeps its strict round-trip contract; here the
+        // server renders and stamps its own canonical values.
+        let render =
+            crate::execution_baseline::render_execution_baseline(&content).map_err(|error| {
+                ServiceError::invalid_operation(format!("render baseline: {error}"))
+            })?;
+        let rendered_view = render.rendered_view;
+        let render_version =
+            crate::execution_baseline::EXECUTION_BASELINE_RENDER_VERSION.to_owned();
+        let content_digest = render.content_digest;
+        let render_digest = render.render_digest;
         let authorization_action = match action_name.as_str() {
             "draft_revision" | "revise" => EXECUTION_BASELINE_SAVE_DRAFT_COMMAND,
             "propose_approval" => EXECUTION_BASELINE_PROPOSE_COMMAND,
@@ -1300,12 +1313,25 @@ impl ProjectOrchestrationActionService {
         context: &CommandContext,
     ) -> Result<Value> {
         let action_name = string(payload, "action")?;
-        let content: ExecutionBaselineContent = from_value(payload, "content")?;
+        let content = self
+            .native_execution_baseline_content(project_id, payload)
+            .await?;
         let provenance: RevisionProvenance = from_value(payload, "provenance")?;
-        let rendered_view = string(payload, "rendered_view")?;
-        let render_version = string(payload, "render_version")?;
-        let content_digest = string(payload, "content_digest")?;
-        let render_digest = string(payload, "render_digest")?;
+        // The review target is derived from `content`, never echoed by the
+        // agent. Requiring the model to reproduce the server renderer
+        // byte-for-byte and recompute both digests is a contract it cannot
+        // satisfy, and it failed every baseline the Project Agent authored.
+        // The REST route keeps its strict round-trip contract; here the
+        // server renders and stamps its own canonical values.
+        let render =
+            crate::execution_baseline::render_execution_baseline(&content).map_err(|error| {
+                ServiceError::invalid_operation(format!("render baseline: {error}"))
+            })?;
+        let rendered_view = render.rendered_view;
+        let render_version =
+            crate::execution_baseline::EXECUTION_BASELINE_RENDER_VERSION.to_owned();
+        let content_digest = render.content_digest;
+        let render_digest = render.render_digest;
         let authorization_action = match action_name.as_str() {
             "draft_revision" | "revise" => EXECUTION_BASELINE_SAVE_DRAFT_COMMAND,
             "propose_approval" => EXECUTION_BASELINE_PROPOSE_COMMAND,
@@ -1385,6 +1411,83 @@ impl ProjectOrchestrationActionService {
                 "serialize direct execution baseline outcome: {error}"
             ))
         })
+    }
+
+    /// Build the native baseline content from authoritative Project state.
+    /// The model selects a Charter revision by id; Forge authorizes that id in
+    /// the bound Project and supplies every digest/render echo from persistence
+    /// before the baseline itself is rendered. REST callers retain the strict
+    /// round-trip validation in `ExecutionBaselineCommandService`.
+    async fn native_execution_baseline_content(
+        &self,
+        project_id: &str,
+        payload: &Value,
+    ) -> Result<ExecutionBaselineContent> {
+        let mut content_value = payload
+            .get("content")
+            .cloned()
+            .ok_or_else(|| ServiceError::invalid_operation("content is required"))?;
+        let content_object = content_value.as_object_mut().ok_or_else(|| {
+            ServiceError::invalid_operation("execution baseline content must be an object")
+        })?;
+        let charter_revision_id = content_object
+            .get("charter_revision")
+            .and_then(Value::as_object)
+            .and_then(|reference| reference.get("revision_id"))
+            .and_then(Value::as_str)
+            .filter(|revision_id| !revision_id.trim().is_empty())
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "content.charter_revision.revision_id must be non-empty",
+                )
+            })?;
+        let charter_revision =
+            ProjectOrchestrationRepo::get_project_charter_revision(&*self.db, charter_revision_id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::conflict("Charter revision is not owned by this Project")
+                })?;
+        let charter =
+            ProjectOrchestrationRepo::get_project_charter(&*self.db, &charter_revision.charter_id)
+                .await?
+                .filter(|charter| charter.project_id.as_deref() == Some(project_id))
+                .ok_or_else(|| {
+                    ServiceError::conflict("Charter revision is not owned by this Project")
+                })?;
+        content_object.insert(
+            "charter_revision".to_owned(),
+            serde_json::to_value(ArtifactRef {
+                artifact_id: charter.id,
+                revision_id: charter_revision.id,
+                content_digest: charter_revision.content_digest,
+                render_version: Some(charter_revision.render_version),
+                render_digest: Some(charter_revision.rendered_digest),
+            })
+            .map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "serialize canonical Charter ArtifactRef: {error}"
+                ))
+            })?,
+        );
+
+        // The policy digest is a hash over the frozen release policy the caller
+        // just supplied. A model cannot compute a digest, so demanding it echo
+        // one made the baseline unauthorable. A placeholder keeps the typed
+        // shape intact through deserialization; the real value is derived below
+        // from the policy payload the server is about to validate.
+        content_object.insert(
+            "release_policy_digest".to_owned(),
+            Value::String("pending-server-derived".to_owned()),
+        );
+        let mut content: ExecutionBaselineContent =
+            serde_json::from_value(content_value).map_err(|error| {
+                ServiceError::invalid_operation(format!("invalid content: {error}"))
+            })?;
+        content.release_policy_digest =
+            crate::execution_baseline::release_policy_digest(&content.release_policy).map_err(
+                |error| ServiceError::invalid_operation(format!("release policy digest: {error}")),
+            )?;
+        Ok(content)
     }
 
     async fn materialize_milestone(
@@ -1960,7 +2063,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn action_baseline_materializer_persists_ordered_milestone_definition_manifest_v076() {
+    async fn action_baseline_materializer_rehydrates_charter_ref_and_persists_manifest_v076() {
         let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
         run_migrations(&pool).await.expect("fresh V076 schema");
         let db = SqliteDb::new(pool);
@@ -2103,12 +2206,56 @@ mod tests {
         .await
         .expect("milestone definition pointer");
 
-        let content = baseline_test_content(
+        let mut content = baseline_test_content(
             &charter_id,
             &charter_revision_id,
             "charter-content-digest",
             &milestone_id,
             &milestone_definition_revision_id,
+        );
+        content.charter_revision.artifact_id = "invented-charter".to_owned();
+        content.charter_revision.content_digest = "invented-content-digest".to_owned();
+        content.charter_revision.render_version = Some("forge.charter-render/v1".to_owned());
+        content.charter_revision.render_digest = Some("invented-render-digest".to_owned());
+        let mut native_payload = json!({"content": content});
+        let action_service = ProjectOrchestrationActionService::new(Arc::new(db.clone()));
+        let content = action_service
+            .native_execution_baseline_content(&project_id, &native_payload)
+            .await
+            .expect("native content rehydrates the persisted Charter revision");
+        assert_eq!(content.charter_revision.artifact_id, charter_id);
+        assert_eq!(
+            content.charter_revision.content_digest,
+            "charter-content-digest"
+        );
+        assert_eq!(
+            content.charter_revision.render_version.as_deref(),
+            Some("charter-render-v1")
+        );
+        assert_eq!(
+            content.charter_revision.render_digest.as_deref(),
+            Some("charter-render-digest")
+        );
+        // The native provider adapter removes these redundant echoes entirely;
+        // the service accepts that exact shape as long as revision_id remains.
+        for field in [
+            "artifact_id",
+            "content_digest",
+            "render_version",
+            "render_digest",
+        ] {
+            native_payload["content"]["charter_revision"]
+                .as_object_mut()
+                .expect("Charter ref object")
+                .remove(field);
+        }
+        let content_without_echoes = action_service
+            .native_execution_baseline_content(&project_id, &native_payload)
+            .await
+            .expect("revision_id alone resolves the canonical Charter ref");
+        assert_eq!(
+            content_without_echoes.charter_revision,
+            content.charter_revision
         );
         let expected_release_policy_digest = content.release_policy_digest.clone();
         let expected_release_policy =

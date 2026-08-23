@@ -2573,6 +2573,20 @@ fn service_error(error: crate::ServiceError) -> AgentHostError {
         outcome.retry = Some(RetryInstruction::new(RetryAction::CorrectInput, false));
         return AgentHostError::StructuredOutcome(Box::new(outcome));
     }
+    // A conflict's prose is the only account of what the caller got wrong, so
+    // it is shown. It stays unstructured on purpose: read it, never parse it
+    // to infer version or digest semantics.
+    if let crate::ServiceError::Conflict(message) = &error {
+        let mut outcome = OrchestrationOutcome::failed(
+            OutcomeCode::ValidationError,
+            "unknown",
+            OutcomeScopeRef::new(OutcomeScopeType::Account, ""),
+            "",
+            format!("the command could not be accepted; correct the typed input ({message})"),
+        );
+        outcome.retry = Some(RetryInstruction::new(RetryAction::CorrectInput, false));
+        return AgentHostError::StructuredOutcome(Box::new(outcome));
+    }
     let (code, safe_message, setup_requirement, retry) = match error {
         crate::ServiceError::NotFound { .. } | crate::ServiceError::Db(db::DbError::NotFound) => (
             OutcomeCode::NotFound,
@@ -2747,7 +2761,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generic_conflicts_are_typed_and_redacted() {
+    fn generic_conflicts_are_typed_and_keep_the_actionable_reason() {
         let error = service_error(crate::ServiceError::Conflict(
             "send expected_charter_version = 2".to_owned(),
         ));
@@ -2755,7 +2769,8 @@ mod tests {
             AgentHostError::StructuredOutcome(outcome) => {
                 assert_eq!(outcome.code, OutcomeCode::ValidationError);
                 assert_eq!(outcome.status, OutcomeStatus::Failed);
-                assert!(!outcome.safe_message.contains("expected_charter_version"));
+                assert!(outcome.safe_message.contains("expected_charter_version"));
+                assert!(outcome.safe_message.contains("correct the typed input"));
             }
             other => panic!("conflict must be structured, got {other:?}"),
         }
