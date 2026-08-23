@@ -605,7 +605,8 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
                 "plan_item_id":string_or_null_schema(),
                 "milestone_id":string_or_null_schema(),
                 "capability_class":string_or_null_schema(),
-                "risk_class":string_or_null_schema()
+                "risk_class":string_or_null_schema(),
+                "depends_on_task_ids":string_array_schema()
             }),
             &["action", "title"],
             "Create one Task proposal in the authenticated Project scope. The server binds the active baseline, milestone, permissions, and runnable Task state.",
@@ -901,6 +902,8 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
             "\"repository_read\", \"repository_write\", \"read_only\", \"discovery_read\", ",
             "\"planning_read\" — and, when the baseline declares allowed classes, also one of ",
             "those); risk_class (only when the baseline declares allowed classes). ",
+            "depends_on_task_ids (optional accepted Task ids in this Project; each prerequisite ",
+            "must reach done before this Task can dispatch). ",
             "Forge binds the Task to the Project's active user-approved baseline revision ",
             "itself; never echo baseline ids or digests.",
         ));
@@ -978,6 +981,11 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
         "risk_class": {
             "type": ["string", "null"],
             "description": "task.propose: optional; only when the baseline declares allowed risk classes."
+        },
+        "depends_on_task_ids": {
+            "type": ["array", "null"],
+            "items": {"type": "string", "minLength": 1},
+            "description": "task.propose: optional accepted Task ids in this Project; every prerequisite must reach done before dispatch. Use this for implementation-before-verification ordering instead of narration."
         }
     });
     if operations.contains(TASK_ADAPTIVE_OPERATION) {

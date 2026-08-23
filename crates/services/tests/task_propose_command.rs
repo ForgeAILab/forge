@@ -52,6 +52,16 @@ struct Fixture {
     action_service: AgentActionService,
 }
 
+type GovernanceTraceabilityRow = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+);
+
 async fn database() -> Arc<SqliteDb> {
     let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
     run_migrations(&pool).await.expect("migrations");
@@ -286,9 +296,9 @@ async fn seed_active_baseline(db: &SqliteDb, project_id: &str) {
           risk_classes_json, adaptive_envelope_json, elevated_operations_json,
           exclusions_json, rollback_recovery_json, schema_version, render_version,
           rendered_view, content_digest, rendered_digest, source_refs_json, created_at)
-        VALUES (?, ?, 1, 0, NULL, 'approved', ?, '[]', '[\"plan-1\"]',
+        VALUES (?, ?, 1, 0, NULL, 'approved', ?, '[]', '[\"plan-1\",\"plan-2\"]',
                  ?, '[\"{}\"]', '[\"{}\"]', ?, '{{}}', 'policy-1',
-                 'policy-digest', '[]', '[\"repository_write\"]', '[\"low\"]',
+                 'policy-digest', '[]', '[\"repository_write\",\"repository_read\"]', '[\"low\"]',
                  '{{\"allowed_task_operations\":[\"split\",\"sequence\",\"replace\"],\"fixed_outcomes\":[],\"fixed_acceptance\":[],\"fixed_risk_classes\":[\"low\"],\"forbidden_side_effects\":[],\"elevated_operations\":[]}}', '[]', '[]', '{{}}', 'baseline@1', 'baseline-render@1',
                  '# Baseline', 'baseline-content', 'baseline-rendered', '[]', ?)",
         MILESTONE_ID, MILESTONE_REVISION_ID,
@@ -391,6 +401,7 @@ fn payload(_project_id: &str, title: &str, task_type: &str, baseline_governed: b
         "merge_config": null,
         "role_assignments": null,
         "governance": null,
+        "depends_on_task_ids": [],
     });
     if baseline_governed {
         value["plan_item_id"] = Value::String("plan-1".to_owned());
@@ -644,6 +655,169 @@ async fn task_proposal_commits_one_atomic_bundle_and_replays_frozen_task() {
     );
     assert_eq!(
         count(&fixture.db, "SELECT COUNT(*) FROM agent_action_execution").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn active_baseline_read_only_task_retains_traceability_and_dependencies() {
+    let fixture = fixture().await;
+    let implementation_payload = payload(
+        BASELINE_PROJECT_ID,
+        "Implement the approved outcome",
+        "task",
+        true,
+    );
+    let implementation_action = action(
+        &fixture.db,
+        "task-command-readonly-prerequisite",
+        AGENT_ID,
+        BASELINE_PROJECT_ID,
+        &implementation_payload,
+    )
+    .await;
+    let implementation = propose(
+        &fixture,
+        implementation_action.id,
+        implementation_action.version,
+        "task-command-readonly-prerequisite-key",
+    )
+    .await
+    .expect("implementation prerequisite");
+
+    let mut verification_payload = payload(
+        BASELINE_PROJECT_ID,
+        "Verify the approved outcome",
+        "task",
+        true,
+    );
+    verification_payload["plan_item_id"] = Value::String("plan-2".to_owned());
+    verification_payload["capability_class"] = Value::String("repository_read".to_owned());
+    verification_payload["depends_on_task_ids"] = json!([implementation.task.id.clone()]);
+    let verification_action = action(
+        &fixture.db,
+        "task-command-readonly-verification",
+        AGENT_ID,
+        BASELINE_PROJECT_ID,
+        &verification_payload,
+    )
+    .await;
+    let verification = propose(
+        &fixture,
+        verification_action.id,
+        verification_action.version,
+        "task-command-readonly-verification-key",
+    )
+    .await
+    .expect("read-only verification proposal");
+
+    let governance: GovernanceTraceabilityRow = sqlx::query_as(
+        "SELECT baseline_id, baseline_revision_id, plan_item_id, milestone_id,
+                capability_class, risk_class, runnable
+         FROM project_task_governance WHERE task_id = ?",
+    )
+    .bind(&verification.task.id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("read-only verification governance");
+    assert_eq!(governance.0.as_deref(), Some(BASELINE_ID));
+    assert_eq!(governance.1.as_deref(), Some(BASELINE_REVISION_ID));
+    assert_eq!(governance.2.as_deref(), Some("plan-2"));
+    assert_eq!(governance.3.as_deref(), Some(MILESTONE_ID));
+    assert_eq!(governance.4.as_deref(), Some("repository_read"));
+    assert_eq!(governance.5.as_deref(), Some("low"));
+    assert_eq!(
+        governance.6, 1,
+        "an active approved baseline makes governed read-only verification runnable"
+    );
+
+    let dependencies: Vec<String> = sqlx::query_scalar(
+        "SELECT depends_on_id FROM task_dependency WHERE task_id = ? ORDER BY depends_on_id",
+    )
+    .bind(&verification.task.id)
+    .fetch_all(fixture.db.pool())
+    .await
+    .expect("verification dependencies");
+    assert_eq!(dependencies, vec![implementation.task.id]);
+}
+
+#[tokio::test]
+async fn task_proposal_receipt_failure_rolls_back_prerequisite_links() {
+    let fixture = fixture().await;
+    let prerequisite_payload = payload(
+        BASELINE_PROJECT_ID,
+        "Implement before verification",
+        "task",
+        true,
+    );
+    let prerequisite_action = action(
+        &fixture.db,
+        "task-command-dependency-rollback-prerequisite",
+        AGENT_ID,
+        BASELINE_PROJECT_ID,
+        &prerequisite_payload,
+    )
+    .await;
+    let prerequisite = propose(
+        &fixture,
+        prerequisite_action.id,
+        prerequisite_action.version,
+        "task-command-dependency-rollback-prerequisite-key",
+    )
+    .await
+    .expect("dependency rollback prerequisite");
+
+    let mut dependent_payload = payload(
+        BASELINE_PROJECT_ID,
+        "Verify after implementation",
+        "task",
+        true,
+    );
+    dependent_payload["plan_item_id"] = Value::String("plan-2".to_owned());
+    dependent_payload["capability_class"] = Value::String("repository_read".to_owned());
+    dependent_payload["depends_on_task_ids"] = json!([prerequisite.task.id]);
+    let dependent_action = action(
+        &fixture.db,
+        "task-command-dependency-rollback-dependent",
+        AGENT_ID,
+        BASELINE_PROJECT_ID,
+        &dependent_payload,
+    )
+    .await;
+    sqlx::query(
+        "CREATE TEMP TRIGGER task_dependency_receipt_failpoint
+         BEFORE INSERT ON command_receipt
+         BEGIN SELECT RAISE(ABORT, 'task dependency receipt failpoint'); END",
+    )
+    .execute(fixture.db.pool())
+    .await
+    .expect("dependency receipt failpoint");
+
+    let failed = propose(
+        &fixture,
+        dependent_action.id,
+        dependent_action.version,
+        "task-command-dependency-rollback-dependent-key",
+    )
+    .await
+    .expect_err("receipt failure must roll back the dependent Task");
+    assert!(failed.to_string().contains("failpoint"));
+    assert_eq!(count(&fixture.db, "SELECT COUNT(*) FROM task").await, 1);
+    assert_eq!(
+        count(&fixture.db, "SELECT COUNT(*) FROM task_dependency").await,
+        0,
+        "the prerequisite link must roll back with the Task and receipt"
+    );
+    assert_eq!(
+        count(&fixture.db, "SELECT COUNT(*) FROM project_task_governance").await,
+        1
+    );
+    assert_eq!(
+        count(
+            &fixture.db,
+            "SELECT COUNT(*) FROM command_receipt WHERE operation = 'task.propose'",
+        )
+        .await,
         1
     );
 }

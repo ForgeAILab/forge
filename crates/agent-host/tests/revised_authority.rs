@@ -400,6 +400,7 @@ fn task_proposal_schema_declares_plan_item_binding_explicitly() {
             "milestone_id",
             "capability_class",
             "risk_class",
+            "depends_on_task_ids",
         ] {
             assert!(
                 properties.contains_key(field),

@@ -661,9 +661,16 @@ Charter-backed Project without an explicit governance envelope are bound
 server-side to the active user-approved execution baseline; the proposal
 payload carries only `plan_item_id` (required for implementation Tasks),
 optional `milestone_id` (defaults to the baseline's primary milestone), and
-optional capability/risk classes. Task proposal execution commits the Task,
-governance projection, durable `task.created` event, and command receipt in one
-transaction; an exact response-loss replay returns the frozen Task snapshot.
+optional capability/risk classes. A proposal that names a plan item or
+milestone retains that exact baseline traceability even when its capability is
+read-only (for example, an independent verification Task); those references
+are never discarded merely because the Task does not mutate the repository.
+Optional `depends_on_task_ids` are re-authorized as accepted Tasks in the same
+Project and inserted in the same transaction, so implementation → verification
+ordering is scheduler-enforced rather than narration-only. Task proposal
+execution commits the Task, governance projection, prerequisite links, durable
+`task.created` event, and command receipt in one transaction; an exact
+response-loss replay returns the frozen Task snapshot.
 A ReadyOnly Project Agent may likewise invoke the native `task.adaptive`
 Coordination operation in the bound Project or its Project Agent Chat. The
 adapter accepts only the closed `split`, `sequence`, and `replace` payloads

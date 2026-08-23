@@ -1463,16 +1463,17 @@ pub struct CreateProjectTaskGovernance {
 }
 
 /// Atomic Task proposal composite.  The Task row, optional immutable
-/// governance projection, explicit/default role assignments, durable
-/// `task.created` event, command receipt, and optional AgentAction execution
-/// are committed by one SQLite transaction.  The command receipt is optional
-/// only for repository-level characterization callers; the service command
-/// always supplies it.
+/// governance projection, prerequisite dependencies, explicit/default role
+/// assignments, durable `task.created` event, command receipt, and optional
+/// AgentAction execution are committed by one SQLite transaction. The command
+/// receipt is optional only for repository-level characterization callers;
+/// the service command always supplies it.
 #[derive(Debug, Clone)]
 pub struct CreateTaskProposalCommand {
     pub task: CreateTask,
     pub governance: Option<CreateProjectTaskGovernance>,
     pub role_assignments: Vec<CreateTaskRoleAssignment>,
+    pub depends_on_task_ids: Vec<String>,
     pub metadata_json: Option<String>,
     /// Present only for an approval/audit-backed execution. Directly allowed
     /// commands intentionally leave these unset and therefore cannot create

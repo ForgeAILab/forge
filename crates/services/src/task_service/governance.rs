@@ -706,15 +706,18 @@ impl TaskService {
                     "repository implementation Tasks require a Project milestone provenance",
                 ));
             }
+        } else if requested.plan_item_id.is_some() || requested.milestone_id.is_some() {
+            // Plan-item and milestone identities belong to an exact approved
+            // baseline regardless of whether execution is read-only or
+            // mutating. Never silently retain or discard those references on
+            // an unbound Task.
+            return Err(ServiceError::invalid_operation(
+                "Task plan_item_id and milestone_id require an active execution baseline",
+            ));
         } else if implementation {
             // This is a valid planning record before baseline approval, but it
             // is intentionally never runnable/write-capable. Only the
             // server-selected read-only profile may receive a discovery lease.
-            if requested.plan_item_id.is_some() || requested.milestone_id.is_some() {
-                return Err(ServiceError::invalid_operation(
-                    "pre-baseline implementation plans cannot claim baseline or milestone authority",
-                ));
-            }
         }
 
         if repository_capable

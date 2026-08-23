@@ -604,18 +604,22 @@ idempotent by action/idempotency key.
 
 `task.propose` is available through the typed Task proposal endpoint. An
 automatically admitted request invokes one atomic `TaskService` command: the
-Task, derived governance projection, durable `task.created` event, and direct
-command receipt become visible together. It does not create an `AgentAction` or
-`AgentActionExecution`; the receipt principal is the authenticated user while
-the selected Project Agent remains the source actor. A response-loss retry
-with the same canonical input returns the frozen original Task; reusing the
-key with changed input or principal is an idempotency conflict. A denied or
-invalid proposal is never listed as a Task. The exact closed proposal payload
-is validated before the command runs. For a Charter-backed Project, an omitted
-governance object is derived from the current Charter: implementation Tasks
-remain non-runnable until a matching baseline activates them, while
-pre-baseline `planning_task` and `discovery` claims are restricted to the
-read-only lane.
+Task, derived governance projection, prerequisite dependency links, durable
+`task.created` event, and direct command receipt become visible together. It
+does not create an `AgentAction` or `AgentActionExecution`; the receipt
+principal is the authenticated user while the selected Project Agent remains
+the source actor. A response-loss retry with the same canonical input returns
+the frozen original Task; reusing the key with changed input or principal is an
+idempotency conflict. A denied or invalid proposal is never listed as a Task.
+The exact closed proposal payload is validated before the command runs. For a
+Charter-backed Project, an omitted governance object is derived from the
+current Charter: implementation Tasks remain non-runnable until a matching
+baseline activates them, while pre-baseline `planning_task` and `discovery`
+claims are restricted to the read-only lane. A proposal that supplies
+`plan_item_id` or `milestone_id` binds those references to the active baseline
+even when `capability_class` is read-only. Optional
+`depends_on_task_ids` must name accepted, non-cancelled Tasks in the same
+Project and every prerequisite must reach `done` before dispatch.
 `task_type`, when present, is the same closed enum as normal
 Task creation: `task`, `planning_task`, `sub_task`, or `discovery`; unknown
 values are rejected before the command is admitted. Terminal Task delivery,

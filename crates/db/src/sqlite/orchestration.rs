@@ -1519,6 +1519,40 @@ impl ProjectOrchestrationRepo for SqliteDb {
         )
         .await?;
 
+        // Dependencies are part of the proposal's authoritative acceptance,
+        // not a best-effort follow-up. Re-authorize every prerequisite while
+        // holding the same writer lock that will insert the Task and receipt.
+        // The Task id is server-minted and not yet present, so a dependency
+        // cycle cannot point back to it; duplicates are rejected explicitly.
+        let mut seen_dependency_ids = std::collections::HashSet::new();
+        for depends_on_task_id in &input.depends_on_task_ids {
+            if depends_on_task_id.trim().is_empty()
+                || depends_on_task_id.trim() != depends_on_task_id
+                || !seen_dependency_ids.insert(depends_on_task_id.as_str())
+            {
+                return Err(DbError::Check(
+                    "Task dependency ids must be non-empty and unique".to_owned(),
+                ));
+            }
+            let prerequisite = sqlx::query(
+                "SELECT project_id, status, deleted_at
+                 FROM task WHERE id = ? LIMIT 1",
+            )
+            .bind(depends_on_task_id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(DbError::NotFound)?;
+            let prerequisite_project_id: String = prerequisite.try_get("project_id")?;
+            let prerequisite_status: String = prerequisite.try_get("status")?;
+            let prerequisite_deleted_at: Option<String> = prerequisite.try_get("deleted_at")?;
+            if prerequisite_project_id != input.task.project_id
+                || prerequisite_deleted_at.is_some()
+                || prerequisite_status == "cancelled"
+            {
+                return Err(DbError::InvalidTransition);
+            }
+        }
+
         // The plan item is a Project-local singleton among non-cancelled
         // Tasks.  This check is inside the same transaction as the insert;
         // the old native read-before-create guard is intentionally not an
@@ -1630,6 +1664,18 @@ impl ProjectOrchestrationRepo for SqliteDb {
         if let Some(governance) = input.governance {
             super::task_adaptive::insert_task_governance_in_tx(&mut transaction, &governance)
                 .await?;
+        }
+        for depends_on_task_id in &input.depends_on_task_ids {
+            sqlx::query(
+                "INSERT INTO task_dependency (task_id, depends_on_id, created_at)
+                 VALUES (?, ?, ?)",
+            )
+            .bind(&task.id)
+            .bind(depends_on_task_id)
+            .bind(&task.created_at)
+            .execute(&mut *transaction)
+            .await
+            .map_err(orchestration_write_error)?;
         }
         for assignment in &input.role_assignments {
             sqlx::query(

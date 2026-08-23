@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+use std::collections::HashSet;
 use std::str::FromStr;
 
 pub const TASK_PROPOSE_COMMAND: &str = "task.propose";
@@ -51,6 +52,11 @@ pub struct TaskProposalPayload {
     pub capability_class: Option<String>,
     #[serde(default)]
     pub risk_class: Option<String>,
+    /// Accepted prerequisite Tasks that must reach `done` before this Task
+    /// can be dispatched. The command persists these links atomically with
+    /// the Task so ordering is canonical rather than narration-only.
+    #[serde(default)]
+    pub depends_on_task_ids: Vec<String>,
 }
 
 /// Transport-neutral input for an automatically allowed Project Agent
@@ -344,6 +350,34 @@ impl TaskService {
         } else {
             None
         };
+        let mut seen_dependency_ids = HashSet::new();
+        for depends_on_task_id in &payload.depends_on_task_ids {
+            if depends_on_task_id.trim().is_empty()
+                || depends_on_task_id.trim() != depends_on_task_id
+            {
+                return Err(ServiceError::invalid_operation(
+                    "Task dependency ids must be non-empty canonical ids",
+                ));
+            }
+            if !seen_dependency_ids.insert(depends_on_task_id.as_str()) {
+                return Err(ServiceError::invalid_operation(
+                    "Task dependency ids must be unique",
+                ));
+            }
+            let prerequisite = TaskRepo::get_by_id(&*self.db, depends_on_task_id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", depends_on_task_id.to_owned()))?;
+            if prerequisite.project_id != project_id {
+                return Err(ServiceError::invalid_operation(
+                    "Task dependencies must belong to the same Project",
+                ));
+            }
+            if prerequisite.status == "cancelled" {
+                return Err(ServiceError::invalid_operation(
+                    "Task dependencies cannot reference a cancelled Task",
+                ));
+            }
+        }
         let repo_id = parent
             .as_ref()
             .map(|task| task.repo_id.clone())
@@ -526,6 +560,7 @@ impl TaskService {
                 },
                 governance,
                 role_assignments,
+                depends_on_task_ids: payload.depends_on_task_ids.clone(),
                 metadata_json,
                 source_action_id: (!action.id.trim().is_empty()).then(|| action.id.clone()),
                 expected_action_version: (!action.id.trim().is_empty())
@@ -779,15 +814,20 @@ impl TaskService {
         payload: &TaskProposalPayload,
         task_type: &str,
     ) -> Result<Option<api_types::TaskGovernanceRequest>> {
-        // Planning/discovery Tasks remain valid pre-existing read-only plans
-        // even while a baseline is active. Implementation intent, however,
-        // must resolve the active baseline before governance validation so a
-        // missing plan_item_id cannot silently fall through as an ungoverned
-        // Task. Explicit read-only capability likewise remains outside this
-        // implementation-only derivation path.
-        if !classify_task_execution(task_type, payload.capability_class.as_deref())?
-            .requires_baseline()
-        {
+        // A read-only planning/discovery Task with no baseline references may
+        // still use the explicit pre-baseline lane. Once the proposal names a
+        // plan item or milestone, however, that traceability must be retained
+        // even when the selected capability is read-only. Otherwise a valid
+        // verification Task is materialized as an ungoverned placeholder and
+        // can never pass the repository runnable gate.
+        let execution_class =
+            classify_task_execution(task_type, payload.capability_class.as_deref())?;
+        let requests_baseline_traceability =
+            payload.plan_item_id.is_some() || payload.milestone_id.is_some();
+        let has_governance_shorthand = requests_baseline_traceability
+            || payload.capability_class.is_some()
+            || payload.risk_class.is_some();
+        if !execution_class.requires_baseline() && !has_governance_shorthand {
             return Ok(None);
         }
         let charter_revision_id: Option<String> = sqlx::query_scalar(
@@ -802,31 +842,37 @@ impl TaskService {
         let Some(charter_revision_id) = charter_revision_id else {
             return Ok(None);
         };
-        let row = sqlx::query(
-            "SELECT b.id, b.current_revision_id, r.primary_milestone_id
+        let row = if execution_class.requires_baseline() || requests_baseline_traceability {
+            sqlx::query(
+                "SELECT b.id, b.current_revision_id, r.primary_milestone_id
              FROM project_execution_baseline b
              JOIN project_execution_baseline_revision r
                ON r.id = b.current_revision_id AND r.baseline_id = b.id
              WHERE b.project_id = ? AND b.lifecycle = 'active'
                AND r.lifecycle = 'approved'
              ORDER BY b.updated_at DESC, b.id DESC LIMIT 1",
-        )
-        .bind(project_id)
-        .fetch_optional(self.db.pool())
-        .await?;
-        let Some(row) = row else {
-            return Ok(None);
+            )
+            .bind(project_id)
+            .fetch_optional(self.db.pool())
+            .await?
+        } else {
+            None
         };
-        let baseline_id: String = row.try_get("id")?;
-        let baseline_revision_id: Option<String> = row.try_get("current_revision_id")?;
-        let primary_milestone_id: Option<String> = row.try_get("primary_milestone_id")?;
-        let Some(baseline_revision_id) = baseline_revision_id else {
-            return Ok(None);
-        };
+        let baseline_id = row.as_ref().map(|row| row.try_get("id")).transpose()?;
+        let baseline_revision_id = row
+            .as_ref()
+            .map(|row| row.try_get::<Option<String>, _>("current_revision_id"))
+            .transpose()?
+            .flatten();
+        let primary_milestone_id = row
+            .as_ref()
+            .map(|row| row.try_get::<Option<String>, _>("primary_milestone_id"))
+            .transpose()?
+            .flatten();
         Ok(Some(api_types::TaskGovernanceRequest {
             charter_revision_id: Some(charter_revision_id),
-            baseline_id: Some(baseline_id),
-            baseline_revision_id: Some(baseline_revision_id),
+            baseline_id,
+            baseline_revision_id,
             plan_item_id: payload.plan_item_id.clone(),
             milestone_id: payload.milestone_id.clone().or(primary_milestone_id),
             document_revision_ids: Vec::new(),
