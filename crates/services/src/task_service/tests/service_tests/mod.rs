@@ -60,7 +60,12 @@ impl TaskExecutor for UncommittedWorktreeFailureExecutor {
                 .await
                 .ok(),
             agent_session_id: Some("native-task-session".to_owned()),
-            error: Some(crate::embedded_task_executor::UNCOMMITTED_WORKTREE_FAILURE.to_owned()),
+            error: Some(
+                ExecutorError::Other(
+                    crate::embedded_task_executor::UNCOMMITTED_WORKTREE_FAILURE.to_owned(),
+                )
+                .to_string(),
+            ),
             ..Default::default()
         })
     }

@@ -231,11 +231,12 @@ async fn uncommitted_native_worker_failure_prompts_a_retry_and_preserves_the_dif
         .await
         .expect("execution failure is persisted");
 
+    let expected_error = ExecutorError::Other(
+        crate::embedded_task_executor::UNCOMMITTED_WORKTREE_FAILURE.to_owned(),
+    )
+    .to_string();
     assert_eq!(updated.status, ExecutionStatus::Failed);
-    assert_eq!(
-        updated.error.as_deref(),
-        Some(crate::embedded_task_executor::UNCOMMITTED_WORKTREE_FAILURE)
-    );
+    assert_eq!(updated.error.as_deref(), Some(expected_error.as_str()));
     assert!(std::path::Path::new(&workspace.worktree_path)
         .join("uncommitted.txt")
         .exists());
