@@ -86,6 +86,10 @@ async fn database() -> Arc<SqliteDb> {
 }
 
 async fn fixture() -> Arc<SqliteDb> {
+    fixture_with_acceptance_matrix("[]").await
+}
+
+async fn fixture_with_acceptance_matrix(acceptance_matrix_json: &str) -> Arc<SqliteDb> {
     let db = database().await;
     UserRepo::create_user(
         &*db,
@@ -279,7 +283,7 @@ async fn fixture() -> Arc<SqliteDb> {
              schema_version, render_version, rendered_view, content_digest,
              rendered_digest, source_refs_json, created_at)
          VALUES (?, ?, 1, 0, NULL, 'approved', ?, '[]', '[]', ?, ?, ?, NULL,
-                 ?, 'policy@1', ?, '[]', '[]', '[]', '{}',
+                 ?, 'policy@1', ?, ?, '[]', '[]', '{}',
                  '[]', '[]', '{}', 'baseline@1', 'baseline-render@1',
                  '# Baseline', 'baseline-digest-1', 'baseline-rendered-1',
                  '[]', ?)",
@@ -292,11 +296,48 @@ async fn fixture() -> Arc<SqliteDb> {
     .bind(format!("[\"{MILESTONE_REVISION_ID}\"]"))
     .bind(release_policy_json)
     .bind(release_policy_digest)
+    .bind(acceptance_matrix_json)
     .bind(NOW)
     .execute(db.pool())
     .await
     .expect("baseline revision creates");
     db
+}
+
+#[tokio::test]
+async fn readiness_fails_closed_when_baseline_matrix_is_absent_from_current_definition() {
+    let matrix = json!([{
+        "id": "missing-check",
+        "description": "A check the approved baseline requires",
+        "required": true,
+        "evidence_kind": "test-report",
+        "check_definition_revision": MILESTONE_REVISION_ID,
+    }]);
+    let db = fixture_with_acceptance_matrix(&matrix.to_string()).await;
+    let error = ProjectMilestoneCommandService::new(Arc::clone(&db))
+        .request_readiness(readiness_command("inconsistent-baseline"), None)
+        .await
+        .expect_err("an inconsistent active baseline cannot produce readiness");
+
+    assert!(error.to_string().contains("reconciliation_required"));
+    assert!(error.to_string().contains("missing-check"));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM project_readiness_snapshot WHERE project_id = ?",
+        )
+        .bind(PROJECT_ID)
+        .fetch_one(db.pool())
+        .await
+        .expect("readiness snapshot count"),
+        0
+    );
+    let lifecycle: String =
+        sqlx::query_scalar("SELECT lifecycle FROM project_milestone WHERE id = ?")
+            .bind(MILESTONE_ID)
+            .fetch_one(db.pool())
+            .await
+            .expect("milestone lifecycle");
+    assert_eq!(lifecycle, "active");
 }
 
 struct ReceiptInput<'a> {

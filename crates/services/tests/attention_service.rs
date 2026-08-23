@@ -868,3 +868,119 @@ async fn projected_incident_emits_one_durable_wake_action_and_replay_is_suppress
     assert!(payload["attention_id"].as_str().is_some());
     assert!(payload["incident_digest"].as_str().is_some());
 }
+
+#[tokio::test]
+async fn completed_task_wakes_project_agent_until_readiness_is_reconciled() {
+    let db = database().await;
+    let identity_id = new_uuid_v4();
+    identity(&db, &identity_id).await;
+    let profile_id: String =
+        sqlx::query_scalar("SELECT selected_profile_id FROM agent_identity WHERE id = ?")
+            .bind(&identity_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let project_id = new_uuid_v4();
+    let now = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO project (
+            id, name, settings, workflow_definition, owner_id, created_at, updated_at
+         ) VALUES (?, 'delivery-followup-project', '{}', '{}', NULL, ?, ?)",
+    )
+    .bind(&project_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE project_agent_binding
+         SET identity_id = ?, profile_id = ?, state = 'active', wake_budget = 10,
+             version = version + 1, updated_at = ?
+         WHERE project_id = ? AND state = 'agent_setup_required'",
+    )
+    .bind(&identity_id)
+    .bind(&profile_id)
+    .bind(&now)
+    .bind(&project_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    DomainEventRepo::append_event(
+        &*db,
+        CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "task.transitioned".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: new_uuid_v4(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "project".to_owned(),
+            scope_id: project_id.clone(),
+            correlation_id: new_uuid_v4(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(new_uuid_v4()),
+            payload_json: r#"{"to_state":"done"}"#.to_owned(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let service = AttentionService::new(Arc::clone(&db));
+    service.project_once(100).await.unwrap();
+    let attention: (String, String, String, Option<String>) = sqlx::query_as(
+        "SELECT attention_type, status, recommended_action, identity_id
+         FROM attention_projection WHERE scope_type = 'project' AND scope_id = ?",
+    )
+    .bind(&project_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(attention.0, "delivery_followup");
+    assert_eq!(attention.1, "open");
+    assert_eq!(attention.2, "reconcile_delivery");
+    assert_eq!(attention.3.as_deref(), Some(identity_id.as_str()));
+    let admitted_identity: String = sqlx::query_scalar(
+        "SELECT json_extract(payload_json, '$.identity_id')
+         FROM domain_event WHERE event_type = 'agent.wake.admitted'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(admitted_identity, identity_id);
+
+    DomainEventRepo::append_event(
+        &*db,
+        CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "milestone.readiness.evaluated".to_owned(),
+            entity_type: "project_milestone".to_owned(),
+            entity_id: new_uuid_v4(),
+            actor_type: "agent".to_owned(),
+            actor_id: Some(identity_id),
+            scope_type: "project".to_owned(),
+            scope_id: project_id.clone(),
+            correlation_id: new_uuid_v4(),
+            causation_id: None,
+            causation_depth: 1,
+            dedupe_key: Some(new_uuid_v4()),
+            payload_json: r#"{"result":"blocked"}"#.to_owned(),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    service.project_once(100).await.unwrap();
+    let resolved: String = sqlx::query_scalar(
+        "SELECT status FROM attention_projection
+         WHERE attention_type = 'delivery_followup' AND scope_id = ?",
+    )
+    .bind(&project_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(resolved, "resolved");
+}

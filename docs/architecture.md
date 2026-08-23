@@ -455,6 +455,16 @@ terminal; later corrections append the next release revision and never mutate
 history. Forge release is an internal frozen evidence snapshot, not a merge,
 tag, deployment, or external publication.
 
+Before evaluating or recomputing readiness, Forge checks that the active
+baseline pins the milestone's current definition and that every baseline
+acceptance/evidence matrix item governing that milestone names the pinned
+definition revision containing the same stable requirement ID. A malformed
+or drifted contract fails closed as `reconciliation_required`; it cannot
+produce a ready snapshot from an empty or unrelated definition. Live validation
+summaries and Project Overview check counts likewise include only rows belonging
+to each milestone's current definition revision, never checks or results left
+behind by a superseded definition.
+
 A Project Agent readiness action invokes the same `MilestoneRuntime`
 evaluation as the authenticated REST route and returns the committed snapshot;
 it is not a request event awaiting an absent consumer. A Project Agent release
@@ -804,6 +814,15 @@ committed together. The Attention projection can derive an
 `execution.progress_warning` remain separate semantic-progress signals.
 Project-scoped incidents with no more specific responder wake the active
 Project Agent binding, whose default wake budget is 10 admissions per hour.
+Every terminal `done` Task transition also creates a `delivery_followup`
+Attention incident for that Project Agent. The follow-up asks it to reconcile
+the Task outcome into authoritative validation, evidence, and milestone
+readiness; the Task transition itself supplies none of those facts and never
+authorizes a release. A committed readiness evaluation resolves the pending
+delivery follow-ups even when the evaluation remains blocked.
+When upgrading from an older Attention consumer, migration `V093` appends one
+deduplicated follow-up event for each Project whose latest completed Task has no
+later readiness evaluation, so already-checkpointed delivery is reconciled too.
 
 The `events` crate still wraps `tokio::sync::broadcast`, and the SSE endpoint at
 `/api/v1/events` still drives live clients. For durable events it is a

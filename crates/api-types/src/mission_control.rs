@@ -26,6 +26,10 @@ pub enum AttentionCategory {
     ReviewReady,
     ReviewRisk,
     ExecutionFailed,
+    /// A terminal Task outcome requires the owning Project Agent to reconcile
+    /// authoritative validation, evidence, and milestone readiness. It is not
+    /// itself a validation or release signal.
+    DeliveryFollowup,
     RuntimeOffline,
     BudgetThreshold,
     CommitmentOverdue,

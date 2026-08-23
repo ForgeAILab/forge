@@ -556,6 +556,12 @@ Project Chat/task scopes) and intentionally excludes account/Main activity.
 Direct receipts linked to an `AgentActionExecution` are omitted from the
 direct stream so one approved execution cannot appear twice.
 
+`AttentionCategory` includes `delivery_followup`. Forge projects it when a
+Task reaches `done` so the bound Project Agent can reconcile authoritative
+validation, evidence, and milestone readiness. It is an orchestration prompt,
+not a validation result, readiness decision, or release approval; a committed
+milestone readiness evaluation resolves the Project's open delivery follow-ups.
+
 ## Commitments, inbox, and typed actions
 
 Coordination endpoints are authenticated and least-authority scoped. An

@@ -57,6 +57,96 @@ struct ReadinessRecheck {
     task_states: Vec<ReadinessTaskState>,
 }
 
+/// Exact active-baseline inputs that govern one readiness evaluation.
+///
+/// The acceptance matrix is intentionally retained as typed data here rather
+/// than treated as an opaque part of `baseline_digest`: readiness must fail
+/// closed when the approved baseline names checks that the pinned milestone
+/// definition does not actually contain.
+struct ActiveBaselineInputs {
+    baseline_digest: String,
+    stored_policy_revision: String,
+    release_policy_digest: String,
+    milestone_ids: Vec<String>,
+    milestone_definition_revision_ids: Vec<String>,
+    acceptance_matrix: Vec<AcceptanceEvidenceRequirement>,
+}
+
+fn validate_baseline_definition_contract(
+    milestone_id: &str,
+    definition: &MilestoneDefinitionRevision,
+    baseline: &ActiveBaselineInputs,
+) -> crate::Result<()> {
+    if baseline.milestone_ids.len() != baseline.milestone_definition_revision_ids.len() {
+        return Err(crate::ServiceError::conflict(
+            "reconciliation_required: the active baseline milestone manifest is malformed",
+        ));
+    }
+    let Some(index) = baseline
+        .milestone_ids
+        .iter()
+        .position(|candidate| candidate == milestone_id)
+    else {
+        return Err(crate::ServiceError::conflict(
+            "reconciliation_required: the readiness milestone is not governed by the active baseline",
+        ));
+    };
+    if baseline.milestone_definition_revision_ids[index] != definition.id {
+        return Err(crate::ServiceError::conflict(
+            "reconciliation_required: the active baseline does not pin the milestone's current definition revision",
+        ));
+    }
+
+    let pinned_revisions = baseline
+        .milestone_definition_revision_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let acceptance_ids = definition
+        .content
+        .acceptance_checks
+        .iter()
+        .map(|check| check.id.as_str())
+        .collect::<HashSet<_>>();
+    let evidence_ids = definition
+        .content
+        .evidence_requirements
+        .iter()
+        .map(|requirement| requirement.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut matrix_ids = HashSet::new();
+    for requirement in &baseline.acceptance_matrix {
+        let definition_revision = requirement
+            .check_definition_revision
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                crate::ServiceError::conflict(
+                    "reconciliation_required: every active-baseline acceptance/evidence item must name its exact milestone definition revision",
+                )
+            })?;
+        if requirement.id.trim().is_empty()
+            || requirement.description.trim().is_empty()
+            || !matrix_ids.insert((definition_revision, requirement.id.as_str()))
+            || !pinned_revisions.contains(definition_revision)
+        {
+            return Err(crate::ServiceError::conflict(
+                "reconciliation_required: the active-baseline acceptance/evidence matrix is malformed or references an unpinned definition",
+            ));
+        }
+        if definition_revision == definition.id
+            && !acceptance_ids.contains(requirement.id.as_str())
+            && !evidence_ids.contains(requirement.id.as_str())
+        {
+            return Err(crate::ServiceError::conflict(format!(
+                "reconciliation_required: active-baseline requirement '{}' is absent from the current milestone definition",
+                requirement.id
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct MilestoneRuntime {
     db: Arc<SqliteDb>,
@@ -285,7 +375,7 @@ impl MilestoneRuntime {
         let mut definition = definition_from_record(definition_record, project_id)?;
         self.hydrate_charter_in_tx(&mut tx, project_id, &mut definition)
             .await?;
-        let (baseline_digest, _stored_policy_revision, release_policy_digest) = self
+        let baseline = self
             .baseline_inputs_in_tx(
                 &mut tx,
                 project_id,
@@ -294,6 +384,9 @@ impl MilestoneRuntime {
                 release_policy_revision,
             )
             .await?;
+        validate_baseline_definition_contract(milestone_id, &definition, &baseline)?;
+        let baseline_digest = baseline.baseline_digest;
+        let release_policy_digest = baseline.release_policy_digest;
         let check_results = self
             .check_results_in_tx(
                 &mut tx,
@@ -489,7 +582,7 @@ impl MilestoneRuntime {
         let mut definition = definition_from_record(definition_record, project_id)?;
         self.hydrate_charter_in_tx(&mut tx, project_id, &mut definition)
             .await?;
-        let (baseline_digest, _stored_policy_revision, release_policy_digest) = self
+        let baseline = self
             .baseline_inputs_in_tx(
                 &mut tx,
                 project_id,
@@ -498,6 +591,9 @@ impl MilestoneRuntime {
                 release_policy_revision,
             )
             .await?;
+        validate_baseline_definition_contract(milestone_id, &definition, &baseline)?;
+        let baseline_digest = baseline.baseline_digest;
+        let release_policy_digest = baseline.release_policy_digest;
         let check_results = self
             .check_results_in_tx(
                 &mut tx,
@@ -1552,7 +1648,7 @@ impl MilestoneRuntime {
         baseline_id: &str,
         baseline_revision_id: &str,
         release_policy_revision: &str,
-    ) -> crate::Result<(String, String, String)> {
+    ) -> crate::Result<ActiveBaselineInputs> {
         if baseline_id.trim().is_empty() || baseline_revision_id.trim().is_empty() {
             return Err(crate::ServiceError::InvalidOperation {
                 message: "readiness requires explicit baseline and baseline revision references"
@@ -1566,7 +1662,10 @@ impl MilestoneRuntime {
                     r.content_digest,
                     r.release_policy_revision,
                     r.release_policy_digest,
-                    r.release_policy_json
+                    r.release_policy_json,
+                    r.milestone_ids_json,
+                    r.milestone_definition_revision_ids_json,
+                    r.acceptance_matrix_json
              FROM project_execution_baseline b
              JOIN project_execution_baseline_revision r
                ON r.id = ? AND r.baseline_id = b.id
@@ -1612,11 +1711,23 @@ impl MilestoneRuntime {
             });
         }
         validate_persisted_release_policy(&policy)?;
-        Ok((
-            row.try_get("content_digest")?,
+        Ok(ActiveBaselineInputs {
+            baseline_digest: row.try_get("content_digest")?,
             stored_policy_revision,
-            row.try_get("release_policy_digest")?,
-        ))
+            release_policy_digest: row.try_get("release_policy_digest")?,
+            milestone_ids: parse_json_required(
+                &row.try_get::<String, _>("milestone_ids_json")?,
+                "execution baseline milestone ids",
+            )?,
+            milestone_definition_revision_ids: parse_json_required(
+                &row.try_get::<String, _>("milestone_definition_revision_ids_json")?,
+                "execution baseline milestone definition revision ids",
+            )?,
+            acceptance_matrix: parse_json_required(
+                &row.try_get::<String, _>("acceptance_matrix_json")?,
+                "execution baseline acceptance/evidence matrix",
+            )?,
+        })
     }
 
     async fn hydrate_charter_in_tx(
@@ -2582,7 +2693,7 @@ impl MilestoneRuntime {
         let baseline_id = candidate.baseline_id.clone();
         let baseline_revision_id = candidate.baseline_revision_id.clone();
         let release_policy_revision = candidate.release_policy_revision.clone();
-        let (baseline_digest, stored_policy_revision, release_policy_digest) = self
+        let baseline = self
             .baseline_inputs_in_tx(
                 tx,
                 project_id,
@@ -2591,12 +2702,15 @@ impl MilestoneRuntime {
                 &release_policy_revision,
             )
             .await?;
-        if stored_policy_revision != release_policy_revision
-            || baseline_digest != candidate.baseline_digest
-            || release_policy_digest != candidate.release_policy_digest
+        validate_baseline_definition_contract(milestone_id, &definition, &baseline)?;
+        if baseline.stored_policy_revision != release_policy_revision
+            || baseline.baseline_digest != candidate.baseline_digest
+            || baseline.release_policy_digest != candidate.release_policy_digest
         {
             return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
         }
+        let baseline_digest = baseline.baseline_digest;
+        let release_policy_digest = baseline.release_policy_digest;
 
         let check_results = self
             .check_results_in_tx(

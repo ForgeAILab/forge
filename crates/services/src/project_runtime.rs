@@ -536,7 +536,12 @@ pub async fn load_effective_project_state(
     let validation_counts = sqlx::query(
         "SELECT COALESCE(r.outcome, 'missing') AS key, COUNT(*) AS count
          FROM project_milestone_check c
-         LEFT JOIN project_milestone_check_result r ON r.id = c.current_result_id
+         JOIN project_milestone m
+           ON m.id = c.milestone_id AND m.project_id = c.project_id
+          AND m.current_definition_revision_id = c.definition_revision_id
+         LEFT JOIN project_milestone_check_result r
+           ON r.id = c.current_result_id
+          AND r.definition_revision_id = c.definition_revision_id
          WHERE c.project_id = ?
          GROUP BY COALESCE(r.outcome, 'missing') ORDER BY key ASC",
     )

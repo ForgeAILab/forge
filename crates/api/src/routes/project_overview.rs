@@ -576,12 +576,18 @@ async fn load_check_summary(
         sqlx::query(
             "SELECT c.required, r.outcome
              FROM project_milestone_check c
+             JOIN project_milestone m
+               ON m.id = c.milestone_id AND m.project_id = c.project_id
+              AND m.current_definition_revision_id = c.definition_revision_id
              LEFT JOIN project_milestone_check_result r
                ON r.id = COALESCE(
                     c.current_result_id,
                     (SELECT r2.id FROM project_milestone_check_result r2
-                     WHERE r2.check_id = c.id ORDER BY r2.created_at DESC, r2.id DESC LIMIT 1)
+                     WHERE r2.check_id = c.id
+                       AND r2.definition_revision_id = c.definition_revision_id
+                     ORDER BY r2.created_at DESC, r2.id DESC LIMIT 1)
                   )
+              AND r.definition_revision_id = c.definition_revision_id
              WHERE c.project_id = ? AND c.milestone_id = ?",
         )
         .bind(project_id)
@@ -593,12 +599,18 @@ async fn load_check_summary(
         sqlx::query(
             "SELECT c.required, r.outcome
              FROM project_milestone_check c
+             JOIN project_milestone m
+               ON m.id = c.milestone_id AND m.project_id = c.project_id
+              AND m.current_definition_revision_id = c.definition_revision_id
              LEFT JOIN project_milestone_check_result r
                ON r.id = COALESCE(
                     c.current_result_id,
                     (SELECT r2.id FROM project_milestone_check_result r2
-                     WHERE r2.check_id = c.id ORDER BY r2.created_at DESC, r2.id DESC LIMIT 1)
+                     WHERE r2.check_id = c.id
+                       AND r2.definition_revision_id = c.definition_revision_id
+                     ORDER BY r2.created_at DESC, r2.id DESC LIMIT 1)
                   )
+              AND r.definition_revision_id = c.definition_revision_id
              WHERE c.project_id = ?",
         )
         .bind(project_id)

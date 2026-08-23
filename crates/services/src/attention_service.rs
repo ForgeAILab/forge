@@ -1672,6 +1672,27 @@ impl AttentionService {
             )
             .await?;
         }
+        if event.event_type == "milestone.readiness.evaluated" {
+            let (scope_type, scope_id) = self.event_scope(event).await?;
+            let (scope_type, scope_id) = self
+                .attention_projection_scope(&scope_type, &scope_id)
+                .await?;
+            let resolved_at = now_rfc3339();
+            sqlx::query(
+                "UPDATE attention_projection
+                 SET status = 'resolved', resolved_at = ?, snoozed_until = NULL,
+                     source_event_id = ?, updated_at = ?, version = version + 1
+                 WHERE attention_type = 'delivery_followup'
+                   AND scope_type = ? AND scope_id = ? AND status <> 'resolved'",
+            )
+            .bind(&resolved_at)
+            .bind(&event.id)
+            .bind(&resolved_at)
+            .bind(scope_type)
+            .bind(scope_id)
+            .execute(self.db.pool())
+            .await?;
+        }
         Ok(())
     }
 
@@ -2838,8 +2859,12 @@ fn classify_event(event: &DomainEvent) -> Option<&'static str> {
             Some("blocked") => Some("validation_failed"),
             Some("review") => Some("review_ready"),
             Some("failed") => Some("run_stalled"),
+            Some("done") => Some("delivery_followup"),
             _ => None,
         };
+    }
+    if matches!(event_type.as_str(), "task.done" | "task.completed") {
+        return Some("delivery_followup");
     }
     if event_type == "execution.failed" {
         return Some("execution_failed");
@@ -2936,6 +2961,11 @@ fn category_metadata(category: &str) -> (i64, &'static str, &'static str) {
         "review_ready" => (55, "Work is ready for review", "review"),
         "review_risk" => (85, "Review reported a risk", "inspect_review"),
         "execution_failed" => (85, "Task execution failed", "inspect_run"),
+        "delivery_followup" => (
+            70,
+            "Task completed; reconcile validation, evidence, and readiness",
+            "reconcile_delivery",
+        ),
         "runtime_offline" => (95, "Agent runtime is unavailable", "restore_runtime"),
         "budget_threshold" => (60, "Agent budget threshold reached", "review_budget"),
         "commitment_overdue" => (75, "Commitment is overdue", "review_commitment"),
@@ -2953,6 +2983,7 @@ pub fn attention_item(item: AttentionProjection) -> Result<AttentionItem> {
         "review_ready" => AttentionCategory::ReviewReady,
         "review_risk" => AttentionCategory::ReviewRisk,
         "execution_failed" => AttentionCategory::ExecutionFailed,
+        "delivery_followup" => AttentionCategory::DeliveryFollowup,
         "runtime_offline" => AttentionCategory::RuntimeOffline,
         "budget_threshold" => AttentionCategory::BudgetThreshold,
         "commitment_overdue" => AttentionCategory::CommitmentOverdue,
@@ -3243,6 +3274,10 @@ mod tests {
         assert_eq!(
             classify_event(&event("task.transitioned", r#"{"to_state":"review"}"#)),
             Some("review_ready")
+        );
+        assert_eq!(
+            classify_event(&event("task.transitioned", r#"{"to_state":"done"}"#)),
+            Some("delivery_followup")
         );
         assert_eq!(
             resolution_categories(&event("task.transitioned", r#"{"to_state":"done"}"#)),
