@@ -14,6 +14,7 @@ use db::{
 use forge_agent_host::{
     CanonicalScope, CanonicalScopeType, MAIN_CHARTER_APPROVAL_TARGET_OPERATION,
     MAIN_CHARTER_DIFF_OPERATION, MAIN_CHARTER_READINESS_OPERATION, MAIN_CHARTER_READ_OPERATION,
+    MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -21,8 +22,9 @@ use sqlx::Row;
 
 use crate::main_orchestration_actions::{parse_maturity, parse_project_mode};
 use crate::{
-    evaluate_project_charter_readiness, resolve_genesis_project_agent, semantic_revision_diff,
-    OrchestrationAuthorizationService, Result, ServiceError, CHARTER_READINESS_POLICY_VERSION,
+    evaluate_project_charter_readiness, list_genesis_project_agents, resolve_genesis_project_agent,
+    semantic_revision_diff, OrchestrationAuthorizationService, Result, ServiceError,
+    CHARTER_READINESS_POLICY_VERSION,
 };
 
 /// Read-only query service for the account-owned Main Agent Charter surface.
@@ -49,6 +51,10 @@ impl MainOrchestrationQueryService {
         arguments: Value,
     ) -> Result<Value> {
         match operation {
+            MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION => {
+                self.project_agents(actor_identity_id, scope, arguments)
+                    .await
+            }
             MAIN_CHARTER_READ_OPERATION => {
                 self.charter_read(actor_identity_id, scope, arguments).await
             }
@@ -67,6 +73,34 @@ impl MainOrchestrationQueryService {
                 "Main Charter query operation is not implemented",
             )),
         }
+    }
+
+    async fn project_agents(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        arguments: Value,
+    ) -> Result<Value> {
+        let query: GenesisProjectAgentsQuery =
+            parse_query(&arguments, MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION)?;
+        let (_account_id, session) = self
+            .main_genesis(
+                actor_identity_id,
+                scope,
+                query.genesis_session_id.as_deref(),
+                None,
+            )
+            .await?;
+        let candidates = list_genesis_project_agents(&self.db, &session).await?;
+        let resolved = resolve_genesis_project_agent(&self.db, &session).await?;
+        Ok(json!({
+            "operation": MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
+            "genesis_session_id": session.id,
+            "session_version": session.version,
+            "preferred_project_agent_identity_id": session.preferred_project_agent_identity_id,
+            "resolved_project_agent": resolved.map(selection_json),
+            "items": candidates.into_iter().map(selection_json).collect::<Vec<_>>(),
+        }))
     }
 
     async fn charter_read(
@@ -398,6 +432,23 @@ struct CharterReadQuery {
     genesis_session_id: Option<String>,
     #[serde(default)]
     limit: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct GenesisProjectAgentsQuery {
+    #[serde(default)]
+    genesis_session_id: Option<String>,
+}
+
+fn selection_json(selection: crate::GenesisAgentSelection) -> Value {
+    json!({
+        "identity_id": selection.identity_id,
+        "display_name": selection.display_name,
+        "profile_revision_id": selection.profile_revision_id,
+        "operating_skill_revision": selection.operating_skill_revision,
+        "policy_digest": selection.policy_digest,
+    })
 }
 
 #[derive(Debug, Deserialize)]

@@ -74,124 +74,136 @@ pub fn validate_execution_baseline_policy(
         return Err("the frozen release policy revision cannot be empty".to_owned());
     }
 
-    validate_identifier_rules(
-        "required_check_definition_revisions",
-        &content.release_policy.required_check_definition_revisions,
-        true,
-    )?;
-    validate_literal_rules(
-        "reviewer_independence_rules",
-        &content.release_policy.reviewer_independence_rules,
-        &["independent-reviewer"],
-        true,
-    )?;
-    validate_literal_rules(
-        "manual_attestation_rules",
-        &content.release_policy.manual_attestation_rules,
-        &["manual-attestation"],
-        false,
-    )?;
-    validate_literal_rules(
-        "waiver_rules",
-        &content.release_policy.waiver_rules,
-        &["user-waiver"],
-        false,
-    )?;
-    validate_literal_rules(
-        "evidence_kinds",
-        &content.release_policy.evidence_kinds,
-        &[
-            "artifact",
-            "ci-log",
-            "media",
-            "review-report",
-            "test-report",
-        ],
-        true,
-    )?;
-    validate_literal_rules(
-        "evidence_contexts",
-        &content.release_policy.evidence_contexts,
-        &[
-            "commit",
-            "external",
-            "milestone",
-            "project",
-            "repository",
-            "task",
-        ],
-        true,
-    )?;
-    validate_literal_rules(
-        "evidence_freshness_rules",
-        &content.release_policy.evidence_freshness_rules,
-        &[
-            "current-baseline",
-            "current-charter",
-            "current-commit",
-            "current-milestone",
-        ],
-        true,
-    )?;
-    validate_literal_rules(
-        "dependency_rules",
-        &content.release_policy.dependency_rules,
-        &[
-            "dependencies-green",
-            "dependencies-reviewed",
-            "no-blocked-dependencies",
-        ],
-        true,
-    )?;
-    validate_literal_rules(
-        "stale_input_rules",
-        &content.release_policy.stale_input_rules,
-        &["stale-baseline-blocks", "stale-evidence-blocks"],
-        true,
-    )?;
-    validate_literal_rules(
-        "forbidden_side_effects",
-        &content.release_policy.forbidden_side_effects,
-        &[
-            "credential-access",
-            "cross-project-write",
-            "force-push",
-            "merge",
-            "publish",
-            "release",
-        ],
-        true,
-    )?;
-    validate_literal_rules(
-        "known_issue_rules",
-        &content.release_policy.known_issue_rules,
-        &[
-            "known-issue-blocks",
-            "known-issue-waiver",
-            "record-known-issue",
-        ],
-        true,
-    )?;
-    validate_literal_rules(
-        "correction_rules",
-        &content.release_policy.correction_rules,
-        &[
-            "correct-before-release",
-            "correction-required",
-            "rerun-failed-checks",
-        ],
-        true,
-    )?;
-    validate_literal_rules(
-        "purge_rules",
-        &content.release_policy.purge_rules,
-        &[
-            "purge-invalid-evidence",
-            "purge-revoked-evidence",
-            "purge-stale-evidence",
-        ],
-        true,
-    )?;
+    // Every rule field is checked in one pass. Returning on the first
+    // violation makes a caller discover this closed contract one field per
+    // round trip, which for a native Agent means one model turn per missing
+    // list. The whole set of violations travels back together instead.
+    let violations: Vec<String> = [
+        validate_identifier_rules(
+            "required_check_definition_revisions",
+            &content.release_policy.required_check_definition_revisions,
+            true,
+        ),
+        validate_literal_rules(
+            "reviewer_independence_rules",
+            &content.release_policy.reviewer_independence_rules,
+            &["independent-reviewer"],
+            true,
+        ),
+        validate_literal_rules(
+            "manual_attestation_rules",
+            &content.release_policy.manual_attestation_rules,
+            &["manual-attestation"],
+            false,
+        ),
+        validate_literal_rules(
+            "waiver_rules",
+            &content.release_policy.waiver_rules,
+            &["user-waiver"],
+            false,
+        ),
+        validate_literal_rules(
+            "evidence_kinds",
+            &content.release_policy.evidence_kinds,
+            &[
+                "artifact",
+                "ci-log",
+                "media",
+                "review-report",
+                "test-report",
+            ],
+            true,
+        ),
+        validate_literal_rules(
+            "evidence_contexts",
+            &content.release_policy.evidence_contexts,
+            &[
+                "commit",
+                "external",
+                "milestone",
+                "project",
+                "repository",
+                "task",
+            ],
+            true,
+        ),
+        validate_literal_rules(
+            "evidence_freshness_rules",
+            &content.release_policy.evidence_freshness_rules,
+            &[
+                "current-baseline",
+                "current-charter",
+                "current-commit",
+                "current-milestone",
+            ],
+            true,
+        ),
+        validate_literal_rules(
+            "dependency_rules",
+            &content.release_policy.dependency_rules,
+            &[
+                "dependencies-green",
+                "dependencies-reviewed",
+                "no-blocked-dependencies",
+            ],
+            true,
+        ),
+        validate_literal_rules(
+            "stale_input_rules",
+            &content.release_policy.stale_input_rules,
+            &["stale-baseline-blocks", "stale-evidence-blocks"],
+            true,
+        ),
+        validate_literal_rules(
+            "forbidden_side_effects",
+            &content.release_policy.forbidden_side_effects,
+            &[
+                "credential-access",
+                "cross-project-write",
+                "force-push",
+                "merge",
+                "publish",
+                "release",
+            ],
+            true,
+        ),
+        validate_literal_rules(
+            "known_issue_rules",
+            &content.release_policy.known_issue_rules,
+            &[
+                "known-issue-blocks",
+                "known-issue-waiver",
+                "record-known-issue",
+            ],
+            true,
+        ),
+        validate_literal_rules(
+            "correction_rules",
+            &content.release_policy.correction_rules,
+            &[
+                "correct-before-release",
+                "correction-required",
+                "rerun-failed-checks",
+            ],
+            true,
+        ),
+        validate_literal_rules(
+            "purge_rules",
+            &content.release_policy.purge_rules,
+            &[
+                "purge-invalid-evidence",
+                "purge-revoked-evidence",
+                "purge-stale-evidence",
+            ],
+            true,
+        ),
+    ]
+    .into_iter()
+    .filter_map(std::result::Result::err)
+    .collect();
+    if !violations.is_empty() {
+        return Err(violations.join("; "));
+    }
     Ok(())
 }
 
@@ -2266,6 +2278,32 @@ mod tests {
         assert!(validate_execution_baseline_policy(&duplicate)
             .expect_err("duplicate rule must fail closed")
             .contains("duplicate"));
+    }
+
+    #[test]
+    fn release_policy_reports_every_missing_rule_list_at_once() {
+        let mut empty = content();
+        empty.release_policy.correction_rules = Vec::new();
+        empty.release_policy.purge_rules = Vec::new();
+        empty.release_policy.dependency_rules = Vec::new();
+        empty.release_policy_digest =
+            release_policy_digest(&empty.release_policy).expect("policy digest");
+
+        let error = validate_execution_baseline_policy(&empty)
+            .expect_err("empty required rule lists must fail closed");
+
+        // A caller that has to resubmit once per missing field spends a full
+        // round trip — for a native Agent, a whole model turn — discovering a
+        // closed contract it could have been handed at once.
+        for field in ["correction_rules", "purge_rules", "dependency_rules"] {
+            assert!(
+                error.contains(field),
+                "every empty rule list must be named; {field} was missing from {error}"
+            );
+        }
+        assert!(error.contains("correct-before-release"));
+        assert!(error.contains("purge-stale-evidence"));
+        assert!(error.contains("dependencies-green"));
     }
 
     #[test]

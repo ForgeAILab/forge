@@ -647,9 +647,13 @@ pub async fn load_effective_project_state(
          LEFT JOIN project_milestone_revision r
            ON r.id = m.current_definition_revision_id AND r.milestone_id = m.id
          WHERE m.project_id = ?
-           AND m.lifecycle IN ('planned', 'active', 'ready_for_release')
+           AND (
+                m.lifecycle IN ('planned', 'active', 'ready_for_release')
+                OR m.id = (SELECT primary_milestone_id FROM project WHERE id = ?)
+           )
          ORDER BY m.milestone_sequence ASC, m.id ASC LIMIT ?",
     )
+    .bind(project_id)
     .bind(project_id)
     .bind(limit)
     .fetch_all(db.pool())
@@ -1350,28 +1354,28 @@ fn validate_primary_milestone_pointer(
         .filter(|milestone| milestone.lifecycle == "active")
         .collect::<Vec<_>>();
     // A Charter-created Project is born with its first milestone still
-    // `planned` and already referenced as primary; the pointer becomes
-    // active-only once any milestone activates.
+    // `planned` and already referenced as primary, and a Project whose only
+    // milestone has reached `ready_for_release` or `released` has moved
+    // forward, not broken its pointer. Only `cancelled` leaves the pointer
+    // naming work the Project no longer intends to do. Rejecting the released
+    // states wedged every turn admission the moment a Project delivered.
     let pointer_eligible = |primary_id: &str| {
         milestones.iter().any(|milestone| {
             milestone.id == primary_id
-                && matches!(milestone.lifecycle.as_str(), "active" | "planned")
+                && matches!(
+                    milestone.lifecycle.as_str(),
+                    "active" | "planned" | "ready_for_release" | "released"
+                )
         })
     };
-    match (active.is_empty(), primary_milestone_id) {
-        (true, None) => Ok(()),
-        (true, Some(primary_id)) if pointer_eligible(primary_id) => Ok(()),
-        (true, Some(_)) => Err(ServiceError::conflict(
-            "Project primary milestone points at a Project with no active milestones",
-        )),
-        (false, None) => Err(ServiceError::conflict(
+    match primary_milestone_id {
+        None if active.is_empty() => Ok(()),
+        None => Err(ServiceError::conflict(
             "Project with active milestones has no explicit primary milestone",
         )),
-        (false, Some(primary_id)) if active.iter().any(|milestone| milestone.id == primary_id) => {
-            Ok(())
-        }
-        (false, Some(_)) => Err(ServiceError::conflict(
-            "Project primary milestone is not one of the active milestones",
+        Some(primary_id) if pointer_eligible(primary_id) => Ok(()),
+        Some(_) => Err(ServiceError::conflict(
+            "Project primary milestone is not an intended Project milestone",
         )),
     }
 }
@@ -1426,6 +1430,31 @@ mod tests {
             Some("active"),
         )
         .is_ok());
+        // Delivering the Project's only milestone must not invalidate the
+        // pointer that still names it — that wedged every turn admission.
+        for delivered in ["ready_for_release", "released"] {
+            assert!(
+                validate_primary_milestone_pointer(
+                    &[milestone("delivered", delivered)],
+                    Some("delivered"),
+                )
+                .is_ok(),
+                "a {delivered} primary milestone must stay a valid pointer"
+            );
+        }
+        assert!(validate_primary_milestone_pointer(
+            &[
+                milestone("delivered", "released"),
+                milestone("next", "active")
+            ],
+            Some("delivered"),
+        )
+        .is_ok());
+        assert!(validate_primary_milestone_pointer(
+            &[milestone("cancelled", "cancelled")],
+            Some("cancelled"),
+        )
+        .is_err());
     }
 
     #[test]

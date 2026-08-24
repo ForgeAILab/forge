@@ -7,6 +7,7 @@ use db::{
 use forge_agent_host::{
     CanonicalScope, CanonicalScopeType, WorkspaceAccess, MAIN_CHARTER_APPROVAL_TARGET_OPERATION,
     MAIN_CHARTER_DIFF_OPERATION, MAIN_CHARTER_READINESS_OPERATION, MAIN_CHARTER_READ_OPERATION,
+    MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
 };
 use serde_json::{json, Value};
 use services::MainOrchestrationQueryService;
@@ -263,6 +264,25 @@ async fn main_charter_queries_do_not_create_action_or_receipt_rows() {
     let service = MainOrchestrationQueryService::new(Arc::clone(&db));
     let scope = main_scope();
     let before = counts(&db).await;
+
+    let project_agents = service
+        .execute(
+            MAIN_IDENTITY_ID,
+            &scope,
+            MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
+            json!({"genesis_session_id": GENESIS_ID}),
+        )
+        .await
+        .expect("Project Agent candidates query");
+    assert_eq!(
+        project_agents["operation"],
+        MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION
+    );
+    assert_eq!(project_agents["session_version"], 1);
+    assert_eq!(
+        project_agents["items"][0]["identity_id"],
+        UNBOUND_IDENTITY_ID
+    );
 
     let read = service
         .execute(

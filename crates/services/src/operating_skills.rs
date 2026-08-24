@@ -54,7 +54,7 @@ pub const PROJECT_OPERATING_SKILL_POLICY_JSON: &str =
 pub const PROJECT_OPERATING_SKILL_POLICY_DIGEST: &str =
     "b9364db0792d4a7aa3e9dcae9ebfab78f6a239db55dc21831b201c9b905dd54b";
 pub const PROJECT_OPERATING_SKILL_CONTENT_DIGEST: &str =
-    "d82c5cb7df0a7b82c715abca911243374e05d07ab777d2fb0a6264aaf351bbfb";
+    "6d6b422693a3e706cf27e6fbc947309467e6fd5cea39dca67df4a5641298dfe2";
 
 /// Returns the exact immutable body of the Main Agent account baseline skill.
 /// This body is server-owned source code, not a seeded database row.
@@ -809,6 +809,7 @@ MILESTONES AND EVIDENCE
 - An unreleased active milestone becomes ready_for_release only when every required acceptance check has a current authorized passing result or explicit user-scoped waiver, required evidence is attached/current, known issues are disclosed, and referenced artifacts/repository metadata match the readiness digest. Non-ready results leave it active with typed reasons, and correction readiness leaves a released milestone released.
 - Reuse authorized existing media assets when possible. Give every image/video a caption, evidence kind, source Task/run when applicable, and acceptance check it supports. Media is evidence only when provenance and relevance are clear.
 - Propose release with a concise summary, exact candidate ReadinessSnapshot ID/digest, exact inputs, known issues, and missing/waived checks. Only the user may approve release; the release transaction recomputes the same digest and atomically creates the release manifest plus release-scoped evidence pins without creating another readiness snapshot.
+- Never propose or narrate a release from a blocked, failed, or stale readiness result. Report every canonical readiness blocker instead; do not write “Known Issues: None” while any required validation or evidence is missing.
 - Once released, never mutate the snapshot. A correction becomes a later immutable release revision or an audited privacy/security/legal purge record that preserves the permitted tombstone, digest, actor, time, and reason.
 - Releasing freezes Forge's Project record only. It does not merge a branch, create/move a git tag, deploy, publish externally, or grant repository authority; such outcomes appear only as bounded references produced by separate authorized Task workflows.
 
@@ -1057,6 +1058,8 @@ mod tests {
         const V095_MIGRATION: &str = include_str!(
             "../../db/migrations/V095__project_agent_acceptance_evidence_contract.sql"
         );
+        const V097_MIGRATION: &str =
+            include_str!("../../db/migrations/V097__project_agent_release_blocker_contract.sql");
 
         fn seeded_body(migration: &str, title: &str) -> String {
             let body_marker = format!("'{title}");
@@ -1101,7 +1104,8 @@ mod tests {
         let prior_project_body = seeded_body(V084_MIGRATION, "Forge Project Agent");
         assert_ne!(prior_project_body, canonical_project_operating_skill_body());
         assert!(V095_MIGRATION.contains("forge.project.orchestration/v1@3"));
-        assert!(V095_MIGRATION.contains(PROJECT_OPERATING_SKILL_CONTENT_DIGEST));
+        assert!(V097_MIGRATION.contains("forge.project.orchestration/v1@4"));
+        assert!(V097_MIGRATION.contains(PROJECT_OPERATING_SKILL_CONTENT_DIGEST));
         assert_eq!(
             sha256_hex(canonical_project_operating_skill_body()),
             PROJECT_OPERATING_SKILL_CONTENT_DIGEST

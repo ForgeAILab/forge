@@ -32,6 +32,7 @@ use forge_agent_host::{
     ForgeToolProvider, OperationClassification, PublicSearchScope, WorkspaceAccess,
     MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
     MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READINESS_OPERATION, MAIN_CHARTER_READ_OPERATION,
+    MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION, MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
     MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
     PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION,
@@ -55,7 +56,8 @@ use crate::{
         DirectTaskProposalInput, TaskProposalCommandResult, TaskProposalPayload,
     },
     MainGenesisCharterDraftRequest, MainGenesisCommandService, MainGenesisDraftCommandInput,
-    MainGenesisDraftPrincipal, MainGenesisStartCommandInput, MainGenesisStartPrincipal,
+    MainGenesisDraftPrincipal, MainGenesisProjectAgentSelectCommandInput,
+    MainGenesisProjectAgentSelectRequest, MainGenesisStartCommandInput, MainGenesisStartPrincipal,
     MainGenesisStartRequest, MainOrchestrationQueryService, OrchestrationAuthorizationService,
     ProjectOrchestrationActionService, TaskService,
 };
@@ -791,6 +793,16 @@ impl CoordinationToolProvider {
                 .execute_main_genesis_start(actor_identity_id, scope, arguments, payload)
                 .await;
         }
+        if operation == MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION {
+            return self
+                .execute_main_genesis_project_agent_select(
+                    actor_identity_id,
+                    scope,
+                    arguments,
+                    payload,
+                )
+                .await;
+        }
         if operation == MAIN_CHARTER_DRAFT_OPERATION {
             return self
                 .execute_main_genesis_charter_draft(actor_identity_id, scope, arguments, payload)
@@ -1333,6 +1345,83 @@ impl CoordinationToolProvider {
         Ok(json!({
             "operation": MAIN_CHARTER_DRAFT_OPERATION,
             "status": "succeeded",
+            "materialized": true,
+            "domain_committed": true,
+            "receipt_id": result.receipt_id,
+            "event_id": result.event_id,
+            "domain_result": result.result,
+        }))
+    }
+
+    async fn execute_main_genesis_project_agent_select(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        arguments: Value,
+        mut payload: Value,
+    ) -> Result<Value, AgentHostError> {
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("action");
+        }
+        let correlation_id = required_argument(&arguments, "correlation_id")?;
+        let request: MainGenesisProjectAgentSelectRequest = typed_command_payload(
+            MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
+            scope,
+            &correlation_id,
+            payload.clone(),
+        )?;
+        let requested_permission = operation_permission(
+            scope.scope_type,
+            MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
+        )
+        .ok_or_else(|| {
+            AgentHostError::Authority(
+                "Project Agent selection has no canonical permission descriptor".to_owned(),
+            )
+        })?;
+        let (policy_result, policy_reason) = self
+            .actions
+            .evaluate_direct_command_policy(
+                actor_identity_id,
+                scope_type_name(scope.scope_type),
+                &scope.scope_id,
+                requested_permission,
+                MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
+                Some(&payload.to_string()),
+            )
+            .await
+            .map_err(service_error)?;
+        if policy_result != AgentActionPolicyResult::Allowed {
+            return Err(AgentHostError::Authority(policy_reason.unwrap_or_else(
+                || "Project Agent selection policy did not admit this command".to_owned(),
+            )));
+        }
+        let result = MainGenesisCommandService::new(self.db.clone())
+            .select_project_agent(MainGenesisProjectAgentSelectCommandInput {
+                principal: MainGenesisDraftPrincipal::MainAgent {
+                    identity_id: actor_identity_id.to_owned(),
+                    scope: scope.clone(),
+                },
+                request,
+                idempotency_key: required_argument(&arguments, "dedupe_key")?,
+                correlation_id,
+                causation_id: arguments
+                    .get("causation_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                causation_depth: arguments
+                    .get("causation_depth")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+                policy_result: policy_result.to_string(),
+                requested_permission: requested_permission.to_owned(),
+            })
+            .await
+            .map_err(service_error)?;
+        Ok(json!({
+            "operation": MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
+            "status": "succeeded",
+            "replayed": result.replayed,
             "materialized": true,
             "domain_committed": true,
             "receipt_id": result.receipt_id,
@@ -1916,7 +2005,8 @@ impl ForgeToolProvider for CoordinationToolProvider {
             }
         }
         let result = match operation {
-            MAIN_CHARTER_READINESS_OPERATION
+            MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION
+            | MAIN_CHARTER_READINESS_OPERATION
             | MAIN_CHARTER_DIFF_OPERATION
             | MAIN_CHARTER_APPROVAL_TARGET_OPERATION => self
                 .main_queries
@@ -2591,6 +2681,23 @@ fn service_error(error: crate::ServiceError) -> AgentHostError {
             OutcomeScopeRef::new(OutcomeScopeType::Account, ""),
             "",
             format!("the command could not be accepted; correct the typed input ({message})"),
+        );
+        outcome.retry = Some(RetryInstruction::new(RetryAction::CorrectInput, false));
+        return AgentHostError::StructuredOutcome(Box::new(outcome));
+    }
+    // A `not_found` that names nothing is uncorrectable: a caller that passed
+    // several ids in one payload cannot tell which one Forge could not resolve,
+    // and retries the same rejected shape. The entity is a server-authored
+    // static name and the id is the one the caller just supplied, so neither
+    // discloses anything the caller did not already hold — the HTTP surface
+    // returns exactly this pair for the same failure.
+    if let crate::ServiceError::NotFound { entity, id } = &error {
+        let mut outcome = OrchestrationOutcome::failed(
+            OutcomeCode::NotFound,
+            "unknown",
+            OutcomeScopeRef::new(OutcomeScopeType::Account, ""),
+            "",
+            format!("the requested Forge resource is unavailable ({entity} {id})"),
         );
         outcome.retry = Some(RetryInstruction::new(RetryAction::CorrectInput, false));
         return AgentHostError::StructuredOutcome(Box::new(outcome));

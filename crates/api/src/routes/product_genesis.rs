@@ -118,6 +118,9 @@ pub async fn apply_product_genesis_guided_setup(
     if current.account_id != user.user_id {
         return Err(ApiError::not_found("product_genesis_session", session_id));
     }
+    if let Some(identity_id) = request.preferred_project_agent_identity_id.as_deref() {
+        services::resolve_requested_genesis_project_agent(&state.db, &current, identity_id).await?;
+    }
     let session = genesis
         .apply_guided_setup(
             &current.id,

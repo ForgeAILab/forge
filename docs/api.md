@@ -359,13 +359,20 @@ Genesis Charter approval omits `expected_project_version` because no Project
 exists yet. Project adoption/amendment approval must provide that field as a
 positive current Project version; zero is not a compatibility sentinel.
 
-The Charter projection's `selected_project_agent` honors the session's
-preferred identity while it is eligible; otherwise the server auto-selects a
-deterministic eligible agent (account-owned, unpaused, current profile, not
-the active Main Agent, preferring identities without an active Project
-binding). It is `null` only when the account has no eligible agent at all, and
-approval still validates the exact identity/profile/skill/policy revision set
-the client submits.
+The Charter projection's `selected_project_agent` honors a session preference
+exactly. The Main Agent can call the typed read
+`genesis.project_agents.read` to obtain eligible structured candidates and the
+current session version, then persist the exact choice with the receipt-backed
+`genesis.project_agent.select` command. Charter prose cannot select or reassign
+an agent. If a persisted preference later becomes ineligible, the projection is
+`null` and approval blocks rather than silently choosing someone else. With no
+preference, the server auto-selects a deterministic eligible agent
+(account-owned, unpaused, current profile, not the active Main Agent,
+preferring identities without an active Project binding). Credential-less CLI
+bootstrap defaults are excluded from automatic choice but remain available for
+explicit selection when local authentication is managed outside Forge.
+Approval validates the exact identity/profile/skill/policy revision set the
+client submits.
 
 Charter lifecycle moments are anchored in the Main Chat history as durable
 system messages: saving a revision (either route or the Main Agent's direct
@@ -433,9 +440,11 @@ reason rather than a global recency merge.
 Milestone definition revisions use `draft`, `proposed`, `approved`, or
 `superseded`; milestone instances use `planned`, `active`, `ready_for_release`,
 `released`, or `cancelled`. Multiple milestones may be active and the
-`primary_milestone_id` pointer is explicit and required only while at least one
-milestone is `active`; planned and `ready_for_release` milestones do not require
-it. `ReadinessSnapshot` is an immutable candidate, not a release: standalone
+`primary_milestone_id` pointer is explicit and required while at least one
+milestone is `active`. Once selected it stays on that outcome through
+`ready_for_release` and `released`, so Overview retains the delivered milestone;
+only removal from the intended outcome set repairs it. `ReadinessSnapshot` is
+an immutable candidate, not a release: standalone
 readiness creates no evidence pins. A ready snapshot moves an unreleased active
 milestone to `ready_for_release`; non-ready or stale results leave it active
 with typed reasons. Baseline/definition drift is recorded as a canonical
@@ -443,8 +452,11 @@ non-ready snapshot and milestone `reconciliation_required` projection rather
 than rejected before the readiness event can commit. Project Agent readiness
 actions execute that same Forge evaluation immediately and return the committed
 snapshot. Project Agent
-release-candidate actions validate the exact ready snapshot and surface a human
-attention item; they never perform the user-only release.
+release-candidate actions admit only an exact current `ready` snapshot and
+surface a human attention item; they never perform the user-only release.
+Blocked, failed, or stale candidates are rejected with their canonical reasons,
+and the Project Agent contract requires those blockers to be reported instead
+of presenting a release or `Known Issues: None`.
 
 Only an authorized user may call the milestone release route with the exact
 candidate snapshot ID and readiness digest. Forge re-authorizes every covered
@@ -452,7 +464,10 @@ source and recomputes the digest inside the release transaction. A match creates
 one immutable `Mxxx-rN` manifest, evidence pins, lifecycle transition, and
 events atomically; it creates no second readiness snapshot. Releases are frozen
 internal evidence records, not deploy/tag/merge operations, and corrections
-append a later revision without mutating history.
+append a later revision without mutating history. A second confirmation of the
+same immutable snapshot/digest by the same user returns the existing release,
+even when a stale UI generated a fresh idempotency key; it cannot create another
+release or fall through to a post-release digest mismatch.
 
 Project media routes provide Project-owned assets and can reuse the same
 underlying asset as Task media. Existing asset IDs, Task media IDs, Task URLs,
@@ -678,6 +693,12 @@ from the leased Main turn. The operation is absent from Project Agent, Worker,
 and reviewer catalogs. Starting discovery is not Charter approval and does not
 create a Project.
 
+During active discovery, `genesis.project_agents.read` lists the exact
+structured Project Agent candidates plus the persisted/resolved selection.
+`genesis.project_agent.select` is a direct, receipt-backed Main-only command
+requiring `propose_discovery`; it accepts the Genesis session/version and one
+identity id, mutates no Charter prose, and freezes no approval by itself.
+
 Project Agent execution-baseline proposals use the typed
 `project.execution_baseline` operation. Every payload supplies canonical
 `content`, `rendered_view`, `render_version`, `content_digest`,
@@ -791,10 +812,14 @@ Genesis transition together. Replay returns the original result, while a
 failure leaves no Project or handoff and keeps Genesis ready for retry.
 
 `DELETE /api/v1/projects/{id}` performs one guarded transaction that removes
-the Project-owned dependency graph before deleting the Project. Immutable-row
-guards are relaxed only for that exact teardown transaction; individual
-Charter, milestone, readiness, release, baseline, decision, lease, and evidence
-records remain non-deletable through ordinary writes.
+the Project-owned dependency graph before deleting the Project, including
+Project/Task/Project-Chat `agent_lcm_*` rows and Project chat/handoff state.
+Before the transaction, Forge stages only repositories managed as direct
+children of `<workspace_root>/repos`; it restores them on rollback and removes
+them after commit. Linked repositories elsewhere on disk are never deleted.
+Immutable-row guards are relaxed only for that exact teardown transaction;
+individual Charter, milestone, readiness, release, baseline, decision, lease,
+and evidence records remain non-deletable through ordinary writes.
 
 There is no later primary-agent election. Projects imported from before the
 Charter model that cannot yield one safe binding remain `agent_setup_required`
@@ -838,7 +863,10 @@ so it may include later durable provisioning progress.
 The reviewer must be a distinct eligible identity from the Worker. Provider
 and model reuse is allowed when the identities are distinct, while active Main
 and Project Agent coordinator identities are excluded by the shared
-eligibility resolver. Provisioning retry delegates to the durable finite
+eligibility resolver. Provisioning also skips credential-less bootstrap default
+identities during automatic Worker/reviewer assignment; an owner may still make
+an explicit assignment for a CLI whose authentication is managed locally.
+Provisioning retry delegates to the durable finite
 operation and never creates a second repository as a retry side effect.
 
 Project hook validation rejects unsupported trigger and action types, the

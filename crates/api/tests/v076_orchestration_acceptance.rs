@@ -331,7 +331,7 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
             "project_mode": "compact",
             "selected_project_agent_identity_id": legacy_identity,
             "selected_project_agent_profile_revision_id": legacy_profile,
-            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@3",
+            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@4",
             "selected_project_agent_policy_digest": legacy_policy
         }),
         &[StatusCode::CREATED, StatusCode::OK],
@@ -1604,6 +1604,52 @@ async fn v076_ready_milestone_releases_once_and_rejects_cross_project_scope() {
     .await;
     assert_eq!(replay, release);
 
+    // A stale dialog can submit the same immutable readiness target with a
+    // fresh UI key after the first release committed. Return the existing
+    // release instead of recomputing against the released lifecycle.
+    let mut fresh_key_release = release_body.clone();
+    fresh_key_release["mutation"]["idempotency_key"] = json!("v076-release-fresh-ui-key");
+    fresh_key_release["mutation"]["authorization"] =
+        user_authorization("project.milestone.release", "v076-release-fresh-ui-event");
+    let semantic_replay = request_json(
+        app,
+        Method::POST,
+        &format!(
+            "/api/v1/projects/{}/milestones/{}/release",
+            fixture.project_id, fixture.milestone_id
+        ),
+        &token,
+        fresh_key_release,
+        &[StatusCode::OK],
+    )
+    .await;
+    assert_eq!(semantic_replay, release);
+    let primary_milestone_id: Option<String> =
+        sqlx::query_scalar("SELECT primary_milestone_id FROM project WHERE id = ?")
+            .bind(&fixture.project_id)
+            .fetch_one(harness.state.db.pool())
+            .await
+            .expect("released Project primary milestone");
+    assert_eq!(
+        primary_milestone_id.as_deref(),
+        Some(fixture.milestone_id.as_str())
+    );
+    let overview = request_json(
+        app,
+        Method::GET,
+        &format!("/api/v1/projects/{}/overview", fixture.project_id),
+        &token,
+        Value::Null,
+        &[StatusCode::OK],
+    )
+    .await;
+    assert!(overview["active_milestones"]
+        .as_array()
+        .is_some_and(|milestones| milestones.iter().any(|entry| {
+            entry["milestone"]["id"] == fixture.milestone_id
+                && entry["milestone"]["lifecycle"] == "released"
+        })));
+
     // The release idempotency key is bound to the complete candidate. A
     // replay after the milestone has moved to `released` is exact, while the
     // same key with a changed readiness digest is a conflict.
@@ -2864,7 +2910,7 @@ async fn create_genesis_project(app: &Router, token: &str, prefix: &str) -> Gene
         "project_mode": "compact",
         "selected_project_agent_identity_id": project_identity,
         "selected_project_agent_profile_revision_id": project_profile,
-        "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@3",
+        "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@4",
         "selected_project_agent_policy_digest": policy_digest
     });
     let approval = request_json(
@@ -3751,7 +3797,7 @@ fn user_authorization_replay_variants(
 fn user_provenance(summary: &str) -> Value {
     json!({
         "author": {"kind": "user", "id": "test-user-id"},
-        "operating_skill_revision": "forge.project.orchestration/v1@3",
+        "operating_skill_revision": "forge.project.orchestration/v1@4",
         "source_refs": [],
         "change_summary": summary
     })

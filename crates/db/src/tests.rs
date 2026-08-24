@@ -6646,7 +6646,7 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
             ),
             (
                 "forge.project.orchestration/v1".to_owned(),
-                "forge.project.orchestration/v1@3".to_owned(),
+                "forge.project.orchestration/v1@4".to_owned(),
             ),
         ],
         "a seeded operating-skill revision must be repointed in the same release (V081 regression)"
@@ -6654,13 +6654,14 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
     let (body, digest): (String, String) = sqlx::query_as(
         "SELECT canonical_body, content_digest
          FROM operating_skill_revision
-         WHERE id = 'forge.project.orchestration/v1@3'",
+         WHERE id = 'forge.project.orchestration/v1@4'",
     )
     .fetch_one(db.pool())
     .await
     .expect("latest Project operating skill reads");
     assert!(body.contains("Never invent aliases such as `ac-1`"));
     assert!(body.contains("Evidence is mandatory proof, not optional decoration"));
+    assert!(body.contains("Never propose or narrate a release from a blocked"));
     assert_eq!(hex::encode(Sha256::digest(body.as_bytes())), digest);
 }
 
@@ -6748,5 +6749,319 @@ async fn append_agent_chat_message_allocates_sequences_and_replays_by_id() {
         count_after,
         count_before + 2,
         "a replay never consumes a sequence"
+    );
+}
+
+#[tokio::test]
+async fn project_delete_tears_down_genesis_chat_and_handoff_rows() {
+    let db = sqlite_db().await;
+    let now = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO user (id, email, password_hash, created_at, updated_at)
+         VALUES ('genesis-user', 'genesis@example.test', 'test', ?, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("user fixture");
+    let project_id = seed_project(&db, "Genesis teardown", Some("genesis-user".to_owned())).await;
+
+    // The account's Main Chat is created by trigger when the user row lands.
+    let main_chat_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM agent_chat WHERE account_id = 'genesis-user' AND kind = 'account_main'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("account main chat");
+    let project_chat_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM agent_chat WHERE project_id = ? AND kind = 'project'",
+    )
+    .bind(&project_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("project chat");
+
+    AgentRepo::create_identity_with_profile(
+        &db,
+        CreateAgentIdentity {
+            id: "teardown-agent".to_owned(),
+            name: "Teardown agent".to_owned(),
+            description: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: Some("genesis-user".to_owned()),
+            visibility: "account".to_owned(),
+            account_permission_ceiling: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        CreateAgentProfile {
+            id: "teardown-profile".to_owned(),
+            identity_id: "teardown-agent".to_owned(),
+            backend_kind: "native".to_owned(),
+            executor_type: "embedded".to_owned(),
+            provider: None,
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "{}".to_owned(),
+            tool_policy_json: "{}".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("teardown identity");
+    for (timeline_id, scope_type, scope_id) in [
+        ("project-lcm", "project", project_id.as_str()),
+        ("chat-lcm", "agent_chat", project_chat_id.as_str()),
+    ] {
+        sqlx::query(
+            "INSERT INTO agent_lcm_timeline
+             (id, identity_id, scope_type, scope_id, authorization_revision,
+              revision, created_at, updated_at)
+             VALUES (?, 'teardown-agent', ?, ?, 'auth-v1', 1, ?, ?)",
+        )
+        .bind(timeline_id)
+        .bind(scope_type)
+        .bind(scope_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("LCM timeline fixture");
+        sqlx::query(
+            "INSERT INTO agent_lcm_entry
+             (timeline_id, entry_id, sequence, content_json, content_fingerprint,
+              source_json, created_at)
+             VALUES (?, 'entry-0', 0, '{}', 'entry-digest', '{}', ?)",
+        )
+        .bind(timeline_id)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("LCM entry fixture");
+        sqlx::query(
+            "INSERT INTO agent_lcm_operation
+             (timeline_id, operation_id, operation_kind, operation_fingerprint,
+              result_revision, result_entries, result_node_id, created_at)
+             VALUES (?, 'leaf-op', 'leaf', 'leaf-op-digest', 1, 1, 'node-0', ?)",
+        )
+        .bind(timeline_id)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("LCM operation fixture");
+        sqlx::query(
+            "INSERT INTO agent_lcm_node
+             (timeline_id, node_id, kind, range_start, range_end, edges_json,
+              source_fingerprint, summary_revision, summary, policy_revision,
+              algorithm_revision, sizer_revision, provenance_json, token_count,
+              source_token_count, classification_json, revision, superseded_by,
+              operation_id, operation_fingerprint, created_at)
+             VALUES (?, 'node-0', 'leaf', 0, 0, '[]', 'source-digest',
+                     'summary-v1', 'summary', 'policy-v1', 'algorithm-v1',
+                     'sizer-v1', '{}', 1, 2, '{}', 1, NULL, 'leaf-op',
+                     'leaf-op-digest', ?)",
+        )
+        .bind(timeline_id)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("LCM node fixture");
+    }
+
+    sqlx::query(
+        "INSERT INTO agent_chat_instruction_revision
+         (id, chat_id, revision, body, created_by_type, created_at)
+         VALUES ('project-instructions', ?, 1, 'build it', 'user', ?)",
+    )
+    .bind(&project_chat_id)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("instruction fixture");
+
+    for (id, chat) in [
+        ("main-message", main_chat_id.as_str()),
+        ("project-message", project_chat_id.as_str()),
+    ] {
+        sqlx::query(
+            "INSERT INTO agent_chat_message
+             (id, chat_id, sequence, author_type, author_id, content, status,
+              correlation_id, created_at)
+             VALUES (?, ?, 0, 'user', 'genesis-user', 'hello', 'complete', 'corr', ?)",
+        )
+        .bind(id)
+        .bind(chat)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("message fixture");
+    }
+
+    sqlx::query(
+        "INSERT INTO agent_handoff
+         (id, source_chat_id, target_chat_id, content, status, correlation_id,
+          dedupe_key, created_at, updated_at)
+         VALUES ('genesis-handoff', ?, ?, 'take it', 'delivered',
+                 'corr', 'dedupe', ?, ?)",
+    )
+    .bind(&main_chat_id)
+    .bind(&project_chat_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("handoff fixture");
+    sqlx::query(
+        "INSERT INTO agent_handoff_delivery
+         (handoff_id, delivery_sequence, status, created_at)
+         VALUES ('genesis-handoff', 1, 'delivered', ?)",
+    )
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("delivery fixture");
+
+    // A wake disposition RESTRICT-references the Project Chat's turn job, which
+    // the Project's removal takes with it.
+    sqlx::query(
+        "INSERT INTO agent_chat_turn_job
+         (id, chat_id, triggering_message_id, canonical_scope_type, canonical_scope_id,
+          status, dedupe_key, correlation_id, created_at, updated_at)
+         VALUES ('project-turn', ?, 'project-message', 'agent_chat',
+                 ?, 'succeeded', 'turn-dedupe', 'corr', ?, ?)",
+    )
+    .bind(&project_chat_id)
+    .bind(&project_chat_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("turn job fixture");
+    sqlx::query(
+        "INSERT INTO domain_event
+         (id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id,
+          correlation_id, created_at)
+         VALUES ('wake-event', 'agent.woke', 'agent_chat', ?, 'system',
+                 'agent_chat', ?, 'corr', ?)",
+    )
+    .bind(&project_chat_id)
+    .bind(&project_chat_id)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("event fixture");
+    sqlx::query(
+        "INSERT INTO agent_wake_disposition
+         (id, consumer_name, source_event_id, source_event_sequence, attempt_number,
+          max_attempts, disposition, reason, turn_job_id, created_at, updated_at)
+         SELECT 'wake-disposition', 'agent-wake', 'wake-event', sequence, 1, 3,
+                'turn_admitted', 'admitted', 'project-turn', ?, ?
+         FROM domain_event WHERE id = 'wake-event'",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("wake disposition fixture");
+    sqlx::query(
+        "INSERT INTO agent_wake_disposition_current
+         (consumer_name, source_event_id, disposition_id, attempt_number, updated_at)
+         VALUES ('agent-wake', 'wake-event', 'wake-disposition', 1, ?)",
+    )
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("current disposition fixture");
+
+    sqlx::query(
+        "INSERT INTO product_genesis_session
+         (id, account_id, main_chat_id, prompt_revision, prompt_body, maturity,
+          lifecycle, project_id, handoff_id, created_at, updated_at)
+         VALUES ('genesis-session', 'genesis-user', ?, 'v1', 'prompt', 'mvp',
+                 'handed_off', ?, 'genesis-handoff', ?, ?)",
+    )
+    .bind(&main_chat_id)
+    .bind(&project_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("genesis session fixture");
+
+    ProjectRepo::delete(&db, &project_id)
+        .await
+        .expect("genesis-born Project tears down");
+
+    for (table, predicate) in [
+        ("project", "id = 'PROJECT'"),
+        ("product_genesis_session", "id = 'genesis-session'"),
+        ("agent_chat", "id = 'PROJECT_CHAT'"),
+        ("agent_chat_message", "id = 'project-message'"),
+        (
+            "agent_chat_instruction_revision",
+            "id = 'project-instructions'",
+        ),
+        ("agent_handoff", "id = 'genesis-handoff'"),
+        ("agent_handoff_delivery", "handoff_id = 'genesis-handoff'"),
+        ("agent_wake_disposition", "id = 'wake-disposition'"),
+        (
+            "agent_wake_disposition_current",
+            "disposition_id = 'wake-disposition'",
+        ),
+        ("agent_lcm_timeline", "id IN ('project-lcm', 'chat-lcm')"),
+        (
+            "agent_lcm_entry",
+            "timeline_id IN ('project-lcm', 'chat-lcm')",
+        ),
+        (
+            "agent_lcm_node",
+            "timeline_id IN ('project-lcm', 'chat-lcm')",
+        ),
+        (
+            "agent_lcm_operation",
+            "timeline_id IN ('project-lcm', 'chat-lcm')",
+        ),
+    ] {
+        let sql = format!(
+            "SELECT COUNT(*) FROM {table} WHERE {}",
+            predicate
+                .replace("PROJECT_CHAT", &project_chat_id)
+                .replace("PROJECT", &project_id)
+        );
+        let count = sqlx::query_scalar::<_, i64>(&sql)
+            .fetch_one(db.pool())
+            .await
+            .unwrap_or_else(|error| panic!("{table} count: {error}"));
+        assert_eq!(count, 0, "{table} row survived Project teardown");
+    }
+
+    // The account's own Chat and its history are outside the Project's scope.
+    let surviving = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM agent_chat_message WHERE id = 'main-message'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("main message count");
+    assert_eq!(surviving, 1);
+
+    // Immutability outside the teardown is unchanged.
+    assert!(
+        sqlx::query("DELETE FROM agent_chat_message WHERE id = 'main-message'")
+            .execute(db.pool())
+            .await
+            .is_err()
     );
 }

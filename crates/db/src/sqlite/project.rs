@@ -433,6 +433,46 @@ impl ProjectRepo for SqliteDb {
             .await?;
 
         for statement in [
+            "DELETE FROM agent_lcm_node WHERE timeline_id IN (
+                 SELECT l.id FROM agent_lcm_timeline l
+                 JOIN project_deletion_guard g ON g.project_id = ?
+                 WHERE (l.scope_type = 'project' AND l.scope_id = g.project_id)
+                    OR (l.scope_type = 'task' AND EXISTS (
+                        SELECT 1 FROM task t WHERE t.id = l.scope_id
+                          AND t.project_id = g.project_id))
+                    OR (l.scope_type = 'agent_chat' AND EXISTS (
+                        SELECT 1 FROM agent_chat c WHERE c.id = l.scope_id
+                          AND c.project_id = g.project_id)))",
+            "DELETE FROM agent_lcm_entry WHERE timeline_id IN (
+                 SELECT l.id FROM agent_lcm_timeline l
+                 JOIN project_deletion_guard g ON g.project_id = ?
+                 WHERE (l.scope_type = 'project' AND l.scope_id = g.project_id)
+                    OR (l.scope_type = 'task' AND EXISTS (
+                        SELECT 1 FROM task t WHERE t.id = l.scope_id
+                          AND t.project_id = g.project_id))
+                    OR (l.scope_type = 'agent_chat' AND EXISTS (
+                        SELECT 1 FROM agent_chat c WHERE c.id = l.scope_id
+                          AND c.project_id = g.project_id)))",
+            "DELETE FROM agent_lcm_operation WHERE timeline_id IN (
+                 SELECT l.id FROM agent_lcm_timeline l
+                 JOIN project_deletion_guard g ON g.project_id = ?
+                 WHERE (l.scope_type = 'project' AND l.scope_id = g.project_id)
+                    OR (l.scope_type = 'task' AND EXISTS (
+                        SELECT 1 FROM task t WHERE t.id = l.scope_id
+                          AND t.project_id = g.project_id))
+                    OR (l.scope_type = 'agent_chat' AND EXISTS (
+                        SELECT 1 FROM agent_chat c WHERE c.id = l.scope_id
+                          AND c.project_id = g.project_id)))",
+            "DELETE FROM agent_lcm_timeline WHERE id IN (
+                 SELECT l.id FROM agent_lcm_timeline l
+                 JOIN project_deletion_guard g ON g.project_id = ?
+                 WHERE (l.scope_type = 'project' AND l.scope_id = g.project_id)
+                    OR (l.scope_type = 'task' AND EXISTS (
+                        SELECT 1 FROM task t WHERE t.id = l.scope_id
+                          AND t.project_id = g.project_id))
+                    OR (l.scope_type = 'agent_chat' AND EXISTS (
+                        SELECT 1 FROM agent_chat c WHERE c.id = l.scope_id
+                          AND c.project_id = g.project_id)))",
             "DELETE FROM media_asset_tombstone WHERE asset_id IN
                  (SELECT id FROM media_asset WHERE project_id = ?)",
             "DELETE FROM project_release_media_pin WHERE project_id = ?",
@@ -468,6 +508,36 @@ impl ProjectRepo for SqliteDb {
                  (SELECT id FROM project_charter WHERE project_id = ?)",
             "DELETE FROM workspace_lease WHERE project_id = ?",
             "DELETE FROM project_charter WHERE project_id = ?",
+            // The Project's Agent Chat is removed by cascade, but the rows that
+            // hang off it are immutable and RESTRICT-referenced, so they have to
+            // go first, while their parents still exist for the guard to match.
+            "DELETE FROM agent_wake_disposition_current WHERE disposition_id IN
+                 (SELECT d.id FROM agent_wake_disposition d
+                  JOIN agent_chat_turn_job j ON j.id = d.turn_job_id
+                  JOIN agent_chat c ON c.id = j.chat_id
+                  WHERE c.project_id = ?)",
+            "DELETE FROM agent_wake_disposition WHERE turn_job_id IN
+                 (SELECT j.id FROM agent_chat_turn_job j
+                  JOIN agent_chat c ON c.id = j.chat_id
+                  WHERE c.project_id = ?)",
+            "DELETE FROM agent_handoff_delivery WHERE handoff_id IN
+                 (SELECT h.id FROM agent_handoff h
+                  JOIN agent_chat c ON c.id = h.source_chat_id OR c.id = h.target_chat_id
+                  WHERE c.project_id = ?)",
+            "DELETE FROM agent_chat_message WHERE chat_id IN
+                 (SELECT id FROM agent_chat WHERE project_id = ?)",
+            // A handed-off Genesis session exists only as this Project's origin
+            // record, and its CHECK forbids the NULL the Project's removal would
+            // otherwise write. It also has to precede the handoff delete for the
+            // same reason. Charters are already gone, so nothing re-parents.
+            "DELETE FROM product_genesis_session WHERE project_id = ?",
+            "DELETE FROM agent_handoff WHERE EXISTS
+                 (SELECT 1 FROM agent_chat c
+                  WHERE c.project_id = ?
+                    AND (c.id = agent_handoff.source_chat_id
+                         OR c.id = agent_handoff.target_chat_id))",
+            "DELETE FROM agent_chat_instruction_revision WHERE chat_id IN
+                 (SELECT id FROM agent_chat WHERE project_id = ?)",
         ] {
             sqlx::query(statement).bind(id).execute(&mut *tx).await?;
         }

@@ -21,7 +21,8 @@ use db::{
 use events::EventBus;
 use forge_agent_host::{
     CanonicalScope, CanonicalScopeType, WorkspaceAccess, MAIN_CHARTER_DRAFT_OPERATION,
-    MAIN_GENESIS_START_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_EXECUTION_BASELINE_OPERATION,
+    MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION, MAIN_GENESIS_START_OPERATION,
+    PROJECT_DOCUMENT_OPERATION, PROJECT_EXECUTION_BASELINE_OPERATION,
 };
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -30,7 +31,8 @@ use crate::{
     test_support::arm_after_domain_commit, AgentActionService, AgentChatService,
     ExecuteProjectOrchestrationActionInput, ExecuteTaskProposalInput,
     MainGenesisCharterDraftRequest, MainGenesisCommandService, MainGenesisDraftCommandInput,
-    MainGenesisDraftPrincipal, MainGenesisStartCommandInput, MainGenesisStartPrincipal,
+    MainGenesisDraftPrincipal, MainGenesisProjectAgentSelectCommandInput,
+    MainGenesisProjectAgentSelectRequest, MainGenesisStartCommandInput, MainGenesisStartPrincipal,
     MainGenesisStartRequest, ProjectArtifactCommandService, ProjectCommandAuthorization,
     ProjectDocumentCreateCommand, ProjectOrchestrationActionService, SendAgentChatMessageInput,
     ServiceError, TaskService, MAIN_BASELINE_OPERATING_SKILL_REVISION,
@@ -295,6 +297,34 @@ fn user_genesis_start_command(idempotency_key: &str, idea: &str) -> MainGenesisS
     }
 }
 
+fn project_agent_selection_command(
+    main_agent_id: &str,
+    project_agent_id: &str,
+    idempotency_key: &str,
+) -> MainGenesisProjectAgentSelectCommandInput {
+    MainGenesisProjectAgentSelectCommandInput {
+        principal: MainGenesisDraftPrincipal::MainAgent {
+            identity_id: main_agent_id.to_owned(),
+            scope: CanonicalScope {
+                scope_type: CanonicalScopeType::Account,
+                scope_id: USER_ID.to_owned(),
+                workspace_access: WorkspaceAccess::Deny,
+            },
+        },
+        request: MainGenesisProjectAgentSelectRequest {
+            genesis_session_id: Some("characterization-genesis".to_owned()),
+            expected_session_version: 1,
+            project_agent_identity_id: project_agent_id.to_owned(),
+        },
+        idempotency_key: idempotency_key.to_owned(),
+        correlation_id: format!("{idempotency_key}:correlation"),
+        causation_id: None,
+        causation_depth: 0,
+        policy_result: "allowed".to_owned(),
+        requested_permission: "propose_discovery".to_owned(),
+    }
+}
+
 struct ActionInput<'a> {
     id: &'a str,
     actor_identity_id: &'a str,
@@ -419,6 +449,57 @@ async fn genesis_start_replays_exactly_and_rejects_changed_input_or_second_sessi
         .await
         .expect_err("a second active Genesis session is rejected");
     assert!(active_conflict.to_string().contains("already active"));
+}
+
+#[tokio::test]
+async fn main_agent_selects_the_structured_project_agent_with_exact_replay() {
+    let (db, _, main_agent_id) = main_fixture().await;
+    let selected_id = "characterization-selected-project-agent";
+    insert_identity(&db, selected_id, r#"{"permissions":["read_project"]}"#).await;
+    let service = MainGenesisCommandService::new(Arc::clone(&db));
+    let command = project_agent_selection_command(
+        &main_agent_id,
+        selected_id,
+        "characterization-project-agent-selection",
+    );
+
+    let first = service
+        .select_project_agent(command.clone())
+        .await
+        .expect("structured Project Agent selection commits");
+    assert!(!first.replayed);
+    assert_eq!(first.selection.identity_id, selected_id);
+    assert_eq!(first.session.version, 2);
+    assert_eq!(
+        first.session.preferred_project_agent_identity_id.as_deref(),
+        Some(selected_id)
+    );
+
+    let replay = service
+        .select_project_agent(command)
+        .await
+        .expect("structured Project Agent selection replays");
+    assert!(replay.replayed);
+    assert_eq!(replay.receipt_id, first.receipt_id);
+    assert_eq!(replay.event_id, first.event_id);
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM command_receipt WHERE operation = ?",
+            Some(MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION),
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM domain_event WHERE event_type = 'product_genesis.project_agent_selected'",
+            None,
+        )
+        .await,
+        1
+    );
 }
 
 #[tokio::test]

@@ -332,9 +332,14 @@ async fn load_active_milestones(
                 blocker_reason_json, stale_reason_json,
                 reconciliation_reason_json, version, created_at, updated_at
          FROM project_milestone
-         WHERE project_id = ? AND lifecycle IN ('active', 'ready_for_release')
+         WHERE project_id = ?
+           AND (
+                lifecycle IN ('active', 'ready_for_release')
+                OR id = (SELECT primary_milestone_id FROM project WHERE id = ?)
+           )
          ORDER BY milestone_sequence ASC, id ASC",
     )
+    .bind(project_id)
     .bind(project_id)
     .fetch_all(state.db.pool())
     .await

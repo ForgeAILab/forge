@@ -362,6 +362,29 @@ async fn readiness_persists_reconciliation_when_baseline_matrix_is_absent_from_c
             .expect("milestone reconciliation projection");
     assert!(reconciliation.contains("reconciliation_required"));
     assert!(reconciliation.contains("missing-check"));
+
+    let error = ProjectMilestoneCommandService::new(Arc::clone(&db))
+        .request_release(
+            release_command("blocked-release-candidate", &snapshot),
+            None,
+        )
+        .await
+        .expect_err("a blocked readiness result cannot become a release candidate");
+    let message = error.to_string();
+    assert!(message.contains("readiness is blocked"));
+    assert!(message.contains("reconciliation_required"));
+    assert!(message.contains("do not claim Known Issues: None"));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM command_receipt
+             WHERE operation = ? AND idempotency_key = 'blocked-release-candidate'",
+        )
+        .bind(PROJECT_RELEASE_OPERATION)
+        .fetch_one(db.pool())
+        .await
+        .expect("blocked release candidate receipt count"),
+        0
+    );
 }
 
 struct ReceiptInput<'a> {

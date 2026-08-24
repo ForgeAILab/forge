@@ -3,18 +3,21 @@
 //! Resolves the Project Agent revision set a Genesis Charter approval will
 //! bind.  The session's preferred identity wins while it is still eligible;
 //! otherwise Forge auto-selects a deterministic eligible agent so approval is
-//! never blocked on an explicit pick the Main Agent did not make.  An agent
+//! never blocked on an explicit pick the Main Agent did not make.  A stored
+//! preference is authoritative: Forge never silently substitutes another
+//! identity when that preference becomes ineligible. An agent
 //! is eligible when the account owns it, it is not paused, its current
 //! profile row exists, and it is not the account's active Main Agent.
 
 use api_types::ProductGenesisSession;
 use db::{AgentProfileRepo, AgentRepo, SqliteDb};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{Result, ServiceError, PROJECT_OPERATING_SKILL_KEY};
 
 /// The exact revision set frozen into an approval for one Project Agent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenesisAgentSelection {
     pub identity_id: String,
     pub display_name: String,
@@ -56,23 +59,22 @@ pub async fn current_project_agent_operating_skill_revision(db: &SqliteDb) -> Re
 
 /// Resolve the Project Agent selection for a Genesis session.
 ///
-/// Returns `None` only when the account has no eligible agent at all.
+/// Returns `None` when there is no automatic candidate, or when a persisted
+/// preference is no longer eligible. A stored preference is never replaced by
+/// a fallback behind the user's back.
 pub async fn resolve_genesis_project_agent(
     db: &SqliteDb,
     session: &ProductGenesisSession,
 ) -> Result<Option<GenesisAgentSelection>> {
     let operating_skill_revision = current_project_agent_operating_skill_revision(db).await?;
     if let Some(preferred) = session.preferred_project_agent_identity_id.as_deref() {
-        if let Some(selection) = eligible_selection(
+        return eligible_selection(
             db,
             preferred,
             &session.account_id,
             &operating_skill_revision,
         )
-        .await?
-        {
-            return Ok(Some(selection));
-        }
+        .await;
     }
     let Some(candidate_id) = auto_pick_candidate(db, &session.account_id).await? else {
         return Ok(None);
@@ -84,6 +86,75 @@ pub async fn resolve_genesis_project_agent(
         &operating_skill_revision,
     )
     .await
+}
+
+/// Resolve one explicitly requested Project Agent without substituting a
+/// fallback. Main-Agent and guided-setup commands use this before persisting a
+/// preference, so the structured selection the user reviews cannot disagree
+/// with the identity Forge will later freeze into Charter approval.
+pub async fn resolve_requested_genesis_project_agent(
+    db: &SqliteDb,
+    session: &ProductGenesisSession,
+    identity_id: &str,
+) -> Result<GenesisAgentSelection> {
+    let identity_id = identity_id.trim();
+    if identity_id.is_empty() {
+        return Err(ServiceError::invalid_operation(
+            "Project Agent identity id is required",
+        ));
+    }
+    let operating_skill_revision = current_project_agent_operating_skill_revision(db).await?;
+    eligible_selection(
+        db,
+        identity_id,
+        &session.account_id,
+        &operating_skill_revision,
+    )
+    .await?
+    .ok_or_else(|| {
+        ServiceError::invalid_operation(format!(
+            "Project Agent {identity_id} is not an eligible account-owned identity"
+        ))
+    })
+}
+
+/// List every identity the user may explicitly select for this Genesis
+/// session. Auto-selection is intentionally stricter (see
+/// [`auto_pick_candidate`]); a user can still deliberately choose a locally
+/// authenticated CLI identity after reviewing it.
+pub async fn list_genesis_project_agents(
+    db: &SqliteDb,
+    session: &ProductGenesisSession,
+) -> Result<Vec<GenesisAgentSelection>> {
+    let operating_skill_revision = current_project_agent_operating_skill_revision(db).await?;
+    let ids = sqlx::query_scalar::<_, String>(
+        "SELECT identity.id
+         FROM agent_identity AS identity
+         JOIN agent_profile AS profile
+           ON profile.id = identity.selected_profile_id
+          AND profile.identity_id = identity.id
+         WHERE identity.owner_id = ?
+           AND identity.paused = 0
+           AND identity.archived_at IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM account_main_agent_binding AS main_binding
+               WHERE main_binding.identity_id = identity.id
+                 AND main_binding.state = 'active'
+           )
+         ORDER BY identity.created_at ASC, identity.id ASC",
+    )
+    .bind(&session.account_id)
+    .fetch_all(db.pool())
+    .await?;
+    let mut selections = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(selection) =
+            eligible_selection(db, &id, &session.account_id, &operating_skill_revision).await?
+        {
+            selections.push(selection);
+        }
+    }
+    Ok(selections)
 }
 
 /// Deterministic fallback: the oldest unpaused agent the account owns that has
@@ -98,6 +169,8 @@ async fn auto_pick_candidate(db: &SqliteDb, account_id: &str) -> Result<Option<S
           AND profile.identity_id = identity.id
          WHERE identity.owner_id = ?
            AND identity.paused = 0
+           AND identity.archived_at IS NULL
+           AND (identity.is_default = 0 OR profile.credential_ref IS NOT NULL)
            AND NOT EXISTS (
                SELECT 1 FROM account_main_agent_binding AS main_binding
                WHERE main_binding.identity_id = identity.id
@@ -261,7 +334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preferred_agent_wins_and_an_ineligible_preference_falls_back() {
+    async fn preferred_agent_wins_and_an_ineligible_preference_never_falls_back() {
         let db = fixture().await;
         create_agent(&db, "agent-a", "2026-01-01T00:00:00Z").await;
         create_agent(&db, "agent-b", "2026-01-02T00:00:00Z").await;
@@ -278,9 +351,32 @@ mod tests {
             .expect("pause");
         let selection = resolve_genesis_project_agent(&db, &session(Some("agent-b")))
             .await
+            .expect("resolve");
+        assert!(selection.is_none());
+    }
+
+    #[tokio::test]
+    async fn auto_pick_skips_credentialless_cli_defaults() {
+        let db = fixture().await;
+        create_agent(&db, "default-cli", "2026-01-01T00:00:00Z").await;
+        create_agent(&db, "configured", "2026-01-02T00:00:00Z").await;
+        sqlx::query("UPDATE agent_identity SET is_default = 1 WHERE id = 'default-cli'")
+            .execute(db.pool())
+            .await
+            .expect("mark default");
+
+        let selection = resolve_genesis_project_agent(&db, &session(None))
+            .await
             .expect("resolve")
-            .expect("selection");
-        assert_eq!(selection.identity_id, "agent-a");
+            .expect("configured selection");
+        assert_eq!(selection.identity_id, "configured");
+
+        // Explicit selection remains available for a CLI identity whose
+        // authentication is managed outside Forge's provider-entry store.
+        let explicit = resolve_requested_genesis_project_agent(&db, &session(None), "default-cli")
+            .await
+            .expect("explicit identity remains selectable");
+        assert_eq!(explicit.identity_id, "default-cli");
     }
 
     #[tokio::test]

@@ -175,8 +175,10 @@ pub use external_sync::ExternalSyncService;
 pub use integration_service::IntegrationService;
 pub use main_genesis_commands::{
     MainGenesisCharterDraftRequest, MainGenesisCharterDraftResult, MainGenesisCommandService,
-    MainGenesisDraftCommandInput, MainGenesisDraftPrincipal, MainGenesisStartCommandInput,
-    MainGenesisStartPrincipal, MainGenesisStartRequest, MainGenesisStartResult,
+    MainGenesisDraftCommandInput, MainGenesisDraftPrincipal,
+    MainGenesisProjectAgentSelectCommandInput, MainGenesisProjectAgentSelectRequest,
+    MainGenesisProjectAgentSelectResult, MainGenesisStartCommandInput, MainGenesisStartPrincipal,
+    MainGenesisStartRequest, MainGenesisStartResult,
 };
 pub use main_orchestration_actions::{
     ExecuteMainOrchestrationActionInput, MainOrchestrationActionService,
@@ -234,8 +236,9 @@ pub use project_agent_actions::{
     ExecuteProjectOrchestrationActionInput, ProjectOrchestrationActionService,
 };
 pub use project_agent_selection::{
-    current_project_agent_operating_skill_revision, project_agent_policy_digest,
-    resolve_genesis_project_agent, GenesisAgentSelection,
+    current_project_agent_operating_skill_revision, list_genesis_project_agents,
+    project_agent_policy_digest, resolve_genesis_project_agent,
+    resolve_requested_genesis_project_agent, GenesisAgentSelection,
 };
 pub use project_artifact_commands::{
     ProjectArtifactCommandService, ProjectCommandAuthorization, ProjectDocumentApprovalCommand,

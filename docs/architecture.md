@@ -136,6 +136,15 @@ role/`is_primary` combination to resolve. Connection health never grants
 Project, Task, or filesystem access; an identity appears in the chat switcher
 only when it is explicitly bound as Main or Project Agent.
 
+Product Genesis stores Project Agent choice as a structured identity reference,
+separate from Charter prose. The Main Agent can list the exact eligible
+identities and persist one selection through receipt-backed native operations;
+Charter approval freezes that same identity/profile/skill/policy set. Once a
+preference exists it is authoritative: an ineligible choice blocks approval
+instead of silently substituting another identity. Automatic selection and
+execution-role provisioning never choose a credential-less bootstrap default,
+although a user may explicitly select a locally authenticated CLI identity.
+
 The singular role boundary is enforced by the authenticated binding and the
 Task scheduler, not by model instructions:
 
@@ -457,10 +466,12 @@ Milestone definition revisions use only `draft`, `proposed`, `approved`, and
 `ready_for_release`, `released`, and `cancelled`; blockers, stale results, and
 `reconciliation_required` remain typed projections while an unreleased
 milestone is `active`. Multiple milestones may be active, and the Project keeps
-an explicit `primary_milestone_id` whenever at least one milestone is `active`;
-planned or `ready_for_release` milestones do not require that pointer, and it
-is cleared when the last active milestone leaves that state. The primary is
-never inferred from recency or Task counts. Compact Project creation supplies
+an explicit `primary_milestone_id` whenever at least one milestone is `active`.
+Once selected, that pointer remains on the emphasized outcome while it advances
+through `ready_for_release` and `released`; delivery does not erase the
+Project's milestone context. It is repaired only when the target is removed
+from the intended outcome set, such as cancellation. The primary is never
+inferred from recency or Task counts. Compact Project creation supplies
 `M001` (shown as `M1 — Deliver outcome`) when no other definition is present.
 Each required compact acceptance check is created with a required evidence
 requirement carrying the same stable ID; a passing result never substitutes
@@ -501,9 +512,12 @@ Agent does not have to reconstruct them from validation errors.
 A Project Agent readiness action invokes the same `MilestoneRuntime`
 evaluation as the authenticated REST route and returns the committed snapshot;
 it is not a request event awaiting an absent consumer. A Project Agent release
-candidate remains non-authoritative: Forge validates the exact ready snapshot
-and milestone version, records the candidate, and raises human attention for
-the user-only release decision. The candidate-request event is an attention
+candidate remains non-authoritative: Forge admits it only for the exact current
+`ready` snapshot and milestone version, records the candidate, and raises human
+attention for the user-only release decision. Blocked, failed, and stale
+snapshots return their canonical reasons and create no candidate; the operating
+contract requires the agent to report those blockers rather than claim a
+release or `Known Issues: None`. The candidate-request event is an attention
 projection only; it does not change the governed readiness inputs or advance
 the readiness source watermark. A candidate therefore cannot make its own
 readiness snapshot stale, and it cannot be treated as a release approval.
@@ -672,7 +686,9 @@ or verifies a local git repository (first commit on `main`) under
 `<workspace_root>/repos/`, registers or reuses one matching logical repository,
 links it with Project-version CAS, and resolves canonical Worker and (when
 required) independent-reviewer assignments from current workflow/baseline
-policy. Main/Project-bound identities are never eligible. A missing Worker or
+policy. Main/Project-bound identities are never eligible, and a credential-less
+bootstrap default is never chosen automatically (an explicit assignment remains
+possible for locally managed CLI authentication). A missing Worker or
 reviewer is a typed `setup_required` blocker in the current setup projection;
 it is not an operator-only log or an executable success. Replays reuse the
 operation, checkpoint target path, directory, repository row, Project link,
@@ -717,11 +733,15 @@ rules make replay safe without inventing approval or silently substituting a
 name, Charter revision, artifact, or evidence asset.
 
 Project deletion is a transactionally guarded teardown. It removes the
-Project-owned immutable graph in dependency order and then the Project itself;
-the database permits those deletes only while the exact Project deletion guard
-is active. Direct attempts to mutate or delete an individual immutable Charter,
-milestone, readiness, release, decision, baseline, lease, or evidence record
-remain rejected.
+Project-owned immutable graph in dependency order — including Project/Task/
+Project-Chat LCM timelines, entries, operations, and nodes — and then the
+Project itself; the database permits those deletes only while the exact Project
+deletion guard is active. The API first stages Forge-managed repositories that
+are direct children of `<workspace_root>/repos`, restores them if the database
+transaction fails, and removes them after commit. Arbitrary linked repositories
+outside that root are never removed. Direct attempts to mutate or delete an
+individual immutable Charter, milestone, readiness, release, decision,
+baseline, lease, or evidence record remain rejected.
 
 ### Direct Agent Runtime host and LCM
 

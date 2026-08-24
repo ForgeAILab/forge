@@ -281,6 +281,7 @@ async fn resolve_project_execution_roles_with_mode(
                     .then(|| {
                         candidates
                             .iter()
+                            .filter(|agent| auto_selectable_execution_agent(agent))
                             .find(|agent| Some(agent.id.as_str()) != worker_identity_id.as_deref())
                             .map(|agent| agent.id.clone())
                     })
@@ -508,9 +509,20 @@ fn resolve_role_identity(
             return Some(configured.clone());
         }
     }
-    allow_preflight_fallback
-        .then(|| candidates.first().map(|agent| agent.id.clone()))
-        .flatten()
+    allow_preflight_fallback.then(|| {
+        candidates
+            .iter()
+            .find(|agent| auto_selectable_execution_agent(agent))
+            .map(|agent| agent.id.clone())
+    })?
+}
+
+/// Bootstrap defaults are discovery conveniences, not proof that a Task can
+/// authenticate. They remain available for an explicit user assignment (the
+/// daemon may own local CLI auth), but provisioning never silently chooses a
+/// credential-less default for Worker or reviewer authority.
+fn auto_selectable_execution_agent(agent: &Agent) -> bool {
+    !agent.is_default || agent.credential_ref.is_some()
 }
 
 fn role_setup_requirement(role: &str, capability: &str, action: RetryAction) -> SetupRequirement {
@@ -600,5 +612,52 @@ mod tests {
         requirement.resource_type = Some("agent_identity".to_owned());
         assert_eq!(requirement.role.as_deref(), Some("independent_reviewer"));
         assert_eq!(requirement.capability.as_deref(), Some("repository_read"));
+    }
+
+    #[test]
+    fn provisioning_does_not_auto_pick_a_credentialless_default() {
+        let agent = Agent {
+            id: "default-cli".to_owned(),
+            name: "CLI Default".to_owned(),
+            description: None,
+            profile_id: "profile-1".to_owned(),
+            backend_kind: "cli".to_owned(),
+            executor_type: "claude_code".to_owned(),
+            provider: None,
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "[]".to_owned(),
+            tool_policy_json: "{}".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: db::AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: true,
+            paused: false,
+            owner_id: Some("user-1".to_owned()),
+            visibility: "account".to_owned(),
+            version: 1,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+        };
+        assert!(!auto_selectable_execution_agent(&agent));
+
+        let explicitly_configured = resolve_role_identity(
+            Some("worker"),
+            Some(&agent.id),
+            std::slice::from_ref(&agent),
+            true,
+        );
+        assert_eq!(explicitly_configured.as_deref(), Some("default-cli"));
+        assert_eq!(
+            resolve_role_identity(Some("worker"), None, &[agent], true),
+            None
+        );
     }
 }

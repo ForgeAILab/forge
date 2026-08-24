@@ -45,6 +45,7 @@ pub use native::NativeAgentRuntimeBackend;
 pub use operation_catalog::{
     MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
     MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION, MAIN_CHARTER_READINESS_OPERATION,
+    MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION, MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
     MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION, MIGRATED_OPERATION_CONTRACTS,
     OperationClassification, OperationContract, OperationDescriptor, OperationExposure,
     OperationInputContract, OperationOutputContract, OperationPermission, OperationSetupExposure,

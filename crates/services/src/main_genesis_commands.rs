@@ -24,7 +24,8 @@ use db::{
     ProjectCharterRecord, ProjectCharterRevisionRecord, ProjectOrchestrationRepo, SqliteDb,
 };
 use forge_agent_host::{
-    CanonicalScope, CanonicalScopeType, MAIN_CHARTER_DRAFT_OPERATION, MAIN_GENESIS_START_OPERATION,
+    CanonicalScope, CanonicalScopeType, MAIN_CHARTER_DRAFT_OPERATION,
+    MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION, MAIN_GENESIS_START_OPERATION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -37,9 +38,10 @@ use crate::{
         PreparedAgentTurnAdmission,
     },
     evaluate_project_charter_readiness, render_and_digest_charter, render_product_genesis_prompt,
-    AuthorizationProvenance, CommandContext, CommandPrincipal, CommandScope, CommandScopeType,
-    ExpectedCommandState, GenesisPromptContext, NewCommandContext, ProductGenesisService, Result,
-    ServiceError, CHARTER_READINESS_POLICY_VERSION, MAIN_OPERATING_SKILL_KEY,
+    resolve_requested_genesis_project_agent, AuthorizationProvenance, CommandContext,
+    CommandPrincipal, CommandScope, CommandScopeType, ExpectedCommandState, GenesisAgentSelection,
+    GenesisPromptContext, NewCommandContext, ProductGenesisService, Result, ServiceError,
+    CHARTER_READINESS_POLICY_VERSION, MAIN_OPERATING_SKILL_KEY,
 };
 
 const CHARTER_SCHEMA_VERSION: &str = "forge.project-charter/v1";
@@ -95,6 +97,40 @@ pub struct MainGenesisStartResult {
     pub source_turn_id: Option<String>,
     pub admitted_turn_id: String,
     pub control_transfer: bool,
+    pub result: Value,
+}
+
+/// Typed native request for changing the structured Project Agent preference
+/// during Product Genesis. Charter prose is deliberately absent: the exact
+/// identity is a separate authority-bearing field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MainGenesisProjectAgentSelectRequest {
+    #[serde(default)]
+    pub genesis_session_id: Option<String>,
+    pub expected_session_version: i64,
+    pub project_agent_identity_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MainGenesisProjectAgentSelectCommandInput {
+    pub principal: MainGenesisDraftPrincipal,
+    pub request: MainGenesisProjectAgentSelectRequest,
+    pub idempotency_key: String,
+    pub correlation_id: String,
+    pub causation_id: Option<String>,
+    pub causation_depth: i64,
+    pub policy_result: String,
+    pub requested_permission: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MainGenesisProjectAgentSelectResult {
+    pub receipt_id: String,
+    pub event_id: String,
+    pub replayed: bool,
+    pub session: ProductGenesisSession,
+    pub selection: GenesisAgentSelection,
     pub result: Value,
 }
 
@@ -872,6 +908,264 @@ impl MainGenesisCommandService {
             source_turn_id,
             admitted_turn_id,
             control_transfer,
+            result,
+        })
+    }
+
+    /// Persist the structured Project Agent selection the user will later see
+    /// and approve. This command is independent of Charter prose and is exact-
+    /// replay safe through the same command-receipt boundary as Genesis start
+    /// and Charter drafting.
+    pub async fn select_project_agent(
+        &self,
+        mut input: MainGenesisProjectAgentSelectCommandInput,
+    ) -> Result<MainGenesisProjectAgentSelectResult> {
+        let (principal, account_id, canonical_scope, actor_type, actor_id) =
+            self.resolve_principal(&input.principal).await?;
+        input.request.genesis_session_id = input
+            .request
+            .genesis_session_id
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        input.request.project_agent_identity_id = required_value(
+            "Project Agent identity id",
+            &input.request.project_agent_identity_id,
+        )?;
+        if input.request.expected_session_version < 1 {
+            return Err(ServiceError::invalid_operation(
+                "expected Product Genesis session version must be at least 1",
+            ));
+        }
+        let context = CommandContext::from_authorized_input(
+            NewCommandContext {
+                principal,
+                canonical_scope,
+                operation: MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION.to_owned(),
+                idempotency_key: required_value("idempotency key", &input.idempotency_key)?,
+                expected_state: ExpectedCommandState {
+                    versions: BTreeMap::from([(
+                        "product_genesis_session".to_owned(),
+                        input.request.expected_session_version,
+                    )]),
+                    digests: BTreeMap::new(),
+                },
+                authorization_provenance: Some(AuthorizationProvenance {
+                    policy_result: input.policy_result.clone(),
+                    policy_revision: None,
+                    policy_digest: None,
+                    requested_permission: Some(input.requested_permission.clone()),
+                }),
+                action_provenance: None,
+                correlation_id: required_value("correlation id", &input.correlation_id)?,
+                causation_id: input.causation_id.clone(),
+                causation_depth: input.causation_depth,
+            },
+            &input.request,
+        )
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "serialize Project Agent selection input digest: {error}"
+            ))
+        })?;
+
+        if let Some(receipt) = CommandReceiptRepo::get_command_receipt(
+            &*self.db,
+            context.principal().principal_type(),
+            context.principal().principal_id(),
+            context.canonical_scope().scope_type().as_str(),
+            context.canonical_scope().scope_id(),
+            context.operation(),
+            context.idempotency_key(),
+            context.input_digest(),
+        )
+        .await?
+        {
+            return self.replay_project_agent_selection(receipt).await;
+        }
+
+        self.authorize_current_principal(&input.principal, &account_id)
+            .await?;
+        if input.policy_result != "allowed" || input.requested_permission != "propose_discovery" {
+            return Err(ServiceError::AuthorizationDenied {
+                message: "Project Agent selection requires admitted Main discovery authority"
+                    .to_owned(),
+            });
+        }
+
+        let session_id = match input.request.genesis_session_id.as_deref() {
+            Some(id) => id.to_owned(),
+            None => sqlx::query_scalar::<_, String>(
+                "SELECT id FROM product_genesis_session
+                 WHERE account_id = ? AND lifecycle = 'discovering'
+                 ORDER BY updated_at DESC, id DESC LIMIT 1",
+            )
+            .bind(&account_id)
+            .fetch_optional(self.db.pool())
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found("product_genesis_session", account_id.clone())
+            })?,
+        };
+        let genesis = ProductGenesisService::for_sqlite(Arc::clone(&self.db));
+        let session = genesis.get(&session_id).await?;
+        if session.account_id != account_id {
+            return Err(ServiceError::not_found(
+                "product_genesis_session",
+                session_id,
+            ));
+        }
+        if session.lifecycle != ProductGenesisLifecycle::Discovering {
+            return Err(ServiceError::invalid_operation(
+                "Project Agent selection is closed after Charter approval or Genesis handoff",
+            ));
+        }
+        if session.version != input.request.expected_session_version {
+            return Err(ServiceError::Db(db::DbError::VersionConflict));
+        }
+        let selection = resolve_requested_genesis_project_agent(
+            &self.db,
+            &session,
+            &input.request.project_agent_identity_id,
+        )
+        .await?;
+
+        let now = now_rfc3339();
+        let event_id = new_uuid_v4();
+        let receipt_id = new_uuid_v4();
+        let outcome = json!({
+            "operation": MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
+            "genesis_session_id": session.id,
+            "session_version": session.version + 1,
+            "selected_project_agent": selection,
+            "receipt_id": receipt_id,
+            "event_id": event_id,
+        });
+        let outcome_json = outcome.to_string();
+        let mut transaction = db::begin_immediate(self.db.pool()).await?;
+        if let Some(receipt) = CommandReceiptRepo::get_command_receipt_in_tx(
+            &*self.db,
+            &mut transaction,
+            context.principal().principal_type(),
+            context.principal().principal_id(),
+            context.canonical_scope().scope_type().as_str(),
+            context.canonical_scope().scope_id(),
+            context.operation(),
+            context.idempotency_key(),
+            context.input_digest(),
+        )
+        .await?
+        {
+            transaction.rollback().await?;
+            return self.replay_project_agent_selection(receipt).await;
+        }
+        let changed = sqlx::query(
+            "UPDATE product_genesis_session
+             SET preferred_project_agent_identity_id = ?, version = version + 1,
+                 updated_at = ?
+             WHERE id = ? AND account_id = ? AND lifecycle = 'discovering'
+               AND version = ?",
+        )
+        .bind(&selection.identity_id)
+        .bind(&now)
+        .bind(&session.id)
+        .bind(&account_id)
+        .bind(input.request.expected_session_version)
+        .execute(&mut *transaction)
+        .await?;
+        if changed.rows_affected() != 1 {
+            return Err(ServiceError::Db(db::DbError::VersionConflict));
+        }
+        let event = DomainEventRepo::append_event_in_tx(
+            &*self.db,
+            &mut transaction,
+            &CreateDomainEvent {
+                id: event_id,
+                event_type: "product_genesis.project_agent_selected".to_owned(),
+                entity_type: "product_genesis_session".to_owned(),
+                entity_id: session.id.clone(),
+                actor_type,
+                actor_id: Some(actor_id),
+                scope_type: "account".to_owned(),
+                scope_id: account_id,
+                correlation_id: input.correlation_id.clone(),
+                causation_id: input.causation_id.clone(),
+                causation_depth: input.causation_depth,
+                dedupe_key: Some(format!("genesis.project-agent.select:{receipt_id}:event")),
+                payload_json: outcome_json.clone(),
+                created_at: now.clone(),
+            },
+        )
+        .await?;
+        let receipt = CommandReceiptRepo::create_command_receipt_in_tx(
+            &*self.db,
+            &mut transaction,
+            CreateCommandReceipt {
+                id: receipt_id,
+                principal_type: context.principal().principal_type().to_owned(),
+                principal_id: context.principal().principal_id().to_owned(),
+                scope_type: context.canonical_scope().scope_type().as_str().to_owned(),
+                scope_id: context.canonical_scope().scope_id().to_owned(),
+                operation: context.operation().to_owned(),
+                idempotency_key: context.idempotency_key().to_owned(),
+                input_digest: context.input_digest().to_owned(),
+                policy_result: input.policy_result,
+                correlation_id: input.correlation_id,
+                causation_id: input.causation_id,
+                causation_depth: input.causation_depth,
+                event_id: event.id,
+                agent_action_execution_id: None,
+                outcome_json,
+                committed_at: now,
+            },
+        )
+        .await?;
+        transaction.commit().await?;
+        self.project_agent_selection_result(receipt, false).await
+    }
+
+    async fn replay_project_agent_selection(
+        &self,
+        receipt: CommandReceipt,
+    ) -> Result<MainGenesisProjectAgentSelectResult> {
+        self.project_agent_selection_result(receipt, true).await
+    }
+
+    async fn project_agent_selection_result(
+        &self,
+        receipt: CommandReceipt,
+        replayed: bool,
+    ) -> Result<MainGenesisProjectAgentSelectResult> {
+        let mut result: Value = serde_json::from_str(&receipt.outcome_json)
+            .map_err(|_| ServiceError::Db(db::DbError::IdempotencyConflict))?;
+        let session_id = result
+            .get("genesis_session_id")
+            .and_then(Value::as_str)
+            .ok_or(ServiceError::Db(db::DbError::IdempotencyConflict))?;
+        let selection: GenesisAgentSelection = result
+            .get("selected_project_agent")
+            .cloned()
+            .ok_or(ServiceError::Db(db::DbError::IdempotencyConflict))
+            .and_then(|value| {
+                serde_json::from_value(value)
+                    .map_err(|_| ServiceError::Db(db::DbError::IdempotencyConflict))
+            })?;
+        let session = ProductGenesisService::for_sqlite(Arc::clone(&self.db))
+            .get(session_id)
+            .await?;
+        if session.preferred_project_agent_identity_id.as_deref()
+            != Some(selection.identity_id.as_str())
+        {
+            return Err(ServiceError::Conflict(
+                "Project Agent selection receipt disagrees with Product Genesis".to_owned(),
+            ));
+        }
+        result["replayed"] = Value::Bool(replayed);
+        Ok(MainGenesisProjectAgentSelectResult {
+            receipt_id: receipt.id,
+            event_id: receipt.event_id,
+            replayed,
+            session,
+            selection,
             result,
         })
     }

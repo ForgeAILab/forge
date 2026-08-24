@@ -286,7 +286,7 @@ async fn product_genesis_approval_creates_one_exact_project_and_handoff() {
     assert_eq!(selected_agent.profile_revision_id, connected.profile.id);
     assert_eq!(
         selected_agent.operating_skill_revision,
-        "forge.project.orchestration/v1@3"
+        "forge.project.orchestration/v1@4"
     );
 
     let content = exact_charter_content();

@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use crate::operation_catalog::{
     MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
     MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION, MAIN_CHARTER_READINESS_OPERATION,
+    MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION, MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
     MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
     PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION,
@@ -362,6 +363,20 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
             }),
             &["action"],
         ),
+        MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION => described_object_schema(
+            json!({
+                "action":{"const":"select"},
+                "genesis_session_id":string_or_null_schema(),
+                "expected_session_version":{"type":"integer","minimum":1},
+                "project_agent_identity_id":{"type":"string","minLength":1}
+            }),
+            &[
+                "action",
+                "expected_session_version",
+                "project_agent_identity_id",
+            ],
+            "Persist the exact structured Project Agent preference for the active Product Genesis session. Read genesis.project_agents.read first; Charter approval will freeze this identity's current profile, operating-skill revision, and policy digest. This operation never changes Charter prose.",
+        ),
         MAIN_CHARTER_DRAFT_OPERATION => object_schema(
             json!({
                 "action":{"const":"save_revision"},"charter_id":{"type":"string","minLength":1},"base_revision_id":string_or_null_schema(),"project_mode":{"type":"string","enum":["compact","standard"]},"maturity":{"type":"string","enum":["prototype","mvp","production","critical"]},"content":charter_content_schema(),"rendered_view":{"type":"string","minLength":1,"description":"Omit. The server renders the canonical view from content; provide only to round-trip an exact server-rendered value."},"render_version":{"type":"string","minLength":1,"description":"Omit. The server stamps its own render version; provide only to round-trip an exact server value."},"provenance":revision_provenance_schema()
@@ -601,7 +616,7 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
                 "readiness_snapshot_id",
                 "readiness_digest",
             ],
-            "Project Agent release candidate only. This submits a user-release request; it never approves, executes, or creates a final release manifest.",
+            "Project Agent release candidate only. Invoke this only for an exact current ReadinessSnapshot whose result is ready. A blocked, failed, or stale snapshot must be reported with every canonical blocker and must never be described as a release proposal or as Known Issues: None. This submits a user-release request; it never approves, executes, or creates a final release manifest.",
         ),
         TASK_PROPOSE_OPERATION => described_object_schema(
             json!({
@@ -1063,6 +1078,11 @@ pub(crate) fn orchestration_proposal_schema(operations: &BTreeSet<String>) -> Va
 
 pub(crate) fn orchestration_read_arguments_schema(operation: &str) -> Value {
     match operation {
+        MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION => described_object_schema(
+            json!({"genesis_session_id":string_or_null_schema()}),
+            &[],
+            "List the exact account-owned Project Agent identities eligible for explicit selection in the active Product Genesis session, plus the currently persisted preference and resolved approval selection.",
+        ),
         MAIN_CHARTER_READ_OPERATION => object_schema(
             json!({"charter_id":string_or_null_schema(),"revision_id":string_or_null_schema(),"genesis_session_id":string_or_null_schema()}),
             &[],
@@ -1341,6 +1361,28 @@ mod tests {
         ] {
             assert!(!properties.contains_key(forbidden));
         }
+    }
+
+    #[test]
+    fn project_agent_selection_contract_is_structured_and_has_no_charter_prose() {
+        let read = orchestration_read_arguments_schema(MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION);
+        assert_eq!(read["additionalProperties"], false);
+        assert!(read["properties"].get("genesis_session_id").is_some());
+
+        let select = orchestration_payload_schema(MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION);
+        assert_eq!(select["additionalProperties"], false);
+        assert_eq!(select["properties"]["action"]["const"], "select");
+        assert_eq!(
+            select["required"],
+            json!([
+                "action",
+                "expected_session_version",
+                "project_agent_identity_id"
+            ])
+        );
+        let properties = select["properties"].as_object().expect("properties");
+        assert!(!properties.contains_key("charter_content"));
+        assert!(!properties.contains_key("charter_prose"));
     }
 
     #[test]

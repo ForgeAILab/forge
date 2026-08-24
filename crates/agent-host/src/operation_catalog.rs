@@ -14,6 +14,8 @@ use crate::CanonicalScopeType;
 
 pub const MAIN_CHARTER_READ_OPERATION: &str = "charter.read";
 pub const MAIN_GENESIS_START_OPERATION: &str = "genesis.start";
+pub const MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION: &str = "genesis.project_agents.read";
+pub const MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION: &str = "genesis.project_agent.select";
 pub const MAIN_CHARTER_DRAFT_OPERATION: &str = "charter.draft";
 pub const MAIN_CHARTER_READINESS_OPERATION: &str = "charter.readiness";
 pub const MAIN_CHARTER_DIFF_OPERATION: &str = "charter.diff";
@@ -159,6 +161,28 @@ const PROJECT_SCOPES: &[CanonicalScopeType] =
 pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
     OperationContract {
         operation: MAIN_GENESIS_START_OPERATION,
+        surface: OperationSurface::MainOrchestration,
+        exposure: OperationExposure::TypedProposal,
+        input: OperationInputContract::ProposalEnvelope,
+        setup: OperationSetupExposure::Always,
+        supported_scopes: MAIN_SCOPES,
+        classification: OperationClassification::DirectCommand,
+        permission: OperationPermission::ProposeDiscovery,
+        output: SHARED_ORCHESTRATION_OUTCOME,
+    },
+    OperationContract {
+        operation: MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
+        surface: OperationSurface::MainOrchestration,
+        exposure: OperationExposure::TypedRead,
+        input: OperationInputContract::ReadArguments,
+        setup: OperationSetupExposure::Always,
+        supported_scopes: MAIN_SCOPES,
+        classification: OperationClassification::Query,
+        permission: OperationPermission::ReadAccountOrAgentChat,
+        output: SHARED_ORCHESTRATION_OUTCOME,
+    },
+    OperationContract {
+        operation: MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
         surface: OperationSurface::MainOrchestration,
         exposure: OperationExposure::TypedProposal,
         input: OperationInputContract::ProposalEnvelope,

@@ -23,6 +23,64 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Product Genesis now exposes receipt-backed native operations for the Main
+  Agent to list and persist the exact structured Project Agent selection.
+  Charter prose can no longer disagree with the identity Forge binds, and an
+  ineligible persisted choice blocks instead of silently falling back. Automatic
+  Project Agent, Worker, and reviewer selection also skips credential-less CLI
+  bootstrap defaults while preserving explicit local-CLI assignment.
+
+- Project Agent release proposals now require an exact current `ready`
+  snapshot. Blocked, failed, and stale snapshots return their canonical reasons
+  without creating a candidate, and the server-owned operating contract tells
+  the agent to report those blockers instead of claiming `Known Issues: None`.
+
+- Delivering a Project's only milestone no longer wedges its Agent. Once that
+  milestone reached `ready_for_release`, the primary-milestone pointer was
+  judged to name "a Project with no active milestones" and every turn admission
+  failed with that conflict, so the Project Agent could not complete the release
+  it had just earned. `ready_for_release` and `released` are now valid pointer
+  targets, and the pointer remains on the delivered outcome so Overview keeps
+  its milestone context. Reconfirming the same immutable readiness target with
+  a fresh UI idempotency key returns the existing release instead of a digest
+  mismatch; only `cancelled` invalidates the pointer.
+
+- Attaching milestone evidence with a display name in the authorization
+  principal no longer blocks the milestone forever. Readiness compared the whole
+  `PrincipalRef` — the optional presentation label included — against an author
+  rebuilt from the `*_principal_type`/`*_principal_id` columns, which never carry
+  one. Identical provenance was rejected as `immutable evidence authorization
+  principal disagrees with author`, and because evidence rows are immutable the
+  milestone could not be repaired. Provenance now compares principal identity,
+  not the label the UI happened to show.
+
+- A `not_found` from a typed native operation now names the entity and id Forge
+  could not resolve, and is marked correctable. A caller that passed several ids
+  in one payload previously got "the requested Forge resource is unavailable"
+  with nothing to act on, and retried the same rejected shape. The HTTP surface
+  already returns this pair for the same failure.
+
+- An execution baseline proposal now reports every release-policy rule list it
+  rejects in one error instead of failing on the first. The closed vocabularies
+  were discoverable only by resubmitting once per field, which for a Project
+  Agent is one model turn per missing list; a first baseline routinely cost more
+  than a dozen round trips before the contract was satisfied.
+
+- Deleting a Project born from Product Genesis no longer fails with a `500`.
+  The Genesis session's `handed_off` CHECK rejected the NULL the Project's
+  removal wrote to its `project_id`, and the Project Agent Chat's messages,
+  instruction revisions, handoffs, and delivery receipts each aborted the
+  cascade with an unconditional immutability trigger. Any Project whose Agent
+  had exchanged a single message was undeletable. The bounded teardown now
+  removes those rows in dependency order and takes the handed-off Genesis
+  session with the Project it produced; the immutability triggers are scoped to
+  the same `project_deletion_guard` contract V077 established, so they still
+  reject every delete outside the teardown. Wake dispositions that
+  RESTRICT-reference the Chat's turn jobs are cleared with them. The same
+  teardown now removes stale Project/Task/Project-Chat `agent_lcm_*` rows and
+  stages then deletes Forge-managed repository directories after the database
+  commit, without touching linked repositories outside Forge's managed root.
+
 - Milestone delivery can no longer appear complete while acceptance proof is
   structurally impossible. Compact milestones now require check-linked
   evidence, `project.current_state` exposes the exact stable check IDs, and an
@@ -42,6 +100,33 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   execution failures. This is separate from the optional Task `max_turns`
   policy.
 
+- Publishing a new profile for a bound Main or Project Agent (for example
+  changing its model) permanently breaks the Project Chat. The Charter handoff
+  pins the exact approved `policy_digest` and source `profile_revision_id`, and
+  the turn worker recomputes them from the identity's current profile, so after
+  a model rotation every Project Agent turn fails with "Project Agent turn has
+  no exact consumed Charter handoff" — an error that names no recovery, and
+  which retries cannot clear. NOT YET FIXED — recorded here so it is visible.
+
+- The Project Agent can author an execution baseline. `project.execution_baseline`
+  required the caller to supply `rendered_view`, `render_version`,
+  `content_digest`, and `render_digest`, and then checked them against the
+  server's own `render_execution_baseline(content)` — so the model had to
+  reproduce the server renderer byte-for-byte and recompute both digests, which
+  it never can. Every baseline the Project Agent attempted failed with
+  "content or rendered review target digest is not canonical", and because an
+  active baseline gates implementation Tasks, no repository work could start.
+  These four fields are now derived from `content` on the native agent path
+  (the Charter draft already worked this way) and are optional in the tool
+  contract. `content.release_policy_digest` is derived the same way and for the
+  same reason: it is a hash over the frozen release policy the caller just
+  supplied, and no model can compute a digest. The baseline's Charter
+  `ArtifactRef` now follows the same rule: the native path accepts the exact
+  `revision_id`, reauthorizes it in the bound Project, and rehydrates the
+  artifact id plus content/render version and digests from persistence. The
+  REST route keeps its strict round-trip contract, with field-level
+  expected/received diagnostics for a mismatched persisted reference.
+
 - The Main and Project Agents can see the shape of the payload they must send.
   The generic orchestration proposal tool declares `payload` as a plain object
   (provider function-calling APIs only reliably deliver flat schemas), and its
@@ -55,13 +140,25 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   exact contract, including nested objects, arrays, and enum variants.
 
 - Orchestration validation failures tell the model what was wrong. Contract
-  and command-boundary rejections were collapsed into a bare "the operation or
-  arguments are not valid for this Forge surface", discarding a
+  rejections, command-boundary rejections, and conflicts were each collapsed
+  into a bare "the operation or arguments are not valid for this Forge
+  surface" / "the command could not be accepted", discarding a
   server-authored reason that named the offending field — so the model
   retried the same rejected shape indefinitely with nothing to correct. The
   reason now travels in the outcome (for example
-  `(expected_document_version must be positive)`). Policy denials stay generic:
-  their reason can describe authority the caller may not observe.
+  `(expected_document_version must be positive)` or `(baseline_id is required
+  when proposing an execution baseline for approval)`). A conflict's prose
+  stays unstructured on purpose: read it, never parse it to infer version or
+  digest semantics. Policy denials stay generic: their reason can describe
+  authority the caller may not observe.
+
+- An execution baseline revision no longer fails with an unexplained policy
+  denial when its `provenance.author` does not match the caller. Echoing the
+  caller's own already-authenticated principal is an input contract, not an
+  authority secret, but it was raised as `AuthorizationDenied` — which is
+  deliberately generic — leaving the Project Agent unable to author a baseline
+  at all. It is now a validation error that names the expected principal id
+  and kind, and an empty `change_summary` reports itself separately.
 
 - A Project can be deleted after its agents have run. `DELETE /api/v1/projects/{id}`
   failed with "context manifests are immutable" for any Project whose agent had

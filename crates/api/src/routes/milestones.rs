@@ -655,10 +655,9 @@ pub async fn transition_milestone(
             "the milestone changed before its lifecycle transition",
         ));
     }
-    // The primary pointer is an explicit Project invariant.  A primary
-    // milestone may move to ready/released (or be cancelled by another
-    // transition path), so repair the pointer in this same transaction rather
-    // than leaving Overview pointing at a non-active instance.
+    // The primary pointer is an explicit Project invariant. Delivery keeps
+    // pointing at the emphasized milestone; only removal from the intended
+    // outcome set may repair it.
     repair_primary_pointer_in_tx(&mut tx, &project_id, &milestone_id).await?;
     let event_id = new_uuid_v4();
     let event_inserted = append_milestone_event_in_tx(
@@ -1933,6 +1932,19 @@ async fn repair_primary_pointer_in_tx(
             .fetch_one(&mut **tx)
             .await?;
     if primary.as_deref() != Some(changed_milestone_id) {
+        return Ok(());
+    }
+    let lifecycle: String = sqlx::query_scalar(
+        "SELECT lifecycle FROM project_milestone WHERE id = ? AND project_id = ?",
+    )
+    .bind(changed_milestone_id)
+    .bind(project_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if matches!(
+        lifecycle.as_str(),
+        "planned" | "active" | "ready_for_release" | "released"
+    ) {
         return Ok(());
     }
     let replacement: Option<String> = sqlx::query_scalar(

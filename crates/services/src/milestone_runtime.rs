@@ -948,6 +948,28 @@ impl MilestoneRuntime {
             return Ok(replay);
         }
         validate_authorization(authorization, actor, "project.milestone.release")?;
+        // A second Confirm may carry a fresh UI key after the first request
+        // committed but before the Overview refreshed. The immutable
+        // readiness target is already released; return that exact record
+        // instead of re-verifying it against the now-released lifecycle.
+        if let Some(existing) = self
+            .release_by_readiness_target(
+                project_id,
+                milestone_id,
+                readiness_snapshot_id,
+                readiness_digest,
+            )
+            .await?
+        {
+            if existing.releasing_principal_type != principal_kind_name(actor.kind)
+                || existing.releasing_principal_id != actor.id
+            {
+                return Err(crate::ServiceError::Conflict(
+                    "this readiness snapshot is already released by another principal".to_owned(),
+                ));
+            }
+            return self.release_from_record(existing).await;
+        }
 
         // Acquire the milestone's write lock before loading any release-gating
         // inputs. SQLite has no FOR UPDATE; a guarded no-op update is the
@@ -2222,6 +2244,24 @@ impl MilestoneRuntime {
         if primary.as_deref() != Some(changed_milestone_id) {
             return Ok(());
         }
+        let changed_lifecycle: String = sqlx::query_scalar(
+            "SELECT lifecycle FROM project_milestone WHERE id = ? AND project_id = ?",
+        )
+        .bind(changed_milestone_id)
+        .bind(project_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        // Readiness and release advance the primary outcome; they do not make
+        // the Project forget which milestone it delivered. Keep the pointer
+        // until a user explicitly emphasizes another milestone. Only a
+        // lifecycle that removes the milestone from the Project's intended
+        // outcome set should require automatic repair.
+        if matches!(
+            changed_lifecycle.as_str(),
+            "planned" | "active" | "ready_for_release" | "released"
+        ) {
+            return Ok(());
+        }
         let replacement: Option<String> = sqlx::query_scalar(
             "SELECT id FROM project_milestone
              WHERE project_id = ? AND lifecycle = 'active' AND id != ?
@@ -2426,7 +2466,7 @@ impl MilestoneRuntime {
                 .await?,
                 "evidence authorization",
             )?;
-            if authorization.principal != attachment.author {
+            if !same_principal(&authorization.principal, &attachment.author) {
                 return Err(crate::ServiceError::InvalidOperation {
                     message: format!(
                         "evidence attachment {} authorization principal disagrees with its author",
@@ -3036,6 +3076,29 @@ impl MilestoneRuntime {
         )
         .bind(project_id)
         .bind(key)
+        .fetch_optional(self.db.pool())
+        .await?
+        .map(release_record_from_row)
+        .transpose()?)
+    }
+
+    async fn release_by_readiness_target(
+        &self,
+        project_id: &str,
+        milestone_id: &str,
+        readiness_snapshot_id: &str,
+        readiness_digest: &str,
+    ) -> crate::Result<Option<ProjectReleaseRecord>> {
+        Ok(sqlx::query(
+            "SELECT * FROM project_release
+             WHERE project_id = ? AND milestone_id = ?
+               AND readiness_snapshot_id = ? AND readiness_digest = ?
+             ORDER BY release_revision ASC, id ASC LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(milestone_id)
+        .bind(readiness_snapshot_id)
+        .bind(readiness_digest)
         .fetch_optional(self.db.pool())
         .await?
         .map(release_record_from_row)
@@ -3729,6 +3792,18 @@ fn validation_results_from_rows(
     Ok(latest.into_values().collect())
 }
 
+/// Two principal references identify the same principal when their kind and id
+/// agree. `display_name` is an optional presentation label: the immutable rows
+/// persist only `*_principal_type`/`*_principal_id`, so a reference rebuilt from
+/// those columns always carries `None` while the authorization the caller sent
+/// may carry the label the UI showed. Comparing the whole struct therefore
+/// rejects provenance that is in fact identical, and — because these rows are
+/// immutable — permanently blocks readiness on evidence that can never be
+/// corrected.
+fn same_principal(left: &PrincipalRef, right: &PrincipalRef) -> bool {
+    left.kind == right.kind && left.id == right.id
+}
+
 fn evidence_from_rows(
     rows: Vec<sqlx::sqlite::SqliteRow>,
     project_id: &str,
@@ -3749,7 +3824,7 @@ fn evidence_from_rows(
                 &row.try_get::<String, _>("authorization_json")?,
                 "evidence authorization",
             )?;
-            if attachment_authorization.principal != author {
+            if !same_principal(&attachment_authorization.principal, &author) {
                 return Err(crate::ServiceError::InvalidOperation {
                     message: "immutable evidence authorization principal disagrees with author"
                         .to_owned(),
@@ -4551,7 +4626,7 @@ fn readiness_from_record(
             || result.evaluated_at.trim().is_empty()
             || result.event_id.trim().is_empty()
             || result.event_id != result.authorization.event_id
-            || result.principal != result.authorization.principal
+            || !same_principal(&result.principal, &result.authorization.principal)
         {
             return Err(crate::ServiceError::InvalidOperation {
                 message: "immutable readiness check result is incomplete".to_owned(),
@@ -5202,6 +5277,37 @@ fn evidence_availability_name(value: EvidenceAvailability) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn principal_identity_ignores_the_display_label() {
+        let stored = PrincipalRef {
+            kind: PrincipalKind::User,
+            id: "user-1".to_owned(),
+            display_name: None,
+        };
+        let sent = PrincipalRef {
+            kind: PrincipalKind::User,
+            id: "user-1".to_owned(),
+            display_name: Some("E2E Default User".to_owned()),
+        };
+        // The row keeps only kind and id, so a caller that sent the label the
+        // UI displayed must still match the author rebuilt from those columns.
+        assert!(same_principal(&stored, &sent));
+
+        let other = PrincipalRef {
+            kind: PrincipalKind::User,
+            id: "user-2".to_owned(),
+            display_name: None,
+        };
+        assert!(!same_principal(&stored, &other));
+
+        let agent = PrincipalRef {
+            kind: PrincipalKind::Agent,
+            id: "user-1".to_owned(),
+            display_name: None,
+        };
+        assert!(!same_principal(&stored, &agent));
+    }
 
     #[test]
     fn result_and_principal_names_are_closed() {

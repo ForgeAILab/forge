@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, path::PathBuf};
 
 use api_types::{
     parse_project_hooks_json, AgentTokenBreakdown as ApiAgentTokenBreakdown, CiStepAnalytics,
@@ -18,8 +18,8 @@ use axum::{
 use db::{
     new_uuid_v4, now_rfc3339, AgentProfileRepo, AgentRepo, AgentTokenBreakdown, CiStepStats,
     CreateProject, ModelTokenBreakdown, PageRequest, ProjectAnalyticsRepo, ProjectHookRun,
-    ProjectHookRunRepo, ProjectRepo, ProjectReviewSummary, ProjectTokenStats, SortBy, SortOrder,
-    UpdateProject,
+    ProjectHookRunRepo, ProjectRepo, ProjectReviewSummary, ProjectTokenStats, RepoRepo, SortBy,
+    SortOrder, UpdateProject,
 };
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde::Deserialize;
@@ -463,7 +463,24 @@ pub async fn delete_project(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    ProjectRepo::delete(&*state.db, &id).await?;
+    let staged_repositories = stage_managed_project_repositories(&state, &id).await?;
+    if let Err(error) = ProjectRepo::delete(&*state.db, &id).await {
+        restore_staged_repositories(&staged_repositories).await;
+        return Err(error.into());
+    }
+    for staged in &staged_repositories {
+        if let Err(error) = tokio::fs::remove_dir_all(&staged.staged).await {
+            tracing::error!(
+                project_id = %id,
+                path = %staged.staged.display(),
+                error = %error,
+                "Project database teardown committed but its staged managed repository could not be removed"
+            );
+            return Err(ApiError::internal(
+                "Project was deleted, but its staged managed repository cleanup failed",
+            ));
+        }
+    }
     state.event_bus.publish(ForgeEvent {
         event_type: "project.deleted".to_owned(),
         entity_id: id,
@@ -471,6 +488,93 @@ pub async fn delete_project(
         context: EventContext::ProjectDeleted {},
     });
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug)]
+struct StagedRepositoryRemoval {
+    original: PathBuf,
+    staged: PathBuf,
+}
+
+async fn stage_managed_project_repositories(
+    state: &AppState,
+    project_id: &str,
+) -> ApiResult<Vec<StagedRepositoryRemoval>> {
+    let managed_root = state.effective_config.workspace.root.join("repos");
+    let Ok(canonical_root) = tokio::fs::canonicalize(&managed_root).await else {
+        return Ok(Vec::new());
+    };
+    let mut seen = HashSet::new();
+    let mut staged = Vec::new();
+    let mut cursor = None;
+    loop {
+        let repos = match RepoRepo::list_by_project(
+            &*state.db,
+            project_id,
+            PageRequest {
+                cursor,
+                limit: 500,
+                include_total: false,
+                sort_by: SortBy::CreatedAt,
+                sort_order: SortOrder::Asc,
+            },
+        )
+        .await
+        {
+            Ok(repos) => repos,
+            Err(error) => {
+                restore_staged_repositories(&staged).await;
+                return Err(error.into());
+            }
+        };
+        for local_path in repos.items.into_iter().filter_map(|repo| repo.local_path) {
+            let original = PathBuf::from(local_path);
+            let Ok(canonical) = tokio::fs::canonicalize(&original).await else {
+                continue;
+            };
+            // Only repositories provisioned as direct children of Forge's managed
+            // repos root are Project-owned filesystem state. Explicitly linked
+            // repositories elsewhere on disk are never removed.
+            if canonical.parent() != Some(canonical_root.as_path())
+                || !seen.insert(canonical.clone())
+            {
+                continue;
+            }
+            let tombstone = canonical_root.join(format!(
+                ".forge-project-delete-{}-{}",
+                project_id,
+                new_uuid_v4()
+            ));
+            if let Err(error) = tokio::fs::rename(&canonical, &tombstone).await {
+                restore_staged_repositories(&staged).await;
+                return Err(ApiError::internal(format!(
+                    "stage managed Project repository for deletion: {error}"
+                )));
+            }
+            staged.push(StagedRepositoryRemoval {
+                original: canonical,
+                staged: tombstone,
+            });
+        }
+        let Some(next_cursor) = repos.next_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+    Ok(staged)
+}
+
+async fn restore_staged_repositories(staged: &[StagedRepositoryRemoval]) {
+    for repository in staged.iter().rev() {
+        if let Err(error) = tokio::fs::rename(&repository.staged, &repository.original).await {
+            tracing::error!(
+                path = %repository.staged.display(),
+                restore_path = %repository.original.display(),
+                error = %error,
+                "failed to restore a managed repository after Project teardown rolled back"
+            );
+        }
+    }
 }
 
 pub async fn pause_project(
@@ -880,12 +984,42 @@ fn review_summary_analytics(summary: ProjectReviewSummary) -> ReviewSummaryAnaly
 
 #[cfg(test)]
 mod tests {
-    use super::is_legacy_manual_default_assignee;
+    use super::{
+        is_legacy_manual_default_assignee, restore_staged_repositories, StagedRepositoryRemoval,
+    };
 
     #[test]
     fn recognizes_legacy_manual_default_assignee() {
         assert!(is_legacy_manual_default_assignee(Some("human")));
         assert!(!is_legacy_manual_default_assignee(Some("user-123")));
         assert!(!is_legacy_manual_default_assignee(None));
+    }
+
+    #[tokio::test]
+    async fn staged_repository_restore_reverses_each_rename() {
+        let root = std::env::temp_dir().join(format!(
+            "forge-project-delete-restore-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let original = root.join("repo");
+        let staged = root.join(".forge-project-delete-test");
+        tokio::fs::create_dir_all(&staged)
+            .await
+            .expect("staged repository fixture");
+        tokio::fs::write(staged.join("tracked"), b"preserved")
+            .await
+            .expect("repository content");
+
+        restore_staged_repositories(&[StagedRepositoryRemoval {
+            original: original.clone(),
+            staged: staged.clone(),
+        }])
+        .await;
+
+        assert!(original.join("tracked").is_file());
+        assert!(!staged.exists());
+        tokio::fs::remove_dir_all(&root)
+            .await
+            .expect("remove temporary managed repo root");
     }
 }

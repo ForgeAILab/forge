@@ -195,10 +195,10 @@ pub fn validate_definition_transition(
 
 /// Validate the Project's explicit primary-milestone invariant.
 ///
-/// A primary pointer is required exactly when at least one milestone is in
-/// the `active` instance state.  It must identify an active milestone in the
-/// same Project.  Ready, released, planned, and cancelled milestones are not
-/// eligible pointer targets.
+/// A primary pointer is required when at least one milestone is active. Once
+/// chosen, it may continue to identify that outcome as it advances through
+/// ready-for-release and released; delivery must not erase the Project's
+/// emphasized milestone. Cancelled milestones are never eligible.
 pub fn validate_primary_milestone(
     project_id: &str,
     milestones: &[ProjectMilestone],
@@ -209,51 +209,33 @@ pub fn validate_primary_milestone(
         .filter(|milestone| milestone.lifecycle == MilestoneLifecycle::Active)
         .collect::<Vec<_>>();
 
-    match (active.is_empty(), primary_milestone_id) {
-        (true, None) => Ok(()),
-        (true, Some(milestone_id)) => {
-            let milestone = milestones.iter().find(|item| item.id == milestone_id);
-            match milestone {
-                None => Err(MilestoneOrchestrationError::PrimaryMilestoneNotFound {
-                    project_id: project_id.to_owned(),
-                    milestone_id: milestone_id.to_owned(),
-                }),
-                Some(milestone) if milestone.project_id != project_id => {
-                    Err(MilestoneOrchestrationError::PrimaryMilestoneWrongProject {
-                        project_id: project_id.to_owned(),
-                        milestone_id: milestone_id.to_owned(),
-                    })
-                }
-                Some(_) => Err(MilestoneOrchestrationError::PrimaryMilestoneNotActive {
-                    milestone_id: milestone_id.to_owned(),
-                }),
-            }
-        }
-        (false, None) => Err(MilestoneOrchestrationError::PrimaryMilestoneRequired {
+    let Some(milestone_id) = primary_milestone_id else {
+        return if active.is_empty() {
+            Ok(())
+        } else {
+            Err(MilestoneOrchestrationError::PrimaryMilestoneRequired {
+                project_id: project_id.to_owned(),
+            })
+        };
+    };
+    let Some(milestone) = milestones.iter().find(|item| item.id == milestone_id) else {
+        return Err(MilestoneOrchestrationError::PrimaryMilestoneNotFound {
             project_id: project_id.to_owned(),
-        }),
-        (false, Some(milestone_id)) => {
-            let milestone = milestones.iter().find(|item| item.id == milestone_id);
-            match milestone {
-                None => Err(MilestoneOrchestrationError::PrimaryMilestoneNotFound {
-                    project_id: project_id.to_owned(),
-                    milestone_id: milestone_id.to_owned(),
-                }),
-                Some(milestone) if milestone.project_id != project_id => {
-                    Err(MilestoneOrchestrationError::PrimaryMilestoneWrongProject {
-                        project_id: project_id.to_owned(),
-                        milestone_id: milestone_id.to_owned(),
-                    })
-                }
-                Some(milestone) if milestone.lifecycle != MilestoneLifecycle::Active => {
-                    Err(MilestoneOrchestrationError::PrimaryMilestoneNotActive {
-                        milestone_id: milestone_id.to_owned(),
-                    })
-                }
-                Some(_) => Ok(()),
-            }
-        }
+            milestone_id: milestone_id.to_owned(),
+        });
+    };
+    if milestone.project_id != project_id {
+        return Err(MilestoneOrchestrationError::PrimaryMilestoneWrongProject {
+            project_id: project_id.to_owned(),
+            milestone_id: milestone_id.to_owned(),
+        });
     }
+    if milestone.lifecycle == MilestoneLifecycle::Cancelled {
+        return Err(MilestoneOrchestrationError::PrimaryMilestoneNotActive {
+            milestone_id: milestone_id.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Compare principals by authenticated identity, not display name.
@@ -1609,6 +1591,26 @@ mod tests {
             None
         )
         .is_ok());
+        assert!(validate_primary_milestone(
+            "project-1",
+            &[milestone(MilestoneLifecycle::Released)],
+            Some("milestone-1")
+        )
+        .is_ok());
+        let mut next = milestone(MilestoneLifecycle::Active);
+        next.id = "milestone-2".to_owned();
+        assert!(validate_primary_milestone(
+            "project-1",
+            &[milestone(MilestoneLifecycle::Released), next],
+            Some("milestone-1")
+        )
+        .is_ok());
+        assert!(validate_primary_milestone(
+            "project-1",
+            &[milestone(MilestoneLifecycle::Cancelled)],
+            Some("milestone-1")
+        )
+        .is_err());
     }
 
     #[test]

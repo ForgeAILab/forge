@@ -39,9 +39,10 @@ use crate::{
     operation_catalog::{
         MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
         MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION,
-        MAIN_CHARTER_READINESS_OPERATION, OperationExposure, OperationSurface,
-        PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
-        PROJECT_EXECUTION_BASELINE_OPERATION, operation_names_for_surface,
+        MAIN_CHARTER_READINESS_OPERATION, MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
+        OperationExposure, OperationSurface, PROJECT_CHARTER_ADOPTION_OPERATION,
+        PROJECT_CURRENT_STATE_OPERATION, PROJECT_EXECUTION_BASELINE_OPERATION,
+        operation_names_for_surface,
     },
     operation_contract::{
         coordination_payload_guidance, coordination_payload_properties,
@@ -1633,6 +1634,7 @@ fn validate_orchestration_read_arguments(
             .as_object()
             .ok_or_else(|| RuntimeError::tool("Forge read arguments must be an object"))?;
         let nested_allowed: &[&str] = match operation {
+            MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION => &["genesis_session_id"],
             MAIN_CHARTER_READ_OPERATION => &["charter_id", "revision_id", "genesis_session_id"],
             MAIN_CHARTER_READINESS_OPERATION => &[
                 "charter_id",
@@ -2065,7 +2067,7 @@ mod tests {
     }
 
     #[test]
-    fn main_orchestration_catalog_is_charter_only_and_has_no_project_surface() {
+    fn main_orchestration_catalog_is_genesis_only_and_has_no_project_surface() {
         let allowed = BTreeSet::from([
             "read_account".to_owned(),
             "propose_discovery".to_owned(),
@@ -2107,6 +2109,9 @@ mod tests {
                 .iter()
                 .any(|value| value == MAIN_PROJECT_CREATE_OPERATION)
         );
+        assert!(operations.iter().any(|value| {
+            value == crate::operation_catalog::MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION
+        }));
         assert!(
             !operations
                 .iter()

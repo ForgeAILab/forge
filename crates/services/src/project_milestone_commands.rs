@@ -11,7 +11,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use api_types::{
     canonical_digest_with_schema, canonical_json, MilestoneDefinitionContent,
-    MilestoneDefinitionLifecycle, RevisionProvenance,
+    MilestoneDefinitionLifecycle, ReadinessReason, RevisionProvenance,
 };
 use db::{
     new_uuid_v4, now_rfc3339, AgentAction, AgentActionExecutionStatus, AgentActionStatus,
@@ -760,6 +760,7 @@ impl ProjectMilestoneCommandService {
             return Ok(record);
         }
         authorize_project_principal(&self.db, &command.project_id, &command.authorization).await?;
+        validate_release_readiness_candidate(&self.db, &command).await?;
         let result_json = json!({
             "operation": PROJECT_RELEASE_OPERATION,
             "project_id": command.project_id,
@@ -1206,6 +1207,53 @@ fn validate_release_command(command: &ProjectReleaseRequestCommand) -> Result<()
         &command.authorization,
         MILESTONE_RELEASE_REQUEST_AUTHORIZATION_ACTION,
     )
+}
+
+async fn validate_release_readiness_candidate(
+    db: &SqliteDb,
+    command: &ProjectReleaseRequestCommand,
+) -> Result<()> {
+    let row = sqlx::query(
+        "SELECT project_id, milestone_id, readiness_digest, outcome,
+                blocking_reasons_json
+         FROM project_readiness_snapshot WHERE id = ?",
+    )
+    .bind(&command.readiness_snapshot_id)
+    .fetch_optional(db.pool())
+    .await?
+    .ok_or_else(|| {
+        ServiceError::not_found("readiness_snapshot", command.readiness_snapshot_id.clone())
+    })?;
+    let project_id: String = row.try_get("project_id")?;
+    let milestone_id: String = row.try_get("milestone_id")?;
+    let readiness_digest: String = row.try_get("readiness_digest")?;
+    if project_id != command.project_id
+        || milestone_id != command.milestone_id
+        || readiness_digest != command.readiness_digest
+    {
+        return Err(ServiceError::Db(db::DbError::VersionConflict));
+    }
+    let outcome: String = row.try_get("outcome")?;
+    if outcome == "ready" {
+        return Ok(());
+    }
+    let reasons = serde_json::from_str::<Vec<ReadinessReason>>(
+        &row.try_get::<String, _>("blocking_reasons_json")?,
+    )
+    .unwrap_or_default();
+    let details = reasons
+        .iter()
+        .filter(|reason| reason.blocking)
+        .map(|reason| format!("{}: {}", reason.code, reason.message))
+        .collect::<Vec<_>>();
+    let details = if details.is_empty() {
+        format!("readiness outcome is {outcome}")
+    } else {
+        details.join("; ")
+    };
+    Err(ServiceError::invalid_operation(format!(
+        "release candidate cannot be proposed while readiness is {outcome}: {details}. Report these blockers and do not claim Known Issues: None"
+    )))
 }
 
 fn validate_authorization(authorization: &ProjectCommandAuthorization) -> Result<()> {
