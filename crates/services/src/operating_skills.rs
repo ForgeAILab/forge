@@ -54,7 +54,7 @@ pub const PROJECT_OPERATING_SKILL_POLICY_JSON: &str =
 pub const PROJECT_OPERATING_SKILL_POLICY_DIGEST: &str =
     "b9364db0792d4a7aa3e9dcae9ebfab78f6a239db55dc21831b201c9b905dd54b";
 pub const PROJECT_OPERATING_SKILL_CONTENT_DIGEST: &str =
-    "4ed93ecd8bde54be90c659fb367aed8e1106001862bb40d401b010509d1466b0";
+    "d82c5cb7df0a7b82c715abca911243374e05d07ab777d2fb0a6264aaf351bbfb";
 
 /// Returns the exact immutable body of the Main Agent account baseline skill.
 /// This body is server-owned source code, not a seeded database row.
@@ -769,6 +769,7 @@ PROJECT DOCUMENTS
 
 EXECUTION BASELINE
 Bundle the exact governing Charter and content/render digests, applicable Document revisions, stable plan-item identities, milestone selection and primary_milestone_id, release-policy revision, acceptance/evidence matrix, Task capability/risk classes, adaptive envelope, elevated/irreversible operations, known assumptions, exclusions, risks, rollback/recovery, and material diff into one proposed baseline.
+Before drafting or proposing, read `project.current_state` and copy each current milestone's exact acceptance-check ID and definition revision into the acceptance/evidence matrix. Never invent aliases such as `ac-1`, renumber a stable check, or use a description as its identity. The proposed matrix must exactly match the pinned milestone definitions and their required evidence kinds; Forge rejects a mismatch before user approval.
 Only the interactive user may approve or activate the exact baseline digest.
 Before activation, allow bounded non-mutating discovery/planning Tasks and implementation Tasks only as non-runnable plans. Deny repository write leases, implementation dispatch, and release operations.
 Within the active adaptive envelope, split, sequence, or replace Tasks without another baseline approval only when outcome, acceptance, risk class, external side effects, release policy, and elevated operations remain unchanged; preserve origin plan_item_id and replacement provenance. Require reconciliation and new approval when a fixed boundary changes.
@@ -800,7 +801,8 @@ You are the Project's engine, not its stenographer. Between user messages, Forge
 
 MILESTONES AND EVIDENCE
 - A milestone is an outcome/release contract, not a manually maintained percentage or substitute Task board.
-- Define its outcome, included/excluded scope, acceptance checks, linked artifact revisions, Task selection, evidence expectations, and optional human-facing version label.
+- Define its outcome, included/excluded scope, acceptance checks, linked artifact revisions, Task selection, evidence expectations, and optional human-facing version label. Every required acceptance check has one required evidence requirement with the same stable ID. Evidence is mandatory proof, not optional decoration.
+- Preserve existing stable check IDs across milestone revisions. Use `manual` only when an authorized user must make a genuinely human observation or judgment; never treat repository test output as a manual attestation. A manual result and its required evidence are separate inputs, and you may request but never record the user's result.
 - Multiple milestones may be active; primary_milestone_id identifies the single outcome emphasized in the Overview.
 - Live progress is derived from current Tasks and validation. Report concrete counts/states and failed or missing checks; do not imply that completion equals release.
 - Propose standalone readiness only. Forge alone computes an immutable ReadinessSnapshot from the approved release policy and principal-bound inputs. The snapshot references exact evidence attachments/digests and creates no release pins. You may not approve or attest a release-gating Document, manual check, waiver, validation, or release on the user's behalf.
@@ -1052,6 +1054,9 @@ mod tests {
             include_str!("../../db/migrations/V082__conversational_genesis_skill.sql");
         const V084_MIGRATION: &str =
             include_str!("../../db/migrations/V084__project_agent_autonomous_drive_skill.sql");
+        const V095_MIGRATION: &str = include_str!(
+            "../../db/migrations/V095__project_agent_acceptance_evidence_contract.sql"
+        );
 
         fn seeded_body(migration: &str, title: &str) -> String {
             let body_marker = format!("'{title}");
@@ -1072,35 +1077,42 @@ mod tests {
             hex::encode(Sha256::digest(value.as_bytes()))
         }
 
-        for (migration, revision_id, title, renderer_body, expected_digest) in [
-            (
-                V082_MIGRATION,
-                "forge.main.project-discovery/v2@3",
-                "Forge Main Agent",
-                canonical_main_operating_skill_body(),
-                MAIN_OPERATING_SKILL_CONTENT_DIGEST,
-            ),
-            (
-                V084_MIGRATION,
-                "forge.project.orchestration/v1@2",
-                "Forge Project Agent",
-                canonical_project_operating_skill_body(),
-                PROJECT_OPERATING_SKILL_CONTENT_DIGEST,
-            ),
-        ] {
-            let seeded = seeded_body(migration, title);
-            assert_eq!(seeded, renderer_body, "seeded body drift for {revision_id}");
-            assert_eq!(
-                sha256_hex(&seeded),
-                expected_digest,
-                "digest drift for {revision_id}"
-            );
-            assert_eq!(
-                seeded.lines().filter(|line| *line == "RESEARCH").count(),
-                1,
-                "canonical body must contain one RESEARCH section for {revision_id}"
-            );
-        }
+        let main_revision_id = "forge.main.project-discovery/v2@3";
+        let seeded_main = seeded_body(V082_MIGRATION, "Forge Main Agent");
+        assert_eq!(
+            seeded_main,
+            canonical_main_operating_skill_body(),
+            "seeded body drift for {main_revision_id}"
+        );
+        assert_eq!(
+            sha256_hex(&seeded_main),
+            MAIN_OPERATING_SKILL_CONTENT_DIGEST,
+            "digest drift for {main_revision_id}"
+        );
+        assert_eq!(
+            seeded_main
+                .lines()
+                .filter(|line| *line == "RESEARCH")
+                .count(),
+            1,
+            "canonical body must contain one RESEARCH section for {main_revision_id}"
+        );
+
+        let prior_project_body = seeded_body(V084_MIGRATION, "Forge Project Agent");
+        assert_ne!(prior_project_body, canonical_project_operating_skill_body());
+        assert!(V095_MIGRATION.contains("forge.project.orchestration/v1@3"));
+        assert!(V095_MIGRATION.contains(PROJECT_OPERATING_SKILL_CONTENT_DIGEST));
+        assert_eq!(
+            sha256_hex(canonical_project_operating_skill_body()),
+            PROJECT_OPERATING_SKILL_CONTENT_DIGEST
+        );
+        assert_eq!(
+            canonical_project_operating_skill_body()
+                .lines()
+                .filter(|line| *line == "RESEARCH")
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -462,6 +462,9 @@ planned or `ready_for_release` milestones do not require that pointer, and it
 is cleared when the last active milestone leaves that state. The primary is
 never inferred from recency or Task counts. Compact Project creation supplies
 `M001` (shown as `M1 — Deliver outcome`) when no other definition is present.
+Each required compact acceptance check is created with a required evidence
+requirement carrying the same stable ID; a passing result never substitutes
+for proof.
 
 Forge persists one immutable `ReadinessSnapshot` per standalone evaluation.
 It records the exact input manifest, source versions, evidence attachment
@@ -476,8 +479,13 @@ terminal; later corrections append the next release revision and never mutate
 history. Forge release is an internal frozen evidence snapshot, not a merge,
 tag, deployment, or external publication.
 
-Before evaluating or recomputing readiness, Forge checks that the active
-baseline milestone manifest pins the milestone's current definition. Required
+Before an execution baseline may be proposed for user approval, Forge checks
+that its acceptance/evidence matrix exactly matches the stable required IDs,
+descriptions, evidence kinds, and definition revisions in every pinned
+milestone. This keeps an invented alias or missing evidence contract from
+becoming user-approved authority. Before evaluating or recomputing readiness,
+Forge repeats the check against legacy active baselines and checks that the
+active baseline milestone manifest pins the milestone's current definition. Required
 stable requirement IDs in that definition must be represented by the
 baseline's acceptance/evidence matrix, and each matrix row's
 `check_definition_revision` must be one of the check-definition revisions
@@ -486,7 +494,9 @@ a persisted non-ready snapshot with typed `reconciliation_required` reasons;
 it cannot produce a ready snapshot from an empty or unrelated definition. Live
 validation summaries and Project Overview check counts likewise include only
 rows belonging to each milestone's current definition revision, never checks
-or results left behind by a superseded definition.
+or results left behind by a superseded definition. `project.current_state`
+includes those exact current check IDs and evidence requirements so a Project
+Agent does not have to reconstruct them from validation errors.
 
 A Project Agent readiness action invokes the same `MilestoneRuntime`
 evaluation as the authenticated REST route and returns the committed snapshot;

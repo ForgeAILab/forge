@@ -23,6 +23,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Milestone delivery can no longer appear complete while acceptance proof is
+  structurally impossible. Compact milestones now require check-linked
+  evidence, `project.current_state` exposes the exact stable check IDs, and an
+  execution baseline proposal is rejected before approval unless its matrix
+  exactly matches the pinned milestone contracts. Readiness repeats that guard
+  for legacy active baselines. Project Overview now renders the individual
+  checks, evidence coverage, and a user-only Pass/Fail dialog for current
+  manual checks; recording an attestation does not attach evidence or create a
+  release.
+
 - Native Agent Runtime provider exhaustion is no longer reported as the
   misleading `invalid operation: ... turn limit reached`. Forge now preserves
   whether the runtime exhausted provider attempts, tool steps, elapsed time,

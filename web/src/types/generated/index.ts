@@ -190,6 +190,7 @@ export type { ProjectMediaListResponse } from './bindings/ProjectMediaListRespon
 export type { ProjectMediaUploadRequest } from './bindings/ProjectMediaUploadRequest'
 export type { ProjectMediaTombstoneRequest } from './bindings/ProjectMediaTombstoneRequest'
 export type { MilestoneAcceptanceCheck } from './bindings/MilestoneAcceptanceCheck'
+export type { MilestoneAcceptanceCheckState } from './bindings/MilestoneAcceptanceCheckState'
 export type { MilestoneDefinitionContent } from './bindings/MilestoneDefinitionContent'
 export type { MilestoneDefinitionLifecycle } from './bindings/MilestoneDefinitionLifecycle'
 export type { MilestoneDefinitionRevision } from './bindings/MilestoneDefinitionRevision'

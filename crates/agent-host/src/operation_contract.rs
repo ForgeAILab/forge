@@ -318,11 +318,11 @@ pub(crate) fn execution_baseline_content_schema() -> Value {
             "release_policy_digest": {"type":"string","minLength":1,"description":"Omit. The server computes this from release_policy."},
             "release_policy": execution_baseline_release_policy_schema(),
             "acceptance_evidence_matrix": {"type":"array","items":object_schema(json!({
-                "id":{"type":"string","minLength":1},
+                "id":{"type":"string","minLength":1,"description":"Reuse the exact stable acceptance-check id exposed by project.current_state; never invent an alias such as ac-1."},
                 "description":{"type":"string","minLength":1},
                 "required":{"type":"boolean"},
-                "evidence_kind":string_or_null_schema(),
-                "check_definition_revision":string_or_null_schema()
+                "evidence_kind":{"type":["string","null"],"enum":["screenshot","walkthrough_video","log","report","other",null]},
+                "check_definition_revision":{"type":["string","null"],"minLength":1,"description":"Use the exact milestone definition_revision_id exposed with this check by project.current_state."}
             }), &["id","description","required"])},
             "capability_classes": string_array_schema(),
             "risk_classes": string_array_schema(),
@@ -560,7 +560,7 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
             "Project Agent may save a draft (draft_revision or revise) or propose a complete execution baseline for user approval (propose_approval). The shared command service validates exact Project-owned ArtifactRefs, versions, digests, milestones, policy, and reconciliation state. Approval and activation are user-only and never exposed here.",
         ),
         PROJECT_MILESTONE_OPERATION => object_schema(
-            json!({"action":{"enum":["define","revise","set_primary"]},"milestone_id":string_or_null_schema(),"display_label":string_or_null_schema(),"expected_milestone_version":{"type":"integer","minimum":1},"primary_milestone_id":string_or_null_schema(),"content":{"type":"object","properties":{"name":{"type":"string","minLength":1},"outcome":{"type":"string","minLength":1},"included_scope":string_array_schema(),"excluded_scope":string_array_schema(),"charter_revision":{"oneOf":[artifact_ref_schema(),{"type":"null"}]},"document_revisions":{"type":"array","items":artifact_ref_schema()},"task_ids":string_array_schema(),"dependencies":string_array_schema(),"risks":{"type":"array","items":charter_risk_schema()},"acceptance_checks":{"type":"array"},"evidence_requirements":{"type":"array"},"known_issues":string_array_schema(),"target_date":string_or_null_schema()},"additionalProperties":false}}),
+            json!({"action":{"enum":["define","revise","set_primary"]},"milestone_id":string_or_null_schema(),"display_label":string_or_null_schema(),"expected_milestone_version":{"type":"integer","minimum":1},"primary_milestone_id":string_or_null_schema(),"content":{"type":"object","properties":{"name":{"type":"string","minLength":1},"outcome":{"type":"string","minLength":1},"included_scope":string_array_schema(),"excluded_scope":string_array_schema(),"charter_revision":{"oneOf":[artifact_ref_schema(),{"type":"null"}]},"document_revisions":{"type":"array","items":artifact_ref_schema()},"task_ids":string_array_schema(),"dependencies":string_array_schema(),"risks":{"type":"array","items":charter_risk_schema()},"acceptance_checks":{"type":"array","items":object_schema(json!({"id":{"type":"string","minLength":1,"description":"Stable canonical id; preserve it across milestone revisions."},"description":{"type":"string","minLength":1},"required":{"type":"boolean"},"source_kind":{"type":"string","enum":["manual","policy_waiver"],"description":"Only source kinds with a current authoritative result path are admitted. Use manual only for a genuinely human observation; automated output belongs in required evidence."},"expected_result":{"type":"string","minLength":1},"latest_result":string_or_null_schema(),"latest_result_id":string_or_null_schema(),"latest_result_digest":string_or_null_schema()}), &["id","description","required","source_kind","expected_result"])},"evidence_requirements":{"type":"array","items":object_schema(json!({"id":{"type":"string","minLength":1,"description":"Use the exact acceptance-check id this evidence proves."},"description":{"type":"string","minLength":1},"required":{"type":"boolean"},"evidence_kind":{"type":["string","null"],"enum":["screenshot","walkthrough_video","log","report","other",null]},"check_definition_revision":string_or_null_schema()}), &["id","description","required"])},"known_issues":string_array_schema(),"target_date":string_or_null_schema()},"additionalProperties":false}}),
             &["action", "expected_milestone_version"],
         ),
         PROJECT_EVIDENCE_OPERATION => object_schema(
@@ -1279,6 +1279,42 @@ mod tests {
         assert_eq!(
             schema["properties"]["expected_baseline_version"]["minimum"],
             0
+        );
+    }
+
+    #[test]
+    fn milestone_and_baseline_contracts_expose_exact_acceptance_evidence_shape() {
+        let milestone = orchestration_payload_schema(PROJECT_MILESTONE_OPERATION);
+        let check = &milestone["properties"]["content"]["properties"]["acceptance_checks"]["items"];
+        assert_eq!(
+            check["properties"]["source_kind"]["enum"],
+            json!(["manual", "policy_waiver"])
+        );
+        let evidence =
+            &milestone["properties"]["content"]["properties"]["evidence_requirements"]["items"];
+        assert_eq!(
+            evidence["properties"]["evidence_kind"]["enum"],
+            json!([
+                "screenshot",
+                "walkthrough_video",
+                "log",
+                "report",
+                "other",
+                null
+            ])
+        );
+
+        let baseline = orchestration_payload_schema(PROJECT_EXECUTION_BASELINE_OPERATION);
+        let matrix =
+            &baseline["properties"]["content"]["properties"]["acceptance_evidence_matrix"]["items"];
+        assert!(
+            matrix["properties"]["id"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("project.current_state"))
+        );
+        assert_eq!(
+            matrix["properties"]["evidence_kind"]["enum"],
+            evidence["properties"]["evidence_kind"]["enum"]
         );
     }
 

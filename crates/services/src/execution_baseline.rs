@@ -5,11 +5,11 @@
 //! payload and computes the exact digests shown to the approving user.
 
 use api_types::{
-    canonical_digest_with_schema, canonical_render_digest,
+    canonical_digest_with_schema, canonical_render_digest, AcceptanceEvidenceRequirement,
     AuthorizationProvenance as ApiAuthorizationProvenance, ExecutionBaseline,
     ExecutionBaselineApproval, ExecutionBaselineContent, ExecutionBaselineLifecycle,
     ExecutionBaselineReleasePolicy, ExecutionBaselineResponse, ExecutionBaselineRevision,
-    PrincipalKind, PrincipalRef, RevisionProvenance,
+    MilestoneAcceptanceCheck, PrincipalKind, PrincipalRef, RevisionProvenance,
 };
 use chrono::{DateTime, Utc};
 use db::{
@@ -1690,6 +1690,178 @@ async fn validate_baseline_content(
                     "every execution baseline milestone must reference its current definition tied to the Charter",
                 ));
             }
+        }
+    }
+    validate_baseline_milestone_contract(db, project_id, content, complete).await?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ExpectedBaselineRequirement {
+    description: String,
+    evidence_kind: Option<String>,
+    definition_revision_id: String,
+}
+
+async fn validate_baseline_milestone_contract(
+    db: &SqliteDb,
+    project_id: &str,
+    content: &ExecutionBaselineContent,
+    complete: bool,
+) -> Result<()> {
+    if !complete {
+        return Ok(());
+    }
+
+    let policy_revisions = content
+        .release_policy
+        .required_check_definition_revisions
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut expected = BTreeMap::<String, ExpectedBaselineRequirement>::new();
+
+    for (milestone_id, definition_revision_id) in content
+        .milestone_ids
+        .iter()
+        .zip(&content.milestone_definition_revision_ids)
+    {
+        if !policy_revisions.contains(definition_revision_id.as_str()) {
+            return Err(ServiceError::conflict(format!(
+                "release_policy.required_check_definition_revisions must include milestone definition '{definition_revision_id}'"
+            )));
+        }
+        let row = sqlx::query(
+            "SELECT r.acceptance_checks_json, r.evidence_requirements_json
+             FROM project_milestone m
+             JOIN project_milestone_revision r
+               ON r.id = ? AND r.milestone_id = m.id
+             WHERE m.id = ? AND m.project_id = ?",
+        )
+        .bind(definition_revision_id)
+        .bind(milestone_id)
+        .bind(project_id)
+        .fetch_optional(db.pool())
+        .await?
+        .ok_or_else(|| {
+            ServiceError::conflict(format!(
+                "milestone '{milestone_id}' definition '{definition_revision_id}' is unavailable"
+            ))
+        })?;
+        let checks = serde_json::from_str::<Vec<MilestoneAcceptanceCheck>>(
+            &row.try_get::<String, _>("acceptance_checks_json")?,
+        )
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "milestone '{milestone_id}' acceptance contract is invalid: {error}"
+            ))
+        })?;
+        let evidence = serde_json::from_str::<Vec<AcceptanceEvidenceRequirement>>(
+            &row.try_get::<String, _>("evidence_requirements_json")?,
+        )
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "milestone '{milestone_id}' evidence contract is invalid: {error}"
+            ))
+        })?;
+
+        for check in checks.iter().filter(|check| check.required) {
+            let Some(evidence_requirement) = evidence
+                .iter()
+                .find(|requirement| requirement.required && requirement.id == check.id)
+            else {
+                return Err(ServiceError::conflict(format!(
+                    "required acceptance check '{}' has no required evidence requirement with the same stable id; revise the milestone definition before proposing the baseline",
+                    check.id
+                )));
+            };
+            if expected
+                .insert(
+                    check.id.clone(),
+                    ExpectedBaselineRequirement {
+                        description: check.description.clone(),
+                        evidence_kind: evidence_requirement.evidence_kind.clone(),
+                        definition_revision_id: definition_revision_id.clone(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(ServiceError::conflict(format!(
+                    "acceptance check id '{}' is duplicated across pinned milestone definitions",
+                    check.id
+                )));
+            }
+        }
+
+        for requirement in evidence.iter().filter(|requirement| requirement.required) {
+            if expected.contains_key(&requirement.id) {
+                continue;
+            }
+            if expected
+                .insert(
+                    requirement.id.clone(),
+                    ExpectedBaselineRequirement {
+                        description: requirement.description.clone(),
+                        evidence_kind: requirement.evidence_kind.clone(),
+                        definition_revision_id: definition_revision_id.clone(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(ServiceError::conflict(format!(
+                    "evidence requirement id '{}' is duplicated across pinned milestone definitions",
+                    requirement.id
+                )));
+            }
+        }
+    }
+
+    let mut actual = BTreeMap::new();
+    for requirement in &content.acceptance_evidence_matrix {
+        if actual
+            .insert(requirement.id.as_str(), requirement)
+            .is_some()
+        {
+            return Err(ServiceError::conflict(format!(
+                "acceptance_evidence_matrix contains duplicate id '{}'",
+                requirement.id
+            )));
+        }
+    }
+    let expected_ids = expected.keys().cloned().collect::<Vec<_>>();
+    let actual_ids = actual.keys().copied().collect::<Vec<_>>();
+    if expected_ids.iter().map(String::as_str).collect::<Vec<_>>() != actual_ids {
+        return Err(ServiceError::conflict(format!(
+            "acceptance_evidence_matrix ids must exactly match the pinned milestone contract; expected [{}], got [{}]",
+            expected_ids.join(", "),
+            actual_ids.join(", ")
+        )));
+    }
+    for (id, expected_requirement) in expected {
+        let requirement = actual[&id.as_str()];
+        if !requirement.required {
+            return Err(ServiceError::conflict(format!(
+                "acceptance_evidence_matrix[{id}].required must be true"
+            )));
+        }
+        if requirement.description != expected_requirement.description {
+            return Err(ServiceError::conflict(format!(
+                "acceptance_evidence_matrix[{id}].description must equal the pinned milestone description"
+            )));
+        }
+        if requirement.evidence_kind != expected_requirement.evidence_kind {
+            return Err(ServiceError::conflict(format!(
+                "acceptance_evidence_matrix[{id}].evidence_kind must be {:?}, got {:?}",
+                expected_requirement.evidence_kind, requirement.evidence_kind
+            )));
+        }
+        if requirement.check_definition_revision.as_deref()
+            != Some(expected_requirement.definition_revision_id.as_str())
+        {
+            return Err(ServiceError::conflict(format!(
+                "acceptance_evidence_matrix[{id}].check_definition_revision must be '{}', got {:?}",
+                expected_requirement.definition_revision_id, requirement.check_definition_revision
+            )));
         }
     }
     Ok(())

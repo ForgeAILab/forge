@@ -65,7 +65,7 @@ database for historical provenance.
 | POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/readiness` | Persist one principal-bound immutable `ReadinessSnapshot` candidate |
 | GET    | `/api/v1/projects/{id}/milestones/{milestone_id}/readiness/history` | List immutable readiness candidates with opaque keyset pagination |
 | GET    | `/api/v1/projects/{id}/milestones/{milestone_id}/readiness/{snapshot_id}` | Read one exact readiness candidate |
-| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/checks/{check_id}/result` | Record a user-bound manual acceptance result |
+| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/checks/{check_id}/result` | Record a user-bound manual Pass/Fail result against the current check version and governing Charter/baseline revisions; this does not attach evidence |
 | POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/checks/{check_id}/waive` | Record a user-bound immutable acceptance waiver |
 | POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/release` | User-only release of an exact readiness candidate into immutable `Mxxx-rN` |
 | GET    | `/api/v1/projects/{id}/releases/{release_id}` | Inspect an immutable release manifest and evidence pins |
@@ -79,7 +79,7 @@ database for historical provenance.
 | POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/evidence` | Attach/reuse Project media as milestone evidence |
 | GET    | `/api/v1/projects/{id}/milestones/{milestone_id}/evidence/{evidence_id}` | Read one exact active evidence attachment |
 | DELETE | `/api/v1/projects/{id}/milestones/{milestone_id}/evidence/{evidence_id}` | Remove a milestone evidence attachment (release pins remain immutable) |
-| GET    | `/api/v1/projects/{id}/overview` | Read the derived Project Overview projection |
+| GET    | `/api/v1/projects/{id}/overview` | Read the derived Project Overview projection, including hydrated current acceptance-check results and check CAS versions |
 | GET    | `/api/v1/projects/{id}/execution-baseline` | Read the Project's current execution-baseline proposal/approval projection |
 | GET    | `/api/v1/projects/{id}/execution-setup` | Read independent coordination, execution-setup, and baseline-gate state plus eligible Worker/reviewer identities |
 | POST   | `/api/v1/projects/{id}/execution-setup/worker` | Project owner/admin selects an eligible Worker identity with `expected_project_version` and `idempotency_key` |
@@ -87,7 +87,7 @@ database for historical provenance.
 | POST   | `/api/v1/projects/{id}/execution-setup/repository` | Project owner/admin attaches a repository with `expected_project_version` and `idempotency_key` |
 | POST   | `/api/v1/projects/{id}/execution-setup/provisioning/retry` | Project owner/admin retries the durable, finite provisioning operation with `expected_operation_version` and `idempotency_key` |
 | POST   | `/api/v1/projects/{id}/execution-baseline` | Save the first complete or incomplete execution-baseline candidate as a `draft`; the request must carry `operation: "save_draft"`, the candidate content, canonical rendered view/digests, provenance, and `mutation.expected_version: 0` (the baseline id is server-minted) |
-| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions` | Save an exact digest-bound revision with explicit `operation: "save_draft"` or `"propose_for_approval"`; only the latter returns `requires_user_authorization: true` and a frozen `approval_target` |
+| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions` | Save an exact digest-bound revision with explicit `operation: "save_draft"` or `"propose_for_approval"`; proposal additionally requires its acceptance/evidence matrix to exactly match the stable IDs, evidence kinds, and revisions of the pinned milestone definitions, and only a valid proposal returns `requires_user_authorization: true` with a frozen `approval_target` |
 | POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions/{revision_id}/approve` | Record the exact authenticated user's baseline approval receipt |
 | POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/activate` | Activate the exact user-approved baseline; the request supplies both `mutation.expected_version` (Project version) and `expected_baseline_version` (baseline version), then atomically promotes matching preplanned Tasks and fills a missing Project primary-milestone pointer from the baseline's primary (or only) active milestone |
 | GET    | `/api/v1/projects/{id}/memory/search` | Search project memory |

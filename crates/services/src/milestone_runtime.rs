@@ -179,6 +179,52 @@ fn baseline_definition_contract_reasons(
         }
     }
 
+    for check in definition
+        .content
+        .acceptance_checks
+        .iter()
+        .filter(|check| check.required)
+    {
+        let evidence_requirement = definition
+            .content
+            .evidence_requirements
+            .iter()
+            .find(|requirement| requirement.required && requirement.id == check.id);
+        let Some(evidence_requirement) = evidence_requirement else {
+            reasons.push(reason(
+                "milestone_evidence_contract_reconciliation_required",
+                format!(
+                    "reconciliation_required: required acceptance check '{}' has no required evidence requirement with the same stable id",
+                    check.id
+                ),
+                vec![check.id.clone(), definition.id.clone()],
+            ));
+            continue;
+        };
+        let matrix_requirement = baseline
+            .acceptance_matrix
+            .iter()
+            .find(|requirement| requirement.id == check.id);
+        let Some(matrix_requirement) = matrix_requirement else {
+            continue;
+        };
+        if !matrix_requirement.required
+            || matrix_requirement.description != check.description
+            || matrix_requirement.evidence_kind != evidence_requirement.evidence_kind
+            || matrix_requirement.check_definition_revision.as_deref()
+                != Some(definition.id.as_str())
+        {
+            reasons.push(reason(
+                "baseline_requirement_semantics_reconciliation_required",
+                format!(
+                    "reconciliation_required: active-baseline requirement '{}' does not exactly match the pinned milestone check, evidence kind, and definition revision",
+                    check.id
+                ),
+                vec![check.id.clone(), definition.id.clone()],
+            ));
+        }
+    }
+
     let mut definition_ids = definition
         .content
         .acceptance_checks

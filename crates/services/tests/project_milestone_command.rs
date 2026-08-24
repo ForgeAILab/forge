@@ -10,9 +10,9 @@
 use std::sync::Arc;
 
 use api_types::{
-    AcceptanceCheckSourceKind, ExecutionBaselineReleasePolicy, MilestoneAcceptanceCheck,
-    MilestoneDefinitionContent, MilestoneDefinitionLifecycle, PrincipalKind, PrincipalRef,
-    RevisionProvenance,
+    AcceptanceCheckSourceKind, AcceptanceEvidenceRequirement, ExecutionBaselineReleasePolicy,
+    MilestoneAcceptanceCheck, MilestoneDefinitionContent, MilestoneDefinitionLifecycle,
+    PrincipalKind, PrincipalRef, RevisionProvenance,
 };
 use db::{
     create_sqlite_pool, run_migrations, AgentActionExecutionStatus, AgentActionPolicyResult,
@@ -492,7 +492,17 @@ fn definition_content(name: &str, check_id: Option<&str>) -> MilestoneDefinition
                 }]
             })
             .unwrap_or_default(),
-        evidence_requirements: Vec::new(),
+        evidence_requirements: check_id
+            .map(|id| {
+                vec![AcceptanceEvidenceRequirement {
+                    id: id.to_owned(),
+                    description: format!("Evidence for {name}"),
+                    required: true,
+                    evidence_kind: None,
+                    check_definition_revision: None,
+                }]
+            })
+            .unwrap_or_default(),
         known_issues: Vec::new(),
         target_date: None,
     }

@@ -43,6 +43,8 @@ struct GenesisFixture {
     milestone_id: String,
     milestone_version: i64,
     milestone_definition_revision_id: String,
+    milestone_acceptance_check_id: String,
+    milestone_acceptance_check_description: String,
 }
 
 #[derive(Debug, Clone)]
@@ -329,7 +331,7 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
             "project_mode": "compact",
             "selected_project_agent_identity_id": legacy_identity,
             "selected_project_agent_profile_revision_id": legacy_profile,
-            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@2",
+            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@3",
             "selected_project_agent_policy_digest": legacy_policy
         }),
         &[StatusCode::CREATED, StatusCode::OK],
@@ -1135,7 +1137,7 @@ async fn v076_project_evidence_is_scoped_pinned_and_user_attested() {
         },
         "milestone_id": fixture.milestone_id,
         "asset_id": task_asset_id,
-        "acceptance_check_ids": [],
+        "acceptance_check_ids": [fixture.milestone_acceptance_check_id],
         "caption": "A bounded Project proof screenshot.",
         "kind": "screenshot",
         "checksum": proof_checksum
@@ -2509,6 +2511,7 @@ async fn record_passed_check(
     .await;
     assert_eq!(result["status"], json!("pass"));
     assert_eq!(result["principal"]["kind"], json!("user"));
+    ensure_required_evidence(app, token, fixture).await;
 
     for (label, altered) in user_authorization_replay_variants(&result_body, false) {
         let conflict = request_json(
@@ -2650,6 +2653,102 @@ async fn record_passed_check(
     assert_eq!(altered["code"], json!("idempotency_conflict"));
 }
 
+async fn ensure_required_evidence(app: &Router, token: &str, fixture: &GenesisFixture) {
+    let evidence = request_json(
+        app,
+        Method::GET,
+        &format!(
+            "/api/v1/projects/{}/milestones/{}/evidence",
+            fixture.project_id, fixture.milestone_id
+        ),
+        token,
+        Value::Null,
+        &[StatusCode::OK],
+    )
+    .await;
+    if evidence["items"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["availability"] == json!("available")
+                && item["acceptance_check_ids"].as_array().is_some_and(|ids| {
+                    ids.iter()
+                        .any(|id| id == &json!(fixture.milestone_acceptance_check_id))
+                })
+        })
+    }) {
+        return;
+    }
+
+    let project = request_json(
+        app,
+        Method::GET,
+        &format!("/api/v1/projects/{}", fixture.project_id),
+        token,
+        Value::Null,
+        &[StatusCode::OK],
+    )
+    .await;
+    let project_version = project["version"]
+        .as_i64()
+        .expect("Project version for required evidence");
+    let mut proof = b"\x89PNG\r\n\x1a\nrequired evidence ".to_vec();
+    proof.extend_from_slice(fixture.milestone_acceptance_check_id.as_bytes());
+    let asset = upload_project_media(
+        app,
+        token,
+        &fixture.project_id,
+        project_version,
+        "v076-required-evidence-upload",
+        &user_authorization(
+            "project.media.upload",
+            "v076-required-evidence-upload-event",
+        ),
+        &proof,
+        StatusCode::CREATED,
+    )
+    .await;
+    let asset_id = required_string(&asset, &["id"]);
+    let checksum = required_string(&asset, &["checksum"]);
+    let milestone = request_json(
+        app,
+        Method::GET,
+        &format!(
+            "/api/v1/projects/{}/milestones/{}",
+            fixture.project_id, fixture.milestone_id
+        ),
+        token,
+        Value::Null,
+        &[StatusCode::OK],
+    )
+    .await;
+    request_json(
+        app,
+        Method::POST,
+        &format!(
+            "/api/v1/projects/{}/milestones/{}/evidence",
+            fixture.project_id, fixture.milestone_id
+        ),
+        token,
+        json!({
+            "mutation": {
+                "expected_version": milestone["version"],
+                "idempotency_key": "v076-required-evidence-attach",
+                "authorization": user_authorization(
+                    "project.evidence.attach",
+                    "v076-required-evidence-attach-event"
+                )
+            },
+            "milestone_id": fixture.milestone_id,
+            "asset_id": asset_id,
+            "acceptance_check_ids": [fixture.milestone_acceptance_check_id],
+            "caption": "Required acceptance evidence fixture.",
+            "kind": "screenshot",
+            "checksum": checksum
+        }),
+        &[StatusCode::OK],
+    )
+    .await;
+}
+
 async fn create_genesis_project(app: &Router, token: &str, prefix: &str) -> GenesisFixture {
     let main = connect_agent(
         app,
@@ -2765,7 +2864,7 @@ async fn create_genesis_project(app: &Router, token: &str, prefix: &str) -> Gene
         "project_mode": "compact",
         "selected_project_agent_identity_id": project_identity,
         "selected_project_agent_profile_revision_id": project_profile,
-        "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@2",
+        "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@3",
         "selected_project_agent_policy_digest": policy_digest
     });
     let approval = request_json(
@@ -2884,6 +2983,25 @@ async fn create_genesis_project(app: &Router, token: &str, prefix: &str) -> Gene
     .await;
     let milestone_version = milestone["version"].as_i64().expect("milestone version");
     let milestone_definition_revision_id = required_string(&milestone, &["definition_revision_id"]);
+    let milestone_definition = request_json(
+        app,
+        Method::GET,
+        &format!(
+            "/api/v1/projects/{project_id}/milestones/{milestone_id}/revisions/{milestone_definition_revision_id}"
+        ),
+        token,
+        Value::Null,
+        &[StatusCode::OK],
+    )
+    .await;
+    let milestone_acceptance_check_id = required_string(
+        &milestone_definition["content"]["acceptance_checks"][0],
+        &["id"],
+    );
+    let milestone_acceptance_check_description = required_string(
+        &milestone_definition["content"]["acceptance_checks"][0],
+        &["description"],
+    );
     GenesisFixture {
         project_id,
         project_version,
@@ -2904,6 +3022,8 @@ async fn create_genesis_project(app: &Router, token: &str, prefix: &str) -> Gene
         milestone_id,
         milestone_version,
         milestone_definition_revision_id,
+        milestone_acceptance_check_id,
+        milestone_acceptance_check_description,
     }
 }
 
@@ -2972,7 +3092,13 @@ async fn create_baseline(
         "release_policy_revision": "v076-policy-r1",
         "release_policy_digest": release_policy_digest,
         "release_policy": release_policy,
-        "acceptance_evidence_matrix": [],
+        "acceptance_evidence_matrix": [{
+            "id": fixture.milestone_acceptance_check_id,
+            "description": fixture.milestone_acceptance_check_description,
+            "required": true,
+            "evidence_kind": null,
+            "check_definition_revision": fixture.milestone_definition_revision_id
+        }],
         "capability_classes": ["repository_write"],
         "risk_classes": ["low"],
         "reviewer_independence_rules": ["independent-reviewer"],
@@ -3625,7 +3751,7 @@ fn user_authorization_replay_variants(
 fn user_provenance(summary: &str) -> Value {
     json!({
         "author": {"kind": "user", "id": "test-user-id"},
-        "operating_skill_revision": "forge.project.orchestration/v1@2",
+        "operating_skill_revision": "forge.project.orchestration/v1@3",
         "source_refs": [],
         "change_summary": summary
     })

@@ -24,6 +24,8 @@ struct ProjectAuthorityFixture {
     charter_render_digest: String,
     milestone_id: String,
     milestone_definition_revision_id: String,
+    milestone_acceptance_check_id: String,
+    milestone_acceptance_check_description: String,
 }
 
 struct TaskGovernanceFixture {
@@ -215,7 +217,7 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
             "project_mode": "compact",
             "selected_project_agent_identity_id": project_identity,
             "selected_project_agent_profile_revision_id": project_profile,
-            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@2",
+            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@3",
             "selected_project_agent_policy_digest": project_policy_digest(
                 &project_agent["profile"]["tool_policy"]
             )
@@ -285,6 +287,25 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
     )
     .await;
     let milestone_definition_revision_id = required_string(&milestone, &["definition_revision_id"]);
+    let milestone_definition = request_json(
+        app,
+        Method::GET,
+        &format!(
+            "/api/v1/projects/{project_id}/milestones/{milestone_id}/revisions/{milestone_definition_revision_id}"
+        ),
+        &token,
+        Value::Null,
+        &[StatusCode::OK],
+    )
+    .await;
+    let milestone_acceptance_check_id = required_string(
+        &milestone_definition["content"]["acceptance_checks"][0],
+        &["id"],
+    );
+    let milestone_acceptance_check_description = required_string(
+        &milestone_definition["content"]["acceptance_checks"][0],
+        &["description"],
+    );
 
     let project_binding = request_json(
         app,
@@ -386,6 +407,8 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
             charter_render_digest: rendered_charter.render_digest.clone(),
             milestone_id: milestone_id.clone(),
             milestone_definition_revision_id,
+            milestone_acceptance_check_id,
+            milestone_acceptance_check_description,
         },
     )
     .await;
@@ -628,7 +651,13 @@ async fn create_active_execution_baseline(
         "release_policy_revision": "revised-acceptance-policy-r1",
         "release_policy_digest": release_policy_digest,
         "release_policy": release_policy,
-        "acceptance_evidence_matrix": [],
+        "acceptance_evidence_matrix": [{
+            "id": authority.milestone_acceptance_check_id,
+            "description": authority.milestone_acceptance_check_description,
+            "required": true,
+            "evidence_kind": null,
+            "check_definition_revision": authority.milestone_definition_revision_id
+        }],
         "capability_classes": ["repository_write"],
         "risk_classes": ["low"],
         "reviewer_independence_rules": ["independent-reviewer"],
@@ -897,7 +926,7 @@ fn user_authorization(action: &str, event_id: &str) -> Value {
 fn user_provenance(summary: &str) -> Value {
     json!({
         "author": {"kind": "user", "id": "test-user-id"},
-        "operating_skill_revision": "forge.project.orchestration/v1@2",
+        "operating_skill_revision": "forge.project.orchestration/v1@3",
         "source_refs": [],
         "change_summary": summary
     })

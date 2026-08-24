@@ -447,6 +447,7 @@ fn export_typescript() {
     ProjectMediaUploadRequest::export().expect("export ProjectMediaUploadRequest");
     ProjectMediaTombstoneRequest::export().expect("export ProjectMediaTombstoneRequest");
     MilestoneAcceptanceCheck::export().expect("export MilestoneAcceptanceCheck");
+    MilestoneAcceptanceCheckState::export().expect("export MilestoneAcceptanceCheckState");
     MilestoneDefinitionContent::export().expect("export MilestoneDefinitionContent");
     MilestoneDefinitionLifecycle::export().expect("export MilestoneDefinitionLifecycle");
     MilestoneDefinitionRevision::export().expect("export MilestoneDefinitionRevision");

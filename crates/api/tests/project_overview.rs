@@ -179,7 +179,7 @@ async fn project_overview_projects_canonical_active_milestone_state() {
     .await
     .expect("insert overview milestone");
     sqlx::query(
-        "INSERT INTO project_milestone_revision (
+        r#"INSERT INTO project_milestone_revision (
             id, milestone_id, revision, base_revision, lifecycle,
             display_label, outcome, included_scope_json, excluded_scope_json,
             document_revisions_json, task_selection_json, dependencies_json,
@@ -189,8 +189,10 @@ async fn project_overview_projects_canonical_active_milestone_state() {
             source_refs_json, created_at
          ) VALUES (?, ?, 1, 0, 'approved', 'First bounded outcome',
             'Ship the first bounded outcome.', '[]', '[]', '[]', '[]', '[]',
-            '[]', '[]', '[]', '[]', 'initial', 'test', 'v1', 'First bounded outcome',
-            'digest-definition', 'digest-render', 'user', 'test-user-id', '[]', ?)",
+            '[]', '[{"id":"overview-current-check","description":"Current manual check","required":true,"source_kind":"manual","expected_result":"pass"}]',
+            '[{"id":"overview-current-check","description":"Current proof","required":true,"evidence_kind":"report"}]',
+            '[]', 'initial', 'test', 'v1', 'First bounded outcome',
+            'digest-definition', 'digest-render', 'user', 'test-user-id', '[]', ?)"#,
     )
     .bind(definition_id)
     .bind(milestone_id)
@@ -204,6 +206,22 @@ async fn project_overview_projects_canonical_active_milestone_state() {
         .execute(harness.state.db.pool())
         .await
         .expect("point milestone at definition");
+    sqlx::query(
+        "INSERT INTO project_milestone_check (
+            id, project_id, milestone_id, definition_revision_id, check_key,
+            description, required, source_kind, expected_result,
+            evidence_required, version, current_result_id, created_at, updated_at
+         ) VALUES ('overview-current-check', ?, ?, ?, 'overview-current-check',
+            'Current manual check', 1, 'manual', 'pass', 1, 3, NULL, ?, ?)",
+    )
+    .bind(&project.id)
+    .bind(milestone_id)
+    .bind(definition_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(harness.state.db.pool())
+    .await
+    .expect("insert current milestone check");
     sqlx::query(
         "INSERT INTO project_milestone_revision (
             id, milestone_id, revision, base_revision, base_revision_id, lifecycle,
@@ -264,18 +282,33 @@ async fn project_overview_projects_canonical_active_milestone_state() {
         "Ship the first bounded outcome."
     );
     assert_eq!(overview.primary_milestone_id.as_deref(), Some(milestone_id));
-    assert_eq!(overview.check_summary.required_total, 0);
+    assert_eq!(overview.check_summary.required_total, 1);
     assert_eq!(
-        overview.active_milestones[0].check_summary.required_total, 0,
+        overview.active_milestones[0].check_summary.required_total, 1,
         "superseded definition checks are not current validation truth"
     );
+    assert_eq!(overview.active_milestones[0].current_checks.len(), 1);
+    assert_eq!(
+        overview.active_milestones[0].current_checks[0].id,
+        "overview-current-check"
+    );
+    assert_eq!(overview.active_milestones[0].current_checks[0].version, 3);
     let effective =
         services::load_effective_project_state(harness.state.db.as_ref(), &project.id, Some(32))
             .await
             .expect("effective Project state");
     assert_eq!(
-        effective.validation_summary.total, 0,
+        effective.validation_summary.total, 1,
         "Project Agent context excludes superseded definition checks"
+    );
+    assert_eq!(effective.active_milestones[0].acceptance_checks.len(), 1);
+    assert_eq!(
+        effective.active_milestones[0].acceptance_checks[0].id,
+        "overview-current-check"
+    );
+    assert_eq!(
+        effective.active_milestones[0].evidence_requirements.len(),
+        1
     );
     assert_eq!(
         overview.projection_state,

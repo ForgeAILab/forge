@@ -8,9 +8,11 @@
 
 use std::collections::BTreeMap;
 
-use api_types::ProjectExecutionSetupResponse;
+use api_types::{
+    AcceptanceEvidenceRequirement, MilestoneAcceptanceCheck, ProjectExecutionSetupResponse,
+};
 use db::SqliteDb;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::Row;
 
@@ -230,6 +232,12 @@ pub struct MilestoneProjection {
     pub lifecycle: String,
     pub definition_revision_id: Option<String>,
     pub definition_digest: Option<String>,
+    /// Exact current-definition contract. Project Agents must reuse these
+    /// stable IDs instead of inventing baseline acceptance-matrix aliases.
+    #[serde(default)]
+    pub acceptance_checks: Vec<MilestoneAcceptanceCheck>,
+    #[serde(default)]
+    pub evidence_requirements: Vec<AcceptanceEvidenceRequirement>,
     pub version: i64,
     pub blocker_reasons: Vec<Value>,
     pub stale_reasons: Vec<Value>,
@@ -633,7 +641,8 @@ pub async fn load_effective_project_state(
                 m.current_definition_revision_id, m.version,
                 m.blocker_reason_json, m.stale_reason_json,
                 m.reconciliation_reason_json,
-                r.content_digest AS definition_digest
+                r.content_digest AS definition_digest,
+                r.acceptance_checks_json, r.evidence_requirements_json
          FROM project_milestone m
          LEFT JOIN project_milestone_revision r
            ON r.id = m.current_definition_revision_id AND r.milestone_id = m.id
@@ -655,6 +664,10 @@ pub async fn load_effective_project_state(
                 lifecycle: row.try_get("lifecycle")?,
                 definition_revision_id: row.try_get("current_definition_revision_id")?,
                 definition_digest: row.try_get("definition_digest")?,
+                acceptance_checks: json_typed_array(row.try_get("acceptance_checks_json")?)?,
+                evidence_requirements: json_typed_array(
+                    row.try_get("evidence_requirements_json")?,
+                )?,
                 version: row.try_get("version")?,
                 blocker_reasons: json_value_array(row.try_get("blocker_reason_json")?)?,
                 stale_reasons: json_value_array(row.try_get("stale_reason_json")?)?,
@@ -1295,6 +1308,17 @@ fn json_value_array(value: String) -> Result<Vec<Value>> {
     })
 }
 
+fn json_typed_array<T: DeserializeOwned>(value: Option<String>) -> Result<Vec<T>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str::<Vec<T>>(&value).map_err(|error| {
+        ServiceError::invalid_operation(format!(
+            "Project runtime state contains an invalid typed JSON array: {error}"
+        ))
+    })
+}
+
 fn json_object_value(value: String) -> Result<Value> {
     let parsed = serde_json::from_str::<Value>(&value).map_err(|error| {
         ServiceError::invalid_operation(format!(
@@ -1364,6 +1388,8 @@ mod tests {
             lifecycle: lifecycle.to_owned(),
             definition_revision_id: None,
             definition_digest: None,
+            acceptance_checks: Vec::new(),
+            evidence_requirements: Vec::new(),
             version: 1,
             blocker_reasons: Vec::new(),
             stale_reasons: Vec::new(),

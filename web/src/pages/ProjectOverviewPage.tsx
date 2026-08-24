@@ -18,7 +18,11 @@ import {
   XCircle,
 } from '@phosphor-icons/react'
 import { apiFetchBlob } from '@/api/client'
-import { useProjectOverviewQuery, useReleaseProjectMilestone } from '@/api/hooks'
+import {
+  useProjectOverviewQuery,
+  useRecordManualMilestoneCheck,
+  useReleaseProjectMilestone,
+} from '@/api/hooks'
 import { ConflictDetails } from '@/components/conflict-details'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -48,6 +52,9 @@ import type {
   TaskProgressCounts,
 } from '@/types/generated'
 import type { AuthorizationProvenance } from '@/types/generated/bindings/AuthorizationProvenance'
+import type { MilestoneAcceptanceCheckState } from '@/types/generated/bindings/MilestoneAcceptanceCheckState'
+import { Label } from '@/components/ui/label'
+import { Textarea } from '@/components/ui/textarea'
 
 type CountValue = number | bigint
 
@@ -93,16 +100,25 @@ function newIdempotencyKey(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`
 }
 
-function createUserAuthorization(action: string): AuthorizationProvenance {
+function createUserAuthorization(
+  action: string,
+  authorizationBasis = 'interactive_user_release',
+): AuthorizationProvenance {
   const user = useAuthStore.getState().user
-  if (!user) throw new Error('Sign in again before releasing this milestone.')
+  if (!user) throw new Error('Sign in again before completing this user-authorized action.')
   return {
     principal: { kind: 'user', id: user.id, display_name: user.display_name ?? null },
-    authorization_basis: 'interactive_user_release',
+    authorization_basis: authorizationBasis,
     action,
     event_id: newIdempotencyKey(action),
     occurred_at: new Date().toISOString(),
   }
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const bytes = new TextEncoder().encode(value)
+  const digest = await crypto.subtle.digest('SHA-256', bytes)
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
 type ReleaseCandidate = {
@@ -113,6 +129,14 @@ type ReleaseCandidate = {
   digest: string
   expectedMilestoneVersion: number
   readinessExpectedMilestoneVersion: number
+}
+
+type ManualAttestationCandidate = {
+  milestoneId: string
+  milestoneLabel: string
+  definitionRevisionId: string
+  charterRevisionId: string
+  check: MilestoneAcceptanceCheckState
 }
 
 function formatDuration(value: number | null): string {
@@ -253,6 +277,218 @@ function CheckSummary({ summary }: { summary: AcceptanceCheckSummary }) {
         ))}
       </div>
     </div>
+  )
+}
+
+function AcceptanceChecksPanel({
+  milestones,
+  hasUser,
+  pending,
+  onReview,
+}: {
+  milestones: ProjectMilestoneOverview[]
+  hasUser: boolean
+  pending: boolean
+  onReview: (candidate: ManualAttestationCandidate) => void
+}) {
+  const checks = milestones.flatMap((item) =>
+    (item.current_checks ?? []).map((check) => ({ item, check })),
+  )
+
+  if (checks.length === 0) {
+    return (
+      <p className="mt-4 border-t border-border-subtle pt-4 text-xs text-muted-foreground">
+        No current acceptance-check definitions are available.
+      </p>
+    )
+  }
+
+  return (
+    <ul className="mt-4 divide-y divide-border-subtle border-t border-border-subtle">
+      {checks.map(({ item, check }) => {
+        const evidenceRequirement = item.definition.content.evidence_requirements.find(
+          (requirement) => requirement.id === check.id && requirement.required,
+        )
+        const evidenceAttached = item.evidence.some(
+          (evidence) =>
+            evidence.availability === 'available' &&
+            evidence.acceptance_check_ids.includes(check.id),
+        )
+        const resultStatus = check.latest_result ?? 'missing'
+        const evidenceKindLabel = evidenceRequirement?.evidence_kind
+          ? `${humanize(evidenceRequirement.evidence_kind)} `
+          : ''
+        const canAttest =
+          Boolean(evidenceRequirement) &&
+          check.source_kind === 'manual' &&
+          !['pass', 'waived'].includes(resultStatus) &&
+          check.version > 0
+
+        return (
+          <li key={`${item.milestone.id}:${check.id}`} className="min-w-0 py-4 last:pb-0">
+            <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <div className="flex min-w-0 flex-wrap items-center gap-2">
+                  <StatusLabel status={resultStatus} />
+                  <span className="font-mono text-micro text-muted-foreground">
+                    {humanize(check.source_kind)} · {check.required ? 'required' : 'optional'}
+                  </span>
+                </div>
+                <p className="mt-2 break-words text-sm leading-6 text-foreground">
+                  {check.description}
+                </p>
+                <p className="mt-1 break-all font-mono text-micro text-muted-foreground">
+                  {item.milestone.canonical_id} · check {shortId(check.id)} · definition{' '}
+                  {shortId(item.definition.id)} · check v{count(check.version)}
+                </p>
+                <p
+                  className={`mt-2 text-xs ${
+                    evidenceRequirement && evidenceAttached ? 'text-success' : 'text-warning'
+                  }`}
+                >
+                  {evidenceRequirement
+                    ? evidenceAttached
+                      ? `Required ${evidenceKindLabel}evidence is attached.`
+                      : `Required ${evidenceKindLabel}evidence is still missing.`
+                    : 'No required evidence contract is linked to this check; the milestone must be revised before release.'}
+                </p>
+              </div>
+              {canAttest ? (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={!hasUser || pending}
+                  onClick={() =>
+                    onReview({
+                      milestoneId: item.milestone.id,
+                      milestoneLabel:
+                        item.milestone.display_label ?? item.definition.content.name,
+                      definitionRevisionId: item.definition.id,
+                      charterRevisionId: item.definition.content.charter_revision?.revision_id ?? '',
+                      check,
+                    })
+                  }
+                >
+                  {!hasUser ? 'Sign in to attest' : pending ? 'Recording…' : 'Record attestation'}
+                </Button>
+              ) : null}
+            </div>
+            {check.source_kind !== 'manual' && !['pass', 'waived'].includes(resultStatus) ? (
+              <p className="mt-2 text-xs text-muted-foreground">
+                Waiting for the authoritative {humanize(check.source_kind).toLowerCase()} result;
+                this cannot be replaced by a user attestation.
+              </p>
+            ) : null}
+          </li>
+        )
+      })}
+    </ul>
+  )
+}
+
+function ManualAttestationDialog({
+  candidate,
+  open,
+  pending,
+  error,
+  onOpenChange,
+  onConfirm,
+}: {
+  candidate: ManualAttestationCandidate | null
+  open: boolean
+  pending: boolean
+  error: string | null
+  onOpenChange: (open: boolean) => void
+  onConfirm: (status: 'pass' | 'fail', observation: string) => void
+}) {
+  const [status, setStatus] = useState<'pass' | 'fail' | null>(null)
+  const [observation, setObservation] = useState('')
+
+  useEffect(() => {
+    if (open) {
+      setStatus(null)
+      setObservation('')
+    }
+  }, [open, candidate?.check.id])
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Record manual acceptance</DialogTitle>
+          <DialogDescription>
+            This writes an authoritative user result for one immutable check. It does not attach
+            evidence and does not release the milestone.
+          </DialogDescription>
+        </DialogHeader>
+        {candidate ? (
+          <div className="space-y-4">
+            <div className="rounded-md border border-border-subtle bg-muted/30 p-3">
+              <p className="text-xs font-semibold text-foreground">{candidate.milestoneLabel}</p>
+              <p className="mt-2 break-words text-sm leading-6 text-foreground">
+                {candidate.check.description}
+              </p>
+              <p className="mt-2 break-all font-mono text-micro text-muted-foreground">
+                check {candidate.check.id} · definition {candidate.definitionRevisionId} · v
+                {count(candidate.check.version)}
+              </p>
+            </div>
+            <fieldset>
+              <legend className="text-xs font-medium text-foreground">Observed result</legend>
+              <div className="mt-2 grid grid-cols-2 gap-2">
+                <Button
+                  type="button"
+                  variant={status === 'pass' ? 'default' : 'outline'}
+                  aria-pressed={status === 'pass'}
+                  onClick={() => setStatus('pass')}
+                >
+                  <CheckCircle size={15} aria-hidden /> Pass
+                </Button>
+                <Button
+                  type="button"
+                  variant={status === 'fail' ? 'destructive' : 'outline'}
+                  aria-pressed={status === 'fail'}
+                  onClick={() => setStatus('fail')}
+                >
+                  <XCircle size={15} aria-hidden /> Fail
+                </Button>
+              </div>
+            </fieldset>
+            <div className="space-y-2">
+              <Label htmlFor="manual-attestation-observation">Observation</Label>
+              <Textarea
+                id="manual-attestation-observation"
+                value={observation}
+                onChange={(event) => setObservation(event.target.value)}
+                placeholder="Describe exactly what you observed. This note is not evidence."
+                rows={4}
+              />
+            </div>
+            {error ? (
+              <p className="break-words text-xs leading-5 text-destructive" role="alert">
+                {error}
+              </p>
+            ) : null}
+          </div>
+        ) : null}
+        <DialogFooter>
+          <Button type="button" variant="ghost" disabled={pending} onClick={() => onOpenChange(false)}>
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            disabled={!status || observation.trim().length < 3 || pending}
+            aria-busy={pending}
+            onClick={() => {
+              if (status) onConfirm(status, observation.trim())
+            }}
+          >
+            {pending ? 'Recording exact result…' : 'Record result'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -1307,6 +1543,7 @@ function ReleaseReviewDialog({
 export function ProjectOverviewPage({ projectId }: { projectId: string }) {
   const overviewQuery = useProjectOverviewQuery(projectId)
   const releaseMutation = useReleaseProjectMilestone()
+  const attestationMutation = useRecordManualMilestoneCheck()
   const hasUser = Boolean(useAuthStore((state) => state.user))
   const releaseAttemptRef = useRef<{
     fingerprint: string
@@ -1316,6 +1553,10 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
   const [releaseCandidate, setReleaseCandidate] = useState<ReleaseCandidate | null>(null)
   const [releaseError, setReleaseError] = useState<string | null>(null)
   const [releaseNotice, setReleaseNotice] = useState<string | null>(null)
+  const [attestationCandidate, setAttestationCandidate] =
+    useState<ManualAttestationCandidate | null>(null)
+  const [attestationError, setAttestationError] = useState<string | null>(null)
+  const [attestationNotice, setAttestationNotice] = useState<string | null>(null)
 
   function reviewRelease(candidate: ReleaseCandidate) {
     setReleaseError(null)
@@ -1361,6 +1602,55 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
               error,
               'The release could not be recorded. Review the current readiness snapshot and try again.',
             ),
+      )
+      void overviewQuery.refetch()
+    }
+  }
+
+  async function executeAttestation(
+    candidate: ManualAttestationCandidate,
+    status: 'pass' | 'fail',
+    observation: string,
+  ) {
+    setAttestationError(null)
+    try {
+      if (!candidate.charterRevisionId) {
+        throw new Error('The current milestone has no governing Charter revision.')
+      }
+      const inputDigest = await sha256Hex(
+        JSON.stringify({
+          check_id: candidate.check.id,
+          definition_revision_id: candidate.definitionRevisionId,
+          status,
+          observation,
+        }),
+      )
+      await attestationMutation.mutateAsync({
+        projectId,
+        milestoneId: candidate.milestoneId,
+        checkId: candidate.check.id,
+        definitionRevisionId: candidate.definitionRevisionId,
+        charterRevisionId: candidate.charterRevisionId,
+        expectedCheckVersion: count(candidate.check.version),
+        status,
+        result: observation,
+        inputDigest,
+        idempotencyKey: newIdempotencyKey('manual-attestation'),
+        authorization: createUserAuthorization(
+          'project.milestone.check.record',
+          'interactive_user_attestation',
+        ),
+      })
+      setAttestationCandidate(null)
+      setAttestationNotice(
+        `${humanize(status)} recorded for “${candidate.check.description}”. Required evidence remains separate.`,
+      )
+    } catch (error) {
+      setAttestationError(
+        getApiErrorMessage(
+          error,
+          'The result could not be recorded. Refresh the current check and try again.',
+        ),
       )
       void overviewQuery.refetch()
     }
@@ -1463,6 +1753,16 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
         </div>
       ) : null}
 
+      {attestationNotice ? (
+        <div
+          className="flex min-w-0 items-start gap-2 rounded-md border border-success/30 bg-success/10 p-3 text-sm"
+          role="status"
+        >
+          <CheckCircle size={17} className="mt-0.5 shrink-0 text-success" aria-hidden />
+          <p className="break-words text-foreground">{attestationNotice}</p>
+        </div>
+      ) : null}
+
       {setupRequired ? <ProjectCharterAdoptionBanner projectId={projectId} /> : null}
 
       <div className="grid min-w-0 gap-5 xl:grid-cols-[minmax(0,1.45fr)_minmax(300px,0.75fr)]">
@@ -1525,6 +1825,17 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
             <div id="readiness" className="scroll-mt-24">
               <SectionCard title="Validation" eyebrow="Acceptance contract">
                 <CheckSummary summary={overview.check_summary} />
+                <AcceptanceChecksPanel
+                  milestones={activeMilestones}
+                  hasUser={hasUser}
+                  pending={attestationMutation.isPending}
+                  onReview={(candidate) => {
+                    setAttestationError(null)
+                    setAttestationNotice(null)
+                    attestationMutation.reset?.()
+                    setAttestationCandidate(candidate)
+                  }}
+                />
               </SectionCard>
             </div>
           </div>
@@ -1571,6 +1882,28 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
         }}
         onConfirm={() => {
           if (releaseCandidate) void executeRelease(releaseCandidate)
+        }}
+      />
+      <ManualAttestationDialog
+        candidate={attestationCandidate}
+        open={attestationCandidate !== null}
+        pending={attestationMutation.isPending}
+        error={
+          attestationError ??
+          (attestationMutation.error
+            ? getApiErrorMessage(
+                attestationMutation.error,
+                'The result could not be recorded. Refresh the current check and try again.',
+              )
+            : null)
+        }
+        onOpenChange={(open) => {
+          if (!open && !attestationMutation.isPending) setAttestationCandidate(null)
+        }}
+        onConfirm={(status, observation) => {
+          if (attestationCandidate) {
+            void executeAttestation(attestationCandidate, status, observation)
+          }
         }}
       />
     </div>

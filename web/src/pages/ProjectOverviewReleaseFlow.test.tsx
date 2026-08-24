@@ -3,7 +3,11 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { useProjectOverviewQuery, useReleaseProjectMilestone } from '@/api/hooks'
+import {
+  useProjectOverviewQuery,
+  useRecordManualMilestoneCheck,
+  useReleaseProjectMilestone,
+} from '@/api/hooks'
 import { ProjectOverviewPage } from '@/pages/ProjectOverviewPage'
 import { useAuthStore } from '@/stores/auth'
 import type { ProjectOverview } from '@/types/generated'
@@ -31,6 +35,7 @@ vi.mock('@tanstack/react-router', () => ({
 
 vi.mock('@/api/hooks', () => ({
   useProjectOverviewQuery: vi.fn(),
+  useRecordManualMilestoneCheck: vi.fn(),
   useProjectQuery: vi.fn(() => ({ data: undefined, isLoading: false })),
   useReleaseProjectMilestone: vi.fn(),
 }))
@@ -330,6 +335,19 @@ function releaseMutation(overrides: Record<string, unknown> = {}) {
   return { mutate, mutateAsync }
 }
 
+function manualAttestationMutation(overrides: Record<string, unknown> = {}) {
+  const mutateAsync = vi.fn().mockResolvedValue({ id: 'validation-result-1' })
+  const state = {
+    mutateAsync,
+    isPending: false,
+    error: null,
+    reset: vi.fn(),
+    ...overrides,
+  }
+  vi.mocked(useRecordManualMilestoneCheck).mockReturnValue(state as never)
+  return { mutateAsync }
+}
+
 describe('Project Overview release flow', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -339,6 +357,7 @@ describe('Project Overview release flow', () => {
       user: { id: 'user-1', display_name: 'Test User' } as never,
     })
     releaseMutation()
+    manualAttestationMutation()
   })
 
   it('submits the exact readiness candidate identity, digest, and milestone CAS version', async () => {
@@ -376,6 +395,101 @@ describe('Project Overview release flow', () => {
         principal: expect.objectContaining({ kind: 'user' }),
       }),
     )
+  })
+
+  it('records a deliberate manual result without presenting it as evidence or release', async () => {
+    const mutation = manualAttestationMutation()
+    const manualMilestone = {
+      ...readyMilestone,
+      milestone: {
+        ...readyMilestone.milestone,
+        lifecycle: 'active',
+        version: 4n,
+      },
+      definition: {
+        ...readyMilestone.definition,
+        content: {
+          ...readyMilestone.definition.content,
+          charter_revision: {
+            artifact_id: 'charter-1',
+            revision_id: 'charter-revision-1',
+            content_digest: 'charter-digest',
+            render_version: 'forge.project-charter/v1',
+            render_digest: 'charter-render-digest',
+          },
+          acceptance_checks: [
+            {
+              id: 'check-manual-1',
+              description: 'The user observes that the saved list survives a refresh.',
+              required: true,
+              source_kind: 'manual',
+              expected_result: 'passed',
+              latest_result: null,
+              latest_result_id: null,
+              latest_result_digest: null,
+            },
+          ],
+          evidence_requirements: [
+            {
+              id: 'check-manual-1',
+              description: 'Refresh proof',
+              required: true,
+              evidence_kind: 'report',
+              check_definition_revision: 'milestone-revision-1',
+            },
+          ],
+        },
+      },
+      check_summary: { ...checks, passed: 0n, missing: 1n },
+      current_checks: [
+        {
+          id: 'check-manual-1',
+          description: 'The user observes that the saved list survives a refresh.',
+          required: true,
+          source_kind: 'manual',
+          expected_result: 'passed',
+          version: 3n,
+          latest_result: null,
+          latest_result_id: null,
+          latest_result_digest: null,
+        },
+      ],
+      latest_readiness: null,
+      readiness_freshness: null,
+      evidence: [],
+    }
+    renderPage({
+      ...baseOverview,
+      active_milestones: [manualMilestone],
+      check_summary: { ...checks, passed: 0n, missing: 1n },
+    } as unknown as ProjectOverview)
+
+    expect(screen.getByText('Required Report evidence is still missing.')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Record attestation' }))
+    const dialog = screen.getByRole('dialog', { name: 'Record manual acceptance' })
+    const submit = within(dialog).getByRole('button', { name: 'Record result' })
+    expect((submit as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Pass' }))
+    fireEvent.change(within(dialog).getByLabelText('Observation'), {
+      target: { value: 'I refreshed the page and the exact list remained visible.' },
+    })
+    fireEvent.click(submit)
+
+    await waitFor(() =>
+      expect(mutation.mutateAsync).toHaveBeenCalledWith(
+        expect.objectContaining({
+          projectId: 'project-1',
+          milestoneId: 'milestone-1',
+          checkId: 'check-manual-1',
+          definitionRevisionId: 'milestone-revision-1',
+          charterRevisionId: 'charter-revision-1',
+          expectedCheckVersion: 3,
+          status: 'pass',
+          result: 'I refreshed the page and the exact list remained visible.',
+        }),
+      ),
+    )
+    expect(screen.queryByText(/is now immutable release truth/i)).toBeNull()
   })
 
   it('keeps release disabled and announces the pending state while the user release is in flight', async () => {

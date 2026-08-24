@@ -159,6 +159,12 @@ pub async fn get_project_overview(
             "definition": definition,
             "task_counts": counts,
             "check_summary": checks,
+            "current_checks": load_current_acceptance_checks(
+                &state,
+                &project.id,
+                &milestone_id,
+                definition_revision_id,
+            ).await?,
             "latest_readiness": latest_readiness,
             "readiness_freshness": readiness_freshness,
             "evidence": evidence,
@@ -516,6 +522,56 @@ async fn load_active_milestones(
         result.push((milestone, definition));
     }
     Ok((result, stale))
+}
+
+async fn load_current_acceptance_checks(
+    state: &AppState,
+    project_id: &str,
+    milestone_id: &str,
+    definition_revision_id: &str,
+) -> ApiResult<Vec<Value>> {
+    let rows = sqlx::query(
+        "SELECT c.id, c.description, c.required, c.source_kind, c.expected_result,
+                c.version, r.id AS result_id, r.outcome, r.input_digest
+         FROM project_milestone_check c
+         LEFT JOIN project_milestone_check_result r ON r.id = c.current_result_id
+         WHERE c.project_id = ? AND c.milestone_id = ? AND c.definition_revision_id = ?
+         ORDER BY c.check_key ASC, c.id ASC",
+    )
+    .bind(project_id)
+    .bind(milestone_id)
+    .bind(definition_revision_id)
+    .fetch_all(state.db.pool())
+    .await
+    .map_err(sql_error)?;
+
+    rows.into_iter()
+        .map(|row| {
+            let outcome = row
+                .try_get::<Option<String>, _>("outcome")
+                .map_err(sql_error)?;
+            let latest_result = match outcome.as_deref() {
+                Some("passed") => Some("pass"),
+                Some("failed") => Some("fail"),
+                Some("missing") => Some("blocked"),
+                Some("stale") => Some("stale"),
+                Some("waived") => Some("waived"),
+                Some(_) => Some("unavailable"),
+                None => None,
+            };
+            Ok(json!({
+                "id": try_get!(row, String, "id"),
+                "description": try_get!(row, String, "description"),
+                "required": try_get!(row, i64, "required") != 0,
+                "source_kind": try_get!(row, String, "source_kind"),
+                "expected_result": try_get!(row, String, "expected_result"),
+                "version": try_get!(row, i64, "version"),
+                "latest_result": latest_result,
+                "latest_result_id": try_get!(row, Option<String>, "result_id"),
+                "latest_result_digest": try_get!(row, Option<String>, "input_digest"),
+            }))
+        })
+        .collect()
 }
 
 async fn load_task_counts(
@@ -1631,6 +1687,27 @@ fn next_action(context: NextActionContext<'_>) -> Option<ProjectNextAction> {
         api_types::ExecutionGate::Active => {}
     }
 
+    if let Some(milestone) = milestones
+        .iter()
+        .find(|milestone| readiness_requires_contract_reconciliation(milestone))
+    {
+        let milestone = milestone.get("milestone")?;
+        let milestone_id = milestone.get("id")?.as_str()?;
+        let version = milestone.get("version").and_then(Value::as_i64);
+        return Some(project_action!(
+            "acceptance_contract_reconciliation",
+            "project_agent",
+            "milestone",
+            milestone_id,
+            "Reconcile the acceptance and evidence contract",
+            "The active baseline and current milestone use different stable check or evidence identities. Revise the milestone and propose one exact replacement baseline before collecting release inputs.",
+            "reconciliation",
+            "project.milestone.revise",
+            true,
+            version,
+        ));
+    }
+
     if value_i64(task_counts, "blocked") > 0 || failed_task_count > 0 {
         return Some(project_action!(
             if value_i64(task_counts, "blocked") > 0 {
@@ -1655,6 +1732,27 @@ fn next_action(context: NextActionContext<'_>) -> Option<ProjectNextAction> {
             "task.remediate",
             true,
             None,
+        ));
+    }
+    if let Some((_, check)) = manual_check_requiring_user(milestones) {
+        let check_id = check.get("id")?.as_str()?;
+        let version = check.get("version").and_then(Value::as_i64);
+        let latest = check.get("latest_result").and_then(Value::as_str);
+        return Some(project_action!(
+            "manual_attestation_required",
+            "user",
+            "milestone_check",
+            check_id,
+            if latest.is_some() {
+                "Review the manual acceptance result"
+            } else {
+                "Record a manual acceptance result"
+            },
+            "This check requires an explicit user Pass or Fail result. Attestation does not replace its separate evidence requirement.",
+            "attestation",
+            "project.milestone.check.record",
+            true,
+            version,
         ));
     }
     if value_i64(checks, "failed") > 0 {
@@ -1838,6 +1936,38 @@ fn next_action(context: NextActionContext<'_>) -> Option<ProjectNextAction> {
         ));
     }
     None
+}
+
+fn manual_check_requiring_user(milestones: &[Value]) -> Option<(&Value, &Value)> {
+    milestones.iter().find_map(|milestone| {
+        milestone
+            .get("current_checks")?
+            .as_array()?
+            .iter()
+            .find(|check| {
+                check.get("required").and_then(Value::as_bool) == Some(true)
+                    && check.get("source_kind").and_then(Value::as_str) == Some("manual")
+                    && !matches!(
+                        check.get("latest_result").and_then(Value::as_str),
+                        Some("pass") | Some("waived")
+                    )
+            })
+            .map(|check| (milestone, check))
+    })
+}
+
+fn readiness_requires_contract_reconciliation(milestone: &Value) -> bool {
+    milestone
+        .pointer("/latest_readiness/reasons")
+        .and_then(Value::as_array)
+        .is_some_and(|reasons| {
+            reasons.iter().any(|reason| {
+                reason
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .is_some_and(|code| code.contains("reconciliation_required"))
+            })
+        })
 }
 
 fn value_i64(value: &Value, key: &str) -> i64 {

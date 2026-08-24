@@ -282,6 +282,11 @@ pub async fn transition_milestone_revision(
     let acceptance_checks: Vec<api_types::MilestoneAcceptanceCheck> =
         serde_json::from_str(&acceptance_checks_json)
             .map_err(|_| ApiError::internal("persisted milestone acceptance checks are invalid"))?;
+    let evidence_requirements_json: String = target.try_get("evidence_requirements_json")?;
+    let evidence_requirements: Vec<api_types::AcceptanceEvidenceRequirement> =
+        serde_json::from_str(&evidence_requirements_json).map_err(|_| {
+            ApiError::internal("persisted milestone evidence requirements are invalid")
+        })?;
     let transitioned = sqlx::query(
         "UPDATE project_milestone_revision SET lifecycle = ?
          WHERE id = ? AND milestone_id = ? AND lifecycle = ?",
@@ -309,6 +314,7 @@ pub async fn transition_milestone_revision(
             &milestone_id,
             &revision_id,
             &acceptance_checks,
+            &evidence_requirements,
             &updated_at,
         )
         .await?;
@@ -1732,8 +1738,39 @@ async fn materialize_check_definitions_in_tx(
     milestone_id: &str,
     definition_revision_id: &str,
     checks: &[api_types::MilestoneAcceptanceCheck],
+    evidence_requirements: &[api_types::AcceptanceEvidenceRequirement],
     updated_at: &str,
 ) -> ApiResult<()> {
+    let mut evidence_by_id = std::collections::HashMap::new();
+    for requirement in evidence_requirements {
+        if requirement.id.trim().is_empty()
+            || requirement.description.trim().is_empty()
+            || evidence_by_id
+                .insert(requirement.id.as_str(), requirement)
+                .is_some()
+        {
+            return Err(ApiError::bad_request(
+                "milestone evidence requirements require unique stable ids and descriptions",
+            ));
+        }
+        if requirement.evidence_kind.as_deref().is_some_and(|kind| {
+            !matches!(
+                kind,
+                "screenshot" | "walkthrough_video" | "log" | "report" | "other"
+            )
+        }) {
+            return Err(ApiError::bad_request(
+                "milestone evidence_kind must be one of: screenshot, walkthrough_video, log, report, other",
+            ));
+        }
+        if requirement.required && !checks.iter().any(|check| check.id == requirement.id) {
+            return Err(ApiError::bad_request(format!(
+                "required evidence '{}' must reference an acceptance check with the same stable id",
+                requirement.id
+            )));
+        }
+    }
+
     let mut seen = std::collections::HashSet::new();
     for check in checks {
         if !seen.insert(check.id.as_str()) {
@@ -1745,6 +1782,15 @@ async fn materialize_check_definitions_in_tx(
             return Err(ApiError::bad_request(
                 "milestone acceptance checks require stable ids and descriptions",
             ));
+        }
+        let evidence_required = evidence_by_id
+            .get(check.id.as_str())
+            .is_some_and(|requirement| requirement.required);
+        if check.required && !evidence_required {
+            return Err(ApiError::bad_request(format!(
+                "required acceptance check '{}' requires a required evidence requirement with the same stable id",
+                check.id
+            )));
         }
         // Only check kinds with an authoritative server projection are
         // admitted into a release-gating definition.  A check result cannot
@@ -1792,10 +1838,7 @@ async fn materialize_check_definitions_in_tx(
             .bind(check.required)
             .bind(source_kind)
             .bind(&check.expected_result)
-            .bind(matches!(
-                check.source_kind,
-                api_types::AcceptanceCheckSourceKind::MediaEvidence
-            ))
+            .bind(evidence_required)
             .bind(updated_at)
             .bind(&check.id)
             .bind(project_id)
@@ -1819,10 +1862,7 @@ async fn materialize_check_definitions_in_tx(
             .bind(check.required)
             .bind(source_kind)
             .bind(&check.expected_result)
-            .bind(matches!(
-                check.source_kind,
-                api_types::AcceptanceCheckSourceKind::MediaEvidence
-            ))
+            .bind(evidence_required)
             .bind(updated_at)
             .bind(updated_at)
             .execute(&mut **tx)

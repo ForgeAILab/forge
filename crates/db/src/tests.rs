@@ -6629,6 +6629,8 @@ async fn stale_execution_baseline_cannot_mint_a_running_execution_after_read_gat
 
 #[tokio::test]
 async fn operating_skills_point_at_their_latest_seeded_revisions() {
+    use sha2::{Digest, Sha256};
+
     let db = sqlite_db().await;
     let rows: Vec<(String, String)> =
         sqlx::query_as("SELECT id, current_revision_id FROM operating_skill ORDER BY id")
@@ -6644,11 +6646,22 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
             ),
             (
                 "forge.project.orchestration/v1".to_owned(),
-                "forge.project.orchestration/v1@2".to_owned(),
+                "forge.project.orchestration/v1@3".to_owned(),
             ),
         ],
         "a seeded operating-skill revision must be repointed in the same release (V081 regression)"
     );
+    let (body, digest): (String, String) = sqlx::query_as(
+        "SELECT canonical_body, content_digest
+         FROM operating_skill_revision
+         WHERE id = 'forge.project.orchestration/v1@3'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("latest Project operating skill reads");
+    assert!(body.contains("Never invent aliases such as `ac-1`"));
+    assert!(body.contains("Evidence is mandatory proof, not optional decoration"));
+    assert_eq!(hex::encode(Sha256::digest(body.as_bytes())), digest);
 }
 
 #[tokio::test]

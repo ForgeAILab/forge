@@ -31,6 +31,12 @@ vi.mock('@tanstack/react-router', () => ({
 const releaseMutation = vi.hoisted(() => vi.fn())
 vi.mock('@/api/hooks', () => ({
   useProjectOverviewQuery: vi.fn(),
+  useRecordManualMilestoneCheck: vi.fn(() => ({
+    mutateAsync: vi.fn(),
+    isPending: false,
+    error: null,
+    reset: vi.fn(),
+  })),
   useReleaseProjectMilestone: releaseMutation,
   useProjectQuery: vi.fn(() => ({ data: undefined, isLoading: false })),
 }))
@@ -150,6 +156,7 @@ const activeMilestone = {
   },
   task_counts: counts,
   check_summary: checkSummary,
+  current_checks: [],
   latest_readiness: null,
   readiness_freshness: null,
   evidence: [],

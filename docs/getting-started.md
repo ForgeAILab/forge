@@ -549,6 +549,15 @@ digest; Forge recomputes it inside the release transaction and creates one
 immutable `Mxxx-rN` manifest plus evidence pins. A release is a frozen Forge
 evidence record, not a deploy or merge. Corrections append a later revision.
 
+Every required acceptance check also requires check-linked evidence. The
+Project Overview shows the exact check rows and evidence coverage separately.
+When a check is intentionally `manual`, an authenticated user records an
+explicit Pass or Fail from the Overview after reviewing the immutable check;
+Forge never treats Project-Agent narration as that attestation. A manual result
+does not satisfy missing evidence. Automated, document, media, waiver, and Git
+checks instead wait for their authoritative producer and do not expose the
+manual-attestation control.
+
 For screenshots, videos, and reports, reuse existing Task media from the same
 Project whenever possible. When it is reused, the Project evidence attachment
 keeps the existing asset ID, Task media ID, Task URL, storage key, and file

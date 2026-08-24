@@ -93,6 +93,36 @@ async fn materialize_milestone_check_definitions_in_tx(
         return Err(DbError::VersionConflict);
     }
 
+    let declared_evidence: Vec<serde_json::Value> =
+        serde_json::from_str(&revision.evidence_requirements_json).map_err(|error| {
+            DbError::Check(format!(
+                "milestone evidence-requirement definition JSON is invalid: {error}"
+            ))
+        })?;
+    let mut evidence_ids = BTreeSet::new();
+    let mut required_evidence_ids = BTreeSet::new();
+    for value in &declared_evidence {
+        let id = value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                DbError::Check(
+                    "milestone evidence requirements require stable non-empty ids".to_owned(),
+                )
+            })?;
+        if !evidence_ids.insert(id.to_owned()) {
+            return Err(DbError::VersionConflict);
+        }
+        if value
+            .get("required")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            required_evidence_ids.insert(id.to_owned());
+        }
+    }
+
     for check in checks {
         if check.id.trim().is_empty()
             || check.project_id != project_id
@@ -102,7 +132,7 @@ async fn materialize_milestone_check_definitions_in_tx(
             || check.check_key != check.id
             || check.description.trim().is_empty()
             || !matches!(check.source_kind.as_str(), "manual" | "policy_waiver")
-            || check.evidence_required
+            || check.evidence_required != required_evidence_ids.contains(&check.id)
             || check.updated_at != revision.created_at
             || check.created_at.trim().is_empty()
         {
@@ -10149,10 +10179,11 @@ impl ProjectOrchestrationRepo for SqliteDb {
         }
 
         // Compact Projects start with one explicit, planned M001. Acceptance
-        // statements already approved in the Charter become manual checks;
-        // the Project Agent may refine the immutable definition later. A
-        // milestone is not runnable or release-authoritative until a user
-        // approves and activates an execution baseline containing it.
+        // statements already approved in the Charter become manual checks
+        // with required, check-linked evidence; the Project Agent may refine
+        // the immutable definition later. A milestone is not runnable or
+        // release-authoritative until a user approves and activates an
+        // execution baseline containing it.
         if project_mode == "compact" {
             let milestone_id = new_uuid_v4();
             let milestone_revision_id = new_uuid_v4();
@@ -10177,6 +10208,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
                 ));
             }
             let mut acceptance_checks = Vec::new();
+            let mut evidence_requirements = Vec::new();
             let mut acceptance_check_rows = Vec::new();
             for (index, statement) in acceptance_statements.iter().enumerate() {
                 let description = statement
@@ -10194,6 +10226,13 @@ impl ProjectOrchestrationRepo for SqliteDb {
                     "required": true,
                     "source_kind": "manual",
                     "expected_result": "passed",
+                }));
+                evidence_requirements.push(serde_json::json!({
+                    "id": check_id.clone(),
+                    "description": format!("Authoritative evidence for: {description}"),
+                    "required": true,
+                    "evidence_kind": null,
+                    "check_definition_revision": milestone_revision_id.clone(),
                 }));
                 acceptance_check_rows.push((
                     check_id,
@@ -10213,7 +10252,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
                 "dependencies": [],
                 "risks": [],
                 "acceptance_checks": acceptance_checks.clone(),
-                "evidence_requirements": [],
+                "evidence_requirements": evidence_requirements.clone(),
                 "known_issues": [],
             })
             .to_string();
@@ -10246,7 +10285,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
                     rendered_digest,
                     author_type, author_id, source_refs_json, created_at
                  ) VALUES (?, ?, 1, 0, 'approved', 'M1 — Deliver outcome', ?, '[]', '[]', ?, '[]', '[]',
-                           '[]', '[]', ?, '[]', '[]', 'Genesis baseline',
+                           '[]', '[]', ?, ?, '[]', 'Genesis baseline',
                            'forge.project-orchestration/v1', '1', ?, ?, ?, 'system',
                            'forge.project_creation', '[]', ?)",
             )
@@ -10256,6 +10295,9 @@ impl ProjectOrchestrationRepo for SqliteDb {
             .bind(&approval.revision_id)
             .bind(serde_json::to_string(&acceptance_checks).map_err(|error| {
                 DbError::Check(format!("invalid compact milestone checks: {error}"))
+            })?)
+            .bind(serde_json::to_string(&evidence_requirements).map_err(|error| {
+                DbError::Check(format!("invalid compact milestone evidence: {error}"))
             })?)
             .bind(&milestone_rendered_view)
             .bind(&milestone_content_digest)
@@ -10271,7 +10313,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
                         check_key, description, required, source_kind,
                         expected_result, evidence_required, version,
                         current_result_id, created_at, updated_at
-                     ) VALUES (?, ?, ?, ?, ?, ?, 1, 'manual', 'passed', 0, 1, NULL, ?, ?)",
+                     ) VALUES (?, ?, ?, ?, ?, ?, 1, 'manual', 'passed', 1, 1, NULL, ?, ?)",
                 )
                 .bind(check_id)
                 .bind(&input.project.id)

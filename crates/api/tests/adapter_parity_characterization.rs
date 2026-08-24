@@ -1086,7 +1086,7 @@ fn incomplete_baseline_content(fixture: &CharterFixture) -> ExecutionBaselineCon
     let release_policy = ExecutionBaselineReleasePolicy {
         schema_version: services::EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA.to_owned(),
         revision: "adapter-parity-policy-r1".to_owned(),
-        required_check_definition_revisions: vec!["check-r1".to_owned()],
+        required_check_definition_revisions: vec![fixture.milestone_revision_id.clone()],
         reviewer_independence_rules: vec!["independent-reviewer".to_owned()],
         manual_attestation_rules: vec!["manual-attestation".to_owned()],
         waiver_rules: vec!["user-waiver".to_owned()],

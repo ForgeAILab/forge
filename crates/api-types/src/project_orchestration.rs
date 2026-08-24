@@ -1424,6 +1424,27 @@ pub struct MilestoneAcceptanceCheck {
     pub latest_result_digest: Option<String>,
 }
 
+/// Live acceptance-check state for Project Overview actions. This is kept
+/// outside immutable `MilestoneDefinitionContent`, so optimistic-concurrency
+/// metadata can never change a definition digest.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct MilestoneAcceptanceCheckState {
+    pub id: String,
+    pub description: String,
+    pub required: bool,
+    pub source_kind: AcceptanceCheckSourceKind,
+    pub expected_result: String,
+    pub version: i64,
+    #[serde(default)]
+    pub latest_result: Option<AcceptanceCheckResultStatus>,
+    #[serde(default)]
+    pub latest_result_id: Option<String>,
+    #[serde(default)]
+    pub latest_result_digest: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 #[serde(deny_unknown_fields)]
@@ -2070,6 +2091,8 @@ pub struct ProjectMilestoneOverview {
     pub definition: MilestoneDefinitionRevision,
     pub task_counts: TaskProgressCounts,
     pub check_summary: AcceptanceCheckSummary,
+    #[serde(default)]
+    pub current_checks: Vec<MilestoneAcceptanceCheckState>,
     #[serde(default)]
     pub latest_readiness: Option<ReadinessSnapshot>,
     #[serde(default)]

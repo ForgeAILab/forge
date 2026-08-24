@@ -74,6 +74,8 @@ import type {
   Project,
   ProjectOverview,
   ProjectRelease,
+  ExecutionBaselineResponse,
+  ValidationResult,
   Repo,
   Review,
   ReviewDecisionResponse,
@@ -279,6 +281,59 @@ export function useReleaseProjectMilestone() {
       void queryClient.invalidateQueries({ queryKey: qk.projectOverview(input.projectId) })
       void queryClient.invalidateQueries({ queryKey: qk.project(input.projectId) })
       queryClient.setQueryData(qk.projectRelease(input.projectId, release.id), release)
+    },
+  })
+}
+
+export type RecordManualMilestoneCheckInput = {
+  projectId: string
+  milestoneId: string
+  checkId: string
+  definitionRevisionId: string
+  charterRevisionId: string
+  expectedCheckVersion: number
+  status: 'pass' | 'fail'
+  result: string
+  inputDigest: string
+  idempotencyKey: string
+  authorization: AuthorizationProvenance
+}
+
+export function useRecordManualMilestoneCheck() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async (input: RecordManualMilestoneCheckInput) => {
+      const baseline = await apiFetch<ExecutionBaselineResponse>(
+        `/projects/${input.projectId}/execution-baseline`,
+      )
+      const baselineRevisionId = baseline.current_revision?.id
+      if (baseline.baseline.lifecycle !== 'active' || !baselineRevisionId) {
+        throw new Error('A current active execution baseline is required before attestation.')
+      }
+      return apiFetch<ValidationResult>(
+        `/projects/${input.projectId}/milestones/${input.milestoneId}/checks/${input.checkId}/result`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            mutation: {
+              expected_version: input.expectedCheckVersion,
+              expected_digest: null,
+              idempotency_key: input.idempotencyKey,
+              deduplication_key: null,
+              authorization: input.authorization,
+            },
+            check_id: input.checkId,
+            definition_revision_id: input.definitionRevisionId,
+            status: input.status,
+            result: input.result,
+            input_digest: input.inputDigest,
+            governing_revision_ids: [input.charterRevisionId, baselineRevisionId],
+          }),
+        },
+      )
+    },
+    onSuccess: (_, input) => {
+      void queryClient.invalidateQueries({ queryKey: qk.projectOverview(input.projectId) })
     },
   })
 }

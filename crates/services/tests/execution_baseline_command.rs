@@ -145,14 +145,34 @@ async fn fixture() -> Arc<SqliteDb> {
           rendered_view, content_digest, rendered_digest, author_type,
           author_id, source_refs_json, created_at)
          VALUES (?, ?, 1, 0, NULL, 'approved', 'First milestone',
-                 'Outcome', '[]', '[]', ?, '[]', '[]', '[]', '[]', '[]',
-                 '[]', '[]', 'Initial definition', 'milestone@1',
+                 'Outcome', '[]', '[]', ?, '[]', '[]', '[]', '[]', ?,
+                 ?, '[]', 'Initial definition', 'milestone@1',
                  'milestone-render@1', '# Milestone', 'milestone-content',
                  'milestone-rendered', 'user', ?, '[]', ?)",
     )
     .bind(MILESTONE_REVISION_ID)
     .bind(MILESTONE_ID)
     .bind(CHARTER_REVISION_ID)
+    .bind(
+        serde_json::json!([{
+            "id": "check-1",
+            "description": "Verify the first milestone",
+            "required": true,
+            "source_kind": "manual",
+            "expected_result": "pass"
+        }])
+        .to_string(),
+    )
+    .bind(
+        serde_json::json!([{
+            "id": "check-1",
+            "description": "Evidence for the first milestone",
+            "required": true,
+            "evidence_kind": "report",
+            "check_definition_revision": MILESTONE_REVISION_ID
+        }])
+        .to_string(),
+    )
     .bind(USER_ID)
     .bind(NOW)
     .execute(db.pool())
@@ -205,7 +225,7 @@ fn release_policy() -> ExecutionBaselineReleasePolicy {
     ExecutionBaselineReleasePolicy {
         schema_version: EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA.to_owned(),
         revision: "policy-1".to_owned(),
-        required_check_definition_revisions: vec!["check-1".to_owned()],
+        required_check_definition_revisions: vec![MILESTONE_REVISION_ID.to_owned()],
         reviewer_independence_rules: vec!["independent-reviewer".to_owned()],
         manual_attestation_rules: vec!["manual-attestation".to_owned()],
         waiver_rules: vec!["user-waiver".to_owned()],
@@ -267,7 +287,17 @@ fn content(complete: bool) -> ExecutionBaselineContent {
         } else {
             ExecutionBaselineReleasePolicy::default()
         },
-        acceptance_evidence_matrix: Vec::new(),
+        acceptance_evidence_matrix: if complete {
+            vec![api_types::AcceptanceEvidenceRequirement {
+                id: "check-1".to_owned(),
+                description: "Verify the first milestone".to_owned(),
+                required: true,
+                evidence_kind: Some("report".to_owned()),
+                check_definition_revision: Some(MILESTONE_REVISION_ID.to_owned()),
+            }]
+        } else {
+            Vec::new()
+        },
         capability_classes: if complete {
             vec!["repository_write".to_owned()]
         } else {
@@ -552,6 +582,70 @@ async fn incomplete_candidate_is_rejected_without_a_proposed_revision() {
     .await
     .expect("proposal receipt count");
     assert_eq!(proposal_receipts, 0);
+}
+
+#[tokio::test]
+async fn proposal_rejects_invented_acceptance_ids_before_user_approval() {
+    let db = fixture().await;
+    let service = ExecutionBaselineCommandService::new(db.clone());
+    let draft_content = content(false);
+    let draft_rendered = render_execution_baseline(&draft_content).expect("draft render");
+    let draft = service
+        .save_draft(SaveExecutionBaselineDraftCommand {
+            project_id: PROJECT_ID.to_owned(),
+            baseline_id: None,
+            base_revision_id: None,
+            expected_baseline_version: None,
+            content: draft_content,
+            rendered_view: draft_rendered.rendered_view,
+            render_version: services::EXECUTION_BASELINE_RENDER_VERSION.to_owned(),
+            content_digest: draft_rendered.content_digest,
+            render_digest: draft_rendered.render_digest,
+            provenance: provenance(),
+            idempotency_key: "alias-draft".to_owned(),
+            authorization: authorization(EXECUTION_BASELINE_SAVE_DRAFT_COMMAND, "alias-draft"),
+            action: None,
+        })
+        .await
+        .expect("draft");
+
+    let mut proposal_content = content(true);
+    proposal_content.acceptance_evidence_matrix[0].id = "ac-1".to_owned();
+    let rendered = render_execution_baseline(&proposal_content).expect("proposal render");
+    let error = service
+        .propose_for_approval(ProposeExecutionBaselineForApprovalCommand {
+            project_id: PROJECT_ID.to_owned(),
+            baseline_id: draft.baseline_id.clone(),
+            base_revision_id: draft.revision_id.clone(),
+            expected_baseline_version: draft.baseline_version,
+            content: proposal_content,
+            rendered_view: rendered.rendered_view,
+            render_version: services::EXECUTION_BASELINE_RENDER_VERSION.to_owned(),
+            content_digest: rendered.content_digest,
+            render_digest: rendered.render_digest,
+            provenance: provenance(),
+            idempotency_key: "alias-proposal".to_owned(),
+            authorization: authorization(EXECUTION_BASELINE_PROPOSE_COMMAND, "alias-proposal"),
+            action: None,
+        })
+        .await
+        .expect_err("an invented acceptance id must never become approvable");
+    let message = error.to_string();
+    assert!(
+        message.contains("expected [check-1], got [ac-1]"),
+        "{message}"
+    );
+    let revision_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM project_execution_baseline_revision WHERE baseline_id = ?",
+    )
+    .bind(&draft.baseline_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("revision count");
+    assert_eq!(
+        revision_count, 1,
+        "the rejected proposal writes no revision"
+    );
 }
 
 #[tokio::test]
