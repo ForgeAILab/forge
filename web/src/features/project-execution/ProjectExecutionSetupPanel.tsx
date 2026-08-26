@@ -22,6 +22,7 @@ import type {
   RetryAction,
 } from '@/types/generated'
 
+import { executionBlockerNavTarget } from './executionBlockerNav'
 import {
   useAttachPrimaryRepositoryMutation,
   useProjectExecutionSetupQuery,
@@ -139,6 +140,30 @@ function stateDescription(kind: 'coordination' | 'setup' | 'gate', value: string
     return 'Execution is paused until the recorded reconciliation requirement is resolved.'
   }
   return 'Planning remains available, but execution is read-only until a baseline is active.'
+}
+
+function compactStateDescription(kind: 'coordination' | 'setup' | 'gate', value: string): string {
+  if (kind === 'coordination' && value === 'ready') {
+    return 'The Project Agent can plan and coordinate this Project.'
+  }
+  if (kind === 'setup' && value === 'ready') {
+    return 'The Worker, reviewer, and repository are ready.'
+  }
+  if (kind === 'gate') {
+    if (value === 'active') {
+      return 'Approved Tasks can run without another approval.'
+    }
+    if (value === 'baseline_approval_required') {
+      return 'Approve the implementation plan once to start every covered Task.'
+    }
+    if (value === 'pre_baseline_read_only') {
+      return 'The Project Agent still needs to prepare the implementation plan.'
+    }
+    if (value === 'reconciliation_required') {
+      return 'Review plan changes before repository work resumes.'
+    }
+  }
+  return stateDescription(kind, value)
 }
 
 function StateIcon({ value }: { value: string }) {
@@ -419,6 +444,7 @@ function ActionArea({
   compact?: boolean
 }) {
   const attemptKeys = useRef<Record<string, { fingerprint: string; key: string }>>({})
+  const blocker = data.execution_blocker
   const expectedProjectVersion = asNumber(data.project_version)
   const reviewerOptions = data.eligible_reviewers.filter(
     (principal) => principal.identity_id !== data.worker?.identity_id,
@@ -432,6 +458,13 @@ function ActionArea({
           ? repositoryMutation.error
           : retryMutation.error
   const conflict = isConflictError(mutationError)
+  const allReady =
+    !conflict &&
+    data.coordination_state === 'ready' &&
+    data.execution_setup_state === 'ready' &&
+    data.execution_gate === 'active'
+
+  if (allReady) return null
 
   const idempotencyKey = (actionName: string, fingerprint: string): string => {
     const previous = attemptKeys.current[actionName]
@@ -600,34 +633,32 @@ function ActionArea({
       )
     }
 
-    if (
-      data.execution_setup_state === 'ready' &&
-      data.execution_gate === 'baseline_approval_required'
-    ) {
-      return (
-        <Link
-          to="/projects/$projectId/chat"
-          params={{ projectId }}
-          className="inline-flex w-full max-w-full justify-center items-center gap-1.5 text-xs font-semibold text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-auto"
-        >
-          Review proposed baseline <ArrowUpRight size={13} aria-hidden />
-        </Link>
-      )
-    }
-
-    if (
-      data.execution_setup_state === 'ready' &&
-      data.execution_gate === 'pre_baseline_read_only'
-    ) {
-      return (
-        <Link
-          to="/projects/$projectId/chat"
-          params={{ projectId }}
-          className="inline-flex w-full max-w-full justify-center items-center gap-1.5 text-xs font-semibold text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-auto"
-        >
-          Plan execution baseline <ArrowUpRight size={13} aria-hidden />
-        </Link>
-      )
+    // Every remaining gate (baseline approval, an unstarted implementation
+    // plan, or an outstanding reconciliation — including one the Project's
+    // execution_gate cannot itself distinguish from the others) routes
+    // through the one canonical `execution_blocker.next_action` instead of
+    // re-deriving a link from `execution_gate` here. This is also what
+    // fixes the dead end a `reconciliation_required` gate used to fall
+    // into: it now lands on the exact reconciliation review card instead of
+    // a generic "keep planning" link (D16/8.2.6).
+    if (data.execution_setup_state === 'ready') {
+      const navTarget = executionBlockerNavTarget(blocker?.next_action)
+      if (navTarget) {
+        const className =
+          navTarget.variant === 'primary'
+            ? 'inline-flex w-full max-w-full items-center justify-center gap-1.5 rounded-md bg-primary px-3 py-2 text-xs font-semibold text-primary-foreground shadow-xs transition-[color,background-color,transform] hover:brightness-95 active:translate-y-px focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 sm:w-auto'
+            : 'inline-flex w-full max-w-full justify-center items-center gap-1.5 text-xs font-semibold text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-auto'
+        return (
+          <Link
+            to={navTarget.to}
+            params={{ projectId }}
+            hash={navTarget.hash}
+            className={className}
+          >
+            {navTarget.label} <ArrowUpRight size={13} aria-hidden />
+          </Link>
+        )
+      }
     }
 
     if (data.execution_setup_state === 'provisioning') {
@@ -708,11 +739,12 @@ function ActionArea({
                   ? data.execution_setup_state === 'provisioning'
                     ? 'Recheck provisioning without claiming success before the server confirms it.'
                     : 'Retry the recorded provisioning operation; Forge will report if its retry budget is exhausted.'
-                  : data.execution_gate === 'baseline_approval_required'
-                    ? 'Review the proposed execution baseline before activation.'
-                    : data.execution_gate === 'pre_baseline_read_only'
-                      ? 'Plan an execution baseline before repository-backed work can start.'
-                      : 'Execution setup is complete; continue with the current planning gate.'
+                  : // The one canonical blocker's own explanation, not a
+                    // re-derivation from `execution_gate` — this is what
+                    // keeps a reconciliation from ever reading like a
+                    // baseline-approval prompt here (F12b/D17).
+                    (blocker?.safe_explanation ??
+                    'Execution setup is complete; continue with the current planning gate.')
 
   return (
     <div className="min-w-0 rounded-md border border-ember-border bg-ember-surface p-3">
@@ -862,7 +894,11 @@ export function ProjectExecutionSetupPanel({
   const headingId = `execution-readiness-${projectId}`
 
   return (
-    <section className="min-w-0" aria-labelledby={headingId}>
+    <section
+      id="project-execution-status"
+      className="min-w-0 scroll-mt-4"
+      aria-labelledby={headingId}
+    >
       <p className="sr-only" role="status" aria-live="polite">
         Execution readiness updated: coordination {stateLabel(data.coordination_state)}, execution
         setup {stateLabel(data.execution_setup_state)}, execution gate{' '}
@@ -880,11 +916,15 @@ export function ProjectExecutionSetupPanel({
               id={headingId}
               className={`mt-1 break-words font-semibold text-foreground ${compact ? 'text-sm' : 'text-base'}`}
             >
-              Execution readiness
+              {compact ? 'Ready to build?' : 'Execution readiness'}
             </h2>
             <p className="mt-1 max-w-3xl break-words text-xs leading-5 text-muted-foreground">
               {compact
-                ? 'Three independent gates determine whether this Project can execute.'
+                ? data.execution_gate === 'baseline_approval_required'
+                  ? 'Your Project is approved. One final approval starts all work covered by the plan.'
+                  : data.execution_gate === 'active'
+                    ? 'Approved work can run without another Task-by-Task approval.'
+                    : 'See what Forge still needs before implementation can start.'
                 : 'Coordination, repository setup, and the execution baseline are independent gates. A ready Project Agent Chat does not imply operational execution.'}
             </p>
           </div>
@@ -895,21 +935,33 @@ export function ProjectExecutionSetupPanel({
           className={`mt-4 grid min-w-0 ${contentSpacing} ${compact ? '' : 'xl:grid-cols-3'}`}
         >
           <ReadinessRow
-            label="Coordination"
+            label={compact ? 'Project Agent' : 'Coordination'}
             value={data.coordination_state}
-            description={stateDescription('coordination', data.coordination_state)}
+            description={
+              compact
+                ? compactStateDescription('coordination', data.coordination_state)
+                : stateDescription('coordination', data.coordination_state)
+            }
             compact={compact}
           />
           <ReadinessRow
-            label="Execution setup"
+            label={compact ? 'Build setup' : 'Execution setup'}
             value={data.execution_setup_state}
-            description={stateDescription('setup', data.execution_setup_state)}
+            description={
+              compact
+                ? compactStateDescription('setup', data.execution_setup_state)
+                : stateDescription('setup', data.execution_setup_state)
+            }
             compact={compact}
           />
           <ReadinessRow
-            label="Execution gate"
+            label={compact ? 'Permission to build' : 'Execution gate'}
             value={data.execution_gate}
-            description={stateDescription('gate', data.execution_gate)}
+            description={
+              compact
+                ? compactStateDescription('gate', data.execution_gate)
+                : stateDescription('gate', data.execution_gate)
+            }
             compact={compact}
           />
         </ul>

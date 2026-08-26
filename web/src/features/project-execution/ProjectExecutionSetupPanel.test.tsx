@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { useReposQuery } from '@/api/hooks'
 import { ApiError } from '@/api/client'
-import type { ProjectExecutionSetupResponse } from '@/types/generated'
+import type { ExecutionBlockerProjection, ProjectExecutionSetupResponse } from '@/types/generated'
 
 import { ProjectExecutionSetupPanel } from './ProjectExecutionSetupPanel'
 import {
@@ -18,16 +18,18 @@ vi.mock('@tanstack/react-router', () => ({
   Link: ({
     to,
     params,
+    hash,
     children,
   }: {
     to: string
     params?: Record<string, string>
+    hash?: string
     children: React.ReactNode
   }) => {
-    const href = params
+    const path = params
       ? Object.entries(params).reduce((path, [key, value]) => path.replace(`$${key}`, value), to)
       : to
-    return <a href={href}>{children}</a>
+    return <a href={`${path}${hash ? `#${hash}` : ''}`}>{children}</a>
   },
 }))
 
@@ -88,6 +90,25 @@ const baseSetup = {
   provisioning: null,
 } as unknown as ProjectExecutionSetupResponse
 
+function blocker(overrides: Partial<ExecutionBlockerProjection>): ExecutionBlockerProjection {
+  return {
+    code: 'baseline_approval_required',
+    stage: 'plan',
+    scope: 'project',
+    affected_refs: [],
+    governing_ref: null,
+    headline: 'Waiting for permission to build',
+    safe_explanation:
+      'The Project is already approved. This one approval starts every Task covered by the current plan — there is no separate approval for each Task.',
+    evidence: null,
+    required_principal: 'user',
+    next_action: 'reauthorize',
+    blocker_digest: 'sha256:test',
+    observed_version: 1,
+    ...overrides,
+  } as unknown as ExecutionBlockerProjection
+}
+
 function mutationState() {
   return { mutate: vi.fn(), isPending: false, error: null }
 }
@@ -127,7 +148,7 @@ describe('ProjectExecutionSetupPanel', () => {
     expect(statusList.className).not.toContain('xl:grid-cols-3')
     expect(within(statusList).getAllByRole('listitem')).toHaveLength(3)
     expect(
-      screen.getByText('Three independent gates determine whether this Project can execute.'),
+      screen.getByText('See what Forge still needs before implementation can start.'),
     ).toBeTruthy()
   })
 
@@ -389,16 +410,101 @@ describe('ProjectExecutionSetupPanel', () => {
       independent_reviewer: reviewer,
       primary_repo: { id: 'repo-1', name: 'forge', default_branch: 'main' },
       next_action: null,
+      execution_blocker: blocker({
+        code: 'pre_baseline_read_only',
+        headline: 'Waiting for an implementation plan',
+        safe_explanation:
+          'The Project Agent still needs to prepare the implementation plan; approving that plan starts every covered Task.',
+        required_principal: 'project_agent',
+        next_action: 'repropose',
+      }),
     } as unknown as ProjectExecutionSetupResponse)
 
     render(<ProjectExecutionSetupPanel projectId="project-1" />)
 
     expect(screen.getByText(/Planning remains available, but execution is read-only/)).toBeTruthy()
     expect(screen.getByText('Pre Baseline Read Only')).toBeTruthy()
-    expect(screen.getByRole('link', { name: /Plan execution baseline/ })).toBeTruthy()
+    const action = screen.getByRole('link', { name: /Plan execution baseline/ })
+    expect(action.getAttribute('href')).toBe('/projects/project-1/chat')
     const region = screen.getByRole('region', { name: 'Execution readiness' })
     expect(region.className).toContain('min-w-0')
     expect(screen.getByRole('status').getAttribute('aria-live')).toBe('polite')
+  })
+
+  it('makes the one execution approval explicit and links to its exact card', () => {
+    mockPanel({
+      ...baseSetup,
+      execution_setup_state: 'ready',
+      execution_gate: 'baseline_approval_required',
+      worker,
+      independent_reviewer: reviewer,
+      primary_repo: { id: 'repo-1', name: 'forge', default_branch: 'main' },
+      next_action: null,
+      execution_blocker: blocker({}),
+    } as unknown as ProjectExecutionSetupResponse)
+
+    render(<ProjectExecutionSetupPanel projectId="project-1" compact />)
+
+    expect(screen.getByText('Ready to build?')).toBeTruthy()
+    expect(screen.getByText(/One final approval starts all work covered by the plan/)).toBeTruthy()
+    expect(screen.getByText('Permission to build')).toBeTruthy()
+    const action = screen.getByRole('link', { name: /Approve plan & start work/ })
+    expect(action.getAttribute('href')).toBe('/projects/project-1/chat#execution-approval')
+  })
+
+  /// F12(b)/8.2.6: a reconciliation-blocked gate must never fall through to
+  /// the generic "keep planning" link — it routes to the exact
+  /// reconciliation review card (`ReconciliationReviewCard`, mounted on the
+  /// Project overview route) instead of a dead end.
+  it('routes a reconciliation-blocked gate to the Project overview review card, not a dead end', () => {
+    mockPanel({
+      ...baseSetup,
+      execution_setup_state: 'ready',
+      execution_gate: 'reconciliation_required',
+      worker,
+      independent_reviewer: reviewer,
+      primary_repo: { id: 'repo-1', name: 'forge', default_branch: 'main' },
+      next_action: null,
+      execution_blocker: blocker({
+        code: 'reconciliation_required',
+        stage: 'build',
+        governing_ref: { record_type: 'execution_baseline', record_id: 'baseline-1', label: null },
+        headline: 'Waiting for plan reconciliation',
+        safe_explanation:
+          'The approved plan changed and must be reconciled before repository work can resume.',
+        next_action: 'resolve_reconciliation',
+      }),
+    } as unknown as ProjectExecutionSetupResponse)
+
+    render(<ProjectExecutionSetupPanel projectId="project-1" />)
+
+    expect(
+      screen.getByText(
+        'The approved plan changed and must be reconciled before repository work can resume.',
+      ),
+    ).toBeTruthy()
+    const action = screen.getByRole('link', { name: /Review current plan/ })
+    expect(action.getAttribute('href')).toBe('/projects/project-1/overview')
+    expect(screen.queryByRole('link', { name: /Continue planning/ })).toBeNull()
+  })
+
+  it('does not invent another action after implementation is active', () => {
+    mockPanel({
+      ...baseSetup,
+      execution_setup_state: 'ready',
+      execution_gate: 'active',
+      worker,
+      independent_reviewer: reviewer,
+      primary_repo: { id: 'repo-1', name: 'forge', default_branch: 'main' },
+      next_action: null,
+    } as unknown as ProjectExecutionSetupResponse)
+
+    render(<ProjectExecutionSetupPanel projectId="project-1" compact />)
+
+    expect(screen.getByText('Ready to build?')).toBeTruthy()
+    expect(screen.getByText('Approved Tasks can run without another approval.')).toBeTruthy()
+    expect(screen.queryByText('Next action')).toBeNull()
+    expect(screen.queryByRole('link', { name: /Continue planning/ })).toBeNull()
   })
 
   it('uses refresh_and_retry for unavailable projections instead of planning or setup links', () => {

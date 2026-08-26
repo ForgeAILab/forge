@@ -791,12 +791,24 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
         .expect("typed Project Decision proposal is admitted");
     assert_eq!(decision_proposal["result"]["materialized"], json!(true));
     assert_eq!(decision_proposal["result"]["domain_committed"], json!(true));
-    let decision_count: i64 =
+    // D19/F15: an in-envelope, already-authorized, already-decided
+    // implementation choice (a firm `selected_outcome` plus `rationale`,
+    // inside the active baseline's adaptive envelope) is written as an
+    // effective Decision rather than left as a pending approval candidate,
+    // even though this call self-declares `record_candidate`.
+    let decision_candidate_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM project_decision_candidate WHERE project_id = ?")
             .bind(&fixture.project_id)
             .fetch_one(harness.state.db.pool())
             .await
             .expect("decision candidate count");
+    assert_eq!(decision_candidate_count, 0);
+    let decision_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM project_decision WHERE project_id = ?")
+            .bind(&fixture.project_id)
+            .fetch_one(harness.state.db.pool())
+            .await
+            .expect("effective decision count");
     assert_eq!(decision_count, 1);
 
     // A Project Agent cannot self-release through the user-only release API.

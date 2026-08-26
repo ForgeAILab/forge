@@ -45,7 +45,7 @@ export function LoginPage() {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background p-4">
+    <main className="flex min-h-dvh items-center justify-center bg-background p-4">
       <div className="w-full max-w-sm space-y-6">
         <div className="flex flex-col items-center gap-2">
           <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-primary shadow-[0_0_16px_rgba(249,115,22,0.3)]">
@@ -98,6 +98,6 @@ export function LoginPage() {
           </Link>
         </p>
       </div>
-    </div>
+    </main>
   )
 }

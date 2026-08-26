@@ -1023,37 +1023,14 @@ impl EmbeddedAgentService {
         canonical
             .validate()
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-        let mut authority = scope_authority_json(&input.actor_user_id, &input.scope);
-        if let Some(object) = authority.as_object_mut() {
-            object.insert("frozen_binding_id".to_owned(), json!(input.binding_id));
-            object.insert(
-                "frozen_binding_version".to_owned(),
-                json!(input.binding_version),
-            );
-            object.insert("frozen_profile_id".to_owned(), json!(input.profile_id));
-            object.insert(
-                "frozen_profile_version".to_owned(),
-                json!(input.profile_version),
-            );
-            object.insert(
-                "frozen_policy_revision".to_owned(),
-                json!(input.policy_revision),
-            );
-            object.insert(
-                "frozen_policy_digest".to_owned(),
-                json!(input.policy_digest),
-            );
-            object.insert(
-                "frozen_permission_policy_digest".to_owned(),
-                json!(input.permission_policy_digest),
-            );
-            object.insert(
-                "frozen_tool_policy_digest".to_owned(),
-                json!(input.tool_policy_digest),
-            );
-        }
         self.persist_authorized_session(
-            identity, profile, canonical, project_id, None, None, authority,
+            identity,
+            profile,
+            canonical,
+            project_id,
+            None,
+            None,
+            scope_authority_json(&input.actor_user_id, &input.scope),
         )
         .await
     }
@@ -2375,6 +2352,166 @@ fn task_role_admitted_by_workflow(active_role: Option<&str>, requested_role: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn frozen_chat_session_rotates_after_a_new_profile_is_admitted() {
+        let (service, owner) = test_service_with_owner().await;
+        let identity_id = new_uuid_v4();
+        let first_profile_id = new_uuid_v4();
+        let now = now_rfc3339();
+        let tool_policy = json!({"allowed": ["read_account"]}).to_string();
+        AgentRepo::create_identity_with_profile(
+            &*service.db,
+            CreateAgentIdentity {
+                id: identity_id.clone(),
+                name: "profile-rotation-main".to_owned(),
+                description: None,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: AgentStatus::Idle,
+                last_heartbeat_at: None,
+                is_default: false,
+                paused: false,
+                owner_id: Some(owner.clone()),
+                visibility: "account".to_owned(),
+                account_permission_ceiling: json!({"permissions": ["read_account"]}).to_string(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            CreateAgentProfile {
+                id: first_profile_id.clone(),
+                identity_id: identity_id.clone(),
+                backend_kind: "native".to_owned(),
+                executor_type: NATIVE_EXECUTOR_TYPE.to_owned(),
+                provider: Some("test".to_owned()),
+                model: Some("model-one".to_owned()),
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "{}".to_owned(),
+                tool_policy_json: tool_policy.clone(),
+                config_json: "{}".to_owned(),
+                credential_ref: None,
+                daemon_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("identity creates");
+        let binding = crate::AgentChatService::new(Arc::clone(&service.db))
+            .set_main_binding(crate::SetMainAgentBindingInput {
+                actor_user_id: owner.clone(),
+                account_id: owner.clone(),
+                identity_id: identity_id.clone(),
+                autonomy_policy_json: "{}".to_owned(),
+                tool_policy_revision: "profile-rotation-policy".to_owned(),
+                expected_version: None,
+                replacement_reason: None,
+            })
+            .await
+            .expect("Main binding creates");
+        let chat = AgentChatRepo::get_main_chat(&*service.db, &owner)
+            .await
+            .expect("Main Chat lookup")
+            .expect("Main Chat exists");
+        let policy_digest =
+            crate::agent_turn_admission::policy_digest(&binding.autonomy_policy_json)
+                .expect("policy digest");
+        let tool_policy_digest =
+            crate::agent_turn_admission::policy_digest(&tool_policy).expect("tool policy digest");
+
+        let first = service
+            .create_or_resume_frozen_chat_session(CreateFrozenAgentChatSession {
+                actor_user_id: owner.clone(),
+                identity_id: identity_id.clone(),
+                profile_id: first_profile_id,
+                profile_version: 1,
+                binding_id: binding.id.clone(),
+                binding_version: binding.version,
+                policy_revision: binding.tool_policy_revision.clone(),
+                policy_digest: policy_digest.clone(),
+                permission_policy_digest: "permission-digest".to_owned(),
+                tool_policy_digest: tool_policy_digest.clone(),
+                scope: RequestedCanonicalScope::AgentChat {
+                    chat_id: chat.id.clone(),
+                },
+            })
+            .await
+            .expect("first frozen session creates");
+
+        let selected_identity = AgentRepo::get_by_id(&*service.db, &identity_id)
+            .await
+            .expect("identity lookup")
+            .expect("identity exists");
+        let second_profile_id = new_uuid_v4();
+        let later = now_rfc3339();
+        let (second_profile, _) = AgentProfileRepo::create_and_select_profile(
+            &*service.db,
+            CreateAgentProfile {
+                id: second_profile_id.clone(),
+                identity_id: identity_id.clone(),
+                backend_kind: "native".to_owned(),
+                executor_type: NATIVE_EXECUTOR_TYPE.to_owned(),
+                provider: Some("test".to_owned()),
+                model: Some("model-two".to_owned()),
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "{}".to_owned(),
+                tool_policy_json: tool_policy,
+                config_json: "{}".to_owned(),
+                credential_ref: None,
+                daemon_id: None,
+                created_at: later.clone(),
+                updated_at: later.clone(),
+            },
+            SelectAgentProfile {
+                identity_id: identity_id.clone(),
+                profile_id: second_profile_id.clone(),
+                expected_version: selected_identity.version,
+                updated_at: later,
+            },
+        )
+        .await
+        .expect("new Profile is selected");
+
+        let second = service
+            .create_or_resume_frozen_chat_session(CreateFrozenAgentChatSession {
+                actor_user_id: owner,
+                identity_id,
+                profile_id: second_profile_id.clone(),
+                profile_version: second_profile.version,
+                binding_id: binding.id,
+                binding_version: binding.version,
+                policy_revision: binding.tool_policy_revision,
+                policy_digest,
+                permission_policy_digest: "permission-digest".to_owned(),
+                tool_policy_digest,
+                scope: RequestedCanonicalScope::AgentChat { chat_id: chat.id },
+            })
+            .await
+            .expect("newly admitted Profile rotates the chat session");
+
+        assert_eq!(second.profile_id, second_profile_id);
+        assert_eq!(
+            second.predecessor_session_id.as_deref(),
+            Some(first.id.as_str())
+        );
+        let previous = AgentSessionRepo::get_agent_session(&*service.db, &first.id)
+            .await
+            .expect("previous session lookup")
+            .expect("previous session exists");
+        assert_eq!(previous.status, "replaced");
+        let scopes =
+            AgentContextScopeRepo::list_context_scopes(&*service.db, &previous.identity_id)
+                .await
+                .expect("context scopes list");
+        assert_eq!(scopes.len(), 1);
+        assert!(!scopes[0].authority_json.contains("frozen_profile_id"));
+        assert!(!scopes[0].authority_json.contains("frozen_binding_id"));
+    }
 
     #[test]
     fn frozen_binding_accepts_the_retained_replacement_version_only() {

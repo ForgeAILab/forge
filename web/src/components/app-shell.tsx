@@ -8,6 +8,7 @@ import {
   type ComponentType,
   type ReactNode,
 } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
 import type { IconWeight } from '@phosphor-icons/react'
 import {
@@ -57,6 +58,7 @@ import { Label } from '@/components/ui/label'
 import { cn } from '@/lib/cn'
 import { useLayoutStore } from '@/stores/layout'
 import { useAuthStore } from '@/stores/auth'
+import { clearDeletedProjectScope, resolveNextProjectId } from '@/stores/project-scope'
 import type { Agent } from '@/types/generated/api'
 
 const CommandPalette = lazy(() =>
@@ -522,6 +524,8 @@ function UserMenu() {
 
 export function AppShell({ children }: { children: ReactNode }) {
   const { t } = useTranslation()
+  const navigate = useNavigate()
+  const queryClient = useQueryClient()
   const isAdmin = useAuthStore((s) => Boolean(s.user?.is_admin))
   const sidebarCollapsed = useLayoutStore((s) => s.sidebarCollapsed)
   const setSidebarCollapsed = useLayoutStore((s) => s.setSidebarCollapsed)
@@ -559,6 +563,31 @@ export function AppShell({ children }: { children: ReactNode }) {
       setSelectedProjectId(routeProjectId)
     }
   }, [routeProjectId, storedProjectId, setSelectedProjectId])
+
+  // F17 / 8.4.4: converge immediately when a Project is deleted elsewhere
+  // while its route is open here, the same way an explicit delete does.
+  // `web/src/api/sse.ts` dispatches this on `project.deleted`; it is a
+  // latency optimization only — a lost/late frame still converges once the
+  // next Project-scoped fetch 404s (`DeletedProjectRedirect` on Project
+  // Overview).
+  useEffect(() => {
+    function handleProjectDeleted(event: Event) {
+      const detail = (event as CustomEvent<{ entity_id?: string }>).detail
+      const deletedProjectId = detail?.entity_id
+      if (!deletedProjectId) return
+      clearDeletedProjectScope(queryClient, deletedProjectId)
+      if (routeProjectId !== deletedProjectId) return
+      void resolveNextProjectId(queryClient, deletedProjectId).then((nextProjectId) => {
+        void navigate(
+          nextProjectId
+            ? { to: '/projects/$projectId/board', params: { projectId: nextProjectId } }
+            : { to: '/chat' },
+        )
+      })
+    }
+    window.addEventListener('forge:project-deleted', handleProjectDeleted)
+    return () => window.removeEventListener('forge:project-deleted', handleProjectDeleted)
+  }, [queryClient, navigate, routeProjectId])
 
   useEffect(() => {
     setRailExpanded(false)
@@ -602,11 +631,7 @@ export function AppShell({ children }: { children: ReactNode }) {
 
   const projectNavItems = navigationItemsForSection('project')
   const globalNavItems = navigationItemsForSection('global').filter((item) => {
-    if (
-      item.key === 'daemons' ||
-      item.key === 'operations' ||
-      item.key === 'forgeSettings'
-    ) {
+    if (item.key === 'daemons' || item.key === 'operations' || item.key === 'forgeSettings') {
       return isAdmin
     }
     return true

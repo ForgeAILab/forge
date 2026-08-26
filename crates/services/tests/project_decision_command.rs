@@ -256,6 +256,18 @@ fn action_payload(action: &str, expected_project_version: i64, decision_id: Opti
     payload
 }
 
+/// A `record_candidate` payload that stays a genuine pending candidate under
+/// the D19/F15 boundary rule: it has no firm `selected_outcome` yet, so it
+/// is an open question rather than an already-made in-envelope choice. (A
+/// fully decided in-envelope choice is always materialized as an effective
+/// Decision instead -- see
+/// `native_record_candidate_in_envelope_already_decided_materializes_effective_decision`.)
+fn open_candidate_action_payload(expected_project_version: i64) -> Value {
+    let mut payload = action_payload("record_candidate", expected_project_version, None);
+    payload["selected_outcome"] = Value::Null;
+    payload
+}
+
 async fn create_action(
     fixture: &Fixture,
     action_id: &str,
@@ -572,12 +584,12 @@ fn user_candidate_command(
 }
 
 #[tokio::test]
-async fn native_candidate_decision_is_project_scoped_and_replay_safe() {
+async fn native_open_candidate_decision_is_project_scoped_and_replay_safe() {
     let fixture = fixture().await;
     let action = create_action(
         &fixture,
         "decision-candidate-action",
-        action_payload("record_candidate", fixture.project_version, None),
+        open_candidate_action_payload(fixture.project_version),
         "decision-candidate-correlation",
     )
     .await;
@@ -665,6 +677,72 @@ async fn native_candidate_decision_is_project_scoped_and_replay_safe() {
             Err(ServiceError::Db(db::DbError::IdempotencyConflict))
         ),
         "changed principal must fail closed: {changed_principal:?}"
+    );
+}
+
+/// D19/F15: an in-envelope, already-authorized, reversible implementation
+/// choice the Project Agent already made must be written as an effective
+/// Decision, not left as a pending approval candidate -- even when the
+/// Agent's tool call self-declares `record_candidate`. Trusting the
+/// caller's declared action alone is exactly the defect behind F15: the
+/// preserved failed run's malformed candidate had a populated
+/// `selected_outcome` and `rationale` but was still left as an opaque
+/// pending proposal.
+#[tokio::test]
+async fn native_record_candidate_in_envelope_already_decided_materializes_effective_decision() {
+    let fixture = fixture().await;
+    let action = create_action(
+        &fixture,
+        "decision-already-decided-action",
+        action_payload("record_candidate", fixture.project_version, None),
+        "decision-already-decided-correlation",
+    )
+    .await;
+    let input = execute_input(
+        &action.id,
+        action.version,
+        "decision-already-decided-command",
+        AGENT_ID,
+    );
+    let service = ProjectOrchestrationActionService::new(Arc::clone(&fixture.db));
+    service
+        .execute(input)
+        .await
+        .expect("an in-envelope already-decided record_candidate call must succeed");
+
+    let receipt = sqlx::query("SELECT outcome_json FROM command_receipt WHERE idempotency_key = ?")
+        .bind("decision-already-decided-command")
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("effective command receipt");
+    let outcome: Value = serde_json::from_str(&receipt.get::<String, _>("outcome_json"))
+        .expect("effective outcome JSON");
+    assert!(
+        outcome.get("candidate_id").is_none(),
+        "an already-decided in-envelope choice must never surface a candidate_id: {outcome}"
+    );
+    assert_eq!(outcome["state"], "active");
+    assert!(outcome["decision_id"].as_str().is_some());
+    assert_eq!(outcome["requires_user_authorization"], false);
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM project_decision_candidate WHERE project_id = ?",
+        )
+        .bind(PROJECT_ID)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("no pending candidate is left behind"),
+        0,
+        "an already-decided in-envelope choice must not sit as a pending approval candidate"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM project_decision WHERE project_id = ?")
+            .bind(PROJECT_ID)
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("exactly one effective Decision is written"),
+        1
     );
 }
 
@@ -1323,4 +1401,202 @@ async fn rejection_receipt_failpoint_rolls_back_candidate_rejection_and_replays_
         "replay must preserve receipt and event IDs"
     );
     assert_eq!(mutation_counts(&fixture.db).await, after);
+}
+
+/// F15: the live candidate `6c753f9c-9428-4202-8e94-b55830e74ae1` was
+/// persisted with `options_json = []` while carrying a populated
+/// `selected_outcome`, giving the user an opaque identifier with no
+/// question, alternatives, or approve/reject action. Design D19 requires a
+/// non-empty question, at least two distinct non-empty options, a
+/// rationale, and (when present) a recommendation that names one of those
+/// options -- every shape below must fail closed at creation.
+#[tokio::test]
+async fn create_candidate_rejects_invalid_option_shapes() {
+    let fixture = fixture().await;
+    let service = ProjectDecisionCommandService::new(Arc::clone(&fixture.db));
+
+    let mut empty_options = user_candidate_command(
+        "decision-invariant-empty-options",
+        "Which implementation choice should the Project use?",
+        fixture.project_version,
+    );
+    empty_options.options = Vec::new();
+    let error = service
+        .create_candidate(empty_options, None)
+        .await
+        .expect_err(
+            "F15: an empty options list must be rejected even with a populated selected_outcome",
+        );
+    assert!(
+        matches!(error, ServiceError::InvalidOperation { .. }),
+        "expected InvalidOperation, got {error:?}"
+    );
+
+    let mut single_option = user_candidate_command(
+        "decision-invariant-single-option",
+        "Which implementation choice should the Project use?",
+        fixture.project_version,
+    );
+    single_option.options = vec!["option-a".to_owned()];
+    single_option.selected_outcome = Some("option-a".to_owned());
+    let error = service
+        .create_candidate(single_option, None)
+        .await
+        .expect_err("a single option is not a real choice between alternatives");
+    assert!(
+        matches!(error, ServiceError::InvalidOperation { .. }),
+        "expected InvalidOperation, got {error:?}"
+    );
+
+    let mut duplicate_options = user_candidate_command(
+        "decision-invariant-duplicate-options",
+        "Which implementation choice should the Project use?",
+        fixture.project_version,
+    );
+    duplicate_options.options = vec!["option-a".to_owned(), "option-a".to_owned()];
+    let error = service
+        .create_candidate(duplicate_options, None)
+        .await
+        .expect_err("two copies of the same option are not two distinct options");
+    assert!(
+        matches!(error, ServiceError::InvalidOperation { .. }),
+        "expected InvalidOperation, got {error:?}"
+    );
+
+    let mut outside_recommendation = user_candidate_command(
+        "decision-invariant-outside-recommendation",
+        "Which implementation choice should the Project use?",
+        fixture.project_version,
+    );
+    outside_recommendation.selected_outcome = Some("option-not-listed".to_owned());
+    let error = service
+        .create_candidate(outside_recommendation, None)
+        .await
+        .expect_err("a recommendation must name one of the candidate's own options");
+    assert!(
+        matches!(error, ServiceError::InvalidOperation { .. }),
+        "expected InvalidOperation, got {error:?}"
+    );
+
+    let mut missing_rationale = user_candidate_command(
+        "decision-invariant-missing-rationale",
+        "Which implementation choice should the Project use?",
+        fixture.project_version,
+    );
+    missing_rationale.rationale = None;
+    let error = service
+        .create_candidate(missing_rationale, None)
+        .await
+        .expect_err("rationale is required for every Decision candidate");
+    assert!(
+        matches!(error, ServiceError::InvalidOperation { .. }),
+        "expected InvalidOperation, got {error:?}"
+    );
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM project_decision_candidate")
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("no malformed candidate is ever persisted"),
+        0
+    );
+}
+
+/// A row shaped exactly like the F15 regression can already exist in a real
+/// database (this correction must not rewrite or delete history). Project
+/// Overview marks such a row non-approvable; the service boundary must also
+/// fail closed if anything ever posts an approval for it directly, because
+/// approving it would promote its malformed shape into a permanent
+/// effective Decision. Rejecting it must still work: rejection never
+/// propagates the malformed shape anywhere consequential.
+#[tokio::test]
+async fn approve_candidate_rejects_historical_malformed_options() {
+    let fixture = fixture().await;
+    let malformed_id = "decision-historical-malformed-candidate";
+    sqlx::query(
+        "INSERT INTO project_decision_candidate
+            (id, project_id, lifecycle, question, context_json, options_json,
+             selected_outcome, rationale, principal_type, principal_id,
+             source_refs_json, expected_project_version, effective_decision_id,
+             version, created_at, updated_at)
+         VALUES (?, ?, 'proposed', ?, ?, '[]', ?, ?, 'agent', ?, '[]', ?, NULL, 1, ?, ?)",
+    )
+    .bind(malformed_id)
+    .bind(PROJECT_ID)
+    .bind("Which implementation choice should the Project use?")
+    .bind(
+        json!({
+            "summary": null,
+            "constraints": [],
+            "affected_artifact_refs": [],
+            "affected_task_ids": [],
+            "affected_milestone_ids": [],
+            "governing_charter_revision_id": null,
+            "governing_baseline_revision_id": BASELINE_REVISION_ID,
+            "supersedes_decision_id": null,
+            "invalidates_decision_id": null,
+            "decision_class": "project_implementation",
+        })
+        .to_string(),
+    )
+    .bind("Retain existing task and re-dispatch worker execution")
+    .bind("Historical F15-shaped row: options were never populated.")
+    .bind(AGENT_ID)
+    .bind(fixture.project_version)
+    .bind(NOW)
+    .bind(NOW)
+    .execute(fixture.db.pool())
+    .await
+    .expect("a historical malformed candidate inserts directly, bypassing service validation");
+
+    let service = ProjectDecisionCommandService::new(Arc::clone(&fixture.db));
+    let approval_key = "decision-historical-malformed-approve";
+    let approval = ProjectDecisionApprovalCommand {
+        project_id: PROJECT_ID.to_owned(),
+        candidate_id: malformed_id.to_owned(),
+        expected_project_version: fixture.project_version,
+        idempotency_key: approval_key.to_owned(),
+        authorization: user_authorization(PROJECT_DECISION_CANDIDATE_APPROVE_COMMAND, approval_key),
+    };
+    let error = service
+        .approve_candidate(approval, None)
+        .await
+        .expect_err("a malformed historical candidate must not be approvable");
+    assert!(
+        matches!(error, ServiceError::Conflict(_)),
+        "expected a conflict, got {error:?}"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM project_decision")
+            .fetch_one(fixture.db.pool())
+            .await
+            .expect("no effective Decision is created from the malformed candidate"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT lifecycle FROM project_decision_candidate WHERE id = ?",
+        )
+        .bind(malformed_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("malformed candidate lifecycle"),
+        "proposed",
+        "a failed approval must not silently change the malformed candidate's lifecycle"
+    );
+
+    let rejection_key = "decision-historical-malformed-reject";
+    let rejection = ProjectDecisionRejectionCommand {
+        project_id: PROJECT_ID.to_owned(),
+        candidate_id: malformed_id.to_owned(),
+        reason: "Malformed historical candidate; clearing without approving.".to_owned(),
+        expected_project_version: fixture.project_version,
+        idempotency_key: rejection_key.to_owned(),
+        authorization: user_authorization(PROJECT_DECISION_CANDIDATE_REJECT_COMMAND, rejection_key),
+    };
+    let rejected = service
+        .reject_candidate(rejection, None)
+        .await
+        .expect("a malformed historical candidate can still be rejected");
+    assert_eq!(rejected.lifecycle, "rejected");
 }

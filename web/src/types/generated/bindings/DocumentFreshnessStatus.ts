@@ -5,9 +5,4 @@
  * revision ahead of the approved revision is a normal `changes_pending`
  * state, not evidence that approved Project truth is absent or stale.
  */
-export type DocumentFreshnessStatus =
-  | 'current'
-  | 'changes_pending'
-  | 'stale'
-  | 'reconciliation_required'
-  | 'unavailable'
+export type DocumentFreshnessStatus = "current" | "changes_pending" | "stale" | "reconciliation_required" | "unavailable";

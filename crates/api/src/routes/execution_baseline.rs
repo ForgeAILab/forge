@@ -7,8 +7,9 @@
 //! events, and Task-governance promotion live below the route.
 
 use api_types::{
+    ApproveAndActivateExecutionBaselineRequest, ApproveAndActivateExecutionBaselineResponse,
     ApproveExecutionBaselineRequest, AuthorizationProvenance, CreateExecutionBaselineRequest,
-    ExecutionBaselineResponse, ExecutionBaselineWriteOperation,
+    ExecutionBaselineLifecycle, ExecutionBaselineResponse, ExecutionBaselineWriteOperation,
     SaveExecutionBaselineRevisionRequest,
 };
 use axum::{
@@ -17,11 +18,13 @@ use axum::{
     Json,
 };
 use services::{
-    ActivateExecutionBaselineCommand, ApproveExecutionBaselineCommand,
-    ExecutionBaselineCommandService, ExecutionBaselineQueryService, ProjectCommandAuthorization,
+    ActivateExecutionBaselineCommand, ApproveAndActivateExecutionBaselineCommand,
+    ApproveExecutionBaselineCommand, ExecutionBaselineCommandService,
+    ExecutionBaselineQueryService, ProjectCommandAuthorization,
     ProposeExecutionBaselineForApprovalCommand, SaveExecutionBaselineDraftCommand,
-    EXECUTION_BASELINE_ACTIVATE_COMMAND, EXECUTION_BASELINE_APPROVE_COMMAND,
-    EXECUTION_BASELINE_PROPOSE_COMMAND, EXECUTION_BASELINE_SAVE_DRAFT_COMMAND,
+    EXECUTION_BASELINE_ACTIVATE_COMMAND, EXECUTION_BASELINE_APPROVE_AND_ACTIVATE_COMMAND,
+    EXECUTION_BASELINE_APPROVE_COMMAND, EXECUTION_BASELINE_PROPOSE_COMMAND,
+    EXECUTION_BASELINE_SAVE_DRAFT_COMMAND,
 };
 
 use crate::{
@@ -318,6 +321,157 @@ pub async fn activate_execution_baseline(
                 .map_err(ApiError::from)?,
         ),
     ))
+}
+
+/// "Approve plan and start work" (D18, F13). This is the ONLY route for that
+/// gesture: one atomic command commits approval, activation, governance
+/// promotion, receipt, and events together, so a lost response can only ever
+/// be satisfied by replaying the frozen receipt -- never by re-deriving a
+/// different outcome from mutable current state. The response is built
+/// receipt-first (8.3.2): the identity fields below always come from the
+/// committed command outcome, and the full `projection` is a best-effort
+/// second read that never turns a successful commit into a reported failure
+/// if it cannot be assembled. Before surfacing a conflict, this also checks
+/// whether the exact requested revision is already the Project's active
+/// baseline -- the same check the web performs, kept here too because a
+/// resent request with a changed digest lands on `idempotency_conflict`
+/// rather than the plain replay path.
+pub async fn approve_and_activate_execution_baseline(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path((project_id, baseline_id, revision_id)): Path<(String, String, String)>,
+    Json(request): Json<ApproveAndActivateExecutionBaselineRequest>,
+) -> ApiResult<(
+    StatusCode,
+    Json<ApproveAndActivateExecutionBaselineResponse>,
+)> {
+    if request.revision_id != revision_id {
+        return Err(ApiError::conflict_with_code(
+            "idempotency_conflict",
+            "approval target does not match the request path",
+        ));
+    }
+    validate_idempotency_key(&request.mutation.idempotency_key)?;
+    let storage_key = scoped_idempotency_key(
+        EXECUTION_BASELINE_APPROVE_AND_ACTIVATE_COMMAND,
+        &project_id,
+        &user.user_id,
+        &request.mutation.idempotency_key,
+    );
+    let authorization = baseline_authorization(
+        &request.mutation.authorization,
+        &user.user_id,
+        EXECUTION_BASELINE_APPROVE_AND_ACTIVATE_COMMAND,
+        &storage_key,
+    )?;
+    let command_outcome = ExecutionBaselineCommandService::new(state.db.clone())
+        .approve_and_activate(ApproveAndActivateExecutionBaselineCommand {
+            project_id: project_id.clone(),
+            baseline_id: baseline_id.clone(),
+            revision_id: revision_id.clone(),
+            expected_baseline_version: request.expected_baseline_version,
+            expected_project_version: request.mutation.expected_version,
+            content_digest: request.content_digest.clone(),
+            render_digest: request.render_digest.clone(),
+            idempotency_key: storage_key,
+            authorization,
+            action: None,
+        })
+        .await;
+
+    let outcome = match command_outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if let Some(response) = already_active_baseline_response(
+                &state,
+                &user.user_id,
+                &project_id,
+                &baseline_id,
+                &revision_id,
+                &request.content_digest,
+                &request.render_digest,
+            )
+            .await
+            {
+                return Ok((StatusCode::OK, Json(response)));
+            }
+            return Err(ApiError::from(error));
+        }
+    };
+
+    let query = ExecutionBaselineQueryService::new(state.db.clone());
+    let projection = query
+        .response_for_command(&project_id, outcome.clone())
+        .await
+        .ok();
+    let refresh_required = projection.is_none();
+    Ok((
+        StatusCode::OK,
+        Json(ApproveAndActivateExecutionBaselineResponse {
+            baseline_id: outcome.baseline_id,
+            revision_id: outcome.revision_id.unwrap_or_else(|| revision_id.clone()),
+            approval_id: outcome.approval_id.unwrap_or_default(),
+            content_digest: outcome
+                .content_digest
+                .unwrap_or_else(|| request.content_digest.clone()),
+            render_digest: outcome
+                .render_digest
+                .unwrap_or_else(|| request.render_digest.clone()),
+            projection,
+            refresh_required,
+        }),
+    ))
+}
+
+/// Best-effort receipt-first fallback for a command call that returned an
+/// error (typically a version or idempotency conflict). If the exact
+/// requested revision is already the Project's active baseline with matching
+/// digests, that is success evidence, not a reason to fail the request --
+/// this is what lets a retried "Approve plan and start work" click render
+/// success instead of the stale-baseline failure F13 reported. Any failure
+/// reading current state here is swallowed: the caller falls back to
+/// reporting the original command error.
+async fn already_active_baseline_response(
+    state: &AppState,
+    user_id: &str,
+    project_id: &str,
+    baseline_id: &str,
+    revision_id: &str,
+    content_digest: &str,
+    render_digest: &str,
+) -> Option<ApproveAndActivateExecutionBaselineResponse> {
+    let projection = ExecutionBaselineQueryService::new(state.db.clone())
+        .get(project_id, user_id)
+        .await
+        .ok()?;
+    let is_exact_active = projection.baseline.id == baseline_id
+        && projection.baseline.lifecycle == ExecutionBaselineLifecycle::Active
+        && projection
+            .current_revision
+            .as_ref()
+            .is_some_and(|revision| {
+                revision.id == revision_id
+                    && revision.content_digest == content_digest
+                    && revision.render_digest == render_digest
+            });
+    if !is_exact_active {
+        return None;
+    }
+    let approval_id = projection
+        .approval
+        .as_ref()
+        .filter(|approval| approval.revision_id == revision_id)
+        .map(|approval| approval.id.clone())
+        .unwrap_or_default();
+    Some(ApproveAndActivateExecutionBaselineResponse {
+        baseline_id: baseline_id.to_owned(),
+        revision_id: revision_id.to_owned(),
+        approval_id,
+        content_digest: content_digest.to_owned(),
+        render_digest: render_digest.to_owned(),
+        projection: Some(projection),
+        refresh_required: false,
+    })
 }
 
 fn validate_idempotency_key(key: &str) -> ApiResult<()> {

@@ -194,7 +194,12 @@ device login are experimental. Gemini uses Google's documented OAuth endpoints
 only when `FORGE_GEMINI_OAUTH_CLIENT_ID` is configured; set
 `FORGE_GEMINI_OAUTH_CLIENT_SECRET` too when the registered client requires it.
 Forge does not import Codex, Grok CLI, Gemini CLI, or Code Assist credential
-caches.
+caches, including Smith's `~/.smith` credential store. A Smith harness can use
+its own logged-in runtime, model, and discovered provider, but that does not
+turn the harness credential into a Forge-native provider entry. Native Main and
+Project Agent typed tools require a provider connected through Forge; embedding
+Smith's host or importing its credentials would be a separate architecture
+change, not an implicit fallback.
 
 Browser login redirects through the exact configured CORS origin. Device login
 shows a provider URL and user code while Forge polls a finite operation. Closing
@@ -242,10 +247,13 @@ agent with `credential_id` and Forge injects the key into the harness
 environment at dispatch (`GET /api/v1/providers/catalog` declares which
 combinations are supported). Harnesses without an entry keep using their own
 CLI login, and the `Providers` tab lists those CLI runtimes with their
-authentication state. Creating an agent does not select a chat binding or grant
-Project/Task authority. Main and Project Agent Chat sessions remain
-filesystem-denied; only an identity admitted through the existing Task
-Worker/reviewer assignment and workflow can receive a Task Workspace.
+authentication state. Explicit negative status such as `Not logged in` wins
+over executable detection, so an installed but unauthenticated harness is
+shown as unavailable with its login recovery action. Creating an agent does not
+select a chat binding or grant Project/Task authority. Main and Project Agent
+Chat sessions remain filesystem-denied; only an identity admitted through the
+existing Task Worker/reviewer assignment and workflow can receive a Task
+Workspace.
 
 To recover from an OAuth failure, cancel the visible operation and start a new
 one. Disconnecting a credential immediately invalidates its local lease. Forge
@@ -349,6 +357,19 @@ Project, handoff, repository, or provisioning operation.
 Use **Continue with Project Agent** to open the Project Chat. The handoff is
 visible there as a bounded, provenance-linked message. It contains approved
 discovery references, not credentials, hidden Main history, or Main authority.
+
+Forge asks for two different user decisions during this flow, not repeated
+approval of the same thing:
+
+1. **Approve the Project Charter** — create this Project with this outcome and
+   Project Agent.
+2. **Approve plan & start work** — allow the Worker/reviewer Tasks covered by
+   the exact implementation plan to change the repository.
+
+The second decision is Project-wide for the approved plan. Forge does not ask
+for another approval for each covered Task. A Task created before that decision
+stays visible and links directly to **Approve plan & start work**; it does not
+need to be recreated.
 
 ### 3. Read the three readiness dimensions
 
@@ -464,6 +485,11 @@ Baseline lifecycle is intentionally four separate operations:
    and emits the activation event. A Project Agent action or chat sentence
    cannot approve or activate a baseline.
 
+The web interface combines steps 3 and 4 behind one explicit **Approve plan &
+start work** action after showing the exact revision. The two server operations
+remain separate for atomic authorization and activation, but they are not two
+user approval prompts.
+
 Until step 4, `execution_gate` remains read-only or approval-required. If a
 baseline is not executable, use the state and corrective fields rather than
 trying to dispatch around them:
@@ -534,9 +560,13 @@ conflict; they are the links between chat, Project truth, and repository work.
 | Missing independent reviewer | Review policy requires a distinct reviewer | Create/select another eligible identity; never assign the Worker as its own reviewer. |
 | `execution_setup_state: provisioning` | Durable setup is still reconciling | Refresh the projection; wait for `ready` or follow the recorded retry action. |
 | `execution_setup_state: failed` | A checkpoint stopped with a typed error | Fix the recorded cause and retry the same provisioning operation with its current version and a new idempotency key. |
-| `execution_gate: baseline_approval_required` | Setup is ready but no approved active baseline exists | Review the exact proposal, approve it as the user, and activate the exact receipt/digests. |
+| `execution_gate: baseline_approval_required` | The Project exists and setup is ready, but repository work has not been authorized | Use **Approve plan & start work** once; every Task covered by that exact plan can then run without per-Task approval. |
 | `version_conflict`, `digest_conflict`, or stale projection | Another command changed the authoritative revision | Refetch current state and re-propose/retry with the correct version; do not overwrite immutable history. |
 | Wake `deferred` or `setup_required` | Delivery could not safely admit a turn yet | Follow the durable retry/setup action; the event remains traceable and is reconsidered after state changes. |
+| `execution_gate: reconciliation_required` | Two authoritative records disagree, or the active governing baseline is itself invalid | Open the Project Overview reconciliation review card and resolve it as the user; resolving wakes the exact affected Task. Only a Project-wide governing conflict stops unrelated work — a Task-scoped one blocks only that Task. |
+| `policy_denied` on an adaptive command | The verb is valid but the approved plan never granted it | Propose a successor baseline that grants it and approve that. This is a denial, not a conflict: nothing was blocked and nothing needs reconciling. |
+| `validation_error` naming `adaptive_envelope.allowed_task_operations` | A plan tried to grant something outside `split`, `sequence`, `replace` | Correct the envelope to those verbs. Command names such as `task.propose` are not adaptive verbs. |
+| A blocked Task showing "implementation committed" | Work is committed and waiting on review, not unstarted | Follow the single next action on the Task's blocker; progress language is derived from real attempt/commit evidence and never regresses to "not started". |
 
 ### After execution: milestones, readiness, and release evidence
 

@@ -6,16 +6,18 @@
 
 use api_types::{
     canonical_digest_with_schema, canonical_render_digest, AcceptanceEvidenceRequirement,
-    AuthorizationProvenance as ApiAuthorizationProvenance, ExecutionBaseline,
-    ExecutionBaselineApproval, ExecutionBaselineContent, ExecutionBaselineLifecycle,
-    ExecutionBaselineReleasePolicy, ExecutionBaselineResponse, ExecutionBaselineRevision,
-    MilestoneAcceptanceCheck, PrincipalKind, PrincipalRef, RevisionProvenance,
+    AdaptiveEnvelope, AdaptiveTaskOperation, AuthorizationProvenance as ApiAuthorizationProvenance,
+    ExecutionBaseline, ExecutionBaselineApproval, ExecutionBaselineContent,
+    ExecutionBaselineIntegrityIssue, ExecutionBaselineLifecycle, ExecutionBaselineReleasePolicy,
+    ExecutionBaselineResponse, ExecutionBaselineRevision, MilestoneAcceptanceCheck, PrincipalKind,
+    PrincipalRef, RevisionProvenance,
 };
 use chrono::{DateTime, Utc};
 use db::{
     new_uuid_v4, now_rfc3339, AgentActionExecutionStatus, AgentActionStatus,
     ApproveProjectExecutionBaselineCommand, CommandReceiptRepo, CreateAgentActionExecution,
-    CreateCommandReceipt, ProjectExecutionBaselineApprovalRecord, ProjectExecutionBaselineRecord,
+    CreateCommandReceipt, CreateProjectCanonicalConflict, CreateProjectReconciliation,
+    ProjectExecutionBaselineApprovalRecord, ProjectExecutionBaselineRecord,
     ProjectExecutionBaselineRevisionRecord, ProjectMemberRepo, ProjectOrchestrationRepo,
     ProjectRepo, SaveProjectExecutionBaselineRevisionCommand, SqliteDb,
 };
@@ -37,6 +39,450 @@ pub const EXECUTION_BASELINE_SCHEMA_VERSION: &str = "forge.execution-baseline/v1
 pub const EXECUTION_BASELINE_RENDER_VERSION: &str = "forge.execution-baseline-render/v1";
 pub const EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA: &str =
     "forge.execution-baseline-release-policy/v1";
+
+/// The exact field path named in every adaptive-operation diagnostic. Kept as
+/// one constant so draft save, proposal, approval, activation, receipt replay,
+/// and active-baseline load all point a caller at the identical location
+/// rather than at three near-miss spellings of the same field.
+pub const ADAPTIVE_ALLOWED_TASK_OPERATIONS_FIELD: &str =
+    "adaptive_envelope.allowed_task_operations";
+
+const EXECUTION_BASELINE_INTEGRITY_AUDITOR_ID: &str = "execution-baseline-integrity-auditor";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecutionBaselineIntegrityAudit {
+    pub invalid_revisions: usize,
+    pub active_blockers: usize,
+    pub successor_drafts: usize,
+}
+
+pub(crate) struct ValidatedBaselineActivationTarget {
+    pub charter_revision_id: String,
+    pub milestone_ids: Vec<String>,
+    pub milestone_definition_revision_ids: Vec<String>,
+    pub primary_milestone_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BaselineIntegrityRecord {
+    revision_id: String,
+    baseline_id: String,
+    invalid_values: Vec<String>,
+    diagnostic: String,
+    successor_revision_id: Option<String>,
+    conflict_id: Option<String>,
+    reconciliation_id: Option<String>,
+    audited_at: String,
+}
+
+/// The closed vocabulary rendered for a diagnostic. Derived from the enum's
+/// own `ALL`, never from a hand-written literal: a second copy of the
+/// vocabulary is exactly the drift that let `task.propose`/`task.adaptive`
+/// reach an approved baseline (F8).
+#[must_use]
+pub fn adaptive_task_operation_supported_values() -> String {
+    AdaptiveTaskOperation::supported_values()
+}
+
+/// Validate an already-typed closed vocabulary. The Rust type makes an
+/// unsupported verb unrepresentable, but a caller can still submit the same
+/// verb twice; an envelope that grants `split` twice is malformed authority,
+/// not a grant of something extra. Called again at proposal, approval,
+/// activation, and replay so every entry point yields the same diagnostic.
+pub fn validate_adaptive_task_operations(
+    values: &[AdaptiveTaskOperation],
+) -> std::result::Result<(), String> {
+    let mut seen = HashSet::new();
+    for value in values {
+        if !seen.insert(*value) {
+            return Err(format!(
+                "`{ADAPTIVE_ALLOWED_TASK_OPERATIONS_FIELD}` contains a duplicate operation '{value}'; supported: {}",
+                adaptive_task_operation_supported_values()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parse one baseline revision's persisted `adaptive_envelope_json` through
+/// the one shared validator used by draft/proposal/approval/activation and
+/// by Task governance admission. A value outside the closed split/sequence/
+/// replace vocabulary -- including a legacy value from before the vocabulary
+/// was closed -- fails here naming the exact field and the allowed verbs
+/// (F8); it never silently admits an unrecognized verb.
+pub fn parse_persisted_adaptive_envelope(
+    value: &str,
+) -> std::result::Result<AdaptiveEnvelope, String> {
+    let envelope = serde_json::from_str::<AdaptiveEnvelope>(value).map_err(|error| {
+        format!(
+            "adaptive envelope is invalid: {error} (`{ADAPTIVE_ALLOWED_TASK_OPERATIONS_FIELD}` must be one of: {})",
+            adaptive_task_operation_supported_values()
+        )
+    })?;
+    validate_adaptive_task_operations(&envelope.allowed_task_operations)?;
+    Ok(envelope)
+}
+
+/// Audit every historical baseline revision against the current closed
+/// adaptive-operation type. Invalid immutable rows are recorded in the
+/// integrity ledger. An invalid active revision additionally gets one
+/// Project-wide reconciliation and a conservative successor draft: valid
+/// typed grants are retained, unsupported/duplicate values are quarantined
+/// in the ledger, and no replacement meaning is inferred for them.
+///
+/// The reserved successor/conflict/reconciliation ids live in the ledger
+/// before their rows are written, making this restartable after a process
+/// failure at any point in the sequence.
+pub async fn audit_execution_baseline_integrity(
+    db: Arc<SqliteDb>,
+) -> Result<ExecutionBaselineIntegrityAudit> {
+    let baseline_ids: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM project_execution_baseline ORDER BY id")
+            .fetch_all(db.pool())
+            .await?;
+    let mut result = ExecutionBaselineIntegrityAudit::default();
+
+    for baseline_id in baseline_ids {
+        let Some(baseline) =
+            ProjectOrchestrationRepo::get_project_execution_baseline(&*db, &baseline_id).await?
+        else {
+            continue;
+        };
+        let revisions =
+            ProjectOrchestrationRepo::list_project_execution_baseline_revisions(&*db, &baseline.id)
+                .await?;
+        for revision in revisions {
+            let Some(invalid_values) =
+                invalid_persisted_adaptive_values(&revision.adaptive_envelope_json)
+            else {
+                continue;
+            };
+            result.invalid_revisions += 1;
+            let is_active = baseline.lifecycle == "active"
+                && baseline.current_revision_id.as_deref() == Some(revision.id.as_str());
+            let diagnostic = format!(
+                "`{ADAPTIVE_ALLOWED_TASK_OPERATIONS_FIELD}` contains historical values outside the closed adaptive-operation contract: {}; supported: {}",
+                invalid_values.join(", "),
+                adaptive_task_operation_supported_values()
+            );
+            let integrity = reserve_integrity_record(
+                &db,
+                &baseline,
+                &revision,
+                &invalid_values,
+                &diagnostic,
+                is_active,
+            )
+            .await?;
+
+            if !is_active {
+                continue;
+            }
+            result.active_blockers += 1;
+            if ensure_integrity_successor(&db, &baseline, &revision, &integrity).await? {
+                result.successor_drafts += 1;
+            }
+            ensure_integrity_reconciliation(&db, &baseline, &revision, &integrity).await?;
+        }
+    }
+
+    Ok(result)
+}
+
+fn invalid_persisted_adaptive_values(value: &str) -> Option<Vec<String>> {
+    let envelope: Value = match serde_json::from_str(value) {
+        Ok(value) => value,
+        Err(_) => return Some(vec![value.to_owned()]),
+    };
+    let Some(values) = envelope
+        .get("allowed_task_operations")
+        .and_then(Value::as_array)
+    else {
+        return Some(vec!["<missing-or-non-array>".to_owned()]);
+    };
+    let mut seen = HashSet::new();
+    let mut invalid = Vec::new();
+    for value in values {
+        let Some(raw) = value.as_str() else {
+            invalid.push(value.to_string());
+            continue;
+        };
+        let Some(operation) = AdaptiveTaskOperation::parse(raw) else {
+            invalid.push(raw.to_owned());
+            continue;
+        };
+        if !seen.insert(operation) {
+            invalid.push(raw.to_owned());
+        }
+    }
+    (!invalid.is_empty()).then_some(invalid)
+}
+
+async fn reserve_integrity_record(
+    db: &SqliteDb,
+    baseline: &ProjectExecutionBaselineRecord,
+    revision: &ProjectExecutionBaselineRevisionRecord,
+    invalid_values: &[String],
+    diagnostic: &str,
+    active: bool,
+) -> Result<BaselineIntegrityRecord> {
+    let now = now_rfc3339();
+    let successor_revision_id = active.then(new_uuid_v4);
+    let conflict_id = active.then(new_uuid_v4);
+    let reconciliation_id = active.then(new_uuid_v4);
+    sqlx::query(
+        "INSERT OR IGNORE INTO execution_baseline_revision_integrity (
+             revision_id, baseline_id, project_id, field_path,
+             invalid_values_json, diagnostic, successor_revision_id,
+             conflict_id, reconciliation_id, audited_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&revision.id)
+    .bind(&baseline.id)
+    .bind(&baseline.project_id)
+    .bind(ADAPTIVE_ALLOWED_TASK_OPERATIONS_FIELD)
+    .bind(serde_json::to_string(invalid_values).map_err(|error| {
+        ServiceError::invalid_operation(format!("serialize invalid baseline values: {error}"))
+    })?)
+    .bind(diagnostic)
+    .bind(successor_revision_id)
+    .bind(conflict_id)
+    .bind(reconciliation_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await?;
+    load_integrity_record(db, &revision.id)
+        .await?
+        .ok_or_else(|| ServiceError::conflict("execution baseline integrity audit was not stored"))
+}
+
+async fn load_integrity_record(
+    db: &SqliteDb,
+    revision_id: &str,
+) -> Result<Option<BaselineIntegrityRecord>> {
+    let row = sqlx::query(
+        "SELECT revision_id, baseline_id, invalid_values_json,
+                diagnostic, successor_revision_id, conflict_id,
+                reconciliation_id, audited_at
+         FROM execution_baseline_revision_integrity WHERE revision_id = ?",
+    )
+    .bind(revision_id)
+    .fetch_optional(db.pool())
+    .await?;
+    row.map(|row| {
+        let invalid_values_json: String = row.try_get("invalid_values_json")?;
+        let invalid_values = serde_json::from_str(&invalid_values_json).map_err(|error| {
+            ServiceError::conflict(format!(
+                "execution baseline integrity values are invalid: {error}"
+            ))
+        })?;
+        Ok(BaselineIntegrityRecord {
+            revision_id: row.try_get("revision_id")?,
+            baseline_id: row.try_get("baseline_id")?,
+            invalid_values,
+            diagnostic: row.try_get("diagnostic")?,
+            successor_revision_id: row.try_get("successor_revision_id")?,
+            conflict_id: row.try_get("conflict_id")?,
+            reconciliation_id: row.try_get("reconciliation_id")?,
+            audited_at: row.try_get("audited_at")?,
+        })
+    })
+    .transpose()
+}
+
+async fn ensure_integrity_successor(
+    db: &SqliteDb,
+    baseline: &ProjectExecutionBaselineRecord,
+    revision: &ProjectExecutionBaselineRevisionRecord,
+    integrity: &BaselineIntegrityRecord,
+) -> Result<bool> {
+    let Some(successor_revision_id) = integrity.successor_revision_id.as_deref() else {
+        return Ok(false);
+    };
+    if ProjectOrchestrationRepo::get_project_execution_baseline_revision(db, successor_revision_id)
+        .await?
+        .is_some()
+    {
+        return Ok(false);
+    }
+
+    let mut manifest_value: Value =
+        serde_json::from_str(&revision.source_refs_json).map_err(|error| {
+            ServiceError::conflict(format!(
+                "invalid active baseline manifest cannot seed a correction draft: {error}"
+            ))
+        })?;
+    let allowed = manifest_value
+        .pointer_mut("/content/adaptive_envelope/allowed_task_operations")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            ServiceError::conflict(
+                "invalid active baseline has no adaptive-operation array to correct",
+            )
+        })?;
+    let mut retained = Vec::new();
+    let mut seen = HashSet::new();
+    for value in allowed.iter() {
+        let Some(operation) = value.as_str().and_then(AdaptiveTaskOperation::parse) else {
+            continue;
+        };
+        if seen.insert(operation) {
+            retained.push(Value::String(operation.as_str().to_owned()));
+        }
+    }
+    *allowed = retained;
+    let mut manifest: ExecutionBaselineManifest =
+        serde_json::from_value(manifest_value).map_err(|error| {
+            ServiceError::conflict(format!(
+                "invalid active baseline cannot seed a typed correction draft: {error}"
+            ))
+        })?;
+    manifest.provenance = RevisionProvenance {
+        author: PrincipalRef {
+            kind: PrincipalKind::System,
+            id: EXECUTION_BASELINE_INTEGRITY_AUDITOR_ID.to_owned(),
+            display_name: Some("Execution baseline integrity audit".to_owned()),
+        },
+        profile_revision: None,
+        operating_skill_revision: None,
+        source_refs: manifest.provenance.source_refs,
+        change_summary: "Quarantine unsupported historical adaptive-operation values for explicit correction"
+            .to_owned(),
+        material_diff: Some(format!(
+            "Removed no authority from the immutable active revision. The correction draft retains only already-valid adaptive verbs; quarantined values: {}",
+            integrity.invalid_values.join(", ")
+        )),
+    };
+    let rendered = render_execution_baseline(&manifest.content).map_err(|error| {
+        ServiceError::conflict(format!("render correction baseline draft: {error}"))
+    })?;
+    manifest.rendered_view = rendered.rendered_view.clone();
+    let columns = baseline_column_json(&manifest.content)
+        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+    let source_refs_json = serde_json::to_string(&manifest).map_err(|error| {
+        ServiceError::invalid_operation(format!("serialize correction baseline draft: {error}"))
+    })?;
+    ProjectOrchestrationRepo::save_project_execution_baseline_draft_command(
+        db,
+        SaveProjectExecutionBaselineRevisionCommand {
+            project_id: baseline.project_id.clone(),
+            baseline_id: Some(baseline.id.clone()),
+            revision_id: successor_revision_id.to_owned(),
+            expected_baseline_version: Some(baseline.version),
+            base_revision: revision.revision,
+            base_revision_id: Some(revision.id.clone()),
+            lifecycle: "draft".to_owned(),
+            charter_revision_id: manifest.content.charter_revision.revision_id.clone(),
+            document_revisions_json: columns.document_revisions_json,
+            plan_items_json: columns.plan_items_json,
+            milestone_id: columns.milestone_id,
+            milestone_ids_json: serde_json::to_string(&manifest.content.milestone_ids)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+            milestone_definition_revision_ids_json: columns.milestone_definition_revision_ids_json,
+            primary_milestone_id: columns.primary_milestone_id,
+            release_policy_json: columns.release_policy_json,
+            release_policy_revision: manifest.content.release_policy_revision.clone(),
+            release_policy_digest: manifest.content.release_policy_digest.clone(),
+            acceptance_matrix_json: columns.acceptance_matrix_json,
+            capability_classes_json: columns.capability_classes_json,
+            risk_classes_json: columns.risk_classes_json,
+            adaptive_envelope_json: columns.adaptive_envelope_json,
+            elevated_operations_json: columns.elevated_operations_json,
+            exclusions_json: columns.exclusions_json,
+            rollback_recovery_json: columns.rollback_recovery_json,
+            schema_version: EXECUTION_BASELINE_SCHEMA_VERSION.to_owned(),
+            render_version: EXECUTION_BASELINE_RENDER_VERSION.to_owned(),
+            rendered_view: rendered.rendered_view,
+            content_digest: rendered.content_digest,
+            rendered_digest: rendered.render_digest,
+            source_refs_json,
+            created_at: now_rfc3339(),
+            command_receipt: None,
+            action_execution: None,
+        },
+    )
+    .await?;
+    Ok(true)
+}
+
+async fn ensure_integrity_reconciliation(
+    db: &SqliteDb,
+    baseline: &ProjectExecutionBaselineRecord,
+    revision: &ProjectExecutionBaselineRevisionRecord,
+    integrity: &BaselineIntegrityRecord,
+) -> Result<()> {
+    let conflict_id = integrity
+        .conflict_id
+        .as_deref()
+        .ok_or_else(|| ServiceError::conflict("integrity audit has no conflict identity"))?;
+    let conflict = if let Some(conflict) =
+        ProjectOrchestrationRepo::get_project_canonical_conflict(db, conflict_id).await?
+    {
+        conflict
+    } else {
+        ProjectOrchestrationRepo::create_project_canonical_conflict(
+            db,
+            CreateProjectCanonicalConflict {
+                id: conflict_id.to_owned(),
+                project_id: baseline.project_id.clone(),
+                domain: "execution".to_owned(),
+                governing_record_type: "execution_baseline".to_owned(),
+                governing_record_id: baseline.id.clone(),
+                governing_record_revision: revision.id.clone(),
+                governing_record_digest: revision.content_digest.clone(),
+                conflicting_record_type: "execution_baseline_revision".to_owned(),
+                conflicting_record_id: revision.id.clone(),
+                conflicting_record_revision: revision.revision.to_string(),
+                conflicting_record_digest: revision.content_digest.clone(),
+                affected_paths_json: serde_json::to_string(&[
+                    ADAPTIVE_ALLOWED_TASK_OPERATIONS_FIELD,
+                ])
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+                conflict_code: "invalid_active_baseline".to_owned(),
+                description: integrity.diagnostic.clone(),
+                detected_by_type: "system".to_owned(),
+                detected_by_id: Some(EXECUTION_BASELINE_INTEGRITY_AUDITOR_ID.to_owned()),
+                authorization_basis: "startup_integrity_audit".to_owned(),
+                authorization_action: "project.execution_baseline.audit".to_owned(),
+                explicit_event: "project.execution_baseline.invalid_active_detected".to_owned(),
+                authorization_occurred_at: integrity.audited_at.clone(),
+                idempotency_key: format!("invalid-active-baseline:{}", revision.id),
+                created_at: integrity.audited_at.clone(),
+            },
+        )
+        .await?
+    };
+    let reconciliation_id = integrity
+        .reconciliation_id
+        .as_deref()
+        .ok_or_else(|| ServiceError::conflict("integrity audit has no reconciliation identity"))?;
+    if ProjectOrchestrationRepo::get_project_reconciliation(db, reconciliation_id)
+        .await?
+        .is_none()
+    {
+        ProjectOrchestrationRepo::create_project_reconciliation(
+            db,
+            CreateProjectReconciliation {
+                id: reconciliation_id.to_owned(),
+                project_id: baseline.project_id.clone(),
+                conflict_id: conflict.id,
+                record_type: "execution_baseline_revision".to_owned(),
+                record_id: revision.id.clone(),
+                record_revision: revision.revision.to_string(),
+                record_digest: revision.content_digest.clone(),
+                governing_record_type: "execution_baseline".to_owned(),
+                governing_record_id: baseline.id.clone(),
+                governing_record_revision: revision.id.clone(),
+                governing_record_digest: revision.content_digest.clone(),
+                created_at: integrity.audited_at.clone(),
+                updated_at: integrity.audited_at.clone(),
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
 
 /// Compute the authority digest for the complete, closed release policy.
 /// Callers must never accept a client-supplied opaque policy digest without
@@ -374,6 +820,16 @@ pub const EXECUTION_BASELINE_PROPOSE_COMMAND: &str =
     "project.execution_baseline.propose_for_approval";
 pub const EXECUTION_BASELINE_APPROVE_COMMAND: &str = "project.execution_baseline.approve";
 pub const EXECUTION_BASELINE_ACTIVATE_COMMAND: &str = "project.execution_baseline.activate";
+/// The single atomic "Approve plan and start work" gesture (D18, F13). Binds
+/// the exact Project/baseline/revision/content/render identities and one
+/// stable idempotency key, and commits approval, activation, governance
+/// promotion, receipt, and events together. This is deliberately a distinct
+/// operation/receipt name from `approve`/`activate` above: a replay of one
+/// can never be satisfied by a receipt minted for the other, and the
+/// already-approved "Start approved work" gesture keeps using the separate
+/// exact replay-safe `activate` command.
+pub const EXECUTION_BASELINE_APPROVE_AND_ACTIVATE_COMMAND: &str =
+    "project.execution_baseline.approve_and_activate";
 const EXECUTION_BASELINE_MANIFEST_SCHEMA: &str = "forge.execution-baseline-manifest/v1";
 const MAX_AUTHORIZATION_CLOCK_SKEW_SECONDS: i64 = 48 * 60 * 60;
 
@@ -434,6 +890,27 @@ pub struct ActivateExecutionBaselineCommand {
     pub baseline_id: String,
     pub revision_id: String,
     pub approval_id: String,
+    pub expected_baseline_version: i64,
+    pub expected_project_version: i64,
+    pub content_digest: String,
+    pub render_digest: String,
+    pub idempotency_key: String,
+    pub authorization: ProjectCommandAuthorization,
+    #[serde(skip_serializing)]
+    pub action: Option<AgentActionProvenance>,
+}
+
+/// "Approve plan and start work": one atomic command binding the exact
+/// proposed baseline revision the user reviewed. `expected_baseline_version`
+/// is the CAS for the still-`proposed` baseline; `expected_project_version`
+/// is the CAS for the Project the baseline activates into. Both must name
+/// the identities observed while the user reviewed this exact revision, the
+/// same contract `approve`/`activate` already use individually.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApproveAndActivateExecutionBaselineCommand {
+    pub project_id: String,
+    pub baseline_id: String,
+    pub revision_id: String,
     pub expected_baseline_version: i64,
     pub expected_project_version: i64,
     pub content_digest: String,
@@ -651,7 +1128,7 @@ impl ExecutionBaselineCommandService {
             &command.render_digest,
         )?;
         validate_baseline_content(&self.db, &command.project_id, &command.content, true).await?;
-        ensure_reconciliation_clear(&self.db, &command.project_id).await?;
+        ensure_reconciliation_clear(&self.db, &command.project_id, true).await?;
         let (baseline_id, expected_version, base_revision) = self
             .resolve_revision_base(
                 &command.project_id,
@@ -787,7 +1264,7 @@ impl ExecutionBaselineCommandService {
                 "approval does not target the exact proposed baseline review target",
             ));
         }
-        ensure_reconciliation_clear(&self.db, &command.project_id).await?;
+        ensure_reconciliation_clear(&self.db, &command.project_id, true).await?;
         let approval_id = new_uuid_v4();
         let outcome_json = serde_json::json!({
             "operation": "approve",
@@ -849,6 +1326,12 @@ impl ExecutionBaselineCommandService {
             Some(&command.content_digest),
         )?;
         if let Some(outcome) = self.replay(&context).await? {
+            self.wake_activated_baseline_dispatch(
+                &command.project_id,
+                &command.baseline_id,
+                &command.revision_id,
+            )
+            .await;
             return self.outcome_from_receipt(&outcome, &context).await;
         }
         validate_baseline_authorization(
@@ -879,7 +1362,7 @@ impl ExecutionBaselineCommandService {
                 "activation does not target the exact persisted baseline review target",
             ));
         }
-        ensure_reconciliation_clear(&self.db, &command.project_id).await?;
+        ensure_reconciliation_clear(&self.db, &command.project_id, false).await?;
         let outcome_json = serde_json::json!({
             "operation": "activate",
             "project_id": command.project_id,
@@ -918,7 +1401,161 @@ impl ExecutionBaselineCommandService {
         )
         .await
         .map_err(ServiceError::from)?;
+        self.wake_activated_baseline_dispatch(
+            &command.project_id,
+            &command.baseline_id,
+            &command.revision_id,
+        )
+        .await;
         self.committed_outcome(&context).await
+    }
+
+    /// "Approve plan and start work" (D18, F13): one atomic, replay-exact
+    /// command that binds the exact Project/baseline/revision/content/render
+    /// identities the user reviewed and commits approval, activation,
+    /// governance promotion, receipt, and events together. A lost HTTP
+    /// response after this commits can only ever be satisfied by replaying
+    /// this exact receipt -- it is never re-derived from mutable current
+    /// state. Only a freshly `proposed` baseline may use this method; the
+    /// already-approved "Start approved work" gesture keeps using
+    /// [`Self::activate`].
+    pub async fn approve_and_activate(
+        &self,
+        command: ApproveAndActivateExecutionBaselineCommand,
+    ) -> Result<ExecutionBaselineCommandOutcome> {
+        let context = baseline_context(
+            EXECUTION_BASELINE_APPROVE_AND_ACTIVATE_COMMAND,
+            &command.idempotency_key,
+            &command.authorization,
+            &command,
+            command.action.clone(),
+            &command.project_id,
+            command.expected_project_version,
+            Some(&command.content_digest),
+        )?;
+        if let Some(outcome) = self.replay(&context).await? {
+            self.wake_activated_baseline_dispatch(
+                &command.project_id,
+                &command.baseline_id,
+                &command.revision_id,
+            )
+            .await;
+            return self.outcome_from_receipt(&outcome, &context).await;
+        }
+        validate_baseline_authorization(
+            &command.authorization,
+            EXECUTION_BASELINE_APPROVE_AND_ACTIVATE_COMMAND,
+            true,
+        )?;
+        authorize_baseline_principal(&self.db, &command.project_id, &command.authorization).await?;
+        let revision = self
+            .load_revision_for_project(
+                &command.project_id,
+                &command.baseline_id,
+                &command.revision_id,
+            )
+            .await?;
+        let manifest = validate_persisted_manifest(
+            &self.db,
+            &command.project_id,
+            &command.baseline_id,
+            &revision,
+            true,
+        )
+        .await?;
+        if revision.content_digest != command.content_digest
+            || revision.rendered_digest != command.render_digest
+        {
+            return Err(ServiceError::conflict(
+                "approval does not target the exact proposed baseline review target",
+            ));
+        }
+        ensure_reconciliation_clear(&self.db, &command.project_id, false).await?;
+        let approval_id = new_uuid_v4();
+        let outcome_json = serde_json::json!({
+            "operation": "approve_and_activate",
+            "project_id": command.project_id,
+            "baseline_id": command.baseline_id,
+            "revision_id": command.revision_id,
+            "approval_id": approval_id,
+            "lifecycle": "active",
+            "content_digest": command.content_digest,
+            "render_digest": command.render_digest,
+            "requires_user_authorization": false,
+            "domain_committed": true,
+        })
+        .to_string();
+        let (receipt, action_execution) = command_bundle(&context, &outcome_json);
+        let _baseline =
+            ProjectOrchestrationRepo::approve_and_activate_project_execution_baseline_command(
+                &*self.db,
+                db::ApproveAndActivateProjectExecutionBaselineCommand {
+                    project_id: command.project_id.clone(),
+                    baseline_id: command.baseline_id.clone(),
+                    revision_id: command.revision_id.clone(),
+                    approval_id: approval_id.clone(),
+                    expected_baseline_version: command.expected_baseline_version,
+                    expected_project_version: command.expected_project_version,
+                    principal_type: command.authorization.principal_type.clone(),
+                    principal_id: command.authorization.principal_id.clone(),
+                    authorization_basis: command.authorization.authorization_basis.clone(),
+                    authorization_occurred_at: command
+                        .authorization
+                        .authorization_occurred_at
+                        .clone(),
+                    explicit_event: command.authorization.authorization_event_id.clone(),
+                    content_digest: command.content_digest.clone(),
+                    rendered_digest: command.render_digest.clone(),
+                    charter_revision_id: manifest.content.charter_revision.revision_id,
+                    milestone_ids: manifest.content.milestone_ids,
+                    milestone_definition_revision_ids: manifest
+                        .content
+                        .milestone_definition_revision_ids,
+                    primary_milestone_id: manifest.content.primary_milestone_id,
+                    idempotency_key: command.idempotency_key,
+                    created_at: now_rfc3339(),
+                    updated_at: now_rfc3339(),
+                    command_receipt: Some(receipt),
+                    action_execution,
+                },
+            )
+            .await
+            .map_err(ServiceError::from)?;
+        self.wake_activated_baseline_dispatch(
+            &command.project_id,
+            &command.baseline_id,
+            &command.revision_id,
+        )
+        .await;
+        self.committed_outcome(&context).await
+    }
+
+    async fn wake_activated_baseline_dispatch(
+        &self,
+        project_id: &str,
+        baseline_id: &str,
+        revision_id: &str,
+    ) {
+        if let Err(error) = crate::wake_baseline_task_dispatch(
+            &self.db,
+            project_id,
+            baseline_id,
+            revision_id,
+            "execution_baseline_activated",
+        )
+        .await
+        {
+            // The domain command and receipt are already durable. A response
+            // replay re-attempts this idempotent wake, so never turn a
+            // post-commit scheduling nudge into a false command failure.
+            tracing::warn!(
+                %project_id,
+                %baseline_id,
+                %revision_id,
+                %error,
+                "execution baseline activated but waking affected Task dispatch failed"
+            );
+        }
     }
 
     async fn resolve_revision_base(
@@ -1186,15 +1823,28 @@ impl ExecutionBaselineQueryService {
             .current_revision_id
             .clone()
             .or_else(|| revisions.first().map(|revision| revision.id.clone()));
-        let current_revision = match current_revision_id {
-            Some(revision_id) => Some(self.render_revision(baseline, &revisions, &revision_id)?),
+        let integrity = match current_revision_id.as_deref() {
+            Some(revision_id) => load_integrity_record(&self.db, revision_id).await?,
             None => None,
         };
-        let proposed_revision = revisions.first().and_then(|latest| {
-            current_revision
-                .as_ref()
-                .filter(|current| current.id != latest.id)
-                .map(|_| latest)
+        let current_revision = match (&current_revision_id, &integrity) {
+            (Some(revision_id), None) => {
+                Some(self.render_revision(baseline, &revisions, revision_id)?)
+            }
+            _ => None,
+        };
+        let invalid_revision_ids: HashSet<String> = sqlx::query_scalar(
+            "SELECT revision_id FROM execution_baseline_revision_integrity
+             WHERE baseline_id = ?",
+        )
+        .bind(&baseline.id)
+        .fetch_all(self.db.pool())
+        .await?
+        .into_iter()
+        .collect();
+        let proposed_revision = revisions.iter().find(|candidate| {
+            current_revision_id.as_deref() != Some(candidate.id.as_str())
+                && !invalid_revision_ids.contains(&candidate.id)
         });
         let proposed_revision = proposed_revision
             .map(|revision| self.render_revision(baseline, &revisions, &revision.id))
@@ -1232,6 +1882,16 @@ impl ExecutionBaselineQueryService {
             approval,
             approval_target: None,
             requires_user_authorization: false,
+            integrity_issue: integrity.map(|integrity| ExecutionBaselineIntegrityIssue {
+                revision_id: integrity.revision_id,
+                baseline_id: integrity.baseline_id,
+                field_path: ADAPTIVE_ALLOWED_TASK_OPERATIONS_FIELD.to_owned(),
+                invalid_values: integrity.invalid_values,
+                diagnostic: integrity.diagnostic,
+                successor_revision_id: integrity.successor_revision_id,
+                conflict_id: integrity.conflict_id,
+                reconciliation_id: integrity.reconciliation_id,
+            }),
         })
     }
 
@@ -1655,6 +2315,13 @@ async fn validate_baseline_content(
             "execution baseline requires plan items, milestones, release policy, capability classes, and risk classes",
         ));
     }
+    // The closed enum already makes an unsupported verb unrepresentable by
+    // the time content reaches here. This runs on every draft save as well as
+    // on the complete envelope at proposal/approval/activation so a malformed
+    // grant -- today a duplicate -- is refused at the first entry point that
+    // sees it rather than at activation (F8/8.1.2).
+    validate_adaptive_task_operations(&content.adaptive_envelope.allowed_task_operations)
+        .map_err(ServiceError::invalid_operation)?;
     let policy_present = !content.release_policy_revision.trim().is_empty()
         || !content.release_policy_digest.trim().is_empty()
         || !content.release_policy.schema_version.trim().is_empty();
@@ -2054,18 +2721,22 @@ fn validate_persisted_artifact_ref(
     Ok(())
 }
 
-async fn ensure_reconciliation_clear(db: &SqliteDb, project_id: &str) -> Result<()> {
+async fn ensure_reconciliation_clear(
+    db: &SqliteDb,
+    project_id: &str,
+    allow_invalid_baseline_correction: bool,
+) -> Result<()> {
     let required: i64 = sqlx::query_scalar(
-        "SELECT (
-             SELECT COUNT(*) FROM project_reconciliation_record
-             WHERE project_id = ? AND state = 'required'
-         ) + (
-             SELECT COUNT(*) FROM project_canonical_conflict
-             WHERE project_id = ?
-         )",
+        "SELECT COUNT(*)
+         FROM project_reconciliation_record reconciliation
+         JOIN project_canonical_conflict conflict
+           ON conflict.id = reconciliation.conflict_id
+         WHERE reconciliation.project_id = ?
+           AND reconciliation.state = 'required'
+           AND (? = 0 OR conflict.conflict_code != 'invalid_active_baseline')",
     )
     .bind(project_id)
-    .bind(project_id)
+    .bind(i64::from(allow_invalid_baseline_correction))
     .fetch_one(db.pool())
     .await?;
     if required > 0 {
@@ -2126,6 +2797,21 @@ async fn validate_persisted_manifest(
     )?;
     validate_baseline_content(db, project_id, &manifest.content, complete).await?;
     Ok(manifest)
+}
+
+pub(crate) async fn validated_baseline_activation_target(
+    db: &SqliteDb,
+    project_id: &str,
+    baseline_id: &str,
+    revision: &ProjectExecutionBaselineRevisionRecord,
+) -> Result<ValidatedBaselineActivationTarget> {
+    let manifest = validate_persisted_manifest(db, project_id, baseline_id, revision, true).await?;
+    Ok(ValidatedBaselineActivationTarget {
+        charter_revision_id: manifest.content.charter_revision.revision_id,
+        milestone_ids: manifest.content.milestone_ids,
+        milestone_definition_revision_ids: manifest.content.milestone_definition_revision_ids,
+        primary_milestone_id: manifest.content.primary_milestone_id,
+    })
 }
 
 fn command_bundle(
@@ -2189,9 +2875,7 @@ fn command_bundle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use api_types::{
-        AdaptiveEnvelope, ArtifactRef, ExecutionBaselineContent, ExecutionBaselineReleasePolicy,
-    };
+    use api_types::{ArtifactRef, ExecutionBaselineContent, ExecutionBaselineReleasePolicy};
 
     fn content() -> ExecutionBaselineContent {
         let release_policy = ExecutionBaselineReleasePolicy {
@@ -2233,7 +2917,7 @@ mod tests {
             reviewer_independence_rules: Vec::new(),
             elevated_operations: Vec::new(),
             adaptive_envelope: AdaptiveEnvelope {
-                allowed_task_operations: vec!["split".to_owned()],
+                allowed_task_operations: vec![api_types::AdaptiveTaskOperation::Split],
                 fixed_outcomes: Vec::new(),
                 fixed_acceptance: Vec::new(),
                 fixed_risk_classes: vec!["low".to_owned()],

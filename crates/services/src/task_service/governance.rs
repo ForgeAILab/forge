@@ -10,9 +10,12 @@ use crate::execution_setup::{
     canonical_task_capability, classify_task_execution, is_read_only_capability,
     TaskExecutionClass, SUPPORTED_CAPABILITY_PROFILES,
 };
+use crate::project_execution_setup_projection::{
+    required_reconciliation_conflicts, ReconciliationConflictRow,
+};
 use api_types::{
-    AdaptiveEnvelope, ExecutionGate, ExecutionSetupState, RetryAction, SetupRequirement,
-    TaskGovernanceRequest,
+    AdaptiveEnvelope, AdaptiveTaskOperation, ExecutionGate, ExecutionSetupState, RetryAction,
+    SetupRequirement, TaskGovernanceRequest,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use db::{CreateProjectCanonicalConflict, CreateProjectReconciliation, ProjectOrchestrationRepo};
@@ -24,6 +27,34 @@ const WORKSPACE_LEASE_SECONDS: i64 = 15 * 60;
 const CAPABILITY_PROFILE_REVISION: &str = "forge.capability-profile/v1";
 const FIXED_BOUNDARY_DIGEST_SCHEMA: &str = "forge.task-governance/fixed-boundary/v1";
 const ADAPTIVE_ENVELOPE_DIGEST_SCHEMA: &str = "forge.task-governance/adaptive-envelope/v1";
+
+/// Adaptive-boundary fields that describe a Task's fixed outcomes,
+/// acceptance, risk, side effects, release policy, or elevated authority.
+/// Shared by boundary-crossing detection (D14) and capability-aware review
+/// admission (D16/8.2.5): a recorded conflict whose affected paths never
+/// touch one of these fields does not change what an independent reviewer
+/// is evaluating, so read-only review of an already-committed result may
+/// continue even while repository mutation stays blocked.
+const FIXED_BOUNDARY_FIELDS: [&str; 8] = [
+    "fixed_outcomes",
+    "fixed_acceptance",
+    "fixed_risk_classes",
+    "forbidden_side_effects",
+    "release_policy_revision",
+    "release_policy_digest",
+    "elevated_operations",
+    "fixed_boundary_digest",
+];
+
+/// Whether the requested WorkspaceLease capability is repository-mutating or
+/// independent read-only review. Only the dedicated `reviewer` canonical
+/// role is read-only; every other resolved role is a repository Worker
+/// (D16/8.2.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutionGateCapability {
+    RepositoryMutation,
+    ReadOnlyReview,
+}
 
 /// Immutable governance facts inherited by an adaptive Task reshape.
 ///
@@ -81,47 +112,30 @@ struct BaselineContext {
     rendered_digest: String,
 }
 
+/// Parse the active governing baseline's persisted adaptive envelope through
+/// the one shared validator (`crate::execution_baseline`), also used by
+/// content submission (draft/proposal/approval/activation) and by Decision
+/// admission. A parse failure here — including a legacy value outside the
+/// closed split/sequence/replace vocabulary, the exact F8 defect — means the
+/// active governing baseline is itself invalid, which is Project-wide
+/// `reconciliation_required` truth, not a caller mistake.
 fn parse_adaptive_task_envelope(value: &str) -> Result<AdaptiveEnvelope> {
-    let value: Value = serde_json::from_str(value).map_err(|error| {
-        ServiceError::Conflict(format!(
-            "reconciliation_required: governing adaptive envelope is invalid: {error}"
-        ))
-    })?;
-    let object = value.as_object().ok_or_else(|| {
-        ServiceError::Conflict(
-            "reconciliation_required: governing adaptive envelope must be an object".to_owned(),
-        )
-    })?;
-    const FIELDS: [&str; 6] = [
-        "allowed_task_operations",
-        "fixed_outcomes",
-        "fixed_acceptance",
-        "fixed_risk_classes",
-        "forbidden_side_effects",
-        "elevated_operations",
-    ];
-    if object.len() != FIELDS.len() || FIELDS.iter().any(|field| !object.contains_key(*field)) {
-        return Err(ServiceError::Conflict(
-            "reconciliation_required: governing adaptive envelope is incomplete".to_owned(),
-        ));
-    }
-    if FIELDS.iter().any(|field| {
-        !object.get(*field).is_some_and(Value::is_array)
-            || object
-                .get(*field)
-                .and_then(Value::as_array)
-                .is_some_and(|values| values.iter().any(|value| !value.is_string()))
-    }) {
-        return Err(ServiceError::Conflict(
-            "reconciliation_required: governing adaptive envelope contains a non-string boundary"
-                .to_owned(),
-        ));
-    }
-    serde_json::from_value(value).map_err(|error| {
-        ServiceError::Conflict(format!(
-            "reconciliation_required: governing adaptive envelope is invalid: {error}"
-        ))
+    crate::execution_baseline::parse_persisted_adaptive_envelope(value).map_err(|message| {
+        ServiceError::Conflict(format!("reconciliation_required: governing {message}"))
     })
+}
+
+/// Render the exact set of currently-allowed verbs for a policy-denial
+/// diagnostic (D14: "policy_denied with allowed operations").
+fn allowed_operations_list(values: &[AdaptiveTaskOperation]) -> String {
+    if values.is_empty() {
+        return "none".to_owned();
+    }
+    values
+        .iter()
+        .map(|operation| operation.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl TaskService {
@@ -172,16 +186,27 @@ impl TaskService {
     /// Legacy Tasks have no governing baseline and retain their historical
     /// behavior.  Charter-backed Tasks require an active envelope entry and
     /// an empty reconciliation projection before they can be reshaped.
+    ///
+    /// Outcomes are deliberately distinct (D14): a malformed/unknown
+    /// operation is a typed validation failure; a valid operation the active
+    /// envelope simply does not grant is a policy denial; only a proven
+    /// divergence between authoritative records — or an invalid current
+    /// governing baseline — creates canonical-conflict/reconciliation truth.
+    /// A rejected no-op never mutates durable state.
     pub(crate) async fn authorize_adaptive_task_operation(
         &self,
         task: &db::Task,
         operation: &str,
     ) -> Result<Option<AdaptiveTaskGovernance>> {
-        if operation.trim().is_empty() {
-            return Err(ServiceError::invalid_operation(
-                "adaptive Task operation is required",
-            ));
-        }
+        // Parse first. An unsupported verb is a caller/typed-input mistake —
+        // it can never prove that any authoritative record diverged, so it
+        // must never create a canonical conflict or reconciliation row.
+        let Some(requested_operation) = AdaptiveTaskOperation::parse(operation) else {
+            return Err(ServiceError::invalid_operation(format!(
+                "adaptive Task operation '{operation}' is not a supported verb; supported: {}",
+                crate::execution_baseline::adaptive_task_operation_supported_values()
+            )));
+        };
         let Some(governance) = self.adaptive_task_governance(task).await? else {
             return Ok(None);
         };
@@ -226,6 +251,9 @@ impl TaskService {
         .fetch_one(self.db.pool())
         .await?;
         if admitted != 1 {
+            // The Task's own governance pointer no longer names the
+            // Project's active, approved baseline revision: a proven
+            // divergence between two authoritative records.
             let reason =
                 "adaptive Task operation references a stale or unapproved execution baseline";
             self.record_adaptive_boundary_reconciliation(
@@ -235,6 +263,8 @@ impl TaskService {
                 baseline_revision_id,
                 operation,
                 reason,
+                "adaptive_task_governance_stale",
+                &["baseline_id", "baseline_revision_id"],
             )
             .await?;
             return Err(ServiceError::Conflict(format!(
@@ -249,42 +279,76 @@ impl TaskService {
         .fetch_one(self.db.pool())
         .await?;
         if unresolved > 0 {
+            // An existing reconciliation is a hard gate; it is not this
+            // command's job to create a second one for the same Project.
             return Err(ServiceError::Conflict(
                 "reconciliation_required: resolve the Project's active adaptive boundary conflict before reshaping Tasks"
                     .to_owned(),
             ));
         }
-        let envelope_json = governance
-            .adaptive_envelope_json
-            .as_deref()
-            .ok_or_else(|| {
-                ServiceError::Conflict(
-                    "reconciliation_required: governing baseline adaptive envelope is unavailable"
-                        .to_owned(),
-                )
-            })?;
-        let envelope = parse_adaptive_task_envelope(envelope_json)?;
+        let Some(envelope_json) = governance.adaptive_envelope_json.as_deref() else {
+            // The governance row names an active/approved revision that has
+            // no adaptive-envelope projection: the governing baseline itself
+            // is invalid, not a caller mistake.
+            let reason = "governing baseline adaptive envelope is unavailable";
+            self.record_adaptive_boundary_reconciliation(
+                task,
+                &governance,
+                baseline_id,
+                baseline_revision_id,
+                operation,
+                reason,
+                "invalid_active_baseline",
+                &["baseline_revision_id"],
+            )
+            .await?;
+            return Err(ServiceError::Conflict(format!(
+                "reconciliation_required: {reason}"
+            )));
+        };
+        let envelope =
+            match crate::execution_baseline::parse_persisted_adaptive_envelope(envelope_json) {
+                Ok(envelope) => envelope,
+                Err(message) => {
+                    // The active governing baseline's own persisted envelope is
+                    // internally invalid (for example a legacy value outside the
+                    // closed split/sequence/replace vocabulary — the F8 defect).
+                    // This is Project-wide `invalid_active_baseline` truth, named
+                    // with the exact invalid content in `message`.
+                    let reason = format!("governing {message}");
+                    self.record_adaptive_boundary_reconciliation(
+                        task,
+                        &governance,
+                        baseline_id,
+                        baseline_revision_id,
+                        operation,
+                        &reason,
+                        "invalid_active_baseline",
+                        &[crate::execution_baseline::ADAPTIVE_ALLOWED_TASK_OPERATIONS_FIELD],
+                    )
+                    .await?;
+                    return Err(ServiceError::Conflict(format!(
+                        "reconciliation_required: {reason}"
+                    )));
+                }
+            };
         if envelope
             .allowed_task_operations
-            .iter()
-            .any(|allowed| allowed == operation)
+            .contains(&requested_operation)
         {
             return Ok(Some(governance));
         }
-        let reason =
-            format!("adaptive Task operation '{operation}' is outside the approved envelope");
-        self.record_adaptive_boundary_reconciliation(
-            task,
-            &governance,
-            baseline_id,
-            baseline_revision_id,
-            operation,
-            &reason,
-        )
-        .await?;
-        Err(ServiceError::Conflict(format!(
-            "reconciliation_required: {reason}"
-        )))
+        // The requested verb is valid and the governing baseline is valid;
+        // it simply was never granted. This is a policy denial, not a
+        // divergence between authoritative records — no conflict, no
+        // reconciliation row, no execution effect. Expanded authority
+        // requires an explicit successor-baseline/reconciliation proposal.
+        Err(ServiceError::AuthorizationDenied {
+            message: format!(
+                "adaptive Task operation '{operation}' is not permitted by the active baseline's adaptive envelope; allowed: {}",
+                allowed_operations_list(&envelope.allowed_task_operations)
+            ),
+        })
     }
 
     /// A child/replacement must inherit the source Task's immutable
@@ -313,39 +377,50 @@ impl TaskService {
                 ))
             })?;
         let requested_provenance = requested.provenance.as_ref();
-        const FIXED_BOUNDARY_FIELDS: [&str; 8] = [
-            "fixed_outcomes",
-            "fixed_acceptance",
-            "fixed_risk_classes",
-            "forbidden_side_effects",
-            "release_policy_revision",
-            "release_policy_digest",
-            "elevated_operations",
-            "fixed_boundary_digest",
-        ];
-        let provenance_boundary_mismatch = requested_provenance
-            .and_then(Value::as_object)
-            .is_some_and(|requested| {
-                FIXED_BOUNDARY_FIELDS.iter().any(|field| {
-                    requested.get(*field).is_some()
-                        && source_provenance.get(*field) != requested.get(*field)
-                })
-            });
-        let boundary_mismatch = requested.baseline_id.as_deref() != Some(baseline_id)
-            || requested.baseline_revision_id.as_deref()
-                != governance.baseline_revision_id.as_deref()
-            || requested.charter_revision_id.as_deref()
-                != governance.charter_revision_id.as_deref()
-            || requested.plan_item_id.as_deref() != governance.plan_item_id.as_deref()
-            || requested.milestone_id.as_deref() != governance.milestone_id.as_deref()
-            || serde_json::to_string(&requested.document_revision_ids)
-                .ok()
-                .as_deref()
-                != Some(governance.document_revisions_json.as_str())
-            || requested.capability_class.as_deref() != governance.capability_class.as_deref()
-            || requested.risk_class.as_deref() != governance.risk_class.as_deref()
-            || provenance_boundary_mismatch;
-        if !boundary_mismatch {
+        // Record exactly which fields diverged rather than a generic list
+        // unrelated to the detected difference (D14).
+        let mut affected_paths: Vec<&str> = Vec::new();
+        if requested.baseline_id.as_deref() != Some(baseline_id) {
+            affected_paths.push("baseline_id");
+        }
+        if requested.baseline_revision_id.as_deref() != governance.baseline_revision_id.as_deref() {
+            affected_paths.push("baseline_revision_id");
+        }
+        if requested.charter_revision_id.as_deref() != governance.charter_revision_id.as_deref() {
+            affected_paths.push("charter_revision_id");
+        }
+        if requested.plan_item_id.as_deref() != governance.plan_item_id.as_deref() {
+            affected_paths.push("plan_item_id");
+        }
+        if requested.milestone_id.as_deref() != governance.milestone_id.as_deref() {
+            affected_paths.push("milestone_id");
+        }
+        if serde_json::to_string(&requested.document_revision_ids)
+            .ok()
+            .as_deref()
+            != Some(governance.document_revisions_json.as_str())
+        {
+            affected_paths.push("document_revision_ids");
+        }
+        if requested.capability_class.as_deref() != governance.capability_class.as_deref() {
+            affected_paths.push("capability_class");
+        }
+        if requested.risk_class.as_deref() != governance.risk_class.as_deref() {
+            affected_paths.push("risk_class");
+        }
+        for field in FIXED_BOUNDARY_FIELDS {
+            let mismatch =
+                requested_provenance
+                    .and_then(Value::as_object)
+                    .is_some_and(|requested| {
+                        requested.get(field).is_some()
+                            && source_provenance.get(field) != requested.get(field)
+                    });
+            if mismatch {
+                affected_paths.push(field);
+            }
+        }
+        if affected_paths.is_empty() {
             return Ok(());
         }
         let reason = format!(
@@ -361,6 +436,8 @@ impl TaskService {
                 .unwrap_or("unknown"),
             operation,
             &reason,
+            "adaptive_task_boundary_crossed",
+            &affected_paths,
         )
         .await?;
         Err(ServiceError::Conflict(format!(
@@ -368,6 +445,7 @@ impl TaskService {
         )))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn record_adaptive_boundary_reconciliation(
         &self,
         task: &db::Task,
@@ -376,13 +454,15 @@ impl TaskService {
         baseline_revision_id: &str,
         operation: &str,
         reason: &str,
+        conflict_code: &str,
+        affected_paths: &[&str],
     ) -> Result<()> {
         use sha2::{Digest, Sha256};
 
         let task_digest = hex::encode(Sha256::digest(governance.provenance_json.as_bytes()));
         let idempotency_key = format!(
-            "adaptive-boundary:{}:{}:{}:{}",
-            task.project_id, task.id, operation, task_digest
+            "adaptive-boundary:{}:{}:{}:{}:{}",
+            task.project_id, task.id, conflict_code, operation, task_digest
         );
         let now = now_rfc3339();
         let conflict = ProjectOrchestrationRepo::create_project_canonical_conflict(
@@ -402,16 +482,12 @@ impl TaskService {
                 conflicting_record_id: task.id.clone(),
                 conflicting_record_revision: task.version.to_string(),
                 conflicting_record_digest: task_digest.clone(),
-                affected_paths_json: serde_json::json!([
-                    "outcome",
-                    "acceptance",
-                    "risk_class",
-                    "side_effects",
-                    "release_policy",
-                    "elevated_operations"
-                ])
-                .to_string(),
-                conflict_code: "adaptive_task_boundary_crossed".to_owned(),
+                affected_paths_json: serde_json::to_string(affected_paths).map_err(|error| {
+                    ServiceError::invalid_operation(format!(
+                        "adaptive boundary affected paths are invalid: {error}"
+                    ))
+                })?,
+                conflict_code: conflict_code.to_owned(),
                 description: reason.to_owned(),
                 detected_by_type: "system".to_owned(),
                 detected_by_id: Some("task-service".to_owned()),
@@ -943,8 +1019,29 @@ impl TaskService {
 
     /// Fail closed immediately before any path can prepare a repository
     /// workspace.  This keeps claim, manual launch, role dispatch, retry, and
-    /// follow-up execution behind the same gate.
+    /// follow-up execution behind the same gate. This is the repository-
+    /// mutation capability; see [`Self::ensure_task_reviewable`] for the
+    /// independent read-only review capability (D16, 8.2.5).
     pub(crate) async fn ensure_task_runnable(&self, task: &db::Task) -> Result<()> {
+        self.ensure_task_runnable_for_capability(task, ExecutionGateCapability::RepositoryMutation)
+            .await
+    }
+
+    /// Independent read-only review of an already-committed result (D16,
+    /// 8.2.5). Repository mutation remains fully gated; this admits only the
+    /// `reviewer` canonical role's read-only WorkspaceLease, and only while
+    /// every currently blocking reconciliation is acceptance/evidence/risk/
+    /// reviewer/release neutral.
+    pub(crate) async fn ensure_task_reviewable(&self, task: &db::Task) -> Result<()> {
+        self.ensure_task_runnable_for_capability(task, ExecutionGateCapability::ReadOnlyReview)
+            .await
+    }
+
+    async fn ensure_task_runnable_for_capability(
+        &self,
+        task: &db::Task,
+        capability: ExecutionGateCapability,
+    ) -> Result<()> {
         let row = sqlx::query(
             "SELECT p.charter_status, p.charter_setup_required,
                     p.current_charter_revision_id,
@@ -1037,11 +1134,8 @@ impl TaskService {
                     requirements,
                 ));
             }
-            if setup.execution_gate != ExecutionGate::Active {
-                return Err(ServiceError::invalid_operation(
-                    "repository implementation Task is not runnable: an active user-approved execution baseline is required",
-                ));
-            }
+            self.ensure_capability_permits_execution(task, capability, setup.execution_gate)
+                .await?;
         }
 
         if let Some(allowed) = row.get::<Option<String>, _>("capability_classes_json") {
@@ -1082,10 +1176,67 @@ impl TaskService {
             && row.get::<i64, _>("approval_count") > 0;
         if !admitted {
             return Err(ServiceError::invalid_operation(
-                "repository Task is not runnable: an active user-approved execution baseline with matching traceability is required",
+                "repository Task cannot start because its approved implementation-plan traceability is stale or missing; review the Project's current plan before retrying",
             ));
         }
         Ok(())
+    }
+
+    /// Evaluate the Project's execution gate together with any reconciliation
+    /// scoped specifically to this Task, capability-aware (D16, 8.2.5).
+    ///
+    /// Repository mutation requires the Project gate to be `Active` and no
+    /// Task-scoped conflict outstanding. Independent read-only review may
+    /// continue past either blocker as long as every currently applicable
+    /// conflict is acceptance/evidence/risk/reviewer/release neutral — a
+    /// mere baseline-governance pointer conflict must not unnecessarily
+    /// prevent reviewing an already-committed result (F11).
+    async fn ensure_capability_permits_execution(
+        &self,
+        task: &db::Task,
+        capability: ExecutionGateCapability,
+        execution_gate: ExecutionGate,
+    ) -> Result<()> {
+        let conflicts = required_reconciliation_conflicts(&self.db, &task.project_id)
+            .await?
+            .into_iter()
+            .filter(|conflict| conflict.is_project_wide() || conflict.is_scoped_to_task(&task.id))
+            .collect::<Vec<_>>();
+
+        match capability {
+            ExecutionGateCapability::RepositoryMutation => {
+                if execution_gate != ExecutionGate::Active {
+                    return Err(ServiceError::invalid_operation(
+                        "repository implementation Task is waiting for plan approval: approve and start the Project's implementation plan once; covered Tasks do not need separate approval",
+                    ));
+                }
+                if let Some(conflict) = conflicts.first() {
+                    return Err(ServiceError::Conflict(format!(
+                        "reconciliation_required: {}",
+                        conflict.description
+                    )));
+                }
+                Ok(())
+            }
+            ExecutionGateCapability::ReadOnlyReview => {
+                if execution_gate != ExecutionGate::Active && conflicts.is_empty() {
+                    // No active approved baseline and no recorded conflict to
+                    // evaluate for neutrality: there is no governed result to
+                    // review yet.
+                    return Err(ServiceError::invalid_operation(
+                        "independent review is waiting for plan approval: approve and start the Project's implementation plan once; covered Tasks do not need separate approval",
+                    ));
+                }
+                let Some(blocking) = conflicts.iter().find(|conflict| !review_neutral(conflict))
+                else {
+                    return Ok(());
+                };
+                Err(ServiceError::Conflict(format!(
+                    "review_blocked: independent review is blocked because the recorded conflict affects acceptance, evidence, risk, reviewer, or release policy: {}",
+                    blocking.description
+                )))
+            }
+        }
     }
 
     /// Issue the scheduler's short-lived internal repository authority only
@@ -1132,8 +1283,15 @@ impl TaskService {
         let Some(repo_id) = task.repo_id.as_deref() else {
             return Ok(None);
         };
-        self.ensure_task_runnable(task).await?;
         let canonical_role = canonical_workspace_lease_role(role)?;
+        // The dedicated reviewer role is independent read-only review; every
+        // other resolved role is repository-mutating and stays fully gated
+        // (D16, 8.2.5).
+        if canonical_role == "reviewer" {
+            self.ensure_task_reviewable(task).await?;
+        } else {
+            self.ensure_task_runnable(task).await?;
+        }
         let principal_id = self
             .validate_workspace_assignment(task, role, principal_id)
             .await?;
@@ -1494,8 +1652,12 @@ impl TaskService {
         let repo_id = task.repo_id.as_deref().ok_or_else(|| {
             ServiceError::invalid_operation("WorkspaceLease requires a repository-backed Task")
         })?;
-        self.ensure_task_runnable(task).await?;
         let canonical_role = canonical_workspace_lease_role(role)?;
+        if canonical_role == "reviewer" {
+            self.ensure_task_reviewable(task).await?;
+        } else {
+            self.ensure_task_runnable(task).await?;
+        }
         let principal_id = self
             .validate_workspace_assignment(task, role, principal_id)
             .await?;
@@ -1859,6 +2021,19 @@ impl TaskService {
 /// reissue identity per (execution, task-version) pair.
 fn workspace_lease_reissue_key(execution_id: &str, task_version: i64) -> String {
     format!("{execution_id}::reissue::v{task_version}")
+}
+
+/// Whether a recorded conflict is neutral to independent read-only review
+/// (D16, 8.2.5): its affected paths never touch a fixed outcome, acceptance,
+/// risk, side-effect, release, or elevated-authority boundary. A conflict
+/// limited to governance-pointer fields (`baseline_id`, `baseline_revision_id`,
+/// `charter_revision_id`, ...) does not change what a reviewer is evaluating
+/// in an already-committed result.
+fn review_neutral(conflict: &ReconciliationConflictRow) -> bool {
+    !conflict
+        .affected_paths
+        .iter()
+        .any(|path| FIXED_BOUNDARY_FIELDS.contains(&path.as_str()))
 }
 
 fn canonical_workspace_lease_role(role: &str) -> Result<&'static str> {
@@ -2324,6 +2499,82 @@ mod tests {
         assert!(governance.provenance_json.contains("baseline_pending"));
     }
 
+    fn minimal_task(id: &str, project_id: &str) -> db::Task {
+        db::Task {
+            id: id.to_owned(),
+            project_id: project_id.to_owned(),
+            repo_id: None,
+            parent_task_id: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "Task".to_owned(),
+            description: None,
+            task_type: "task".to_owned(),
+            status: "todo".to_owned(),
+            is_automation: false,
+            priority: 1,
+            board_position: 0.0,
+            subtask_order: None,
+            task_state_config: None,
+            merge_config: None,
+            metadata_json: None,
+            plan: None,
+            error_annotation: None,
+            blocked_json: None,
+            failed_json: None,
+            entry_barrier_json: None,
+            review_passed_at: None,
+            archived_at: None,
+            deleted_at: None,
+            version: 1,
+            created_at: "2026-08-13T00:00:00Z".to_owned(),
+            updated_at: "2026-08-13T00:00:00Z".to_owned(),
+        }
+    }
+
+    /// D14/8.1.4 characterization: a malformed or unknown adaptive operation
+    /// name (for example a command name such as `task.propose` mistakenly
+    /// passed as an operation) is a typed `validation_error`, never durable
+    /// conflict/reconciliation truth. Parsing happens before any governance
+    /// lookup, so this holds even for a Task/Project that do not exist.
+    #[tokio::test]
+    async fn authorize_adaptive_task_operation_rejects_malformed_verb_as_validation_error() {
+        let pool = db::create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("pool creates");
+        db::run_migrations(&pool).await.expect("migrations");
+        let db = Arc::new(db::SqliteDb::new(pool));
+        let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(4)));
+        let task = minimal_task("task-does-not-exist", "project-does-not-exist");
+
+        let error = service
+            .authorize_adaptive_task_operation(&task, "task.propose")
+            .await
+            .expect_err("a command name is not an adaptive verb");
+        match error {
+            ServiceError::InvalidOperation { message } => {
+                assert!(message.contains("task.propose"));
+                assert!(message.contains("split"));
+                assert!(message.contains("sequence"));
+                assert!(message.contains("replace"));
+                assert!(!message.contains("reconciliation_required"));
+            }
+            other => panic!("expected InvalidOperation (validation_error), got {other:?}"),
+        }
+        let reconciliation_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM project_reconciliation_record")
+                .fetch_one(db.pool())
+                .await
+                .expect("reconciliation count");
+        let conflict_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM project_canonical_conflict")
+                .fetch_one(db.pool())
+                .await
+                .expect("conflict count");
+        assert_eq!(reconciliation_count, 0);
+        assert_eq!(conflict_count, 0);
+    }
+
     #[tokio::test]
     async fn charter_backed_repository_planning_task_is_admitted_only_as_non_runnable() {
         let pool = db::create_sqlite_pool("sqlite::memory:")
@@ -2433,5 +2684,229 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("not server-approved"));
         assert!(message.contains("repository_write"));
+    }
+
+    // -- Capability-aware review (D16/D17, 8.2.5) --
+    //
+    // Repository mutation and independent read-only review are evaluated
+    // separately against the exact same recorded conflicts. Review of an
+    // already-committed result may continue only while every currently
+    // applicable conflict is acceptance/evidence/risk/reviewer/release
+    // neutral (`review_neutral`); repository mutation stays fully gated by
+    // any outstanding conflict regardless of neutrality.
+
+    fn reconciliation_conflict_row(
+        conflict_code: &str,
+        affected_paths: &[&str],
+    ) -> ReconciliationConflictRow {
+        ReconciliationConflictRow {
+            reconciliation_id: "reconciliation-1".to_owned(),
+            conflict_code: conflict_code.to_owned(),
+            description: format!("{conflict_code} for task-1"),
+            record_type: "task".to_owned(),
+            record_id: "task-1".to_owned(),
+            governing_record_type: "execution_baseline".to_owned(),
+            governing_record_id: "baseline-1".to_owned(),
+            affected_paths: affected_paths
+                .iter()
+                .map(|path| (*path).to_owned())
+                .collect(),
+            updated_at: "2026-08-13T00:00:00Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn review_neutral_admits_plan_paths_but_blocks_every_fixed_boundary_field() {
+        assert!(review_neutral(&reconciliation_conflict_row(
+            "adaptive_task_governance_stale",
+            &["plan_items", "milestone_id"],
+        )));
+
+        for field in FIXED_BOUNDARY_FIELDS {
+            let blocking = reconciliation_conflict_row("adaptive_task_governance_stale", &[field]);
+            assert!(
+                !review_neutral(&blocking),
+                "a conflict touching '{field}' must not be review-neutral"
+            );
+        }
+    }
+
+    /// Insert one Task-scoped canonical conflict + required reconciliation
+    /// record directly (mirroring what `record_adaptive_boundary_reconciliation`
+    /// persists), so `ensure_capability_permits_execution` reads it back
+    /// through the same `required_reconciliation_conflicts` query the rest of
+    /// D16/D17 relies on.
+    async fn insert_task_scoped_conflict(
+        db: &db::SqliteDb,
+        project_id: &str,
+        task_id: &str,
+        conflict_code: &str,
+        affected_paths: &[&str],
+    ) {
+        let now = now_rfc3339();
+        let conflict_id = format!("{task_id}-conflict");
+        sqlx::query(
+            "INSERT INTO project_canonical_conflict (
+                 id, project_id, domain, governing_record_type, governing_record_id,
+                 governing_record_revision, governing_record_digest,
+                 conflicting_record_type, conflicting_record_id, conflicting_record_revision,
+                 conflicting_record_digest, affected_paths_json, conflict_code, description,
+                 detected_by_type, detected_by_id, authorization_basis, authorization_action,
+                 explicit_event, authorization_occurred_at, idempotency_key, created_at
+             ) VALUES (?, ?, 'execution', 'execution_baseline', 'baseline-1', '1',
+                       'test-baseline-content', 'task', ?, '1', 'task-digest', ?, ?, ?, 'system',
+                       'test-fixture', 'adaptive_task_boundary', 'task.adaptive.reject',
+                       'task.adaptive.split.rejected', ?, ?, ?)",
+        )
+        .bind(&conflict_id)
+        .bind(project_id)
+        .bind(task_id)
+        .bind(serde_json::to_string(affected_paths).expect("affected paths encode"))
+        .bind(conflict_code)
+        .bind(format!("{conflict_code} for {task_id}"))
+        .bind(&now)
+        .bind(format!("{task_id}-idempotency"))
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("canonical conflict inserts");
+        sqlx::query(
+            "INSERT INTO project_reconciliation_record (
+                 id, project_id, conflict_id, record_type, record_id, record_revision,
+                 record_digest, governing_record_type, governing_record_id,
+                 governing_record_revision, governing_record_digest, state,
+                 current_resolution_id, version, created_at, updated_at
+             ) VALUES (?, ?, ?, 'task', ?, '1', 'task-digest', 'execution_baseline', 'baseline-1',
+                       '1', 'test-baseline-content', 'required', NULL, 1, ?, ?)",
+        )
+        .bind(format!("{task_id}-reconciliation"))
+        .bind(project_id)
+        .bind(&conflict_id)
+        .bind(task_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("reconciliation record inserts");
+    }
+
+    async fn capability_review_fixture(
+        project_id: &str,
+        task_id: &str,
+    ) -> (Arc<db::SqliteDb>, TaskService, db::Task) {
+        let pool = db::create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("pool creates");
+        db::run_migrations(&pool).await.expect("migrations");
+        let db = Arc::new(db::SqliteDb::new(pool));
+        let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(4)));
+        let now = now_rfc3339();
+        db::ProjectRepo::create(
+            &*db,
+            db::CreateProject {
+                id: project_id.to_owned(),
+                name: "Capability review project".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("project creates");
+        let task = minimal_task(task_id, project_id);
+        (db, service, task)
+    }
+
+    #[tokio::test]
+    async fn read_only_review_continues_past_a_review_neutral_conflict_that_blocks_mutation() {
+        let (db, service, task) =
+            capability_review_fixture("capability-review-neutral", "task-1").await;
+        insert_task_scoped_conflict(
+            &db,
+            &task.project_id,
+            &task.id,
+            "adaptive_task_governance_stale",
+            &["plan_items"],
+        )
+        .await;
+
+        // Repository mutation stays blocked by the recorded conflict even
+        // though the Project gate itself reports `Active`.
+        let mutation_error = service
+            .ensure_capability_permits_execution(
+                &task,
+                ExecutionGateCapability::RepositoryMutation,
+                ExecutionGate::Active,
+            )
+            .await
+            .expect_err("repository mutation stays blocked by the recorded conflict");
+        assert!(matches!(mutation_error, ServiceError::Conflict(_)));
+
+        // Independent read-only review of the already-committed result
+        // continues: the conflict never touches an acceptance/evidence/
+        // risk/reviewer/release boundary field (D16/8.2.5, F11).
+        service
+            .ensure_capability_permits_execution(
+                &task,
+                ExecutionGateCapability::ReadOnlyReview,
+                ExecutionGate::Active,
+            )
+            .await
+            .expect("a review-neutral conflict must never block independent review");
+    }
+
+    #[tokio::test]
+    async fn read_only_review_is_blocked_when_the_conflict_affects_a_fixed_boundary_field() {
+        let (db, service, task) =
+            capability_review_fixture("capability-review-blocking", "task-1").await;
+        insert_task_scoped_conflict(
+            &db,
+            &task.project_id,
+            &task.id,
+            "adaptive_task_governance_stale",
+            &["fixed_acceptance"],
+        )
+        .await;
+
+        let review_error = service
+            .ensure_capability_permits_execution(
+                &task,
+                ExecutionGateCapability::ReadOnlyReview,
+                ExecutionGate::Active,
+            )
+            .await
+            .expect_err("a conflict touching acceptance must block independent review too");
+        match review_error {
+            ServiceError::Conflict(message) => {
+                assert!(message.contains("review_blocked"), "message: {message}")
+            }
+            other => panic!("expected a review_blocked Conflict, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_review_requires_a_governed_result_before_reviewing_anything() {
+        let (_db, service, task) =
+            capability_review_fixture("capability-review-ungoverned", "task-1").await;
+
+        // No active baseline and no recorded conflict to evaluate: there is
+        // no governed result yet for an independent reviewer to look at.
+        let error = service
+            .ensure_capability_permits_execution(
+                &task,
+                ExecutionGateCapability::ReadOnlyReview,
+                ExecutionGate::PreBaselineReadOnly,
+            )
+            .await
+            .expect_err("review has nothing governed to review yet");
+        match error {
+            ServiceError::InvalidOperation { message } => {
+                assert!(message.contains("waiting for plan approval"));
+            }
+            other => panic!("expected InvalidOperation, got {other:?}"),
+        }
     }
 }

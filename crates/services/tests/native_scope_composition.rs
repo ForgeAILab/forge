@@ -26,6 +26,7 @@ use forge_agent_host::{
     FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL, FORGE_PROJECT_ORCHESTRATION_READ_TOOL,
     MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
     MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READINESS_OPERATION, MAIN_CHARTER_READ_OPERATION,
+    MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION, MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
     MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION, MIGRATED_OPERATION_CONTRACTS,
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
     PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION,
@@ -38,6 +39,9 @@ use services::{CoordinationToolProvider, TaskService};
 const USER_ID: &str = "scope-composition-user";
 const AGENT_ID: &str = "scope-composition-agent";
 const PROFILE_ID: &str = "scope-composition-profile";
+const PROJECT_AGENT_CANDIDATE_ID: &str = "scope-composition-project-agent-candidate";
+const PROJECT_AGENT_CANDIDATE_PROFILE_ID: &str =
+    "scope-composition-project-agent-candidate-profile";
 const PROJECT_ID: &str = "scope-composition-project";
 const REPO_ID: &str = "scope-composition-repo";
 const PROJECT_CHARTER_ID: &str = "scope-composition-project-charter";
@@ -113,6 +117,47 @@ async fn fixture(with_task_service: bool) -> Fixture {
     )
     .await
     .expect("identity/profile");
+
+    AgentRepo::create_identity_with_profile(
+        &*db,
+        CreateAgentIdentity {
+            id: PROJECT_AGENT_CANDIDATE_ID.to_owned(),
+            name: "Scope composition Project Agent candidate".to_owned(),
+            description: None,
+            max_concurrent_tasks: 4,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: Some(USER_ID.to_owned()),
+            visibility: "account".to_owned(),
+            account_permission_ceiling: broad_permission_json(),
+            created_at: NOW.to_owned(),
+            updated_at: NOW.to_owned(),
+        },
+        CreateAgentProfile {
+            id: PROJECT_AGENT_CANDIDATE_PROFILE_ID.to_owned(),
+            identity_id: PROJECT_AGENT_CANDIDATE_ID.to_owned(),
+            backend_kind: "native".to_owned(),
+            executor_type: "embedded".to_owned(),
+            provider: Some("test".to_owned()),
+            model: Some("test-model".to_owned()),
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "{}".to_owned(),
+            tool_policy_json: broad_permission_json(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            created_at: NOW.to_owned(),
+            updated_at: NOW.to_owned(),
+        },
+    )
+    .await
+    .expect("Project Agent candidate identity/profile");
 
     sqlx::query(
         "UPDATE agent_chat SET id = ?, status = 'ready'
@@ -633,6 +678,10 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
 
     let read_cases = [
         (
+            MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
+            json!({"genesis_session_id": MAIN_GENESIS_ID}),
+        ),
+        (
             MAIN_CHARTER_READ_OPERATION,
             json!({"charter_id": MAIN_CHARTER_ID, "genesis_session_id": MAIN_GENESIS_ID}),
         ),
@@ -703,6 +752,20 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
             genesis_start_arguments("matrix-genesis-start"),
         ),
         (
+            MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
+            json!({
+                "operation": MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
+                "payload": {
+                    "action": "select",
+                    "genesis_session_id": MAIN_GENESIS_ID,
+                    "expected_session_version": 1,
+                    "project_agent_identity_id": PROJECT_AGENT_CANDIDATE_ID
+                },
+                "dedupe_key": "matrix-project-agent-select",
+                "correlation_id": "correlation-matrix-project-agent-select"
+            }),
+        ),
+        (
             MAIN_CHARTER_DRAFT_OPERATION,
             main_draft_arguments("matrix-main-draft"),
         ),
@@ -725,6 +788,13 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
         .await
         .unwrap_or_else(|error| panic!("{operation} failed at composition boundary: {error:?}"));
         assert_outcome_operation(&outcome, operation);
+        if operation == MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION {
+            assert!(
+                !outcome.is_error,
+                "successful Main Project-Agent selection outcome: {}",
+                outcome.value
+            );
+        }
         covered_operations.insert(operation.to_owned());
     }
 

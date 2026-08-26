@@ -22,6 +22,7 @@ import {
 } from '@/features/agent-chat/hooks'
 import type { AgentChatEntry } from '@/features/agent-chat/types'
 import { BaselineApprovalCard } from '@/features/agent-chat/BaselineApprovalCard'
+import { MainChatTopicControl } from '@/features/agent-chat/MainChatTopicControl'
 import { ProjectCharterApprovalCard } from '@/features/project-charter/ProjectCharterApprovalCard'
 import { ProjectExecutionSetupPanel } from '@/features/project-execution/ProjectExecutionSetupPanel'
 import { useChatSelection } from '@/stores/chat'
@@ -195,6 +196,13 @@ export function ChatPage({ projectId }: { projectId?: string }) {
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2">
+          {!projectId && activeState === 'ready' && chatQuery.data ? (
+            <MainChatTopicControl
+              chatId={chatQuery.data.id}
+              disabled={hasActiveGenesis}
+              disabledReason="Finish or cancel the active Product Genesis session before starting a new topic."
+            />
+          ) : null}
           {!projectId ? <ProductGenesisControls /> : null}
           {projectId ? (
             <Link

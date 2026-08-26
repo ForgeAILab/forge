@@ -85,7 +85,7 @@ function buildApproveRequest(
 
 function OAuthCard({ children }: { children: ReactNode }) {
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background p-4">
+    <main className="flex min-h-dvh items-center justify-center bg-background p-4">
       <Card className="w-full max-w-sm">
         <CardHeader className="items-center text-center">
           <div className="flex items-center gap-2">
@@ -99,7 +99,7 @@ function OAuthCard({ children }: { children: ReactNode }) {
         </CardHeader>
         {children}
       </Card>
-    </div>
+    </main>
   )
 }
 
@@ -122,9 +122,7 @@ function ErrorCard({ message }: { message: string }) {
   return (
     <OAuthCard>
       <CardContent>
-        <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          {message}
-        </p>
+        <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">{message}</p>
       </CardContent>
     </OAuthCard>
   )

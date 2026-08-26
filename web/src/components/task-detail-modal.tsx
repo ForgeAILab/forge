@@ -28,6 +28,7 @@ import { TaskPrSummaryCard } from '@/components/task-detail/task-pr-summary-card
 import { TaskSubtasksPanel } from '@/components/task-detail/task-subtasks-panel'
 import { TaskDependenciesPanel } from '@/components/task-detail/task-dependencies-panel'
 import { TaskBlockingBanner } from '@/components/task-detail/task-blocking-banner'
+import { TaskExecutionApprovalNotice } from '@/features/project-execution/TaskExecutionApprovalNotice'
 import { WorkflowExceptionPanel } from '@/components/task-detail/workflow-exception-panel'
 import { TaskHistoryPanel } from '@/components/task-detail/task-history-panel'
 import { Button } from '@/components/ui/button'
@@ -360,6 +361,12 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
               />
             ) : task ? (
               <div className="space-y-6">
+                <TaskExecutionApprovalNotice
+                  projectId={task.project_id}
+                  blocker={task.execution_blocker}
+                  evidence={task.execution_evidence}
+                />
+
                 {errorInfo && !task.workflow_exception ? (
                   errorInfo.tone === 'workspace' ? (
                     <ModalWorkspaceErrorBanner
@@ -414,11 +421,7 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
                         }}
                       />
                       <div className="flex items-center gap-2">
-                        <Button
-                          size="sm"
-                          disabled={updateTask.isPending}
-                          onClick={saveDescription}
-                        >
+                        <Button size="sm" disabled={updateTask.isPending} onClick={saveDescription}>
                           Save
                         </Button>
                         <Button
@@ -553,9 +556,7 @@ function ModalReviewSummary({
   onOpenFullPage: () => void
 }) {
   if (!latestReview) {
-    return (
-      <p className="text-sm text-muted-foreground">No reviews yet.</p>
-    )
+    return <p className="text-sm text-muted-foreground">No reviews yet.</p>
   }
 
   const failedStep =
@@ -566,9 +567,7 @@ function ModalReviewSummary({
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-2">
-        <span className="text-sm font-medium">
-          Review — attempt {latestReview.attempt_number}
-        </span>
+        <span className="text-sm font-medium">Review — attempt {latestReview.attempt_number}</span>
         <span
           className={cn(
             'inline-flex items-center rounded-full px-2 py-0.5 text-micro font-medium',
@@ -593,7 +592,7 @@ function ModalReviewSummary({
           {failedStep.exit_code != null ? (
             <p className="mt-1 text-muted-foreground">exit code {failedStep.exit_code}</p>
           ) : null}
-          {(failedStep.output_tail || failedStep.stderr_tail) ? (
+          {failedStep.output_tail || failedStep.stderr_tail ? (
             <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap font-mono text-[11px] text-muted-foreground">
               {failedStep.stderr_tail || failedStep.output_tail}
             </pre>
@@ -667,8 +666,7 @@ function ModalWorkspaceErrorBanner({
                         toast.success('Workspace reset successfully')
                         setConfirming(false)
                       },
-                      onError: (error) =>
-                        toast.error(getApiErrorMessage(error, 'Reset failed')),
+                      onError: (error) => toast.error(getApiErrorMessage(error, 'Reset failed')),
                     })
                   }}
                 >

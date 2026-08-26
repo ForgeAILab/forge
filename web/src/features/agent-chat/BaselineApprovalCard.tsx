@@ -1,12 +1,15 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ClipboardText } from '@phosphor-icons/react'
 
 import { ApiError, apiFetch } from '@/api/client'
 import { useProjectQuery } from '@/api/hooks'
+import { qk } from '@/api/query-keys'
+import { useProjectExecutionSetupQuery } from '@/features/project-execution/hooks'
 import { useAuthStore } from '@/stores/auth'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/cn'
+import { BaselineReviewSections } from '@/features/agent-chat/BaselineReviewSections'
 import {
   Dialog,
   DialogContent,
@@ -44,6 +47,30 @@ type BaselineResponseWire = {
   current_revision: RevisionWire | null
   proposed_revision: RevisionWire | null
   approval: ApprovalWire | null
+  integrity_issue?: {
+    revision_id: string
+    baseline_id: string
+    field_path: string
+    invalid_values: string[]
+    diagnostic: string
+    successor_revision_id: string | null
+    conflict_id: string | null
+    reconciliation_id: string | null
+  } | null
+}
+
+// The atomic approve-and-activate response is receipt-first (D18/8.3.2): the
+// identity fields are always populated once the command committed, and
+// `projection` is a best-effort full baseline read that can be absent
+// (`refresh_required: true`) without the command itself having failed.
+type ApproveAndActivateResponseWire = {
+  baseline_id: string
+  revision_id: string
+  approval_id: string
+  content_digest: string
+  render_digest: string
+  projection: BaselineResponseWire | null
+  refresh_required: boolean
 }
 
 const baselineQueryKey = (projectId: string) =>
@@ -79,6 +106,20 @@ async function fetchBaseline(projectId: string): Promise<BaselineResponseWire | 
   }
 }
 
+/** Is the exact revision this click targeted already the Project's active
+ * baseline? D18/8.3.2: before showing a conflict, check this first -- a
+ * lost response, a double submit, or a race this exact command itself won
+ * must all render success, never the stale-baseline failure F13 reported.
+ * The server's own route performs the same check for the atomic command;
+ * this is the client-side half of that contract, and it also covers the
+ * separate "Start approved work" activation call. */
+function isExactRevisionActive(baseline: BaselineResponseWire | null, revisionId: string) {
+  return (
+    baseline?.baseline.lifecycle === 'active' &&
+    baseline.baseline.current_revision_id === revisionId
+  )
+}
+
 function approvalErrorMessage(cause: unknown): string {
   if (cause instanceof ApiError) {
     if (cause.status === 409 || cause.status === 412) {
@@ -97,6 +138,12 @@ function approvalErrorMessage(cause: unknown): string {
  * single gate that starts autonomous work — so the request surfaces here, in
  * the chat, with a review dialog and a one-click approve-and-activate that
  * writes the durable approval receipt through the normal REST contract.
+ *
+ * "Approve plan & start work" is one atomic, replay-exact server command
+ * (D18/F13): approval, activation, governance promotion, receipt, and events
+ * commit together, so a lost response can only ever replay the committed
+ * success. "Start approved work" (an already-approved revision) stays the
+ * separate exact replay-safe activation call.
  */
 export function BaselineApprovalCard({
   projectId,
@@ -110,6 +157,7 @@ export function BaselineApprovalCard({
   const [actionError, setActionError] = useState<string | null>(null)
 
   const projectQuery = useProjectQuery(projectId)
+  const setupQuery = useProjectExecutionSetupQuery(projectId)
   const baselineQuery = useQuery({
     queryKey: baselineQueryKey(projectId),
     queryFn: () => fetchBaseline(projectId),
@@ -120,13 +168,51 @@ export function BaselineApprovalCard({
   const revision = data?.proposed_revision ?? data?.current_revision ?? null
   const approval =
     data?.approval && revision && data.approval.revision_id === revision.id ? data.approval : null
-  const step: 'approve' | 'activate' | null = !revision
+  const correctionRequired = Boolean(data?.integrity_issue)
+  const step: 'approve' | 'approve_correction' | 'activate' | null = !revision
     ? null
     : revision.lifecycle === 'proposed'
-      ? 'approve'
+      ? correctionRequired
+        ? 'approve_correction'
+        : 'approve'
       : revision.lifecycle === 'approved' && approval
-        ? 'activate'
+        ? correctionRequired
+          ? null
+          : 'activate'
         : null
+
+  // A newer draft can appear beside an already-active baseline (the Project
+  // Agent starts drafting the next revision as soon as this one activates).
+  // That draft is valid immutable history, not evidence anything failed --
+  // it must never be silently swallowed into a blank card, and never read as
+  // a failed approval (D18/8.3.2, F13).
+  const unapprovedFutureDraft =
+    !step &&
+    data?.current_revision?.lifecycle === 'active' &&
+    data.proposed_revision &&
+    data.proposed_revision.lifecycle === 'draft' &&
+    data.proposed_revision.id !== data.current_revision.id
+      ? data.proposed_revision
+      : null
+  const correctionDraft =
+    correctionRequired && data?.proposed_revision?.lifecycle === 'draft'
+      ? data.proposed_revision
+      : null
+  const approvedCorrection =
+    correctionRequired && revision?.lifecycle === 'approved' && approval ? revision : null
+
+  // One stable idempotency key per (step, revision): reused across retries
+  // of the exact same click so a lost response replays the committed
+  // outcome instead of minting a second, unrelated command (D18/8.3.1). A
+  // different revision or a different step is a genuinely different user
+  // gesture and gets its own key.
+  const idempotencyKeyRef = useRef<{ scope: string; key: string } | null>(null)
+  const stableIdempotencyKey = (scope: string): string => {
+    if (idempotencyKeyRef.current?.scope !== scope) {
+      idempotencyKeyRef.current = { scope, key: newIdempotencyKey() }
+    }
+    return idempotencyKeyRef.current.key
+  }
 
   const mutation = useMutation({
     mutationFn: async () => {
@@ -134,71 +220,117 @@ export function BaselineApprovalCard({
       const project = projectQuery.data
       if (!project) throw new Error('Project details are still loading. Try again.')
 
-      let baselineVersion = data.baseline.version
-      let activationApproval: ApprovalWire | null = approval
-      let projectVersion = project.version
-
-      if (step === 'approve') {
-        const approved = await apiFetch<BaselineResponseWire>(
+      if (step === 'approve_correction') {
+        const scope = `approve-correction:${revision.id}`
+        await apiFetch<BaselineResponseWire>(
           `/projects/${projectId}/execution-baseline/${data.baseline.id}/revisions/${revision.id}/approve`,
           {
             method: 'POST',
             body: JSON.stringify({
               mutation: {
-                expected_version: baselineVersion,
-                expected_digest: revision.content_digest,
-                idempotency_key: newIdempotencyKey(),
+                expected_version: data.baseline.version,
+                expected_digest: null,
+                idempotency_key: stableIdempotencyKey(scope),
                 deduplication_key: null,
                 authorization: createAuthorization('project.execution_baseline.approve'),
               },
               revision_id: revision.id,
               content_digest: revision.content_digest,
               render_digest: revision.render_digest,
-              expected_project_version: projectVersion,
+              expected_project_version: project.version,
             }),
           },
         )
-        baselineVersion = approved.baseline.version
-        activationApproval =
-          approved.approval && approved.approval.revision_id === revision.id
-            ? approved.approval
-            : null
+        return { refreshRequired: false }
       }
 
-      if (!activationApproval) {
-        throw new Error('The approval receipt was not returned; refresh and try again.')
-      }
-      // The receipt pins the Project version observed at approval time; the
-      // activation CAS must use the same value.
-      projectVersion = activationApproval.expected_project_version
-
-      return apiFetch<BaselineResponseWire>(
-        `/projects/${projectId}/execution-baseline/${data.baseline.id}/activate`,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            mutation: {
-              expected_version: projectVersion,
-              expected_digest: null,
-              idempotency_key: newIdempotencyKey(),
-              deduplication_key: null,
-              authorization: createAuthorization('project.execution_baseline.activate'),
+      if (step === 'approve') {
+        const scope = `approve-and-activate:${revision.id}`
+        try {
+          const result = await apiFetch<ApproveAndActivateResponseWire>(
+            `/projects/${projectId}/execution-baseline/${data.baseline.id}/revisions/${revision.id}/approve-and-activate`,
+            {
+              method: 'POST',
+              body: JSON.stringify({
+                mutation: {
+                  expected_version: project.version,
+                  expected_digest: null,
+                  idempotency_key: stableIdempotencyKey(scope),
+                  deduplication_key: null,
+                  authorization: createAuthorization(
+                    'project.execution_baseline.approve_and_activate',
+                  ),
+                },
+                revision_id: revision.id,
+                content_digest: revision.content_digest,
+                render_digest: revision.render_digest,
+                expected_baseline_version: data.baseline.version,
+              }),
             },
-            baseline_id: data.baseline.id,
-            revision_id: revision.id,
-            approval_id: activationApproval.id,
-            expected_baseline_version: baselineVersion,
-            content_digest: revision.content_digest,
-            render_digest: revision.render_digest,
-          }),
-        },
-      )
+          )
+          // "The requested active revision must render success even when a
+          // follow-up refresh is needed" (8.3.2): a committed outcome with
+          // no projection is still success, never an error.
+          return { refreshRequired: result.refresh_required }
+        } catch (cause) {
+          if (cause instanceof ApiError && (cause.status === 409 || cause.status === 412)) {
+            const refreshed = await fetchBaseline(projectId)
+            if (isExactRevisionActive(refreshed, revision.id)) {
+              return { refreshRequired: false }
+            }
+          }
+          throw cause
+        }
+      }
+
+      // step === 'activate': the already-approved "Start approved work"
+      // gesture keeps using the separate exact replay-safe activation call.
+      if (!approval)
+        throw new Error('The approval receipt was not returned; refresh and try again.')
+      const scope = `activate:${revision.id}`
+      try {
+        await apiFetch<BaselineResponseWire>(
+          `/projects/${projectId}/execution-baseline/${data.baseline.id}/activate`,
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              mutation: {
+                expected_version: approval.expected_project_version,
+                expected_digest: null,
+                idempotency_key: stableIdempotencyKey(scope),
+                deduplication_key: null,
+                authorization: createAuthorization('project.execution_baseline.activate'),
+              },
+              baseline_id: data.baseline.id,
+              revision_id: revision.id,
+              approval_id: approval.id,
+              expected_baseline_version: data.baseline.version,
+              content_digest: revision.content_digest,
+              render_digest: revision.render_digest,
+            }),
+          },
+        )
+        return { refreshRequired: false }
+      } catch (cause) {
+        if (cause instanceof ApiError && (cause.status === 409 || cause.status === 412)) {
+          const refreshed = await fetchBaseline(projectId)
+          if (isExactRevisionActive(refreshed, revision.id)) {
+            return { refreshRequired: false }
+          }
+        }
+        throw cause
+      }
     },
-    onSuccess: () => {
+    onSuccess: (result) => {
       setReviewOpen(false)
       setActionError(null)
-      void queryClient.invalidateQueries({ queryKey: baselineQueryKey(projectId) })
+      if (result.refreshRequired) {
+        void queryClient.refetchQueries({ queryKey: baselineQueryKey(projectId) })
+      } else {
+        void queryClient.invalidateQueries({ queryKey: baselineQueryKey(projectId) })
+      }
       void queryClient.invalidateQueries({ queryKey: ['projects', projectId] })
+      void queryClient.invalidateQueries({ queryKey: qk.projectReconciliations(projectId) })
       void queryClient.invalidateQueries({ queryKey: ['agent-chats'] })
     },
     onError: (cause) => {
@@ -208,14 +340,93 @@ export function BaselineApprovalCard({
     },
   })
 
-  if (!data || !revision || !step) return null
+  // A revision can sit `approved` with a live approval receipt even while
+  // the Project's execution gate is actually blocked by an outstanding
+  // reconciliation (for example an invalid active baseline). Never show
+  // this card's "approve/activate" copy in that state — it would read
+  // exactly like the F12(b) bug this design forbids, offering a baseline
+  // approval action for a blocker a baseline approval cannot resolve. The
+  // canonical reconciliation review card is the one authorized recovery
+  // path there (D16/D17).
+  const reconciliationRequired = setupQuery.data?.execution_gate === 'reconciliation_required'
 
-  const stepLabel = step === 'approve' ? 'Approve & activate' : 'Activate'
+  if (!data || (reconciliationRequired && !correctionRequired)) return null
+
+  if (!revision || !step) {
+    if (correctionDraft) {
+      return (
+        <section
+          className={cn(
+            'mx-4 mt-3 min-w-0 scroll-mt-3 rounded-lg border border-ember-border bg-ember-surface px-3 py-3 sm:mx-6 sm:px-4',
+            className,
+          )}
+          aria-label="Execution baseline correction draft"
+        >
+          <p className="font-mono text-micro font-semibold uppercase tracking-[0.1em] text-primary">
+            Active plan repair · draft only
+          </p>
+          <p className="mt-1 text-sm font-medium text-foreground">
+            Forge preserved the invalid active revision and prepared a typed correction draft.
+          </p>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">
+            Unsupported values ({data.integrity_issue?.invalid_values.join(', ')}) were quarantined,
+            not reinterpreted. Review and propose revision {correctionDraft.revision_number} before
+            asking the user to approve it.
+          </p>
+        </section>
+      )
+    }
+    if (approvedCorrection) {
+      return (
+        <section
+          className={cn(
+            'mx-4 mt-3 min-w-0 scroll-mt-3 rounded-lg border border-ember-border bg-ember-surface px-3 py-3 sm:mx-6 sm:px-4',
+            className,
+          )}
+          aria-label="Approved execution baseline correction"
+        >
+          <p className="font-mono text-micro font-semibold uppercase tracking-[0.1em] text-primary">
+            Correction approved · not active
+          </p>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">
+            Revision {approvedCorrection.revision_number} is approved. Complete the reconciliation
+            review below to atomically replace the invalid active revision and resume work.
+          </p>
+        </section>
+      )
+    }
+    if (!unapprovedFutureDraft) return null
+    return (
+      <section
+        className={cn(
+          'mx-4 mt-3 min-w-0 scroll-mt-3 rounded-lg border border-border-subtle bg-muted/20 px-3 py-2 sm:mx-6',
+          className,
+        )}
+        aria-label="Unapproved future baseline draft"
+      >
+        <p className="font-mono text-micro leading-5 text-muted-foreground">
+          <span className="rounded-full border border-border bg-muted/30 px-2 py-0.5 uppercase tracking-[0.08em]">
+            Draft — not active
+          </span>{' '}
+          A newer plan revision is being drafted. This is unapproved future work, not a sign that
+          anything failed — the active plan above is still running.
+        </p>
+      </section>
+    )
+  }
+
+  const stepLabel =
+    step === 'approve'
+      ? 'Approve plan & start work'
+      : step === 'approve_correction'
+        ? 'Approve corrected plan'
+        : 'Start approved work'
 
   return (
     <section
+      id="execution-approval"
       className={cn(
-        'mx-4 mt-3 min-w-0 rounded-lg border border-ember-border bg-card p-3 shadow-xs sm:mx-6 sm:p-4',
+        'mx-4 mt-3 min-w-0 scroll-mt-3 rounded-lg border border-ember-border bg-card p-3 shadow-xs sm:mx-6 sm:p-4',
         className,
       )}
       aria-labelledby="baseline-approval-heading"
@@ -223,9 +434,19 @@ export function BaselineApprovalCard({
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-2">
           <ClipboardText size={16} className="text-primary" aria-hidden />
-          <h2 id="baseline-approval-heading" className="text-sm font-semibold text-foreground">
-            Execution baseline awaiting your approval
-          </h2>
+          <div className="min-w-0">
+            <p className="font-mono text-micro font-semibold uppercase tracking-[0.1em] text-primary">
+              {step === 'approve_correction' ? 'Plan repair · user approval' : 'Step 2 of 2 · Start building'}
+            </p>
+            <h2
+              id="baseline-approval-heading"
+              className="mt-1 text-sm font-semibold text-foreground"
+            >
+              {step === 'approve_correction'
+                ? 'Approve the corrected implementation plan'
+                : 'Approve the implementation plan'}
+            </h2>
+          </div>
           <span className="rounded-full border border-border bg-muted/30 px-2 py-0.5 font-mono text-micro uppercase tracking-[0.08em] text-muted-foreground">
             Revision {revision.revision_number} · {revision.lifecycle}
           </span>
@@ -247,8 +468,9 @@ export function BaselineApprovalCard({
         </div>
       </div>
       <p className="mt-1.5 max-w-2xl text-xs leading-5 text-muted-foreground">
-        Approving this exact revision is the moment autonomous execution starts. Nothing runs until
-        you approve and activate it.
+        {step === 'approve_correction'
+          ? 'This approval records the exact corrected successor but does not activate it. The reconciliation review remains the explicit step that replaces the preserved invalid revision.'
+          : 'Your Project is already approved. This one action authorizes every Task covered by this exact plan to change the repository; Forge will not ask you to approve each Task.'}
       </p>
       {actionError ? (
         <p className="mt-2 text-xs leading-5 text-destructive" role="alert">
@@ -262,13 +484,17 @@ export function BaselineApprovalCard({
             <DialogTitle>Execution baseline · revision {revision.revision_number}</DialogTitle>
           </DialogHeader>
           <div className="max-h-[60vh] overflow-auto rounded-md border border-border-subtle bg-muted/20 p-3">
-            <pre className="whitespace-pre-wrap font-mono text-xs leading-5 text-foreground">
-              {revision.rendered_view}
-            </pre>
+            <BaselineReviewSections
+              content={revision.content}
+              previousContent={
+                data.current_revision && data.current_revision.id !== revision.id
+                  ? data.current_revision.content
+                  : null
+              }
+              renderedView={revision.rendered_view}
+              contentDigest={revision.content_digest}
+            />
           </div>
-          <p className="mt-2 font-mono text-micro uppercase tracking-[0.08em] text-muted-foreground">
-            content digest {revision.content_digest.slice(0, 16)}…
-          </p>
           {actionError ? (
             <p className="mt-2 text-xs leading-5 text-destructive" role="alert">
               {actionError}

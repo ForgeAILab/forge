@@ -64,6 +64,7 @@ use std::str::FromStr;
 mod action;
 mod agent;
 mod agent_chat;
+mod agent_chat_topic;
 mod agent_wake;
 mod analytics;
 mod attention;

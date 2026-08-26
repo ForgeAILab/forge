@@ -187,6 +187,26 @@ pub async fn approve_genesis_charter_revision(
         ApiError::conflict_with_code("charter_approval_conflict", error.to_string())
     })?;
 
+    let selected = services::resolve_genesis_project_agent(&state.db, &session)
+        .await?
+        .ok_or_else(|| {
+            ApiError::conflict_with_code(
+                "project_agent_selection_conflict",
+                "the Genesis session has no eligible selected Project Agent",
+            )
+        })?;
+    if request.selected_project_agent_identity_id != selected.identity_id
+        || request.selected_project_agent_profile_revision_id != selected.profile_revision_id
+        || request.selected_project_agent_operating_skill_revision
+            != selected.operating_skill_revision
+        || request.selected_project_agent_policy_digest != selected.policy_digest
+    {
+        return Err(ApiError::conflict_with_code(
+            "project_agent_selection_conflict",
+            "the approval target does not match the current Genesis Project Agent selection; refresh the Charter and retry",
+        ));
+    }
+
     let profile = AgentProfileRepo::get_profile(
         &*state.db,
         &request.selected_project_agent_profile_revision_id,

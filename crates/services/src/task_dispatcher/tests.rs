@@ -1444,3 +1444,247 @@ async fn dispatcher_skips_reviewer_until_configured_ci_has_finished() {
         1
     );
 }
+
+/// Attach an approved Charter so the Project becomes `charter_backed` and
+/// `ensure_task_runnable` applies the governance gate instead of the legacy
+/// pre-Charter passthrough. With no execution baseline, an implementation
+/// Task is then deterministically refused for as long as nothing changes.
+async fn make_project_charter_backed(db: &db::SqliteDb, project_id: &str) {
+    let now = now_rfc3339();
+    let owner_id = new_uuid_v4();
+    let charter_id = format!("{project_id}-charter");
+    let revision_id = format!("{charter_id}-revision-1");
+    sqlx::query(
+        "INSERT OR IGNORE INTO user (id, email, password_hash, display_name, created_at, updated_at)
+         VALUES (?, ?, 'test', NULL, ?, ?)",
+    )
+    .bind(&owner_id)
+    .bind(format!("{owner_id}@example.test"))
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("owning account exists");
+    // The Charter's account must own the Project (V076 owner guard).
+    sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
+        .bind(&owner_id)
+        .bind(project_id)
+        .execute(db.pool())
+        .await
+        .expect("project ownership attaches");
+    sqlx::query(
+        "INSERT INTO project_charter (
+             id, account_id, project_id, project_mode, maturity, lifecycle,
+             version, created_at, updated_at
+         ) VALUES (?, ?, ?, 'compact', 'prototype', 'attached', 1, ?, ?)",
+    )
+    .bind(&charter_id)
+    .bind(&owner_id)
+    .bind(project_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("charter creates");
+    sqlx::query(
+        "INSERT INTO project_charter_revision (
+             id, charter_id, revision, base_revision, lifecycle, schema_version,
+             render_version, content_json, rendered_view, change_summary,
+             author_type, author_id, source_refs_json, content_digest,
+             rendered_digest, created_at
+         ) VALUES (?, ?, 1, 0, 'approved', 'forge.project-charter/v1',
+                   'forge.project-charter-render/v1', '{}', '# Project',
+                   'dispatch quiescence fixture', 'user', ?, '[]',
+                   'dispatch-charter-content-digest', 'dispatch-charter-render-digest', ?)",
+    )
+    .bind(&revision_id)
+    .bind(&charter_id)
+    .bind(&owner_id)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("charter revision creates");
+    sqlx::query(
+        "UPDATE project_charter
+         SET current_approved_revision_id = ?, current_draft_revision_id = ?, version = 2
+         WHERE id = ?",
+    )
+    .bind(&revision_id)
+    .bind(&revision_id)
+    .bind(&charter_id)
+    .execute(db.pool())
+    .await
+    .expect("charter approval attaches");
+    sqlx::query(
+        "UPDATE project
+         SET current_charter_id = ?, current_charter_revision_id = ?,
+             current_charter_version = 1, charter_status = 'charter_backed',
+             charter_setup_required = 0, version = version + 1, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&charter_id)
+    .bind(&revision_id)
+    .bind(&now)
+    .bind(project_id)
+    .execute(db.pool())
+    .await
+    .expect("approved Charter attaches to Project");
+}
+
+#[tokio::test]
+async fn dispatcher_stays_quiescent_for_unchanged_deterministic_governance_denial() {
+    // F11: a governance denial is deterministic — re-running the identical
+    // admission against the identical Task version cannot succeed. The old
+    // dispatcher re-attempted and re-logged it on every ten-second scan
+    // forever. One disposition must be recorded on the first observation and
+    // every later scan must skip the Task without touching it again.
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    make_project_charter_backed(&db, &project_id).await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let task = seed_task(&db, &project_id, &repo_id, "blocked", "todo", 0).await;
+    assign_role(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        &agent_id,
+    )
+    .await;
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    for scan in 0..3 {
+        let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+        assert_eq!(
+            dispatched, 0,
+            "blocked task must not dispatch on scan {scan}"
+        );
+    }
+
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert_eq!(current.status, "todo");
+    assert_eq!(
+        current.version, task.version,
+        "a quiesced blocker must not churn the Task version"
+    );
+    let disposition = deferred_dispatch::dispatch_disposition_for_test(&current)
+        .expect("the first observation records exactly one disposition");
+    assert_eq!(disposition.task_version, task.version);
+    assert_eq!(
+        disposition.capability,
+        crate::workflow::default_roles::CODER
+    );
+    assert!(disposition.blocker_digest.starts_with("sha256:"));
+    assert!(
+        !disposition.safe_message.trim().is_empty(),
+        "the disposition must carry the observed refusal for the blocker projection"
+    );
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(
+            &*db,
+            &task.id,
+            crate::workflow::default_roles::CODER
+        )
+        .await
+        .expect("execution count loads"),
+        0
+    );
+    assert!(tokio::time::timeout(Duration::from_millis(100), rx.recv())
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn wake_task_dispatch_unblocks_exactly_once_and_survives_restart() {
+    // F11's other half: resolving the blocker must wake exactly the affected
+    // Task exactly once. Governance state lives outside the `task` row, so
+    // nothing bumps `version` — without an explicit wake the disposition
+    // would keep the Task quiesced forever. A restart (a fresh dispatcher
+    // over the same database) must neither duplicate the dispatch nor lose
+    // the wake.
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    make_project_charter_backed(&db, &project_id).await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let task = seed_task(&db, &project_id, &repo_id, "blocked", "todo", 0).await;
+    assign_role(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        &agent_id,
+    )
+    .await;
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 0);
+    let blocked = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert!(deferred_dispatch::dispatch_disposition_for_test(&blocked).is_some());
+
+    // Resolve the governing blocker the way a reconciliation resolution or a
+    // baseline activation does: change authority on another table, then wake
+    // exactly this Task.
+    sqlx::query(
+        "UPDATE project
+         SET current_charter_id = NULL, current_charter_revision_id = NULL,
+             charter_status = 'legacy_unverified', charter_setup_required = 1
+         WHERE id = ?",
+    )
+    .bind(&project_id)
+    .execute(db.pool())
+    .await
+    .expect("governing state changes");
+    deferred_dispatch::wake_task_dispatch(&db, &task.id, "test: blocker resolved")
+        .await
+        .expect("wake succeeds");
+
+    let woken = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert!(
+        deferred_dispatch::dispatch_disposition_for_test(&woken).is_none(),
+        "the wake must clear the disposition"
+    );
+
+    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+    assert_eq!(dispatched, 1, "the woken Task dispatches exactly once");
+    assert!(tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("executor receives the woken dispatch")
+        .is_some());
+
+    // Restart: a fresh dispatcher over the same database must not re-dispatch
+    // the Task the previous instance already moved on.
+    let (restarted, mut restarted_rx) =
+        build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+    assert_eq!(
+        restarted.check_once().await.expect("dispatcher runs"),
+        0,
+        "restart must not duplicate the dispatch"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), restarted_rx.recv())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(
+            &*db,
+            &task.id,
+            crate::workflow::default_roles::CODER
+        )
+        .await
+        .expect("execution count loads"),
+        1,
+        "exactly one execution exists after wake + restart"
+    );
+}

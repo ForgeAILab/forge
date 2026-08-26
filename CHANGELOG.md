@@ -21,7 +21,260 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Project/Project-chat scoped, requires `propose_task`, uses direct command
   receipts without an `AgentAction`, and returns receipt-first replay metadata.
 
+- "Approve plan & start work" is now one atomic, replay-exact command that
+  binds the exact Project, baseline, revision, content digest, and render
+  version behind a single stable idempotency key, committing approval,
+  activation, governance promotion, receipt, and events together. Route
+  responses are reconstructed from the frozen receipt before mutable current
+  state, so a lost response, a post-commit projection failure, a double
+  submit, or a Project-version race can no longer report failure for a command
+  that committed. Previously any 409 or 412 was rendered as "the baseline
+  changed" — the live run showed that error while the baseline path had
+  already created and dispatched the Task. A newer draft revision is now
+  labelled as unapproved future work rather than presented as evidence the
+  command failed.
+
+- Committed durable events for Project creation, Main control transfer,
+  messages and turns, baseline and reconciliation, Task and review, readiness,
+  release, and Project deletion are now audited to publish after their
+  transaction commits and to invalidate the exact query keys they affect. On
+  stream open, reconnect, or resync the client invalidates active
+  authoritative queries once, and a live optimistic turn is reconciled by a
+  bounded watchdog that stops at the terminal or control-transfer state rather
+  than polling indefinitely.
+
+- Project creation now selects the committed Project and navigates to its
+  returned Project Agent handoff. Project deletion clears every deleted-scope
+  query, local chat/layout/modal state, and any persisted selection, then
+  navigates to another authorized Project or Main Chat; an externally deleted
+  Project and an authorized 404 converge the same way. The root route no
+  longer fabricates a `/projects/default/board` destination for a `default`
+  Project that does not exist.
+
+- Every surface now reads one server-owned `ExecutionBlockerProjection`
+  (`ProjectExecutionSetupResponse.execution_blocker`,
+  `TaskResponse.execution_blocker`) — code, stage, scope, affected and
+  governing record refs, execution evidence, required principal, and exactly
+  one permitted next action — instead of each deriving its own copy from
+  `coordination_state`/`execution_setup_state`/`execution_gate`. The same
+  record could previously appear simultaneously as "Waiting for plan
+  reconciliation", "waiting for plan approval", and "TASK NOT STARTED" while
+  the Task already had two executions and a commit. Progress language now
+  derives from canonical attempt/execution/commit evidence and can never
+  regress to "not started" once an attempt or commit exists, and a
+  reconciliation is never rendered as baseline-approval copy. A
+  reconciliation-blocked gate routes to the Project Overview reconciliation
+  review card instead of a dead "keep planning" link, and a blocked Task no
+  longer offers a phase control that would just re-enter the same gate.
+
+- Independent read-only review is now evaluated separately from repository
+  mutation. Review of an already-committed result continues when the blocking
+  conflict is acceptance-, evidence-, risk-, reviewer-, and release-neutral,
+  and shows the exact review blocker otherwise; review remediation that writes
+  the repository remains Worker-only and fully gated. Previously any unresolved
+  conflict stopped review entirely, so a committed result could not be
+  independently reviewed even when the conflict had nothing to do with
+  acceptance.
+
+- A Decision candidate can no longer be persisted in a shape no one can act
+  on. A user-choice candidate now requires a non-empty question, at least two
+  distinct non-empty options, and a rationale, and a recommendation must name
+  one of those options. An in-envelope, already-authorized, reversible
+  implementation choice is recorded as an effective Decision rather than left
+  as a pending approval candidate. Previously a candidate could be written with
+  an empty option list beside a populated selected outcome, leaving the user an
+  opaque identifier and no approve or reject action. Historical malformed
+  candidates are preserved and marked non-approvable rather than rewritten.
+
+- Tool calls executed through the native runtime and the smith adapter now
+  carry a bounded `ToolResultSummary` — status, stable code, safe message,
+  retryability and permitted recovery action, and correlation ID — across the
+  runtime event boundary. The durable JSONL log's `tool_result` entries gain a
+  matching `summary` field, and the UI tool card reads it. Previously only
+  `is_error`/`success` reached the durable log, discarding a structured Forge
+  command outcome's code, safe message, correlation ID, and recovery action, so
+  a failed tool call left the user and the model with no actionable diagnostic.
+  Raw arguments, raw payloads, credentials, and unredacted internal causes
+  remain absent from every one of these surfaces.
+
+- Main Chat gained a user-owned topic boundary via
+  `GET`/`POST /api/v1/agent-chats/{chat_id}/topics` (migration `V103`). Starting
+  a topic rotates the episodic context a new turn receives and appends a
+  visible timeline divider, while keeping every historical message and turn
+  ID, its provenance, canonical portfolio state, and unresolved obligations.
+  Forge still has exactly one account Main Chat — a topic is a context epoch
+  inside it, never a second chat, binding, identity, or authority scope. A
+  reset is denied while a Main turn is live or while a Genesis session or
+  approval still needs an explicit finish-or-cancel decision.
+
+- The Project workbench shows a persistent, server-derived
+  `Define → Plan → Build → Release` orientation with scoped reconciliation
+  surfaced at the affected stage. It is navigation and explanation over
+  canonical Charter, baseline, Task/review, readiness, and Release state — not
+  a second lifecycle or a client-side truth store.
+
+- The execution baseline Review now renders semantic sections and an exact
+  revision diff — intended outcomes, plan items, milestones and checks,
+  evidence, adaptive authority, risks and elevated actions, exclusions, and
+  rollback — instead of a raw preformatted JSON blob. The frozen approval
+  target and its digests are unchanged; raw JSON remains available only inside
+  a collapsed technical-details disclosure.
+
+- A canonical reconciliation conflict now has a real product exit. Added the
+  shared reconciliation query/command service and
+  `GET /api/v1/projects/{id}/reconciliations`,
+  `GET /api/v1/projects/{id}/reconciliations/{reconciliation_id}`, and
+  `POST /api/v1/projects/{id}/reconciliations/{reconciliation_id}/resolve`.
+  Resolving commits the resolution, canonical-conflict disposition, command
+  receipt, and durable event in one transaction, then wakes exactly the
+  affected Task. Resolution is interactive-user-only for every record type; no
+  chat agent receives a self-resolve tool. Project Overview gained a
+  reconciliation review card that resolves and resumes without a page reload,
+  replacing the `project.reconciliation.resolve` next action that previously
+  had no handler at all. A parity test now fails whenever any Project Overview
+  next action names an operation with no registered target.
+
+### Breaking
+
+- The SSE stream at `GET /api/v1/events` no longer sets a per-frame SSE
+  `event:` name. Every frame is now one canonical envelope delivered as a
+  default `message` event, and the payload's `event_type` field is the sole
+  routing discriminator. Clients must consume the stream with
+  `EventSource.onmessage` (or an equivalent default-message listener) and
+  switch on `payload.event_type`; per-event-name listeners receive nothing.
+  The previous transport required every client to hand-maintain a duplicate
+  catalog of ~90 server event names, and a frame whose name was missing from
+  that catalog was delivered to no listener and silently dropped — which is
+  how `project.created_from_charter_approval` and
+  `agent_chat.turn.control_transferred` never reached the browser. Treat an
+  unrecognized `event_type` as a signal to re-synchronize rather than
+  something to ignore.
+
+- `ProjectOverview.unresolved_decision_ids` is removed and replaced by
+  `pending_decisions`, a list of typed pending Decision candidate summaries
+  carrying question, options, recommendation, rationale, decision class,
+  affected records, lifecycle/version, required principal, and approve/reject
+  targets. The old field exposed bare UUIDs with no question, no alternatives,
+  and no action, so a pending Decision could not be acted on at all. No
+  deprecated alias remains.
+
+- A malformed or contract-violating JSON request body now returns
+  `400 validation_error` in the standard `{ code, message }` error envelope
+  instead of a bare `422` with a plain-text reason. `422` continues to mean an
+  illegal state transition.
+
 ### Fixed
+
+- Native Main/Project Agent Chat continuity now survives an identity Profile
+  edit correctly. Reusable canonical Chat scopes persist only stable
+  account/Project authority; the binding, Profile, operating-skill, and policy
+  revisions remain frozen on each admitted turn and session. Previously those
+  per-turn revisions were duplicated into the reusable scope authority, so the
+  first turn after a Profile edit failed with `canonical context scope already
+  exists with different authority` even though its new provenance was valid.
+
+- The receipt-backed Main operation `genesis.project_agent.select` is now
+  admitted under `propose_discovery`, matching the canonical operation catalog
+  and Main operating contract. It was previously routed to the typed command
+  executor but omitted from the final direct-command policy allowlist, causing
+  a structured `policy_denied` result during live Product Genesis.
+
+- Genesis Charter approval now rejects a stale browser projection when its
+  selected Project Agent identity/Profile/operating-skill/policy set no longer
+  matches the session's authoritative selection. Previously the route checked
+  only whether the submitted agent was independently eligible, so a cached
+  auto-selection could be frozen into the approval and handoff after the Main
+  Agent had persisted a different explicit choice.
+
+- A backgrounded Agent Chat no longer remains visibly in `Retrying…` after the
+  authoritative turn has failed or completed. The convergence watchdog now
+  follows both optimistic admissions and cached server-side live states through
+  their exact terminal state, using an active REST refetch that can also renew
+  an expired SSE access token. It previously stopped as soon as a queued turn
+  first appeared in the server response, leaving later `retry_wait → failed`
+  transitions dependent on a frame a hidden tab might never receive.
+
+- Constrained CLI Agent Chat execution now applies the immutable Profile's
+  top-level model, reasoning effort, and permission policy instead of reading
+  only its auxiliary `config_json`. Smith model discovery also preserves the
+  exact provider associated with each bare model name, so selecting
+  `gpt-5.6-terra` persists `provider=chatgpt` rather than silently running the
+  previous/default Google model. Frozen retry provenance remains unchanged.
+
+- CLI authentication health no longer reports Cursor as authenticated when
+  `cursor-agent status` says `Not logged in`. The status parser now rejects
+  negative login and authentication phrases before evaluating positive ones;
+  Providers therefore shows the installed runtime as unavailable with its
+  login recovery action instead of admitting turns that can only fail.
+
+- Authenticated Project surfaces now meet the automated WCAG A/AA checks used
+  by Gate E: light-theme semantic colors have sufficient contrast, deterministic
+  avatar gradients remain legible with white initials, Project Overview no
+  longer nests buttons inside links, and public login/register/OAuth shells use
+  a main landmark with dynamic viewport height. Keyboard skip navigation moves
+  focus directly into the app's main landmark.
+
+- `adaptive_envelope.allowed_task_operations` is now the closed
+  `AdaptiveTaskOperation` vocabulary — exactly `split`, `sequence`, and
+  `replace` — in the API types, the generated TypeScript union, the
+  agent-host input schema, native payload parsing, baseline content, and Task
+  governance. It was previously an unrestricted string array, so a Project
+  Agent could author and a user could approve an envelope granting the command
+  names `task.propose` and `task.adaptive`, neither of which Task governance
+  recognizes; the approved plan therefore granted no adaptive authority at all.
+  The envelope is validated on draft save and again on the complete envelope at
+  proposal, approval, activation, receipt replay, and active-baseline load, and
+  every diagnostic names the exact field path and the allowed verbs. Existing
+  invalid revisions remain immutable: an invalid active baseline is projected
+  as an exact `invalid_active_baseline` blocker rather than silently rewritten.
+  A startup integrity audit now records the exact historical values, prevents
+  invalid candidates from later approval or activation, and gives an invalid
+  active revision a conservative successor draft plus a visible correction
+  path. The draft must be explicitly proposed and approved; resolving the
+  blocker as `revised` then revalidates and activates that exact successor in
+  the same transaction as conflict/reconciliation disposition, preserving the
+  invalid revision and approval history. Unrelated Task-scoped reconciliations
+  remain scoped and do not block the repair.
+
+- A rejected adaptive command that committed no mutation no longer creates
+  durable conflict truth. An unsupported verb is a validation error and a valid
+  verb the active envelope does not grant is a policy denial that names the
+  allowed operations; neither creates a canonical conflict or a reconciliation
+  row, and neither reduces unrelated execution authority. Canonical conflicts
+  are now created only for a proven divergence between authoritative records or
+  an invalid current governing record, and they record the exact affected
+  paths. A Task-, plan-item-, or milestone-scoped conflict no longer stops
+  every unrelated Task in the Project: only a Project-wide governing-truth
+  conflict changes the Project execution gate.
+
+- The Task dispatcher no longer churns on a blocker that cannot change. A
+  deterministic refusal — a governance denial, an unresolved conflict, missing
+  setup — now records one dispatch disposition keyed by Task version,
+  requested capability, and blocker digest, and the ten-second scan skips an
+  unchanged disposition without re-attempting it or re-logging it. Previously
+  the identical denial was retried and logged every ten seconds indefinitely
+  and review never ran. Baseline activation, reconciliation resolution, a
+  relevant version change, or an explicit authorized retry wakes exactly the
+  affected Task exactly once. Baseline activation now selects only Tasks whose
+  runnable governance names the exact activated revision, and receipt replay
+  safely repairs a lost post-commit wake without widening to unrelated Tasks.
+  Transient failures are unaffected and still retry on the next scan.
+
+- Durable event consumers now use the event ID itself when a committed event
+  has no explicit dedupe key. Three consumers previously invented an
+  `event:{id}` fallback while the repository contract requires `{id}`; one
+  internal event could therefore wedge SSE broadcast, Task-outcome
+  reconciliation, and Agent Chat memory indexing at the same cursor forever.
+  The fallback is shared and characterized with a null-key committed event.
+
+- Project and execution approval are now visibly distinct instead of surfacing
+  a raw "active user-approved execution baseline is required" failure on a
+  Task. Non-terminal implementation Tasks show one plain-language recovery
+  card and link directly to the exact Project approval target. The Project Chat
+  rail uses `Project Agent`, `Build setup`, and `Permission to build`, and the
+  final action reads **Approve plan & start work** while explaining that it
+  covers every Task in the approved plan rather than requiring per-Task
+  approval.
 
 - Product Genesis now exposes receipt-backed native operations for the Main
   Agent to list and persist the exact structured Project Agent selection.

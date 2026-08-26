@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use api_types::{
-    canonical_digest_with_schema, AttachPrimaryRepositoryRequest, ExecutionSetupState,
+    canonical_digest_with_schema, AttachPrimaryRepositoryRequest, ExecutionBlockerCode,
+    ExecutionBlockerScope, ExecutionGate, ExecutionProgress, ExecutionSetupState, RetryAction,
     RetryProvisioningRequest, SelectExecutionPrincipalRequest,
 };
 use chrono::{Duration, Utc};
@@ -643,7 +644,7 @@ async fn pre_baseline_implementation_task_creates_no_workspace_lease() {
         panic!("expected a deterministic governance refusal, got {error:?}");
     };
     assert!(
-        message.contains("active user-approved execution baseline is required"),
+        message.contains("waiting for plan approval"),
         "the refusal must name the missing baseline approval, got {message}"
     );
 
@@ -830,4 +831,555 @@ async fn a_worker_at_capacity_is_still_eligible_for_its_own_role() {
     services::ensure_execution_role_principal(&db, &project.id, "coder", &worker_id)
         .await
         .expect("a saturated Worker can still dispatch its own role");
+}
+
+// ---------------------------------------------------------------------------
+// Gate 8 / F12 characterization: one canonical execution-blocker projection
+// ---------------------------------------------------------------------------
+//
+// The preserved failed run showed Task `5de47062-02ab-44b1-91d1-1182d4da87d7`
+// — which had executions `7b073660...` (failed) and `27f9f73b...` (completed
+// with a commit) plus a Task-scoped reconciliation — described simultaneously
+// as "Waiting for plan reconciliation," "waiting for plan approval," and
+// "TASK NOT STARTED" by different surfaces, and the Task-scoped conflict was
+// projected as a Project-wide gate. These tests reproduce that shape and lock
+// in the fix (D16/D17).
+
+/// A Project created with an active Project Agent binding, so
+/// `coordination_state` is `Ready` from the start and the only remaining
+/// gates are execution setup and the execution baseline.
+async fn coordinated_project(db: &SqliteDb, name: &str) -> Project {
+    let (coordinator_id, coordinator_profile_id) =
+        native_agent(db, &format!("{name} coordinator")).await;
+    let now = now_rfc3339();
+    ProjectRepo::create_with_agent_binding(
+        db,
+        CreateProject {
+            id: new_uuid_v4(),
+            name: name.to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some(OWNER_ID.to_owned()),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+        Some(coordinator_id),
+        Some(coordinator_profile_id),
+    )
+    .await
+    .expect("coordinated project creates")
+}
+
+/// Take a Project through Worker/reviewer/repository setup and an approved
+/// Charter so only the execution baseline remains ungoverned, then attach one
+/// active, user-approved execution baseline revision with a real adaptive
+/// envelope. Returns `(repo_id, baseline_id, revision_id)`.
+async fn ready_project_with_active_baseline(
+    db: &Arc<SqliteDb>,
+    project: &Project,
+) -> (String, String, String) {
+    let (worker_id, _) = native_agent(db, "F12 Worker").await;
+    let (reviewer_id, _) = native_agent(db, "F12 Reviewer").await;
+    let setup = ProjectExecutionSetupService::new(Arc::clone(db));
+    let selected_worker = setup
+        .select_execution_principal(
+            &project.id,
+            ExecutionPrincipalRole::Worker,
+            &SelectExecutionPrincipalRequest {
+                identity_id: worker_id.clone(),
+                expected_project_version: project.version,
+                idempotency_key: format!("{}-select-worker", project.id),
+            },
+            OWNER_ID,
+        )
+        .await
+        .expect("worker selection commits");
+    let selected_reviewer = setup
+        .select_execution_principal(
+            &project.id,
+            ExecutionPrincipalRole::IndependentReviewer,
+            &SelectExecutionPrincipalRequest {
+                identity_id: reviewer_id,
+                expected_project_version: selected_worker.project_version,
+                idempotency_key: format!("{}-select-reviewer", project.id),
+            },
+            OWNER_ID,
+        )
+        .await
+        .expect("independent reviewer selection commits");
+    let repo_id = repo(db, &project.id).await;
+    let attached = setup
+        .attach_primary_repository(
+            &project.id,
+            &AttachPrimaryRepositoryRequest {
+                repo_id: repo_id.clone(),
+                expected_project_version: selected_reviewer.project_version,
+                idempotency_key: format!("{}-attach-repo", project.id),
+            },
+            OWNER_ID,
+        )
+        .await
+        .expect("repository attachment commits");
+    assert_eq!(attached.execution_setup_state, ExecutionSetupState::Ready);
+
+    attach_approved_charter(db, &project.id).await;
+    let charter_revision_id: String = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT current_charter_revision_id FROM project WHERE id = ?",
+    )
+    .bind(&project.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("charter revision id reads")
+    .expect("current charter revision is set");
+
+    let baseline_id = format!("{}-baseline", project.id);
+    let revision_id = format!("{}-baseline-revision", project.id);
+    let now = now_rfc3339();
+    let envelope = json!({
+        "allowed_task_operations": ["split", "sequence", "replace"],
+        "fixed_outcomes": ["ship-the-approved-outcome"],
+        "fixed_acceptance": ["acceptance-r1"],
+        "fixed_risk_classes": ["low"],
+        "forbidden_side_effects": [],
+        "elevated_operations": [],
+    });
+    sqlx::query(
+        "INSERT INTO project_execution_baseline
+         (id, project_id, current_revision_id, lifecycle, version, created_at, updated_at)
+         VALUES (?, ?, ?, 'active', 1, ?, ?)",
+    )
+    .bind(&baseline_id)
+    .bind(&project.id)
+    .bind(&revision_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("baseline inserts");
+    sqlx::query(
+        "INSERT INTO project_execution_baseline_revision
+         (id, baseline_id, revision, base_revision, lifecycle,
+          charter_revision_id, document_revisions_json, plan_items_json,
+          milestone_id, milestone_ids_json, milestone_definition_revision_ids_json,
+          primary_milestone_id, release_policy_json, release_policy_revision,
+          release_policy_digest, acceptance_matrix_json, capability_classes_json,
+          risk_classes_json, adaptive_envelope_json, elevated_operations_json,
+          exclusions_json, rollback_recovery_json, schema_version, render_version,
+          rendered_view, content_digest, rendered_digest, source_refs_json, created_at)
+         VALUES (?, ?, 1, 0, 'approved', ?, '[]', '[\"plan-1\"]', NULL, '[]', '[]', NULL,
+                 '{}', 'release-r1', 'release-digest',
+                 '[{\"id\":\"acceptance-r1\",\"description\":\"acceptance\",\"required\":true}]',
+                 '[\"repository_write\"]', '[\"low\"]', ?, '[]', '[]', '{}', 'baseline@1',
+                 'baseline-render@1', '# F12 baseline', 'f12-baseline-content',
+                 'f12-baseline-rendered', '[]', ?)",
+    )
+    .bind(&revision_id)
+    .bind(&baseline_id)
+    .bind(&charter_revision_id)
+    .bind(envelope.to_string())
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("baseline revision inserts");
+    sqlx::query(
+        "INSERT INTO project_execution_baseline_approval
+         (id, baseline_id, revision_id, expected_project_version,
+          principal_type, principal_id, authorization_basis,
+          authorization_action, explicit_event, authorization_occurred_at,
+          content_digest, rendered_digest, lifecycle, idempotency_key,
+          created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'user', ?, 'explicit approval',
+                 'project.execution_baseline.approve', 'f12-approval-event', ?,
+                 'f12-baseline-content', 'f12-baseline-rendered', 'active', ?, ?, ?)",
+    )
+    .bind(format!("{}-approval", project.id))
+    .bind(&baseline_id)
+    .bind(&revision_id)
+    .bind(attached.project_version)
+    .bind(OWNER_ID)
+    .bind(&now)
+    .bind(format!("{}-approval-key", project.id))
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("baseline approval inserts");
+
+    (repo_id, baseline_id, revision_id)
+}
+
+/// Create a repository-backed implementation Task with governance bound to
+/// the exact active/approved baseline revision, so `ensure_task_runnable`'s
+/// traceability check admits it.
+async fn governed_task(
+    db: &SqliteDb,
+    project_id: &str,
+    repo_id: &str,
+    baseline_id: &str,
+    revision_id: &str,
+    title: &str,
+) -> String {
+    let task_id = new_uuid_v4();
+    let now = now_rfc3339();
+    TaskRepo::create(
+        db,
+        CreateTask {
+            id: task_id.clone(),
+            project_id: project_id.to_owned(),
+            repo_id: Some(repo_id.to_owned()),
+            parent_task_id: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: title.to_owned(),
+            description: None,
+            task_type: "task".to_owned(),
+            status: "in_progress".to_owned(),
+            is_automation: false,
+            priority: 0,
+            subtask_order: None,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("governed Task creates");
+    let charter_revision_id: String = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT current_charter_revision_id FROM project WHERE id = ?",
+    )
+    .bind(project_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("charter revision id reads")
+    .expect("current charter revision is set");
+    sqlx::query(
+        "INSERT INTO project_task_governance
+         (task_id, project_id, charter_revision_id, baseline_id,
+          baseline_revision_id, plan_item_id, milestone_id,
+          document_revisions_json, capability_class, risk_class, runnable,
+          replacement_of_task_id, provenance_json, version, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, NULL, NULL, '[]', 'repository_write', 'low',
+                 1, NULL, '{}', 1, ?, ?)",
+    )
+    .bind(&task_id)
+    .bind(project_id)
+    .bind(&charter_revision_id)
+    .bind(baseline_id)
+    .bind(revision_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("task governance inserts");
+    task_id
+}
+
+/// Record one execution row directly (the durable evidence
+/// `ExecutionEvidenceSummary` reads from), optionally with commit evidence.
+async fn insert_execution(db: &SqliteDb, task_id: &str, role: &str, status: &str, committed: bool) {
+    let now = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO execution
+         (id, task_id, agent_id, role, status, before_sha, after_sha, created_at, updated_at)
+         VALUES (?, ?, NULL, ?, ?, 'before-sha', ?, ?, ?)",
+    )
+    .bind(new_uuid_v4())
+    .bind(task_id)
+    .bind(role)
+    .bind(status)
+    .bind(committed.then(|| "after-sha-committed".to_owned()))
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("execution inserts");
+}
+
+/// Record a Task-scoped canonical conflict + required reconciliation record,
+/// mirroring what `record_adaptive_boundary_reconciliation` persists — but
+/// directly, so the test controls the exact scope/conflict_code independent
+/// of any particular admission call.
+async fn insert_task_scoped_reconciliation(
+    db: &SqliteDb,
+    project_id: &str,
+    task_id: &str,
+    baseline_id: &str,
+    revision_id: &str,
+    conflict_code: &str,
+    affected_paths: &[&str],
+) {
+    let now = now_rfc3339();
+    let conflict_id = format!("{task_id}-conflict");
+    sqlx::query(
+        "INSERT INTO project_canonical_conflict (
+             id, project_id, domain, governing_record_type, governing_record_id,
+             governing_record_revision, governing_record_digest,
+             conflicting_record_type, conflicting_record_id, conflicting_record_revision,
+             conflicting_record_digest, affected_paths_json, conflict_code, description,
+             detected_by_type, detected_by_id, authorization_basis, authorization_action,
+             explicit_event, authorization_occurred_at, idempotency_key, created_at
+         ) VALUES (?, ?, 'execution', 'execution_baseline', ?, '1', 'f12-baseline-content',
+                   'task', ?, '1', 'task-digest', ?, ?, ?, 'system', 'test-fixture',
+                   'adaptive_task_boundary', 'task.adaptive.reject', 'task.adaptive.split.rejected',
+                   ?, ?, ?)",
+    )
+    .bind(&conflict_id)
+    .bind(project_id)
+    .bind(baseline_id)
+    .bind(task_id)
+    .bind(serde_json::to_string(affected_paths).expect("affected paths encode"))
+    .bind(conflict_code)
+    .bind(format!("{conflict_code} for {task_id}"))
+    .bind(&now)
+    .bind(format!("{task_id}-idempotency"))
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("canonical conflict inserts");
+    sqlx::query(
+        "INSERT INTO project_reconciliation_record (
+             id, project_id, conflict_id, record_type, record_id, record_revision, record_digest,
+             governing_record_type, governing_record_id, governing_record_revision,
+             governing_record_digest, state, current_resolution_id, version, created_at, updated_at
+         ) VALUES (?, ?, ?, 'task', ?, '1', 'task-digest', 'execution_baseline', ?, ?,
+                   'f12-baseline-content', 'required', NULL, 1, ?, ?)",
+    )
+    .bind(format!("{task_id}-reconciliation"))
+    .bind(project_id)
+    .bind(&conflict_id)
+    .bind(task_id)
+    .bind(baseline_id)
+    .bind(revision_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("reconciliation record inserts");
+}
+
+/// F12(a): a Task with executions and a commit is never described as "not
+/// started," and a commit awaiting review is described as committed —  never
+/// mapped back to `not_started` progress language.
+#[tokio::test]
+async fn task_with_executions_and_a_commit_is_never_not_started() {
+    let db = database().await;
+    let project = coordinated_project(&db, "f12 progress language").await;
+    let (repo_id, baseline_id, revision_id) =
+        ready_project_with_active_baseline(&db, &project).await;
+    let task_id = governed_task(
+        &db,
+        &project.id,
+        &repo_id,
+        &baseline_id,
+        &revision_id,
+        "task with attempts and a commit",
+    )
+    .await;
+    // Mirror the preserved run: one failed attempt, one completed execution
+    // with a commit.
+    insert_execution(&db, &task_id, "executor", "failed", false).await;
+    insert_execution(&db, &task_id, "executor", "completed", true).await;
+
+    let task = TaskRepo::get_by_id(&*db, &task_id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    let (evidence, _blocker) = services::load_task_execution_blocker(&db, &task)
+        .await
+        .expect("blocker projection loads");
+
+    assert_eq!(evidence.execution_count, 2);
+    assert_eq!(evidence.attempt_count, 2);
+    assert!(evidence.has_commit);
+    assert_eq!(
+        evidence.progress,
+        ExecutionProgress::ImplementationCommitted
+    );
+    assert_eq!(evidence.progress_label, "Implementation committed");
+    assert_ne!(evidence.progress, ExecutionProgress::NotStarted);
+    assert_ne!(evidence.progress_label, "Not started");
+}
+
+/// F12(b): a `ReconciliationRequired` blocker never renders baseline-approval
+/// copy, and its permitted next action is to resolve the reconciliation, not
+/// to reauthorize a baseline that is already active and approved.
+#[tokio::test]
+async fn reconciliation_required_blocker_never_renders_baseline_approval_copy() {
+    let db = database().await;
+    let project = coordinated_project(&db, "f12 reconciliation copy").await;
+    let (repo_id, baseline_id, revision_id) =
+        ready_project_with_active_baseline(&db, &project).await;
+    let task_id = governed_task(
+        &db,
+        &project.id,
+        &repo_id,
+        &baseline_id,
+        &revision_id,
+        "task blocked by reconciliation",
+    )
+    .await;
+    insert_execution(&db, &task_id, "executor", "failed", false).await;
+    insert_execution(&db, &task_id, "executor", "completed", true).await;
+    insert_task_scoped_reconciliation(
+        &db,
+        &project.id,
+        &task_id,
+        &baseline_id,
+        &revision_id,
+        "adaptive_task_governance_stale",
+        &["baseline_id", "baseline_revision_id"],
+    )
+    .await;
+
+    let task = TaskRepo::get_by_id(&*db, &task_id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    let (_evidence, blocker) = services::load_task_execution_blocker(&db, &task)
+        .await
+        .expect("blocker projection loads");
+    let blocker = blocker.expect("Task-scoped reconciliation projects a blocker");
+
+    assert_eq!(blocker.code, ExecutionBlockerCode::ReconciliationRequired);
+    assert_eq!(blocker.next_action, RetryAction::ResolveReconciliation);
+    assert_ne!(blocker.next_action, RetryAction::Reauthorize);
+    assert!(
+        !blocker
+            .headline
+            .to_lowercase()
+            .contains("permission to build"),
+        "reconciliation copy must not read like the baseline-approval headline: {}",
+        blocker.headline
+    );
+    assert!(
+        !blocker
+            .safe_explanation
+            .to_lowercase()
+            .contains("approve the implementation plan"),
+        "reconciliation copy must not read like baseline-approval copy: {}",
+        blocker.safe_explanation
+    );
+    // Evidence travels with the blocker: even while blocked, this Task is
+    // never described as not started.
+    let evidence = blocker
+        .evidence
+        .expect("Task-scoped blocker carries evidence");
+    assert_eq!(
+        evidence.progress,
+        ExecutionProgress::ImplementationCommitted
+    );
+}
+
+/// F12(c) / D16: a Task-scoped reconciliation blocks only that Task. It must
+/// never widen the Project's execution gate for an unrelated, unblocked Task
+/// in the same Project.
+#[tokio::test]
+async fn task_scoped_reconciliation_does_not_block_the_project_gate() {
+    let db = database().await;
+    let project = coordinated_project(&db, "f12 scoped reconciliation").await;
+    let (repo_id, baseline_id, revision_id) =
+        ready_project_with_active_baseline(&db, &project).await;
+    let blocked_task_id = governed_task(
+        &db,
+        &project.id,
+        &repo_id,
+        &baseline_id,
+        &revision_id,
+        "task with its own reconciliation",
+    )
+    .await;
+    let unrelated_task_id = governed_task(
+        &db,
+        &project.id,
+        &repo_id,
+        &baseline_id,
+        &revision_id,
+        "unrelated task under the same active plan",
+    )
+    .await;
+    insert_task_scoped_reconciliation(
+        &db,
+        &project.id,
+        &blocked_task_id,
+        &baseline_id,
+        &revision_id,
+        "adaptive_task_governance_stale",
+        &["baseline_id", "baseline_revision_id"],
+    )
+    .await;
+
+    // The Project-wide gate stays Active: this is not a governing-truth
+    // conflict, so unrelated Tasks are unaffected (D16).
+    let project_setup = services::load_project_execution_setup(&db, &project.id)
+        .await
+        .expect("project setup projection loads");
+    assert_eq!(project_setup.execution_gate, ExecutionGate::Active);
+    assert!(project_setup.execution_blocker.is_none());
+
+    let blocked_task = TaskRepo::get_by_id(&*db, &blocked_task_id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    let (_evidence, blocked_blocker) = services::load_task_execution_blocker(&db, &blocked_task)
+        .await
+        .expect("blocker projection loads");
+    let blocked_blocker = blocked_blocker.expect("the named Task carries its own blocker");
+    assert_eq!(blocked_blocker.scope, ExecutionBlockerScope::Task);
+    assert_eq!(blocked_blocker.affected_refs.len(), 1);
+    assert_eq!(blocked_blocker.affected_refs[0].record_id, blocked_task_id);
+
+    let unrelated_task = TaskRepo::get_by_id(&*db, &unrelated_task_id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    let (_evidence, unrelated_blocker) =
+        services::load_task_execution_blocker(&db, &unrelated_task)
+            .await
+            .expect("blocker projection loads");
+    assert!(
+        unrelated_blocker.is_none(),
+        "an unrelated Task under the same active plan must not inherit another Task's \
+         reconciliation blocker"
+    );
+
+    // `ensure_task_runnable` is `pub(crate)`; `claim_task` runs it as the
+    // very first admission step before any workspace/git side effect
+    // (`task_service::claim`), so its outcome is observable here without
+    // reaching real git operations. The blocked Task must fail with exactly
+    // the reconciliation conflict; the unrelated Task must not.
+    let tasks = TaskService::new(Arc::clone(&db), Arc::new(events::EventBus::new(16)));
+    let blocked_result = tasks
+        .claim_task(
+            blocked_task.id.clone(),
+            Assignee::Agent("nonexistent-agent".to_owned()),
+            None,
+        )
+        .await;
+    match blocked_result {
+        Err(ServiceError::Conflict(message)) => {
+            assert!(
+                message.contains("reconciliation_required"),
+                "message: {message}"
+            );
+        }
+        other => panic!("expected the Task-scoped reconciliation to block claim, got {other:?}"),
+    }
+    let unrelated_result = tasks
+        .claim_task(
+            unrelated_task.id.clone(),
+            Assignee::Agent("nonexistent-agent".to_owned()),
+            None,
+        )
+        .await;
+    assert!(
+        !matches!(
+            &unrelated_result,
+            Err(ServiceError::Conflict(message)) if message.contains("reconciliation_required")
+        ),
+        "an unrelated Task under the same active plan must not inherit another Task's \
+         reconciliation blocker, got {unrelated_result:?}"
+    );
 }

@@ -5,6 +5,7 @@ use db::{AgentRepo, DbError, Project, Task, TaskRoleAssignmentRepo};
 
 use crate::{
     agent_service::{compute_effective_status, EffectiveStatus},
+    deferred_dispatch,
     task_service::TransitionOptions,
     Result, ServiceError,
 };
@@ -54,30 +55,41 @@ impl TaskDispatcher {
             else {
                 continue;
             };
+            if deferred_dispatch::dispatch_disposition_is_current(&task, &target.role) {
+                // An unchanged deterministic blocker was already observed for
+                // this exact Task version and capability. Skip the attempt —
+                // and its warning — entirely rather than re-deriving and
+                // re-logging the identical denial every scan (F11). Nothing
+                // schedules this Task again until its version changes or an
+                // explicit `wake_task_dispatch` clears the disposition.
+                continue;
+            }
             match self.dispatch_initial_task(&task, &target).await {
-                Ok(true) => dispatched += 1,
+                Ok(true) => {
+                    deferred_dispatch::clear_dispatch_disposition(&self.db, &task).await?;
+                    dispatched += 1;
+                }
                 Ok(false) => {}
                 Err(ServiceError::Db(DbError::VersionConflict)) => {
                     tracing::debug!(task_id = %task.id, "task dispatcher initial transition lost version race");
                 }
-                Err(error) if helpers::is_not_runnable_error(&error) => {
+                Err(error) if helpers::is_deterministic_dispatch_refusal(&error) => {
+                    deferred_dispatch::record_dispatch_disposition(
+                        &self.db,
+                        &task,
+                        &target.role,
+                        &error.to_string(),
+                    )
+                    .await?;
                     tracing::warn!(
                         task_id = %task.id,
                         %error,
-                        "task is not runnable under governance; parking until a user restarts it"
+                        "task dispatch blocked; parked until Task/governance state changes or an explicit wake"
                     );
-                    if let Err(annotate_error) = crate::workflow::engine::annotate_dispatch_failure(
-                        &self.db,
-                        &task.id,
-                        task.status.as_str(),
-                        &error.to_string(),
-                    )
-                    .await
-                    {
-                        tracing::warn!(task_id = %task.id, %annotate_error, "failed to annotate not-runnable task");
-                    }
                 }
                 Err(error) => {
+                    // Potentially transient: no disposition, so the next scan
+                    // retries instead of stalling on a momentary failure.
                     tracing::warn!(task_id = %task.id, %error, "task dispatcher initial dispatch failed");
                 }
             }

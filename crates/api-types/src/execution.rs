@@ -3,10 +3,11 @@ use serde_json::Value;
 use ts_rs::TS;
 
 use crate::{
-    AgentStatus, CanonicalPhase, ExecutionAction, ExecutionBehavior, ExecutionRole,
-    ExecutionStatus, InterruptionMetadata, PlanArtifactDetail, PlanProgressSummary, ResumePolicy,
-    StopReason, TaskAnnotation, TaskRoleAssignmentResponse, TaskStatus, TaskType,
-    WorkflowExceptionSummary, WorkflowHealthSummary, WorkspaceResponse,
+    AgentStatus, CanonicalPhase, ExecutionAction, ExecutionBehavior, ExecutionBlockerProjection,
+    ExecutionEvidenceSummary, ExecutionRole, ExecutionStatus, InterruptionMetadata,
+    PlanArtifactDetail, PlanProgressSummary, ResumePolicy, StopReason, TaskAnnotation,
+    TaskRoleAssignmentResponse, TaskStatus, TaskType, WorkflowExceptionSummary,
+    WorkflowHealthSummary, WorkspaceResponse,
 };
 
 /// Public owner state for a running execution.  This is deliberately
@@ -97,6 +98,14 @@ pub struct TaskResponse {
     pub plan_artifact: Option<PlanArtifactDetail>,
     pub external_issue_number: Option<i64>,
     pub external_issue_url: Option<String>,
+    /// Canonical attempt/execution/commit evidence for this Task (D17, F12).
+    /// Progress language everywhere else must derive from this value; it can
+    /// never be overridden to show "not started" once evidence exists.
+    pub execution_evidence: ExecutionEvidenceSummary,
+    /// The one canonical execution blocker for this Task (D16/D17), or
+    /// `None` when nothing blocks this Task's execution right now. A
+    /// Task-scoped blocker here never implies the whole Project is blocked.
+    pub execution_blocker: Option<ExecutionBlockerProjection>,
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,

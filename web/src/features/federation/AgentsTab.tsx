@@ -150,6 +150,7 @@ export function NewAgentDialog({
           permission_policy: permissionPolicy,
           prompt_template: systemPrompt.trim() ? systemPrompt.trim() : null,
           credential_id: credentialId || null,
+          config_json: discovered.data?.modelConfigs?.[model.trim()] ?? {},
         })
       }
       onClose()

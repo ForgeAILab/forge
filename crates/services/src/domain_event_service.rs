@@ -8,6 +8,14 @@ use events::{EventBus, EventContext, ForgeEvent};
 
 use crate::Result;
 
+/// The repository's completion identity is the stored dedupe key when one is
+/// present and the event id itself otherwise. Keep every durable consumer on
+/// this exact fallback; inventing a prefixed value wedges its cursor forever
+/// on legacy or internal events whose dedupe key is null.
+pub(crate) fn event_completion_dedupe_key(event: &DomainEvent) -> String {
+    event.dedupe_key.clone().unwrap_or_else(|| event.id.clone())
+}
+
 /// Commits authoritative domain events to SQLite and only then mirrors a
 /// bounded invalidation notification to the in-process event bus.
 #[derive(Clone)]
@@ -65,7 +73,7 @@ impl DomainEventService {
         let events = self.claim_batch(input).await?;
         let mut completed = 0;
         for event in events {
-            let dedupe_key = event.dedupe_key.clone().unwrap_or_else(|| event.id.clone());
+            let dedupe_key = event_completion_dedupe_key(&event);
             handler(event.clone()).await?;
             let inserted = DomainEventRepo::complete_claimed_event(
                 &*self.db,

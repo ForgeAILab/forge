@@ -6,18 +6,18 @@ import { cn } from '@/lib/cn'
  */
 
 const palette = [
-  ['#6366f1', '#818cf8'], // indigo
-  ['#8b5cf6', '#a78bfa'], // violet
-  ['#ec4899', '#f472b6'], // pink
-  ['#f43f5e', '#fb7185'], // rose
-  ['#ef4444', '#f87171'], // red
-  ['#f97316', '#fb923c'], // orange
-  ['#eab308', '#facc15'], // yellow
-  ['#22c55e', '#4ade80'], // green
-  ['#14b8a6', '#2dd4bf'], // teal
-  ['#06b6d4', '#22d3ee'], // cyan
-  ['#3b82f6', '#60a5fa'], // blue
-  ['#a855f7', '#c084fc'], // purple
+  ['#4338ca', '#3730a3'], // indigo
+  ['#6d28d9', '#5b21b6'], // violet
+  ['#be185d', '#9d174d'], // pink
+  ['#be123c', '#9f1239'], // rose
+  ['#b91c1c', '#991b1b'], // red
+  ['#c2410c', '#9a3412'], // orange
+  ['#a16207', '#854d0e'], // yellow
+  ['#15803d', '#166534'], // green
+  ['#0f766e', '#115e59'], // teal
+  ['#0e7490', '#155e75'], // cyan
+  ['#1d4ed8', '#1e40af'], // blue
+  ['#7e22ce', '#6b21a8'], // purple
 ]
 
 function hashCode(str: string): number {

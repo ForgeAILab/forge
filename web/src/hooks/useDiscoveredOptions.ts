@@ -18,6 +18,7 @@ export type DiscoveredExecutionOptions = {
   models: DiscoveredModelOption[]
   reasoningOptions: ReasoningOption[]
   permissionPolicies: string[]
+  modelConfigs: Record<string, Record<string, string>>
 }
 
 type AgentDiscoveredOptionsResponse = {
@@ -73,6 +74,21 @@ function reasoningByModelFromCliSpecific(cliSpecific: unknown): Map<string, stri
   return result
 }
 
+function modelConfigsFromCliSpecific(
+  cliSpecific: unknown,
+): Record<string, Record<string, string>> {
+  if (!cliSpecific || typeof cliSpecific !== 'object') return {}
+
+  const raw = (cliSpecific as Record<string, unknown>).model_providers
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+
+  return Object.fromEntries(
+    Object.entries(raw as Record<string, unknown>).flatMap(([model, provider]) =>
+      typeof provider === 'string' && provider ? [[model, { provider }]] : [],
+    ),
+  )
+}
+
 export function normalizeDiscoveredOptions(
   response: AgentDiscoveredOptionsResponse,
 ): DiscoveredExecutionOptions {
@@ -119,6 +135,7 @@ export function normalizeDiscoveredOptions(
     models,
     reasoningOptions: reasoningIds.map((id) => ({ id, label: titleCase(id) })),
     permissionPolicies: policies.length > 0 ? policies : ['auto', 'supervised', 'plan'],
+    modelConfigs: modelConfigsFromCliSpecific(response.cli_specific),
   }
 }
 

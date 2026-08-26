@@ -252,7 +252,7 @@ const baseOverview = {
   active_milestones: [readyMilestone],
   task_counts: counts,
   check_summary: checks,
-  unresolved_decision_ids: [],
+  pending_decisions: [],
   risks: [],
   document_freshness: [baseDocument],
   evidence: [
@@ -591,10 +591,41 @@ describe('Project Overview release flow', () => {
     expect(screen.getByText(/blocking action/i)).toBeTruthy()
   })
 
-  it('renders effective decisions and keeps pending proposal IDs separate', () => {
+  it('renders effective decisions and keeps pending Decision candidates separate', () => {
     renderPage({
       ...baseOverview,
-      unresolved_decision_ids: ['candidate-1'],
+      pending_decisions: [
+        {
+          id: 'candidate-1',
+          project_id: 'project-1',
+          lifecycle: 'proposed',
+          version: 1,
+          question: 'Which pending implementation choice needs review?',
+          options: ['keep-current-approach', 'switch-approach'],
+          recommendation: 'keep-current-approach',
+          rationale: 'The current approach already satisfies the acceptance record.',
+          decision_class: 'project_implementation',
+          affected_records: {
+            affected_artifact_refs: [],
+            affected_task_ids: [],
+            affected_milestone_ids: [],
+          },
+          proposed_by: { kind: 'agent', id: 'agent-1', display_name: null },
+          required_principal: 'user',
+          validity: 'valid',
+          invalid_reason: null,
+          approve_target: {
+            method: 'POST',
+            path: '/api/v1/projects/project-1/decisions/candidates/candidate-1/approve',
+          },
+          reject_target: {
+            method: 'POST',
+            path: '/api/v1/projects/project-1/decisions/candidates/candidate-1/reject',
+          },
+          created_at: '2026-08-21T10:00:00Z',
+          updated_at: '2026-08-21T10:00:00Z',
+        },
+      ],
       decisions: [
         {
           id: 'decision-1',
@@ -620,12 +651,8 @@ describe('Project Overview release flow', () => {
     } as unknown as ProjectOverview)
 
     expect(screen.getByText('Pending proposals')).toBeTruthy()
-    expect(
-      screen.getAllByText(
-        (_content, element) =>
-          element?.textContent?.replace(/\s+/g, ' ').trim() === 'Pending proposal candidate-1',
-      ).length,
-    ).toBeGreaterThan(0)
+    expect(screen.getByText('Which pending implementation choice needs review?')).toBeTruthy()
+    expect(screen.getAllByText(/keep-current-approach/).length).toBeGreaterThan(0)
     expect(screen.getByText('Decision log')).toBeTruthy()
     expect(screen.getByText('Which release boundary is authoritative?')).toBeTruthy()
     expect(screen.getByText('The first milestone has the complete acceptance record.')).toBeTruthy()

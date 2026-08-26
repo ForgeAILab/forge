@@ -1,3 +1,4 @@
+use api_types::{OrchestrationOutcome, ToolResultSummary};
 use async_trait::async_trait;
 use executors::{
     AvailabilityInfo, AvailabilityStatus, CodingExecutorAdapter, DiscoverContext,
@@ -180,6 +181,7 @@ impl CodingExecutorAdapter for SmithAdapter {
             cli_specific: serde_json::json!({
                 "profiles": surface.profiles,
                 "providers": surface.providers,
+                "model_providers": surface.model_providers,
             }),
         })
     }
@@ -451,6 +453,27 @@ fn runtime_error_kind(payload: &serde_json::Value) -> Option<&str> {
         })
 }
 
+/// Builds the bounded `ToolResultSummary` for a smith `tool_call_finished`
+/// runtime event.
+///
+/// The smith CLI's own runtime-event boundary only guarantees `is_error`, so
+/// a structured Forge command outcome the underlying tool produced is
+/// opportunistically recovered when smith nests it under `value` (the same
+/// convention the native runtime path uses); any other payload is not vetted
+/// safe to echo verbatim and receives a fixed, generic summary instead.
+fn tool_result_summary_from_smith_payload(
+    payload: &serde_json::Value,
+    call_id: &str,
+    is_error: bool,
+) -> ToolResultSummary {
+    payload
+        .get("value")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<OrchestrationOutcome>(value).ok())
+        .map(|outcome| ToolResultSummary::from_orchestration_outcome(&outcome))
+        .unwrap_or_else(|| ToolResultSummary::unclassified(is_error, call_id))
+}
+
 async fn stream_run_output(
     stdout: tokio::process::ChildStdout,
     stderr: tokio::process::ChildStderr,
@@ -589,7 +612,7 @@ async fn process_smith_stdout_line(
                                     .await?;
                             }
                         }
-                        Some("tool_call_started") | Some("tool_call_finished") => {
+                        Some("tool_call_started") => {
                             writer
                                 .write(
                                     LogKind::System,
@@ -597,6 +620,36 @@ async fn process_smith_stdout_line(
                                     serde_json::json!({
                                         "event": event_kind,
                                         "payload": payload,
+                                        "source": "smith_tool_event",
+                                    }),
+                                )
+                                .await?;
+                        }
+                        Some("tool_call_finished") => {
+                            let call_id = payload
+                                .get("call")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            let name = payload
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            let is_error = payload
+                                .get("is_error")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            let summary =
+                                tool_result_summary_from_smith_payload(payload, call_id, is_error);
+                            writer
+                                .write(
+                                    LogKind::ToolResult,
+                                    LogStream::Main,
+                                    serde_json::json!({
+                                        "call_id": call_id,
+                                        "name": name,
+                                        "is_error": is_error,
+                                        "success": !is_error,
+                                        "summary": summary,
                                         "source": "smith_tool_event",
                                     }),
                                 )
@@ -711,6 +764,7 @@ struct SmithConfigSurface {
     models: Vec<String>,
     providers: Vec<String>,
     profiles: Vec<serde_json::Value>,
+    model_providers: std::collections::BTreeMap<String, String>,
 }
 
 /// Extract the user-facing selection surface from a Smith `config.toml`.
@@ -745,6 +799,12 @@ fn parse_smith_config_surface(text: &str) -> SmithConfigSurface {
             if let Some(model) = model.filter(|m| seen_models.insert((*m).to_owned())) {
                 surface.models.push(model.to_owned());
             }
+            if let (Some(provider), Some(model)) = (provider, model) {
+                surface
+                    .model_providers
+                    .entry(model.to_owned())
+                    .or_insert_with(|| provider.to_owned());
+            }
             surface.profiles.push(serde_json::json!({
                 "name": name,
                 "provider": provider,
@@ -755,9 +815,19 @@ fn parse_smith_config_surface(text: &str) -> SmithConfigSurface {
 
     if let Some(models) = root.get("models").and_then(|v| v.as_table()) {
         for key in models.keys() {
-            let bare = key.split_once('/').map_or(key.as_str(), |(_, model)| model);
+            let (provider, bare) = key
+                .split_once('/')
+                .map_or((None, key.as_str()), |(provider, model)| {
+                    (Some(provider), model)
+                });
             if seen_models.insert(bare.to_owned()) {
                 surface.models.push(bare.to_owned());
+            }
+            if let Some(provider) = provider {
+                surface
+                    .model_providers
+                    .entry(bare.to_owned())
+                    .or_insert_with(|| provider.to_owned());
             }
         }
     }
@@ -980,6 +1050,60 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn tool_call_finished_persists_a_bounded_summary_without_the_raw_payload() {
+        // Characterizes F14 for the smith adapter path: `tool_call_finished`
+        // previously logged the entire foreign runtime-event payload
+        // verbatim, so anything smith's own process happened to include
+        // (here simulated as a leaked secret) reached the durable log
+        // unbounded and unredacted.
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("fixture.jsonl");
+        let mut writer = LogWriter::new(
+            log_path.clone(),
+            "exec-fixture".to_owned(),
+            DEFAULT_MAX_OUTPUT_BYTES,
+        );
+        let mut result = StreamResult::default();
+        let mut chunks = Vec::new();
+        let line = serde_json::json!({
+            "type": "runtime_event",
+            "event": {
+                "payload": {
+                    "event": "tool_call_finished",
+                    "call": "call-1",
+                    "name": "forge_task_command",
+                    "is_error": true,
+                    "raw_output": "fatal: uncommitted worktree changes SECRET_TOKEN=abc123",
+                },
+            },
+        })
+        .to_string();
+
+        process_smith_stdout_line(&line, &mut writer, &mut result, &mut chunks)
+            .await
+            .expect("line processes");
+
+        let raw = tokio::fs::read_to_string(&log_path)
+            .await
+            .expect("durable log reads");
+        assert!(!raw.contains("SECRET_TOKEN"));
+        assert!(!raw.contains("raw_output"));
+
+        let entry: serde_json::Value =
+            serde_json::from_str(raw.lines().next().expect("one log line writes"))
+                .expect("log entry parses as JSON");
+        assert_eq!(entry["kind"], "tool_result");
+        let payload = &entry["payload"];
+        assert_eq!(payload["call_id"], "call-1");
+        assert_eq!(payload["name"], "forge_task_command");
+        assert_eq!(payload["is_error"], true);
+        assert_eq!(payload["success"], false);
+        assert_eq!(payload["summary"]["status"], "failed");
+        assert_eq!(payload["summary"]["code"], "internal_failure");
+        assert_eq!(payload["summary"]["correlation_id"], "call-1");
+    }
+
     #[test]
     fn test_build_command() {
         let config = SmithConfig {
@@ -1099,6 +1223,18 @@ context_tokens = 200000
         assert!(surface.models.contains(&"gemini-3.6-flash".to_owned()));
         assert!(surface.models.contains(&"glm-5.2".to_owned()));
         assert!(!surface.models.contains(&"glm-4.7".to_owned()));
+        assert_eq!(
+            surface.model_providers.get("gpt-5.6-terra"),
+            Some(&"chatgpt".to_owned())
+        );
+        assert_eq!(
+            surface.model_providers.get("gemini-3.6-flash"),
+            Some(&"google".to_owned())
+        );
+        assert_eq!(
+            surface.model_providers.get("glm-5.2"),
+            Some(&"zai".to_owned())
+        );
         // Catalog keys are deduplicated against profile models.
         assert_eq!(
             surface
@@ -1118,5 +1254,6 @@ context_tokens = 200000
         assert!(surface.models.is_empty());
         assert!(surface.providers.is_empty());
         assert!(surface.profiles.is_empty());
+        assert!(surface.model_providers.is_empty());
     }
 }

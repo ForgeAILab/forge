@@ -18,7 +18,10 @@ use db::{
     AgentProfileRepo, AgentRepo, AgentSession, CompleteAgentChatControlTransfer,
     CredentialHandleRepo, PageRequest, ProjectAgentBindingRepo, ProjectRepo, SqliteDb,
 };
-use executors::{ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorKind, TaskExecutor};
+use executors::{
+    merge_overrides, ExecutionContext, ExecutionOutcome, ExecutionOverrides, ExecutionResult,
+    ExecutorKind, TaskExecutor,
+};
 use forge_agent_host::RuntimeContextManifestLink;
 use forge_agent_host::{
     AgentSessionBackend, AgentTurnRequest, BackendCapabilities, CanonicalScope, CanonicalScopeType,
@@ -1361,6 +1364,16 @@ impl FederatedAgentChatTurnRunner {
                 })
                 .await?
         };
+        // D21/F18: a new Main turn's episodic context is bounded to the
+        // current topic's messages, not the whole prior chat history. A
+        // topic-less chat (every Project Chat today, and any Main Chat
+        // before its first topic exists) has no floor, so this is a no-op
+        // for them.
+        let topic_floor =
+            db::AgentChatTopicRepo::get_current_agent_chat_topic(&*self.db, &job.chat_id)
+                .await?
+                .map(|topic| topic.starting_message_sequence)
+                .unwrap_or(0);
         let history = AgentChatMessageRepo::list_agent_chat_messages(
             &*self.db,
             AgentChatMessageListQuery {
@@ -1379,7 +1392,9 @@ impl FederatedAgentChatTurnRunner {
         .items
         .into_iter()
         .filter(|message| {
-            message.sequence < input.sequence && message.status == AgentChatMessageStatus::Complete
+            message.sequence < input.sequence
+                && message.sequence >= topic_floor
+                && message.status == AgentChatMessageStatus::Complete
         })
         .collect();
         Ok(LoadedAgentChatTurn {
@@ -3211,8 +3226,7 @@ impl FederatedAgentChatTurnRunner {
             &history,
             &input.content,
         );
-        let config: Value = serde_json::from_str(&profile.config_json)
-            .map_err(|_| ServiceError::invalid_operation("Agent profile config is invalid"))?;
+        let config = cli_profile_execution_config(&profile)?;
         let scope = CanonicalScope {
             scope_type: CanonicalScopeType::AgentChat,
             scope_id: job.chat_id.clone(),
@@ -5008,6 +5022,30 @@ fn cli_result_content(result: ExecutionResult) -> Result<String> {
     })
 }
 
+fn cli_profile_execution_config(profile: &AgentProfile) -> Result<Value> {
+    let mut config: Value = serde_json::from_str(&profile.config_json)
+        .map_err(|_| ServiceError::invalid_operation("Agent profile config is invalid"))?;
+    merge_overrides(
+        &mut config,
+        &ExecutionOverrides {
+            model_id: profile.model.clone(),
+            reasoning_effort: profile.reasoning_effort.clone(),
+            permission_policy: profile.permission_policy.clone(),
+        },
+    )?;
+
+    if profile.executor_type == ExecutorKind::Smith.to_string() {
+        if let Some(provider) = &profile.provider {
+            config
+                .as_object_mut()
+                .expect("merge_overrides accepted an object")
+                .insert("provider".to_owned(), Value::String(provider.clone()));
+        }
+    }
+
+    Ok(config)
+}
+
 fn cli_executor_snapshot(executor_type: &str, config: Value) -> Value {
     serde_json::json!({
         "executor_type": executor_type,
@@ -5102,6 +5140,40 @@ mod tests {
         assert_eq!(snapshot["executor_type"], "smith");
         assert_eq!(snapshot["config"]["profile"], "luna");
         assert_eq!(snapshot["config"]["approval"], "deny");
+    }
+
+    #[test]
+    fn cli_chat_applies_frozen_profile_execution_fields() {
+        let profile = AgentProfile {
+            id: "profile-id".to_owned(),
+            identity_id: "identity-id".to_owned(),
+            backend_kind: "cli".to_owned(),
+            executor_type: "smith".to_owned(),
+            provider: Some("chatgpt".to_owned()),
+            model: Some("gpt-5.6-terra".to_owned()),
+            reasoning_effort: Some("high".to_owned()),
+            permission_policy: Some("auto".to_owned()),
+            prompt_template: None,
+            capabilities_json: "[]".to_owned(),
+            tool_policy_json: "{}".to_owned(),
+            config_json: r#"{"profile":"luna","provider":"google","model":"gemini-3.6-flash"}"#
+                .to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            version: 1,
+            created_at: "2026-08-26T00:00:00Z".to_owned(),
+            updated_at: "2026-08-26T00:00:00Z".to_owned(),
+        };
+
+        let config = cli_profile_execution_config(&profile)
+            .expect("frozen profile fields apply to the CLI config");
+
+        assert_eq!(config["profile"], "luna");
+        assert_eq!(config["provider"], "chatgpt");
+        assert_eq!(config["model"], "gpt-5.6-terra");
+        assert_eq!(config["model_reasoning_effort"], "high");
+        assert_eq!(config["effort"], "high");
+        assert_eq!(config["permission_policy"], "auto");
     }
 
     #[test]

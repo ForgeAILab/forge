@@ -41,8 +41,18 @@ impl TaskDispatcher {
             if self.is_stopped() {
                 break;
             }
+            if deferred_dispatch::dispatch_disposition_is_current(&task, &task.status) {
+                // An unchanged deterministic blocker was already observed for
+                // this exact Task version and capability — skip the attempt
+                // and its warning entirely (F11). See the matching check in
+                // `dispatch_initial_tasks`.
+                continue;
+            }
             match self.recover_active_task(project, workflow, &task).await {
-                Ok(true) => dispatched += 1,
+                Ok(true) => {
+                    deferred_dispatch::clear_dispatch_disposition(&self.db, &task).await?;
+                    dispatched += 1;
+                }
                 Ok(false) => {}
                 Err(ServiceError::Db(DbError::VersionConflict)) => {
                     tracing::debug!(task_id = %task.id, "task dispatcher recovery lost version race");
@@ -63,24 +73,23 @@ impl TaskDispatcher {
                         tracing::warn!(task_id = %task.id, %block_error, "failed to block task after workspace error");
                     }
                 }
-                Err(error) if helpers::is_not_runnable_error(&error) => {
+                Err(error) if helpers::is_deterministic_dispatch_refusal(&error) => {
+                    deferred_dispatch::record_dispatch_disposition(
+                        &self.db,
+                        &task,
+                        &task.status,
+                        &error.to_string(),
+                    )
+                    .await?;
                     tracing::warn!(
                         task_id = %task.id,
                         %error,
-                        "task is not runnable under governance; parking until a user restarts it"
+                        "task dispatch blocked; parked until Task/governance state changes or an explicit wake"
                     );
-                    if let Err(annotate_error) = crate::workflow::engine::annotate_dispatch_failure(
-                        &self.db,
-                        &task.id,
-                        task.status.as_str(),
-                        &error.to_string(),
-                    )
-                    .await
-                    {
-                        tracing::warn!(task_id = %task.id, %annotate_error, "failed to annotate not-runnable task");
-                    }
                 }
                 Err(error) => {
+                    // Potentially transient: no disposition, so the next scan
+                    // retries instead of stalling on a momentary failure.
                     tracing::warn!(task_id = %task.id, %error, "task dispatcher recovery failed");
                 }
             }

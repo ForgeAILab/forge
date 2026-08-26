@@ -5,4 +5,4 @@
  * separately named `arguments` map and are only populated by a command that
  * has validated those parameters for the caller's scope.
  */
-export type RetryAction = "refresh_and_retry" | "use_new_idempotency_key" | "repropose" | "reauthorize" | "complete_setup" | "retry_after" | "correct_input" | "select_worker" | "select_independent_reviewer" | "attach_repository" | "retry_provisioning";
+export type RetryAction = "refresh_and_retry" | "use_new_idempotency_key" | "repropose" | "reauthorize" | "complete_setup" | "retry_after" | "correct_input" | "select_worker" | "select_independent_reviewer" | "attach_repository" | "retry_provisioning" | "resolve_reconciliation";

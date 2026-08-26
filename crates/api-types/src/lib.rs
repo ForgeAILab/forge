@@ -10,6 +10,7 @@ mod coordination;
 mod core;
 mod daemon_transport;
 mod execution;
+mod execution_blocker;
 mod execution_setup;
 mod git;
 mod integration;
@@ -39,6 +40,7 @@ pub use coordination::*;
 pub use core::*;
 pub use daemon_transport::*;
 pub use execution::*;
+pub use execution_blocker::*;
 pub use execution_setup::*;
 pub use git::*;
 pub use integration::*;
@@ -126,6 +128,14 @@ fn export_typescript() {
     ExecutionPrincipalResponse::export().expect("export ExecutionPrincipalResponse");
     ProvisioningOperationResponse::export().expect("export ProvisioningOperationResponse");
     ProjectExecutionSetupResponse::export().expect("export ProjectExecutionSetupResponse");
+    ExecutionBlockerStage::export().expect("export ExecutionBlockerStage");
+    ExecutionBlockerScope::export().expect("export ExecutionBlockerScope");
+    ExecutionBlockerPrincipal::export().expect("export ExecutionBlockerPrincipal");
+    ExecutionBlockerCode::export().expect("export ExecutionBlockerCode");
+    ExecutionBlockerRecordRef::export().expect("export ExecutionBlockerRecordRef");
+    ExecutionProgress::export().expect("export ExecutionProgress");
+    ExecutionEvidenceSummary::export().expect("export ExecutionEvidenceSummary");
+    ExecutionBlockerProjection::export().expect("export ExecutionBlockerProjection");
     SelectExecutionPrincipalRequest::export().expect("export SelectExecutionPrincipalRequest");
     AttachPrimaryRepositoryRequest::export().expect("export AttachPrimaryRepositoryRequest");
     RetryProvisioningRequest::export().expect("export RetryProvisioningRequest");
@@ -289,6 +299,7 @@ fn export_typescript() {
     RetryAction::export().expect("export RetryAction");
     RetryInstruction::export().expect("export RetryInstruction");
     OrchestrationOutcome::export().expect("export OrchestrationOutcome");
+    ToolResultSummary::export().expect("export ToolResultSummary");
     ActionExecutionResponse::export().expect("export ActionExecutionResponse");
     TaskGovernanceRequest::export().expect("export TaskGovernanceRequest");
     TransitionSource::export().expect("export TransitionSource");
@@ -375,6 +386,11 @@ fn export_typescript() {
     AcceptanceEvidenceRequirement::export().expect("export AcceptanceEvidenceRequirement");
     ActivateExecutionBaselineRequest::export().expect("export ActivateExecutionBaselineRequest");
     AdaptiveEnvelope::export().expect("export AdaptiveEnvelope");
+    AdaptiveTaskOperation::export().expect("export AdaptiveTaskOperation");
+    ApproveAndActivateExecutionBaselineRequest::export()
+        .expect("export ApproveAndActivateExecutionBaselineRequest");
+    ApproveAndActivateExecutionBaselineResponse::export()
+        .expect("export ApproveAndActivateExecutionBaselineResponse");
     ApproveExecutionBaselineRequest::export().expect("export ApproveExecutionBaselineRequest");
     ApproveProjectCharterRequest::export().expect("export ApproveProjectCharterRequest");
     ApproveProjectDocumentRequest::export().expect("export ApproveProjectDocumentRequest");
@@ -435,6 +451,7 @@ fn export_typescript() {
     ExecutionBaseline::export().expect("export ExecutionBaseline");
     ExecutionBaselineApproval::export().expect("export ExecutionBaselineApproval");
     ExecutionBaselineApprovalTarget::export().expect("export ExecutionBaselineApprovalTarget");
+    ExecutionBaselineIntegrityIssue::export().expect("export ExecutionBaselineIntegrityIssue");
     ExecutionBaselineContent::export().expect("export ExecutionBaselineContent");
     ExecutionBaselineReleasePolicy::export().expect("export ExecutionBaselineReleasePolicy");
     ExecutionBaselineLifecycle::export().expect("export ExecutionBaselineLifecycle");
@@ -489,10 +506,19 @@ fn export_typescript() {
     ProjectNextAction::export().expect("export ProjectNextAction");
     ProjectMode::export().expect("export ProjectMode");
     ProjectOverview::export().expect("export ProjectOverview");
+    PendingDecisionSummary::export().expect("export PendingDecisionSummary");
+    PendingDecisionAffectedRecords::export().expect("export PendingDecisionAffectedRecords");
+    PendingDecisionActionTarget::export().expect("export PendingDecisionActionTarget");
+    PendingDecisionValidity::export().expect("export PendingDecisionValidity");
     ProjectRelease::export().expect("export ProjectRelease");
     ProjectReleaseListResponse::export().expect("export ProjectReleaseListResponse");
     ProvenanceRef::export().expect("export ProvenanceRef");
     ProvenanceSourceKind::export().expect("export ProvenanceSourceKind");
+    AgentChatTopicPrincipalType::export().expect("export AgentChatTopicPrincipalType");
+    AgentChatTopicResponse::export().expect("export AgentChatTopicResponse");
+    AgentChatTopicListResponse::export().expect("export AgentChatTopicListResponse");
+    StartAgentChatTopicRequest::export().expect("export StartAgentChatTopicRequest");
+    StartAgentChatTopicResponse::export().expect("export StartAgentChatTopicResponse");
     ReadinessInput::export().expect("export ReadinessInput");
     ReadinessFreshnessStatus::export().expect("export ReadinessFreshnessStatus");
     ReadinessFreshness::export().expect("export ReadinessFreshness");
@@ -522,6 +548,18 @@ fn export_typescript() {
     TransitionMilestoneRequest::export().expect("export TransitionMilestoneRequest");
     RecordMilestoneCheckRequest::export().expect("export RecordMilestoneCheckRequest");
     WaiveMilestoneCheckRequest::export().expect("export WaiveMilestoneCheckRequest");
+    ReconciliationResolutionAction::export().expect("export ReconciliationResolutionAction");
+    ReconciliationState::export().expect("export ReconciliationState");
+    ReconciliationRecordRef::export().expect("export ReconciliationRecordRef");
+    ReconciliationReplacementRef::export().expect("export ReconciliationReplacementRef");
+    ReconciliationConflictSummary::export().expect("export ReconciliationConflictSummary");
+    ReconciliationResolutionSummary::export().expect("export ReconciliationResolutionSummary");
+    ProjectReconciliation::export().expect("export ProjectReconciliation");
+    ProjectReconciliationListResponse::export().expect("export ProjectReconciliationListResponse");
+    ResolveProjectReconciliationRequest::export()
+        .expect("export ResolveProjectReconciliationRequest");
+    ResolveProjectReconciliationResponse::export()
+        .expect("export ResolveProjectReconciliationResponse");
     TaskProgressCounts::export().expect("export TaskProgressCounts");
     ValidationResult::export().expect("export ValidationResult");
     VersionedDigest::export().expect("export VersionedDigest");

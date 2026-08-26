@@ -15,8 +15,9 @@ use forge_agent_host::{
     classify_operation, is_allowed_project_direct_payload,
     is_project_orchestration_operation as is_catalog_project_orchestration_operation,
     operation_contract, OperationClassification, MAIN_CHARTER_DRAFT_OPERATION,
-    MAIN_GENESIS_START_OPERATION, PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_RELEASE_OPERATION,
-    TASK_ADAPTIVE_OPERATION, TASK_PROPOSE_OPERATION,
+    MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION, MAIN_GENESIS_START_OPERATION,
+    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_RELEASE_OPERATION, TASK_ADAPTIVE_OPERATION,
+    TASK_PROPOSE_OPERATION,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -1473,9 +1474,9 @@ async fn evaluate_action_policy(
 
 fn is_allowed_main_orchestration_operation(requested_permission: &str, operation: &str) -> bool {
     match operation {
-        MAIN_CHARTER_DRAFT_OPERATION | MAIN_GENESIS_START_OPERATION => {
-            requested_permission == "propose_discovery"
-        }
+        MAIN_CHARTER_DRAFT_OPERATION
+        | MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION
+        | MAIN_GENESIS_START_OPERATION => requested_permission == "propose_discovery",
         _ => false,
     }
 }
@@ -1692,6 +1693,18 @@ mod tests {
         assert!(!is_allowed_main_orchestration_operation(
             "propose_project",
             MAIN_GENESIS_START_OPERATION,
+        ));
+    }
+
+    #[test]
+    fn main_project_agent_selection_is_admitted_as_a_direct_discovery_command() {
+        assert!(is_allowed_main_orchestration_operation(
+            "propose_discovery",
+            MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
+        ));
+        assert!(!is_allowed_main_orchestration_operation(
+            "propose_project",
+            MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
         ));
     }
 

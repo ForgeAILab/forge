@@ -5,6 +5,7 @@ import type { DecisionRecord } from "./DecisionRecord";
 import type { DocumentFreshness } from "./DocumentFreshness";
 import type { EvidenceAttachment } from "./EvidenceAttachment";
 import type { OverviewProjectionState } from "./OverviewProjectionState";
+import type { PendingDecisionSummary } from "./PendingDecisionSummary";
 import type { ProjectCharterRevision } from "./ProjectCharterRevision";
 import type { ProjectCharterState } from "./ProjectCharterState";
 import type { ProjectExecutionSetupResponse } from "./ProjectExecutionSetupResponse";
@@ -13,10 +14,17 @@ import type { ProjectNextAction } from "./ProjectNextAction";
 import type { ProjectRelease } from "./ProjectRelease";
 import type { TaskProgressCounts } from "./TaskProgressCounts";
 
-export type ProjectOverview = { project_id: string, project_name: string, vision: string, charter_state: ProjectCharterState, current_charter: ProjectCharterRevision | null, primary_milestone_id: string | null, active_milestones: Array<ProjectMilestoneOverview>, task_counts: TaskProgressCounts, check_summary: AcceptanceCheckSummary, unresolved_decision_ids: Array<string>,
+export type ProjectOverview = { project_id: string, project_name: string, vision: string, charter_state: ProjectCharterState, current_charter: ProjectCharterRevision | null, primary_milestone_id: string | null, active_milestones: Array<ProjectMilestoneOverview>, task_counts: TaskProgressCounts, check_summary: AcceptanceCheckSummary,
+/**
+ * Bounded typed summaries of pending Decision candidates (design D19,
+ * finding F15). This replaced the bare `unresolved_decision_ids`
+ * identifier list in a public beta breaking response change: that
+ * field and every call site are gone, with no deprecated alias.
+ */
+pending_decisions: Array<PendingDecisionSummary>,
 /**
  * Effective Decision Log records. Draft/proposed candidates remain
- * represented separately by `unresolved_decision_ids`.
+ * represented separately by `pending_decisions`.
  */
 decisions: Array<DecisionRecord>, risks: Array<CharterRisk>, document_freshness: Array<DocumentFreshness>, evidence: Array<EvidenceAttachment>, releases: Array<ProjectRelease>, next_action: ProjectNextAction | null, projection_state: OverviewProjectionState, source_event_watermark: string, generated_at: string,
 /**

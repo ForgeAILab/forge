@@ -96,10 +96,7 @@ impl AgentChatMemoryConsumer {
                 }
             }
 
-            let dedupe_key = event
-                .dedupe_key
-                .clone()
-                .unwrap_or_else(|| format!("event:{}", event.id));
+            let dedupe_key = crate::domain_event_service::event_completion_dedupe_key(&event);
             DomainEventRepo::complete_claimed_event(
                 &*self.db,
                 CompleteDomainEvent {

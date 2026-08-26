@@ -38,10 +38,11 @@ use crate::{
         PreparedAgentTurnAdmission,
     },
     evaluate_project_charter_readiness, render_and_digest_charter, render_product_genesis_prompt,
-    resolve_requested_genesis_project_agent, AuthorizationProvenance, CommandContext,
-    CommandPrincipal, CommandScope, CommandScopeType, ExpectedCommandState, GenesisAgentSelection,
-    GenesisPromptContext, NewCommandContext, ProductGenesisService, Result, ServiceError,
-    CHARTER_READINESS_POLICY_VERSION, MAIN_OPERATING_SKILL_KEY,
+    resolve_requested_genesis_project_agent, resolve_requested_genesis_project_agent_for_account,
+    AuthorizationProvenance, CommandContext, CommandPrincipal, CommandScope, CommandScopeType,
+    ExpectedCommandState, GenesisAgentSelection, GenesisPromptContext, NewCommandContext,
+    ProductGenesisService, Result, ServiceError, CHARTER_READINESS_POLICY_VERSION,
+    MAIN_OPERATING_SKILL_KEY,
 };
 
 const CHARTER_SCHEMA_VERSION: &str = "forge.project-charter/v1";
@@ -265,6 +266,15 @@ impl MainGenesisCommandService {
         let maturity = input.request.maturity.unwrap_or(ProductMaturity::Mvp);
 
         let chat = self.main_chat_for_account(&account_id).await?;
+        if let Some(identity_id) = input.request.preferred_project_agent_identity_id.as_deref() {
+            let selection = resolve_requested_genesis_project_agent_for_account(
+                &self.db,
+                &account_id,
+                identity_id,
+            )
+            .await?;
+            input.request.preferred_project_agent_identity_id = Some(selection.identity_id);
+        }
         if let MainGenesisStartPrincipal::MainAgent { scope, .. } = &input.principal {
             if scope.scope_type == CanonicalScopeType::AgentChat && scope.scope_id != chat.id {
                 return Err(ServiceError::AuthorizationDenied {

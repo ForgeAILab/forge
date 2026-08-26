@@ -450,7 +450,27 @@ function takeMatchingToolCall(
 }
 
 function resultStatus(payload: unknown): ChatEntryStatus {
-  return asRecord(payload)?.success === false ? 'failed' : 'success'
+  return toolResultSummaryStatus(payload) ?? (asRecord(payload)?.success === false ? 'failed' : 'success')
+}
+
+// A tool-result payload may carry a bounded `ToolResultSummary` (see
+// `api_types::ToolResultSummary`) written by the durable log or the smith
+// adapter. When present, its `status` is authoritative over the generic
+// `success` heuristic below, since it reflects the exact typed orchestration
+// outcome rather than a boolean process exit code.
+function toolResultSummaryStatus(payload: unknown): ChatEntryStatus | undefined {
+  const status = stringField(asRecord(asRecord(payload)?.summary), 'status')
+  switch (status) {
+    case 'succeeded':
+      return 'success'
+    case 'failed':
+      return 'failed'
+    case 'approval_required':
+    case 'setup_required':
+      return 'pending_approval'
+    default:
+      return undefined
+  }
 }
 
 function appendSessionInfoEntry(
@@ -930,7 +950,11 @@ function toolResultLabel(payload: unknown): string | undefined {
   const record = asRecord(payload)
   const result = asRecord(record?.result)
   const resultContent = Array.isArray(result?.content) ? asRecord(result.content[0]) : undefined
+  // A bounded `ToolResultSummary` (see `api_types::ToolResultSummary`), when
+  // present, carries the exact safe message the durable log and model both
+  // saw for this call — prefer it over generic payload sniffing below.
   const value =
+    stringField(asRecord(record?.summary), 'safe_message') ??
     displayText(valueAtPath(record, ['error', 'message'])) ??
     displayText(record?.error) ??
     displayText(record?.output) ??

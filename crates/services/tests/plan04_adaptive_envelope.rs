@@ -41,6 +41,15 @@ async fn database() -> Arc<SqliteDb> {
 }
 
 async fn fixture() -> (Arc<SqliteDb>, TaskService) {
+    fixture_with_allowed_operations(&["split", "sequence", "replace"]).await
+}
+
+/// Seed the same Project with an exact adaptive grant. Baseline revisions are
+/// immutable by trigger — correctly so — which means a narrowed envelope has
+/// to be authored up front rather than patched into an approved revision.
+async fn fixture_with_allowed_operations(
+    allowed_task_operations: &[&str],
+) -> (Arc<SqliteDb>, TaskService) {
     let db = database().await;
     sqlx::query(
         "INSERT INTO user (id, email, password_hash, display_name, created_at, updated_at)
@@ -182,7 +191,7 @@ async fn fixture() -> (Arc<SqliteDb>, TaskService) {
     .expect("milestone revision");
 
     let envelope = json!({
-        "allowed_task_operations": ["split", "sequence", "replace"],
+        "allowed_task_operations": allowed_task_operations,
         "fixed_outcomes": ["ship-the-approved-outcome"],
         "fixed_acceptance": ["acceptance-r1"],
         "fixed_risk_classes": ["low"],
@@ -1235,4 +1244,163 @@ async fn plan04_generic_task_propose_cannot_bypass_adaptive_parent_governance() 
         0,
         "a rejected generic bypass must not leave a receipt"
     );
+}
+
+/// F8/8.1.1: the closed vocabulary must have exactly one source of truth.
+/// A hand-written diagnostic literal is the same drift that let
+/// `task.propose`/`task.adaptive` reach an approved baseline, so the message
+/// a caller reads is derived from the enum itself.
+#[test]
+fn adaptive_vocabulary_diagnostic_derives_from_the_closed_enum() {
+    use api_types::AdaptiveTaskOperation;
+
+    assert_eq!(
+        AdaptiveTaskOperation::ALL.len(),
+        3,
+        "the adaptive vocabulary is exactly split/sequence/replace"
+    );
+    assert_eq!(
+        services::adaptive_task_operation_supported_values(),
+        AdaptiveTaskOperation::ALL
+            .iter()
+            .map(|operation| operation.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        "the diagnostic must be derived from the enum, never a parallel literal"
+    );
+    for operation in AdaptiveTaskOperation::ALL {
+        assert_eq!(
+            AdaptiveTaskOperation::parse(operation.as_str()),
+            Some(operation)
+        );
+    }
+    for rejected in ["task.propose", "task.adaptive", "", "Split", "split "] {
+        assert!(
+            AdaptiveTaskOperation::parse(rejected).is_none(),
+            "'{rejected}' must never parse as an adaptive verb"
+        );
+    }
+}
+
+/// 8.1.2: an envelope granting the same verb twice is malformed authority.
+/// The closed type cannot express an unsupported verb, so the duplicate is
+/// the remaining representable defect and must be named with the exact field
+/// path and the allowed verbs.
+#[test]
+fn duplicate_adaptive_operation_is_rejected_with_the_exact_field_path() {
+    use api_types::AdaptiveTaskOperation;
+
+    let error = services::validate_adaptive_task_operations(&[
+        AdaptiveTaskOperation::Split,
+        AdaptiveTaskOperation::Split,
+    ])
+    .expect_err("a duplicate grant must be refused");
+    assert!(
+        error.contains("adaptive_envelope.allowed_task_operations"),
+        "the diagnostic must name the exact field path, got: {error}"
+    );
+    assert!(
+        error.contains("split") && error.contains("sequence") && error.contains("replace"),
+        "the diagnostic must list the allowed verbs, got: {error}"
+    );
+
+    services::validate_adaptive_task_operations(&[
+        AdaptiveTaskOperation::Split,
+        AdaptiveTaskOperation::Replace,
+    ])
+    .expect("distinct grants remain valid");
+}
+
+/// A persisted legacy envelope carrying the pre-closure command names must
+/// fail at active-baseline load naming the exact field, never silently admit
+/// an unrecognized verb (F8).
+#[test]
+fn persisted_legacy_adaptive_envelope_fails_naming_the_field() {
+    let legacy = r#"{"allowed_task_operations":["task.propose","task.adaptive"],
+        "fixed_outcomes":[],"fixed_acceptance":[],"fixed_risk_classes":[],
+        "forbidden_side_effects":[],"elevated_operations":[]}"#;
+    let error = services::parse_persisted_adaptive_envelope(legacy)
+        .expect_err("a legacy command-name envelope must not load");
+    assert!(
+        error.contains("adaptive_envelope.allowed_task_operations"),
+        "the diagnostic must name the exact field path, got: {error}"
+    );
+    assert!(
+        error.contains("split") && error.contains("sequence") && error.contains("replace"),
+        "the diagnostic must list the allowed verbs, got: {error}"
+    );
+}
+
+/// F9: a *denied no-op* must not create durable conflict truth.
+///
+/// The preserved failed run narrowed an envelope to exclude `replace`, called
+/// it, and the miss recorded a canonical conflict plus a Task-scoped
+/// reconciliation row — which `execution_gate()` then projected as a
+/// Project-wide `ReconciliationRequired`. One rejected command that committed
+/// no mutation stopped every unrelated Task in the Project. A denial is a
+/// policy outcome; only a proven divergence between authoritative records is
+/// reconciliation truth (D14).
+#[tokio::test]
+async fn plan04_denied_adaptive_no_op_creates_no_conflict_or_reconciliation() {
+    // `replace` is valid vocabulary this baseline simply never granted — the
+    // exact live shape.
+    let (db, service) = fixture_with_allowed_operations(&["split"]).await;
+
+    let error = service
+        .replace_task(
+            ROOT_TASK_ID.to_owned(),
+            "replacement outside the granted envelope",
+            Some("same acceptance".to_owned()),
+        )
+        .await
+        .expect_err("replace is not granted by the narrowed envelope");
+
+    // A denial, not a conflict: the message must name the allowed verbs so the
+    // caller can propose a successor baseline instead of guessing.
+    let rendered = error.to_string();
+    assert!(
+        !rendered.contains("reconciliation_required"),
+        "a denied no-op must not be reported as reconciliation truth: {rendered}"
+    );
+    assert!(
+        rendered.contains("split"),
+        "the denial must name the allowed operations: {rendered}"
+    );
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM project_canonical_conflict WHERE project_id = ?"
+        )
+        .bind(PROJECT_ID)
+        .fetch_one(db.pool())
+        .await
+        .expect("conflict count"),
+        0,
+        "a rejected no-op must create no canonical conflict"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM project_reconciliation_record WHERE project_id = ?"
+        )
+        .bind(PROJECT_ID)
+        .fetch_one(db.pool())
+        .await
+        .expect("reconciliation count"),
+        0,
+        "a rejected no-op must create no reconciliation row"
+    );
+
+    // The Project's execution authority is untouched: the still-granted
+    // operation continues to work.
+    service
+        .create_subtasks(
+            ROOT_TASK_ID.to_owned(),
+            vec![services::NewSubtaskInput {
+                title: "still-granted split".to_owned(),
+                description: Some("same acceptance".to_owned()),
+                assignee_id: None,
+            }],
+        )
+        .await
+        .expect("a denied no-op must not reduce unrelated execution authority");
 }

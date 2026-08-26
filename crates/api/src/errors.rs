@@ -43,6 +43,15 @@ impl ApiError {
         }
     }
 
+    /// A malformed or contract-violating request body. Every route's `Json`
+    /// extractor (`crate::json::Json`) maps a deserialization rejection to
+    /// this so a closed-vocabulary violation (for example an
+    /// `AdaptiveTaskOperation` outside `split`/`sequence`/`replace`) is one
+    /// `400 validation_error`, never axum's default bare `422`.
+    pub fn validation(message: impl Into<String>) -> Self {
+        Self::bad_request_with_code("validation_error", message)
+    }
+
     pub fn too_many_requests_with_code(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,

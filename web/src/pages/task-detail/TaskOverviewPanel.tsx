@@ -11,6 +11,7 @@ import {
   TaskStatusDropdown,
 } from '@/components/task-controls'
 import { TaskExecutionObservabilityPanel } from '@/components/task-execution-observability'
+import { TaskExecutionApprovalNotice } from '@/features/project-execution/TaskExecutionApprovalNotice'
 import { TaskBlockingBanner } from '@/components/task-detail/task-blocking-banner'
 import { WorkflowExceptionPanel } from '@/components/task-detail/workflow-exception-panel'
 import { TaskExternalLinks } from '@/components/task-detail/task-external-links'
@@ -433,6 +434,12 @@ export function TaskOverviewPanel({
               </div>
             ) : null}
 
+            <TaskExecutionApprovalNotice
+              projectId={task.project_id}
+              blocker={task.execution_blocker}
+              evidence={task.execution_evidence}
+            />
+
             {errorInfo && !task.workflow_exception ? (
               <div
                 className={cn(
@@ -547,7 +554,12 @@ export function TaskOverviewPanel({
                   })}
                   {showFallbackActions ? (
                     <>
-                      {canLaunch ? (
+                      {/* An outstanding execution blocker (D16/D17) means
+                          launching would just re-enter the same gate this
+                          Task is already waiting on -- `TaskExecutionApprovalNotice`
+                          above already states the one authorized recovery, so this
+                          option is removed rather than offered only to fail (8.2.6). */}
+                      {canLaunch && !task.execution_blocker ? (
                         <Button
                           variant="outline"
                           size="sm"

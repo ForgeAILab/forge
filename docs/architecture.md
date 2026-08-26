@@ -141,9 +141,11 @@ separate from Charter prose. The Main Agent can list the exact eligible
 identities and persist one selection through receipt-backed native operations;
 Charter approval freezes that same identity/profile/skill/policy set. Once a
 preference exists it is authoritative: an ineligible choice blocks approval
-instead of silently substituting another identity. Automatic selection and
-execution-role provisioning never choose a credential-less bootstrap default,
-although a user may explicitly select a locally authenticated CLI identity.
+instead of silently substituting another identity, and a stale client approval
+target that names any different eligible identity or revision set is rejected
+before an approval receipt can commit. Automatic selection and execution-role
+provisioning never choose a credential-less bootstrap default, although a user
+may explicitly select a locally authenticated CLI identity.
 
 The singular role boundary is enforced by the authenticated binding and the
 Task scheduler, not by model instructions:
@@ -174,6 +176,11 @@ Every persistent agent session binds to one canonical scope:
 Effective permissions are a fail-closed intersection of the account, selected
 profile, canonical scope, tool, approval, and applicable binding or
 Task-assignment layers. Opaque record IDs are references, not capabilities.
+The reusable Agent Chat context scope records only this stable canonical
+authority. Each admitted turn separately freezes its binding, identity,
+Profile, operating-skill, and policy revisions, so editing an identity can
+rotate the next native session without either mutating an earlier turn's
+provenance or falsely reporting that the same Chat scope changed authority.
 
 ### Main and Project Agent Chats
 
@@ -232,7 +239,12 @@ authorize the user-only release action.
 The chat worker selects the session backend from the bound identity's profile.
 A native profile uses the embedded host and an Agent Chat-scoped continuity
 timeline; a safely migrated CLI profile may use an explicit constrained chat
-backend and must advertise its actual limitations. Main and Project chats have
+backend and must advertise its actual limitations. CLI execution is derived
+from the admitted immutable Profile's top-level model, reasoning effort, and
+permission policy plus its bounded `config_json`; retry never re-reads the
+current Profile. Adapter discovery also preserves model-to-provider identity,
+so a Smith model such as `gpt-5.6-terra` remains bound to its discovered
+`chatgpt` provider rather than an adapter default. Main and Project chats have
 deny-all filesystem access. Project Agent Task actions go through the existing
 `TaskService` and workflow; repository mutation remains limited to admitted
 Task Worker/reviewer executions in their Task Workspaces.
@@ -344,6 +356,42 @@ or configuration action, not a best-effort executable success. Read-only
 planning/discovery may remain available under its explicit capability before an
 active baseline.
 
+#### Canonical execution blocker and capability-aware review
+
+`ExecutionBlockerProjection` (`api-types::execution_blocker`) is the one
+server-owned explanation for why repository-mutating execution cannot proceed
+right now: `code`, `stage`, `scope`, affected/governing record refs, canonical
+attempt/execution/commit evidence, safe headline/explanation copy, the
+required principal, and exactly one permitted `next_action`.
+`ProjectExecutionSetupResponse.execution_blocker` carries the Project-wide
+instance (built from the same `coordination_state`/`execution_setup_state`/
+`execution_gate` computation as the table above); `TaskResponse.execution_blocker`
+carries either that same Project-wide blocker or, when the Project itself is
+clear, a reconciliation scoped to only that Task
+(`services::load_task_execution_blocker`). Only a governing-truth conflict
+(currently `invalid_active_baseline`) widens the Project-wide gate; every
+other recorded conflict attaches solely to its own affected Task/plan-item/
+milestone record and leaves unrelated work on the same active plan
+untouched. Every surface that explains a blocker — Project execution setup,
+Task detail/banner, chat context, phase controls, and activity history —
+renders this projection's copy verbatim; a Task's own
+`execution_evidence` (`ExecutionEvidenceSummary`) is separately derived from
+its attempt/execution/commit history and can never regress to "not started"
+once an attempt or commit exists, even while the Task is blocked.
+
+Gate evaluation is capability-aware
+(`task_service::governance::{ensure_task_runnable, ensure_task_reviewable}`).
+Repository mutation (the `worker` WorkspaceLease role) requires the Project
+gate to be `active` with no applicable conflict outstanding. Independent
+read-only review of an already-committed result (the dedicated `reviewer`
+role) may continue past an outstanding conflict as long as every currently
+applicable one is acceptance/evidence/risk/reviewer/release neutral — it
+never touches one of the baseline's fixed-boundary fields (fixed outcomes,
+fixed acceptance, fixed risk classes, forbidden side effects, release policy,
+or elevated operations). Remediation that writes to the repository remains
+gated exactly like any other repository mutation; only the read-only review
+lease is granted the wider allowance.
+
 ### Execution liveness and terminal concurrency
 
 An execution attempt has its own owner-bound liveness contract. The
@@ -450,6 +498,149 @@ does not use a global “latest record wins” hierarchy. It computes a typed
 Documents/Decisions/Tasks/checks/milestones/releases, and records a visible
 canonical conflict plus `reconciliation_required` reason when authoritative
 records disagree. It blocks only the affected execution or readiness path.
+
+#### Main Chat topic epochs
+
+Forge has exactly one account Main Chat. A *topic* is a durable, user-owned
+context epoch inside that chat, not a second chat: `agent_chat_topic`
+(migration `V103`) records an immutable sequence, label/summary, principal,
+timestamp, and the `starting_message_sequence` its epoch begins at. Topic
+membership is derived from `sequence >= starting_message_sequence`, so no
+message row is ever rewritten and every historical message/turn ID and its
+provenance survive the backfill unchanged. Rotation inserts one topic row plus
+one ordinary system message that the timeline renders as a divider.
+
+`FederatedAgentChatTurnRunner` bounds a new Main turn's episodic history to the
+current topic's floor. A chat with no topic — every Project Chat, and any Main
+Chat before its first topic — has floor `0`, so the behavior is unchanged for
+them. Canonical portfolio state and unresolved durable obligations are supplied
+independently of the epoch, and earlier topics stay inspectable rather than
+being injected wholesale. Starting a topic is denied while a Main turn is live
+or while a Genesis session/approval needs an explicit finish-or-cancel
+decision.
+
+#### Adaptive authority is a closed vocabulary
+
+`AdaptiveEnvelope.allowed_task_operations` is `Vec<AdaptiveTaskOperation>` — a
+closed server-owned enum of exactly `split`, `sequence`, and `replace`. JSON is
+the bare lowercase string and the generated TypeScript is a closed union, so
+every transport shares one vocabulary. These are adaptive *verbs*, never
+command names: `task.propose` and `task.adaptive` are commands and can never
+appear here. The single source of that vocabulary is `AdaptiveTaskOperation::ALL`
+— every diagnostic, input schema, and parser derives from it rather than
+repeating a literal list, because a second copy is how an envelope granting
+unrecognized verbs reached an approved baseline in the first place.
+
+Validation runs whenever the field is present in a draft and again over the
+complete envelope at proposal, approval, activation, persisted-receipt replay,
+and active-baseline load. This is defense in depth through one shared
+validator, not a per-adapter validator: REST, native, and any future MCP
+adapter return the same field path and the same allowed values. Historical
+revisions stay immutable — an invalid one is marked non-activatable, and an
+invalid *active* baseline projects an exact `invalid_active_baseline` blocker
+rather than being silently rewritten.
+
+Migration `V104` adds the data-preserving integrity ledger and database guards.
+At startup, before any agent or dispatcher can act, the service audits every
+persisted revision with the same Rust enum validator used at command admission.
+For an invalid inactive candidate it records the exact field and values and
+prevents later approval or activation. For an invalid active revision it also
+reserves stable conflict, reconciliation, and successor identities; preserves
+the active revision and its approval unchanged; projects a Project-wide
+blocker; and creates a draft on the same baseline that retains only already
+valid verbs. Unsupported historical values are shown as quarantined evidence,
+never guessed or mapped to new authority.
+
+The correction draft follows the ordinary proposal and explicit user approval
+path, but approval alone cannot move the active pointer. The only exit is the
+`revised` action on that exact `invalid_active_baseline` reconciliation, naming
+the exact approved successor revision. One transaction revalidates its
+manifest, receipt, digests, Charter, milestones, and optimistic versions;
+activates the successor; supersedes (without deleting) the invalid revision;
+consumes the approval; resolves only the named reconciliation; and records one
+receipt/event. Any race rolls the whole correction back.
+
+#### Denial and reconciliation are different outcomes
+
+Adaptive admission parses the requested operation as the closed enum *before*
+any governance lookup, and its outcomes are deliberately distinct:
+
+| Condition | Outcome | Durable conflict | Execution effect |
+|---|---|---|---|
+| Operation is malformed or unknown | `validation_error` | none | none |
+| Valid operation outside a valid active envelope | `policy_denied` naming the allowed verbs | none | none |
+| An authoritative Task/artifact diverges from its governing baseline | `reconciliation_required` | exact conflict and affected records | smallest affected capability blocked |
+| Active governing baseline is itself invalid | Project-wide `reconciliation_required` | exact governing conflict | repository mutation blocked until successor approval |
+
+A rejected command that commits no authoritative mutation can never create a
+`project_reconciliation_record`. Creating one requires evidence of two
+diverging authoritative records or an invalid current governing record, and the
+conflict stores the exact affected paths rather than a generic list. Wanting
+authority beyond the envelope is an explicit successor-baseline or
+reconciliation proposal, not a conflict.
+
+#### Reconciliation has one shared, scoped command
+
+`services::ProjectReconciliationService` owns Project and principal
+authorization before lookup, record/conflict/governing-reference consistency,
+expected-version and idempotency checks, action validity for the affected
+record type, exact replacement references for `revised`/`superseded`, and the
+atomic commit of resolution, canonical-conflict disposition, affected-record
+updates, command receipt, and durable event. It publishes after commit and
+wakes the exact Task scope affected by the committed change. An invalid active
+baseline is the one record-specific exception to the generic action set: it
+allows only `revised` with the exact approved successor and performs activation
+inside that same transaction; unrelated Task-scoped reconciliations remain
+required and do not block this Project-wide repair. `GET`/`GET`/`POST` under
+`/api/v1/projects/{id}/reconciliations[/{id}/resolve]` are its only adapters.
+Resolution is interactive-user-only for every record type; no chat agent
+receives a generic self-resolve tool. A registry parity test fails whenever a
+Project next action names an operation with no registered handler and
+authorized presentation target.
+
+#### Dispatch dispositions and wakes
+
+A deterministic dispatch refusal — a governance denial, an unresolved conflict,
+missing setup — is recorded once as a dispatch disposition keyed by Task ID,
+Task version, requested capability, and a blocker digest
+(`services::deferred_dispatch`). The periodic scan skips an unchanged
+disposition without re-attempting it, re-annotating it, or logging it again;
+without this, an unchanged blocker was retried and logged every ten seconds
+indefinitely and review never ran. Classification is by typed `ServiceError`
+variant, never by matching refusal text, because that text belongs to the
+blocker projection and keeps changing. Potentially transient failures record no
+disposition and retry on the next scan.
+
+Metadata writes do not bump a Task's `version`, so a disposition stays keyed to
+the state it observed. Governance state living outside the `task` row —
+baseline activation, reconciliation resolution, an authorized retry — must call
+`services::wake_task_dispatch`, which clears the disposition so exactly one
+subsequent scan re-attempts that exact Task. Baseline activation uses
+`wake_baseline_task_dispatch` to select only non-terminal Tasks whose runnable
+governance names the exact activated revision. The wake is safe to replay after
+a lost response or process crash because clearing an absent disposition is a
+no-op.
+
+#### One SSE transport envelope
+
+`GET /api/v1/events` sends one default-message JSON envelope per frame; the
+payload's `event_type` is the sole routing discriminator, and the route sets no
+per-frame SSE `event:` name. SSE remains a latency optimization only: durable
+queries plus a bounded resync stay sufficient to converge after loss,
+reconnect, or an unrecognized `event_type`. Every committed durable event
+uses one shared completion identity across consumers: its stored `dedupe_key`
+when present, otherwise the bare event ID. Consumers must not invent a
+transport-specific fallback, because disagreement with the repository contract
+would pin that consumer's cursor at the event forever. Events publish after
+their transaction and invalidate the exact query keys they affect; the client
+invalidates active authoritative queries once per stream
+open, reconnect, or resync, and reconciles a live optimistic turn with a
+bounded watchdog. The watchdog follows both a locally optimistic admission and
+an authoritative cached server turn while either is live, actively refetches
+messages and turns even when the document is hidden, and stops only at the
+terminal or control-transfer state. An expired event-stream token therefore
+cannot leave a backgrounded `retry_wait` turn visibly stuck after REST truth
+has advanced to `failed`.
 
 When Task creation omits an explicit governance envelope, Forge derives one
 from the Project's current Charter. Before baseline activation, ordinary
@@ -766,7 +957,9 @@ entry's API key into the in-memory executor snapshot as the provider's
 environment variable; the stored snapshot, events, and logs never carry the
 key, and OAuth bundles are refused for harness injection. Harness agents
 without an entry keep their CLI-managed login and are surfaced from daemon CLI
-discovery.
+discovery. Adapter health parsers treat explicit negative authentication
+phrases as authoritative before considering positive phrases; executable
+presence alone is never evidence that a harness can accept work.
 
 Credential handles distinguish static `api_key` payloads from renewable
 `oauth_bundle` payloads and carry optimistic versions. Native adapters acquire
@@ -791,7 +984,10 @@ protected credential/checkpoint/session stores, interaction handling, runtime
 events, content guards, usage mapping, cancellation/steering capabilities,
 typed tools, and scope-derived workspaces. Forge does not depend on the sibling
 TUI and does not add a Smith-native backend; Smith remains an existing CLI Task
-executor/profile.
+executor/profile. Accordingly, a Smith-managed login under `~/.smith` is used
+only while Smith owns that CLI runtime. Forge neither reads nor imports that
+credential store into the native host; native Main/Project typed tools require
+an account-owned Forge provider entry and lease.
 
 Agent Runtime terminal limits retain their typed cause across the host boundary:
 `provider_attempts`, `tool_steps`, `time`, or `output`. These are distinct from

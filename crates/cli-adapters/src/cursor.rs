@@ -563,7 +563,15 @@ fn cursor_status_authenticated() -> bool {
 
     let mut combined = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
     combined.push_str(&String::from_utf8_lossy(&output.stderr).to_ascii_lowercase());
+    cursor_status_output_authenticated(&combined)
+}
+
+fn cursor_status_output_authenticated(combined: &str) -> bool {
+    let combined = combined.to_ascii_lowercase();
     if combined.contains("not authenticated")
+        || combined.contains("not logged in")
+        || combined.contains("not signed in")
+        || combined.contains("authentication required")
         || combined.contains("authenticated: false")
         || combined.contains("authenticated false")
     {
@@ -717,5 +725,19 @@ mod tests {
         assert_eq!(session_id.as_deref(), Some("session-1"));
         assert_eq!(summary.as_deref(), Some("final text"));
         assert!(error.is_none());
+    }
+
+    #[test]
+    fn status_parser_does_not_treat_not_logged_in_as_logged_in() {
+        assert!(!cursor_status_output_authenticated("Not logged in"));
+        assert!(!cursor_status_output_authenticated(
+            "Authentication required. Please run 'agent login' first"
+        ));
+        assert!(!cursor_status_output_authenticated("Authenticated: false"));
+        assert!(cursor_status_output_authenticated("Logged in"));
+        assert!(cursor_status_output_authenticated(
+            "Signed in as user@example.test"
+        ));
+        assert!(cursor_status_output_authenticated("Authenticated: true"));
     }
 }

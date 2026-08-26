@@ -16,13 +16,37 @@ pub(super) fn is_io_or_workspace_error(error: &ServiceError) -> bool {
     }
 }
 
-/// Governance admission rejections (`ensure_task_runnable`) are deterministic:
-/// retrying the dispatch cannot succeed until a user approves an execution
-/// baseline. The dispatcher parks such tasks instead of rescheduling them.
-pub(super) fn is_not_runnable_error(error: &ServiceError) -> bool {
+/// Whether a dispatch refusal is *deterministic*: re-running the identical
+/// attempt against the identical Task version and governance state produces
+/// the identical refusal.
+///
+/// Only a deterministic refusal earns a dispatch disposition. Quiescing on a
+/// transient failure — a busy database, an unreachable daemon, a rate limit —
+/// would park the Task until its `version` happened to change or someone
+/// called `wake_task_dispatch`, turning a momentary blip into a permanent
+/// stall. Those keep the previous behavior of being retried next scan.
+///
+/// Classification is by typed variant, never by matching refusal text: the
+/// governance/denial wording belongs to the blocker projection and is
+/// expected to keep changing.
+pub(super) fn is_deterministic_dispatch_refusal(error: &ServiceError) -> bool {
     match error {
-        ServiceError::ExecutionSetupRequired { .. } => true,
-        ServiceError::InvalidOperation { message } => message.contains("is not runnable"),
+        // Governance and admission outcomes: setup a user must complete, an
+        // authority the active baseline does not grant, an unresolved
+        // canonical conflict, or an action this Task cannot currently offer.
+        ServiceError::ExecutionSetupRequired { .. }
+        | ServiceError::AuthorizationDenied { .. }
+        | ServiceError::Conflict(_)
+        | ServiceError::TaskActionUnavailable { .. }
+        | ServiceError::DependencyGate
+        | ServiceError::MissingPrimaryRepo { .. }
+        | ServiceError::RepoMismatch { .. }
+        | ServiceError::PrProviderMissing { .. } => true,
+        // A malformed or contract-violating request cannot fix itself, but an
+        // I/O or workspace failure surfaced through the same variant can.
+        ServiceError::InvalidOperation { .. } => !is_io_or_workspace_error(error),
+        // Everything else — database, git, review, daemon, rate limiting — is
+        // treated as potentially transient and retried.
         _ => false,
     }
 }

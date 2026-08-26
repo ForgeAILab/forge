@@ -58,5 +58,23 @@ describe('normalizeDiscoveredOptions', () => {
       'medium',
       'high',
     ])
+    expect(options.modelConfigs).toEqual({})
+  })
+
+  it('preserves Smith model-to-provider config for harness registration', () => {
+    const options = normalizeDiscoveredOptions({
+      models: ['gpt-5.6-terra', 'gemini-3.6-flash'],
+      cli_specific: {
+        model_providers: {
+          'gpt-5.6-terra': 'chatgpt',
+          'gemini-3.6-flash': 'google',
+        },
+      },
+    })
+
+    expect(options.modelConfigs).toEqual({
+      'gpt-5.6-terra': { provider: 'chatgpt' },
+      'gemini-3.6-flash': { provider: 'google' },
+    })
   })
 })

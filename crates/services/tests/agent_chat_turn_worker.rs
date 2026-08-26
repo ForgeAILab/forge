@@ -194,6 +194,55 @@ impl AgentChatTurnRunner for GenesisTransferRunner {
 }
 
 #[tokio::test]
+async fn genesis_start_rejects_a_project_agent_display_name_before_persistence() {
+    let db = database().await;
+    let chats = AgentChatService::new(Arc::clone(&db));
+    chats
+        .set_main_binding(SetMainAgentBindingInput {
+            actor_user_id: ACCOUNT_ID.to_owned(),
+            account_id: ACCOUNT_ID.to_owned(),
+            identity_id: IDENTITY_ID.to_owned(),
+            autonomy_policy_json: "{}".to_owned(),
+            tool_policy_revision: "genesis-invalid-project-agent-policy".to_owned(),
+            expected_version: None,
+            replacement_reason: None,
+        })
+        .await
+        .expect("Main binding");
+
+    let error = MainGenesisCommandService::new(Arc::clone(&db))
+        .start(MainGenesisStartCommandInput {
+            principal: MainGenesisStartPrincipal::User {
+                user_id: ACCOUNT_ID.to_owned(),
+            },
+            request: MainGenesisStartRequest {
+                maturity: Some(ProductMaturity::Mvp),
+                initial_idea: Some("Build a local note app.".to_owned()),
+                preferred_project_agent_identity_id: Some("Gate E OpenAI Project".to_owned()),
+            },
+            idempotency_key: "genesis-invalid-project-agent".to_owned(),
+            correlation_id: "genesis-invalid-project-agent-correlation".to_owned(),
+            causation_id: None,
+            causation_depth: 0,
+            policy_result: "allowed".to_owned(),
+            requested_permission: "propose_discovery".to_owned(),
+        })
+        .await
+        .expect_err("display name must not be accepted as an identity id");
+    assert!(matches!(
+        error,
+        ServiceError::InvalidOperation { ref message }
+            if message.contains("is not an eligible account-owned identity")
+    ));
+
+    let sessions = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM product_genesis_session")
+        .fetch_one(db.pool())
+        .await
+        .expect("Genesis count");
+    assert_eq!(sessions, 0, "invalid input must not persist Genesis state");
+}
+
+#[tokio::test]
 async fn genesis_control_transfer_stops_provider_and_commits_no_baseline_response() {
     let db = database().await;
     let chats = AgentChatService::new(Arc::clone(&db));

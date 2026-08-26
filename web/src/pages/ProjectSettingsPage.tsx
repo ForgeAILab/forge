@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
 import type { Icon } from '@phosphor-icons/react'
 import {
@@ -60,6 +61,7 @@ import { getApiErrorMessage } from '@/lib/api-error'
 import { cn } from '@/lib/cn'
 import { productTerm } from '@/lib/i18n'
 import { useAuthStore } from '@/stores/auth'
+import { clearDeletedProjectScope, resolveNextProjectId } from '@/stores/project-scope'
 import type { DefaultRoleAssignment, LifecycleHooks } from '@/types/generated'
 
 export type ProjectSettingsTab =
@@ -106,6 +108,7 @@ export function ProjectSettingsPage({
   const pauseProject = usePauseProject()
   const resumeProject = useResumeProject()
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
 
   const agentsQuery = useAgentsQuery()
 
@@ -386,9 +389,23 @@ export function ProjectSettingsPage({
               variant="destructive"
               onClick={() => {
                 deleteProject.mutate(projectId, {
-                  onSuccess: () => {
+                  onSuccess: async () => {
                     toast.success('Project deleted')
-                    void navigate({ to: '/' })
+                    // F17 / 8.4.4: clear every deleted-scope cache, chat
+                    // state, and the persisted selection, then land on
+                    // another authorized Project or Main Chat — never a
+                    // stale Project-scoped page, never the fabricated
+                    // `default` id `/` used to fall back to.
+                    clearDeletedProjectScope(queryClient, projectId)
+                    const nextProjectId = await resolveNextProjectId(queryClient, projectId)
+                    void navigate(
+                      nextProjectId
+                        ? {
+                            to: '/projects/$projectId/board',
+                            params: { projectId: nextProjectId },
+                          }
+                        : { to: '/chat' },
+                    )
                   },
                   onError: (error) => {
                     toast.error(

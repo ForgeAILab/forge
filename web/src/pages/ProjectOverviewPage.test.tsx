@@ -15,6 +15,8 @@ type LinkProps = {
   children: ReactNode
 }
 
+const navigate = vi.hoisted(() => vi.fn())
+
 vi.mock('@tanstack/react-router', () => ({
   Link: ({ to, params, className, children }: LinkProps) => {
     const href = params
@@ -26,6 +28,7 @@ vi.mock('@tanstack/react-router', () => ({
       </a>
     )
   },
+  useNavigate: () => navigate,
 }))
 
 const releaseMutation = vi.hoisted(() => vi.fn())
@@ -64,14 +67,21 @@ vi.mock('@/api/client', () => {
     apiFetchBlob: mediaFetch,
     // The adoption banner reads the Project Charter; an empty projection keeps
     // it on the "nothing to approve yet" branch these Overview tests assert.
-    apiFetch: vi.fn(async () => ({
-      charter: null,
-      revisions: [],
-      current_draft_revision: null,
-      current_approved_revision: null,
-      approval: null,
-      selected_project_agent: null,
-    })),
+    // `/projects` is `resolveNextProjectId`'s call, exercised by the
+    // deleted-Project redirect test below.
+    apiFetch: vi.fn(async (path: string) => {
+      if (path === '/projects') {
+        return { items: [], next_cursor: null, has_more: false, total_count: 0 }
+      }
+      return {
+        charter: null,
+        revisions: [],
+        current_draft_revision: null,
+        current_approved_revision: null,
+        approval: null,
+        selected_project_agent: null,
+      }
+    }),
     ApiError: MockApiError,
   }
 })
@@ -172,7 +182,38 @@ const overview: ProjectOverview = {
   active_milestones: [activeMilestone],
   task_counts: counts,
   check_summary: checkSummary,
-  unresolved_decision_ids: ['decision-1'],
+  pending_decisions: [
+    {
+      id: 'decision-1',
+      project_id: 'project-1',
+      lifecycle: 'proposed',
+      version: 1n,
+      question: 'Which implementation approach should the Project use?',
+      options: ['option-a', 'option-b'],
+      recommendation: 'option-a',
+      rationale: 'The bounded implementation choice fits the approved envelope.',
+      decision_class: 'project_implementation',
+      affected_records: {
+        affected_artifact_refs: [],
+        affected_task_ids: [],
+        affected_milestone_ids: [],
+      },
+      proposed_by: { kind: 'agent', id: 'agent-1', display_name: null },
+      required_principal: 'user',
+      validity: 'valid',
+      invalid_reason: null,
+      approve_target: {
+        method: 'POST',
+        path: '/api/v1/projects/project-1/decisions/candidates/decision-1/approve',
+      },
+      reject_target: {
+        method: 'POST',
+        path: '/api/v1/projects/project-1/decisions/candidates/decision-1/reject',
+      },
+      created_at: '2026-08-13T10:00:00Z',
+      updated_at: '2026-08-13T10:00:00Z',
+    },
+  ],
   decisions: [],
   risks: [
     {
@@ -487,5 +528,25 @@ describe('ProjectOverviewPage', () => {
 
     expect(screen.getByRole('status').getAttribute('aria-busy')).toBe('true')
     expect(screen.getByText('Loading Project Overview…')).toBeTruthy()
+  })
+
+  // F17 / 8.4.4: viewing an Overview whose Project was deleted (by this
+  // user elsewhere, or another authorized member) must converge the same
+  // way an explicit delete does, not strand the user on a dead page.
+  it('clears the deleted Project scope and navigates away on a 404', async () => {
+    navigate.mockClear()
+    mockQuery({
+      data: undefined,
+      isError: true,
+      error: new ApiError(JSON.stringify({ code: 'not_found', message: 'gone' }), 404),
+    })
+
+    render(<ProjectOverviewPage projectId="project-1" />)
+
+    expect(screen.getByText(/This Project no longer exists/)).toBeTruthy()
+    await waitFor(() => expect(navigate).toHaveBeenCalled())
+    // No other Project exists per the `/projects` mock above, so the only
+    // safe destination is Main Chat — never the fabricated `default` board.
+    expect(navigate).toHaveBeenCalledWith({ to: '/chat' })
   })
 })

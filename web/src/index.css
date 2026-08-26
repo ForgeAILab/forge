@@ -13,7 +13,7 @@
   --border: 30 10% 88%;
   --input: 30 10% 88%;
   --ring: 25 95% 53%;
-  --primary: 21 90% 40%;
+  --primary: 21 90% 37%;
   --primary-foreground: 0 0% 100%;
   --secondary: 30 12% 95%;
   --secondary-foreground: 24 10% 15%;
@@ -25,9 +25,9 @@
   --popover-foreground: 24 10% 10%;
 
   /* Extended tokens */
-  --success: 160 84% 39%;
+  --success: 160 84% 26%;
   --success-foreground: 0 0% 100%;
-  --warning: 38 92% 50%;
+  --warning: 38 92% 33%;
   --warning-foreground: 0 0% 100%;
 
   /* Sidebar */
@@ -35,7 +35,7 @@
   --sidebar-foreground: 25 6% 45%;
   --sidebar-border: 30 10% 91%;
   --sidebar-active: 25 95% 53%;
-  --sidebar-active-foreground: 25 95% 40%;
+  --sidebar-active-foreground: 25 95% 37%;
   --sidebar-hover: 30 12% 95%;
 
   /* Subtle border — softer than --border, used for cards/panels */

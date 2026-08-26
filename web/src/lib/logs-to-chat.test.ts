@@ -85,6 +85,62 @@ describe('logsToChatEntries', () => {
     })
   })
 
+  it('3b. tool_result summary drives status and label over the generic success heuristic', () => {
+    const result = {
+      call_id: 'call-1',
+      name: 'forge_project_orchestration_propose',
+      is_error: true,
+      success: false,
+      summary: {
+        status: 'failed',
+        code: 'version_conflict',
+        safe_message: 'the authorized resource changed; refresh current state and retry',
+        retryable: true,
+        recovery_action: 'refresh_and_retry',
+        correlation_id: 'corr-1',
+      },
+    }
+    const entries = logsToChatEntries([
+      log('tool_call', { tool: 'forge_project_orchestration_propose', call_id: 'call-1' }, 1),
+      log('tool_result', result, 2),
+    ])
+
+    expect(entries).toHaveLength(1)
+    expect(entries[0]).toMatchObject({
+      kind: 'tool_call',
+      status: 'failed',
+      resultLabel: 'the authorized resource changed; refresh current state and retry',
+    })
+  })
+
+  it('3c. tool_result summary never leaks a redacted internal cause into the label', () => {
+    // The durable log entry only ever carries the bounded summary fields, so
+    // there is nothing for the tool card to accidentally surface here — this
+    // guards the frontend contract even though redaction itself happens
+    // server-side before the entry is written.
+    const result = {
+      call_id: 'call-1',
+      name: 'forge_task_command',
+      is_error: true,
+      success: false,
+      summary: {
+        status: 'failed',
+        code: 'internal_failure',
+        safe_message: 'the tool call did not complete successfully',
+        retryable: false,
+        correlation_id: 'call-1',
+      },
+    }
+    const entries = logsToChatEntries([log('tool_result', result, 1)])
+
+    const entry = entries.find((candidate) => candidate.kind === 'tool_call')
+    expect(entry).toMatchObject({
+      status: 'failed',
+      resultLabel: 'the tool call did not complete successfully',
+    })
+    expect(JSON.stringify(entry)).not.toContain('SECRET')
+  })
+
   it('4. Orphan tool_result without a tool name -> standalone ChatSystemEntry', () => {
     const payload = { success: true, output: 'late' }
     const entries = logsToChatEntries([log('tool_result', payload, 1)])

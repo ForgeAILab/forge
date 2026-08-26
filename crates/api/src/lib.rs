@@ -17,6 +17,7 @@ use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
 pub mod errors;
+pub mod json;
 pub mod middleware;
 mod path_input;
 pub mod routes;
@@ -232,12 +233,28 @@ pub fn api_router(state: AppState) -> Router {
             post(routes::project_execution_setup::retry_provisioning),
         )
         .route(
+            "/api/v1/projects/{id}/reconciliations",
+            get(routes::reconciliations::list_project_reconciliations),
+        )
+        .route(
+            "/api/v1/projects/{id}/reconciliations/{reconciliation_id}",
+            get(routes::reconciliations::get_project_reconciliation),
+        )
+        .route(
+            "/api/v1/projects/{id}/reconciliations/{reconciliation_id}/resolve",
+            post(routes::reconciliations::resolve_project_reconciliation),
+        )
+        .route(
             "/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions",
             post(routes::execution_baseline::save_execution_baseline_revision),
         )
         .route(
             "/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions/{revision_id}/approve",
             post(routes::execution_baseline::approve_execution_baseline),
+        )
+        .route(
+            "/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions/{revision_id}/approve-and-activate",
+            post(routes::execution_baseline::approve_and_activate_execution_baseline),
         )
         .route(
             "/api/v1/projects/{id}/execution-baseline/{baseline_id}/activate",
@@ -438,6 +455,11 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/agent-chats/{chat_id}/turns/{turn_id}/cancel",
             post(routes::agent_chats::cancel_agent_chat_turn),
+        )
+        .route(
+            "/api/v1/agent-chats/{chat_id}/topics",
+            get(routes::agent_chats::list_agent_chat_topics)
+                .post(routes::agent_chats::start_agent_chat_topic),
         )
         .route(
             "/api/v1/projects/{id}/agent-handoffs",

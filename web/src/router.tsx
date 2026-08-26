@@ -168,6 +168,18 @@ function RootRouteComponent() {
   return <AppShell>{content}</AppShell>
 }
 
+// 8.4.4: the root route must never invent a `default` Project ID — that
+// fabricated ID 404s on every Project-scoped fetch behind it. With no
+// authorized Project (a fresh account, or the last one just deleted), Main
+// Chat is the only destination that is always valid. Exported as a pure
+// function so this exact selection is unit-testable without a full router
+// harness (see router.test.ts).
+export function firstAuthorizedProjectId(
+  projects: Pick<PaginatedResponse<Project>, 'items'>,
+): string | undefined {
+  return projects.items[0]?.id
+}
+
 const indexRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/',
@@ -176,10 +188,12 @@ const indexRoute = createRoute({
       queryKey: qk.projects,
       queryFn: () => apiFetch<PaginatedResponse<Project>>('/projects'),
     })
-    throw redirect({
-      to: '/projects/$projectId/board',
-      params: { projectId: projects.items[0]?.id ?? 'default' },
-    })
+    const firstProjectId = firstAuthorizedProjectId(projects)
+    throw redirect(
+      firstProjectId
+        ? { to: '/projects/$projectId/board', params: { projectId: firstProjectId } }
+        : { to: '/chat' },
+    )
   },
 })
 
@@ -398,8 +412,7 @@ const agentsRoute = createRoute({
     project: typeof search.project === 'string' ? search.project : undefined,
     provider: typeof search.provider === 'string' ? search.provider : undefined,
     status: typeof search.status === 'string' ? search.status : undefined,
-    authorization:
-      typeof search.authorization === 'string' ? search.authorization : undefined,
+    authorization: typeof search.authorization === 'string' ? search.authorization : undefined,
     identity: typeof search.identity === 'string' ? search.identity : undefined,
   }),
   component: AgentsRouteComponent,

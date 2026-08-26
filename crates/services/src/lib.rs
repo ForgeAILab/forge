@@ -21,6 +21,7 @@ pub mod default_agents;
 pub(crate) mod deferred_dispatch;
 pub mod demo;
 pub mod diff;
+pub mod domain_event_broadcast;
 pub mod domain_event_service;
 pub mod embedded_agent_service;
 pub mod embedded_daemon;
@@ -31,6 +32,7 @@ pub mod external_api;
 pub mod external_sync;
 pub mod integration_service;
 pub mod lifecycle;
+pub mod main_chat_topic;
 pub mod main_genesis_commands;
 pub mod main_orchestration_actions;
 pub mod main_orchestration_queries;
@@ -63,6 +65,7 @@ pub mod project_member_service;
 pub mod project_milestone_commands;
 pub mod project_orchestration;
 pub mod project_provisioning;
+pub mod project_reconciliation;
 pub mod project_runtime;
 pub mod prompt_preview;
 pub mod provider_authorization;
@@ -145,23 +148,31 @@ pub use daemon_transport::{
     ExecutionProvider, FilesystemProvider, RemoteExecutionProvider, RemoteFilesystemProvider,
 };
 pub use default_agents::ensure_default_agents;
+pub use deferred_dispatch::{wake_baseline_task_dispatch, wake_task_dispatch};
 pub use demo::install_demo_data;
 pub use diff::DiffService;
+pub use domain_event_broadcast::{
+    domain_event_broadcast_consumer_name, domain_event_broadcast_lease_owner,
+    DomainEventBroadcastConsumer,
+};
 pub use domain_event_service::DomainEventService;
 pub use embedded_agent_service::{EmbeddedAgentService, ProviderEntryTestOutcome};
 pub use embedded_daemon::EmbeddedDaemon;
 pub use embedded_task_executor::{EmbeddedTaskExecutor, TaskExecutorRouter};
 pub use execution_baseline::{
-    baseline_column_json, release_policy_digest, render_execution_baseline,
+    adaptive_task_operation_supported_values, audit_execution_baseline_integrity,
+    baseline_column_json, parse_persisted_adaptive_envelope, release_policy_digest,
+    render_execution_baseline, validate_adaptive_task_operations,
     validate_execution_baseline_policy, ActivateExecutionBaselineCommand,
-    ApproveExecutionBaselineCommand, BaselineColumnJson, ExecutionBaselineApprovalTarget,
-    ExecutionBaselineCommandOutcome, ExecutionBaselineCommandService,
+    ApproveAndActivateExecutionBaselineCommand, ApproveExecutionBaselineCommand,
+    BaselineColumnJson, ExecutionBaselineApprovalTarget, ExecutionBaselineCommandOutcome,
+    ExecutionBaselineCommandService, ExecutionBaselineIntegrityAudit,
     ExecutionBaselineQueryService, ExecutionBaselineRender,
     ProposeExecutionBaselineForApprovalCommand, SaveExecutionBaselineDraftCommand,
-    EXECUTION_BASELINE_ACTIVATE_COMMAND, EXECUTION_BASELINE_APPROVE_COMMAND,
-    EXECUTION_BASELINE_PROPOSE_COMMAND, EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA,
-    EXECUTION_BASELINE_RENDER_VERSION, EXECUTION_BASELINE_SAVE_DRAFT_COMMAND,
-    EXECUTION_BASELINE_SCHEMA_VERSION,
+    EXECUTION_BASELINE_ACTIVATE_COMMAND, EXECUTION_BASELINE_APPROVE_AND_ACTIVATE_COMMAND,
+    EXECUTION_BASELINE_APPROVE_COMMAND, EXECUTION_BASELINE_PROPOSE_COMMAND,
+    EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA, EXECUTION_BASELINE_RENDER_VERSION,
+    EXECUTION_BASELINE_SAVE_DRAFT_COMMAND, EXECUTION_BASELINE_SCHEMA_VERSION,
 };
 pub use execution_setup::{
     canonical_task_capability, classify_task_execution, eligible_project_execution_agents,
@@ -173,6 +184,7 @@ pub use execution_setup::{
 };
 pub use external_sync::ExternalSyncService;
 pub use integration_service::IntegrationService;
+pub use main_chat_topic::{MainChatTopicRotation, MainChatTopicService, StartMainChatTopicInput};
 pub use main_genesis_commands::{
     MainGenesisCharterDraftRequest, MainGenesisCharterDraftResult, MainGenesisCommandService,
     MainGenesisDraftCommandInput, MainGenesisDraftPrincipal,
@@ -238,7 +250,8 @@ pub use project_agent_actions::{
 pub use project_agent_selection::{
     current_project_agent_operating_skill_revision, list_genesis_project_agents,
     project_agent_policy_digest, resolve_genesis_project_agent,
-    resolve_requested_genesis_project_agent, GenesisAgentSelection,
+    resolve_requested_genesis_project_agent, resolve_requested_genesis_project_agent_for_account,
+    GenesisAgentSelection,
 };
 pub use project_artifact_commands::{
     ProjectArtifactCommandService, ProjectCommandAuthorization, ProjectDocumentApprovalCommand,
@@ -267,7 +280,9 @@ pub use project_documents::{
     PROJECT_DOCUMENT_SCHEMA_VERSION,
 };
 pub use project_execution_setup::{ExecutionPrincipalRole, ProjectExecutionSetupService};
-pub use project_execution_setup_projection::load_project_execution_setup;
+pub use project_execution_setup_projection::{
+    load_project_execution_setup, load_task_execution_blocker,
+};
 pub use project_hooks::ProjectHookService;
 pub use project_member_service::ProjectMemberService;
 pub use project_milestone_commands::{
@@ -283,6 +298,10 @@ pub use project_orchestration::{
     try_charter_render_digest, validate_approval_candidate, validate_charter_approval_candidate,
     CharterApprovalValidationError, CharterFieldChange, CharterRender, CharterRevisionDiff,
     CHARTER_DIFF_VERSION, CHARTER_READINESS_POLICY_VERSION, PROJECT_CHARTER_RENDER_VERSION,
+};
+pub use project_reconciliation::{
+    ProjectReconciliationPage, ProjectReconciliationService,
+    RESOLVE_PROJECT_RECONCILIATION_OPERATION,
 };
 pub use project_runtime::{
     load_effective_project_state, ProjectCommitmentProjection, ProjectCurrentStateResponse,

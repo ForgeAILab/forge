@@ -30,6 +30,7 @@ type CharterQueryState = {
 const state = vi.hoisted(() => ({
   approval: vi.fn(),
   create: vi.fn(),
+  navigate: vi.fn(),
   active: null as ActiveQueryState | null,
   charter: null as CharterQueryState | null,
 }))
@@ -40,6 +41,7 @@ vi.mock('@tanstack/react-router', () => ({
       {children}
     </a>
   ),
+  useNavigate: () => state.navigate,
 }))
 
 vi.mock('@/api/hooks', () => ({
@@ -229,6 +231,7 @@ describe('ProductGenesisControls', () => {
     }
     state.approval.mockReset()
     state.create.mockReset()
+    state.navigate.mockReset()
   })
 
   it('keeps approval unavailable until the backend publishes a real Charter', () => {
@@ -353,6 +356,13 @@ describe('ProductGenesisControls', () => {
     expect(state.approval.mock.calls[0][0].revisionId).toBe(revision.id)
     expect(state.create).toHaveBeenCalledTimes(1)
     expect(state.create.mock.calls[0][0].approval_id).toBe('approval-1')
+    // 8.4.4: the committed Project is selected and the user is taken to its
+    // Project Agent handoff automatically, rather than leaving them to
+    // notice and click a "Continue" link.
+    expect(state.navigate).toHaveBeenCalledWith({
+      to: '/projects/$projectId/chat',
+      params: { projectId: 'project-1' },
+    })
   })
 
   it('typed approval reports a clear error when nothing is approvable', async () => {

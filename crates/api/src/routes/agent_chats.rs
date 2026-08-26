@@ -9,10 +9,12 @@ use api_types::{
     AgentBindingState, AgentChatDetailResponse, AgentChatKind, AgentChatMessageAuthorType,
     AgentChatMessageListResponse, AgentChatMessageResponse, AgentChatMessageStatus,
     AgentChatMessagesQuery, AgentChatResponse, AgentChatStatus, AgentChatSwitcherItem,
-    AgentChatSwitcherResponse, AgentChatTurnJobResponse, AgentChatTurnStatus, AgentHandoffResponse,
+    AgentChatSwitcherResponse, AgentChatTopicListResponse, AgentChatTopicPrincipalType,
+    AgentChatTopicResponse, AgentChatTurnJobResponse, AgentChatTurnStatus, AgentHandoffResponse,
     AgentHandoffStatus, CancelAgentChatTurnRequest, CreateAgentHandoffRequest,
     MainAgentBindingResponse, ProjectAgentBindingResponse, SendAgentChatMessageRequest,
     SendAgentChatMessageResponse, SetMainAgentBindingRequest, SetProjectAgentBindingRequest,
+    StartAgentChatTopicRequest, StartAgentChatTopicResponse,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -22,7 +24,7 @@ use axum::{
 use db::{
     AccountMainAgentBinding, AccountMainAgentBindingRepo, AgentChat, AgentChatMessage,
     AgentChatMessageAuthorType as DbMessageAuthorType, AgentChatMessageListQuery,
-    AgentChatMessageRepo, AgentChatMessageStatus as DbMessageStatus, AgentChatRepo,
+    AgentChatMessageRepo, AgentChatMessageStatus as DbMessageStatus, AgentChatRepo, AgentChatTopic,
     AgentChatTurnJob, AgentChatTurnJobRepo, AgentChatTurnState, AgentHandoff, AgentHandoffRepo,
     AgentRepo, PageRequest, ProjectAgentBinding, ProjectAgentBindingRepo, ProjectMemberRepo,
     ProjectRepo, SortBy, SortOrder,
@@ -31,6 +33,7 @@ use serde_json::{json, Value};
 use services::{
     CancelAgentChatTurnInput, CreateAgentHandoffInput, ProductGenesisService,
     SendAgentChatMessageInput, SetMainAgentBindingInput, SetProjectAgentBindingInput,
+    StartMainChatTopicInput,
 };
 
 use crate::{
@@ -275,6 +278,75 @@ pub async fn cancel_agent_chat_turn(
         })
         .await?;
     Ok(Json(turn_response(job)))
+}
+
+/// List the caller's Main Chat topics, oldest first. Earlier topics remain
+/// inspectable/searchable here even though a new Main turn's episodic
+/// context is bounded to the current one (D21/F18).
+pub async fn list_agent_chat_topics(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(chat_id): Path<String>,
+) -> ApiResult<Json<AgentChatTopicListResponse>> {
+    let topics = state
+        .main_chat_topic_service
+        .list_topics(&user.user_id, &chat_id)
+        .await?;
+    let current_id = topics.last().map(|topic| topic.id.clone());
+    Ok(Json(AgentChatTopicListResponse {
+        items: topics
+            .into_iter()
+            .map(|topic| topic_response(current_id.as_deref(), topic))
+            .collect(),
+    }))
+}
+
+/// Start a fresh Main Chat topic. Denied (409) while a Main turn is live or a
+/// Genesis session/approval needs an explicit finish-or-cancel decision
+/// (D21/F18) -- this never creates a second Main Chat, binding, identity, or
+/// authority scope, only a new context epoch inside the one existing chat.
+pub async fn start_agent_chat_topic(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(chat_id): Path<String>,
+    Json(request): Json<StartAgentChatTopicRequest>,
+) -> ApiResult<Json<StartAgentChatTopicResponse>> {
+    let rotation = state
+        .main_chat_topic_service
+        .start_topic(StartMainChatTopicInput {
+            actor_user_id: user.user_id,
+            chat_id,
+            label: request.label,
+            summary: request.summary,
+        })
+        .await?;
+    let divider_message_id = rotation.divider_message.id;
+    let topic_id = rotation.topic.id.clone();
+    Ok(Json(StartAgentChatTopicResponse {
+        topic: topic_response(Some(topic_id.as_str()), rotation.topic),
+        divider_message_id,
+    }))
+}
+
+fn topic_response(current_id: Option<&str>, topic: AgentChatTopic) -> AgentChatTopicResponse {
+    let is_current = current_id == Some(topic.id.as_str());
+    AgentChatTopicResponse {
+        id: topic.id,
+        chat_id: topic.chat_id,
+        sequence: topic.sequence,
+        label: topic.label,
+        summary: topic.summary,
+        starting_message_id: topic.starting_message_id,
+        starting_message_sequence: topic.starting_message_sequence,
+        principal_type: if topic.principal_type == "system" {
+            AgentChatTopicPrincipalType::System
+        } else {
+            AgentChatTopicPrincipalType::User
+        },
+        principal_id: topic.principal_id,
+        created_at: topic.created_at,
+        is_current,
+    }
 }
 
 pub async fn list_agent_handoffs(

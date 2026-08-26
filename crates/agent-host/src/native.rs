@@ -10,11 +10,13 @@ use agent_runtime::{
         cancel::CancelReason,
         catalog::{ModelLimits, ResolvedModelProfile},
         content::{ContentPart, Role, UserInput},
+        error::RuntimeError,
         event::{RuntimeEvent, TurnFinish},
-        ids::SessionId,
+        ids::{SessionId, ToolCallId},
         provider::{ModelId, Provider},
         provider_credential::ProviderCredentialTarget,
         security::SecuritySubject,
+        tool::ToolOutcome,
         usage::CounterKind,
         workspace::DenyAllWorkspace,
     },
@@ -26,6 +28,7 @@ use agent_runtime::{
     },
     runtime::{RuntimeBuilder, SessionHandle, StartSession},
 };
+use api_types::{OrchestrationOutcome, ToolResultSummary};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 
@@ -205,6 +208,22 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             },
             self.forge_tool_provider.clone(),
         )?;
+        // `RuntimeEvent::ToolCallCompleted` only carries `is_error`; observe
+        // each tool's exact result here, keyed by call id, so the bounded
+        // `ToolResultSummary` a structured Forge command already produced
+        // survives to `TurnEventSink::tool_call_finished` instead of being
+        // discarded at that boundary (F14/D18).
+        let tool_result_summaries: Arc<Mutex<HashMap<String, ToolResultSummary>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let observed_summaries = Arc::clone(&tool_result_summaries);
+        let composition = composition.observe_results(Arc::new(
+            move |call_id: &ToolCallId, result: &Result<ToolOutcome, RuntimeError>| {
+                let summary = tool_result_summary(call_id.as_str(), result);
+                if let Ok(mut summaries) = observed_summaries.lock() {
+                    summaries.insert(call_id.as_str().to_owned(), summary);
+                }
+            },
+        ));
         let provider = self.provider(&request)?;
         let model_id = ModelId::new(&request.provider.model);
         let lcm_store = self
@@ -305,7 +324,15 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
                             name,
                             is_error,
                         } => {
-                            sink.tool_call_finished(call.as_str(), name, *is_error).await;
+                            let summary = tool_result_summaries
+                                .lock()
+                                .ok()
+                                .and_then(|mut summaries| summaries.remove(call.as_str()))
+                                .unwrap_or_else(|| {
+                                    ToolResultSummary::unclassified(*is_error, call.as_str())
+                                });
+                            sink.tool_call_finished(call.as_str(), name, *is_error, &summary)
+                                .await;
                         }
                         RuntimeEvent::Error { error } => {
                             last_turn_error = Some(error.to_string());
@@ -407,6 +434,29 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             .steer_current_turn(None, UserInput::text(content))
             .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
         Ok(())
+    }
+}
+
+/// Builds the bounded `ToolResultSummary` this turn attaches to a completed
+/// tool call.
+///
+/// A native Forge command result already carries a full
+/// `OrchestrationOutcome` serialized as the tool's JSON value (see
+/// `typed_tools::provider_result_to_tool_outcome`); when the value round-trips
+/// through that exact shape, its already-redacted fields are reused
+/// unchanged. Any other tool result — a worktree read/write/command, public
+/// search, or a raw runtime failure — is not vetted safe to echo verbatim, so
+/// it receives a fixed, generic summary instead of a message built from its
+/// content.
+fn tool_result_summary(
+    call_id: &str,
+    result: &Result<ToolOutcome, RuntimeError>,
+) -> ToolResultSummary {
+    match result {
+        Ok(outcome) => serde_json::from_value::<OrchestrationOutcome>(outcome.value.clone())
+            .map(|outcome| ToolResultSummary::from_orchestration_outcome(&outcome))
+            .unwrap_or_else(|_| ToolResultSummary::unclassified(outcome.is_error, call_id)),
+        Err(_error) => ToolResultSummary::unclassified(true, call_id),
     }
 }
 
@@ -682,5 +732,106 @@ mod workspace_tests {
             .validate()
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_result_summary_tests {
+    use super::*;
+    use api_types::{CanonicalScopeRef, OutcomeCode, OutcomeScopeType, OutcomeStatus, RetryAction};
+
+    #[test]
+    fn reunites_a_structured_forge_outcome_with_the_runtime_event_boundary() {
+        // Reproduces F14: the runtime event only carries `is_error`, so a
+        // native Forge command's typed outcome must be recovered from the
+        // tool's JSON value rather than lost at this boundary.
+        let outcome = OrchestrationOutcome::failed(
+            OutcomeCode::PolicyDenied,
+            "task.adaptive",
+            CanonicalScopeRef::new(OutcomeScopeType::Task, "task-1"),
+            "corr-task-1",
+            "the operation is not admitted for the current Forge scope",
+        );
+        let tool_outcome = ToolOutcome {
+            value: serde_json::to_value(&outcome).expect("outcome serializes"),
+            content: Default::default(),
+            is_error: true,
+        };
+
+        let summary = tool_result_summary("call-1", &Ok(tool_outcome));
+
+        assert_eq!(summary.status, OutcomeStatus::Failed);
+        assert_eq!(summary.code, OutcomeCode::PolicyDenied);
+        assert_eq!(
+            summary.safe_message,
+            "the operation is not admitted for the current Forge scope"
+        );
+        assert_eq!(summary.correlation_id, "corr-task-1");
+    }
+
+    #[test]
+    fn preserves_retry_and_recovery_from_a_structured_outcome() {
+        let mut outcome = OrchestrationOutcome::failed(
+            OutcomeCode::VersionConflict,
+            "project.execution_baseline",
+            CanonicalScopeRef::new(OutcomeScopeType::Project, "project-1"),
+            "corr-baseline-1",
+            "the authorized resource changed; refresh current state and retry",
+        );
+        outcome.retry = Some(api_types::RetryInstruction::new(
+            RetryAction::RefreshAndRetry,
+            true,
+        ));
+        let tool_outcome = ToolOutcome {
+            value: serde_json::to_value(&outcome).expect("outcome serializes"),
+            content: Default::default(),
+            is_error: true,
+        };
+
+        let summary = tool_result_summary("call-2", &Ok(tool_outcome));
+
+        assert!(summary.retryable);
+        assert_eq!(summary.recovery_action, Some(RetryAction::RefreshAndRetry));
+    }
+
+    #[test]
+    fn falls_back_to_a_generic_bounded_summary_for_worktree_results() {
+        // A Task worktree command (e.g. `forge_task_command` running `git
+        // commit`) never carries an `OrchestrationOutcome` — its JSON value
+        // is arbitrary process stdout/stderr, which must not be echoed as a
+        // safe message.
+        let tool_outcome = ToolOutcome {
+            value: serde_json::json!({
+                "program": "git",
+                "args": ["commit"],
+                "status": 1,
+                "success": false,
+                "stdout": "",
+                "stderr": "fatal: uncommitted worktree changes with SECRET_TOKEN=abc123",
+            }),
+            content: Default::default(),
+            is_error: false,
+        };
+
+        let summary = tool_result_summary("call-3", &Ok(tool_outcome));
+
+        assert_eq!(summary.status, OutcomeStatus::Succeeded);
+        assert_eq!(summary.code, OutcomeCode::Ok);
+        assert_eq!(summary.correlation_id, "call-3");
+        let serialized = serde_json::to_string(&summary).expect("summary serializes");
+        assert!(!serialized.contains("SECRET_TOKEN"));
+    }
+
+    #[test]
+    fn falls_back_to_a_generic_bounded_summary_for_a_raw_runtime_failure() {
+        let error = RuntimeError::tool("Task command failed: SECRET_TOKEN=abc123 leaked in stderr");
+
+        let summary = tool_result_summary("call-4", &Err(error));
+
+        assert_eq!(summary.status, OutcomeStatus::Failed);
+        assert_eq!(summary.code, OutcomeCode::InternalFailure);
+        assert_eq!(summary.correlation_id, "call-4");
+        let serialized = serde_json::to_string(&summary).expect("summary serializes");
+        assert!(!serialized.contains("SECRET_TOKEN"));
     }
 }

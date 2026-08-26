@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 
 use crate::{
-    CommandReceipt, CreateAgentActionExecution, CreateCommandReceipt, CreateProject, CreateTask,
-    CreateTaskRoleAssignment, Project, Result, Task,
+    CommandReceipt, CreateAgentActionExecution, CreateCommandReceipt, CreateDomainEvent,
+    CreateProject, CreateTask, CreateTaskRoleAssignment, Project, Result, Task,
 };
 
 /// Recursively sort object keys while preserving array order for the
@@ -375,6 +375,32 @@ pub struct CreateProjectReconciliation {
     pub updated_at: String,
 }
 
+/// One immutable resolution event applied to a `ProjectReconciliationRecord`.
+/// A reconciliation currently carries at most one resolution (the closed
+/// state machine has no re-open path), but the row is kept separate from the
+/// reconciliation projection so the exact principal, reason, and replacement
+/// reference stay append-only evidence rather than columns rewritten in
+/// place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectReconciliationResolutionRecord {
+    pub id: String,
+    pub reconciliation_id: String,
+    pub action: String,
+    pub principal_type: String,
+    pub principal_id: String,
+    pub authorization_basis: String,
+    pub authorization_action: String,
+    pub explicit_event: String,
+    pub authorization_occurred_at: String,
+    pub reason: String,
+    pub occurred_at: String,
+    pub replacement_ref_type: Option<String>,
+    pub replacement_ref_id: Option<String>,
+    pub replacement_ref_revision: Option<String>,
+    pub idempotency_key: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolveProjectReconciliation {
     pub id: String,
@@ -388,9 +414,44 @@ pub struct ResolveProjectReconciliation {
     pub explicit_event: String,
     pub authorization_occurred_at: String,
     pub reason: String,
+    /// Exact successor artifact for a `revised`/`superseded` outcome.  All
+    /// three fields are present together or absent together; the service
+    /// layer enforces that shape and record-type consistency before this
+    /// input is constructed.
+    pub replacement_ref_type: Option<String>,
+    pub replacement_ref_id: Option<String>,
+    pub replacement_ref_revision: Option<String>,
+    /// Present only for `invalid_active_baseline` + `revised`. The repository
+    /// validates and activates this exact approved successor inside the same
+    /// transaction as the reconciliation resolution.
+    pub invalid_baseline_replacement: Option<ResolveInvalidActiveBaseline>,
     pub occurred_at: String,
     pub idempotency_key: String,
     pub updated_at: String,
+    /// The durable domain event committed in the same transaction as the
+    /// resolution.  A replay short-circuits before this input is used, so
+    /// exactly one event is ever appended per genuinely new resolution.
+    pub domain_event: CreateDomainEvent,
+    /// The command receipt bound to `domain_event` by
+    /// `finalize_command_in_tx` inside the same transaction.
+    pub command_receipt: CreateCommandReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveInvalidActiveBaseline {
+    pub project_id: String,
+    pub baseline_id: String,
+    pub invalid_revision_id: String,
+    pub successor_revision_id: String,
+    pub approval_id: String,
+    pub expected_baseline_version: i64,
+    pub expected_project_version: i64,
+    pub charter_revision_id: String,
+    pub milestone_ids: Vec<String>,
+    pub milestone_definition_revision_ids: Vec<String>,
+    pub primary_milestone_id: Option<String>,
+    pub content_digest: String,
+    pub rendered_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -992,6 +1053,40 @@ pub struct ActivateProjectExecutionBaselineCommand {
     pub content_digest: String,
     pub rendered_digest: String,
     pub idempotency_key: String,
+    pub updated_at: String,
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
+}
+
+/// Atomic "approve plan and start work" command composite (D18, F13).  The
+/// service has already validated the exact persisted proposed review target
+/// and interactive-user authorization; this record commits the approval,
+/// activation, milestone/Task-governance promotion, durable events, and one
+/// command receipt in a single transaction. Only a freshly proposed baseline
+/// (never a re-approval of an already-active one) may use this command; the
+/// already-approved "Start approved work" gesture keeps using the separate
+/// exact replay-safe `activate_project_execution_baseline_command`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApproveAndActivateProjectExecutionBaselineCommand {
+    pub project_id: String,
+    pub baseline_id: String,
+    pub revision_id: String,
+    pub approval_id: String,
+    pub expected_baseline_version: i64,
+    pub expected_project_version: i64,
+    pub principal_type: String,
+    pub principal_id: String,
+    pub authorization_basis: String,
+    pub authorization_occurred_at: String,
+    pub explicit_event: String,
+    pub content_digest: String,
+    pub rendered_digest: String,
+    pub charter_revision_id: String,
+    pub milestone_ids: Vec<String>,
+    pub milestone_definition_revision_ids: Vec<String>,
+    pub primary_milestone_id: Option<String>,
+    pub idempotency_key: String,
+    pub created_at: String,
     pub updated_at: String,
     pub command_receipt: Option<CreateCommandReceipt>,
     pub action_execution: Option<CreateAgentActionExecution>,
@@ -1793,6 +1888,10 @@ pub trait ProjectOrchestrationRepo: Send + Sync {
         &self,
         input: ResolveProjectReconciliation,
     ) -> Result<ProjectReconciliationRecord>;
+    async fn get_project_reconciliation_resolution(
+        &self,
+        id: &str,
+    ) -> Result<Option<ProjectReconciliationResolutionRecord>>;
 
     async fn create_project_document(
         &self,
@@ -2088,6 +2187,14 @@ pub trait ProjectOrchestrationRepo: Send + Sync {
     async fn activate_project_execution_baseline_command(
         &self,
         input: ActivateProjectExecutionBaselineCommand,
+    ) -> Result<ProjectExecutionBaselineRecord>;
+    /// Atomically approve and activate the exact freshly proposed revision in
+    /// one transaction/receipt: approval, activation, milestone/Task
+    /// governance promotion, and both durable events commit or roll back
+    /// together (D18, F13).
+    async fn approve_and_activate_project_execution_baseline_command(
+        &self,
+        input: ApproveAndActivateProjectExecutionBaselineCommand,
     ) -> Result<ProjectExecutionBaselineRecord>;
 
     async fn create_project_milestone(

@@ -495,6 +495,32 @@ async fn legacy_agent_chat_scope_upgrades_to_frozen_authority_without_data_loss(
     assert_eq!(replay.id, scope.id);
     assert_eq!(replay.version, 2);
 
+    let stable_authority = serde_json::json!({
+        "issued_to_user_id": account_id,
+        "revision": 1,
+        "scope": {"chat_id": chat.id.clone(), "type": "agent_chat"},
+    });
+    let stable_replay = AgentContextScopeRepo::create_context_scope(
+        &db,
+        CreateAgentContextScope {
+            id: "stable-authority-replay".to_owned(),
+            identity_id: identity_id.to_owned(),
+            scope_type: "agent_chat".to_owned(),
+            scope_id: chat.id.clone(),
+            project_id: None,
+            task_id: None,
+            task_role: None,
+            workspace_access: "deny".to_owned(),
+            authority_json: stable_authority.to_string(),
+            created_at: now.to_owned(),
+            updated_at: "2026-08-21T00:00:03.000Z".to_owned(),
+        },
+    )
+    .await
+    .expect("stable scope authority accepts a previously frozen row");
+    assert_eq!(stable_replay.id, scope.id);
+    assert_eq!(stable_replay.version, 2);
+
     let mut changed_authority = frozen_authority;
     changed_authority["frozen_binding_version"] = serde_json::json!(2);
     let conflict = AgentContextScopeRepo::create_context_scope(

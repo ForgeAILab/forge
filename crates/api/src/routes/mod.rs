@@ -58,6 +58,7 @@ pub mod project_overview;
 pub mod projects;
 pub mod provider_authorizations;
 pub mod providers;
+pub mod reconciliations;
 pub mod repos;
 pub mod reviews;
 pub mod scoped_memory;
@@ -365,6 +366,12 @@ async fn task_response_inner(
     ));
     let execution_observability = task_execution_observability(db, &task.id).await?;
     let external_link = db::ExternalLinkRepo::get_by_task_id(db, &task.id).await?;
+    // Canonical execution evidence/blocker (D16/D17, F12): computed once here
+    // so Task detail, banner, and chat context all render the same server-
+    // owned progress language and blocker instead of reinterpreting raw
+    // gate/status enums per surface.
+    let (execution_evidence, execution_blocker) =
+        services::load_task_execution_blocker(db, &task).await?;
 
     Ok(TaskResponse {
         id: task.id,
@@ -405,6 +412,8 @@ async fn task_response_inner(
         plan_artifact,
         external_issue_number: external_link.as_ref().map(|link| link.remote_issue_number),
         external_issue_url: external_link.as_ref().map(|link| link.remote_url.clone()),
+        execution_evidence,
+        execution_blocker,
         version: task.version,
         created_at: task.created_at,
         updated_at: task.updated_at,

@@ -1145,7 +1145,8 @@ fn complete_baseline_content(fixture: &CharterFixture) -> ExecutionBaselineConte
     content.primary_milestone_id = Some(fixture.milestone_id.clone());
     content.capability_classes = vec!["repository_write".to_owned()];
     content.risk_classes = vec!["low".to_owned()];
-    content.adaptive_envelope.allowed_task_operations = vec!["implement".to_owned()];
+    content.adaptive_envelope.allowed_task_operations =
+        vec![api_types::AdaptiveTaskOperation::Split];
     content
 }
 

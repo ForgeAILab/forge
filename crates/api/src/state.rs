@@ -66,6 +66,7 @@ pub struct AppState {
     pub agent_service: Arc<AgentService>,
     pub embedded_agent_service: Arc<EmbeddedAgentService>,
     pub agent_chat_service: Arc<services::AgentChatService<SqliteDb>>,
+    pub main_chat_topic_service: Arc<services::MainChatTopicService<SqliteDb>>,
     pub agent_chat_turn_worker: Arc<AgentChatTurnWorker>,
     pub commitment_service: Arc<CommitmentService>,
     pub agent_inbox_service: Arc<AgentInboxService>,
@@ -176,6 +177,11 @@ impl AppState {
         let embedded_agent_service =
             Arc::new(EmbeddedAgentService::new(Arc::clone(&db), &jwt_secret));
         let agent_chat_service = Arc::new(services::AgentChatService::new(Arc::clone(&db)));
+        let main_chat_topic_service = Arc::new(services::MainChatTopicService::new(
+            Arc::clone(&db),
+            Arc::clone(&agent_chat_service),
+            services::ProductGenesisService::for_sqlite(Arc::clone(&db)),
+        ));
         let commitment_service = Arc::new(CommitmentService::new(Arc::clone(&db)));
         let agent_inbox_service = Arc::new(AgentInboxService::new(Arc::clone(&db)));
         let agent_action_service = Arc::new(AgentActionService::new(Arc::clone(&db)));
@@ -295,6 +301,7 @@ impl AppState {
             agent_service,
             embedded_agent_service,
             agent_chat_service,
+            main_chat_topic_service,
             agent_chat_turn_worker,
             commitment_service,
             agent_inbox_service,

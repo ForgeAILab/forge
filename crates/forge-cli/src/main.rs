@@ -120,6 +120,19 @@ async fn main() {
 
     let db = Arc::new(db::SqliteDb::new(pool));
     let event_bus = Arc::new(events::EventBus::with_default_capacity());
+    match services::audit_execution_baseline_integrity(Arc::clone(&db)).await {
+        Ok(audit) if audit.invalid_revisions > 0 => info!(
+            invalid_revisions = audit.invalid_revisions,
+            active_blockers = audit.active_blockers,
+            successor_drafts = audit.successor_drafts,
+            "execution baseline integrity audit completed"
+        ),
+        Ok(_) => {}
+        Err(error) => {
+            error!(%error, "execution baseline integrity audit failed");
+            std::process::exit(1);
+        }
+    }
     let mut registry = cli_adapters::default_registry();
     if cli.demo {
         registry.register(Box::new(cli_adapters::NullAdapter::new()));
@@ -286,6 +299,19 @@ async fn main() {
         services::wake_turn_consumer_lease_owner(),
     ));
     let mut wake_turn_consumer_handle = wake_turn_consumer.start(state.shutdown_signal.subscribe());
+    // Mirrors the durable domain-event outbox to the live SSE bus (D20):
+    // several commands (Project creation from a Charter approval, Main
+    // Genesis control transfer, Agent Chat messages/turns, milestone
+    // readiness/release) append their event inside a larger composite
+    // transaction and have no other path to `EventBus`. See
+    // `services::domain_event_broadcast` for why this is generic rather than
+    // a bespoke publish per command.
+    let domain_event_broadcast = Arc::new(services::DomainEventBroadcastConsumer::new(
+        Arc::clone(&state.db),
+        Arc::clone(&state.event_bus),
+    ));
+    let mut domain_event_broadcast_handle =
+        domain_event_broadcast.start(state.shutdown_signal.subscribe());
 
     if let Err(error) = state.workflow_template_service.initialize().await {
         warn!(%error, "workflow template initialization failed");
@@ -446,6 +472,17 @@ async fn main() {
             warn!("wake turn consumer did not stop before shutdown timeout");
             wake_turn_consumer_handle.abort();
             let _ = wake_turn_consumer_handle.await;
+        }
+    }
+    match tokio::time::timeout(Duration::from_secs(5), &mut domain_event_broadcast_handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            warn!(%error, "SSE domain-event broadcast consumer failed during shutdown")
+        }
+        Err(_) => {
+            warn!("SSE domain-event broadcast consumer did not stop before shutdown timeout");
+            domain_event_broadcast_handle.abort();
+            let _ = domain_event_broadcast_handle.await;
         }
     }
 }

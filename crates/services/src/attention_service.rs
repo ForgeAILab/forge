@@ -250,7 +250,7 @@ impl AttentionService {
             }
 
             let completed_at = now_rfc3339();
-            let dedupe_key = event.dedupe_key.clone().unwrap_or_else(|| event.id.clone());
+            let dedupe_key = crate::domain_event_service::event_completion_dedupe_key(&event);
             DomainEventRepo::complete_claimed_event(
                 &*self.db,
                 CompleteDomainEvent {

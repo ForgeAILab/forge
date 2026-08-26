@@ -16,6 +16,7 @@ export const qk = {
   project: (id: string) => ['projects', id] as const,
   projectOverview: (id: string) => ['projects', id, 'overview'] as const,
   projectExecutionSetup: (id: string) => ['projects', id, 'execution-setup'] as const,
+  projectReconciliations: (id: string) => ['projects', id, 'reconciliations'] as const,
   projectRelease: (projectId: string, releaseId: string) =>
     ['projects', projectId, 'releases', releaseId] as const,
   projectPages: (limit: number) => ['projects', 'pages', limit] as const,

@@ -2050,7 +2050,7 @@ mod tests {
             reviewer_independence_rules: Vec::new(),
             elevated_operations: Vec::new(),
             adaptive_envelope: AdaptiveEnvelope {
-                allowed_task_operations: vec!["split".to_owned()],
+                allowed_task_operations: vec![api_types::AdaptiveTaskOperation::Split],
                 fixed_outcomes: Vec::new(),
                 fixed_acceptance: Vec::new(),
                 fixed_risk_classes: vec!["low".to_owned()],

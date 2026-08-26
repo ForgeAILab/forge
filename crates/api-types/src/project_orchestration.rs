@@ -1020,6 +1020,94 @@ pub struct DecisionCandidate {
     pub updated_at: String,
 }
 
+/// Whether a pending Decision candidate can currently be approved through
+/// the shared candidate command service, or whether it is a historical row
+/// that predates the D19/F15 candidate-shape invariant (a non-empty
+/// question, at least two distinct non-empty options, a rationale, and a
+/// recommendation that names one of those options). A malformed row is
+/// preserved verbatim rather than rewritten or deleted; `validity` and
+/// `invalid_reason` are how the projection marks it non-approvable instead.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum PendingDecisionValidity {
+    Valid,
+    Malformed,
+}
+
+/// The affected artifact/Task/milestone references a pending Decision
+/// candidate names, in the same shape as an effective `DecisionRecord`'s
+/// affected records.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct PendingDecisionAffectedRecords {
+    #[serde(default)]
+    pub affected_artifact_refs: Vec<ArtifactRef>,
+    #[serde(default)]
+    pub affected_task_ids: Vec<String>,
+    #[serde(default)]
+    pub affected_milestone_ids: Vec<String>,
+}
+
+/// The exact REST route and method a pending-candidate action posts to.
+/// Every surface renders this rather than hand-building the candidate
+/// route.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct PendingDecisionActionTarget {
+    pub method: String,
+    pub path: String,
+}
+
+/// A bounded, typed summary of one pending Decision candidate (design D19,
+/// finding F15). `ProjectOverview` exposes these in place of the bare
+/// `unresolved_decision_ids` identifier list so every surface can render the
+/// question, its alternatives, the Project Agent's recommendation, its
+/// rationale, and an approve/reject action without opaque UUIDs or a second
+/// fetch. `approve_target`/`reject_target` name the same Decision candidates
+/// REST routes the dedicated resource already exposes.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct PendingDecisionSummary {
+    pub id: String,
+    pub project_id: String,
+    pub lifecycle: DecisionEditorState,
+    pub version: i64,
+    pub question: String,
+    pub options: Vec<String>,
+    #[serde(default)]
+    pub recommendation: Option<String>,
+    #[serde(default)]
+    pub rationale: Option<String>,
+    pub decision_class: DecisionClass,
+    #[serde(default)]
+    pub affected_records: PendingDecisionAffectedRecords,
+    pub proposed_by: PrincipalRef,
+    /// The principal class permitted to approve/reject this candidate.
+    /// Always `user`: the shared candidate command service rejects any
+    /// other principal's approval/rejection authorization.
+    pub required_principal: PrincipalKind,
+    pub validity: PendingDecisionValidity,
+    /// Present only when `validity` is `malformed`; the exact reason no
+    /// approval action is offered.
+    #[serde(default)]
+    pub invalid_reason: Option<String>,
+    /// Absent when `validity` is `malformed`: approving a candidate whose
+    /// shape violates the D19 invariant would promote that malformed shape
+    /// into a permanent effective Decision, so no surface may offer it.
+    #[serde(default)]
+    pub approve_target: Option<PendingDecisionActionTarget>,
+    /// Always present: rejecting a candidate never propagates its shape
+    /// into anything consequential, so it remains how a malformed row is
+    /// cleared.
+    pub reject_target: PendingDecisionActionTarget,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
@@ -1059,12 +1147,73 @@ pub struct AcceptanceEvidenceRequirement {
     pub check_definition_revision: Option<String>,
 }
 
+/// The closed set of adaptive Task authority verbs a baseline's adaptive
+/// envelope may grant. JSON is the bare lowercase string ("split",
+/// "sequence", "replace") so every transport and the generated TypeScript
+/// union stay closed together; there is no fourth value and no adapter may
+/// invent one.
+///
+/// This is intentionally a different type from `db::AdaptiveTaskOperation`,
+/// which additionally carries the payload for one executed split/sequence/
+/// replace command. This type is the bare policy vocabulary a baseline
+/// grants; it is never itself a command name such as `task.propose` or
+/// `task.adaptive`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum AdaptiveTaskOperation {
+    Split,
+    Sequence,
+    Replace,
+}
+
+impl AdaptiveTaskOperation {
+    /// Every closed value, in the canonical order used by every generated
+    /// schema and diagnostic. Deriving both the parser and the diagnostic
+    /// from this one array is what keeps a fourth variant from silently
+    /// going missing from an input schema or an error message.
+    pub const ALL: [Self; 3] = [Self::Split, Self::Sequence, Self::Replace];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Split => "split",
+            Self::Sequence => "sequence",
+            Self::Replace => "replace",
+        }
+    }
+
+    /// Parse the bare wire verb. Anything outside the closed vocabulary
+    /// (including a legacy/free-form value) returns `None` -- callers must
+    /// treat that as a typed validation failure, never as an implicit grant.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|op| op.as_str() == value)
+    }
+
+    /// The closed vocabulary rendered for a diagnostic, in canonical order.
+    #[must_use]
+    pub fn supported_values() -> String {
+        Self::ALL
+            .iter()
+            .map(|operation| operation.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl std::fmt::Display for AdaptiveTaskOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 #[serde(deny_unknown_fields)]
 pub struct AdaptiveEnvelope {
     #[serde(default)]
-    pub allowed_task_operations: Vec<String>,
+    pub allowed_task_operations: Vec<AdaptiveTaskOperation>,
     #[serde(default)]
     pub fixed_outcomes: Vec<String>,
     #[serde(default)]
@@ -1229,6 +1378,27 @@ pub struct ExecutionBaselineApprovalTarget {
     pub requires_user_authorization: bool,
 }
 
+/// Data-preserving diagnosis for a historical current revision that cannot
+/// be represented by the closed execution-baseline schema. The immutable
+/// revision remains stored; `successor_revision_id` is a non-authoritative
+/// correction draft until an explicit user approval and reconciliation.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionBaselineIntegrityIssue {
+    pub revision_id: String,
+    pub baseline_id: String,
+    pub field_path: String,
+    pub invalid_values: Vec<String>,
+    pub diagnostic: String,
+    #[serde(default)]
+    pub successor_revision_id: Option<String>,
+    #[serde(default)]
+    pub conflict_id: Option<String>,
+    #[serde(default)]
+    pub reconciliation_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 #[serde(deny_unknown_fields)]
@@ -1251,6 +1421,10 @@ pub struct ExecutionBaselineResponse {
     pub approval_target: Option<ExecutionBaselineApprovalTarget>,
     #[serde(default)]
     pub requires_user_authorization: bool,
+    /// Present only when the authoritative current pointer names a preserved
+    /// historical revision rejected by the closed baseline schema.
+    #[serde(default)]
+    pub integrity_issue: Option<ExecutionBaselineIntegrityIssue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -1297,6 +1471,54 @@ pub struct ApproveExecutionBaselineRequest {
     /// Activation performs a second CAS against the then-current Project
     /// version; this value remains part of the durable approval receipt.
     pub expected_project_version: i64,
+}
+
+/// "Approve plan and start work" (D18, F13): the one atomic, replay-exact
+/// command for the proposed-baseline approval gesture. It binds the exact
+/// revision/content/render identities the user reviewed and, unlike
+/// [`ApproveExecutionBaselineRequest`] followed by
+/// [`ActivateExecutionBaselineRequest`], commits approval and activation in
+/// a single server transaction under one idempotency key. The web must reuse
+/// the same `mutation.idempotency_key` across retries of this exact click so
+/// a lost response replays the committed outcome instead of surfacing a
+/// false failure.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ApproveAndActivateExecutionBaselineRequest {
+    pub mutation: MutationEnvelope,
+    pub revision_id: String,
+    pub content_digest: String,
+    pub render_digest: String,
+    /// Exact baseline version observed while the user reviewed the proposed
+    /// revision. `mutation.expected_version` is the Project version CAS, the
+    /// same convention [`ActivateExecutionBaselineRequest`] uses.
+    pub expected_baseline_version: i64,
+}
+
+/// Response for [`ApproveAndActivateExecutionBaselineRequest`] (D18, F13).
+///
+/// The identity fields are always populated once the command has committed:
+/// they are reconstructed from the frozen command receipt, never re-derived
+/// from mutable current state, so the caller can trust `revision_id` is now
+/// the Project's active revision even if nothing else in this response could
+/// be assembled. `projection` is the full baseline view for rendering; if
+/// re-reading it after a successful commit fails, `projection` is absent and
+/// `refresh_required` is `true` instead of the whole response failing -- a
+/// commit-truthful adapter never turns a successful write into a reported
+/// failure because a subsequent read could not be assembled.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ApproveAndActivateExecutionBaselineResponse {
+    pub baseline_id: String,
+    pub revision_id: String,
+    pub approval_id: String,
+    pub content_digest: String,
+    pub render_digest: String,
+    #[serde(default)]
+    pub projection: Option<ExecutionBaselineResponse>,
+    pub refresh_required: bool,
 }
 
 /// Server-checked provenance for a Project Task.
@@ -2037,6 +2259,155 @@ pub struct ProjectNextAction {
     pub expected_version: Option<i64>,
 }
 
+/// The five terminal outcomes a reconciliation resolution may record. This
+/// mirrors the closed `CHECK` on `project_reconciliation_record.state` and
+/// `project_reconciliation_resolution.action` exactly; there is no sixth
+/// value and no free-form escape hatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ReconciliationResolutionAction {
+    Retained,
+    Revised,
+    Cancelled,
+    Superseded,
+    Invalidated,
+}
+
+/// A reconciliation's lifecycle state: `Required` until an explicit
+/// resolution advances it to one of the four other terminal values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ReconciliationState {
+    Required,
+    Retained,
+    Revised,
+    Cancelled,
+    Superseded,
+    Invalidated,
+}
+
+/// A typed pointer to one canonical record: its type, id, and the exact
+/// revision/digest observed when the conflict or reconciliation was
+/// recorded. Bodies are intentionally not inlined here -- callers load the
+/// named record through its own typed endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ReconciliationRecordRef {
+    pub record_type: String,
+    pub record_id: String,
+    pub record_revision: String,
+    pub record_digest: String,
+}
+
+/// The exact successor artifact a `revised`/`superseded` resolution names.
+/// Required together with the action; the shared service rejects a
+/// `revised`/`superseded` resolve request that omits it and rejects one
+/// supplied for any other action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ReconciliationReplacementRef {
+    pub record_type: String,
+    pub record_id: String,
+    pub record_revision: Option<String>,
+}
+
+/// The immutable canonical conflict a reconciliation was opened against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ReconciliationConflictSummary {
+    pub id: String,
+    pub domain: String,
+    pub governing: ReconciliationRecordRef,
+    pub conflicting: ReconciliationRecordRef,
+    pub affected_paths: Vec<String>,
+    pub conflict_code: String,
+    pub description: String,
+    pub detected_by_type: String,
+    pub detected_by_id: Option<String>,
+    pub created_at: String,
+}
+
+/// The resolution already applied, present only once `state != required`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ReconciliationResolutionSummary {
+    pub id: String,
+    pub action: ReconciliationResolutionAction,
+    pub principal: PrincipalRef,
+    pub reason: String,
+    pub replacement_ref: Option<ReconciliationReplacementRef>,
+    pub occurred_at: String,
+}
+
+/// The complete list/detail projection. `allowed_actions` is empty once the
+/// record leaves `required`: a resolved reconciliation offers no further
+/// action, only its recorded outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ProjectReconciliation {
+    pub id: String,
+    pub project_id: String,
+    pub conflict: ReconciliationConflictSummary,
+    /// The record whose claim diverges from `governing`. For the adaptive
+    /// Task-boundary fixture this is the Task at the version the divergence
+    /// was detected.
+    pub affected: ReconciliationRecordRef,
+    /// The record whose claim is authoritative until the reconciliation is
+    /// resolved.
+    pub governing: ReconciliationRecordRef,
+    pub state: ReconciliationState,
+    pub required_principal: PrincipalKind,
+    pub allowed_actions: Vec<ReconciliationResolutionAction>,
+    /// Server-validated replacement currently eligible for this resolution.
+    /// For `invalid_active_baseline` this appears only after the exact
+    /// successor revision has an active user approval receipt.
+    #[serde(default)]
+    pub suggested_replacement_ref: Option<ReconciliationReplacementRef>,
+    pub resolution: Option<ReconciliationResolutionSummary>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ProjectReconciliationListResponse {
+    pub items: Vec<ProjectReconciliation>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ResolveProjectReconciliationRequest {
+    pub mutation: MutationEnvelope,
+    pub action: ReconciliationResolutionAction,
+    pub replacement_ref: Option<ReconciliationReplacementRef>,
+    pub reason: String,
+}
+
+/// The frozen response to a resolve command: the exact final projection plus
+/// the receipt/event identities a client can use to prove replay-exactness,
+/// and whether the affected Task's dispatcher was woken.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ResolveProjectReconciliationResponse {
+    pub reconciliation: ProjectReconciliation,
+    pub receipt_id: String,
+    pub event_id: String,
+    pub dispatch_woken: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 #[serde(deny_unknown_fields)]
@@ -2117,10 +2488,14 @@ pub struct ProjectOverview {
     pub active_milestones: Vec<ProjectMilestoneOverview>,
     pub task_counts: TaskProgressCounts,
     pub check_summary: AcceptanceCheckSummary,
+    /// Bounded typed summaries of pending Decision candidates (design D19,
+    /// finding F15). This replaced the bare `unresolved_decision_ids`
+    /// identifier list in a public beta breaking response change: that
+    /// field and every call site are gone, with no deprecated alias.
     #[serde(default)]
-    pub unresolved_decision_ids: Vec<String>,
+    pub pending_decisions: Vec<PendingDecisionSummary>,
     /// Effective Decision Log records. Draft/proposed candidates remain
-    /// represented separately by `unresolved_decision_ids`.
+    /// represented separately by `pending_decisions`.
     #[serde(default)]
     pub decisions: Vec<DecisionRecord>,
     #[serde(default)]
@@ -2550,6 +2925,73 @@ fn hex_lower(bytes: &[u8]) -> String {
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
     output
+}
+
+// ---------------------------------------------------------------------------
+// Main Chat topic boundary (design D21, live-acceptance finding F18)
+// ---------------------------------------------------------------------------
+
+/// Who started a Main Chat topic. `System` is used only for the migration
+/// backfill's one initial topic per existing Main Chat; every topic a user
+/// starts from the product is `User`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum AgentChatTopicPrincipalType {
+    User,
+    System,
+}
+
+/// One durable Main Chat topic (D21). A topic is a context epoch *inside*
+/// the one account Main Chat -- it is never a second chat, binding, or
+/// authority scope. `starting_message_sequence` is the sequence of the
+/// visible divider message that opens it; a new Main turn's episodic context
+/// is bounded to messages at or after this value in the current topic.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct AgentChatTopicResponse {
+    pub id: String,
+    pub chat_id: String,
+    pub sequence: i64,
+    pub label: String,
+    pub summary: Option<String>,
+    pub starting_message_id: Option<String>,
+    pub starting_message_sequence: i64,
+    pub principal_type: AgentChatTopicPrincipalType,
+    pub principal_id: Option<String>,
+    pub created_at: String,
+    /// True for exactly one topic per chat: the most recently started one.
+    pub is_current: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct AgentChatTopicListResponse {
+    pub items: Vec<AgentChatTopicResponse>,
+}
+
+/// `label`/`summary` are optional -- an empty request still starts a topic
+/// with a server-assigned default label.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct StartAgentChatTopicRequest {
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct StartAgentChatTopicResponse {
+    pub topic: AgentChatTopicResponse,
+    /// The visible divider message appended to the chat timeline at the
+    /// start of this topic.
+    pub divider_message_id: String,
 }
 
 #[cfg(test)]

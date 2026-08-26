@@ -374,31 +374,32 @@ async fn product_genesis_approval_creates_one_exact_project_and_handoff() {
     );
     assert!(projection.approval.is_none());
 
-    let approval_body = |content_digest: &str, approval_key: &str| {
-        json!({
-            "mutation": {
-                "expected_version": charter.version,
-                "expected_digest": rendered.content_digest,
-                "idempotency_key": approval_key,
-                "authorization": user_authorization(
-                    "product_genesis.charter_approval",
-                    format!("approval-event-{approval_key}")
-                )
-            },
-            "charter_id": charter_id,
-            "revision_id": save.id,
-            "content_digest": content_digest,
-            "render_digest": rendered.render_digest,
-            "expected_charter_version": charter.version,
-            "approved_project_name": content.identity.working_name,
-            "approved_project_slug": "exact-charter-project",
-            "project_mode": "compact",
-            "selected_project_agent_identity_id": selected_agent.identity_id,
-            "selected_project_agent_profile_revision_id": selected_agent.profile_revision_id,
-            "selected_project_agent_operating_skill_revision": selected_agent.operating_skill_revision,
-            "selected_project_agent_policy_digest": selected_agent.policy_digest
-        })
-    };
+    let approval_body =
+        |content_digest: &str, approval_key: &str, agent: &api_types::ProductAgentSelection| {
+            json!({
+                "mutation": {
+                    "expected_version": charter.version,
+                    "expected_digest": rendered.content_digest,
+                    "idempotency_key": approval_key,
+                    "authorization": user_authorization(
+                        "product_genesis.charter_approval",
+                        format!("approval-event-{approval_key}")
+                    )
+                },
+                "charter_id": charter_id,
+                "revision_id": save.id,
+                "content_digest": content_digest,
+                "render_digest": rendered.render_digest,
+                "expected_charter_version": charter.version,
+                "approved_project_name": content.identity.working_name,
+                "approved_project_slug": "exact-charter-project",
+                "project_mode": "compact",
+                "selected_project_agent_identity_id": agent.identity_id,
+                "selected_project_agent_profile_revision_id": agent.profile_revision_id,
+                "selected_project_agent_operating_skill_revision": agent.operating_skill_revision,
+                "selected_project_agent_policy_digest": agent.policy_digest
+            })
+        };
 
     let stale_digest: ErrorResponse = common::json_request_with_bearer(
         app,
@@ -408,15 +409,18 @@ async fn product_genesis_approval_creates_one_exact_project_and_handoff() {
             started.session.id, save.id
         ),
         &token,
-        approval_body("stale-content-digest", "approval-stale"),
+        approval_body("stale-content-digest", "approval-stale", &selected_agent),
         StatusCode::CONFLICT,
     )
     .await;
     assert!(stale_digest.message.contains("digest"));
 
     let other_user_token = jwt_for("other-user-id", "other@example.com");
-    let mut cross_user_approval_body =
-        approval_body(&rendered.content_digest, "approval-cross-user");
+    let mut cross_user_approval_body = approval_body(
+        &rendered.content_digest,
+        "approval-cross-user",
+        &selected_agent,
+    );
     cross_user_approval_body["mutation"]["authorization"]["principal"]["id"] =
         json!("other-user-id");
     let cross_user: ErrorResponse = common::json_request_with_bearer(
@@ -433,6 +437,54 @@ async fn product_genesis_approval_creates_one_exact_project_and_handoff() {
     .await;
     assert!(cross_user.message.contains("product_genesis_session"));
 
+    let replacement = connect_genesis_agent(app, &token, "genesis-project-agent").await;
+    sqlx::query(
+        "UPDATE product_genesis_session
+         SET preferred_project_agent_identity_id = ?, version = version + 1, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&replacement.agent.id)
+    .bind(db::now_rfc3339())
+    .bind(&started.session.id)
+    .execute(harness.state.db.pool())
+    .await
+    .expect("rotate the selected Project Agent after the browser projection was read");
+
+    let stale_selection: ErrorResponse = common::json_request_with_bearer(
+        app,
+        Method::POST,
+        &format!(
+            "/api/v1/account/main-agent/product-genesis/{}/charter/revisions/{}/approve",
+            started.session.id, save.id
+        ),
+        &token,
+        approval_body(
+            &rendered.content_digest,
+            "approval-stale-agent",
+            &selected_agent,
+        ),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(stale_selection.code, "project_agent_selection_conflict");
+
+    let refreshed_projection: ProductGenesisCharterResponse = common::empty_request_with_bearer(
+        app,
+        Method::GET,
+        &format!(
+            "/api/v1/account/main-agent/product-genesis/{}/charter",
+            started.session.id
+        ),
+        &token,
+        StatusCode::OK,
+    )
+    .await;
+    let selected_agent = refreshed_projection
+        .selected_project_agent
+        .expect("the refreshed projection uses the current Genesis selection");
+    assert_eq!(selected_agent.identity_id, replacement.agent.id);
+    assert_eq!(selected_agent.profile_revision_id, replacement.profile.id);
+
     let approval: ProjectCharterApproval = common::json_request_with_bearer(
         app,
         Method::POST,
@@ -441,7 +493,7 @@ async fn product_genesis_approval_creates_one_exact_project_and_handoff() {
             started.session.id, save.id
         ),
         &token,
-        approval_body(&rendered.content_digest, "approval-exact"),
+        approval_body(&rendered.content_digest, "approval-exact", &selected_agent),
         StatusCode::CREATED,
     )
     .await;
@@ -456,11 +508,11 @@ async fn product_genesis_approval_creates_one_exact_project_and_handoff() {
     );
     assert_eq!(
         approval.selected_project_agent_identity_id,
-        connected.agent.id
+        replacement.agent.id
     );
     assert_eq!(
         approval.selected_project_agent_profile_revision_id,
-        connected.profile.id
+        replacement.profile.id
     );
     assert!(matches!(
         approval.state,

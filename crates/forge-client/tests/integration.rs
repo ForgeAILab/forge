@@ -11,8 +11,9 @@ use std::{
 
 use api_types::{
     AgentResponse, AgentStatus, CanonicalPhase, ClaimTaskRequest, CreateAgentRequest,
-    CreateProjectRequest, CreateRepoRequest, CreateTaskRequest, DaemonResponse, PaginatedResponse,
-    ProjectResponse, RepoResponse, TaskExecutionObservability, TaskResponse, TaskType, WorkMode,
+    CreateProjectRequest, CreateRepoRequest, CreateTaskRequest, DaemonResponse,
+    ExecutionEvidenceSummary, PaginatedResponse, ProjectResponse, RepoResponse,
+    TaskExecutionObservability, TaskResponse, TaskType, WorkMode,
 };
 use axum::{
     extract::{Path as AxumPath, State},
@@ -607,6 +608,8 @@ fn task_response(
         plan_artifact: None,
         external_issue_number: None,
         external_issue_url: None,
+        execution_evidence: ExecutionEvidenceSummary::from_counts(0, 0, false, None),
+        execution_blocker: None,
         version: 1,
         created_at: now(),
         updated_at: now(),

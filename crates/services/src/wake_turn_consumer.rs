@@ -1397,7 +1397,7 @@ fn completion_for(
         lease_owner: lease_owner.to_owned(),
         event_sequence: event.sequence,
         event_id: event.id.clone(),
-        dedupe_key: event.dedupe_key.clone().unwrap_or_else(|| event.id.clone()),
+        dedupe_key: crate::domain_event_service::event_completion_dedupe_key(event),
         completed_at: now_rfc3339(),
     }
 }

@@ -8,6 +8,7 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+api-types = { path = "../api-types" }
 executors = { path = "../executors" }
 git = { path = "../git" }
 async-trait = "0.1"

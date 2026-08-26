@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod agent_chat_topic_repository;
 mod connection;
 mod error;
 mod ids;
@@ -14,6 +15,7 @@ mod task_metadata;
 mod tests;
 mod time;
 
+pub use agent_chat_topic_repository::*;
 pub use connection::{begin_immediate, create_sqlite_pool};
 pub use error::{DbError, Result};
 pub use ids::{new_uuid_v4, validate_uuid_v4};

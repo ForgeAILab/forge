@@ -5,4 +5,4 @@
  * Overview. The snapshot remains inspectable when stale; this overlay is the
  * only field that tells callers whether it may be used for a release.
  */
-export type ReadinessFreshnessStatus = 'current' | 'stale' | 'unavailable'
+export type ReadinessFreshnessStatus = "current" | "stale" | "unavailable";

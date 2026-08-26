@@ -179,6 +179,15 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 - **Outcome privacy:** show `correlation_id` only as bounded inspectable diagnostic metadata; never render protected causes, raw persistence errors, payload bodies, or unredacted outcome JSON. Current versions, revisions, and corrective arguments may be shown only after the server has authorized the caller for that exact scope/resource.
 - **Refresh:** server events may accelerate updates, but mounted timelines poll messages, turns, handoffs, and chat status at a bounded interval so a completed response never depends on an unavailable event channel.
 
+#### Main Chat topic boundary
+
+- **Structure:** a compact control beside the Main Chat header showing the current topic's label and a `New topic` action. This is a durable, user-owned context epoch *inside* the one account Main Chat (design D21) -- it never renders as, links to, or implies a second chat, binding, or identity. Earlier topics are listed in a disclosure as inspectable/searchable history; opening one never injects it into the live turn's episodic context.
+- **Starting a topic:** `New topic` opens a small dialog with an optional label field and explains, in plain language, that Forge keeps the same Main Chat, rotates what the Main Agent sees on the next message to the new topic plus canonical portfolio state and unresolved obligations, and adds a visible divider. On success the dialog closes and the divider appears in place in the timeline as a real, durable, immutable message rendered as a `TimelineDivider` separator rather than a chat bubble.
+- **Denial:** starting a topic is refused while a Main turn is live or while a Product Genesis session/approval still needs an explicit finish-or-cancel decision (design D21). The dialog stays open, keeps the user's in-progress label, and shows the server's specific reason inline with `role="alert"`; it is never presented as a generic failure.
+- **States:** apply the shared state contract in "Charter, Project Overview, and release primitives" below -- loading (topics not yet fetched, action disabled), disabled (with a truthful reason surfaced via `title` and passed down from the live-turn/Genesis-pending signal), stale (a background refetch badge beside the current label), conflict/denied (inline alert, dialog remains open), error (topic history unavailable, rest of the chat stays usable), and success (dialog closes, current label updates, divider visible).
+- **Accessibility:** the current-topic disclosure uses the native `<details>`/`<summary>` pattern (keyboard-operable, screen-reader-exposed open/closed state by default); the dialog traps focus, restores focus to the triggering control on close, and closes on `Escape`; the divider uses `role="separator"` with an accessible label naming the new topic.
+- **Responsive:** the control stays inline with the chat header at every width; at 375px the topic label truncates with a `title` tooltip and the dialog's actions stack full width.
+
 ### Project Agent Workspace
 
 - **Structure:** `/projects/:projectId/chat` is titled `Agent Workspace` and identifies the active Project and bound Project Agent. At desktop it pairs the durable timeline with a bounded editing rail for Project summary/status, Decisions, artifacts, milestones, and Tasks. All mutations use typed Forge services and return a durable receipt.
@@ -281,12 +290,30 @@ All primitives use `min-width: 0`, wrap long labels/identifiers, and keep horizo
 - **States:** apply the shared state contract. `loading` preserves the checklist shape; `empty` explains which maturity-specific information is not yet known; `error` offers retry without changing the draft; `stale`/`conflict` disable approval and require a refreshed diff; `setup-required` routes to adoption rather than implying approval; `permission-denied` hides approval metadata and the action.
 - **Accessibility:** checklist items expose pass/gap text, not color alone; approval has a descriptive label containing the revision, is keyboard reachable, and announces success/failure in a polite status region. A failed or stale approval never moves focus to an unrelated chat.
 
+#### Execution baseline review
+
+- **Structure:** the baseline "Review" dialog (opened from the Project Agent Chat approval card) renders named sections in this order: intended outcomes, plan items, milestones, milestones/acceptance checks, adaptive authority, risks, elevated actions, exclusions, and rollback/recovery. This replaces a raw preformatted JSON blob as the primary view (live-acceptance finding F19); raw JSON survives only inside a collapsed `Technical details` disclosure alongside the content digest. This is presentation only over the exact same approved `content` the frozen `rendered_view`/digests already cover -- it never recomputes, reorders, or overrides the frozen render or its digest.
+- **Revision diff:** when a currently active revision exists beside the one under review, each section diffs by exact value (string/id lists) or by record id (acceptance-evidence entries). Additions and removals use a text label (`Added`/`Removed`, exposed to screen readers even though the leading `+`/`−` glyph is `aria-hidden`) plus a restrained `success`/`destructive` treatment, never color or strikethrough alone. A first-ever revision (no prior to compare) renders every entry as plain, undecorated content.
+- **Adaptive authority:** `allowed_task_operations` renders as the closed, plain-language vocabulary (`split`, `sequence`, `replace` become full sentences) rather than the bare enum token; an empty grant explicitly states the plan is fixed rather than showing a blank section.
+- **States:** apply the shared state contract from the section above. `empty` per-section states name what was not recorded (for example "No exclusions recorded") rather than omitting the section; the approve/activate controls beneath the dialog keep their own loading, disabled, stale, conflict, error, and success states unchanged.
+- **Accessibility:** each section is a named `region`/`section` with an `h3` heading; the raw-JSON disclosure uses the native `<details>`/`<summary>` pattern; diff badges carry screen-reader-only "Added"/"Removed" text distinct from the `aria-hidden` glyph.
+- **Responsive:** at 1280px the dialog uses its existing bounded width with a scrollable section list; at 768px and 375px sections stack full width, plan-item/milestone identifiers wrap, and the technical-details disclosure never forces page-level horizontal overflow.
+
 #### Project Overview and current outcome
 
 - **Structure:** one Overview landmark with a header (Project name, vision, current approved Charter revision, active milestone labels, explicit `primary_milestone_id`), one next user action, a current-outcome rail, authoritative Task/validation counts, Documents and Decision risks, bounded Evidence, immutable Release history, and links to the singular Project Agent Chat/global Main Chat. Keep live progress and released truth in separate titled surfaces.
 - **Current outcome card:** show the milestone identity/outcome, included and excluded scope, lifecycle, blockers, check counts, evidence coverage, and concrete Task counts by workflow state. Ember marks current active work; success marks an actual passing/released result; warning marks stale/waived data. Never render an editable percentage or a released badge from terminal Task counts alone.
 - **States:** apply the shared state contract to the Overview and current-outcome card. `empty` is a Project with no active milestone and names the next setup action; `setup-required` explains adoption while keeping Tasks/chat/evidence usable; `stale` shows the projection watermark and separates cached progress from release truth; `conflict` names the affected authority domain; `permission-denied` preserves navigation but withholds protected Project details.
 - **Responsive:** at 1280px, use a main outcome/status column with a bounded right rail for Decisions/Evidence/Release history; at 768px, collapse to one ordered column with the next action and outcome first; at 375px, stack header actions, wrap labels/identifiers, keep the composer/deep links reachable, and contain any horizontal gallery inside its own region. The page itself never scrolls horizontally.
+
+#### Project stage orientation
+
+- **Structure:** a persistent, server-derived `Define → Plan → Build → Release` strip directly under the Overview's projection banner (design D17/8.5.1). It is navigation and explanation only -- never a second lifecycle, workflow, or client truth store: every stage's status and detail text is derived, with no independent judgment, from already-canonical fields already served on `ProjectOverview` (`charter_state`, the execution gate, Task/check counts, and Releases). It does not poll or fetch on its own.
+- **Stage status:** each of the four stops shows `complete` (check glyph plus text), `active` (in progress, numbered), `blocked` (warning glyph, ember/destructive treatment), or `pending` (muted, numbered) -- text plus icon, never color alone, with the status also exposed as screen-reader-only text beside the visible label.
+- **Scoped reconciliation:** the one canonical `ExecutionBlockerProjection` (design D17) already served on execution setup is reused verbatim -- its `stage` names exactly which stop is blocked (a `review`-stage blocker is shown scoped inside `Build`, since the visible strip has four stops, not five) and its `headline`/`safe_explanation`/next action render below the strip. No parallel stage vocabulary or blocker copy is invented here.
+- **States:** apply the shared state contract. `loading`/`stale`/`error`/`permission-denied` are inherited from the Overview's own projection state -- the strip does not carry a separate one. An outstanding blocker is the only state that adds visible content (the reconciliation panel beneath the strip); no blocker means no panel.
+- **Accessibility:** the strip is a `nav` landmark labeled "Project stage"; the blocker panel is a `role="status"` region with a keyboard-reachable "Review and resolve" link to the affected stage's recovery surface.
+- **Responsive:** stops wrap onto their own row at 375px and drop the connecting rule between them (`motion-reduce:` safe, no animation plays); at 768px and 1280px stops stay in one row with a thin connecting rule between them.
 
 #### Project execution readiness state rail
 
@@ -321,6 +348,38 @@ All primitives use `min-width: 0`, wrap long labels/identifiers, and keep horizo
   timeline; at 768px it becomes the first ordered full-width panel; at 375px
   rows stack, IDs wrap, and the one next action becomes full width. The rail
   owns no page-level horizontal overflow and respects reduced motion.
+- **Plain-language compact labels:** the Project Agent side rail translates the
+  three authority dimensions into `Project Agent`, `Build setup`, and
+  `Permission to build`. When the baseline is proposed, the primary action is
+  `Approve plan & start work`; it anchors directly to the exact approval card
+  instead of linking generically back to the page. Copy must state that the
+  Project already exists, that this is the one execution approval for every
+  Task covered by the plan, and that covered Tasks do not require per-Task
+  approval. Once all three dimensions are ready and permission is active, the
+  rail ends with the status list; it must not invent a redundant `Next action`.
+
+#### Task execution approval notice
+
+- **Structure:** a compact ember-edged status card near the Task title, shown
+  only for a non-terminal implementation Task whose Project execution setup or
+  execution gate is not ready. It names the Task outcome (`Waiting to start`),
+  distinguishes Project creation from permission to change the repository, and
+  exposes exactly one route to the relevant Project Agent status or exact
+  baseline approval card.
+- **Actions:** `Approve plan & start work` when an execution baseline is
+  proposed, `Open implementation planning` before a proposal exists, and
+  `Finish build setup` when Worker/reviewer/repository setup is incomplete.
+  The control is a semantic link with a visible focus ring; it never attempts
+  to approve on the user's behalf and never presents a workflow-state gate as
+  the execution-baseline approval.
+- **States:** loading preserves a single-line status shape; unavailable data is
+  omitted in favor of the Task's existing server-authored error surface; an
+  active execution gate removes the notice. Planning/discovery and terminal
+  Tasks do not render it. Status is text plus icon/structure, never color alone.
+- **Responsive/accessibility:** the message and action sit side by side when
+  space permits and stack at compact widths with a full-width action. The
+  heading is named, copy wraps within the Task content column, and the status
+  uses `role="status"` without moving focus.
 
 #### Structured operational state feedback
 

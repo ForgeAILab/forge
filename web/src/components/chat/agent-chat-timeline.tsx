@@ -849,6 +849,12 @@ export function AgentChatTimeline({
               ) : null}
               {message.author_type === 'user' ? (
                 <UserMessage message={message} handoff={handoffFor(message)} />
+              ) : message.outcome === 'topic_started' ? (
+                // The visible Main Chat topic-boundary divider (D21/F18): a
+                // real, durable, immutable message like any other, rendered
+                // as a timeline separator rather than a chat bubble so a
+                // fresh topic reads as a context break, not more chatter.
+                <TimelineDivider label={message.content} />
               ) : message.author_type === 'system' ? (
                 <SystemMessage message={message} />
               ) : (

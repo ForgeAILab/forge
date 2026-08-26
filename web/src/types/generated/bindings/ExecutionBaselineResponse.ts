@@ -2,19 +2,25 @@
 import type { ExecutionBaseline } from "./ExecutionBaseline";
 import type { ExecutionBaselineApproval } from "./ExecutionBaselineApproval";
 import type { ExecutionBaselineApprovalTarget } from "./ExecutionBaselineApprovalTarget";
+import type { ExecutionBaselineIntegrityIssue } from "./ExecutionBaselineIntegrityIssue";
 import type { ExecutionBaselineRevision } from "./ExecutionBaselineRevision";
 
-export type ExecutionBaselineResponse = { baseline: ExecutionBaseline, current_revision: ExecutionBaselineRevision | null, 
+export type ExecutionBaselineResponse = { baseline: ExecutionBaseline, current_revision: ExecutionBaselineRevision | null,
 /**
  * A proposed/approved successor that is not authoritative until
  * activation.  This is populated when an active baseline is being
  * superseded so callers can approve and activate the exact revision
  * without mistaking it for the currently runnable revision.
  */
-proposed_revision: ExecutionBaselineRevision | null, approval: ExecutionBaselineApproval | null, 
+proposed_revision: ExecutionBaselineRevision | null, approval: ExecutionBaselineApproval | null,
 /**
  * Exact immutable target returned by a proposal command.  Query-only
  * responses leave this absent and set `requires_user_authorization` to
  * false.
  */
-approval_target: ExecutionBaselineApprovalTarget | null, requires_user_authorization: boolean, };
+approval_target: ExecutionBaselineApprovalTarget | null, requires_user_authorization: boolean,
+/**
+ * Present only when the authoritative current pointer names a preserved
+ * historical revision rejected by the closed baseline schema.
+ */
+integrity_issue: ExecutionBaselineIntegrityIssue | null, };

@@ -304,54 +304,66 @@ impl ProjectDecisionCommandService {
             observed_at: Some(now_rfc3339()),
         }];
 
-        if operation == "record_effective" && reconciliation_reason.is_none() {
-            let selected_outcome = selected_outcome.ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "an effective implementation decision requires selected_outcome",
-                )
-            })?;
-            let rationale = rationale.ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "an effective implementation decision requires rationale",
-                )
-            })?;
-            let decision = self
-                .append_effective_with_context(
-                    ProjectDecisionEffectiveCommand {
-                        project_id: project_id.to_owned(),
-                        decision_id: payload_string(payload, "decision_id")?,
-                        question,
-                        context: decision_context,
-                        options,
-                        selected_outcome,
-                        rationale,
-                        decision_class: DecisionClass::ProjectImplementation,
-                        authority_basis: "active_execution_baseline_adaptive_envelope".to_owned(),
-                        charter_revision_id: Some(baseline_charter_revision_id),
-                        baseline_revision_id: Some(baseline_revision_id),
-                        source_refs,
-                        supersedes_decision_id: None,
-                        state: "active".to_owned(),
-                        expected_project_version,
-                        idempotency_key: context.idempotency_key().to_owned(),
-                        authorization: agent_authorization(
-                            action,
-                            context,
-                            "project.decision.record_effective",
-                        ),
-                    },
-                    context.clone(),
-                )
-                .await?;
-            return Ok(json!({
-                "operation": context.operation(),
-                "project_id": project_id,
-                "decision_id": decision.id,
-                "state": decision.state,
-                "authority_basis": decision.authority_basis,
-                "domain_committed": true,
-                "requires_user_authorization": false,
-            }));
+        // An in-envelope, already-authorized, reversible implementation
+        // choice the Project Agent has already made is written as an
+        // effective Decision, not left sitting as a pending approval
+        // candidate (D19/F15). A self-declared `record_candidate` action is
+        // never sufficient authority to hide an already-decided in-envelope
+        // choice behind an approval step the user cannot meaningfully act
+        // on -- the server, not the caller's chosen tool action, decides
+        // effectiveness. Only a choice the envelope cannot already
+        // authorize, or one the Agent has not actually finished deciding,
+        // remains a candidate.
+        if reconciliation_reason.is_none() {
+            if let (Some(selected_outcome), Some(rationale)) =
+                (selected_outcome.clone(), rationale.clone())
+            {
+                let decision_id =
+                    payload_optional_string(payload, "decision_id").unwrap_or_else(new_uuid_v4);
+                let decision = self
+                    .append_effective_with_context(
+                        ProjectDecisionEffectiveCommand {
+                            project_id: project_id.to_owned(),
+                            decision_id,
+                            question: question.clone(),
+                            context: decision_context.clone(),
+                            options: options.clone(),
+                            selected_outcome,
+                            rationale,
+                            decision_class: DecisionClass::ProjectImplementation,
+                            authority_basis: "active_execution_baseline_adaptive_envelope"
+                                .to_owned(),
+                            charter_revision_id: Some(baseline_charter_revision_id),
+                            baseline_revision_id: Some(baseline_revision_id),
+                            source_refs: source_refs.clone(),
+                            supersedes_decision_id: None,
+                            state: "active".to_owned(),
+                            expected_project_version,
+                            idempotency_key: context.idempotency_key().to_owned(),
+                            authorization: agent_authorization(
+                                action,
+                                context,
+                                "project.decision.record_effective",
+                            ),
+                        },
+                        context.clone(),
+                    )
+                    .await?;
+                return Ok(json!({
+                    "operation": context.operation(),
+                    "project_id": project_id,
+                    "decision_id": decision.id,
+                    "state": decision.state,
+                    "authority_basis": decision.authority_basis,
+                    "domain_committed": true,
+                    "requires_user_authorization": false,
+                }));
+            }
+            if operation == "record_effective" {
+                return Err(ServiceError::invalid_operation(
+                    "an effective implementation decision requires selected_outcome and rationale",
+                ));
+            }
         }
 
         let reconciliation_required = reconciliation_reason.is_some();
@@ -615,6 +627,23 @@ impl ProjectDecisionCommandService {
         }
         let selected_outcome = required_option(&candidate.selected_outcome, "selected_outcome")?;
         let rationale = required_option(&candidate.rationale, "rationale")?;
+        // Re-check the candidate-shape invariant at approval time, not only
+        // at creation: a historical row persisted before this invariant
+        // existed (F15) can carry `options_json = []` alongside a populated
+        // `selected_outcome`. Approving such a row would promote its
+        // malformed shape into a permanent effective Decision, so it must
+        // fail closed here and direct the user to reject it instead.
+        let persisted_options: Vec<String> = serde_json::from_str(&candidate.options_json)
+            .map_err(|_| {
+                ServiceError::conflict("persisted Decision candidate options are invalid")
+            })?;
+        if let Some(reason) =
+            candidate_option_invariant_violation(&persisted_options, Some(&selected_outcome))
+        {
+            return Err(ServiceError::conflict(format!(
+                "this Decision candidate cannot be approved because {reason}; reject it instead"
+            )));
+        }
         let context_value: Value = serde_json::from_str(&candidate.context_json).map_err(|_| {
             ServiceError::conflict("persisted Decision candidate context is invalid")
         })?;
@@ -994,6 +1023,32 @@ fn required_option(value: &Option<String>, field: &str) -> Result<String> {
         .ok_or_else(|| ServiceError::conflict(format!("{field} is required")))
 }
 
+/// A user-choice Decision candidate requires a non-empty question, at
+/// least two distinct non-empty options, and a rationale (design D19). A
+/// recommended `selected_outcome`, when present, must name one of those
+/// options. This is the exact invariant behind finding F15: the live
+/// candidate was persisted with `options_json = []` alongside a populated
+/// `selected_outcome`, so the user saw an opaque identifier with no
+/// question, alternatives, or approve/reject action.
+fn candidate_option_invariant_violation(
+    options: &[String],
+    selected_outcome: Option<&str>,
+) -> Option<&'static str> {
+    if options.iter().any(|option| option.trim().is_empty()) {
+        return Some("an option is empty");
+    }
+    let distinct: std::collections::BTreeSet<&str> = options.iter().map(String::as_str).collect();
+    if distinct.len() < 2 {
+        return Some("it does not have at least two distinct options");
+    }
+    if let Some(outcome) = selected_outcome {
+        if !options.iter().any(|option| option == outcome) {
+            return Some("its recommendation does not name one of its options");
+        }
+    }
+    None
+}
+
 fn validate_candidate_envelope(command: &ProjectDecisionCandidateCommand) -> Result<()> {
     validate_common(
         &command.project_id,
@@ -1003,6 +1058,22 @@ fn validate_candidate_envelope(command: &ProjectDecisionCandidateCommand) -> Res
     )?;
     if command.question.trim().is_empty() {
         return Err(ServiceError::invalid_operation("question is required"));
+    }
+    if let Some(reason) =
+        candidate_option_invariant_violation(&command.options, command.selected_outcome.as_deref())
+    {
+        return Err(ServiceError::invalid_operation(format!(
+            "a Decision candidate is invalid: {reason}"
+        )));
+    }
+    if command
+        .rationale
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return Err(ServiceError::invalid_operation("rationale is required"));
     }
     validate_decision_authority(
         &command.authorization,

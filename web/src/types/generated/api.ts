@@ -4,6 +4,8 @@
 import type { CanonicalPhase } from './bindings/CanonicalPhase'
 import type { ProjectHookRule } from './bindings/ProjectHookRule'
 import type { ProjectExecutionSetupResponse } from './bindings/ProjectExecutionSetupResponse'
+import type { ExecutionBlockerProjection } from './bindings/ExecutionBlockerProjection'
+import type { ExecutionEvidenceSummary } from './bindings/ExecutionEvidenceSummary'
 
 export type TaskStatus = string
 
@@ -579,6 +581,17 @@ export interface Task {
   execution_observability?: TaskExecutionObservability
   plan_progress?: PlanProgressSummary | null
   plan_artifact?: PlanArtifactDetail | null
+  // Canonical attempt/execution/commit evidence for this Task (D17, F12).
+  // Progress language everywhere else must derive from this value; it can
+  // never be overridden to show "not started" once evidence exists. Optional
+  // here (unlike the Rust response, which always sends it) only so existing
+  // hand-built `Task` fixtures across the frontend do not all need updating;
+  // every real response includes it.
+  execution_evidence?: ExecutionEvidenceSummary
+  // The one canonical execution blocker for this Task (D16/D17), or `null`
+  // when nothing blocks this Task's execution right now. A Task-scoped
+  // blocker here never implies the whole Project is blocked.
+  execution_blocker?: ExecutionBlockerProjection | null
   version: number
   created_at: string
   updated_at: string

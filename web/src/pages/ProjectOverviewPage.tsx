@@ -1,4 +1,5 @@
-import { Link } from '@tanstack/react-router'
+import { useQueryClient } from '@tanstack/react-query'
+import { Link, useNavigate } from '@tanstack/react-router'
 import type { ReactNode } from 'react'
 import { useEffect, useRef, useState } from 'react'
 import {
@@ -11,7 +12,6 @@ import {
   FileText,
   FilmStrip,
   ImageSquare,
-  Info,
   LockKey,
   Pulse,
   WarningCircle,
@@ -25,6 +25,7 @@ import {
 } from '@/api/hooks'
 import { ConflictDetails } from '@/components/conflict-details'
 import { Button } from '@/components/ui/button'
+import { buttonClassName } from '@/components/ui/button-styles'
 import { Card } from '@/components/ui/card'
 import {
   Dialog,
@@ -35,9 +36,13 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { ProjectCharterAdoptionBanner } from '@/features/project-charter/ProjectCharterAdoptionBanner'
+import { ProjectStageOrientation } from '@/features/project-workbench/ProjectStageOrientation'
+import { DecisionCandidateCard } from '@/features/project-execution/DecisionCandidateCard'
 import { ProjectExecutionSetupPanel } from '@/features/project-execution/ProjectExecutionSetupPanel'
+import { ReconciliationReviewCard } from '@/features/project-execution/ReconciliationReviewCard'
 import { getApiErrorCode, getApiErrorMessage, isApiStatus } from '@/lib/api-error'
 import { useAuthStore } from '@/stores/auth'
+import { clearDeletedProjectScope, resolveNextProjectId } from '@/stores/project-scope'
 import type {
   AcceptanceCheckSummary,
   CharterRisk,
@@ -362,10 +367,10 @@ function AcceptanceChecksPanel({
                   onClick={() =>
                     onReview({
                       milestoneId: item.milestone.id,
-                      milestoneLabel:
-                        item.milestone.display_label ?? item.definition.content.name,
+                      milestoneLabel: item.milestone.display_label ?? item.definition.content.name,
                       definitionRevisionId: item.definition.id,
-                      charterRevisionId: item.definition.content.charter_revision?.revision_id ?? '',
+                      charterRevisionId:
+                        item.definition.content.charter_revision?.revision_id ?? '',
                       check,
                     })
                   }
@@ -473,7 +478,12 @@ function ManualAttestationDialog({
           </div>
         ) : null}
         <DialogFooter>
-          <Button type="button" variant="ghost" disabled={pending} onClick={() => onOpenChange(false)}>
+          <Button
+            type="button"
+            variant="ghost"
+            disabled={pending}
+            onClick={() => onOpenChange(false)}
+          >
             Cancel
           </Button>
           <Button
@@ -797,31 +807,22 @@ function DocumentFreshnessPanel({ documents }: { documents: DocumentFreshness[] 
   )
 }
 
-function DecisionsAndRisks({ overview }: { overview: ProjectOverview }) {
+function DecisionsAndRisks({
+  projectId,
+  overview,
+}: {
+  projectId: string
+  overview: ProjectOverview
+}) {
   const decisions = overview.decisions
   return (
     <SectionCard title="Decisions & risks" eyebrow="Authority Ledger">
       <div className="space-y-4">
         <div>
           <p className="text-xs font-medium text-muted-foreground">Pending proposals</p>
-          {overview.unresolved_decision_ids.length === 0 ? (
-            <EmptyInline text="No pending decision proposals are recorded." />
-          ) : (
-            <ul className="mt-2 space-y-2">
-              {overview.unresolved_decision_ids.map((id) => (
-                <li
-                  key={id}
-                  className="flex min-w-0 items-start gap-2 rounded-md border border-warning/30 bg-warning/5 px-3 py-2"
-                >
-                  <Info size={15} className="mt-0.5 shrink-0 text-warning" aria-hidden />
-                  <span className="min-w-0 break-all font-mono text-xs text-foreground">
-                    <span className="text-muted-foreground">Pending proposal </span>
-                    {id}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
+          <div className="mt-2">
+            <DecisionCandidateCard projectId={projectId} candidates={overview.pending_decisions} />
+          </div>
         </div>
         <div className="border-t border-border-subtle pt-4">
           <p className="text-xs font-medium text-muted-foreground">Decision log</p>
@@ -1338,17 +1339,60 @@ function DeniedState({ projectId }: { projectId: string }) {
         </p>
       </div>
       <div className="flex flex-wrap justify-center gap-2">
-        <Link to="/projects/$projectId/chat" params={{ projectId }}>
-          <Button variant="outline">Open Project Agent Chat</Button>
+        <Link
+          to="/projects/$projectId/chat"
+          params={{ projectId }}
+          className={buttonClassName({ variant: 'outline' })}
+        >
+          Open Project Agent Chat
         </Link>
         <Link
           to="/projects/$projectId/tasks"
           params={{ projectId }}
           search={{ sort_by: 'updated_at', sort_order: 'desc' }}
+          className={buttonClassName({ variant: 'ghost' })}
         >
-          <Button variant="ghost">View Tasks</Button>
+          View Tasks
         </Link>
       </div>
+    </div>
+  )
+}
+
+/**
+ * The Project this route names is gone — deleted by this user elsewhere, by
+ * another authorized member, or by this same delete just committing. F17 /
+ * 8.4.4 requires external deletion and an authorized 404 to converge the
+ * same way explicit deletion does: clear the deleted scope and land on
+ * another authorized Project or Main Chat, not a dead Overview page.
+ */
+function DeletedProjectRedirect({ projectId }: { projectId: string }) {
+  const queryClient = useQueryClient()
+  const navigate = useNavigate()
+
+  useEffect(() => {
+    let cancelled = false
+    clearDeletedProjectScope(queryClient, projectId)
+    void resolveNextProjectId(queryClient, projectId).then((nextProjectId) => {
+      if (cancelled) return
+      void navigate(
+        nextProjectId
+          ? { to: '/projects/$projectId/board', params: { projectId: nextProjectId } }
+          : { to: '/chat' },
+      )
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [projectId, queryClient, navigate])
+
+  return (
+    <div
+      className="mx-auto flex w-full max-w-2xl flex-col items-center gap-3 py-16 text-center"
+      role="status"
+      aria-live="polite"
+    >
+      <p className="text-sm text-muted-foreground">This Project no longer exists. Redirecting…</p>
     </div>
   )
 }
@@ -1383,8 +1427,12 @@ function ErrorState({
         <Button onClick={onRetry}>
           <ArrowClockwise size={15} aria-hidden /> Retry
         </Button>
-        <Link to="/projects/$projectId/chat" params={{ projectId }}>
-          <Button variant="outline">Open Project Agent Chat</Button>
+        <Link
+          to="/projects/$projectId/chat"
+          params={{ projectId }}
+          className={buttonClassName({ variant: 'outline' })}
+        >
+          Open Project Agent Chat
         </Link>
       </div>
     </div>
@@ -1659,6 +1707,8 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
   if (overviewQuery.isLoading) return <LoadingState />
   if (overviewQuery.isError) {
     if (isApiStatus(overviewQuery.error, 403)) return <DeniedState projectId={projectId} />
+    if (isApiStatus(overviewQuery.error, 404))
+      return <DeletedProjectRedirect projectId={projectId} />
     return (
       <ErrorState
         error={overviewQuery.error}
@@ -1725,13 +1775,15 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
             </div>
           </div>
           <div className="flex shrink-0 flex-wrap gap-2">
-            <Link to="/projects/$projectId/chat" params={{ projectId }}>
-              <Button variant="outline">
-                <ChatCircleDots size={15} aria-hidden /> Project Agent Chat
-              </Button>
+            <Link
+              to="/projects/$projectId/chat"
+              params={{ projectId }}
+              className={buttonClassName({ variant: 'outline' })}
+            >
+              <ChatCircleDots size={15} aria-hidden /> Project Agent Chat
             </Link>
-            <Link to="/chat">
-              <Button variant="ghost">Main Chat</Button>
+            <Link to="/chat" className={buttonClassName({ variant: 'ghost' })}>
+              Main Chat
             </Link>
           </div>
         </div>
@@ -1742,6 +1794,8 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
         watermark={overview.source_event_watermark}
         onRetry={() => void overviewQuery.refetch()}
       />
+
+      <ProjectStageOrientation overview={overview} />
 
       {releaseNotice ? (
         <div
@@ -1764,6 +1818,8 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
       ) : null}
 
       {setupRequired ? <ProjectCharterAdoptionBanner projectId={projectId} /> : null}
+
+      <ReconciliationReviewCard projectId={projectId} />
 
       <div className="grid min-w-0 gap-5 xl:grid-cols-[minmax(0,1.45fr)_minmax(300px,0.75fr)]">
         <section
@@ -1855,7 +1911,7 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
             <DocumentFreshnessPanel documents={overview.document_freshness} />
           </div>
           <div id="decisions" className="order-5 min-w-0 scroll-mt-24 xl:order-none">
-            <DecisionsAndRisks overview={overview} />
+            <DecisionsAndRisks projectId={projectId} overview={overview} />
           </div>
           <div id="evidence" className="order-6 min-w-0 scroll-mt-24 xl:order-none">
             <EvidenceGallery projectId={projectId} evidence={overview.evidence} />

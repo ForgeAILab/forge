@@ -8,7 +8,9 @@
 use std::path::Path;
 
 use api_types::{
-    CoordinationState, ExecutionGate, ExecutionPrincipalResponse, ExecutionSetupState,
+    CoordinationState, ExecutionBlockerCode, ExecutionBlockerPrincipal, ExecutionBlockerProjection,
+    ExecutionBlockerRecordRef, ExecutionBlockerScope, ExecutionBlockerStage,
+    ExecutionEvidenceSummary, ExecutionGate, ExecutionPrincipalResponse, ExecutionSetupState,
     ProjectExecutionSetupAvailability, ProjectExecutionSetupResponse, ProjectionStatus,
     ProvisioningOperationResponse, RepoResponse, RetryAction, SetupRequirement,
 };
@@ -16,11 +18,93 @@ use db::{
     Agent, AgentChatRepo, Project, ProjectAgentBindingRepo, ProjectProvisioningRepo, ProjectRepo,
     RepoRepo, SqliteDb,
 };
+use sha2::{Digest, Sha256};
 
 use crate::{
-    execution_setup::{eligible_project_execution_agents, resolve_project_execution_roles},
+    execution_setup::{
+        classify_task_execution, eligible_project_execution_agents, is_read_only_capability,
+        resolve_project_execution_roles, TaskExecutionClass,
+    },
     Result, ServiceError,
 };
+
+/// Reconciliation conflict codes whose divergence invalidates the Project's
+/// governing baseline itself, not merely one downstream record. Only these
+/// widen the Project execution gate (D16); every other recorded conflict
+/// code is scoped to its own affected record(s) — a Task, plan item, or
+/// milestone — and must attach only there.
+pub(crate) const PROJECT_WIDE_RECONCILIATION_CONFLICT_CODES: &[&str] = &["invalid_active_baseline"];
+
+/// One required reconciliation record joined with its canonical conflict.
+/// Shared by the Project-wide gate computation, the per-Task blocker
+/// projection, and the capability-aware review evaluation in
+/// `task_service::governance` so all three agree on exactly the same set of
+/// outstanding conflicts.
+#[derive(Debug, Clone)]
+pub(crate) struct ReconciliationConflictRow {
+    pub reconciliation_id: String,
+    pub conflict_code: String,
+    pub description: String,
+    pub record_type: String,
+    pub record_id: String,
+    pub governing_record_type: String,
+    pub governing_record_id: String,
+    pub affected_paths: Vec<String>,
+    pub updated_at: String,
+}
+
+impl ReconciliationConflictRow {
+    /// Whether this conflict invalidates the Project's governing baseline
+    /// itself (D16). Everything else is scoped to `record_type`/`record_id`.
+    pub(crate) fn is_project_wide(&self) -> bool {
+        PROJECT_WIDE_RECONCILIATION_CONFLICT_CODES.contains(&self.conflict_code.as_str())
+    }
+
+    /// Whether this conflict attaches to the named Task specifically.
+    pub(crate) fn is_scoped_to_task(&self, task_id: &str) -> bool {
+        self.record_type == "task" && self.record_id == task_id
+    }
+}
+
+/// Load every `required` reconciliation record for a Project, joined with
+/// its canonical conflict. Ordered most-recently-updated first so the
+/// exact same "current" conflict is chosen everywhere it is consulted.
+pub(crate) async fn required_reconciliation_conflicts(
+    db: &SqliteDb,
+    project_id: &str,
+) -> Result<Vec<ReconciliationConflictRow>> {
+    let rows = sqlx::query(
+        "SELECT r.id AS reconciliation_id, c.conflict_code, c.description,
+                r.record_type, r.record_id,
+                r.governing_record_type, r.governing_record_id,
+                c.affected_paths_json, r.updated_at
+         FROM project_reconciliation_record r
+         JOIN project_canonical_conflict c ON c.id = r.conflict_id
+         WHERE r.project_id = ? AND r.state = 'required'
+         ORDER BY r.updated_at DESC, r.id DESC",
+    )
+    .bind(project_id)
+    .fetch_all(db.pool())
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let affected_paths_json: String = sqlx::Row::try_get(&row, "affected_paths_json")?;
+            let affected_paths: Vec<String> =
+                serde_json::from_str(&affected_paths_json).unwrap_or_default();
+            Ok(ReconciliationConflictRow {
+                reconciliation_id: sqlx::Row::try_get(&row, "reconciliation_id")?,
+                conflict_code: sqlx::Row::try_get(&row, "conflict_code")?,
+                description: sqlx::Row::try_get(&row, "description")?,
+                record_type: sqlx::Row::try_get(&row, "record_type")?,
+                record_id: sqlx::Row::try_get(&row, "record_id")?,
+                governing_record_type: sqlx::Row::try_get(&row, "governing_record_type")?,
+                governing_record_id: sqlx::Row::try_get(&row, "governing_record_id")?,
+                affected_paths,
+                updated_at: sqlx::Row::try_get(&row, "updated_at")?,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, ServiceError>>()
+}
 
 /// Load the authoritative, scope-neutral Project setup projection used by
 /// REST Project views and the Project current-state tool.
@@ -146,10 +230,15 @@ pub async fn load_project_execution_setup(
         .map(execution_principal_response)
         .collect::<Vec<_>>();
 
-    let (execution_gate, gate_status) = match execution_gate(db, project_id).await {
-        Ok(gate) => (gate, ProjectionStatus::current()),
-        Err(_) => (ExecutionGate::Unavailable, ProjectionStatus::unavailable()),
-    };
+    let (execution_gate, gate_status, reconciliation_conflict) =
+        match execution_gate(db, project_id).await {
+            Ok((gate, conflict)) => (gate, ProjectionStatus::current(), conflict),
+            Err(_) => (
+                ExecutionGate::Unavailable,
+                ProjectionStatus::unavailable(),
+                None,
+            ),
+        };
     if gate_status.availability != api_types::ProjectionAvailability::Current {
         let mut requirement = SetupRequirement::new("execution_gate_projection");
         requirement.action = Some(RetryAction::RefreshAndRetry);
@@ -165,11 +254,25 @@ pub async fn load_project_execution_setup(
         .or(match execution_gate {
             ExecutionGate::BaselineApprovalRequired => Some(RetryAction::Reauthorize),
             ExecutionGate::PreBaselineReadOnly => Some(RetryAction::Repropose),
-            ExecutionGate::ReconciliationRequired | ExecutionGate::Unavailable => {
-                Some(RetryAction::RefreshAndRetry)
-            }
+            ExecutionGate::ReconciliationRequired => Some(RetryAction::ResolveReconciliation),
+            ExecutionGate::Unavailable => Some(RetryAction::RefreshAndRetry),
             ExecutionGate::Active => None,
         });
+    let leading_requirement = next_action.and_then(|action| {
+        setup_requirements
+            .iter()
+            .find(|requirement| requirement.action == Some(action))
+    });
+    let execution_blocker = project_scope_execution_blocker(
+        project.version,
+        coordination_state,
+        execution_setup_state,
+        execution_gate,
+        next_action,
+        leading_requirement,
+        provisioning.as_ref(),
+        reconciliation_conflict.as_ref(),
+    );
 
     Ok(ProjectExecutionSetupResponse {
         project_id: project.id,
@@ -196,6 +299,7 @@ pub async fn load_project_execution_setup(
         setup_requirements,
         next_action,
         provisioning,
+        execution_blocker,
     })
 }
 
@@ -334,19 +438,21 @@ fn provisioning_retry_allowed(operation: &ProvisioningOperationResponse) -> bool
     operation.retryable && operation.attempt_count < operation.max_attempts
 }
 
-async fn execution_gate(db: &SqliteDb, project_id: &str) -> Result<ExecutionGate> {
-    let reconciliation_required = sqlx::query_scalar::<_, i64>(
-        "SELECT EXISTS (
-             SELECT 1 FROM project_reconciliation_record
-             WHERE project_id = ? AND state = 'required'
-         )",
-    )
-    .bind(project_id)
-    .fetch_one(db.pool())
-    .await?
-        != 0;
-    if reconciliation_required {
-        return Ok(ExecutionGate::ReconciliationRequired);
+/// The Project-wide execution gate and, when it is `ReconciliationRequired`,
+/// the exact governing-truth conflict that widened it. Per D16, a Task-,
+/// plan-item-, or milestone-scoped reconciliation never appears here — it
+/// leaves this gate untouched and attaches only to its own affected
+/// record(s) through [`load_task_execution_blocker`].
+async fn execution_gate(
+    db: &SqliteDb,
+    project_id: &str,
+) -> Result<(ExecutionGate, Option<ReconciliationConflictRow>)> {
+    let conflicts = required_reconciliation_conflicts(db, project_id).await?;
+    if let Some(project_wide) = conflicts
+        .into_iter()
+        .find(ReconciliationConflictRow::is_project_wide)
+    {
+        return Ok((ExecutionGate::ReconciliationRequired, Some(project_wide)));
     }
 
     let baseline = sqlx::query(
@@ -368,16 +474,19 @@ async fn execution_gate(db: &SqliteDb, project_id: &str) -> Result<ExecutionGate
     .fetch_optional(db.pool())
     .await?;
     let Some(row) = baseline else {
-        return Ok(ExecutionGate::PreBaselineReadOnly);
+        return Ok((ExecutionGate::PreBaselineReadOnly, None));
     };
     let lifecycle: String = sqlx::Row::try_get(&row, "lifecycle")?;
     let revision_lifecycle: Option<String> = sqlx::Row::try_get(&row, "revision_lifecycle")?;
-    Ok(match (lifecycle.as_str(), revision_lifecycle.as_deref()) {
+    let gate = match (lifecycle.as_str(), revision_lifecycle.as_deref()) {
         ("active", Some("approved")) => ExecutionGate::Active,
+        // The active baseline's own current revision is not approved: a
+        // structural Project-wide invalidity, not a recorded conflict row.
         ("active", _) => ExecutionGate::ReconciliationRequired,
         ("proposed" | "approved", _) => ExecutionGate::BaselineApprovalRequired,
         _ => ExecutionGate::PreBaselineReadOnly,
-    })
+    };
+    Ok((gate, None))
 }
 
 fn execution_principal_response(agent: Agent) -> ExecutionPrincipalResponse {
@@ -417,7 +526,7 @@ fn add_gate_requirement(requirements: &mut Vec<SetupRequirement>, gate: Executio
     let action = match gate {
         ExecutionGate::BaselineApprovalRequired => Some(RetryAction::Reauthorize),
         ExecutionGate::PreBaselineReadOnly => Some(RetryAction::Repropose),
-        ExecutionGate::ReconciliationRequired => Some(RetryAction::RefreshAndRetry),
+        ExecutionGate::ReconciliationRequired => Some(RetryAction::ResolveReconciliation),
         ExecutionGate::Active | ExecutionGate::Unavailable => None,
     };
     if let Some(action) = action {
@@ -436,6 +545,370 @@ fn deduplicate_requirements(requirements: &mut Vec<SetupRequirement>) {
             requirement.capability.clone(),
         ))
     });
+}
+
+/// Build the one Project-wide `ExecutionBlockerProjection`, or `None` when
+/// the Project has no outstanding blocker. This is a pure translation of the
+/// exact same state `load_project_execution_setup` already computed — it
+/// never re-derives copy from raw enums on a different surface (D17).
+#[allow(clippy::too_many_arguments)]
+fn project_scope_execution_blocker(
+    project_version: i64,
+    coordination_state: CoordinationState,
+    execution_setup_state: ExecutionSetupState,
+    execution_gate: ExecutionGate,
+    next_action: Option<RetryAction>,
+    leading_requirement: Option<&SetupRequirement>,
+    provisioning: Option<&ProvisioningOperationResponse>,
+    reconciliation: Option<&ReconciliationConflictRow>,
+) -> Option<ExecutionBlockerProjection> {
+    let next_action = next_action?;
+    let (code, stage, headline, safe_explanation, required_principal, governing_ref) = blocker_copy(
+        coordination_state,
+        execution_setup_state,
+        execution_gate,
+        leading_requirement,
+        provisioning,
+        reconciliation,
+    );
+    let affected_refs = Vec::new();
+    let blocker_digest = compute_blocker_digest(
+        code,
+        ExecutionBlockerScope::Project,
+        &affected_refs,
+        governing_ref.as_ref(),
+        project_version,
+        reconciliation,
+    );
+    Some(ExecutionBlockerProjection {
+        code,
+        stage,
+        scope: ExecutionBlockerScope::Project,
+        affected_refs,
+        governing_ref,
+        headline,
+        safe_explanation,
+        evidence: None,
+        required_principal,
+        next_action,
+        blocker_digest,
+        observed_version: project_version,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn blocker_copy(
+    coordination_state: CoordinationState,
+    execution_setup_state: ExecutionSetupState,
+    execution_gate: ExecutionGate,
+    leading_requirement: Option<&SetupRequirement>,
+    provisioning: Option<&ProvisioningOperationResponse>,
+    reconciliation: Option<&ReconciliationConflictRow>,
+) -> (
+    ExecutionBlockerCode,
+    ExecutionBlockerStage,
+    String,
+    String,
+    ExecutionBlockerPrincipal,
+    Option<ExecutionBlockerRecordRef>,
+) {
+    if coordination_state != CoordinationState::Ready {
+        return (
+            ExecutionBlockerCode::CoordinationSetupRequired,
+            ExecutionBlockerStage::Define,
+            "Waiting for Project Agent setup".to_owned(),
+            "Project Agent Chat needs its authorized binding before the Project Agent can coordinate this Project.".to_owned(),
+            ExecutionBlockerPrincipal::User,
+            None,
+        );
+    }
+    if let Some(requirement) = leading_requirement {
+        if requirement.role.as_deref() == Some("worker") {
+            return (
+                ExecutionBlockerCode::WorkerAssignmentRequired,
+                ExecutionBlockerStage::Build,
+                "Waiting for a Worker".to_owned(),
+                "Select or create a Worker before repository-backed execution can proceed."
+                    .to_owned(),
+                ExecutionBlockerPrincipal::User,
+                None,
+            );
+        }
+        if requirement.role.as_deref() == Some("independent_reviewer") {
+            return (
+                ExecutionBlockerCode::IndependentReviewerAssignmentRequired,
+                ExecutionBlockerStage::Review,
+                "Waiting for an independent reviewer".to_owned(),
+                "Select an independent reviewer distinct from the Worker.".to_owned(),
+                ExecutionBlockerPrincipal::User,
+                None,
+            );
+        }
+        if requirement.requirement_type == "repository" {
+            return (
+                ExecutionBlockerCode::RepositorySetupRequired,
+                ExecutionBlockerStage::Build,
+                "Waiting for repository setup".to_owned(),
+                "Attach the Project's primary repository before repository-backed execution can start.".to_owned(),
+                ExecutionBlockerPrincipal::User,
+                None,
+            );
+        }
+        if requirement.requirement_type == "provisioning" {
+            if execution_setup_state == ExecutionSetupState::Failed {
+                let explanation = provisioning
+                    .and_then(|operation| operation.last_error_message.clone())
+                    .filter(|message| !message.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        "The server recorded a provisioning failure without a user-facing detail."
+                            .to_owned()
+                    });
+                return (
+                    ExecutionBlockerCode::ProvisioningFailed,
+                    ExecutionBlockerStage::Build,
+                    "Provisioning failed".to_owned(),
+                    explanation,
+                    ExecutionBlockerPrincipal::User,
+                    None,
+                );
+            }
+            return (
+                ExecutionBlockerCode::ProvisioningInProgress,
+                ExecutionBlockerStage::Build,
+                "Provisioning in progress".to_owned(),
+                "Repository-backed execution is provisioning. No operational success is claimed yet."
+                    .to_owned(),
+                ExecutionBlockerPrincipal::System,
+                None,
+            );
+        }
+        if requirement.requirement_type == "execution_gate_projection"
+            || requirement.requirement_type == "execution_setup_projection"
+        {
+            return (
+                ExecutionBlockerCode::ProjectionUnavailable,
+                ExecutionBlockerStage::Build,
+                "Execution status unavailable".to_owned(),
+                "Forge could not verify execution status. Refresh before acting.".to_owned(),
+                ExecutionBlockerPrincipal::System,
+                None,
+            );
+        }
+        // Falls through for "coordination" (already handled above) and
+        // "execution_baseline" (handled by the gate match below).
+    }
+    match execution_gate {
+        ExecutionGate::PreBaselineReadOnly => (
+            ExecutionBlockerCode::PreBaselineReadOnly,
+            ExecutionBlockerStage::Plan,
+            "Waiting for an implementation plan".to_owned(),
+            "The Project Agent still needs to prepare the implementation plan; approving that plan starts every covered Task.".to_owned(),
+            ExecutionBlockerPrincipal::ProjectAgent,
+            None,
+        ),
+        ExecutionGate::BaselineApprovalRequired => (
+            ExecutionBlockerCode::BaselineApprovalRequired,
+            ExecutionBlockerStage::Plan,
+            "Waiting for permission to build".to_owned(),
+            "The Project is already approved. This one approval starts every Task covered by the current plan — there is no separate approval for each Task.".to_owned(),
+            ExecutionBlockerPrincipal::User,
+            None,
+        ),
+        ExecutionGate::ReconciliationRequired => {
+            let invalid_baseline = reconciliation
+                .is_some_and(|conflict| conflict.conflict_code == "invalid_active_baseline");
+            let governing_ref = reconciliation.map(|conflict| ExecutionBlockerRecordRef {
+                record_type: conflict.governing_record_type.clone(),
+                record_id: conflict.governing_record_id.clone(),
+                label: None,
+            });
+            if invalid_baseline {
+                (
+                    ExecutionBlockerCode::InvalidActiveBaseline,
+                    ExecutionBlockerStage::Build,
+                    "Active plan needs repair".to_owned(),
+                    "The Project's active execution baseline is invalid and must be corrected before repository work can resume.".to_owned(),
+                    ExecutionBlockerPrincipal::User,
+                    governing_ref,
+                )
+            } else {
+                (
+                    ExecutionBlockerCode::ReconciliationRequired,
+                    ExecutionBlockerStage::Build,
+                    "Waiting for plan reconciliation".to_owned(),
+                    "The approved plan changed and must be reconciled before repository work can resume.".to_owned(),
+                    ExecutionBlockerPrincipal::User,
+                    governing_ref,
+                )
+            }
+        }
+        ExecutionGate::Active | ExecutionGate::Unavailable => (
+            ExecutionBlockerCode::ProjectionUnavailable,
+            ExecutionBlockerStage::Build,
+            "Execution status unavailable".to_owned(),
+            "Forge could not verify execution status. Refresh before acting.".to_owned(),
+            ExecutionBlockerPrincipal::System,
+            None,
+        ),
+    }
+}
+
+fn compute_blocker_digest(
+    code: ExecutionBlockerCode,
+    scope: ExecutionBlockerScope,
+    affected_refs: &[ExecutionBlockerRecordRef],
+    governing_ref: Option<&ExecutionBlockerRecordRef>,
+    observed_version: i64,
+    conflict: Option<&ReconciliationConflictRow>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{code:?}\0{scope:?}\0").as_bytes());
+    for reference in affected_refs {
+        hasher.update(format!("{}:{}\0", reference.record_type, reference.record_id).as_bytes());
+    }
+    if let Some(reference) = governing_ref {
+        hasher.update(format!("g:{}:{}\0", reference.record_type, reference.record_id).as_bytes());
+    }
+    hasher.update(observed_version.to_le_bytes());
+    if let Some(conflict) = conflict {
+        // Fold in the exact reconciliation record identity and its last
+        // update so a superseding/newly-recorded conflict for the same code
+        // and scope is never mistaken for the same unchanged blocker.
+        hasher.update(
+            format!("r:{}:{}\0", conflict.reconciliation_id, conflict.updated_at).as_bytes(),
+        );
+    }
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+/// Canonical attempt/execution/commit evidence for one Task (D17, F12).
+/// `has_commit` follows the same `after_sha.is_some()` convention used
+/// elsewhere in this codebase to detect committed execution results.
+async fn task_execution_evidence(db: &SqliteDb, task_id: &str) -> Result<ExecutionEvidenceSummary> {
+    let row = sqlx::query(
+        "SELECT
+             COUNT(*) AS execution_count,
+             SUM(CASE WHEN role != 'reviewer' THEN 1 ELSE 0 END) AS attempt_count,
+             (SELECT after_sha FROM execution
+                WHERE task_id = ? AND after_sha IS NOT NULL
+                ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_commit_sha
+         FROM execution WHERE task_id = ?",
+    )
+    .bind(task_id)
+    .bind(task_id)
+    .fetch_one(db.pool())
+    .await?;
+    let execution_count: i64 = sqlx::Row::try_get(&row, "execution_count")?;
+    let attempt_count: i64 =
+        sqlx::Row::try_get::<Option<i64>, _>(&row, "attempt_count")?.unwrap_or(0);
+    let latest_commit_sha: Option<String> = sqlx::Row::try_get(&row, "latest_commit_sha")?;
+    Ok(ExecutionEvidenceSummary::from_counts(
+        attempt_count,
+        execution_count,
+        latest_commit_sha.is_some(),
+        latest_commit_sha,
+    ))
+}
+
+/// Load the canonical execution blocker for one Task (D16/D17).
+///
+/// The returned evidence is always this Task's own attempt/execution/commit
+/// history — it is never re-derived from the Project gate, so a Task with a
+/// commit can never be described as "not started" (F12). When the Project
+/// itself has no outstanding blocker, this also checks for a reconciliation
+/// scoped specifically to this Task; that blocker attaches only here and
+/// never widens the Project's execution gate for unrelated work (D16).
+pub async fn load_task_execution_blocker(
+    db: &SqliteDb,
+    task: &db::Task,
+) -> Result<(ExecutionEvidenceSummary, Option<ExecutionBlockerProjection>)> {
+    let evidence = task_execution_evidence(db, &task.id).await?;
+
+    if matches!(task.status.as_str(), "done" | "cancelled") {
+        return Ok((evidence, None));
+    }
+
+    let Some(project) = ProjectRepo::get_by_id(db, &task.project_id).await? else {
+        return Ok((evidence, None));
+    };
+    let charter_backed = project.charter_status == "charter_backed"
+        && !project.charter_setup_required
+        && project.current_charter_revision_id.is_some();
+    if !charter_backed {
+        return Ok((evidence, None));
+    }
+
+    let capability_class = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT capability_class FROM project_task_governance
+         WHERE task_id = ? AND project_id = ?",
+    )
+    .bind(&task.id)
+    .bind(&task.project_id)
+    .fetch_optional(db.pool())
+    .await?
+    .flatten();
+    let execution_class = classify_task_execution(&task.task_type, capability_class.as_deref())
+        .unwrap_or(TaskExecutionClass::Implementation);
+    if execution_class == TaskExecutionClass::ReadOnlyPlanning {
+        return Ok((evidence, None));
+    }
+    if capability_class
+        .as_deref()
+        .is_some_and(is_read_only_capability)
+    {
+        return Ok((evidence, None));
+    }
+
+    let setup = load_project_execution_setup(db, &task.project_id).await?;
+    if let Some(mut blocker) = setup.execution_blocker {
+        blocker.evidence = Some(evidence.clone());
+        return Ok((evidence, Some(blocker)));
+    }
+
+    // The Project itself is fully clear. A reconciliation scoped to exactly
+    // this Task still blocks only this Task's repository mutation.
+    let conflicts = required_reconciliation_conflicts(db, &task.project_id).await?;
+    let Some(conflict) = conflicts
+        .iter()
+        .find(|conflict| conflict.is_scoped_to_task(&task.id))
+    else {
+        return Ok((evidence, None));
+    };
+    let governing_ref = Some(ExecutionBlockerRecordRef {
+        record_type: conflict.governing_record_type.clone(),
+        record_id: conflict.governing_record_id.clone(),
+        label: None,
+    });
+    let affected_refs = vec![ExecutionBlockerRecordRef {
+        record_type: "task".to_owned(),
+        record_id: task.id.clone(),
+        label: Some(task.title.clone()),
+    }];
+    let blocker_digest = compute_blocker_digest(
+        ExecutionBlockerCode::ReconciliationRequired,
+        ExecutionBlockerScope::Task,
+        &affected_refs,
+        governing_ref.as_ref(),
+        task.version,
+        Some(conflict),
+    );
+    let blocker = ExecutionBlockerProjection {
+        code: ExecutionBlockerCode::ReconciliationRequired,
+        stage: ExecutionBlockerStage::Build,
+        scope: ExecutionBlockerScope::Task,
+        affected_refs,
+        governing_ref,
+        headline: "Waiting for plan reconciliation".to_owned(),
+        safe_explanation: "This Task's governance changed and must be reconciled before it can \
+            safely resume. The rest of the Project's approved plan remains active."
+            .to_owned(),
+        evidence: Some(evidence.clone()),
+        required_principal: ExecutionBlockerPrincipal::User,
+        next_action: RetryAction::ResolveReconciliation,
+        blocker_digest,
+        observed_version: task.version,
+    };
+    Ok((evidence, Some(blocker)))
 }
 
 #[cfg(test)]
@@ -565,7 +1038,8 @@ mod tests {
         assert_eq!(
             execution_gate(&db, "projection-baseline-project")
                 .await
-                .expect("gate"),
+                .expect("gate")
+                .0,
             ExecutionGate::ReconciliationRequired
         );
     }

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::{RepoResponse, RetryAction, SetupRequirement};
+use crate::{ExecutionBlockerProjection, RepoResponse, RetryAction, SetupRequirement};
 
 /// Whether the singular Project Agent chat can admit a turn.  This is kept
 /// independent from repository/role setup and baseline approval.
@@ -154,6 +154,11 @@ pub struct ProjectExecutionSetupResponse {
     pub setup_requirements: Vec<SetupRequirement>,
     pub next_action: Option<RetryAction>,
     pub provisioning: Option<ProvisioningOperationResponse>,
+    /// The one canonical Project-wide execution blocker (D17), or `None`
+    /// when the Project has no outstanding blocker. Consumers render this
+    /// projection's copy instead of deriving their own from the raw
+    /// `coordination_state`/`execution_setup_state`/`execution_gate` enums.
+    pub execution_blocker: Option<ExecutionBlockerProjection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]

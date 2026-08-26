@@ -264,7 +264,19 @@ pub trait TurnEventSink: Send + Sync + fmt::Debug {
     /// the runtime; only the top-level key names are visible.
     async fn tool_call_started(&self, _call_id: &str, _name: &str, _argument_keys: &[String]) {}
 
-    async fn tool_call_finished(&self, _call_id: &str, _name: &str, _is_error: bool) {}
+    /// A tool call finished. `summary` is the same bounded, redaction-safe
+    /// result the model and the UI tool card receive: a stable code, a safe
+    /// message, retryability/permitted recovery, and a correlation id. Raw
+    /// arguments, raw payloads, credentials, and unredacted internal causes
+    /// are never in it.
+    async fn tool_call_finished(
+        &self,
+        _call_id: &str,
+        _name: &str,
+        _is_error: bool,
+        _summary: &api_types::ToolResultSummary,
+    ) {
+    }
 }
 
 #[derive(Debug, Default)]

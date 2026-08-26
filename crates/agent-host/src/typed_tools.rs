@@ -22,9 +22,10 @@ use agent_runtime::core::{
         SecurityCheckRevision,
     },
     prelude::{
-        ActionClass, AuthorizationRequest, DecisionCode, InvocationContext, PermissionSet,
+        ActionClass, AuthorizationRequest, Deadline, DecisionCode, InteractionOrigin,
+        InteractionRequest, InteractionResponse, InvocationContext, PermissionSet,
         PreparationContext, PreparedToolCall, RuntimeError, SecurityResource, Tool,
-        ToolCallDisplay, ToolEffects, ToolOutcome, ToolSpec,
+        ToolCallDisplay, ToolCallId, ToolEffects, ToolOutcome, ToolSpec,
     },
     workspace::Workspace,
 };
@@ -534,6 +535,98 @@ impl ScopeToolComposition {
     /// The canonical scope captured by the host composition.
     pub fn scope(&self) -> &CanonicalScope {
         &self.scope
+    }
+
+    /// Wraps every composed tool so `observer` sees the exact call id and
+    /// result immediately before it returns to the runtime.
+    ///
+    /// `RuntimeEvent::ToolCallCompleted` (the runtime-event boundary the host
+    /// observes) carries only `is_error`; a typed Forge command result is
+    /// otherwise lost before it reaches the durable log, runtime event, and
+    /// UI tool card. This reunites them without changing tool behavior:
+    /// `observer` must stay synchronous and must not panic.
+    #[must_use]
+    pub fn observe_results(mut self, observer: ToolResultObserver) -> Self {
+        self.tools = self
+            .tools
+            .into_iter()
+            .map(|tool| -> Arc<dyn Tool> {
+                Arc::new(ObservedTool {
+                    inner: tool,
+                    observer: Arc::clone(&observer),
+                })
+            })
+            .collect();
+        self
+    }
+}
+
+/// A callback notified with the exact call id and result of one tool
+/// invocation, before an [`ScopeToolComposition::observe_results`]-wrapped
+/// composition returns it to the runtime.
+pub type ToolResultObserver =
+    Arc<dyn Fn(&ToolCallId, &Result<ToolOutcome, RuntimeError>) + Send + Sync>;
+
+struct ObservedTool {
+    inner: Arc<dyn Tool>,
+    observer: ToolResultObserver,
+}
+
+impl fmt::Debug for ObservedTool {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ObservedTool")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl Tool for ObservedTool {
+    fn spec(&self) -> ToolSpec {
+        self.inner.spec()
+    }
+
+    async fn prepare(
+        &self,
+        arguments: Value,
+        ctx: &PreparationContext,
+    ) -> Result<PreparedToolCall, RuntimeError> {
+        self.inner.prepare(arguments, ctx).await
+    }
+
+    fn interaction_request(
+        &self,
+        prepared: &PreparedToolCall,
+        origin: InteractionOrigin,
+        deadline: Deadline,
+    ) -> Result<Option<InteractionRequest>, RuntimeError> {
+        self.inner.interaction_request(prepared, origin, deadline)
+    }
+
+    fn supports_interaction(&self) -> bool {
+        self.inner.supports_interaction()
+    }
+
+    fn resolve_interaction(
+        &self,
+        prepared: &PreparedToolCall,
+        response: &InteractionResponse,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        let result = self.inner.resolve_interaction(prepared, response);
+        (self.observer)(prepared.call_id(), &result);
+        result
+    }
+
+    async fn invoke(
+        &self,
+        prepared: PreparedToolCall,
+        ctx: &InvocationContext,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        let call_id = ctx.call_id.clone();
+        let result = self.inner.invoke(prepared, ctx).await;
+        (self.observer)(&call_id, &result);
+        result
     }
 }
 

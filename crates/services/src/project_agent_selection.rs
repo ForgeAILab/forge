@@ -97,6 +97,18 @@ pub async fn resolve_requested_genesis_project_agent(
     session: &ProductGenesisSession,
     identity_id: &str,
 ) -> Result<GenesisAgentSelection> {
+    resolve_requested_genesis_project_agent_for_account(db, &session.account_id, identity_id).await
+}
+
+/// Resolve one explicitly requested Project Agent before a Genesis session
+/// exists. This keeps `genesis.start` from relying on the database ownership
+/// trigger for model-authored identity ids and returns the same bounded
+/// validation error as a later explicit selection.
+pub async fn resolve_requested_genesis_project_agent_for_account(
+    db: &SqliteDb,
+    account_id: &str,
+    identity_id: &str,
+) -> Result<GenesisAgentSelection> {
     let identity_id = identity_id.trim();
     if identity_id.is_empty() {
         return Err(ServiceError::invalid_operation(
@@ -104,18 +116,13 @@ pub async fn resolve_requested_genesis_project_agent(
         ));
     }
     let operating_skill_revision = current_project_agent_operating_skill_revision(db).await?;
-    eligible_selection(
-        db,
-        identity_id,
-        &session.account_id,
-        &operating_skill_revision,
-    )
-    .await?
-    .ok_or_else(|| {
-        ServiceError::invalid_operation(format!(
-            "Project Agent {identity_id} is not an eligible account-owned identity"
-        ))
-    })
+    eligible_selection(db, identity_id, account_id, &operating_skill_revision)
+        .await?
+        .ok_or_else(|| {
+            ServiceError::invalid_operation(format!(
+                "Project Agent {identity_id} is not an eligible account-owned identity"
+            ))
+        })
 }
 
 /// List every identity the user may explicitly select for this Genesis
