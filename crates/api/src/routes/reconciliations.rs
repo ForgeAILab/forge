@@ -65,6 +65,8 @@ pub async fn resolve_project_reconciliation(
     Path((project_id, reconciliation_id)): Path<(String, String)>,
     Json(request): Json<ResolveProjectReconciliationRequest>,
 ) -> ApiResult<Json<ResolveProjectReconciliationResponse>> {
+    // For the server-suggested invalid-baseline correction, this one
+    // authenticated user gesture is both approval and atomic activation.
     let response = service(&state)
         .resolve(&project_id, &user.user_id, &reconciliation_id, request)
         .await?;

@@ -281,7 +281,7 @@ async fn invalid_historical_active_baseline_is_audited_and_revised_atomically() 
     let draft_envelope: Value = serde_json::from_str(&draft_envelope).expect("draft envelope");
     assert_eq!(
         draft_envelope["allowed_task_operations"],
-        serde_json::json!([])
+        serde_json::json!(["split", "sequence", "replace"])
     );
     let active_pointer: String = sqlx::query_scalar(
         "SELECT current_revision_id FROM project_execution_baseline WHERE id = ?",
@@ -318,77 +318,16 @@ async fn invalid_historical_active_baseline_is_audited_and_revised_atomically() 
     .expect("audit replay row counts");
     assert_eq!(counts_after_replay, counts_before_replay);
 
-    // The generated draft is deliberately not authority. Propose its typed
-    // content against the still-current invalid revision, then approve it;
-    // approval alone must retain the invalid current pointer.
-    let correction_content = content(true);
-    let correction_rendered = render_execution_baseline(&correction_content).expect("render");
-    let baseline_version: i64 =
-        sqlx::query_scalar("SELECT version FROM project_execution_baseline WHERE id = ?")
-            .bind(&active.baseline_id)
-            .fetch_one(db.pool())
-            .await
-            .expect("baseline version after audit");
-    let correction = ExecutionBaselineCommandService::new(db.clone())
-        .propose_for_approval(ProposeExecutionBaselineForApprovalCommand {
-            project_id: PROJECT_ID.to_owned(),
-            baseline_id: active.baseline_id.clone(),
-            base_revision_id: Some(invalid_revision_id.clone()),
-            expected_baseline_version: baseline_version,
-            content: correction_content,
-            rendered_view: correction_rendered.rendered_view,
-            render_version: services::EXECUTION_BASELINE_RENDER_VERSION.to_owned(),
-            content_digest: correction_rendered.content_digest,
-            render_digest: correction_rendered.render_digest,
-            provenance: provenance(),
-            idempotency_key: "integrity-correction-propose".to_owned(),
-            authorization: authorization(
-                EXECUTION_BASELINE_PROPOSE_COMMAND,
-                "integrity-correction-propose",
-            ),
-            action: None,
-        })
-        .await
-        .expect("invalid-baseline reconciliation allows a typed successor proposal");
-    let project_version_before_resolution: i64 =
-        sqlx::query_scalar("SELECT version FROM project WHERE id = ?")
-            .bind(PROJECT_ID)
-            .fetch_one(db.pool())
-            .await
-            .expect("project version before correction approval");
-    let approved = ExecutionBaselineCommandService::new(db.clone())
-        .approve(ApproveExecutionBaselineCommand {
-            project_id: PROJECT_ID.to_owned(),
-            baseline_id: active.baseline_id.clone(),
-            revision_id: correction.revision_id.clone().expect("correction revision"),
-            expected_baseline_version: correction.baseline_version,
-            expected_project_version: project_version_before_resolution,
-            content_digest: correction
-                .content_digest
-                .clone()
-                .expect("correction digest"),
-            render_digest: correction
-                .render_digest
-                .clone()
-                .expect("correction render digest"),
-            idempotency_key: "integrity-correction-approve".to_owned(),
-            authorization: authorization(
-                EXECUTION_BASELINE_APPROVE_COMMAND,
-                "integrity-correction-approve",
-            ),
-            action: None,
-        })
-        .await
-        .expect("corrected successor approval");
+    // The generated draft is not authority until the user accepts the repair.
+    // That one reconciliation gesture approves and activates this exact
+    // server-generated revision atomically; there is no separate proposal or
+    // baseline-approval click.
+    let correction_revision_id = audit_draft_id.clone();
 
     // A Task already staged against the exact successor carries a persisted
     // deterministic-blocker disposition. The atomic correction must promote
     // its governance and clear that disposition immediately; a ten-second
     // polling scan is not an acceptable recovery mechanism.
-    let correction_revision_id = correction
-        .revision_id
-        .clone()
-        .expect("correction revision id");
     let task = TaskRepo::create(
         &*db,
         db::CreateTask {
@@ -473,8 +412,9 @@ async fn invalid_historical_active_baseline_is_audited_and_revised_atomically() 
             conflicting_record_revision: task.version.to_string(),
             conflicting_record_digest: "scoped-task-digest".to_owned(),
             affected_paths_json: r#"["acceptance"]"#.to_owned(),
-            conflict_code: "task_acceptance_diverged".to_owned(),
-            description: "Task-scoped acceptance divergence".to_owned(),
+            conflict_code: "adaptive_task_boundary_crossed".to_owned(),
+            description: "adaptive Task operation 'replace' is outside the approved envelope"
+                .to_owned(),
             detected_by_type: "system".to_owned(),
             detected_by_id: Some("test".to_owned()),
             authorization_basis: "characterization".to_owned(),
@@ -507,14 +447,14 @@ async fn invalid_historical_active_baseline_is_audited_and_revised_atomically() 
     )
     .await
     .expect("Task-scoped reconciliation creates");
-    let active_pointer_after_approval: String = sqlx::query_scalar(
+    let active_pointer_before_resolution: String = sqlx::query_scalar(
         "SELECT current_revision_id FROM project_execution_baseline WHERE id = ?",
     )
     .bind(&active.baseline_id)
     .fetch_one(db.pool())
     .await
-    .expect("active pointer after successor approval");
-    assert_eq!(active_pointer_after_approval, invalid_revision_id);
+    .expect("active pointer before repair decision");
+    assert_eq!(active_pointer_before_resolution, invalid_revision_id);
 
     let reconciliation =
         ProjectReconciliationService::new(db.clone(), Arc::new(events::EventBus::new(16)));
@@ -533,11 +473,8 @@ async fn invalid_historical_active_baseline_is_audited_and_revised_atomically() 
     let replacement = pending
         .suggested_replacement_ref
         .clone()
-        .expect("approved successor is suggested");
-    assert_eq!(
-        replacement.record_id,
-        correction.revision_id.clone().unwrap()
-    );
+        .expect("server correction is suggested");
+    assert_eq!(replacement.record_id, correction_revision_id);
     let resolved = reconciliation
         .resolve(
             PROJECT_ID,
@@ -568,12 +505,13 @@ async fn invalid_historical_active_baseline_is_audited_and_revised_atomically() 
                     record_id: replacement.record_id,
                     record_revision: replacement.record_revision,
                 }),
-                reason: "Approve the exact typed successor and preserve the invalid revision as history."
-                    .to_owned(),
+                reason:
+                    "Accept the recommended plan-format update and default Project Agent authority."
+                        .to_owned(),
             },
         )
         .await
-        .expect("revised resolution atomically activates the approved successor");
+        .expect("one reconciliation decision atomically approves and activates the successor");
     assert_eq!(
         resolved.reconciliation.state,
         api_types::ReconciliationState::Revised
@@ -586,7 +524,7 @@ async fn invalid_historical_active_baseline_is_audited_and_revised_atomically() 
     .fetch_one(db.pool())
     .await
     .expect("corrected baseline state");
-    assert_eq!(final_pointer, correction.revision_id.unwrap());
+    assert_eq!(final_pointer, correction_revision_id);
     assert_eq!(final_lifecycle, "active");
     let old_lifecycle: String = sqlx::query_scalar(
         "SELECT lifecycle FROM project_execution_baseline_revision WHERE id = ?",
@@ -597,9 +535,10 @@ async fn invalid_historical_active_baseline_is_audited_and_revised_atomically() 
     .expect("invalid revision remains preserved");
     assert_eq!(old_lifecycle, "superseded");
     let approval_lifecycle: String = sqlx::query_scalar(
-        "SELECT lifecycle FROM project_execution_baseline_approval WHERE id = ?",
+        "SELECT lifecycle FROM project_execution_baseline_approval
+         WHERE revision_id = ? AND authorization_action = 'project.execution_baseline.approve'",
     )
-    .bind(approved.approval_id.expect("approval id"))
+    .bind(&final_pointer)
     .fetch_one(db.pool())
     .await
     .expect("successor approval is consumed");
@@ -625,6 +564,15 @@ async fn invalid_historical_active_baseline_is_audited_and_revised_atomically() 
         scoped_after.state, "required",
         "baseline correction resolves only its named Project-wide record"
     );
+    let scoped_projection = reconciliation
+        .get(PROJECT_ID, USER_ID, &scoped_reconciliation.id)
+        .await
+        .expect("Task-scoped reconciliation projection");
+    let retry_baseline = scoped_projection
+        .suggested_replacement_ref
+        .expect("corrected baseline makes the blocked adaptive retry actionable");
+    assert_eq!(retry_baseline.record_type, "execution_baseline_revision");
+    assert_eq!(retry_baseline.record_id, final_pointer);
     let final_projection = ExecutionBaselineQueryService::new(db.clone())
         .get(PROJECT_ID, USER_ID)
         .await

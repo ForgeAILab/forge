@@ -297,10 +297,45 @@ async fn ensure_integrity_successor(
     revision: &ProjectExecutionBaselineRevisionRecord,
     integrity: &BaselineIntegrityRecord,
 ) -> Result<bool> {
-    let Some(successor_revision_id) = integrity.successor_revision_id.as_deref() else {
+    let Some(reserved_successor_revision_id) = integrity.successor_revision_id.as_deref() else {
         return Ok(false);
     };
-    if ProjectOrchestrationRepo::get_project_execution_baseline_revision(db, successor_revision_id)
+    let successor_revision_id =
+        match ProjectOrchestrationRepo::get_project_execution_baseline_revision(
+            db,
+            reserved_successor_revision_id,
+        )
+        .await?
+        {
+            Some(existing)
+                if correction_has_default_adaptive_authority(&existing.adaptive_envelope_json) =>
+            {
+                return Ok(false);
+            }
+            Some(_) => {
+                // Early integrity builds produced an empty correction envelope by
+                // retaining only historical values that happened to parse. Forge
+                // now starts Project Agents with the full safe adaptive vocabulary
+                // (split, sequence, replace), so reserve a fresh immutable draft
+                // instead of rewriting the earlier revision in place.
+                let replacement_id = new_uuid_v4();
+                sqlx::query(
+                    "UPDATE execution_baseline_revision_integrity
+                 SET successor_revision_id = ?, updated_at = ?
+                 WHERE revision_id = ? AND successor_revision_id = ?",
+                )
+                .bind(&replacement_id)
+                .bind(now_rfc3339())
+                .bind(&integrity.revision_id)
+                .bind(reserved_successor_revision_id)
+                .execute(db.pool())
+                .await?;
+                replacement_id
+            }
+            None => reserved_successor_revision_id.to_owned(),
+        };
+
+    if ProjectOrchestrationRepo::get_project_execution_baseline_revision(db, &successor_revision_id)
         .await?
         .is_some()
     {
@@ -321,17 +356,10 @@ async fn ensure_integrity_successor(
                 "invalid active baseline has no adaptive-operation array to correct",
             )
         })?;
-    let mut retained = Vec::new();
-    let mut seen = HashSet::new();
-    for value in allowed.iter() {
-        let Some(operation) = value.as_str().and_then(AdaptiveTaskOperation::parse) else {
-            continue;
-        };
-        if seen.insert(operation) {
-            retained.push(Value::String(operation.as_str().to_owned()));
-        }
-    }
-    *allowed = retained;
+    *allowed = AdaptiveTaskOperation::ALL
+        .iter()
+        .map(|operation| Value::String(operation.as_str().to_owned()))
+        .collect();
     let mut manifest: ExecutionBaselineManifest =
         serde_json::from_value(manifest_value).map_err(|error| {
             ServiceError::conflict(format!(
@@ -347,10 +375,11 @@ async fn ensure_integrity_successor(
         profile_revision: None,
         operating_skill_revision: None,
         source_refs: manifest.provenance.source_refs,
-        change_summary: "Quarantine unsupported historical adaptive-operation values for explicit correction"
-            .to_owned(),
+        change_summary:
+            "Replace historical adaptive-operation values with Forge's default Project Agent authority"
+                .to_owned(),
         material_diff: Some(format!(
-            "Removed no authority from the immutable active revision. The correction draft retains only already-valid adaptive verbs; quarantined values: {}",
+            "The immutable active revision is preserved. The correction grants the default split, sequence, and replace Task operations; quarantined historical values: {}",
             integrity.invalid_values.join(", ")
         )),
     };
@@ -368,7 +397,7 @@ async fn ensure_integrity_successor(
         SaveProjectExecutionBaselineRevisionCommand {
             project_id: baseline.project_id.clone(),
             baseline_id: Some(baseline.id.clone()),
-            revision_id: successor_revision_id.to_owned(),
+            revision_id: successor_revision_id,
             expected_baseline_version: Some(baseline.version),
             base_revision: revision.revision,
             base_revision_id: Some(revision.id.clone()),
@@ -404,6 +433,11 @@ async fn ensure_integrity_successor(
     )
     .await?;
     Ok(true)
+}
+
+fn correction_has_default_adaptive_authority(value: &str) -> bool {
+    parse_persisted_adaptive_envelope(value)
+        .is_ok_and(|envelope| envelope.allowed_task_operations == AdaptiveTaskOperation::ALL)
 }
 
 async fn ensure_integrity_reconciliation(

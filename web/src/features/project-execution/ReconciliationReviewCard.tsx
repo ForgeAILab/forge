@@ -4,9 +4,7 @@ import { WarningCircle } from '@phosphor-icons/react'
 import { ConflictDetails } from '@/components/conflict-details'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
-import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Textarea } from '@/components/ui/textarea'
 import { getApiErrorMessage } from '@/lib/api-error'
 import { useAuthStore } from '@/stores/auth'
 import type {
@@ -16,18 +14,21 @@ import type {
   ReconciliationResolutionAction,
 } from '@/types/generated'
 
-import { useProjectReconciliationsQuery, useResolveProjectReconciliationMutation } from './reconciliation-hooks'
+import {
+  useProjectReconciliationsQuery,
+  useResolveProjectReconciliationMutation,
+} from './reconciliation-hooks'
 import type { ResolveProjectReconciliationWire } from './reconciliation-api'
 
 const RESOLVE_AUTHORIZATION_BASIS = 'interactive_user_reconciliation_resolution'
 const RESOLVE_OPERATION = 'project.reconciliation.resolve'
 
 const ACTION_LABELS: Record<ReconciliationResolutionAction, string> = {
-  retained: 'Retain the governing record',
-  revised: 'Replace with a revised record',
-  cancelled: 'Cancel the affected record',
-  superseded: 'Supersede with a replacement',
-  invalidated: 'Invalidate the affected record',
+  retained: 'Keep the current work',
+  revised: 'Use the recommended replacement',
+  cancelled: 'Cancel the affected work',
+  superseded: 'Replace and archive the current work',
+  invalidated: 'Discard the conflicting change',
 }
 
 const REPLACEMENT_REQUIRED = new Set<ReconciliationResolutionAction>(['revised', 'superseded'])
@@ -52,6 +53,10 @@ function newIdempotencyKey(prefix: string): string {
     return crypto.randomUUID()
   }
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+function adaptiveOperation(description: string): string {
+  return description.match(/operation ['‘]([^'’]+)['’]/i)?.[1]?.toLowerCase() ?? 'change'
 }
 
 function createUserAuthorization(action: string): AuthorizationProvenance {
@@ -80,7 +85,7 @@ function recordRefLine(recordType: string, recordId: string, recordRevision: str
  * nothing here asks the user to reload the page or flip a phase control.
  */
 export function ReconciliationReviewCard({ projectId }: { projectId: string }) {
-  const { data, isLoading, isError, error } = useProjectReconciliationsQuery(projectId)
+  const { data, isLoading, isError, error, refetch } = useProjectReconciliationsQuery(projectId)
   const [resolved, setResolved] = useState<Record<string, ProjectReconciliation>>({})
 
   if (isLoading) return null
@@ -100,9 +105,7 @@ export function ReconciliationReviewCard({ projectId }: { projectId: string }) {
   // immediately rather than waiting on the background refetch this
   // mutation's `onSettled` already triggered -- the user should never see a
   // reconciliation they just resolved still offering the same action form.
-  const pending = items.filter(
-    (item) => item.allowed_actions.length > 0 && !(item.id in resolved),
-  )
+  const pending = items.filter((item) => item.allowed_actions.length > 0 && !(item.id in resolved))
   const recentlyResolved = Object.values(resolved)
 
   if (pending.length === 0 && recentlyResolved.length === 0) return null
@@ -115,11 +118,15 @@ export function ReconciliationReviewCard({ projectId }: { projectId: string }) {
       <div className="flex min-w-0 flex-wrap items-start justify-between gap-3 border-b border-border-subtle px-4 py-3 sm:px-5">
         <div className="min-w-0">
           <p className="font-mono text-micro font-semibold uppercase tracking-[0.12em] text-muted-foreground">
-            Canonical conflict
+            Project decision
           </p>
           <h2 className="mt-1 break-words text-sm font-semibold text-foreground">
-            Reconciliation review
+            Review a requested change
           </h2>
+          <p className="mt-1 max-w-2xl text-xs leading-5 text-muted-foreground">
+            Choose the outcome in plain language. Technical record details are available only if you
+            need them.
+          </p>
         </div>
       </div>
       <div className="min-w-0 space-y-4 p-4 sm:p-5">
@@ -128,9 +135,8 @@ export function ReconciliationReviewCard({ projectId }: { projectId: string }) {
             key={reconciliation.id}
             projectId={projectId}
             reconciliation={reconciliation}
-            onResolved={(result) =>
-              setResolved((current) => ({ ...current, [result.id]: result }))
-            }
+            onRefresh={() => void refetch()}
+            onResolved={(result) => setResolved((current) => ({ ...current, [result.id]: result }))}
           />
         ))}
         {recentlyResolved.length > 0 ? (
@@ -150,37 +156,49 @@ export function ReconciliationReviewCard({ projectId }: { projectId: string }) {
 
 function ResolvedResultSummary({ reconciliation }: { reconciliation: ProjectReconciliation }) {
   const resolution = reconciliation.resolution
+  const title =
+    reconciliation.conflict.conflict_code === 'invalid_active_baseline'
+      ? 'Plan updated. Work can resume.'
+      : reconciliation.conflict.conflict_code === 'adaptive_task_boundary_crossed'
+        ? reconciliation.state === 'revised'
+          ? 'Task change accepted. The Project Agent can retry.'
+          : 'Task change rejected. The approved plan stays in place.'
+        : 'Decision saved.'
   return (
     <div className="rounded-md border border-ember-border bg-ember-surface p-3 text-xs">
-      <p className="font-medium text-foreground">
-        {humanize(reconciliation.state)} · {recordRefLine(
-          reconciliation.affected.record_type,
-          reconciliation.affected.record_id,
-          reconciliation.affected.record_revision,
-        )}
-      </p>
+      <p className="font-medium text-foreground">{title}</p>
       {resolution ? (
-        <>
-          <p className="mt-1 text-muted-foreground">
-            By {resolution.principal.display_name ?? resolution.principal.id} at{' '}
-            {formatTimestamp(resolution.occurred_at)}
-          </p>
-          <p className="mt-1 text-foreground">Reason: {resolution.reason}</p>
-          {resolution.replacement_ref ? (
-            <p className="mt-1 text-muted-foreground">
-              Replacement:{' '}
-              {recordRefLine(
-                resolution.replacement_ref.record_type,
-                resolution.replacement_ref.record_id,
-                resolution.replacement_ref.record_revision ?? 'unspecified',
-              )}
+        <details className="mt-2 rounded-md border border-border-subtle bg-background px-3 py-2">
+          <summary className="cursor-pointer font-medium text-muted-foreground">
+            Technical details
+          </summary>
+          <div className="mt-2 space-y-1 break-words">
+            <p className="text-muted-foreground">
+              By {resolution.principal.display_name ?? resolution.principal.id} at{' '}
+              {formatTimestamp(resolution.occurred_at)}
             </p>
-          ) : null}
-        </>
+            <p className="text-foreground">Reason: {resolution.reason}</p>
+            {resolution.replacement_ref ? (
+              <p className="text-muted-foreground">
+                Replacement:{' '}
+                {recordRefLine(
+                  resolution.replacement_ref.record_type,
+                  resolution.replacement_ref.record_id,
+                  resolution.replacement_ref.record_revision ?? 'unspecified',
+                )}
+              </p>
+            ) : null}
+            <p className="font-mono text-micro text-muted-foreground">
+              {recordRefLine(
+                reconciliation.affected.record_type,
+                reconciliation.affected.record_id,
+                reconciliation.affected.record_revision,
+              )}{' '}
+              · version v{numberValue(reconciliation.version)}
+            </p>
+          </div>
+        </details>
       ) : null}
-      <p className="mt-1 font-mono text-micro text-muted-foreground">
-        version v{numberValue(reconciliation.version)}
-      </p>
     </div>
   )
 }
@@ -188,52 +206,41 @@ function ResolvedResultSummary({ reconciliation }: { reconciliation: ProjectReco
 function ReconciliationItem({
   projectId,
   reconciliation,
+  onRefresh,
   onResolved,
 }: {
   projectId: string
   reconciliation: ProjectReconciliation
+  onRefresh: () => void
   onResolved: (result: ProjectReconciliation) => void
 }) {
   const mutation = useResolveProjectReconciliationMutation(projectId)
-  const options = reconciliation.allowed_actions.map((action) => ({
-    value: action,
-    label: ACTION_LABELS[action],
-  }))
-  const [action, setAction] = useState<ReconciliationResolutionAction>(
-    reconciliation.allowed_actions[0],
-  )
-  const [reason, setReason] = useState('')
-  const [replacementType, setReplacementType] = useState('')
-  const [replacementId, setReplacementId] = useState('')
-  const [replacementRevision, setReplacementRevision] = useState('')
   const invalidBaselineCorrection =
     reconciliation.conflict.conflict_code === 'invalid_active_baseline'
-  const replacementTypeValue = invalidBaselineCorrection
-    ? (reconciliation.suggested_replacement_ref?.record_type ?? '')
-    : replacementType
-  const replacementIdValue = invalidBaselineCorrection
-    ? (reconciliation.suggested_replacement_ref?.record_id ?? '')
-    : replacementId
-  const replacementRevisionValue = invalidBaselineCorrection
-    ? (reconciliation.suggested_replacement_ref?.record_revision ?? '')
-    : replacementRevision
+  const adaptiveBoundary =
+    reconciliation.conflict.conflict_code === 'adaptive_task_boundary_crossed'
+  const suggestedReplacement = reconciliation.suggested_replacement_ref
+  const options = reconciliation.allowed_actions
+    .filter((candidate) => !REPLACEMENT_REQUIRED.has(candidate) || suggestedReplacement)
+    .map((candidate) => ({ value: candidate, label: ACTION_LABELS[candidate] }))
+  const [action, setAction] = useState<ReconciliationResolutionAction>(
+    options[0]?.value ?? reconciliation.allowed_actions[0],
+  )
+  const [deferred, setDeferred] = useState(false)
 
-  const replacementRequired = REPLACEMENT_REQUIRED.has(action)
-  const reasonValid = reason.trim().length > 0
-  const replacementValid =
-    !replacementRequired ||
-    (replacementTypeValue.trim().length > 0 && replacementIdValue.trim().length > 0)
-  const canSubmit = reasonValid && replacementValid && !mutation.isPending
-
-  function submit() {
-    if (!canSubmit) return
+  function submit(selectedAction: ReconciliationResolutionAction) {
+    const replacementRequired = REPLACEMENT_REQUIRED.has(selectedAction)
+    if (mutation.isPending || (replacementRequired && !suggestedReplacement)) return
     const replacement_ref: ReconciliationReplacementRef | null = replacementRequired
-      ? {
-          record_type: replacementTypeValue.trim(),
-          record_id: replacementIdValue.trim(),
-          record_revision: replacementRevisionValue.trim() || null,
-        }
+      ? suggestedReplacement
       : null
+    const reason = invalidBaselineCorrection
+      ? "Accepted Forge's recommended plan-format update and default Project Agent task authority."
+      : adaptiveBoundary && selectedAction === 'revised'
+        ? 'Accepted the corrected governing baseline and allowed the Project Agent to retry the blocked Task operation.'
+        : adaptiveBoundary && selectedAction === 'retained'
+          ? 'Kept the governing plan and rejected the earlier blocked Task operation.'
+          : `User selected “${ACTION_LABELS[selectedAction]}” for ${humanize(reconciliation.conflict.conflict_code).toLowerCase()}.`
     const input: ResolveProjectReconciliationWire = {
       mutation: {
         expected_version: numberValue(reconciliation.version),
@@ -242,19 +249,15 @@ function ReconciliationItem({
         deduplication_key: null,
         authorization: createUserAuthorization(RESOLVE_OPERATION),
       },
-      action,
+      action: selectedAction,
       replacement_ref,
-      reason: reason.trim(),
+      reason,
     }
     mutation.mutate(
       { reconciliationId: reconciliation.id, input },
       {
         onSuccess: (result) => {
           onResolved(result)
-          setReason('')
-          setReplacementType('')
-          setReplacementId('')
-          setReplacementRevision('')
         },
       },
     )
@@ -262,69 +265,161 @@ function ReconciliationItem({
 
   const fieldId = `reconciliation-${reconciliation.id}`
 
+  if (invalidBaselineCorrection) {
+    return (
+      <div className="rounded-md border border-ember-border bg-ember-surface p-3 sm:p-4">
+        <div className="min-w-0">
+          <p className="text-sm font-semibold text-foreground">
+            Update how the Project Agent manages work
+          </p>
+          <p className="mt-1 max-w-3xl text-sm leading-6 text-foreground">
+            This Project uses an older plan format. Accepting replaces that plan record with
+            Forge&apos;s corrected version and lets the Project Agent split, reorder, and replace
+            in-scope Tasks. Work resumes automatically.
+          </p>
+          <p className="mt-2 text-xs leading-5 text-muted-foreground">
+            This does not change the approved Charter, switch your Project Agent, or release the
+            Project.
+          </p>
+        </div>
+
+        <TechnicalDetails reconciliation={reconciliation} />
+
+        {deferred ? (
+          <div
+            className="mt-3 rounded-md border border-border-subtle bg-background p-3"
+            role="status"
+          >
+            <p className="text-xs text-foreground">
+              No change was made. Repository work remains paused until you accept the update.
+            </p>
+            <Button className="mt-2" variant="outline" size="sm" onClick={() => setDeferred(false)}>
+              Review again
+            </Button>
+          </div>
+        ) : (
+          <div className="mt-4 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+            <Button
+              variant="outline"
+              onClick={() => setDeferred(true)}
+              disabled={mutation.isPending}
+            >
+              Reject for now
+            </Button>
+            {suggestedReplacement ? (
+              <Button
+                onClick={() => submit('revised')}
+                disabled={mutation.isPending}
+                aria-describedby={`${fieldId}-accept-help`}
+              >
+                {mutation.isPending ? 'Applying update…' : 'Accept update & resume work'}
+              </Button>
+            ) : (
+              <Button onClick={onRefresh} disabled={mutation.isPending}>
+                Refresh recommended update
+              </Button>
+            )}
+          </div>
+        )}
+        <p
+          id={`${fieldId}-accept-help`}
+          className="mt-2 text-xs text-muted-foreground sm:text-right"
+        >
+          One click approves and applies the correction; there is no second plan approval.
+        </p>
+
+        {mutation.isError ? (
+          <div className="mt-3">
+            <ConflictDetails error={mutation.error} fallbackAuthority="reconciliation" />
+          </div>
+        ) : null}
+      </div>
+    )
+  }
+
+  if (adaptiveBoundary) {
+    const operation = adaptiveOperation(reconciliation.conflict.description)
+    const operationLabel =
+      operation === 'replace'
+        ? 'Task replacement'
+        : operation === 'split'
+          ? 'Task split'
+          : operation === 'sequence'
+            ? 'Task order change'
+            : 'Task change'
+
+    return (
+      <div className="rounded-md border border-ember-border bg-ember-surface p-3 sm:p-4">
+        <div className="min-w-0">
+          <p className="text-sm font-semibold text-foreground">
+            Allow the Project Agent to retry this {operationLabel.toLowerCase()}?
+          </p>
+          <p className="mt-1 max-w-3xl text-sm leading-6 text-foreground">
+            Forge blocked the earlier {operationLabel.toLowerCase()} under the old plan rules.
+            Accepting clears that block and lets the Project Agent retry it under the corrected
+            plan.
+          </p>
+          <p className="mt-2 text-xs leading-5 text-muted-foreground">
+            {operation === 'replace'
+              ? 'This replaces the in-scope Task. It does not switch the Project Agent assigned to this Project.'
+              : 'This changes only the in-scope Tasks. It does not switch the Project Agent assigned to this Project.'}
+          </p>
+        </div>
+
+        <TechnicalDetails reconciliation={reconciliation} />
+
+        <div className="mt-4 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+          <Button
+            variant="outline"
+            onClick={() => submit('retained')}
+            disabled={mutation.isPending}
+          >
+            Reject change
+          </Button>
+          <Button
+            onClick={() => submit('revised')}
+            disabled={mutation.isPending || !suggestedReplacement}
+            aria-describedby={`${fieldId}-adaptive-help`}
+          >
+            {mutation.isPending ? 'Saving decision…' : 'Accept & let agent retry'}
+          </Button>
+        </div>
+        <p
+          id={`${fieldId}-adaptive-help`}
+          className="mt-2 text-xs text-muted-foreground sm:text-right"
+        >
+          {suggestedReplacement
+            ? 'The corrected plan is active. This decision resumes the affected Task automatically.'
+            : 'Accept the plan-format update first; then this action becomes available.'}
+        </p>
+
+        {mutation.isError ? (
+          <div className="mt-3">
+            <ConflictDetails error={mutation.error} fallbackAuthority="reconciliation" />
+          </div>
+        ) : null}
+      </div>
+    )
+  }
+
   return (
-    <div className="rounded-md border border-ember-border bg-ember-surface p-3">
+    <div className="rounded-md border border-ember-border bg-ember-surface p-3 sm:p-4">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="min-w-0">
-          <p className="break-words text-sm font-medium text-foreground">
+          <p className="break-words text-sm font-semibold text-foreground">
             {reconciliation.conflict.description}
           </p>
-          <p className="mt-1 font-mono text-micro text-muted-foreground">
-            {reconciliation.conflict.conflict_code} · {reconciliation.conflict.domain}
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">
+            Choose what Forge should keep. The Project Agent cannot make this decision silently.
           </p>
         </div>
-        <span className="inline-flex items-center rounded-full border px-2 py-0.5 font-mono text-micro font-semibold uppercase tracking-[0.08em] text-muted-foreground">
-          required principal: {reconciliation.required_principal}
-        </span>
       </div>
 
-      <dl className="mt-3 grid grid-cols-1 gap-2 text-xs sm:grid-cols-2">
-        <div>
-          <dt className="font-semibold uppercase tracking-[0.06em] text-muted-foreground">
-            Governing record
-          </dt>
-          <dd className="mt-0.5 break-words text-foreground">
-            {recordRefLine(
-              reconciliation.governing.record_type,
-              reconciliation.governing.record_id,
-              reconciliation.governing.record_revision,
-            )}
-          </dd>
-        </div>
-        <div>
-          <dt className="font-semibold uppercase tracking-[0.06em] text-muted-foreground">
-            Affected record
-          </dt>
-          <dd className="mt-0.5 break-words text-foreground">
-            {recordRefLine(
-              reconciliation.affected.record_type,
-              reconciliation.affected.record_id,
-              reconciliation.affected.record_revision,
-            )}
-          </dd>
-        </div>
-      </dl>
-
-      {reconciliation.conflict.affected_paths.length > 0 ? (
-        <div className="mt-3 text-xs">
-          <p className="font-semibold uppercase tracking-[0.06em] text-muted-foreground">
-            Impact
-          </p>
-          <ul className="mt-0.5 list-inside list-disc break-words text-foreground">
-            {reconciliation.conflict.affected_paths.map((path) => (
-              <li key={path}>{path}</li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-
-      <p className="mt-3 font-mono text-micro text-muted-foreground">
-        state {reconciliation.state} · version v{numberValue(reconciliation.version)}
-      </p>
+      <TechnicalDetails reconciliation={reconciliation} />
 
       <div className="mt-4 space-y-3 border-t border-border-subtle pt-3">
         <div>
-          <Label htmlFor={`${fieldId}-action`}>Resolution</Label>
+          <Label htmlFor={`${fieldId}-action`}>What should Forge do?</Label>
           <select
             id={`${fieldId}-action`}
             className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-ui"
@@ -340,70 +435,74 @@ function ReconciliationItem({
           </select>
         </div>
 
-        {replacementRequired ? (
-          <div>
-            {invalidBaselineCorrection ? (
-              <p className="mb-2 text-xs leading-5 text-muted-foreground">
-                {reconciliation.suggested_replacement_ref
-                  ? 'Forge verified the exact approved successor below. Resolving will activate it in the same transaction.'
-                  : 'Approve a typed successor revision first. Forge will fill the exact replacement here once its user approval receipt is active.'}
-              </p>
-            ) : null}
-            <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-              <div>
-                <Label htmlFor={`${fieldId}-replacement-type`}>Replacement type</Label>
-                <Input
-                  id={`${fieldId}-replacement-type`}
-                  value={replacementTypeValue}
-                  onChange={(event) => setReplacementType(event.target.value)}
-                  placeholder="task"
-                  readOnly={invalidBaselineCorrection}
-                />
-              </div>
-              <div>
-                <Label htmlFor={`${fieldId}-replacement-id`}>Replacement id</Label>
-                <Input
-                  id={`${fieldId}-replacement-id`}
-                  value={replacementIdValue}
-                  onChange={(event) => setReplacementId(event.target.value)}
-                  readOnly={invalidBaselineCorrection}
-                />
-              </div>
-              <div>
-                <Label htmlFor={`${fieldId}-replacement-revision`}>Replacement revision</Label>
-                <Input
-                  id={`${fieldId}-replacement-revision`}
-                  value={replacementRevisionValue}
-                  onChange={(event) => setReplacementRevision(event.target.value)}
-                  placeholder="optional"
-                  readOnly={invalidBaselineCorrection}
-                />
-              </div>
-            </div>
-          </div>
-        ) : null}
-
-        <div>
-          <Label htmlFor={`${fieldId}-reason`}>Reason</Label>
-          <Textarea
-            id={`${fieldId}-reason`}
-            value={reason}
-            onChange={(event) => setReason(event.target.value)}
-            placeholder="Explain why this resolution is correct."
-            rows={3}
-          />
-        </div>
-
         {mutation.isError ? (
           <ConflictDetails error={mutation.error} fallbackAuthority="reconciliation" />
         ) : null}
 
         <div className="flex justify-end">
-          <Button onClick={submit} disabled={!canSubmit}>
-            {mutation.isPending ? 'Resolving…' : 'Resolve'}
-          </Button>
+          {options.length > 0 ? (
+            <Button onClick={() => submit(action)} disabled={mutation.isPending}>
+              {mutation.isPending ? 'Saving decision…' : 'Confirm decision'}
+            </Button>
+          ) : (
+            <Button onClick={onRefresh}>Refresh available choices</Button>
+          )}
         </div>
       </div>
     </div>
+  )
+}
+
+function TechnicalDetails({ reconciliation }: { reconciliation: ProjectReconciliation }) {
+  return (
+    <details className="mt-3 rounded-md border border-border-subtle bg-background px-3 py-2 text-xs">
+      <summary className="cursor-pointer font-medium text-muted-foreground">
+        Technical details
+      </summary>
+      <div className="mt-3 space-y-3">
+        <p className="break-words font-mono text-micro text-muted-foreground">
+          {reconciliation.conflict.conflict_code} · {reconciliation.conflict.domain} · version v
+          {numberValue(reconciliation.version)}
+        </p>
+        <dl className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+          <div>
+            <dt className="font-semibold uppercase tracking-[0.06em] text-muted-foreground">
+              Current rule
+            </dt>
+            <dd className="mt-0.5 break-words text-foreground">
+              {recordRefLine(
+                reconciliation.governing.record_type,
+                reconciliation.governing.record_id,
+                reconciliation.governing.record_revision,
+              )}
+            </dd>
+          </div>
+          <div>
+            <dt className="font-semibold uppercase tracking-[0.06em] text-muted-foreground">
+              Affected work
+            </dt>
+            <dd className="mt-0.5 break-words text-foreground">
+              {recordRefLine(
+                reconciliation.affected.record_type,
+                reconciliation.affected.record_id,
+                reconciliation.affected.record_revision,
+              )}
+            </dd>
+          </div>
+        </dl>
+        {reconciliation.conflict.affected_paths.length > 0 ? (
+          <div>
+            <p className="font-semibold uppercase tracking-[0.06em] text-muted-foreground">
+              Fields involved
+            </p>
+            <ul className="mt-1 list-inside list-disc break-words text-foreground">
+              {reconciliation.conflict.affected_paths.map((path) => (
+                <li key={path}>{path}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+      </div>
+    </details>
   )
 }

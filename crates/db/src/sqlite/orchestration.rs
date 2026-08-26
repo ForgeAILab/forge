@@ -11224,6 +11224,58 @@ async fn activate_invalid_baseline_successor_in_tx(
     )
     .await?;
 
+    if input.create_approval {
+        if input.approval_principal_id.trim().is_empty()
+            || input.approval_authorization_basis.trim().is_empty()
+            || input.approval_authorization_action != "project.execution_baseline.approve"
+            || input.approval_explicit_event.trim().is_empty()
+            || input.approval_idempotency_key.trim().is_empty()
+            || !valid_authorization_timestamp(&input.approval_authorization_occurred_at)
+        {
+            return Err(DbError::VersionConflict);
+        }
+        let approved = sqlx::query(
+            "UPDATE project_execution_baseline_revision
+             SET lifecycle = 'approved'
+             WHERE id = ? AND baseline_id = ?
+               AND lifecycle IN ('draft', 'proposed', 'approved')",
+        )
+        .bind(&input.successor_revision_id)
+        .bind(&input.baseline_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(orchestration_write_error)?;
+        if approved.rows_affected() != 1 {
+            return Err(DbError::VersionConflict);
+        }
+        sqlx::query(
+            "INSERT INTO project_execution_baseline_approval (
+                 id, baseline_id, revision_id, expected_project_version,
+                 principal_type, principal_id, authorization_basis,
+                 authorization_action, authorization_occurred_at, explicit_event,
+                 content_digest, rendered_digest, lifecycle, idempotency_key,
+                 created_at, updated_at
+             ) VALUES (?, ?, ?, ?, 'user', ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)",
+        )
+        .bind(&input.approval_id)
+        .bind(&input.baseline_id)
+        .bind(&input.successor_revision_id)
+        .bind(input.expected_project_version)
+        .bind(&input.approval_principal_id)
+        .bind(&input.approval_authorization_basis)
+        .bind(&input.approval_authorization_action)
+        .bind(&input.approval_authorization_occurred_at)
+        .bind(&input.approval_explicit_event)
+        .bind(&input.content_digest)
+        .bind(&input.rendered_digest)
+        .bind(&input.approval_idempotency_key)
+        .bind(updated_at)
+        .bind(updated_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(orchestration_write_error)?;
+    }
+
     let target = sqlx::query(
         "SELECT baseline.version AS baseline_version,
                 baseline.lifecycle AS baseline_lifecycle,
@@ -11232,7 +11284,8 @@ async fn activate_invalid_baseline_successor_in_tx(
                 revision.charter_revision_id,
                 revision.content_digest, revision.rendered_digest,
                 approval.expected_project_version,
-                approval.principal_type, approval.authorization_action,
+                approval.principal_type, approval.principal_id,
+                approval.authorization_action,
                 approval.lifecycle AS approval_lifecycle,
                 approval.content_digest AS approval_content_digest,
                 approval.rendered_digest AS approval_rendered_digest
@@ -11263,8 +11316,9 @@ async fn activate_invalid_baseline_successor_in_tx(
         || target.try_get::<String, _>("rendered_digest")? != input.rendered_digest
         || target.try_get::<i64, _>("expected_project_version")? != input.expected_project_version
         || target.try_get::<String, _>("principal_type")? != "user"
+        || target.try_get::<String, _>("principal_id")? != input.approval_principal_id
         || target.try_get::<String, _>("authorization_action")?
-            != "project.execution_baseline.approve"
+            != input.approval_authorization_action
         || target.try_get::<String, _>("approval_lifecycle")? != "active"
         || target.try_get::<String, _>("approval_content_digest")? != input.content_digest
         || target.try_get::<String, _>("approval_rendered_digest")? != input.rendered_digest

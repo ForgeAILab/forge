@@ -444,6 +444,16 @@ pub struct ResolveInvalidActiveBaseline {
     pub invalid_revision_id: String,
     pub successor_revision_id: String,
     pub approval_id: String,
+    /// `true` when the reconciliation click is also the user's exact approval
+    /// of the server-generated correction revision. The repository creates
+    /// and consumes that approval inside the same repair transaction.
+    pub create_approval: bool,
+    pub approval_principal_id: String,
+    pub approval_authorization_basis: String,
+    pub approval_authorization_action: String,
+    pub approval_authorization_occurred_at: String,
+    pub approval_explicit_event: String,
+    pub approval_idempotency_key: String,
     pub expected_baseline_version: i64,
     pub expected_project_version: i64,
     pub charter_revision_id: String,

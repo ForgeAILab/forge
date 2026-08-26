@@ -1483,6 +1483,12 @@ impl ProjectOrchestrationActionService {
             serde_json::from_value(content_value).map_err(|error| {
                 ServiceError::invalid_operation(format!("invalid content: {error}"))
             })?;
+        // Project Agents start with the complete safe adaptive vocabulary.
+        // Fine-grained reductions belong to an explicit user setting; until
+        // that surface exists, a model-authored baseline must not accidentally
+        // remove its own ability to split, sequence, or replace in-scope Tasks.
+        content.adaptive_envelope.allowed_task_operations =
+            api_types::AdaptiveTaskOperation::ALL.to_vec();
         content.release_policy_digest =
             crate::execution_baseline::release_policy_digest(&content.release_policy).map_err(
                 |error| ServiceError::invalid_operation(format!("release policy digest: {error}")),
@@ -2223,6 +2229,10 @@ mod tests {
             .native_execution_baseline_content(&project_id, &native_payload)
             .await
             .expect("native content rehydrates the persisted Charter revision");
+        assert_eq!(
+            content.adaptive_envelope.allowed_task_operations,
+            api_types::AdaptiveTaskOperation::ALL
+        );
         assert_eq!(content.charter_revision.artifact_id, charter_id);
         assert_eq!(
             content.charter_revision.content_digest,

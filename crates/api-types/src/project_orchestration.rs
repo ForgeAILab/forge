@@ -2366,8 +2366,8 @@ pub struct ProjectReconciliation {
     pub required_principal: PrincipalKind,
     pub allowed_actions: Vec<ReconciliationResolutionAction>,
     /// Server-validated replacement currently eligible for this resolution.
-    /// For `invalid_active_baseline` this appears only after the exact
-    /// successor revision has an active user approval receipt.
+    /// For `invalid_active_baseline` this may be the server-prepared correction
+    /// draft; resolving it is also the interactive user's exact approval event.
     #[serde(default)]
     pub suggested_replacement_ref: Option<ReconciliationReplacementRef>,
     pub resolution: Option<ReconciliationResolutionSummary>,

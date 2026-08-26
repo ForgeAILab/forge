@@ -165,6 +165,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Project Agents now receive the full safe adaptive Task vocabulary — split,
+  sequence, and replace — in every newly materialized execution baseline.
+  Historical baselines containing command names such as `task.adaptive` get a
+  server-prepared immutable correction that the user can accept and activate
+  in one reconciliation click; Forge no longer requires a separate plan
+  approval first. The reconciliation card now leads with the concrete change
+  and simple accept/defer actions, while internal record IDs, digests, and
+  affected paths are collapsed under technical details.
+
 - Native Main/Project Agent Chat continuity now survives an identity Profile
   edit correctly. Reusable canonical Chat scopes persist only stable
   account/Project authority; the binding, Profile, operating-skill, and policy

@@ -620,13 +620,22 @@ Overview, execution-setup, and Project views resume without a manual phase
 toggle or a page reload.
 
 For `invalid_active_baseline`, the generic action vocabulary is narrowed to
-`revised`. The replacement must be the server-suggested exact approved
-execution-baseline revision. Its activation, governance promotion, invalid
-revision supersession, approval consumption, conflict disposition,
-reconciliation transition, receipt, and event are one atomic database command.
+`revised`. The server prepares and suggests the exact correction revision; it
+may still be a draft. The interactive user's single resolve request is also
+the exact approval event, so the client does not need to propose and approve
+the repair first. Approval, activation, governance promotion, invalid revision
+supersession, approval consumption, conflict disposition, reconciliation
+transition, receipt, and event are one atomic database command.
 Unrelated Task-scoped reconciliations remain unresolved and cannot widen their
 scope to prevent this governing-baseline repair. After commit Forge wakes only
 non-terminal Tasks whose governance was promoted to the successor revision.
+
+Project Overview presents this repair as **Accept update & resume work** or
+**Reject for now**. Replacement identifiers, digests, affected paths, and the
+canonical-conflict record remain available under **Technical details** rather
+than being required form fields. For ordinary reconciliations the web client
+also supplies the exact replacement and audit reason behind a plain-language
+choice; users never have to type record IDs or an internal resolution reason.
 
 Project Overview's `next_action.route_or_operation` names
 `project.reconciliation.resolve` whenever a canonical conflict blocks the

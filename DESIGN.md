@@ -396,6 +396,15 @@ keyboard reachable at every width.
   projection is loaded. The one next action is `Refresh`/`Review current revision`, never an
   automatic retry against newer truth. Reconciliation is `role="status"`; a conflict that
   blocks an action is `role="alert"` with the refresh action in the same region.
+- **Reconciliation decision:** lead with the concrete change and its consequence, never the
+  internal labels “canonical conflict” or “reconciliation review.” Keep record IDs, revisions,
+  digests, field paths, and principal metadata inside a native `Technical details` disclosure.
+  A server-recommended historical plan repair uses `Accept update & resume work` and `Reject for
+  now`; accepting is one atomic user gesture that approves and applies the exact correction, while
+  rejecting truthfully leaves work paused. Generic choices use plain verbs such as `Keep the
+  current work`, `Cancel the affected work`, and `Discard the conflicting change`; Forge supplies
+  the audit reason, so the user is never blocked by an unexplained required textarea or replacement
+  identifier field.
 - **Approval-required:** use an ember-edged approval card that says what exact operation is
   waiting, names its authorization target/revision/digest, and separates approval from the
   eventual domain effect. The primary control names the exact candidate (for example,

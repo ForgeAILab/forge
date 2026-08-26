@@ -531,6 +531,12 @@ appear here. The single source of that vocabulary is `AdaptiveTaskOperation::ALL
 repeating a literal list, because a second copy is how an envelope granting
 unrecognized verbs reached an approved baseline in the first place.
 
+Project Agent-authored baselines receive that complete safe vocabulary by
+default. Splitting work, changing its sequence, and replacing an in-scope Task
+therefore need no extra user approval. A future settings surface may narrow
+that authority explicitly; until it exists, model-authored baseline content
+cannot accidentally remove one of those three operations.
+
 Validation runs whenever the field is present in a draft and again over the
 complete envelope at proposal, approval, activation, persisted-receipt replay,
 and active-baseline load. This is defense in depth through one shared
@@ -548,17 +554,18 @@ prevents later approval or activation. For an invalid active revision it also
 reserves stable conflict, reconciliation, and successor identities; preserves
 the active revision and its approval unchanged; projects a Project-wide
 blocker; and creates a draft on the same baseline that retains only already
-valid verbs. Unsupported historical values are shown as quarantined evidence,
-never guessed or mapped to new authority.
+supported default verbs. Unsupported historical values remain preserved in
+the integrity ledger as quarantined evidence; the immutable invalid revision
+is never rewritten.
 
-The correction draft follows the ordinary proposal and explicit user approval
-path, but approval alone cannot move the active pointer. The only exit is the
-`revised` action on that exact `invalid_active_baseline` reconciliation, naming
-the exact approved successor revision. One transaction revalidates its
-manifest, receipt, digests, Charter, milestones, and optimistic versions;
-activates the successor; supersedes (without deleting) the invalid revision;
-consumes the approval; resolves only the named reconciliation; and records one
-receipt/event. Any race rolls the whole correction back.
+The user sees that server-prepared correction as one plain-language decision:
+**Accept update & resume work** or **Reject for now**. Accepting is the exact
+approval event; it does not lead to a second plan-approval step. One transaction
+approves and activates the successor, promotes Task governance, supersedes
+(without deleting) the invalid revision, consumes the approval, resolves only
+the named reconciliation, and records one receipt/event. It revalidates the
+manifest, digests, Charter, milestones, and optimistic versions first, so any
+race rolls the whole correction back.
 
 #### Denial and reconciliation are different outcomes
 

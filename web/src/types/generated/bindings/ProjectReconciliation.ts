@@ -26,7 +26,7 @@ affected: ReconciliationRecordRef,
 governing: ReconciliationRecordRef, state: ReconciliationState, required_principal: PrincipalKind, allowed_actions: Array<ReconciliationResolutionAction>,
 /**
  * Server-validated replacement currently eligible for this resolution.
- * For `invalid_active_baseline` this appears only after the exact
- * successor revision has an active user approval receipt.
+ * For `invalid_active_baseline` this may be the server-prepared correction
+ * draft; resolving it is also the interactive user's exact approval event.
  */
 suggested_replacement_ref: ReconciliationReplacementRef | null, resolution: ReconciliationResolutionSummary | null, version: bigint, created_at: string, updated_at: string, };
