@@ -26,6 +26,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Agent details now include a plain-language activation summary showing which
+  Main/Project Chat bindings route messages to the Agent, when Project
+  handoffs and background Attention may admit a turn, when Task workflow role
+  assignment dispatches it, and which paths consume the hourly wake budget.
+  Raw admission trigger names remain available in collapsed technical detail.
+
 - Main Chat now starts Product Genesis from clear natural-language new-Project
   intent through the Main-only typed `genesis.start` command. The existing
   `/start-product <idea>` UI command remains an optional shortcut. Both paths

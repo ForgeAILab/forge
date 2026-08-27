@@ -214,7 +214,8 @@ export function ProjectAgentTab({
                 id="project-agent-wake-budget-help"
                 className="text-xs leading-5 text-muted-foreground"
               >
-                Maximum background wake attempts configured for this binding.
+                Maximum policy-admitted background wakes per rolling hour. Chat messages,
+                Project handoffs, and Task executions do not use this budget.
               </p>
             </div>
 

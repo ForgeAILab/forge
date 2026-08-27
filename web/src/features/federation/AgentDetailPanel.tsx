@@ -29,6 +29,7 @@ import {
   formatTokens,
 } from '@/components/settings/project-settings-utils'
 import { DEFAULT_CEILING, humanize, isDirectAgent, runtimeDisplayNames } from './format'
+import { AgentActivationSummary } from './AgentActivationSummary'
 
 export function AgentDetailPanel({
   agent,
@@ -213,6 +214,8 @@ export function AgentDetailPanel({
         </div>
 
         <AgentSettingsForm agent={agent} entries={entries} />
+
+        <AgentActivationSummary agent={agent} chatEntries={chatEntries} />
 
         {requiresRecovery ? (
           <p
