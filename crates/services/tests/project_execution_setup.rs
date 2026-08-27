@@ -1426,3 +1426,144 @@ async fn task_scoped_reconciliation_does_not_block_the_project_gate() {
          reconciliation blocker, got {unrelated_result:?}"
     );
 }
+
+/// Provisioning used to take the first credential-bearing candidate in creation
+/// order for both Task roles. On a stock install that is the account's Main
+/// Agent — created before any purpose-built execution agent — so a freshly
+/// provisioned Project handed the portfolio agent both the Worker and the
+/// reviewer seat and left the dedicated agents idle, with no independent review
+/// left in the workflow.
+#[tokio::test]
+async fn provisioning_prefers_execution_agents_over_the_chat_agents() {
+    let db = database().await;
+    let now = now_rfc3339();
+    db::UserRepo::create_user(
+        &*db,
+        &db::User {
+            id: OWNER_ID.to_owned(),
+            email: "setup-owner@example.test".to_owned(),
+            password_hash: "test".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("account creates");
+
+    let (main_id, main_profile_id) = account_agent(&db, "Main Agent").await;
+    let (project_agent_id, project_agent_profile_id) = account_agent(&db, "Project Agent").await;
+    let (coder_id, _) = native_agent(&db, "Coder Agent").await;
+    let (reviewer_id, _) = native_agent(&db, "Reviewer Agent").await;
+
+    db::AccountMainAgentBindingRepo::create_main_binding(
+        &*db,
+        db::CreateAccountMainAgentBinding {
+            id: new_uuid_v4(),
+            account_id: OWNER_ID.to_owned(),
+            identity_id: main_id.clone(),
+            profile_id: main_profile_id,
+            autonomy_policy_json: "{}".to_owned(),
+            tool_policy_revision: "default".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("main binding creates");
+
+    let project = ProjectRepo::create_with_agent_binding(
+        &*db,
+        CreateProject {
+            id: new_uuid_v4(),
+            name: "role preference".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some(OWNER_ID.to_owned()),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+        Some(project_agent_id.clone()),
+        Some(project_agent_profile_id),
+    )
+    .await
+    .expect("project creates");
+
+    let resolution = services::resolve_project_execution_roles_for_provisioning(&db, &project)
+        .await
+        .expect("roles resolve");
+
+    assert_eq!(
+        resolution.worker_identity_id.as_deref(),
+        Some(coder_id.as_str()),
+        "the Worker seat skips the Main and Project Agents",
+    );
+    assert_eq!(
+        resolution.reviewer_identity_id.as_deref(),
+        Some(reviewer_id.as_str()),
+        "the reviewer seat is a different identity from the Worker",
+    );
+}
+
+/// A Main/Project binding only accepts an identity the account owns.
+async fn account_agent(db: &SqliteDb, name: &str) -> (String, String) {
+    let identity_id = new_uuid_v4();
+    let profile_id = new_uuid_v4();
+    let now = now_rfc3339();
+    AgentRepo::create_identity_with_profile(
+        db,
+        CreateAgentIdentity {
+            id: identity_id.clone(),
+            name: name.to_owned(),
+            description: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: Some(OWNER_ID.to_owned()),
+            visibility: "account".to_owned(),
+            account_permission_ceiling: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        CreateAgentProfile {
+            id: profile_id.clone(),
+            identity_id: identity_id.clone(),
+            backend_kind: "native".to_owned(),
+            executor_type: "embedded".to_owned(),
+            provider: Some("same-provider".to_owned()),
+            model: Some("same-model".to_owned()),
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "{}".to_owned(),
+            tool_policy_json: "{}".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("agent creates");
+    AgentConnectionHealthRepo::upsert_connection_health(
+        db,
+        UpsertAgentConnectionHealth {
+            profile_id: profile_id.clone(),
+            status: "healthy".to_owned(),
+            capability_status_json: "{}".to_owned(),
+            checked_at: Some(now.clone()),
+            error_code: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("agent health creates");
+    (identity_id, profile_id)
+}

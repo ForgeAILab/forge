@@ -197,6 +197,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   now carry only `id:` and `data:`, matching the single-envelope contract the
   client already documents; consumers route on the payload's `event_type`.
 
+- Project provisioning no longer hands both Task roles to the Main Agent.
+  Auto-selection now skips the account's Main Agent and the Project's Project
+  Agent while any other eligible agent exists, and prefers an independent
+  reviewer over reusing the identity already holding the Worker role. A
+  single-agent account still fills both roles with that agent, and explicit
+  assignment of any eligible identity is unchanged.
+
 - Task workflow-role assignments are now authoritative at execution time.
   Project Worker/reviewer selections seed Tasks but no longer lock a Task to
   those exact identities; any enabled, available Project Task agent may fill a

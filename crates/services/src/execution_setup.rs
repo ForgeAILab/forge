@@ -6,10 +6,12 @@
 //! Task-kind/capability classification is used by proposal admission and
 //! WorkspaceLease issuance.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use api_types::{RetryAction, SetupRequirement, WorkflowDefinition};
-use db::{Agent, Project, ProjectRepo, SqliteDb};
+use db::{
+    AccountMainAgentBindingRepo, Agent, Project, ProjectAgentBindingRepo, ProjectRepo, SqliteDb,
+};
 use serde_json::Value;
 
 use crate::{
@@ -234,12 +236,15 @@ async fn resolve_project_execution_roles_with_mode(
     let required = required_execution_roles(&workflow);
     let candidates = eligible_project_execution_agents(db, project).await?;
     let settings_assignments = project_default_assignments(project)?;
+    let conversational = conversational_identities(db, project).await?;
 
     let worker_identity_id = resolve_role_identity(
         required.worker_role.as_deref(),
         settings_assignments.get(required.worker_role.as_deref().unwrap_or_default()),
         &candidates,
         allow_preflight_fallback,
+        None,
+        &conversational,
     );
     let requirements = Vec::new();
 
@@ -250,6 +255,8 @@ async fn resolve_project_execution_roles_with_mode(
             configured,
             &candidates,
             allow_preflight_fallback,
+            worker_identity_id.as_deref(),
+            &conversational,
         )
     });
 
@@ -396,11 +403,37 @@ fn project_default_assignments(project: &Project) -> Result<HashMap<String, Stri
     Ok(assignments)
 }
 
+/// Identities this Project already talks through: the account's Main Agent and
+/// this Project's Project Agent. They stay *eligible* for Task work — a user
+/// may assign them deliberately — but provisioning must not reach for them
+/// first. Every credential-bearing agent sorts after them by creation date in
+/// a fresh install, so the unguarded fallback handed both Task roles to the
+/// Main Agent and left the purpose-built execution agents idle.
+async fn conversational_identities(db: &SqliteDb, project: &Project) -> Result<HashSet<String>> {
+    let mut identities = HashSet::new();
+    if let Some(owner_id) = project.owner_id.as_deref() {
+        if let Some(binding) =
+            AccountMainAgentBindingRepo::get_active_main_binding(db, owner_id).await?
+        {
+            identities.insert(binding.identity_id);
+        }
+    }
+    if let Some(identity_id) = ProjectAgentBindingRepo::get_active_project_binding(db, &project.id)
+        .await?
+        .and_then(|binding| binding.identity_id)
+    {
+        identities.insert(identity_id);
+    }
+    Ok(identities)
+}
+
 fn resolve_role_identity(
     role: Option<&str>,
     configured: Option<&String>,
     candidates: &[Agent],
     allow_preflight_fallback: bool,
+    taken: Option<&str>,
+    conversational: &HashSet<String>,
 ) -> Option<String> {
     let _role = role?;
     if let Some(configured) = configured {
@@ -408,12 +441,26 @@ fn resolve_role_identity(
             return Some(configured.clone());
         }
     }
-    allow_preflight_fallback.then(|| {
-        candidates
-            .iter()
-            .find(|agent| auto_selectable_execution_agent(agent))
-            .map(|agent| agent.id.clone())
-    })?
+    if !allow_preflight_fallback {
+        return None;
+    }
+    // Preference ladder, best first. Reusing the identity that already holds
+    // the other role stays legal — a single-agent install has nothing else to
+    // offer — but it is the last thing tried, so a reviewer is independent
+    // whenever the account owns anyone else who could hold the seat.
+    let selectable = |agent: &&Agent| auto_selectable_execution_agent(agent);
+    let untaken = |agent: &&Agent| Some(agent.id.as_str()) != taken;
+    let dedicated = |agent: &&Agent| !conversational.contains(&agent.id);
+    candidates
+        .iter()
+        .find(|agent| selectable(agent) && untaken(agent) && dedicated(agent))
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|agent| selectable(agent) && untaken(agent))
+        })
+        .or_else(|| candidates.iter().find(selectable))
+        .map(|agent| agent.id.clone())
 }
 
 /// Bootstrap defaults are discovery conveniences, not proof that a Task can
@@ -549,11 +596,136 @@ mod tests {
             Some(&agent.id),
             std::slice::from_ref(&agent),
             true,
+            None,
+            &HashSet::new(),
         );
         assert_eq!(explicitly_configured.as_deref(), Some("default-cli"));
         assert_eq!(
-            resolve_role_identity(Some("worker"), None, &[agent], true),
+            resolve_role_identity(Some("worker"), None, &[agent], true, None, &HashSet::new()),
             None
+        );
+    }
+
+    fn credentialed(id: &str, created_at: &str) -> Agent {
+        Agent {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            description: None,
+            profile_id: format!("profile-{id}"),
+            backend_kind: "native".to_owned(),
+            executor_type: "embedded".to_owned(),
+            provider: Some("gemini".to_owned()),
+            model: Some("gemini-3.7-flash".to_owned()),
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "[]".to_owned(),
+            tool_policy_json: "{}".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: Some("credential-1".to_owned()),
+            daemon_id: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: db::AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: Some("user-1".to_owned()),
+            visibility: "account".to_owned(),
+            version: 1,
+            created_at: created_at.to_owned(),
+            updated_at: created_at.to_owned(),
+        }
+    }
+
+    #[test]
+    fn provisioning_passes_over_the_conversational_agents() {
+        let candidates = [
+            credentialed("main-agent", "2026-01-01T00:00:00Z"),
+            credentialed("project-agent", "2026-01-02T00:00:00Z"),
+            credentialed("coder-agent", "2026-01-03T00:00:00Z"),
+            credentialed("reviewer-agent", "2026-01-04T00:00:00Z"),
+        ];
+        let conversational = HashSet::from(["main-agent".to_owned(), "project-agent".to_owned()]);
+
+        let worker = resolve_role_identity(
+            Some("coder"),
+            None,
+            &candidates,
+            true,
+            None,
+            &conversational,
+        );
+        assert_eq!(worker.as_deref(), Some("coder-agent"));
+
+        let reviewer = resolve_role_identity(
+            Some("reviewer"),
+            None,
+            &candidates,
+            true,
+            worker.as_deref(),
+            &conversational,
+        );
+        assert_eq!(reviewer.as_deref(), Some("reviewer-agent"));
+    }
+
+    #[test]
+    fn a_lone_conversational_agent_is_still_reachable() {
+        let candidates = [credentialed("main-agent", "2026-01-01T00:00:00Z")];
+        let conversational = HashSet::from(["main-agent".to_owned()]);
+
+        assert_eq!(
+            resolve_role_identity(
+                Some("coder"),
+                None,
+                &candidates,
+                true,
+                None,
+                &conversational
+            )
+            .as_deref(),
+            Some("main-agent"),
+        );
+    }
+
+    #[test]
+    fn an_independent_reviewer_outranks_avoiding_a_chat_agent() {
+        let candidates = [
+            credentialed("main-agent", "2026-01-01T00:00:00Z"),
+            credentialed("coder-agent", "2026-01-02T00:00:00Z"),
+        ];
+        let conversational = HashSet::from(["main-agent".to_owned()]);
+
+        assert_eq!(
+            resolve_role_identity(
+                Some("reviewer"),
+                None,
+                &candidates,
+                true,
+                Some("coder-agent"),
+                &conversational
+            )
+            .as_deref(),
+            Some("main-agent"),
+        );
+    }
+
+    #[test]
+    fn a_single_agent_install_still_fills_both_roles() {
+        let candidates = [credentialed("only-agent", "2026-01-01T00:00:00Z")];
+
+        assert_eq!(
+            resolve_role_identity(
+                Some("reviewer"),
+                None,
+                &candidates,
+                true,
+                Some("only-agent"),
+                &HashSet::new()
+            )
+            .as_deref(),
+            Some("only-agent"),
         );
     }
 }
