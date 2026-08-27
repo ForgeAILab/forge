@@ -204,6 +204,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   single-agent account still fills both roles with that agent, and explicit
   assignment of any eligible identity is unchanged.
 
+- A Project that had ever carried one Task attachment could not be deleted.
+  `task_media.asset_id` and `media_asset.legacy_task_media_id` reference each
+  other with `ON DELETE SET NULL`, and immutability triggers aborted on the
+  foreign key's own NULL, so the delete failed with "Task media asset mapping
+  is immutable". Both guards now allow that NULL and keep refusing every other
+  rewrite, and Project teardown clears `project_media_attachment` before the
+  assets it holds with `RESTRICT`.
+
 - Task workflow-role assignments are now authoritative at execution time.
   Project Worker/reviewer selections seed Tasks but no longer lock a Task to
   those exact identities; any enabled, available Project Task agent may fill a

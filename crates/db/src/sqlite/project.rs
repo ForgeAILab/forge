@@ -475,6 +475,9 @@ impl ProjectRepo for SqliteDb {
                           AND c.project_id = g.project_id)))",
             "DELETE FROM media_asset_tombstone WHERE asset_id IN
                  (SELECT id FROM media_asset WHERE project_id = ?)",
+            // Attachments hold the assets with RESTRICT, so the Project's own
+            // cascade cannot be trusted to reach them before the assets.
+            "DELETE FROM project_media_attachment WHERE project_id = ?",
             "DELETE FROM project_release_media_pin WHERE project_id = ?",
             "DELETE FROM project_release_reference WHERE release_id IN
                  (SELECT id FROM project_release WHERE project_id = ?)",
