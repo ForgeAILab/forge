@@ -91,9 +91,9 @@ export function deriveProjectStageOrientation(overview: ProjectOverview): StageV
       label: STAGE_LABELS.plan,
       status: status(planComplete ? 'complete' : planActive ? 'active' : 'pending', 'plan'),
       detail: planComplete
-        ? 'Execution baseline approved'
+        ? 'Optional traceability · Tasks follow their workflow'
         : planActive
-          ? 'Waiting for baseline approval'
+          ? 'Legacy traceability state · does not block Tasks'
           : 'Not started',
       blocker: blockerStage === 'plan' ? blocker : null,
     },

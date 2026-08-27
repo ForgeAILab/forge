@@ -114,6 +114,42 @@ impl CredentialHandleRepo for SqliteDb {
             .collect()
     }
 
+    async fn set_credential_handle_enabled(
+        &self,
+        id: &str,
+        owner_user_id: &str,
+        enabled: bool,
+        expected_version: i64,
+        updated_at: &str,
+    ) -> Result<CredentialHandle> {
+        let result = sqlx::query(
+            "UPDATE credential_handle
+             SET enabled = ?, version = version + 1, updated_at = ?
+             WHERE id = ? AND owner_user_id = ? AND version = ?
+               AND status != 'revoked'",
+        )
+        .bind(enabled)
+        .bind(updated_at)
+        .bind(id)
+        .bind(owner_user_id)
+        .bind(expected_version)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            let current = self
+                .get_credential_handle(id)
+                .await?
+                .filter(|handle| handle.owner_user_id == owner_user_id);
+            return Err(match current {
+                Some(handle) if handle.version != expected_version => DbError::VersionConflict,
+                _ => DbError::NotFound,
+            });
+        }
+        self.get_credential_handle(id)
+            .await?
+            .ok_or(DbError::NotFound)
+    }
+
     async fn revoke_credential_handle(
         &self,
         id: &str,
@@ -626,6 +662,7 @@ fn map_credential_handle(row: SqliteRow) -> Result<CredentialHandle> {
         provider: row.try_get("provider")?,
         label: row.try_get("label")?,
         status: row.try_get("status")?,
+        enabled: row.try_get::<i64, _>("enabled")? != 0,
         credential_method: row.try_get("credential_method")?,
         metadata_json: row.try_get("metadata_json")?,
         version: row.try_get("version")?,

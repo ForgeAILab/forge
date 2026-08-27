@@ -1,7 +1,7 @@
 //! Canonical Project execution-setup projection.
 //!
-//! Coordination, repository/role setup, and the execution-baseline gate are
-//! independent dimensions. A source read failure is surfaced as an explicit
+//! Coordination, repository setup, and Charter-backed Task execution are
+//! independent dimensions. Project role settings are optional defaults. A source read failure is surfaced as an explicit
 //! unavailable dimension with a retry action; it is never converted into a
 //! plausible `setup_required` or `ready` result.
 
@@ -28,13 +28,6 @@ use crate::{
     Result, ServiceError,
 };
 
-/// Reconciliation conflict codes whose divergence invalidates the Project's
-/// governing baseline itself, not merely one downstream record. Only these
-/// widen the Project execution gate (D16); every other recorded conflict
-/// code is scoped to its own affected record(s) — a Task, plan item, or
-/// milestone — and must attach only there.
-pub(crate) const PROJECT_WIDE_RECONCILIATION_CONFLICT_CODES: &[&str] = &["invalid_active_baseline"];
-
 /// One required reconciliation record joined with its canonical conflict.
 /// Shared by the Project-wide gate computation, the per-Task blocker
 /// projection, and the capability-aware review evaluation in
@@ -54,12 +47,6 @@ pub(crate) struct ReconciliationConflictRow {
 }
 
 impl ReconciliationConflictRow {
-    /// Whether this conflict invalidates the Project's governing baseline
-    /// itself (D16). Everything else is scoped to `record_type`/`record_id`.
-    pub(crate) fn is_project_wide(&self) -> bool {
-        PROJECT_WIDE_RECONCILIATION_CONFLICT_CODES.contains(&self.conflict_code.as_str())
-    }
-
     /// Whether this conflict attaches to the named Task specifically.
     pub(crate) fn is_scoped_to_task(&self, task_id: &str) -> bool {
         self.record_type == "task" && self.record_id == task_id
@@ -154,16 +141,9 @@ pub async fn load_project_execution_setup(
         .as_ref()
         .map(|resolution| resolution.requirements.clone())
         .unwrap_or_default();
-    if coordination_state != CoordinationState::Ready {
-        let mut requirement = SetupRequirement::new("coordination");
-        requirement.resource_type = Some("project_agent_chat".to_owned());
-        requirement.action = Some(if coordination_state == CoordinationState::Unavailable {
-            RetryAction::RefreshAndRetry
-        } else {
-            RetryAction::CompleteSetup
-        });
-        setup_requirements.insert(0, requirement);
-    }
+    // Project Agent coordination is useful but optional for Task execution.
+    // A missing/unavailable binding is reported in `coordination_state`; it
+    // does not turn an otherwise runnable Task into Project setup work.
     if !primary_repo_ready && setup_source_available {
         let mut requirement = SetupRequirement::new("repository");
         requirement.resource_type = Some("project_repository".to_owned());
@@ -182,6 +162,11 @@ pub async fn load_project_execution_setup(
         // Keep the durable operation untouched for the recovery worker, but
         // expose a finite, retryable projection immediately.
         ExecutionSetupState::Failed
+    } else if primary_repo_ready {
+        // Project role settings are optional defaults. Once the repository is
+        // verifiably linked, Task-level assignments can satisfy workflow roles
+        // without completing a separate Project-wide role checkpoint.
+        ExecutionSetupState::Ready
     } else {
         provisioning_state(provisioning.as_ref())
     };
@@ -191,10 +176,7 @@ pub async fn load_project_execution_setup(
     // or a stale migration/backfill result.
     if setup_source_available
         && execution_setup_state == ExecutionSetupState::Ready
-        && (!primary_repo_ready
-            || roles
-                .as_ref()
-                .is_none_or(|resolution| !resolution.requirements.is_empty()))
+        && !primary_repo_ready
     {
         execution_setup_state = ExecutionSetupState::SetupRequired;
     }
@@ -225,7 +207,6 @@ pub async fn load_project_execution_setup(
         .collect::<Vec<_>>();
     let eligible_reviewers = eligible_agents
         .iter()
-        .filter(|agent| Some(agent.id.as_str()) != worker_identity_id)
         .cloned()
         .map(execution_principal_response)
         .collect::<Vec<_>>();
@@ -438,55 +419,14 @@ fn provisioning_retry_allowed(operation: &ProvisioningOperationResponse) -> bool
     operation.retryable && operation.attempt_count < operation.max_attempts
 }
 
-/// The Project-wide execution gate and, when it is `ReconciliationRequired`,
-/// the exact governing-truth conflict that widened it. Per D16, a Task-,
-/// plan-item-, or milestone-scoped reconciliation never appears here — it
-/// leaves this gate untouched and attaches only to its own affected
-/// record(s) through [`load_task_execution_blocker`].
+/// Charter approval is the Project-wide implementation authority. Baselines
+/// and their reconciliations remain planning/readiness inputs and do not add a
+/// second Task-dispatch gate; Task-scoped conflicts are projected separately.
 async fn execution_gate(
-    db: &SqliteDb,
-    project_id: &str,
+    _db: &SqliteDb,
+    _project_id: &str,
 ) -> Result<(ExecutionGate, Option<ReconciliationConflictRow>)> {
-    let conflicts = required_reconciliation_conflicts(db, project_id).await?;
-    if let Some(project_wide) = conflicts
-        .into_iter()
-        .find(ReconciliationConflictRow::is_project_wide)
-    {
-        return Ok((ExecutionGate::ReconciliationRequired, Some(project_wide)));
-    }
-
-    let baseline = sqlx::query(
-        "SELECT b.lifecycle, r.lifecycle AS revision_lifecycle
-         FROM project_execution_baseline AS b
-         LEFT JOIN project_execution_baseline_revision AS r
-           ON r.id = b.current_revision_id AND r.baseline_id = b.id
-         WHERE b.project_id = ?
-         ORDER BY CASE b.lifecycle
-             WHEN 'active' THEN 0
-             WHEN 'proposed' THEN 1
-             WHEN 'approved' THEN 2
-             ELSE 3
-         END,
-         b.updated_at DESC, b.id DESC
-         LIMIT 1",
-    )
-    .bind(project_id)
-    .fetch_optional(db.pool())
-    .await?;
-    let Some(row) = baseline else {
-        return Ok((ExecutionGate::PreBaselineReadOnly, None));
-    };
-    let lifecycle: String = sqlx::Row::try_get(&row, "lifecycle")?;
-    let revision_lifecycle: Option<String> = sqlx::Row::try_get(&row, "revision_lifecycle")?;
-    let gate = match (lifecycle.as_str(), revision_lifecycle.as_deref()) {
-        ("active", Some("approved")) => ExecutionGate::Active,
-        // The active baseline's own current revision is not approved: a
-        // structural Project-wide invalidity, not a recorded conflict row.
-        ("active", _) => ExecutionGate::ReconciliationRequired,
-        ("proposed" | "approved", _) => ExecutionGate::BaselineApprovalRequired,
-        _ => ExecutionGate::PreBaselineReadOnly,
-    };
-    Ok((gate, None))
+    Ok((ExecutionGate::Active, None))
 }
 
 fn execution_principal_response(agent: Agent) -> ExecutionPrincipalResponse {
@@ -524,8 +464,9 @@ fn repo_response(repo: db::Repo) -> RepoResponse {
 
 fn add_gate_requirement(requirements: &mut Vec<SetupRequirement>, gate: ExecutionGate) {
     let action = match gate {
-        ExecutionGate::BaselineApprovalRequired => Some(RetryAction::Reauthorize),
-        ExecutionGate::PreBaselineReadOnly => Some(RetryAction::Repropose),
+        // Legacy enum values remain readable for historical projections, but
+        // baseline state no longer creates an execution setup requirement.
+        ExecutionGate::BaselineApprovalRequired | ExecutionGate::PreBaselineReadOnly => None,
         ExecutionGate::ReconciliationRequired => Some(RetryAction::ResolveReconciliation),
         ExecutionGate::Active | ExecutionGate::Unavailable => None,
     };
@@ -638,8 +579,8 @@ fn blocker_copy(
             return (
                 ExecutionBlockerCode::IndependentReviewerAssignmentRequired,
                 ExecutionBlockerStage::Review,
-                "Waiting for an independent reviewer".to_owned(),
-                "Select an independent reviewer distinct from the Worker.".to_owned(),
+                "Waiting for a reviewer".to_owned(),
+                "Select any enabled Agent for the reviewer role.".to_owned(),
                 ExecutionBlockerPrincipal::User,
                 None,
             );
@@ -694,23 +635,22 @@ fn blocker_copy(
                 None,
             );
         }
-        // Falls through for "coordination" (already handled above) and
-        // "execution_baseline" (handled by the gate match below).
+        // Falls through for coordination and legacy execution-baseline rows.
     }
     match execution_gate {
         ExecutionGate::PreBaselineReadOnly => (
             ExecutionBlockerCode::PreBaselineReadOnly,
             ExecutionBlockerStage::Plan,
-            "Waiting for an implementation plan".to_owned(),
-            "The Project Agent still needs to prepare the implementation plan; approving that plan starts every covered Task.".to_owned(),
+            "Legacy planning status".to_owned(),
+            "This legacy status no longer blocks implementation; the approved Charter is the Task execution authority.".to_owned(),
             ExecutionBlockerPrincipal::ProjectAgent,
             None,
         ),
         ExecutionGate::BaselineApprovalRequired => (
             ExecutionBlockerCode::BaselineApprovalRequired,
             ExecutionBlockerStage::Plan,
-            "Waiting for permission to build".to_owned(),
-            "The Project is already approved. This one approval starts every Task covered by the current plan — there is no separate approval for each Task.".to_owned(),
+            "Optional traceability plan review".to_owned(),
+            "Implementation already follows the approved Charter; reviewing this optional plan does not start or stop Tasks.".to_owned(),
             ExecutionBlockerPrincipal::User,
             None,
         ),
@@ -727,7 +667,7 @@ fn blocker_copy(
                     ExecutionBlockerCode::InvalidActiveBaseline,
                     ExecutionBlockerStage::Build,
                     "Active plan needs repair".to_owned(),
-                    "The Project's active execution baseline is invalid and must be corrected before repository work can resume.".to_owned(),
+                    "The optional traceability plan is invalid. Repairing it does not gate unrelated Task execution.".to_owned(),
                     ExecutionBlockerPrincipal::User,
                     governing_ref,
                 )
@@ -735,8 +675,8 @@ fn blocker_copy(
                 (
                     ExecutionBlockerCode::ReconciliationRequired,
                     ExecutionBlockerStage::Build,
-                    "Waiting for plan reconciliation".to_owned(),
-                    "The approved plan changed and must be reconciled before repository work can resume.".to_owned(),
+                    "Traceability conflict".to_owned(),
+                    "Review the recorded difference. Only a conflict scoped to a Task can block that Task.".to_owned(),
                     ExecutionBlockerPrincipal::User,
                     governing_ref,
                 )
@@ -1001,7 +941,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_baseline_wins_over_newer_draft() {
+    async fn baseline_state_does_not_gate_task_execution() {
         let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
         run_migrations(&pool).await.expect("migrations");
         let db = SqliteDb::new(pool);
@@ -1040,12 +980,12 @@ mod tests {
                 .await
                 .expect("gate")
                 .0,
-            ExecutionGate::ReconciliationRequired
+            ExecutionGate::Active
         );
     }
 
     #[tokio::test]
-    async fn gate_source_failure_is_explicitly_unavailable() {
+    async fn optional_gate_source_failure_does_not_block_execution() {
         let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
         run_migrations(&pool).await.expect("migrations");
         let db = SqliteDb::new(pool);
@@ -1073,16 +1013,15 @@ mod tests {
         let projection = load_project_execution_setup(&db, "projection-unavailable-project")
             .await
             .expect("projection remains readable");
-        assert_eq!(projection.execution_gate, ExecutionGate::Unavailable);
+        assert_eq!(projection.execution_gate, ExecutionGate::Active);
         assert_eq!(
             projection.availability.execution_gate.availability,
-            api_types::ProjectionAvailability::Unavailable
+            api_types::ProjectionAvailability::Current
         );
-        assert_eq!(projection.next_action, Some(RetryAction::CompleteSetup));
-        assert!(projection.setup_requirements.iter().any(|requirement| {
-            requirement.requirement_type == "execution_gate_projection"
-                && requirement.action == Some(RetryAction::RefreshAndRetry)
-        }));
+        assert!(!projection
+            .setup_requirements
+            .iter()
+            .any(|requirement| { requirement.requirement_type == "execution_gate_projection" }));
     }
 
     #[tokio::test]

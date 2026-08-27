@@ -193,6 +193,7 @@ impl TaskDispatcher {
             | EffectiveStatus::DaemonUnavailable
             | EffectiveStatus::ConnectionDegraded
             | EffectiveStatus::ConnectionUnavailable
+            | EffectiveStatus::SourceDisabled
             | EffectiveStatus::Deactivated => return Ok(false),
             EffectiveStatus::Active | EffectiveStatus::Busy => {}
         }

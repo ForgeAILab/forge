@@ -111,9 +111,7 @@ describe('ReconciliationReviewCard', () => {
     render(<ReconciliationReviewCard projectId="project-1" />)
 
     expect(screen.getByText('Review a requested change')).toBeTruthy()
-    expect(
-      screen.getByText('The proposed Task definition conflicts with the approved plan.'),
-    ).toBeTruthy()
+    expect(screen.getByText('Apply the proposed change to this Task.')).toBeTruthy()
     expect(screen.getByText('Technical details')).toBeTruthy()
     expect(screen.getByText(/task_definition_conflict/)).toBeTruthy()
     expect(screen.getByText(/Execution Baseline baseline-1 @ revision revision-3/)).toBeTruthy()
@@ -121,16 +119,13 @@ describe('ReconciliationReviewCard', () => {
     expect(screen.getByText('/plan/items/0/outcome')).toBeTruthy()
   })
 
-  it('offers only immediately actionable plain-language choices', () => {
+  it('offers only accept and reject choices', () => {
     mockQuery([baseReconciliation()])
     render(<ReconciliationReviewCard projectId="project-1" />)
 
-    expect(screen.getByRole('option', { name: 'Keep the current work' })).toBeTruthy()
-    expect(screen.getByRole('option', { name: 'Cancel the affected work' })).toBeTruthy()
-    expect(screen.queryByRole('option', { name: 'Use the recommended replacement' })).toBeNull()
-    expect(screen.getByRole('button', { name: 'Confirm decision' }).hasAttribute('disabled')).toBe(
-      false,
-    )
+    expect(screen.queryByRole('combobox')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Accept' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Reject' })).toBeTruthy()
     expect(screen.queryByLabelText('Reason')).toBeNull()
   })
 
@@ -139,7 +134,7 @@ describe('ReconciliationReviewCard', () => {
     const mutate = mockMutation()
     render(<ReconciliationReviewCard projectId="project-1" />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm decision' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Reject' }))
 
     expect(mutate).toHaveBeenCalledTimes(1)
     const [call] = mutate.mock.calls[0] as [
@@ -194,7 +189,7 @@ describe('ReconciliationReviewCard', () => {
     expect(screen.queryByRole('combobox')).toBeNull()
     expect(screen.queryByLabelText('Replacement id')).toBeNull()
     expect(screen.queryByLabelText('Reason')).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: 'Accept update & resume work' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Accept' }))
 
     const [call] = mutate.mock.calls[0] as [
       {
@@ -234,8 +229,8 @@ describe('ReconciliationReviewCard', () => {
 
     expect(screen.getByText('Allow the Project Agent to retry this task replacement?')).toBeTruthy()
     expect(screen.getByText(/replaces the in-scope Task/)).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Reject change' })).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: 'Accept & let agent retry' }))
+    expect(screen.getByRole('button', { name: 'Reject' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Accept' }))
 
     const [call] = mutate.mock.calls[0] as [
       {
@@ -251,7 +246,7 @@ describe('ReconciliationReviewCard', () => {
     expect(call.input.reason).toContain('retry the blocked Task operation')
   })
 
-  it('makes rejection truthful and reversible without mutating canonical state', () => {
+  it('records rejection by retaining the historical record', () => {
     mockQuery([
       baseReconciliation({
         conflict: {
@@ -269,11 +264,10 @@ describe('ReconciliationReviewCard', () => {
     const mutate = mockMutation()
     render(<ReconciliationReviewCard projectId="project-1" />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Reject for now' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Reject' }))
 
-    expect(mutate).not.toHaveBeenCalled()
-    expect(screen.getByText(/No change was made/)).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Review again' })).toBeTruthy()
+    expect(mutate).toHaveBeenCalledTimes(1)
+    expect(mutate.mock.calls[0]?.[0]?.input.action).toBe('retained')
   })
 
   it('shows the exact resolution result after a successful resolve', () => {
@@ -299,7 +293,7 @@ describe('ReconciliationReviewCard', () => {
     >)
     render(<ReconciliationReviewCard projectId="project-1" />)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm decision' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Reject' }))
 
     expect(screen.getByText('Recently resolved')).toBeTruthy()
     expect(screen.getByText('Decision saved.')).toBeTruthy()

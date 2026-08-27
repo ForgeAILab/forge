@@ -1595,7 +1595,7 @@ async fn setup_required_wake_reconsiders_after_binding_change() {
 }
 
 #[tokio::test]
-async fn baseline_activation_delivers_begin_execution_turn() {
+async fn baseline_activation_delivers_traceability_update_turn() {
     let db = database().await;
     let identity_id = new_uuid_v4();
     let profile_id = identity_with_profile(&db, &identity_id).await;
@@ -1643,7 +1643,7 @@ async fn baseline_activation_delivers_begin_execution_turn() {
     .unwrap();
     assert_eq!(status, "queued");
     assert!(content.contains("baseline-1"));
-    assert!(content.contains("Begin execution"));
+    assert!(content.contains("approved Charter already authorizes implementation"));
 }
 
 /// The whole autonomy loop, end to end: a Task execution fails → the durable
@@ -1772,7 +1772,7 @@ async fn failed_execution_wakes_the_project_agent_end_to_end() {
     .unwrap();
     assert_eq!(status, "queued");
     assert_eq!(responder, identity_id);
-    assert!(content.contains("Task execution failed"));
+    assert!(content.contains("Task execution stopped"));
     drop(db);
     let _ = std::fs::remove_file(database_path);
 }

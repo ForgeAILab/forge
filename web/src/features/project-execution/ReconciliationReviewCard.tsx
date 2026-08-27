@@ -4,7 +4,6 @@ import { WarningCircle } from '@phosphor-icons/react'
 import { ConflictDetails } from '@/components/conflict-details'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
-import { Label } from '@/components/ui/label'
 import { getApiErrorMessage } from '@/lib/api-error'
 import { useAuthStore } from '@/stores/auth'
 import type {
@@ -220,13 +219,6 @@ function ReconciliationItem({
   const adaptiveBoundary =
     reconciliation.conflict.conflict_code === 'adaptive_task_boundary_crossed'
   const suggestedReplacement = reconciliation.suggested_replacement_ref
-  const options = reconciliation.allowed_actions
-    .filter((candidate) => !REPLACEMENT_REQUIRED.has(candidate) || suggestedReplacement)
-    .map((candidate) => ({ value: candidate, label: ACTION_LABELS[candidate] }))
-  const [action, setAction] = useState<ReconciliationResolutionAction>(
-    options[0]?.value ?? reconciliation.allowed_actions[0],
-  )
-  const [deferred, setDeferred] = useState(false)
 
   function submit(selectedAction: ReconciliationResolutionAction) {
     const replacementRequired = REPLACEMENT_REQUIRED.has(selectedAction)
@@ -285,47 +277,34 @@ function ReconciliationItem({
 
         <TechnicalDetails reconciliation={reconciliation} />
 
-        {deferred ? (
-          <div
-            className="mt-3 rounded-md border border-border-subtle bg-background p-3"
-            role="status"
+        <div className="mt-4 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+          <Button
+            variant="outline"
+            onClick={() => submit('retained')}
+            disabled={mutation.isPending}
           >
-            <p className="text-xs text-foreground">
-              No change was made. Repository work remains paused until you accept the update.
-            </p>
-            <Button className="mt-2" variant="outline" size="sm" onClick={() => setDeferred(false)}>
-              Review again
-            </Button>
-          </div>
-        ) : (
-          <div className="mt-4 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+            Reject
+          </Button>
+          {suggestedReplacement ? (
             <Button
-              variant="outline"
-              onClick={() => setDeferred(true)}
+              onClick={() => submit('revised')}
               disabled={mutation.isPending}
+              aria-describedby={`${fieldId}-accept-help`}
             >
-              Reject for now
+              {mutation.isPending ? 'Applying update…' : 'Accept'}
             </Button>
-            {suggestedReplacement ? (
-              <Button
-                onClick={() => submit('revised')}
-                disabled={mutation.isPending}
-                aria-describedby={`${fieldId}-accept-help`}
-              >
-                {mutation.isPending ? 'Applying update…' : 'Accept update & resume work'}
-              </Button>
-            ) : (
-              <Button onClick={onRefresh} disabled={mutation.isPending}>
-                Refresh recommended update
-              </Button>
-            )}
-          </div>
-        )}
+          ) : (
+            <Button onClick={onRefresh} disabled={mutation.isPending}>
+              Refresh recommended update
+            </Button>
+          )}
+        </div>
         <p
           id={`${fieldId}-accept-help`}
           className="mt-2 text-xs text-muted-foreground sm:text-right"
         >
-          One click approves and applies the correction; there is no second plan approval.
+          Accept applies the replacement. Reject keeps the existing record. Neither changes Task
+          workflow approval.
         </p>
 
         {mutation.isError ? (
@@ -374,14 +353,14 @@ function ReconciliationItem({
             onClick={() => submit('retained')}
             disabled={mutation.isPending}
           >
-            Reject change
+            Reject
           </Button>
           <Button
             onClick={() => submit('revised')}
             disabled={mutation.isPending || !suggestedReplacement}
             aria-describedby={`${fieldId}-adaptive-help`}
           >
-            {mutation.isPending ? 'Saving decision…' : 'Accept & let agent retry'}
+            {mutation.isPending ? 'Saving decision…' : 'Accept'}
           </Button>
         </div>
         <p
@@ -402,15 +381,28 @@ function ReconciliationItem({
     )
   }
 
+  const replacingAgent = [
+    reconciliation.affected.record_type,
+    reconciliation.conflict.conflicting.record_type,
+  ].some((recordType) => recordType.includes('agent'))
+  const effect = replacingAgent
+    ? 'Replace the assigned Agent with the proposed Agent.'
+    : reconciliation.affected.record_type === 'task'
+      ? 'Apply the proposed change to this Task.'
+      : `Apply the proposed ${humanize(reconciliation.affected.record_type).toLowerCase()} change.`
+  const acceptAction: ReconciliationResolutionAction = suggestedReplacement
+    ? 'revised'
+    : 'invalidated'
+  const canAccept = reconciliation.allowed_actions.includes(acceptAction)
+  const canReject = reconciliation.allowed_actions.includes('retained')
+
   return (
     <div className="rounded-md border border-ember-border bg-ember-surface p-3 sm:p-4">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="min-w-0">
-          <p className="break-words text-sm font-semibold text-foreground">
-            {reconciliation.conflict.description}
-          </p>
+          <p className="break-words text-sm font-semibold text-foreground">{effect}</p>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            Choose what Forge should keep. The Project Agent cannot make this decision silently.
+            Accept applies this change. Reject keeps the current Project record.
           </p>
         </div>
       </div>
@@ -418,35 +410,24 @@ function ReconciliationItem({
       <TechnicalDetails reconciliation={reconciliation} />
 
       <div className="mt-4 space-y-3 border-t border-border-subtle pt-3">
-        <div>
-          <Label htmlFor={`${fieldId}-action`}>What should Forge do?</Label>
-          <select
-            id={`${fieldId}-action`}
-            className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-2 text-ui"
-            value={action}
-            onChange={(event) => setAction(event.target.value as ReconciliationResolutionAction)}
-            aria-label={`Resolution action for ${reconciliation.conflict.conflict_code}`}
-          >
-            {options.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-        </div>
-
         {mutation.isError ? (
           <ConflictDetails error={mutation.error} fallbackAuthority="reconciliation" />
         ) : null}
 
-        <div className="flex justify-end">
-          {options.length > 0 ? (
-            <Button onClick={() => submit(action)} disabled={mutation.isPending}>
-              {mutation.isPending ? 'Saving decision…' : 'Confirm decision'}
-            </Button>
-          ) : (
-            <Button onClick={onRefresh}>Refresh available choices</Button>
-          )}
+        <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+          <Button
+            variant="outline"
+            onClick={() => submit('retained')}
+            disabled={mutation.isPending || !canReject}
+          >
+            Reject
+          </Button>
+          <Button
+            onClick={() => submit(acceptAction)}
+            disabled={mutation.isPending || !canAccept}
+          >
+            {mutation.isPending ? 'Saving decision…' : 'Accept'}
+          </Button>
         </div>
       </div>
     </div>

@@ -4,19 +4,13 @@ use serde_json::Value;
 use crate::Result;
 
 pub(crate) async fn count_running_executions(db: &db::SqliteDb, agent_id: &str) -> Result<i64> {
+    // Main and Project Agent chat turns are coordination work, not Task
+    // executions. They intentionally do not consume the identity's Task
+    // concurrency quota; the same identity may still be assigned a Task and
+    // receives a separate Task-scoped context/lease for that attempt.
     Ok(sqlx::query_scalar::<_, i64>(
-        "SELECT
-            (
-                SELECT COUNT(*) FROM execution WHERE agent_id = ? AND status = 'running'
-            ) +
-            (
-                SELECT COUNT(*)
-                FROM agent_chat_turn_job
-                WHERE responder_identity_id = ?
-                  AND status IN ('leased', 'running')
-            )",
+        "SELECT COUNT(*) FROM execution WHERE agent_id = ? AND status = 'running'",
     )
-    .bind(agent_id)
     .bind(agent_id)
     .fetch_one(db.pool())
     .await?)
@@ -49,22 +43,11 @@ pub(crate) async fn count_running_executions_for_daemon(
     daemon_id: &str,
 ) -> Result<i64> {
     Ok(sqlx::query_scalar::<_, i64>(
-        "SELECT
-            (
-                SELECT COUNT(*)
-                FROM execution
-                JOIN agent_current AS agent ON agent.id = execution.agent_id
-                WHERE agent.daemon_id = ? AND execution.status = 'running'
-            ) +
-            (
-                SELECT COUNT(*)
-                FROM agent_chat_turn_job
-                JOIN agent_current AS agent ON agent.id = agent_chat_turn_job.responder_identity_id
-                WHERE agent.daemon_id = ?
-                  AND agent_chat_turn_job.status IN ('leased', 'running')
-            )",
+        "SELECT COUNT(*)
+         FROM execution
+         JOIN agent_current AS agent ON agent.id = execution.agent_id
+         WHERE agent.daemon_id = ? AND execution.status = 'running'",
     )
-    .bind(daemon_id)
     .bind(daemon_id)
     .fetch_one(db.pool())
     .await?)

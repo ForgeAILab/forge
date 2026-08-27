@@ -41,7 +41,7 @@ pub struct Project {
 
 /// Durable, retryable work that reconciles a Project's repository and
 /// Workspace-capable role setup.  The status is deliberately independent of
-/// the Project Agent binding/chat state and the execution-baseline gate.
+/// the Project Agent binding/chat state and optional plan traceability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectProvisioningOperation {
     pub id: String,
@@ -481,6 +481,7 @@ pub struct CredentialHandle {
     pub provider: String,
     pub label: String,
     pub status: String,
+    pub enabled: bool,
     pub credential_method: String,
     pub metadata_json: String,
     pub version: i64,

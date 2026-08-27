@@ -5,4 +5,9 @@ import type { ProviderEntryAgentRef } from "./ProviderEntryAgentRef";
  * One configured provider entry: a credentialed connection a user added.
  * Multiple entries of the same provider type may coexist.
  */
-export type ProviderEntryResponse = { id: string, provider: string, label: string, credential_method: string, status: string, base_url: string | null, provider_account_id: string | null, used_by: Array<ProviderEntryAgentRef>, last_used_at: string | null, version: number, created_at: string, updated_at: string, };
+export type ProviderEntryResponse = { id: string, provider: string, label: string, credential_method: string, status: string,
+/**
+ * Reversible local policy. Disabled entries retain credentials and
+ * dependents but cannot admit new work.
+ */
+enabled: boolean, base_url: string | null, provider_account_id: string | null, used_by: Array<ProviderEntryAgentRef>, last_used_at: string | null, version: number, created_at: string, updated_at: string, };

@@ -527,9 +527,9 @@ impl TaskRepo for SqliteDb {
             ));
         }
         // Claim and its Running execution are one transaction. Re-check the
-        // active baseline here, before mutating Task assignment/status; the
-        // service's earlier read gate is only an optimization for avoiding
-        // workspace side effects.
+        // Charter-backed execution admission here before mutating Task
+        // assignment/status; the service's earlier read gate only avoids
+        // unnecessary workspace side effects.
         if input.execution.status == ExecutionStatus::Running
             && input.execution.workspace_id.is_some()
         {

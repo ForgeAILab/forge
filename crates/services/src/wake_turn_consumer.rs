@@ -965,7 +965,7 @@ impl WakeTurnConsumer {
             )));
         };
         let content = format!(
-            "Begin execution now. Execution baseline {baseline_id} (revision {revision_id}) is active. Ensure baseline plan items have tasks, confirm runnable assignments, and start the highest-priority runnable task."
+            "Traceability plan {baseline_id} (revision {revision_id}) is now active. The approved Charter already authorizes implementation. Refresh optional plan-item links, confirm Task assignments and workflows, then continue the highest-priority runnable Task."
         );
         let digest = content_digest(&content)
             .map_err(|_| ServiceError::invalid_operation("baseline content digest failed"))?;

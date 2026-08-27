@@ -232,15 +232,10 @@ async fn seed_prebaseline_governance(fixture: &Fixture, task_id: &str, plan_item
     .expect("prebaseline governance fixture");
 }
 
-struct ActivatedBaseline {
-    baseline_id: String,
-    revision_id: String,
-}
-
 /// Propose, revise, approve, and activate a baseline through the repository
 /// contract, covering `plan-item-1`/`plan-item-2` and the fixture milestone
 /// as its primary.
-async fn activate_baseline(fixture: &Fixture) -> ActivatedBaseline {
+async fn activate_baseline(fixture: &Fixture) {
     let baseline = ProjectOrchestrationRepo::create_project_execution_baseline(
         &fixture.db,
         CreateProjectExecutionBaseline {
@@ -332,10 +327,6 @@ async fn activate_baseline(fixture: &Fixture) -> ActivatedBaseline {
     .await
     .expect("baseline activation");
     assert_eq!(activated.lifecycle, "active");
-    ActivatedBaseline {
-        baseline_id: baseline.id,
-        revision_id: revision.id,
-    }
 }
 
 #[tokio::test]
@@ -373,23 +364,21 @@ async fn baseline_shell_id_is_server_minted() {
 }
 
 #[tokio::test]
-async fn activation_backfills_governance_for_preplanned_plan_item_tasks() {
+async fn activation_leaves_preplanned_task_governance_unchanged() {
     let fixture = charter_backed_project().await;
 
-    // Proposed before the baseline was activated: plan-item bound, but no
-    // baseline reference, so it was permanently unrunnable before backfill.
+    // Baselines are optional traceability records. Activating one must not
+    // mutate Task execution authority or attach Tasks implicitly.
     let preplanned = seed_task(&fixture, "Preplanned plan item", "todo").await;
     seed_prebaseline_governance(&fixture, &preplanned, "plan-item-1").await;
-    // Its plan item is not part of the activated baseline: stays untouched.
     let unrelated = seed_task(&fixture, "Unrelated plan item", "todo").await;
     seed_prebaseline_governance(&fixture, &unrelated, "plan-item-unrelated").await;
-    // Terminal work is never promoted.
     let finished = seed_task(&fixture, "Finished plan item", "done").await;
     seed_prebaseline_governance(&fixture, &finished, "plan-item-2").await;
 
-    let activated = activate_baseline(&fixture).await;
+    activate_baseline(&fixture).await;
 
-    let promoted = sqlx::query(
+    let preplanned_row = sqlx::query(
         "SELECT baseline_id, baseline_revision_id, plan_item_id, milestone_id,
                 charter_revision_id, runnable, provenance_json
          FROM project_task_governance WHERE task_id = ?",
@@ -397,49 +386,33 @@ async fn activation_backfills_governance_for_preplanned_plan_item_tasks() {
     .bind(&preplanned)
     .fetch_one(fixture.db.pool())
     .await
-    .expect("promoted governance row");
+    .expect("preplanned governance row");
+    assert_eq!(preplanned_row.get::<Option<String>, _>("baseline_id"), None);
     assert_eq!(
-        promoted.get::<Option<String>, _>("baseline_id").as_deref(),
-        Some(activated.baseline_id.as_str())
+        preplanned_row.get::<Option<String>, _>("baseline_revision_id"),
+        None
     );
     assert_eq!(
-        promoted
-            .get::<Option<String>, _>("baseline_revision_id")
+        preplanned_row
+            .get::<Option<String>, _>("plan_item_id")
             .as_deref(),
-        Some(activated.revision_id.as_str())
-    );
-    assert_eq!(
-        promoted.get::<Option<String>, _>("plan_item_id").as_deref(),
         Some("plan-item-1")
     );
     assert_eq!(
-        promoted.get::<Option<String>, _>("milestone_id").as_deref(),
-        Some(fixture.milestone_id.as_str()),
-        "an unbound preplanned Task falls back to the baseline primary milestone"
+        preplanned_row.get::<Option<String>, _>("milestone_id"),
+        None
     );
     assert_eq!(
-        promoted
+        preplanned_row
             .get::<Option<String>, _>("charter_revision_id")
             .as_deref(),
         Some(fixture.charter_revision_id.as_str())
     );
-    assert_eq!(promoted.get::<i64, _>("runnable"), 1);
+    assert_eq!(preplanned_row.get::<i64, _>("runnable"), 0);
     let provenance: serde_json::Value =
-        serde_json::from_str(&promoted.get::<String, _>("provenance_json"))
-            .expect("promoted provenance JSON");
-    assert_eq!(
-        provenance["governing_baseline_id"],
-        serde_json::json!(activated.baseline_id)
-    );
-    assert_eq!(
-        provenance["governing_baseline_revision_id"],
-        serde_json::json!(activated.revision_id)
-    );
-    assert_eq!(
-        provenance["origin_plan_item_id"],
-        serde_json::json!("plan-item-1")
-    );
-    assert!(provenance.get("baseline_pending").is_none());
+        serde_json::from_str(&preplanned_row.get::<String, _>("provenance_json"))
+            .expect("preplanned provenance JSON");
+    assert_eq!(provenance["baseline_pending"], serde_json::json!(true));
 
     let untouched =
         sqlx::query("SELECT baseline_id, runnable FROM project_task_governance WHERE task_id = ?")
@@ -461,7 +434,7 @@ async fn activation_backfills_governance_for_preplanned_plan_item_tasks() {
 }
 
 #[tokio::test]
-async fn activation_flips_tasks_already_bound_to_the_activated_revision() {
+async fn activation_does_not_change_explicit_task_traceability_flags() {
     let fixture = charter_backed_project().await;
     let bound = seed_task(&fixture, "Bound preplanned", "todo").await;
 
@@ -585,7 +558,7 @@ async fn activation_flips_tasks_already_bound_to_the_activated_revision() {
             .fetch_one(fixture.db.pool())
             .await
             .expect("bound governance runnable");
-    assert_eq!(runnable, 1);
+    assert_eq!(runnable, 0);
 }
 
 #[tokio::test]

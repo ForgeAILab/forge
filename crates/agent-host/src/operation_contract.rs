@@ -18,6 +18,7 @@ use crate::operation_catalog::{
     PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION,
     PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
     PROJECT_RELEASE_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_PROPOSE_OPERATION,
+    TASK_REVIEW_OPERATION,
 };
 
 pub(crate) fn object_schema(properties: Value, required: &[&str]) -> Value {
@@ -632,7 +633,17 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
                 "depends_on_task_ids":string_array_schema()
             }),
             &["action", "title"],
-            "Create one Task proposal in the authenticated Project scope. The server binds the active baseline, milestone, permissions, and runnable Task state.",
+            "Create one Task in the authenticated Project scope. The server binds the current approved Charter, optional traceability references, permissions, and Task workflow state.",
+        ),
+        TASK_REVIEW_OPERATION => described_object_schema(
+            json!({
+                "task_id":{"type":"string","minLength":1},
+                "decision":{"type":"string","enum":["accept","reject"]},
+                "expected_task_version":{"type":"integer","minimum":1},
+                "reason":string_or_null_schema()
+            }),
+            &["task_id", "decision", "expected_task_version"],
+            "Accept or reject an exact human-required Task review in the bound Project. This uses the normal Task workflow, version, CI, and evidence checks and cannot review another Project.",
         ),
         TASK_ADAPTIVE_OPERATION => {
             let child = object_schema(
@@ -916,19 +927,18 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
             "title (required); description (outcome plus acceptance criteria); ",
             "priority (integer, higher runs sooner); ",
             "task_type (\"task\" implementation default, \"planning_task\", or \"discovery\"); ",
-            "plan_item_id (REQUIRED for implementation Tasks once an execution baseline is ",
-            "active — the stable plan-item id from that baseline, for example \"pi-2\"; ",
-            "proposals missing it, naming an id outside the active baseline, or naming a ",
-            "plan item that already has a non-cancelled Task are rejected); ",
-            "milestone_id (optional, defaults to the active baseline's primary milestone); ",
+            "plan_item_id (optional traceability to a stable item in the active execution ",
+            "baseline, for example \"pi-2\"; when supplied, it must exist and may have only ",
+            "one non-cancelled Task); milestone_id (optional traceability, defaulting to the ",
+            "active baseline's primary milestone when one exists); ",
             "capability_class (when supplied it must be one of the server-approved profiles: ",
             "\"repository_read\", \"repository_write\", \"read_only\", \"discovery_read\", ",
             "\"planning_read\" — and, when the baseline declares allowed classes, also one of ",
             "those); risk_class (only when the baseline declares allowed classes). ",
             "depends_on_task_ids (optional accepted Task ids in this Project; each prerequisite ",
             "must reach done before this Task can dispatch). ",
-            "Forge binds the Task to the Project's active user-approved baseline revision ",
-            "itself; never echo baseline ids or digests.",
+            "Forge binds implementation authority to the Project's current approved Charter. ",
+            "Baseline references are optional traceability; never echo baseline ids or digests.",
         ));
     }
     if operations.contains(TASK_ADAPTIVE_OPERATION) {
@@ -955,8 +965,7 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
 /// Declared payload properties for the generic coordination proposal
 /// surface. Several provider function-calling APIs (notably Gemini) surface
 /// only declared properties to the model, so the `task.propose` field
-/// contract — most importantly `plan_item_id`, which governs whether the
-/// created Task can ever run — must be visible as real schema properties,
+/// contract — including optional `plan_item_id` traceability — must be visible as real schema properties,
 /// not only as description prose. The payload deliberately keeps
 /// `additionalProperties` open because every admitted operation shares this
 /// one envelope; each description names its owning operation.
@@ -984,12 +993,9 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
         "plan_item_id": {
             "type": ["string", "null"],
             "description": concat!(
-                "task.propose: REQUIRED for implementation Tasks (task_type \"task\") ",
-                "whenever the Project has an active user-approved execution baseline — ",
-                "a proposal without it is rejected because the Task could never become ",
-                "runnable. Use the stable plan-item id from that active baseline (for ",
-                "example \"pi-2\"); valid ids are the baseline's plan_item_ids, visible ",
-                "in the Project current-state read. Each plan item admits exactly one ",
+                "task.propose: optional traceability to a stable plan-item id in the ",
+                "Project's active execution baseline (for example \"pi-2\"). When supplied, ",
+                "the id must exist in that baseline. Each plan item admits exactly one ",
                 "non-cancelled Task — never re-propose a plan item that already has one."
             )
         },

@@ -117,11 +117,7 @@ pub(crate) async fn reconcile_project_setup_metadata(
         };
 
     let roles = resolve_project_execution_roles(db, project).await?;
-    if !roles.requirements.is_empty()
-        || roles.worker_identity_id.is_none()
-        || roles.reviewer_identity_id.is_none()
-        || roles.worker_identity_id == roles.reviewer_identity_id
-    {
+    if !roles.requirements.is_empty() {
         return Ok(None);
     }
 
@@ -922,16 +918,11 @@ async fn ready_operation_is_verified(
         // inspect, but its durable remote binding must still be non-empty.
         return Ok(false);
     }
-    // A backfilled `ready` row is only authoritative when its current
-    // workflow/baseline-derived role assignments are still eligible and
-    // independent.  This prevents a stale operation status from hiding a
-    // newly removed Worker/reviewer assignment.
+    // Role settings are optional defaults. A ready repository remains ready
+    // when defaults are absent or use the same identity; each Task enforces
+    // its own workflow-role assignment before dispatch.
     let roles = resolve_project_execution_roles(db, project).await?;
-    if !roles.requirements.is_empty()
-        || roles.worker_identity_id.is_none()
-        || roles.reviewer_identity_id.is_none()
-        || roles.worker_identity_id == roles.reviewer_identity_id
-    {
+    if !roles.requirements.is_empty() {
         return Ok(false);
     }
 

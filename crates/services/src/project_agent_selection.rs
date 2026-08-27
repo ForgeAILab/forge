@@ -7,14 +7,17 @@
 //! preference is authoritative: Forge never silently substitutes another
 //! identity when that preference becomes ineligible. An agent
 //! is eligible when the account owns it, it is not paused, its current
-//! profile row exists, and it is not the account's active Main Agent.
+//! profile/source row exists and is enabled. Main/Project bindings do not
+//! consume the identity or make it ineligible for another configured role.
 
 use api_types::ProductGenesisSession;
-use db::{AgentProfileRepo, AgentRepo, SqliteDb};
+use db::{AgentProfileRepo, AgentRepo, CredentialHandleRepo, SqliteDb};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{Result, ServiceError, PROJECT_OPERATING_SKILL_KEY};
+use crate::{
+    agent_service::cli_runtime_source_enabled, Result, ServiceError, PROJECT_OPERATING_SKILL_KEY,
+};
 
 /// The exact revision set frozen into an approval for one Project Agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,11 +146,12 @@ pub async fn list_genesis_project_agents(
          WHERE identity.owner_id = ?
            AND identity.paused = 0
            AND identity.archived_at IS NULL
-           AND NOT EXISTS (
-               SELECT 1 FROM account_main_agent_binding AS main_binding
-               WHERE main_binding.identity_id = identity.id
-                 AND main_binding.state = 'active'
-           )
+           AND (profile.credential_ref IS NULL OR EXISTS (
+               SELECT 1 FROM credential_handle AS credential
+               WHERE credential.id = profile.credential_ref
+                 AND credential.status = 'configured'
+                 AND credential.enabled = 1
+           ))
          ORDER BY identity.created_at ASC, identity.id ASC",
     )
     .bind(&session.account_id)
@@ -164,9 +168,9 @@ pub async fn list_genesis_project_agents(
     Ok(selections)
 }
 
-/// Deterministic fallback: the oldest unpaused agent the account owns that has
-/// a current profile and is not the active Main Agent, preferring identities
-/// not already bound to another Project.
+/// Deterministic fallback: the oldest enabled account-owned Agent with a
+/// current usable profile/source. Existing bindings are a tie-breaker only;
+/// they are not an eligibility restriction.
 async fn auto_pick_candidate(db: &SqliteDb, account_id: &str) -> Result<Option<String>> {
     Ok(sqlx::query_scalar::<_, String>(
         "SELECT identity.id
@@ -178,11 +182,12 @@ async fn auto_pick_candidate(db: &SqliteDb, account_id: &str) -> Result<Option<S
            AND identity.paused = 0
            AND identity.archived_at IS NULL
            AND (identity.is_default = 0 OR profile.credential_ref IS NOT NULL)
-           AND NOT EXISTS (
-               SELECT 1 FROM account_main_agent_binding AS main_binding
-               WHERE main_binding.identity_id = identity.id
-                 AND main_binding.state = 'active'
-           )
+           AND (profile.credential_ref IS NULL OR EXISTS (
+               SELECT 1 FROM credential_handle AS credential
+               WHERE credential.id = profile.credential_ref
+                 AND credential.status = 'configured'
+                 AND credential.enabled = 1
+           ))
          ORDER BY EXISTS (
                SELECT 1 FROM project_agent_binding AS project_binding
                WHERE project_binding.identity_id = identity.id
@@ -215,6 +220,17 @@ async fn eligible_selection(
     else {
         return Ok(None);
     };
+    if let Some(credential_ref) = profile.credential_ref.as_deref() {
+        let source_usable = CredentialHandleRepo::get_credential_handle(db, credential_ref)
+            .await?
+            .is_some_and(|handle| handle.status == "configured" && handle.enabled);
+        if !source_usable {
+            return Ok(None);
+        }
+    }
+    if !cli_runtime_source_enabled(db, &identity).await? {
+        return Ok(None);
+    }
     Ok(Some(GenesisAgentSelection {
         identity_id: identity.id,
         display_name: identity.name,
@@ -387,7 +403,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_main_agent_binding_excludes_an_identity_from_auto_pick() {
+    async fn active_main_agent_binding_does_not_consume_the_identity() {
         let db = fixture().await;
         create_agent(&db, "agent-a", "2026-01-01T00:00:00Z").await;
         let now = now_rfc3339();
@@ -405,6 +421,9 @@ mod tests {
         let selection = resolve_genesis_project_agent(&db, &session(None))
             .await
             .expect("resolve");
-        assert!(selection.is_none());
+        assert_eq!(
+            selection.expect("same identity remains usable").identity_id,
+            "agent-a"
+        );
     }
 }

@@ -53,12 +53,12 @@ pub use operation_catalog::{
     PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION,
     PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
     PROJECT_RELEASE_OPERATION, SHARED_ORCHESTRATION_OUTCOME, TASK_ADAPTIVE_OPERATION,
-    TASK_PROPOSE_OPERATION, classify_operation, contains_adaptive_authority_override,
-    contains_authority_override, descriptor as operation_descriptor,
-    is_allowed_project_direct_payload, is_approval_required_operation, is_denied_operation,
-    is_project_orchestration_operation, is_query_operation, operation_contract,
-    operation_contract_permission, operation_names_for_surface, operation_permission,
-    operation_supported_in_scope,
+    TASK_PROPOSE_OPERATION, TASK_REVIEW_OPERATION, classify_operation,
+    contains_adaptive_authority_override, contains_authority_override,
+    descriptor as operation_descriptor, is_allowed_project_direct_payload,
+    is_approval_required_operation, is_denied_operation, is_project_orchestration_operation,
+    is_query_operation, operation_contract, operation_contract_permission,
+    operation_names_for_surface, operation_permission, operation_supported_in_scope,
 };
 pub use protected_store::{
     CreateOAuthCredential, CredentialRevocationOutcome, OAuthCredentialBundle,

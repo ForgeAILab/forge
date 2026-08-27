@@ -2,8 +2,8 @@
 //!
 //! This module is intentionally independent of the durable setup projection.
 //! It is the policy seam used while that projection is materialized: workflow
-//! roles and the active baseline release policy are interpreted here, and the
-//! same Task-kind/capability classification is used by proposal admission and
+//! roles and the Task workflow are interpreted here, and the same
+//! Task-kind/capability classification is used by proposal admission and
 //! WorkspaceLease issuance.
 
 use std::collections::HashMap;
@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use api_types::{RetryAction, SetupRequirement, WorkflowDefinition};
 use db::{Agent, Project, ProjectRepo, SqliteDb};
 use serde_json::Value;
-use sqlx::Row;
 
 use crate::{
     agent_service::{compute_effective_status, EffectiveStatus},
@@ -47,7 +46,7 @@ pub enum TaskExecutionClass {
 
 impl TaskExecutionClass {
     #[must_use]
-    pub const fn requires_baseline(self) -> bool {
+    pub const fn is_implementation(self) -> bool {
         matches!(self, Self::Implementation)
     }
 
@@ -129,9 +128,9 @@ pub struct RequiredExecutionRoles {
     pub independent_reviewer_required: bool,
 }
 
-/// Result of resolving eligible default role identities. Missing roles are
-/// represented as typed setup requirements instead of silently reusing an
-/// active coordinator or self-reviewing Worker.
+/// Result of resolving eligible optional default role identities. A missing
+/// default is not a Project-wide setup blocker: the Task may carry its own
+/// authoritative role assignment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionRoleResolution {
     pub worker_role: Option<String>,
@@ -174,12 +173,8 @@ impl ExecutionRoleResolution {
     }
 }
 
-/// Resolve required Worker/reviewer roles from a workflow and, when present,
-/// the active baseline's reviewer-independence policy.
-pub fn required_execution_roles(
-    workflow: &WorkflowDefinition,
-    active_baseline_release_policy: Option<&Value>,
-) -> RequiredExecutionRoles {
+/// Resolve required Worker/reviewer roles from the Task workflow.
+pub fn required_execution_roles(workflow: &WorkflowDefinition) -> RequiredExecutionRoles {
     let mut worker_role = None;
     let mut reviewer_role = None;
     for state in &workflow.states {
@@ -199,17 +194,7 @@ pub fn required_execution_roles(
         }
     }
 
-    // A custom workflow may represent review as a gate without naming its
-    // role. An active baseline policy still makes the independent reviewer a
-    // required execution role, using the canonical reviewer role name.
-    let policy_requires_reviewer = active_baseline_release_policy
-        .and_then(|policy| policy.get("reviewer_independence_rules"))
-        .and_then(Value::as_array)
-        .is_some_and(|rules| !rules.is_empty());
-    let independent_reviewer_required = reviewer_role.is_some() || policy_requires_reviewer;
-    if independent_reviewer_required {
-        reviewer_role.get_or_insert_with(|| default_roles::REVIEWER.to_owned());
-    }
+    let independent_reviewer_required = reviewer_role.is_some();
 
     RequiredExecutionRoles {
         worker_role,
@@ -218,9 +203,9 @@ pub fn required_execution_roles(
     }
 }
 
-/// Resolve eligible identities for a Project's default Worker/reviewer roles.
-/// The active Main and Project Agent identities are excluded at the query
-/// boundary, not merely at the final assignment call.
+/// Resolve eligible identities for a Project's optional default
+/// Worker/reviewer roles. Main and Project bindings do not consume an
+/// identity or exclude it from Task work.
 pub async fn resolve_project_execution_roles(
     db: &SqliteDb,
     project: &Project,
@@ -246,8 +231,7 @@ async fn resolve_project_execution_roles_with_mode(
 ) -> Result<ExecutionRoleResolution> {
     let workflow =
         crate::workflow::engine::WorkflowEngine::resolve_workflow(&project.workflow_definition);
-    let release_policy = active_baseline_release_policy(db, project).await?;
-    let required = required_execution_roles(&workflow, release_policy.as_ref());
+    let required = required_execution_roles(&workflow);
     let candidates = eligible_project_execution_agents(db, project).await?;
     let settings_assignments = project_default_assignments(project)?;
 
@@ -257,44 +241,17 @@ async fn resolve_project_execution_roles_with_mode(
         &candidates,
         allow_preflight_fallback,
     );
-    let mut requirements = Vec::new();
-    if required.worker_role.is_some() && worker_identity_id.is_none() {
-        requirements.push(role_setup_requirement(
-            "worker",
-            "repository_write",
-            RetryAction::SelectWorker,
-        ));
-    }
+    let requirements = Vec::new();
 
     let reviewer_identity_id = required.reviewer_role.as_deref().and_then(|role| {
         let configured = settings_assignments.get(role);
-        let candidate = resolve_role_identity(
+        resolve_role_identity(
             Some(role),
             configured,
             &candidates,
             allow_preflight_fallback,
-        );
-        candidate
-            .filter(|identity_id| Some(identity_id.as_str()) != worker_identity_id.as_deref())
-            .or_else(|| {
-                allow_preflight_fallback
-                    .then(|| {
-                        candidates
-                            .iter()
-                            .filter(|agent| auto_selectable_execution_agent(agent))
-                            .find(|agent| Some(agent.id.as_str()) != worker_identity_id.as_deref())
-                            .map(|agent| agent.id.clone())
-                    })
-                    .flatten()
-            })
+        )
     });
-    if required.independent_reviewer_required && reviewer_identity_id.is_none() {
-        requirements.push(role_setup_requirement(
-            "independent_reviewer",
-            "repository_read",
-            RetryAction::SelectIndependentReviewer,
-        ));
-    }
 
     Ok(ExecutionRoleResolution {
         worker_role: required.worker_role,
@@ -329,7 +286,7 @@ pub async fn is_eligible_execution_identity(
 /// The Task's explicit role assignment is authoritative. Project role
 /// selections are defaults used by provisioning and Task creation, not an
 /// execution-time identity allowlist. Eligibility is still re-evaluated here
-/// so disabled, paused, unavailable, cross-account, or coordinator identities
+/// so disabled, paused, unavailable, or cross-account identities
 /// cannot receive a Workspace lease through a stale Task assignment.
 pub async fn ensure_execution_role_principal(
     db: &SqliteDb,
@@ -350,8 +307,7 @@ pub async fn ensure_execution_role_principal(
             .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
         let workflow =
             crate::workflow::engine::WorkflowEngine::resolve_workflow(&project.workflow_definition);
-        let release_policy = active_baseline_release_policy(db, &project).await?;
-        let required = required_execution_roles(&workflow, release_policy.as_ref());
+        let required = required_execution_roles(&workflow);
         let (requirement_role, capability, action) =
             if required.reviewer_role.as_deref() == Some(role) {
                 (
@@ -375,30 +331,9 @@ pub async fn ensure_execution_role_principal(
     Ok(())
 }
 
-async fn active_baseline_release_policy(db: &SqliteDb, project: &Project) -> Result<Option<Value>> {
-    let Some(row) = sqlx::query(
-        "SELECT r.release_policy_json
-         FROM project_execution_baseline b
-         JOIN project_execution_baseline_revision r
-           ON r.id = b.current_revision_id AND r.baseline_id = b.id
-         WHERE b.project_id = ? AND b.lifecycle = 'active'
-           AND r.lifecycle = 'approved'
-         ORDER BY b.updated_at DESC, b.id DESC
-         LIMIT 1",
-    )
-    .bind(&project.id)
-    .fetch_optional(db.pool())
-    .await?
-    else {
-        return Ok(None);
-    };
-    let raw: String = row.try_get("release_policy_json")?;
-    Ok(serde_json::from_str(&raw).ok())
-}
-
-/// Return active, Project-eligible execution identities. Coordinator
-/// bindings are excluded at the query boundary so setup actions and the
-/// scheduler share the same candidate set.
+/// Return active, Project-eligible execution identities. Main and Project
+/// bindings do not disqualify an identity: an explicit Task role gives it a
+/// separate Task-scoped context and scheduler lease.
 pub async fn eligible_project_execution_agents(
     db: &SqliteDb,
     project: &Project,
@@ -423,22 +358,7 @@ pub async fn eligible_project_execution_agents(
         ) {
             continue;
         }
-        let bound: i64 = sqlx::query_scalar(
-            "SELECT EXISTS (
-                 SELECT 1 FROM account_main_agent_binding
-                 WHERE identity_id = ? AND state = 'active'
-             ) OR EXISTS (
-                 SELECT 1 FROM project_agent_binding
-                 WHERE identity_id = ? AND state = 'active'
-             )",
-        )
-        .bind(&agent.id)
-        .bind(&agent.id)
-        .fetch_one(db.pool())
-        .await?;
-        if bound == 0 {
-            eligible.push(agent);
-        }
+        eligible.push(agent);
     }
     eligible.sort_by(|left, right| {
         left.created_at
@@ -558,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn required_roles_follow_workflow_and_baseline_independence() {
+    fn required_roles_follow_only_the_task_workflow() {
         let workflow = WorkflowDefinition {
             roles: Vec::new(),
             states: vec![
@@ -572,17 +492,14 @@ mod tests {
             ],
             ..WorkflowDefinition::default()
         };
-        let roles = required_execution_roles(
-            &workflow,
-            Some(&json!({"reviewer_independence_rules":["always"]})),
-        );
+        let roles = required_execution_roles(&workflow);
         assert_eq!(roles.worker_role.as_deref(), Some("worker"));
-        assert_eq!(roles.reviewer_role.as_deref(), Some("reviewer"));
-        assert!(roles.independent_reviewer_required);
+        assert!(roles.reviewer_role.is_none());
+        assert!(!roles.independent_reviewer_required);
     }
 
     #[test]
-    fn reviewer_requirement_is_distinct_from_worker_requirement() {
+    fn reviewer_requirement_retains_its_own_role_metadata() {
         let mut requirement = role_setup_requirement(
             "independent_reviewer",
             "repository_read",

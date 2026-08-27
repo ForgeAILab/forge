@@ -117,6 +117,14 @@ pub trait CredentialHandleRepo: Send + Sync {
         expected_version: i64,
         updated_at: &str,
     ) -> Result<CredentialHandle>;
+    async fn set_credential_handle_enabled(
+        &self,
+        id: &str,
+        owner_user_id: &str,
+        enabled: bool,
+        expected_version: i64,
+        updated_at: &str,
+    ) -> Result<CredentialHandle>;
     /// Agents whose active profile references each of the owner's provider
     /// entries, with the identity's most recent session activity.
     async fn list_credential_usage(&self, owner_user_id: &str) -> Result<Vec<CredentialUsage>>;

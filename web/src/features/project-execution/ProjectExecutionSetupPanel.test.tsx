@@ -97,9 +97,9 @@ function blocker(overrides: Partial<ExecutionBlockerProjection>): ExecutionBlock
     scope: 'project',
     affected_refs: [],
     governing_ref: null,
-    headline: 'Waiting for permission to build',
+    headline: 'Legacy plan review',
     safe_explanation:
-      'The Project is already approved. This one approval starts every Task covered by the current plan — there is no separate approval for each Task.',
+      'Implementation already follows the approved Charter; this optional plan is traceability only.',
     evidence: null,
     required_principal: 'user',
     next_action: 'reauthorize',
@@ -175,7 +175,7 @@ describe('ProjectExecutionSetupPanel', () => {
     expect(screen.getByText(/Select or create a Worker/)).toBeTruthy()
   })
 
-  it('keeps Worker and independent reviewer choices distinct', () => {
+  it('allows the same enabled Agent to be Worker and reviewer', () => {
     mockPanel({
       ...baseSetup,
       execution_setup_state: 'setup_required',
@@ -197,9 +197,9 @@ describe('ProjectExecutionSetupPanel', () => {
 
     render(<ProjectExecutionSetupPanel projectId="project-1" />)
 
-    const reviewerSelect = screen.getByRole('combobox', { name: 'Independent reviewer' })
+    const reviewerSelect = screen.getByRole('combobox', { name: 'Reviewer' })
     expect(reviewerSelect.querySelector('option[value="reviewer-1"]')).toBeTruthy()
-    expect(reviewerSelect.querySelector('option[value="worker-1"]')).toBeNull()
+    expect(reviewerSelect.querySelector('option[value="worker-1"]')).toBeTruthy()
     expect(screen.getByRole('button', { name: /Select reviewer/ }).className).toContain('w-full')
   })
 
@@ -401,7 +401,7 @@ describe('ProjectExecutionSetupPanel', () => {
     expect(screen.getByRole('button', { name: /Attach repository/ })).toBeTruthy()
   })
 
-  it('keeps a ready setup visibly read-only before baseline activation', () => {
+  it('explains that a legacy pre-baseline projection no longer blocks Tasks', () => {
     mockPanel({
       ...baseSetup,
       execution_setup_state: 'ready',
@@ -413,8 +413,7 @@ describe('ProjectExecutionSetupPanel', () => {
       execution_blocker: blocker({
         code: 'pre_baseline_read_only',
         headline: 'Waiting for an implementation plan',
-        safe_explanation:
-          'The Project Agent still needs to prepare the implementation plan; approving that plan starts every covered Task.',
+        safe_explanation: 'This legacy planning status no longer blocks implementation.',
         required_principal: 'project_agent',
         next_action: 'repropose',
       }),
@@ -422,16 +421,18 @@ describe('ProjectExecutionSetupPanel', () => {
 
     render(<ProjectExecutionSetupPanel projectId="project-1" />)
 
-    expect(screen.getByText(/Planning remains available, but execution is read-only/)).toBeTruthy()
+    expect(
+      screen.getAllByText(/legacy planning status no longer blocks implementation/).length,
+    ).toBeGreaterThan(0)
     expect(screen.getByText('Pre Baseline Read Only')).toBeTruthy()
-    const action = screen.getByRole('link', { name: /Plan execution baseline/ })
+    const action = screen.getByRole('link', { name: /Update traceability plan/ })
     expect(action.getAttribute('href')).toBe('/projects/project-1/chat')
     const region = screen.getByRole('region', { name: 'Execution readiness' })
     expect(region.className).toContain('min-w-0')
     expect(screen.getByRole('status').getAttribute('aria-live')).toBe('polite')
   })
 
-  it('makes the one execution approval explicit and links to its exact card', () => {
+  it('routes a legacy baseline action without claiming it starts implementation', () => {
     mockPanel({
       ...baseSetup,
       execution_setup_state: 'ready',
@@ -445,10 +446,12 @@ describe('ProjectExecutionSetupPanel', () => {
 
     render(<ProjectExecutionSetupPanel projectId="project-1" compact />)
 
-    expect(screen.getByText('Ready to build?')).toBeTruthy()
-    expect(screen.getByText(/One final approval starts all work covered by the plan/)).toBeTruthy()
-    expect(screen.getByText('Permission to build')).toBeTruthy()
-    const action = screen.getByRole('link', { name: /Approve plan & start work/ })
+    expect(
+      screen.getByText(
+        /Implementation already follows the approved Charter; this optional plan is traceability only/,
+      ),
+    ).toBeTruthy()
+    const action = screen.getByRole('link', { name: /Review traceability plan/ })
     expect(action.getAttribute('href')).toBe('/projects/project-1/chat#execution-approval')
   })
 
@@ -502,7 +505,11 @@ describe('ProjectExecutionSetupPanel', () => {
     render(<ProjectExecutionSetupPanel projectId="project-1" compact />)
 
     expect(screen.getByText('Ready to build?')).toBeTruthy()
-    expect(screen.getByText('Approved Tasks can run without another approval.')).toBeTruthy()
+    expect(
+      screen.getByText(
+        'Charter-backed Tasks follow their workflow without another implementation approval.',
+      ),
+    ).toBeTruthy()
     expect(screen.queryByText('Next action')).toBeNull()
     expect(screen.queryByRole('link', { name: /Continue planning/ })).toBeNull()
   })

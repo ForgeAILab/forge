@@ -1551,6 +1551,22 @@ impl AttentionService {
             let identity_id = self.wake_identity_for_event(event).await?;
             let incident_key = attention_incident_key(category, event, &scope_type, &scope_id);
             let (priority, summary, recommended_action) = category_metadata(category);
+            let task_context = if event.entity_type == "task" {
+                sqlx::query("SELECT title, status FROM task WHERE id = ?")
+                    .bind(&event.entity_id)
+                    .fetch_optional(self.db.pool())
+                    .await?
+                    .map(|row| {
+                        json!({
+                            "task_title": bounded_text(row.try_get::<String, _>("title").unwrap_or_default()),
+                            "task_status": row.try_get::<String, _>("status").unwrap_or_default(),
+                        })
+                    })
+            } else {
+                None
+            };
+            let event_payload =
+                serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
             let details_json = serde_json::to_string(&json!({
                 "source_event_id": event.id,
                 "source_sequence": event.sequence,
@@ -1558,6 +1574,11 @@ impl AttentionService {
                 "entity_id": event.entity_id,
                 "scope_type": scope_type,
                 "scope_id": scope_id,
+                "task": task_context,
+                "role": event_payload.get("role").and_then(Value::as_str).map(|value| bounded_text(value.to_owned())),
+                "stop_reason": event_payload.get("stop_reason").and_then(Value::as_str).map(|value| bounded_text(value.to_owned())),
+                "error": event_payload.get("error").and_then(Value::as_str).map(|value| bounded_text(value.to_owned())),
+                "recovery": ["inspect_task", "assign_or_confirm_role", "retry_once"],
             }))
             .map_err(|error| ServiceError::Domain(error.to_string()))?;
             let attention = AttentionRepo::insert_attention(
@@ -2866,7 +2887,10 @@ fn classify_event(event: &DomainEvent) -> Option<&'static str> {
     if matches!(event_type.as_str(), "task.done" | "task.completed") {
         return Some("delivery_followup");
     }
-    if event_type == "execution.failed" {
+    if matches!(
+        event_type.as_str(),
+        "execution.failed" | "execution.cancelled"
+    ) {
         return Some("execution_failed");
     }
     None
@@ -2960,7 +2984,7 @@ fn category_metadata(category: &str) -> (i64, &'static str, &'static str) {
         "retry_exhausted" => (90, "Retry budget exhausted", "review_retry"),
         "review_ready" => (55, "Work is ready for review", "review"),
         "review_risk" => (85, "Review reported a risk", "inspect_review"),
-        "execution_failed" => (85, "Task execution failed", "inspect_run"),
+        "execution_failed" => (85, "Task execution stopped", "inspect_run"),
         "delivery_followup" => (
             70,
             "Task completed; reconcile validation, evidence, and readiness",
@@ -3297,6 +3321,13 @@ mod tests {
         );
         assert_eq!(
             classify_event(&event("execution.failed", r#"{"error":"boom"}"#)),
+            Some("execution_failed")
+        );
+        assert_eq!(
+            classify_event(&event(
+                "execution.cancelled",
+                r#"{"stop_reason":"user_requested"}"#
+            )),
             Some("execution_failed")
         );
         assert_eq!(

@@ -1073,6 +1073,7 @@ export interface UpdateAgentRequest {
   daemon_id?: string | null
   max_concurrent_tasks?: number
   is_default?: boolean
+  paused?: boolean
   version: number
 }
 

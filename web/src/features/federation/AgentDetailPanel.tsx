@@ -39,6 +39,9 @@ export function AgentDetailPanel({
   entries: ProviderEntryResponse[]
   chatEntries: AgentChatEntry[]
 }) {
+  const updateAvailability = useUpdateAgent()
+  const [confirmingDisable, setConfirmingDisable] = useState(false)
+  const [availabilityError, setAvailabilityError] = useState<string>()
   const credentialEntry = entries.find((entry) => entry.id === agent.credential_handle_id)
   const requiresRecovery =
     credentialEntry != null &&
@@ -83,6 +86,80 @@ export function AgentDetailPanel({
       </header>
 
       <div className="flex-1 space-y-6 px-6 py-5">
+        <section className="rounded-md border border-border-subtle bg-card p-3" aria-label="Agent availability">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-sm font-medium text-foreground">
+                Agent is {agent.paused ? 'disabled' : 'enabled'}
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {agent.paused
+                  ? 'Configuration and bindings are preserved. Enable it to accept new work.'
+                  : 'Disabling stops new work without removing this Agent or its bindings.'}
+              </p>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={updateAvailability.isPending}
+              onClick={() => {
+                setAvailabilityError(undefined)
+                if (!agent.paused) {
+                  setConfirmingDisable(true)
+                  return
+                }
+                void updateAvailability
+                  .mutateAsync({
+                    agentId: agent.id,
+                    body: { paused: false, version: agent.version },
+                  })
+                  .catch((cause: unknown) =>
+                    setAvailabilityError(
+                      cause instanceof Error ? cause.message : 'Agent could not be enabled.',
+                    ),
+                  )
+              }}
+            >
+              {agent.paused ? 'Enable agent' : 'Disable agent'}
+            </Button>
+          </div>
+          {confirmingDisable ? (
+            <div className="mt-3 rounded-md border border-warning/30 bg-warning/10 p-3 text-xs text-warning">
+              <p>
+                Disable this Agent? Existing {boundChips.length > 0 ? boundChips.join(' and ') : 'settings'}
+                {' '}stay in place, but the Agent will not accept new work until re-enabled.
+              </p>
+              <div className="mt-2 flex gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={updateAvailability.isPending}
+                  onClick={() =>
+                    void updateAvailability
+                      .mutateAsync({
+                        agentId: agent.id,
+                        body: { paused: true, version: agent.version },
+                      })
+                      .then(() => setConfirmingDisable(false))
+                      .catch((cause: unknown) =>
+                        setAvailabilityError(
+                          cause instanceof Error ? cause.message : 'Agent could not be disabled.',
+                        ),
+                      )
+                  }
+                >
+                  Disable agent
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => setConfirmingDisable(false)}>
+                  Keep enabled
+                </Button>
+              </div>
+            </div>
+          ) : null}
+          {availabilityError ? (
+            <p className="mt-2 text-xs text-destructive" role="alert">{availabilityError}</p>
+          ) : null}
+        </section>
         {/* Stat grid */}
         <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
           {[
@@ -200,7 +277,7 @@ function AgentSettingsForm({
   const [systemPrompt, setSystemPrompt] = useState(agent.prompt_template ?? '')
   const [error, setError] = useState<string>()
 
-  const activeEntries = entries.filter((entry) => entry.status === 'configured')
+  const activeEntries = entries.filter((entry) => entry.status === 'configured' && entry.enabled)
   const capabilities = useAgentProviderCapabilitiesQuery()
   const discovered = useDiscoveredOptions(agent.id, direct ? null : agent.executor_type)
 

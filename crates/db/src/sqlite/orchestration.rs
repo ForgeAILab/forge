@@ -1633,47 +1633,21 @@ impl ProjectOrchestrationRepo for SqliteDb {
                 }
             }
             if governance.runnable {
-                let (Some(charter_revision_id), Some(baseline_id), Some(baseline_revision_id)) = (
-                    governance.charter_revision_id.as_deref(),
-                    governance.baseline_id.as_deref(),
-                    governance.baseline_revision_id.as_deref(),
-                ) else {
+                let Some(charter_revision_id) = governance.charter_revision_id.as_deref() else {
                     return Err(DbError::Check(
-                        "runnable Task governance is missing its governing references".to_owned(),
+                        "runnable Task governance is missing its Charter reference".to_owned(),
                     ));
                 };
                 let admitted: i64 = sqlx::query_scalar(
                     "SELECT EXISTS (
                          SELECT 1
                          FROM project p
-                         JOIN project_execution_baseline b
-                           ON b.id = ? AND b.project_id = p.id
-                         JOIN project_execution_baseline_revision r
-                           ON r.id = ? AND r.baseline_id = b.id
                          WHERE p.id = ?
                            AND p.charter_status = 'charter_backed'
                            AND p.charter_setup_required = 0
                            AND p.current_charter_revision_id = ?
-                           AND b.lifecycle = 'active'
-                           AND b.current_revision_id = r.id
-                           AND r.lifecycle = 'approved'
-                           AND r.charter_revision_id = p.current_charter_revision_id
-                           AND EXISTS (
-                               SELECT 1 FROM project_execution_baseline_approval a
-                               WHERE a.baseline_id = b.id AND a.revision_id = r.id
-                                 AND a.principal_type = 'user'
-                                 AND a.authorization_action = 'project.execution_baseline.approve'
-                                 AND length(trim(a.authorization_basis)) > 0
-                                 AND length(trim(a.authorization_occurred_at)) > 0
-                                 AND length(trim(a.explicit_event)) > 0
-                                 AND a.content_digest = r.content_digest
-                                 AND a.rendered_digest = r.rendered_digest
-                                 AND a.lifecycle IN ('active', 'consumed')
-                           )
                      )",
                 )
-                .bind(baseline_id)
-                .bind(baseline_revision_id)
                 .bind(&input.task.project_id)
                 .bind(charter_revision_id)
                 .fetch_one(&mut *transaction)
@@ -6838,17 +6812,6 @@ impl ProjectOrchestrationRepo for SqliteDb {
         if project_update.rows_affected() != 1 {
             return Err(DbError::VersionConflict);
         }
-        // Promote matching preplanned Tasks in the same transaction: flip
-        // rows already bound to this exact revision and re-bind non-terminal
-        // Tasks whose plan item this baseline covers.
-        crate::promote_baseline_task_governance_in_tx(
-            &mut tx,
-            &project_id,
-            &baseline_id,
-            &revision_id,
-            &input.updated_at,
-        )
-        .await?;
         let consumed = sqlx::query(
             "UPDATE project_execution_baseline_approval
              SET lifecycle = 'consumed', updated_at = ?
@@ -11381,19 +11344,6 @@ async fn activate_invalid_baseline_successor_in_tx(
         }
     }
 
-    sqlx::query(
-        "UPDATE project_task_governance
-         SET runnable = 0, version = version + 1, updated_at = ?
-         WHERE project_id = ? AND baseline_id = ?
-           AND baseline_revision_id != ? AND runnable = 1",
-    )
-    .bind(updated_at)
-    .bind(&input.project_id)
-    .bind(&input.baseline_id)
-    .bind(&input.successor_revision_id)
-    .execute(&mut **tx)
-    .await
-    .map_err(orchestration_write_error)?;
     let baseline_updated = sqlx::query(
         "UPDATE project_execution_baseline
          SET lifecycle = 'active', current_revision_id = ?,
@@ -11460,14 +11410,6 @@ async fn activate_invalid_baseline_successor_in_tx(
     if project_updated.rows_affected() != 1 {
         return Err(DbError::VersionConflict);
     }
-    crate::promote_baseline_task_governance_in_tx(
-        tx,
-        &input.project_id,
-        &input.baseline_id,
-        &input.successor_revision_id,
-        updated_at,
-    )
-    .await?;
     let approval_consumed = sqlx::query(
         "UPDATE project_execution_baseline_approval
          SET lifecycle = 'consumed', updated_at = ?
@@ -12699,31 +12641,7 @@ async fn activate_project_execution_baseline_command(
         .execute(&mut *tx)
         .await
         .map_err(orchestration_write_error)?;
-        sqlx::query(
-            "UPDATE project_task_governance
-             SET runnable = 0, version = version + 1, updated_at = ?
-             WHERE project_id = ? AND baseline_id = ? AND runnable = 1",
-        )
-        .bind(&input.updated_at)
-        .bind(&input.project_id)
-        .bind(&prior_active)
-        .execute(&mut *tx)
-        .await
-        .map_err(orchestration_write_error)?;
     }
-    sqlx::query(
-        "UPDATE project_task_governance
-         SET runnable = 0, version = version + 1, updated_at = ?
-         WHERE project_id = ? AND baseline_id = ?
-           AND baseline_revision_id != ? AND runnable = 1",
-    )
-    .bind(&input.updated_at)
-    .bind(&input.project_id)
-    .bind(&input.baseline_id)
-    .bind(&input.revision_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(orchestration_write_error)?;
 
     let active = sqlx::query(
         "UPDATE project_execution_baseline
@@ -12791,14 +12709,6 @@ async fn activate_project_execution_baseline_command(
     if project_update.rows_affected() != 1 {
         return Err(DbError::VersionConflict);
     }
-    crate::promote_baseline_task_governance_in_tx(
-        &mut tx,
-        &input.project_id,
-        &input.baseline_id,
-        &input.revision_id,
-        &input.updated_at,
-    )
-    .await?;
     let consumed = sqlx::query(
         "UPDATE project_execution_baseline_approval
          SET lifecycle = 'consumed', updated_at = ?
@@ -12903,7 +12813,7 @@ async fn activate_project_execution_baseline_command(
     Ok(baseline)
 }
 
-/// Atomic "approve plan and start work" (D18, F13).  This is deliberately
+/// Atomic baseline-review acceptance (D18, F13). This is deliberately
 /// not a thin wrapper around the two standalone commands above: D3 requires
 /// one commit for the whole gesture, so the approval and activation domain
 /// mutations, both durable events, and the single frozen command receipt
@@ -13241,31 +13151,7 @@ async fn approve_and_activate_project_execution_baseline_command(
         .execute(&mut *tx)
         .await
         .map_err(orchestration_write_error)?;
-        sqlx::query(
-            "UPDATE project_task_governance
-             SET runnable = 0, version = version + 1, updated_at = ?
-             WHERE project_id = ? AND baseline_id = ? AND runnable = 1",
-        )
-        .bind(&input.updated_at)
-        .bind(&input.project_id)
-        .bind(&prior_active)
-        .execute(&mut *tx)
-        .await
-        .map_err(orchestration_write_error)?;
     }
-    sqlx::query(
-        "UPDATE project_task_governance
-         SET runnable = 0, version = version + 1, updated_at = ?
-         WHERE project_id = ? AND baseline_id = ?
-           AND baseline_revision_id != ? AND runnable = 1",
-    )
-    .bind(&input.updated_at)
-    .bind(&input.project_id)
-    .bind(&input.baseline_id)
-    .bind(&input.revision_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(orchestration_write_error)?;
 
     let active = sqlx::query(
         "UPDATE project_execution_baseline
@@ -13332,14 +13218,6 @@ async fn approve_and_activate_project_execution_baseline_command(
     if project_update.rows_affected() != 1 {
         return Err(DbError::VersionConflict);
     }
-    crate::promote_baseline_task_governance_in_tx(
-        &mut tx,
-        &input.project_id,
-        &input.baseline_id,
-        &input.revision_id,
-        &input.updated_at,
-    )
-    .await?;
     let consumed = sqlx::query(
         "UPDATE project_execution_baseline_approval
          SET lifecycle = 'consumed', updated_at = ?

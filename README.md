@@ -34,9 +34,9 @@ review before it merges. **Agents collaborate; they don't collide.**
 
 - **One isolated git worktree per task** — Claude Code, Codex, Cursor, Gemini, and Smith can each work in parallel without overwriting each other or polluting your main checkout.
 - **Main Chat and Project Agent Chats** — one global discovery timeline and one durable conversation per Project; the agent creates tasks and shapes Project records directly from chat, and Main-to-Project handoffs stay explicit and provenance-linked.
-- **Persistent embedded identities** — use canonical Agent Settings for API keys or guided provider login, bind a profile explicitly as Main or Project Agent, and keep Task Worker/reviewer authority separate from chat bindings.
+- **Persistent embedded identities** — use Agent Settings for API keys, guided provider login, and exact CLI runtimes. Any enabled configured Agent can serve as Main, Project, Worker, or reviewer—including the same Agent in multiple roles—while each turn or Task still receives only its scoped permissions.
 - **Mission Control** — inspect attention, commitments, current scope, health, and recent outcomes without opening a wall of runtime logs.
-- **Review gate with your CI** — define `ci_steps` per task; the review runner blocks merge until they pass. Human approval is an explicit transition, not an afterthought.
+- **Review that follows the Task** — define `ci_steps` per Task and choose Agent review, no review, or human-required review. Human-required review can be accepted or rejected by the user or the bound Project Agent.
 - **Structured task lifecycle** — `todo → in_progress → review → merging → done`, with an audit log and explicit cancellation paths so handoffs between agents (and humans) are legible.
 - **BYO agent** — first-class adapters for Claude Code, Codex, Cursor, Gemini, opencode, Smith, and a generic shell executor. Add your own with a small adapter.
 - **One binary, every surface** — REST API, MCP JSON-RPC, `forge-ctl` CLI, and a React web UI ship together. Drive Forge from a script, an editor, or a browser.
@@ -97,7 +97,7 @@ Prefer to build from source? `cargo run -p forge-cli -- --demo`.
 | **Evidence** | Project-authorized image, video, or report metadata that can reuse Task media and survive release pinning. |
 | **Daemon** | The local process that reports installed CLIs and runs executions. |
 | **Worktree** | An isolated git checkout created per task, cleaned up on `done`/`cancelled`. |
-| **Review gate** | The CI steps + optional human approval that block `review → merging`. |
+| **Review mode** | Agent review, no review, or human-required review layered on the Task workflow and CI checks. |
 
 <table>
   <tr>

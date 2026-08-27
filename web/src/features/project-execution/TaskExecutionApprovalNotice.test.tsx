@@ -38,9 +38,9 @@ function blocker(overrides: Partial<ExecutionBlockerProjection>): ExecutionBlock
     scope: 'project',
     affected_refs: [],
     governing_ref: null,
-    headline: 'Waiting for permission to build',
+    headline: 'Legacy plan review',
     safe_explanation:
-      'The Project is already approved. This one approval starts every Task covered by the current plan — there is no separate approval for each Task.',
+      'Implementation already follows the approved Charter; this optional plan is traceability only.',
     evidence: null,
     required_principal: 'user',
     next_action: 'reauthorize',
@@ -63,7 +63,7 @@ function evidence(overrides: Partial<ExecutionEvidenceSummary>): ExecutionEviden
 }
 
 describe('TaskExecutionApprovalNotice', () => {
-  it('explains the single Project-level approval and links to the exact approval card', () => {
+  it('does not claim a legacy plan review starts implementation', () => {
     render(
       <TaskExecutionApprovalNotice
         projectId="project-1"
@@ -72,9 +72,9 @@ describe('TaskExecutionApprovalNotice', () => {
       />,
     )
 
-    expect(screen.getByText('Waiting for permission to build')).toBeTruthy()
-    expect(screen.getByText(/there is no separate approval for each Task/)).toBeTruthy()
-    const action = screen.getByRole('link', { name: /Approve plan & start work/ })
+    expect(screen.getByText('Legacy plan review')).toBeTruthy()
+    expect(screen.getByText(/approved Charter/)).toBeTruthy()
+    const action = screen.getByRole('link', { name: /Review traceability plan/ })
     expect(action.getAttribute('href')).toBe('/projects/project-1/chat#execution-approval')
   })
 

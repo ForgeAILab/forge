@@ -30,7 +30,7 @@ impl TaskService {
             // Direct transitions must obey the same admission boundary as
             // claim/launch for every repository-capable task type.  Task
             // labels such as discovery/planning only select a read-only
-            // executor profile; they do not bypass the baseline/lease gate.
+            // executor profile; they still use the normal lease boundary.
             self.ensure_task_runnable(&task).await?;
         }
         self.ensure_planning_plan_ready_before_leaving(

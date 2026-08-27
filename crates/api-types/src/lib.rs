@@ -264,6 +264,9 @@ fn export_typescript() {
     ProviderEntryTestResponse::export().expect("export ProviderEntryTestResponse");
     CreateProviderEntryRequest::export().expect("export CreateProviderEntryRequest");
     RenameProviderEntryRequest::export().expect("export RenameProviderEntryRequest");
+    SetProviderEntryAvailabilityRequest::export()
+        .expect("export SetProviderEntryAvailabilityRequest");
+    SetCliRuntimeAvailabilityRequest::export().expect("export SetCliRuntimeAvailabilityRequest");
     ProviderAuthorizationState::export().expect("export ProviderAuthorizationState");
     StartProviderAuthorizationRequest::export().expect("export StartProviderAuthorizationRequest");
     CancelProviderAuthorizationRequest::export()

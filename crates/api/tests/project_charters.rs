@@ -661,7 +661,7 @@ fn approval_body(
         "project_mode": "compact",
         "selected_project_agent_identity_id": connected.agent.id,
         "selected_project_agent_profile_revision_id": connected.profile.id,
-        "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@4",
+        "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@5",
         "selected_project_agent_policy_digest": project_agent_policy_digest(&connected.profile.tool_policy)
     })
 }

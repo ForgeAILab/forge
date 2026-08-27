@@ -15,6 +15,7 @@ use agent_runtime::core::{
     prelude::{InvocationContext, PreparationContext, RuntimeError, ToolOutcome},
     workspace::DenyAllWorkspace,
 };
+use api_types::WorkflowTrigger;
 use db::{
     create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CreateAgentIdentity,
     CreateAgentProfile, CreateProject, CreateRepo, ProjectRepo, RepoRepo, SqliteDb, UpdateProject,
@@ -32,6 +33,7 @@ use forge_agent_host::{
     PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION,
     PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
     PROJECT_RELEASE_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_PROPOSE_OPERATION,
+    TASK_REVIEW_OPERATION,
 };
 use serde_json::{json, Value};
 use services::{CoordinationToolProvider, TaskService};
@@ -918,6 +920,69 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
         adaptive.value
     );
     covered_operations.insert(TASK_ADAPTIVE_OPERATION.to_owned());
+
+    let mut human_review_workflow = services::workflow::default_workflow::default_workflow();
+    let review_state = human_review_workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == "review")
+        .expect("default review state");
+    review_state
+        .gate_config
+        .as_mut()
+        .expect("default review gate")
+        .requires_user_approval = Some(true);
+    let reject = review_state
+        .triggers
+        .get_mut(&WorkflowTrigger::Reject)
+        .expect("default review rejection");
+    reject.to = "cancelled".to_owned();
+    reject.dispatch = None;
+    sqlx::query("UPDATE project SET workflow_definition = ? WHERE id = ?")
+        .bind(serde_json::to_string(&human_review_workflow).expect("workflow serializes"))
+        .bind(PROJECT_ID)
+        .execute(fixture.db.pool())
+        .await
+        .expect("human-required workflow installs");
+    sqlx::query(
+        "UPDATE task SET status = 'review', version = version + 1, updated_at = ? WHERE id = ?",
+    )
+    .bind(db::now_rfc3339())
+    .bind(source_task_id)
+    .execute(fixture.db.pool())
+    .await
+    .expect("Task enters human-required review");
+    let review_task_version: i64 = sqlx::query_scalar("SELECT version FROM task WHERE id = ?")
+        .bind(source_task_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("review Task version");
+    let review = invoke_tool(
+        &project,
+        "forge_scope_propose",
+        json!({
+            "operation": TASK_REVIEW_OPERATION,
+            "payload": {
+                "task_id": source_task_id,
+                "decision": "reject",
+                "expected_task_version": review_task_version,
+                "reason": "Exercise the Project Agent human-review decision."
+            },
+            "dedupe_key": "matrix-task-review",
+            "correlation_id": "correlation-matrix-task-review"
+        }),
+        TASK_REVIEW_OPERATION,
+    )
+    .await
+    .expect("task.review composition call");
+    assert_outcome_operation(&review, TASK_REVIEW_OPERATION);
+    assert!(
+        !review.is_error,
+        "Task review should commit: {}",
+        review.value
+    );
+    assert_eq!(review.value["result"]["task_status"], "cancelled");
+    covered_operations.insert(TASK_REVIEW_OPERATION.to_owned());
 
     let setup = ScopeToolComposition::for_scope_with_permissions_and_project_context(
         AGENT_ID,

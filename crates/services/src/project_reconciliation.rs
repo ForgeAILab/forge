@@ -191,9 +191,14 @@ impl ProjectReconciliationService {
         }
 
         let invalid_active_baseline = conflict.conflict_code == "invalid_active_baseline";
-        if invalid_active_baseline && request.action != ReconciliationResolutionAction::Revised {
+        if invalid_active_baseline
+            && !matches!(
+                request.action,
+                ReconciliationResolutionAction::Revised | ReconciliationResolutionAction::Retained
+            )
+        {
             return Err(ServiceError::invalid_operation(
-                "invalid_active_baseline must be resolved as revised with the exact approved successor revision",
+                "invalid_active_baseline may only accept the recommended correction or retain the historical record",
             ));
         }
         let replacement_required = matches!(
@@ -476,12 +481,6 @@ impl ProjectReconciliationService {
             committed_at: now.clone(),
         };
 
-        let activated_baseline = invalid_baseline_replacement.as_ref().map(|replacement| {
-            (
-                replacement.baseline_id.clone(),
-                replacement.successor_revision_id.clone(),
-            )
-        });
         let resolved = ProjectOrchestrationRepo::resolve_project_reconciliation(
             &*self.db,
             ResolveProjectReconciliation {
@@ -552,29 +551,7 @@ impl ProjectReconciliationService {
                 .publish_committed(&event);
         }
 
-        let dispatch_woken = if let Some((baseline_id, revision_id)) = activated_baseline {
-            match crate::wake_baseline_task_dispatch(
-                &self.db,
-                project_id,
-                &baseline_id,
-                &revision_id,
-                "invalid_baseline_successor_activated",
-            )
-            .await
-            {
-                Ok(count) => count > 0,
-                Err(error) => {
-                    tracing::warn!(
-                        reconciliation_id = %resolved.id,
-                        %baseline_id,
-                        %revision_id,
-                        %error,
-                        "invalid baseline successor activated but waking affected Task dispatch failed"
-                    );
-                    false
-                }
-            }
-        } else if resolved.record_type == "task" {
+        let dispatch_woken = if resolved.record_type == "task" {
             match crate::wake_task_dispatch(
                 &self.db,
                 &resolved.record_id,
@@ -686,7 +663,10 @@ impl ProjectReconciliationService {
             None
         };
         let allowed_actions = if state == ReconciliationState::Required && invalid_active_baseline {
-            vec![ReconciliationResolutionAction::Revised]
+            vec![
+                ReconciliationResolutionAction::Revised,
+                ReconciliationResolutionAction::Retained,
+            ]
         } else if state == ReconciliationState::Required {
             RESOLUTION_ACTIONS.to_vec()
         } else {

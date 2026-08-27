@@ -25,6 +25,8 @@ import {
   renameProviderEntry,
   rotateAgentSession,
   setMainAgentBinding,
+  setCliRuntimeAvailability,
+  setProviderEntryAvailability,
   setProjectAgentBinding,
   setAgentSessionStatus,
   startProviderAuthorization,
@@ -41,6 +43,8 @@ import type {
   CancelProviderAuthorizationRequest,
   CreateProviderEntryRequest,
   RenameProviderEntryRequest,
+  SetCliRuntimeAvailabilityRequest,
+  SetProviderEntryAvailabilityRequest,
   StartProviderAuthorizationRequest,
 } from '@/types/generated'
 
@@ -226,6 +230,39 @@ export function useRenameProviderEntryMutation() {
       renameProviderEntry(id, input),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: federationQueryKeys.credentials })
+    },
+  })
+}
+
+export function useSetProviderEntryAvailabilityMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, input }: { id: string; input: SetProviderEntryAvailabilityRequest }) =>
+      setProviderEntryAvailability(id, input),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.credentials })
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.agents })
+      void queryClient.invalidateQueries({ queryKey: ['agent-chats'] })
+    },
+  })
+}
+
+export function useSetCliRuntimeAvailabilityMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      daemonId,
+      executorType,
+      input,
+    }: {
+      daemonId: string
+      executorType: string
+      input: SetCliRuntimeAvailabilityRequest
+    }) => setCliRuntimeAvailability(daemonId, executorType, input),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.credentials })
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.agents })
+      void queryClient.invalidateQueries({ queryKey: ['agent-chats'] })
     },
   })
 }

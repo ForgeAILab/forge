@@ -1146,7 +1146,7 @@ fn complete_baseline_content(fixture: &CharterFixture) -> ExecutionBaselineConte
     content.capability_classes = vec!["repository_write".to_owned()];
     content.risk_classes = vec!["low".to_owned()];
     content.adaptive_envelope.allowed_task_operations =
-        vec![api_types::AdaptiveTaskOperation::Split];
+        api_types::AdaptiveTaskOperation::ALL.to_vec();
     content
 }
 

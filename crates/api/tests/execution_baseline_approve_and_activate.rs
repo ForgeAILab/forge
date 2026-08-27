@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-//! Route-level characterization for the atomic "Approve plan and start work"
+//! Route-level characterization for atomic optional-baseline acceptance
 //! command (D18, F13, tasks 8.3.1/8.3.2).
 //!
 //! F13: the web mapped any approval/activation 409/412 to a stale-baseline

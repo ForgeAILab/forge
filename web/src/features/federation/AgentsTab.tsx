@@ -81,7 +81,7 @@ export function NewAgentDialog({
     setError(undefined)
   }, [open, preselectedEntryId])
 
-  const activeEntries = entries.filter((entry) => entry.status === 'configured')
+  const activeEntries = entries.filter((entry) => entry.status === 'configured' && entry.enabled)
   const selectedEntry =
     harness?.kind === 'direct'
       ? (activeEntries.find((entry) => entry.id === harness.entryId) ?? null)
@@ -98,7 +98,8 @@ export function NewAgentDialog({
   )
   const uniqueCliRuntimes = cliRuntimes.filter(
     (runtimeEntry, index, all) =>
-      all.findIndex((candidate) => candidate.kind === runtimeEntry.kind) === index,
+      runtimeEntry.enabled
+      && all.findIndex((candidate) => candidate.enabled && candidate.kind === runtimeEntry.kind) === index,
   )
   /** Entries whose provider can power the chosen CLI harness via injection. */
   const harnessCredentialEntries = useMemo(() => {

@@ -3,8 +3,8 @@ use ts_rs::TS;
 
 use crate::{ExecutionBlockerProjection, RepoResponse, RetryAction, SetupRequirement};
 
-/// Whether the singular Project Agent chat can admit a turn.  This is kept
-/// independent from repository/role setup and baseline approval.
+/// Whether the singular Project Agent chat can admit a turn. This is kept
+/// independent from repository and Task-role setup.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
@@ -30,8 +30,9 @@ pub enum ExecutionSetupState {
     Unavailable,
 }
 
-/// The baseline gate is separate from execution setup.  A ready setup does
-/// not imply that an approved baseline is active.
+/// Legacy baseline/reconciliation projection retained for traceability UI.
+/// Charter-backed Task execution reports `Active`; baseline approval is not
+/// an execution gate.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]

@@ -33,6 +33,8 @@ import {
   useProviderUsageQuery,
   useRemoveProviderEntryMutation,
   useRenameProviderEntryMutation,
+  useSetCliRuntimeAvailabilityMutation,
+  useSetProviderEntryAvailabilityMutation,
   useStartProviderAuthorizationMutation,
   isVersionConflict,
 } from '@/features/federation/hooks'
@@ -614,16 +616,22 @@ function ProviderEntryCard({
 }) {
   const rename = useRenameProviderEntryMutation()
   const remove = useRemoveProviderEntryMutation()
+  const setAvailability = useSetProviderEntryAvailabilityMutation()
   const queryClient = useQueryClient()
-  const usageQuery = useProviderUsageQuery(entry.status === 'configured' ? entry.id : undefined)
+  const usageQuery = useProviderUsageQuery(
+    entry.status === 'configured' && entry.enabled ? entry.id : undefined,
+  )
   const [renaming, setRenaming] = useState(false)
   const [confirmingRemoval, setConfirmingRemoval] = useState(false)
+  const [confirmingDisable, setConfirmingDisable] = useState(false)
   const [label, setLabel] = useState(entry.label)
   const [error, setError] = useState<string>()
   const [notice, setNotice] = useState<string>()
 
   const statusBadge =
-    entry.status === 'configured'
+    !entry.enabled
+      ? { status: 'paused', label: 'Disabled' }
+      : entry.status === 'configured'
       ? { status: 'active', label: 'Connected' }
       : entry.status === 'revoked'
         ? { status: 'error', label: 'Revoked' }
@@ -670,6 +678,31 @@ function ProviderEntryCard({
       )
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'The entry could not be disconnected.')
+    }
+  }
+
+  async function updateAvailability(enabled: boolean) {
+    setError(undefined)
+    setNotice(undefined)
+    try {
+      await setAvailability.mutateAsync({
+        id: entry.id,
+        input: { enabled, version: entry.version },
+      })
+      setConfirmingDisable(false)
+      setNotice(
+        enabled
+          ? 'Provider enabled. Referencing agents can accept new work again.'
+          : 'Provider disabled. Credentials, agents, and bindings were preserved.',
+      )
+    } catch (cause) {
+      setError(
+        isVersionConflict(cause)
+          ? 'This provider changed in another session. Refresh and try again.'
+          : cause instanceof Error
+            ? cause.message
+            : 'Provider availability could not be changed.',
+      )
     }
   }
 
@@ -722,7 +755,7 @@ function ProviderEntryCard({
           </dd>
         </div>
       </dl>
-      {entry.status === 'configured' ? (
+      {entry.status === 'configured' && entry.enabled ? (
         <div className="mt-3 rounded-md border border-border-subtle bg-muted/20 px-3 py-2 text-xs">
           {usageQuery.isLoading ? (
             <span className="text-muted-foreground">Checking usage…</span>
@@ -781,6 +814,36 @@ function ProviderEntryCard({
           </div>
         </div>
       ) : null}
+      {confirmingDisable ? (
+        <div
+          className="mt-3 rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning"
+          role="alertdialog"
+          aria-label={`Confirm disabling ${entry.label}`}
+        >
+          <p>
+            Disable this provider for {entry.used_by.length} referencing agent
+            {entry.used_by.length === 1 ? '' : 's'}
+            {entry.used_by.length > 0
+              ? ` (${entry.used_by.map((agent) => agent.agent_name).join(', ')})`
+              : ''}
+            ? Their configuration and bindings stay in place, but new work stops until you enable
+            it again.
+          </p>
+          <div className="mt-2 flex gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={setAvailability.isPending}
+              onClick={() => void updateAvailability(false)}
+            >
+              Disable provider
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => setConfirmingDisable(false)}>
+              Keep enabled
+            </Button>
+          </div>
+        </div>
+      ) : null}
       {error ? (
         <p role="alert" className="mt-2 text-xs text-destructive">
           {error}
@@ -791,8 +854,18 @@ function ProviderEntryCard({
           {notice}
         </p>
       ) : null}
-      {entry.status !== 'revoked' && !confirmingRemoval ? (
-        <div className="mt-4 flex gap-2 border-t border-border-subtle pt-3">
+      {entry.status !== 'revoked' && !confirmingRemoval && !confirmingDisable ? (
+        <div className="mt-4 flex flex-wrap gap-2 border-t border-border-subtle pt-3">
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={setAvailability.isPending}
+            onClick={() =>
+              entry.enabled ? setConfirmingDisable(true) : void updateAvailability(true)
+            }
+          >
+            {entry.enabled ? 'Disable' : 'Enable'}
+          </Button>
           {!renaming ? (
             <Button size="sm" variant="outline" onClick={() => setRenaming(true)}>
               Rename
@@ -813,8 +886,13 @@ function ProviderEntryCard({
 }
 
 function CliRuntimeCard({ runtime }: { runtime: CliRuntimeEntryResponse }) {
+  const setAvailability = useSetCliRuntimeAvailabilityMutation()
+  const [confirmingDisable, setConfirmingDisable] = useState(false)
+  const [error, setError] = useState<string>()
   const authenticated = runtime.availability === 'authenticated'
-  const badgeLabel = authenticated
+  const badgeLabel = !runtime.enabled
+    ? 'Disabled'
+    : authenticated
     ? 'Authenticated'
     : runtime.availability === 'unauthenticated'
       ? 'Not Logged In'
@@ -831,7 +909,7 @@ function CliRuntimeCard({ runtime }: { runtime: CliRuntimeEntryResponse }) {
               <span className="font-mono text-xs text-muted-foreground">v{runtime.version}</span>
             ) : null}
             <StateBadge
-              status={authenticated ? 'healthy' : 'unavailable'}
+              status={!runtime.enabled ? 'paused' : authenticated ? 'healthy' : 'unavailable'}
               label={badgeLabel}
             />
           </div>
@@ -851,6 +929,67 @@ function CliRuntimeCard({ runtime }: { runtime: CliRuntimeEntryResponse }) {
         <p className="mt-2 rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning">
           {runtime.login_hint}. Forge never reads the CLI&apos;s credential files.
         </p>
+      ) : null}
+      {confirmingDisable ? (
+        <div className="mt-3 rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning">
+          <p>
+            Disable this runtime on this host? {runtime.used_by.length} referencing agent
+            {runtime.used_by.length === 1 ? '' : 's'} will stop accepting new work, but all
+            configuration stays in place.
+          </p>
+          <div className="mt-2 flex gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={setAvailability.isPending}
+              onClick={() =>
+                void setAvailability
+                  .mutateAsync({
+                    daemonId: runtime.daemon_id,
+                    executorType: runtime.kind,
+                    input: { enabled: false, version: runtime.policy_version },
+                  })
+                  .then(() => setConfirmingDisable(false))
+                  .catch((cause: unknown) =>
+                    setError(cause instanceof Error ? cause.message : 'Runtime could not be disabled.'),
+                  )
+              }
+            >
+              Disable runtime
+            </Button>
+            <Button size="sm" variant="ghost" onClick={() => setConfirmingDisable(false)}>
+              Keep enabled
+            </Button>
+          </div>
+        </div>
+      ) : null}
+      {error ? <p className="mt-2 text-xs text-destructive" role="alert">{error}</p> : null}
+      {!confirmingDisable ? (
+        <div className="mt-4 border-t border-border-subtle pt-3">
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={setAvailability.isPending}
+            onClick={() => {
+              setError(undefined)
+              if (runtime.enabled) {
+                setConfirmingDisable(true)
+                return
+              }
+              void setAvailability
+                .mutateAsync({
+                  daemonId: runtime.daemon_id,
+                  executorType: runtime.kind,
+                  input: { enabled: true, version: runtime.policy_version },
+                })
+                .catch((cause: unknown) =>
+                  setError(cause instanceof Error ? cause.message : 'Runtime could not be enabled.'),
+                )
+            }}
+          >
+            {runtime.enabled ? 'Disable' : 'Enable'}
+          </Button>
+        </div>
       ) : null}
     </Card>
   )

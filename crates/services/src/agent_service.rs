@@ -1,8 +1,8 @@
 use crate::{agent_capacity::has_running_execution_capacity, Result, ServiceError, TaskService};
 use db::{
     new_uuid_v4, now_rfc3339, Agent, AgentConnectionHealthRepo, AgentListQuery, AgentRepo,
-    AgentStatus, CreateAgent, Daemon, DaemonRepo, DaemonStatus, PageRequest, SortBy, SortOrder,
-    SqliteDb, UpdateAgent,
+    AgentStatus, CreateAgent, CredentialHandleRepo, Daemon, DaemonRepo, DaemonStatus, PageRequest,
+    SortBy, SortOrder, SqliteDb, UpdateAgent,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use serde_json::Value;
@@ -16,6 +16,7 @@ pub enum EffectiveStatus {
     DaemonUnavailable,
     ConnectionDegraded,
     ConnectionUnavailable,
+    SourceDisabled,
     Busy,
     Error,
     Paused,
@@ -30,6 +31,7 @@ impl EffectiveStatus {
             Self::DaemonUnavailable => "daemon_unavailable",
             Self::ConnectionDegraded => "connection_degraded",
             Self::ConnectionUnavailable => "connection_unavailable",
+            Self::SourceDisabled => "source_disabled",
             Self::Busy => "busy",
             Self::Error => "error",
             Self::Paused => "paused",
@@ -51,6 +53,15 @@ pub async fn compute_effective_status(db: &SqliteDb, agent: &Agent) -> Result<Ef
 
     if agent.paused {
         return Ok(EffectiveStatus::Paused);
+    }
+
+    if let Some(credential_ref) = agent.credential_ref.as_deref() {
+        let source_enabled = CredentialHandleRepo::get_credential_handle(db, credential_ref)
+            .await?
+            .is_some_and(|handle| handle.status == "configured" && handle.enabled);
+        if !source_enabled {
+            return Ok(EffectiveStatus::SourceDisabled);
+        }
     }
 
     if agent.backend_kind == "native" {
@@ -77,11 +88,24 @@ pub async fn compute_effective_status(db: &SqliteDb, agent: &Agent) -> Result<Ef
         if !daemon_supports_executor(&daemon, &agent.executor_type)? {
             return Ok(EffectiveStatus::Deactivated);
         }
-    } else if DaemonRepo::list_available_for_executor(db, &agent.executor_type)
+        if !cli_runtime_enabled(
+            db,
+            agent.owner_id.as_deref(),
+            daemon_id,
+            &agent.executor_type,
+        )
         .await?
-        .is_empty()
-    {
-        return Ok(EffectiveStatus::DaemonUnavailable);
+        {
+            return Ok(EffectiveStatus::SourceDisabled);
+        }
+    } else {
+        let candidates = DaemonRepo::list_available_for_executor(db, &agent.executor_type).await?;
+        if candidates.is_empty() {
+            return Ok(EffectiveStatus::DaemonUnavailable);
+        }
+        if !has_enabled_cli_daemon(db, agent, &candidates).await? {
+            return Ok(EffectiveStatus::SourceDisabled);
+        }
     }
 
     if !has_running_execution_capacity(db, agent).await? {
@@ -107,19 +131,106 @@ pub async fn resolve_daemon_for_agent(db: &SqliteDb, agent: &Agent) -> Result<Da
                 agent.executor_type
             )));
         }
+        if !cli_runtime_enabled(
+            db,
+            agent.owner_id.as_deref(),
+            daemon_id,
+            &agent.executor_type,
+        )
+        .await?
+        {
+            return Err(ServiceError::invalid_operation(format!(
+                "{} executor is disabled on pinned daemon {daemon_id}",
+                agent.executor_type
+            )));
+        }
         return Ok(daemon);
     }
 
-    DaemonRepo::list_available_for_executor(db, &agent.executor_type)
+    for daemon in DaemonRepo::list_available_for_executor(db, &agent.executor_type).await? {
+        if cli_runtime_enabled(
+            db,
+            agent.owner_id.as_deref(),
+            &daemon.id,
+            &agent.executor_type,
+        )
         .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| {
-            ServiceError::invalid_operation(format!(
-                "No daemon with authenticated {} executor found",
-                agent.executor_type
-            ))
-        })
+        {
+            return Ok(daemon);
+        }
+    }
+    Err(ServiceError::invalid_operation(format!(
+        "No enabled daemon with authenticated {} executor found",
+        agent.executor_type
+    )))
+}
+
+pub async fn cli_runtime_source_enabled(db: &SqliteDb, agent: &Agent) -> Result<bool> {
+    if agent.backend_kind == "native" || agent.credential_ref.is_some() {
+        return Ok(true);
+    }
+    if let Some(daemon_id) = agent.daemon_id.as_deref() {
+        return cli_runtime_enabled(
+            db,
+            agent.owner_id.as_deref(),
+            daemon_id,
+            &agent.executor_type,
+        )
+        .await;
+    }
+    let candidates = DaemonRepo::list_available_for_executor(db, &agent.executor_type).await?;
+    has_enabled_cli_daemon(db, agent, &candidates).await
+}
+
+async fn has_enabled_cli_daemon(db: &SqliteDb, agent: &Agent, daemons: &[Daemon]) -> Result<bool> {
+    for daemon in daemons {
+        if cli_runtime_enabled(
+            db,
+            agent.owner_id.as_deref(),
+            &daemon.id,
+            &agent.executor_type,
+        )
+        .await?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn cli_runtime_enabled(
+    db: &SqliteDb,
+    owner_user_id: Option<&str>,
+    daemon_id: &str,
+    executor_type: &str,
+) -> Result<bool> {
+    if let Some(owner_user_id) = owner_user_id {
+        return Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT enabled FROM cli_runtime_policy
+             WHERE owner_user_id = ? AND daemon_id = ? AND executor_type = ?",
+        )
+        .bind(owner_user_id)
+        .bind(daemon_id)
+        .bind(executor_type)
+        .fetch_optional(db.pool())
+        .await?
+        .unwrap_or(true));
+    }
+
+    // Legacy/global Agents have no owner to scope the local policy lookup.
+    // In the current single-user product, any explicit disable for the exact
+    // daemon/runtime source must still deactivate those Agents; otherwise the
+    // provider screen would claim the source is disabled while global Agents
+    // continued to receive work through it.
+    Ok(sqlx::query_scalar::<_, Option<bool>>(
+        "SELECT MIN(enabled) FROM cli_runtime_policy
+         WHERE daemon_id = ? AND executor_type = ?",
+    )
+    .bind(daemon_id)
+    .bind(executor_type)
+    .fetch_one(db.pool())
+    .await?
+    .unwrap_or(true))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -905,5 +1016,152 @@ mod tests {
             .expect("status computes");
 
         assert_eq!(status, EffectiveStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn disabling_exact_cli_runtime_deactivates_and_reenables_global_agents() {
+        let db = sqlite_db().await;
+        let agent = seed_effective_agent(
+            &db,
+            AgentStatus::Idle,
+            DaemonStatus::Online,
+            r#"[{"kind":"shell","availability":"authenticated"}]"#,
+            1,
+        )
+        .await;
+        let owner_id = new_uuid_v4();
+        let now = now_rfc3339();
+        sqlx::query(
+            "INSERT INTO user (id, email, password_hash, created_at, updated_at)
+             VALUES (?, ?, 'test', ?, ?)",
+        )
+        .bind(&owner_id)
+        .bind(format!("{owner_id}@example.test"))
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("policy owner creates");
+        sqlx::query(
+            "INSERT INTO cli_runtime_policy (
+                 owner_user_id, daemon_id, executor_type, enabled,
+                 version, created_at, updated_at
+             ) VALUES (?, ?, 'shell', 0, 1, ?, ?)",
+        )
+        .bind(&owner_id)
+        .bind(agent.daemon_id.as_deref().expect("Agent has daemon"))
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("CLI runtime disables");
+
+        assert_eq!(
+            compute_effective_status(&db, &agent)
+                .await
+                .expect("disabled status computes"),
+            EffectiveStatus::SourceDisabled
+        );
+
+        sqlx::query(
+            "UPDATE cli_runtime_policy SET enabled = 1, version = 2, updated_at = ?
+             WHERE owner_user_id = ? AND daemon_id = ? AND executor_type = 'shell'",
+        )
+        .bind(&now)
+        .bind(&owner_id)
+        .bind(agent.daemon_id.as_deref().expect("Agent has daemon"))
+        .execute(db.pool())
+        .await
+        .expect("CLI runtime reenables");
+        assert_eq!(
+            compute_effective_status(&db, &agent)
+                .await
+                .expect("reenabled status computes"),
+            EffectiveStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_provider_entry_deactivates_dependent_agent() {
+        let db = sqlite_db().await;
+        let owner_id = new_uuid_v4();
+        let credential_id = new_uuid_v4();
+        let now = now_rfc3339();
+        sqlx::query(
+            "INSERT INTO user (id, email, password_hash, created_at, updated_at)
+             VALUES (?, ?, 'test', ?, ?)",
+        )
+        .bind(&owner_id)
+        .bind(format!("{owner_id}@example.test"))
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("provider owner creates");
+        sqlx::query(
+            "INSERT INTO credential_handle (
+                 id, owner_user_id, provider, label, status, enabled,
+                 created_at, updated_at
+             ) VALUES (?, ?, 'openai', 'Disabled provider', 'configured', 0, ?, ?)",
+        )
+        .bind(&credential_id)
+        .bind(&owner_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("disabled provider creates");
+        let daemon_id = seed_daemon(&db).await;
+        DaemonRepo::update_report(
+            &db,
+            db::UpdateDaemonReport {
+                id: daemon_id.clone(),
+                detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#
+                    .to_owned(),
+                labels_json: None,
+                status: DaemonStatus::Online,
+                last_report_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("daemon report updates");
+        let agent = AgentRepo::create(
+            &db,
+            CreateAgent {
+                id: new_uuid_v4(),
+                name: "provider-agent".to_owned(),
+                description: None,
+                executor_type: "shell".to_owned(),
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                capabilities_json: "[]".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: Some(credential_id),
+                daemon_id: Some(daemon_id),
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: AgentStatus::Idle,
+                last_heartbeat_at: Some(now.clone()),
+                is_default: false,
+                paused: false,
+                owner_id: Some(owner_id),
+                visibility: "account".to_owned(),
+                prompt_template: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("provider Agent creates");
+
+        assert_eq!(
+            compute_effective_status(&db, &agent)
+                .await
+                .expect("provider-disabled status computes"),
+            EffectiveStatus::SourceDisabled
+        );
     }
 }

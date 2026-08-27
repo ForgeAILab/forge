@@ -624,8 +624,8 @@ impl SqliteDb {
              LEFT JOIN project_agent_binding AS binding
                ON binding.identity_id = agent.id
               AND binding.state = 'active'
-             WHERE agent.visibility = 'global'
-                OR (agent.visibility = 'account' AND agent.owner_id = ?)
+             WHERE agent.owner_id = ?
+                OR agent.visibility = 'global'
                 OR (binding.project_id = ?)
              ORDER BY agent.created_at ASC, agent.id ASC",
         )

@@ -164,23 +164,6 @@ impl ProjectExecutionSetupService {
                 role.role_name()
             )));
         }
-        if role == ExecutionPrincipalRole::IndependentReviewer
-            && configured_role_identity(&project, roles.worker_role.as_deref().unwrap_or("worker"))?
-                .as_deref()
-                == Some(request.identity_id.as_str())
-        {
-            return Err(ServiceError::conflict(
-                "independent reviewer must be distinct from the Worker identity",
-            ));
-        }
-        if role == ExecutionPrincipalRole::Worker
-            && roles.reviewer_identity_id.as_deref() == Some(request.identity_id.as_str())
-        {
-            return Err(ServiceError::conflict(
-                "Worker and independent reviewer identities must be distinct",
-            ));
-        }
-
         let mut settings: Value = serde_json::from_str(&project.settings).map_err(|error| {
             ServiceError::invalid_operation(format!("invalid Project settings: {error}"))
         })?;

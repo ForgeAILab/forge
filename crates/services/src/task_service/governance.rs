@@ -56,11 +56,11 @@ pub(crate) enum ExecutionGateCapability {
     ReadOnlyReview,
 }
 
-/// Immutable governance facts inherited by an adaptive Task reshape.
+/// Immutable traceability facts inherited by an adaptive Task reshape.
 ///
-/// The baseline revision is the authority for the envelope and its fixed
-/// boundaries.  A split/sequence/replace operation may only reuse this
-/// snapshot; it cannot manufacture a new one from caller text.
+/// The current Charter authorizes split/sequence/replace. When the source
+/// Task carries optional baseline references, the reshape preserves that
+/// snapshot instead of manufacturing different references from caller text.
 #[derive(Debug, Clone)]
 pub(crate) struct AdaptiveTaskGovernance {
     pub charter_revision_id: Option<String>,
@@ -72,7 +72,6 @@ pub(crate) struct AdaptiveTaskGovernance {
     pub capability_class: Option<String>,
     pub risk_class: Option<String>,
     pub provenance_json: String,
-    pub adaptive_envelope_json: Option<String>,
     pub baseline_content_digest: Option<String>,
 }
 
@@ -92,9 +91,6 @@ pub(super) struct PreparedTaskGovernance {
 }
 
 struct BaselineContext {
-    lifecycle: String,
-    current_revision_id: Option<String>,
-    revision_lifecycle: String,
     charter_revision_id: String,
     document_revisions_json: String,
     plan_items_json: String,
@@ -102,8 +98,6 @@ struct BaselineContext {
     milestone_ids_json: String,
     milestone_definition_revision_ids_json: String,
     primary_milestone_id: Option<String>,
-    capability_classes_json: String,
-    risk_classes_json: String,
     adaptive_envelope_json: String,
     elevated_operations_json: String,
     release_policy_revision: String,
@@ -125,19 +119,6 @@ fn parse_adaptive_task_envelope(value: &str) -> Result<AdaptiveEnvelope> {
     })
 }
 
-/// Render the exact set of currently-allowed verbs for a policy-denial
-/// diagnostic (D14: "policy_denied with allowed operations").
-fn allowed_operations_list(values: &[AdaptiveTaskOperation]) -> String {
-    if values.is_empty() {
-        return "none".to_owned();
-    }
-    values
-        .iter()
-        .map(|operation| operation.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 impl TaskService {
     /// Load the immutable governance projection that adaptive Task operations
     /// are allowed to inherit.  The baseline join is intentionally read from
@@ -152,7 +133,6 @@ impl TaskService {
                     g.milestone_id, g.document_revisions_json,
                     g.capability_class, g.risk_class, g.runnable,
                     g.provenance_json,
-                    r.adaptive_envelope_json,
                     r.content_digest AS baseline_content_digest
              FROM project_task_governance g
              LEFT JOIN project_execution_baseline_revision r
@@ -177,22 +157,15 @@ impl TaskService {
             capability_class: row.get("capability_class"),
             risk_class: row.get("risk_class"),
             provenance_json: row.get("provenance_json"),
-            adaptive_envelope_json: row.get("adaptive_envelope_json"),
             baseline_content_digest: row.get("baseline_content_digest"),
         }))
     }
 
     /// Admit one adaptive operation at the shared TaskService boundary.
-    /// Legacy Tasks have no governing baseline and retain their historical
-    /// behavior.  Charter-backed Tasks require an active envelope entry and
-    /// an empty reconciliation projection before they can be reshaped.
-    ///
-    /// Outcomes are deliberately distinct (D14): a malformed/unknown
-    /// operation is a typed validation failure; a valid operation the active
-    /// envelope simply does not grant is a policy denial; only a proven
-    /// divergence between authoritative records — or an invalid current
-    /// governing baseline — creates canonical-conflict/reconciliation truth.
-    /// A rejected no-op never mutates durable state.
+    /// Split, sequence, and replace are normal Task-system operations. An
+    /// optional execution baseline may contribute traceability, but its
+    /// approval state and operation list do not grant implementation authority;
+    /// the current approved Charter does.
     pub(crate) async fn authorize_adaptive_task_operation(
         &self,
         task: &db::Task,
@@ -201,154 +174,32 @@ impl TaskService {
         // Parse first. An unsupported verb is a caller/typed-input mistake —
         // it can never prove that any authoritative record diverged, so it
         // must never create a canonical conflict or reconciliation row.
-        let Some(requested_operation) = AdaptiveTaskOperation::parse(operation) else {
+        if AdaptiveTaskOperation::parse(operation).is_none() {
             return Err(ServiceError::invalid_operation(format!(
                 "adaptive Task operation '{operation}' is not a supported verb; supported: {}",
                 crate::execution_baseline::adaptive_task_operation_supported_values()
             )));
-        };
+        }
         let Some(governance) = self.adaptive_task_governance(task).await? else {
             return Ok(None);
         };
-        // A pre-baseline planning row is not an executable adaptive envelope.
-        // Keep it on the existing planning path; repository-capable reshaping
-        // still requires the exact baseline references below.
-        let Some(baseline_id) = governance.baseline_id.as_deref() else {
-            return Ok(Some(governance));
-        };
-        let Some(baseline_revision_id) = governance.baseline_revision_id.as_deref() else {
-            return Ok(Some(governance));
-        };
-        let admitted: i64 = sqlx::query_scalar(
-            "SELECT EXISTS (
-                 SELECT 1
-                 FROM project p
-                 JOIN project_execution_baseline b
-                   ON b.id = ? AND b.project_id = p.id
-                 JOIN project_execution_baseline_revision r
-                   ON r.id = ? AND r.baseline_id = b.id
-                 WHERE p.id = ?
-                   AND p.current_charter_revision_id = ?
-                   AND b.lifecycle = 'active'
-                   AND b.current_revision_id = r.id
-                   AND r.lifecycle = 'approved'
-                   AND EXISTS (
-                       SELECT 1
-                       FROM project_execution_baseline_approval a
-                       WHERE a.baseline_id = b.id AND a.revision_id = r.id
-                         AND a.principal_type = 'user'
-                         AND a.authorization_action = 'project.execution_baseline.approve'
-                         AND a.content_digest = r.content_digest
-                         AND a.rendered_digest = r.rendered_digest
-                         AND a.lifecycle IN ('active', 'consumed')
-                   )
-             )",
-        )
-        .bind(baseline_id)
-        .bind(baseline_revision_id)
-        .bind(&task.project_id)
-        .bind(governance.charter_revision_id.as_deref())
-        .fetch_one(self.db.pool())
-        .await?;
-        if admitted != 1 {
-            // The Task's own governance pointer no longer names the
-            // Project's active, approved baseline revision: a proven
-            // divergence between two authoritative records.
-            let reason =
-                "adaptive Task operation references a stale or unapproved execution baseline";
-            self.record_adaptive_boundary_reconciliation(
-                task,
-                &governance,
-                baseline_id,
-                baseline_revision_id,
-                operation,
-                reason,
-                "adaptive_task_governance_stale",
-                &["baseline_id", "baseline_revision_id"],
-            )
-            .await?;
-            return Err(ServiceError::Conflict(format!(
-                "reconciliation_required: {reason}"
-            )));
-        }
-        let unresolved: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM project_reconciliation_record
-             WHERE project_id = ? AND state = 'required'",
+        let current_charter_revision_id: Option<String> = sqlx::query_scalar(
+            "SELECT current_charter_revision_id FROM project
+             WHERE id = ? AND charter_status = 'charter_backed'
+               AND charter_setup_required = 0",
         )
         .bind(&task.project_id)
-        .fetch_one(self.db.pool())
-        .await?;
-        if unresolved > 0 {
-            // An existing reconciliation is a hard gate; it is not this
-            // command's job to create a second one for the same Project.
+        .fetch_optional(self.db.pool())
+        .await?
+        .flatten();
+        if current_charter_revision_id.is_some()
+            && governance.charter_revision_id != current_charter_revision_id
+        {
             return Err(ServiceError::Conflict(
-                "reconciliation_required: resolve the Project's active adaptive boundary conflict before reshaping Tasks"
-                    .to_owned(),
+                "reconciliation_required: Task Charter traceability is stale".to_owned(),
             ));
         }
-        let Some(envelope_json) = governance.adaptive_envelope_json.as_deref() else {
-            // The governance row names an active/approved revision that has
-            // no adaptive-envelope projection: the governing baseline itself
-            // is invalid, not a caller mistake.
-            let reason = "governing baseline adaptive envelope is unavailable";
-            self.record_adaptive_boundary_reconciliation(
-                task,
-                &governance,
-                baseline_id,
-                baseline_revision_id,
-                operation,
-                reason,
-                "invalid_active_baseline",
-                &["baseline_revision_id"],
-            )
-            .await?;
-            return Err(ServiceError::Conflict(format!(
-                "reconciliation_required: {reason}"
-            )));
-        };
-        let envelope =
-            match crate::execution_baseline::parse_persisted_adaptive_envelope(envelope_json) {
-                Ok(envelope) => envelope,
-                Err(message) => {
-                    // The active governing baseline's own persisted envelope is
-                    // internally invalid (for example a legacy value outside the
-                    // closed split/sequence/replace vocabulary — the F8 defect).
-                    // This is Project-wide `invalid_active_baseline` truth, named
-                    // with the exact invalid content in `message`.
-                    let reason = format!("governing {message}");
-                    self.record_adaptive_boundary_reconciliation(
-                        task,
-                        &governance,
-                        baseline_id,
-                        baseline_revision_id,
-                        operation,
-                        &reason,
-                        "invalid_active_baseline",
-                        &[crate::execution_baseline::ADAPTIVE_ALLOWED_TASK_OPERATIONS_FIELD],
-                    )
-                    .await?;
-                    return Err(ServiceError::Conflict(format!(
-                        "reconciliation_required: {reason}"
-                    )));
-                }
-            };
-        if envelope
-            .allowed_task_operations
-            .contains(&requested_operation)
-        {
-            return Ok(Some(governance));
-        }
-        // The requested verb is valid and the governing baseline is valid;
-        // it simply was never granted. This is a policy denial, not a
-        // divergence between authoritative records — no conflict, no
-        // reconciliation row, no execution effect. Expanded authority
-        // requires an explicit successor-baseline/reconciliation proposal.
-        Err(ServiceError::AuthorizationDenied {
-            message: format!(
-                "adaptive Task operation '{operation}' is not permitted by the active baseline's adaptive envelope; allowed: {}",
-                allowed_operations_list(&envelope.allowed_task_operations)
-            ),
-        })
+        Ok(Some(governance))
     }
 
     /// A child/replacement must inherit the source Task's immutable
@@ -537,32 +388,15 @@ impl TaskService {
         Ok(())
     }
 
-    /// Reject orchestration identities before any repository workspace is
-    /// prepared. The in-transaction lease guard repeats this check at the
-    /// authority boundary, but callers use this preflight to avoid leaving a
-    /// task branch/worktree behind for an identity that can never be leased.
+    /// Verify that an identity is currently usable for Project Task execution
+    /// before preparing a repository workspace. Main/Project chat bindings do
+    /// not disqualify it; Task authority still comes only from the explicit
+    /// role assignment and scheduler lease.
     pub(super) async fn ensure_repository_worker_identity(
         &self,
         project_id: &str,
         principal_id: &str,
     ) -> Result<()> {
-        let orchestration_binding_count: i64 = sqlx::query_scalar(
-            "SELECT
-                (SELECT COUNT(*) FROM project_agent_binding
-                 WHERE project_id = ? AND identity_id = ? AND state = 'active')
-              + (SELECT COUNT(*) FROM account_main_agent_binding
-                 WHERE identity_id = ? AND state = 'active')",
-        )
-        .bind(project_id)
-        .bind(principal_id)
-        .bind(principal_id)
-        .fetch_one(self.db.pool())
-        .await?;
-        if orchestration_binding_count > 0 {
-            return Err(ServiceError::invalid_operation(
-                "Main and Project Agent identities cannot receive repository WorkspaceLeases",
-            ));
-        }
         let charter_backed: i64 = sqlx::query_scalar(
             "SELECT EXISTS (
                  SELECT 1 FROM project
@@ -589,10 +423,9 @@ impl TaskService {
     }
 
     /// Validate and prepare the immutable governance row that accompanies a
-    /// new Task.  A pre-baseline implementation Task is allowed only as a
-    /// non-runnable plan with the current Charter provenance; a fully
-    /// traceable Task becomes runnable only when its exact baseline revision is
-    /// active and has a matching user approval receipt.
+    /// new Task. The approved Charter is the implementation authority. A
+    /// baseline, when supplied, contributes immutable traceability but its
+    /// lifecycle or approval status does not decide whether the Task can run.
     pub(super) async fn prepare_task_governance(
         &self,
         project: &db::Project,
@@ -613,7 +446,6 @@ impl TaskService {
         // Implementation intent remains governed even while repository setup
         // is incomplete. A missing primary_repo_id must not downgrade it to
         // an ungoverned planning Task.
-        let requires_execution_governance = implementation || repository_capable;
         let charter_backed = project.charter_status == "charter_backed"
             && !project.charter_setup_required
             && project.current_charter_revision_id.is_some();
@@ -626,11 +458,8 @@ impl TaskService {
 
         let default_capability = canonical_task_capability(task_type, requested_capability)?;
         let mut requested = requested.unwrap_or_else(|| TaskGovernanceRequest {
-            // Mainstream Task creation surfaces do not carry an orchestration
-            // envelope.  Bind those Tasks to the current Charter and keep
-            // them non-runnable until a Project Agent supplies exact baseline
-            // provenance.  Discovery/planning Tasks receive the only
-            // pre-baseline repository capability admitted by the scheduler.
+            // Mainstream Task creation surfaces do not need an orchestration
+            // envelope. Bind directly to the current approved Charter.
             charter_revision_id: project.current_charter_revision_id.clone(),
             baseline_id: None,
             baseline_revision_id: None,
@@ -672,14 +501,11 @@ impl TaskService {
         ) {
             (Some(baseline_id), Some(baseline_revision_id)) => {
                 baseline = sqlx::query(
-                    "SELECT b.lifecycle, b.current_revision_id,
-                            r.lifecycle AS revision_lifecycle,
-                            r.charter_revision_id AS baseline_charter_revision_id,
+                    "SELECT r.charter_revision_id AS baseline_charter_revision_id,
                             r.document_revisions_json, r.plan_items_json,
                             r.milestone_id, r.milestone_ids_json,
                             r.milestone_definition_revision_ids_json,
                             r.primary_milestone_id,
-                            r.capability_classes_json, r.risk_classes_json,
                             r.adaptive_envelope_json, r.elevated_operations_json,
                             r.release_policy_revision, r.release_policy_digest,
                             r.content_digest, r.rendered_digest
@@ -694,9 +520,6 @@ impl TaskService {
                 .fetch_optional(self.db.pool())
                 .await?
                 .map(|row| BaselineContext {
-                    lifecycle: row.get("lifecycle"),
-                    current_revision_id: row.get("current_revision_id"),
-                    revision_lifecycle: row.get("revision_lifecycle"),
                     charter_revision_id: row.get("baseline_charter_revision_id"),
                     document_revisions_json: row.get("document_revisions_json"),
                     plan_items_json: row.get("plan_items_json"),
@@ -705,8 +528,6 @@ impl TaskService {
                     milestone_definition_revision_ids_json: row
                         .get("milestone_definition_revision_ids_json"),
                     primary_milestone_id: row.get("primary_milestone_id"),
-                    capability_classes_json: row.get("capability_classes_json"),
-                    risk_classes_json: row.get("risk_classes_json"),
                     adaptive_envelope_json: row.get("adaptive_envelope_json"),
                     elevated_operations_json: row.get("elevated_operations_json"),
                     release_policy_revision: row.get("release_policy_revision"),
@@ -791,9 +612,8 @@ impl TaskService {
                 "Task plan_item_id and milestone_id require an active execution baseline",
             ));
         } else if implementation {
-            // This is a valid planning record before baseline approval, but it
-            // is intentionally never runnable/write-capable. Only the
-            // server-selected read-only profile may receive a discovery lease.
+            // Charter authority is sufficient; an implementation Task may be
+            // runnable without an optional baseline record.
         }
 
         if repository_capable
@@ -803,7 +623,7 @@ impl TaskService {
             if let Some(capability_class) = requested.capability_class.as_deref() {
                 if !is_read_only_capability(capability_class) {
                     return Err(ServiceError::invalid_operation(
-                        "pre-baseline discovery/planning Tasks require a server-approved read-only capability",
+                        "discovery/planning Tasks without a baseline require a read-only capability",
                     ));
                 }
             } else {
@@ -814,63 +634,15 @@ impl TaskService {
             }
         }
 
-        let baseline_active = baseline.as_ref().is_some_and(|baseline| {
-            baseline.lifecycle == "active"
-                && baseline.revision_lifecycle == "approved"
-                && requested.baseline_revision_id.as_deref()
-                    == baseline.current_revision_id.as_deref()
-        });
-        let approval_matches =
-            if let (Some(baseline_id), Some(baseline_revision_id), Some(baseline)) = (
-                requested.baseline_id.as_deref(),
-                requested.baseline_revision_id.as_deref(),
-                baseline.as_ref(),
-            ) {
-                let approved = sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM project_execution_baseline_approval
-                 WHERE baseline_id = ? AND revision_id = ?
-                   AND principal_type = 'user'
-                   AND authorization_action = 'project.execution_baseline.approve'
-                   AND length(trim(authorization_basis)) > 0
-                   AND length(trim(authorization_occurred_at)) > 0
-                   AND length(trim(explicit_event)) > 0
-                   AND content_digest = ? AND rendered_digest = ?
-                   AND lifecycle IN ('active', 'consumed')",
-                )
-                .bind(baseline_id)
-                .bind(baseline_revision_id)
-                .bind(&baseline.content_digest)
-                .bind(&baseline.rendered_digest)
-                .fetch_one(self.db.pool())
-                .await?;
-                approved > 0
-            } else {
-                false
-            };
-
-        if let Some(baseline) = baseline.as_ref().filter(|_| requires_execution_governance) {
-            require_allowed_class(
-                requested.capability_class.as_deref(),
-                &baseline.capability_classes_json,
-                "capability_class",
-            )?;
-            require_allowed_class(
-                requested.risk_class.as_deref(),
-                &baseline.risk_classes_json,
-                "risk_class",
-            )?;
-        }
         // A baseline may author classes the server cannot dispatch; fail the
         // proposal now with the allowed vocabulary instead of admitting a
         // Task whose every dispatch would be refused by the lease issuer.
         require_server_approved_capability_class(requested.capability_class.as_deref())?;
 
-        // Every repository-capable Task becomes runnable only after the exact
-        // current baseline revision is active and has a user approval receipt.
-        // Discovery/planning Tasks are admitted before that gate as
-        // non-mutating plans; `ensure_task_runnable` verifies their read-only
-        // capability profile immediately before workspace preparation.
-        let runnable = repository_capable && baseline_active && approval_matches;
+        // `runnable` now records Charter-backed repository readiness. The
+        // workflow, role, availability, repository, capability, retry, and
+        // lease checks are repeated immediately before dispatch.
+        let runnable = repository_capable;
         let provenance_json = build_provenance(
             requested.provenance.clone(),
             requested.plan_item_id.as_deref(),
@@ -912,75 +684,6 @@ impl TaskService {
             replacement_of_task_id,
             provenance_json,
         }))
-    }
-
-    /// Promote pre-created implementation plans after the exact baseline
-    /// activation transaction commits.  The immutable governing references
-    /// remain untouched; only the derived runnable bit and row version move.
-    /// The SQL repeats the active/current/approved and exact approval checks so
-    /// a stale caller cannot promote work from a superseded baseline.
-    pub async fn refresh_task_governance_for_baseline(
-        &self,
-        project_id: &str,
-        baseline_id: &str,
-        baseline_revision_id: &str,
-        now: &str,
-    ) -> Result<u64> {
-        let result = sqlx::query(
-            "UPDATE project_task_governance
-             SET runnable = 1, version = version + 1, updated_at = ?
-             WHERE project_id = ? AND baseline_id = ?
-               AND baseline_revision_id = ? AND runnable = 0
-               AND EXISTS (
-                   SELECT 1
-                   FROM task t
-                   WHERE t.id = project_task_governance.task_id
-                     AND t.project_id = project_task_governance.project_id
-                     AND t.repo_id IS NOT NULL
-               )
-               AND EXISTS (
-                   SELECT 1
-                   FROM project_execution_baseline b
-                   JOIN project_execution_baseline_revision r
-                     ON r.id = project_task_governance.baseline_revision_id
-                    AND r.baseline_id = b.id
-                   WHERE b.id = project_task_governance.baseline_id
-                     AND b.project_id = project_task_governance.project_id
-                     AND EXISTS (
-                         SELECT 1 FROM project p
-                         WHERE p.id = b.project_id
-                           AND p.charter_status = 'charter_backed'
-                           AND p.charter_setup_required = 0
-                           AND p.current_charter_revision_id = r.charter_revision_id
-                     )
-                     AND b.lifecycle = 'active'
-                     AND b.current_revision_id = r.id
-                     AND r.lifecycle = 'approved'
-               )
-               AND EXISTS (
-                   SELECT 1
-                   FROM project_execution_baseline_approval a
-                   JOIN project_execution_baseline_revision r
-                     ON r.id = a.revision_id AND r.baseline_id = a.baseline_id
-                   WHERE a.baseline_id = project_task_governance.baseline_id
-                     AND a.revision_id = project_task_governance.baseline_revision_id
-                     AND a.principal_type = 'user'
-                     AND a.authorization_action = 'project.execution_baseline.approve'
-                     AND length(trim(a.authorization_basis)) > 0
-                     AND length(trim(a.authorization_occurred_at)) > 0
-                     AND length(trim(a.explicit_event)) > 0
-                     AND a.content_digest = r.content_digest
-                     AND a.rendered_digest = r.rendered_digest
-                     AND a.lifecycle IN ('active', 'consumed')
-               )",
-        )
-        .bind(now)
-        .bind(project_id)
-        .bind(baseline_id)
-        .bind(baseline_revision_id)
-        .execute(self.db.pool())
-        .await?;
-        Ok(result.rows_affected())
     }
 
     pub(super) async fn insert_task_governance(
@@ -1046,31 +749,14 @@ impl TaskService {
             "SELECT p.charter_status, p.charter_setup_required,
                     p.current_charter_revision_id,
                     t.task_type,
-                    g.runnable, g.charter_revision_id,
+                    g.charter_revision_id,
                     g.baseline_id, g.baseline_revision_id,
-                    g.capability_class, g.risk_class,
-                    b.lifecycle, b.current_revision_id,
-                            r.charter_revision_id AS baseline_charter_revision_id,
-                            r.capability_classes_json, r.risk_classes_json,
-                            (SELECT COUNT(*) FROM project_execution_baseline_approval a
-                     WHERE a.baseline_id = g.baseline_id
-                       AND a.revision_id = g.baseline_revision_id
-                       AND a.principal_type = 'user'
-                       AND a.authorization_action = 'project.execution_baseline.approve'
-                       AND length(trim(a.authorization_basis)) > 0
-                       AND length(trim(a.authorization_occurred_at)) > 0
-                       AND length(trim(a.explicit_event)) > 0
-                       AND a.content_digest = r.content_digest
-                       AND a.rendered_digest = r.rendered_digest
-                       AND a.lifecycle IN ('active', 'consumed')) AS approval_count
+                    g.capability_class
              FROM project p
              JOIN task t ON t.id = ? AND t.project_id = p.id
                  AND t.deleted_at IS NULL
              LEFT JOIN project_task_governance g ON g.project_id = p.id
                  AND g.task_id = t.id
-             LEFT JOIN project_execution_baseline b ON b.id = g.baseline_id
-             LEFT JOIN project_execution_baseline_revision r
-                 ON r.id = g.baseline_revision_id
              WHERE p.id = ?",
         )
         .bind(&task.id)
@@ -1099,18 +785,16 @@ impl TaskService {
             && is_read_only_capability(&capability_class);
 
         if prebaseline_read_only {
-            // Before baseline approval, bounded discovery/planning remains
-            // admissible even when repository setup is incomplete. The Task
-            // may be recorded or handled by a non-repository planning path,
-            // but no WorkspaceLease can be issued without a repo binding.
+            // Bounded discovery/planning remains admissible without repository
+            // setup. It receives no repository WorkspaceLease.
             return Ok(());
         }
 
         if execution_class == TaskExecutionClass::Implementation {
             // The canonical Project setup projection is the authority for
-            // durable repository/role readiness. A primary_repo_id check by
-            // itself is insufficient: an active coordinator identity or a
-            // failed provisioning operation must not receive a write lease.
+            // durable repository readiness. A primary_repo_id check by itself
+            // is insufficient because a failed provisioning operation must
+            // not receive a write lease.
             let setup = crate::load_project_execution_setup(&self.db, &task.project_id).await?;
             if setup.execution_setup_state != ExecutionSetupState::Ready
                 || setup.primary_repo.is_none()
@@ -1138,45 +822,15 @@ impl TaskService {
                 .await?;
         }
 
-        if let Some(allowed) = row.get::<Option<String>, _>("capability_classes_json") {
-            require_allowed_class(Some(&capability_class), &allowed, "capability_class")?;
-        }
-        if let Some(allowed) = row.get::<Option<String>, _>("risk_classes_json") {
-            require_allowed_class(
-                row.get::<Option<String>, _>("risk_class").as_deref(),
-                &allowed,
-                "risk_class",
-            )?;
-        }
-        let runnable: Option<i64> = row.get("runnable");
-        let admitted = runnable == Some(1)
-            && row
-                .get::<Option<String>, _>("charter_revision_id")
-                .as_deref()
-                == row
+        let governance_charter = row.get::<Option<String>, _>("charter_revision_id");
+        if governance_charter.is_some()
+            && governance_charter.as_deref()
+                != row
                     .get::<Option<String>, _>("current_charter_revision_id")
                     .as_deref()
-            && row.get::<Option<String>, _>("baseline_id").is_some()
-            && row
-                .get::<Option<String>, _>("baseline_revision_id")
-                .is_some()
-            && row.get::<Option<String>, _>("lifecycle").as_deref() == Some("active")
-            && row
-                .get::<Option<String>, _>("current_revision_id")
-                .as_deref()
-                == row
-                    .get::<Option<String>, _>("baseline_revision_id")
-                    .as_deref()
-            && row
-                .get::<Option<String>, _>("charter_revision_id")
-                .as_deref()
-                == row
-                    .get::<Option<String>, _>("baseline_charter_revision_id")
-                    .as_deref()
-            && row.get::<i64, _>("approval_count") > 0;
-        if !admitted {
+        {
             return Err(ServiceError::invalid_operation(
-                "repository Task cannot start because its approved implementation-plan traceability is stale or missing; review the Project's current plan before retrying",
+                "repository Task cannot start because its Charter traceability is stale",
             ));
         }
         Ok(())
@@ -1195,21 +849,16 @@ impl TaskService {
         &self,
         task: &db::Task,
         capability: ExecutionGateCapability,
-        execution_gate: ExecutionGate,
+        _execution_gate: ExecutionGate,
     ) -> Result<()> {
         let conflicts = required_reconciliation_conflicts(&self.db, &task.project_id)
             .await?
             .into_iter()
-            .filter(|conflict| conflict.is_project_wide() || conflict.is_scoped_to_task(&task.id))
+            .filter(|conflict| conflict.is_scoped_to_task(&task.id))
             .collect::<Vec<_>>();
 
         match capability {
             ExecutionGateCapability::RepositoryMutation => {
-                if execution_gate != ExecutionGate::Active {
-                    return Err(ServiceError::invalid_operation(
-                        "repository implementation Task is waiting for plan approval: approve and start the Project's implementation plan once; covered Tasks do not need separate approval",
-                    ));
-                }
                 if let Some(conflict) = conflicts.first() {
                     return Err(ServiceError::Conflict(format!(
                         "reconciliation_required: {}",
@@ -1219,14 +868,6 @@ impl TaskService {
                 Ok(())
             }
             ExecutionGateCapability::ReadOnlyReview => {
-                if execution_gate != ExecutionGate::Active && conflicts.is_empty() {
-                    // No active approved baseline and no recorded conflict to
-                    // evaluate for neutrality: there is no governed result to
-                    // review yet.
-                    return Err(ServiceError::invalid_operation(
-                        "independent review is waiting for plan approval: approve and start the Project's implementation plan once; covered Tasks do not need separate approval",
-                    ));
-                }
                 let Some(blocking) = conflicts.iter().find(|conflict| !review_neutral(conflict))
                 else {
                     return Ok(());
@@ -1244,9 +885,9 @@ impl TaskService {
     /// opaque lease is persisted by `WorkspaceLeaseRepo`; no route or chat
     /// context receives the row, its capability JSON, or a filesystem path.
     ///
-    /// The database-side lease scope guard repeats the current-baseline and
-    /// read-only discovery predicates, so a baseline supersession racing this
-    /// call cannot turn a stale preflight into repository authority.
+    /// The database-side lease scope guard repeats the current-Charter and
+    /// capability predicates, so a Charter supersession racing this call
+    /// cannot turn a stale preflight into repository authority.
     pub(super) async fn issue_workspace_lease(
         &self,
         task: &db::Task,
@@ -1409,24 +1050,6 @@ impl TaskService {
                     "WorkspaceLease requires an assigned Task Worker or reviewer",
                 )
             })?;
-        let orchestration_binding_count: i64 = sqlx::query_scalar(
-            "SELECT
-                (SELECT COUNT(*) FROM project_agent_binding
-                 WHERE project_id = ? AND identity_id = ? AND state = 'active')
-              + (SELECT COUNT(*) FROM account_main_agent_binding
-                 WHERE identity_id = ? AND state = 'active')",
-        )
-        .bind(&task.project_id)
-        .bind(principal_id)
-        .bind(principal_id)
-        .fetch_one(&mut **transaction)
-        .await?;
-        if orchestration_binding_count > 0 {
-            return Err(ServiceError::invalid_operation(
-                "Main and Project Agent identities cannot receive repository WorkspaceLeases",
-            ));
-        }
-
         let task_row = sqlx::query(
             "SELECT t.project_id, t.repo_id, t.assignee_type, t.assignee_id,
                     t.task_type, p.charter_status, p.charter_setup_required
@@ -1509,34 +1132,14 @@ impl TaskService {
             ));
         }
 
-        // Repeat the admission predicate inside the claim transaction.  The
-        // migration's scope trigger is the final database backstop, but this
-        // gives callers a stable service error and keeps the read-only
-        // pre-baseline branch explicit.
+        // Repeat the current-Charter predicate inside the claim transaction.
+        // The migration's scope trigger is the final database backstop.
         let gate = sqlx::query(
             "SELECT p.charter_status, p.charter_setup_required,
-                    p.current_charter_revision_id, g.runnable,
-                    g.charter_revision_id, g.baseline_id, g.baseline_revision_id,
-                    b.lifecycle, b.current_revision_id,
-                    r.lifecycle AS revision_lifecycle,
-                    r.charter_revision_id AS baseline_charter_revision_id,
-                    (SELECT COUNT(*) FROM project_execution_baseline_approval a
-                     WHERE a.baseline_id = g.baseline_id
-                       AND a.revision_id = g.baseline_revision_id
-                       AND a.principal_type = 'user'
-                       AND a.authorization_action = 'project.execution_baseline.approve'
-                       AND length(trim(a.authorization_basis)) > 0
-                       AND length(trim(a.authorization_occurred_at)) > 0
-                       AND length(trim(a.explicit_event)) > 0
-                       AND a.content_digest = r.content_digest
-                       AND a.rendered_digest = r.rendered_digest
-                       AND a.lifecycle IN ('active', 'consumed')) AS approval_count
+                    p.current_charter_revision_id, g.charter_revision_id
              FROM project p
              LEFT JOIN project_task_governance g
                ON g.project_id = p.id AND g.task_id = ?
-             LEFT JOIN project_execution_baseline b ON b.id = g.baseline_id
-             LEFT JOIN project_execution_baseline_revision r
-               ON r.id = g.baseline_revision_id
              WHERE p.id = ?",
         )
         .bind(&task.id)
@@ -1546,43 +1149,15 @@ impl TaskService {
         .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
         let charter_backed = gate.get::<String, _>("charter_status") == "charter_backed"
             && gate.get::<i64, _>("charter_setup_required") == 0;
-        let prebaseline_read_only = charter_backed
-            && execution_class == TaskExecutionClass::ReadOnlyPlanning
-            && gate.get::<Option<String>, _>("baseline_id").is_none()
-            && gate
-                .get::<Option<String>, _>("baseline_revision_id")
-                .is_none()
-            && is_read_only_capability(&capability_class);
-        let exact_baseline = charter_backed
-            && gate.get::<Option<i64>, _>("runnable") == Some(1)
-            && gate
-                .get::<Option<String>, _>("charter_revision_id")
-                .as_deref()
-                == gate
-                    .get::<Option<String>, _>("current_charter_revision_id")
-                    .as_deref()
-            && gate.get::<Option<String>, _>("baseline_id").is_some()
-            && gate
-                .get::<Option<String>, _>("baseline_revision_id")
-                .as_deref()
-                == gate
-                    .get::<Option<String>, _>("current_revision_id")
-                    .as_deref()
-            && gate.get::<Option<String>, _>("lifecycle").as_deref() == Some("active")
-            && gate
-                .get::<Option<String>, _>("revision_lifecycle")
-                .as_deref()
-                == Some("approved")
-            && gate
-                .get::<Option<String>, _>("baseline_charter_revision_id")
-                .as_deref()
-                == gate
-                    .get::<Option<String>, _>("current_charter_revision_id")
-                    .as_deref()
-            && gate.get::<i64, _>("approval_count") > 0;
-        if charter_backed && !(exact_baseline || prebaseline_read_only) {
+        let charter_governed = gate
+            .get::<Option<String>, _>("charter_revision_id")
+            .as_deref()
+            == gate
+                .get::<Option<String>, _>("current_charter_revision_id")
+                .as_deref();
+        if charter_backed && !charter_governed {
             return Err(ServiceError::invalid_operation(
-                "WorkspaceLease requires the exact active user-approved execution baseline",
+                "WorkspaceLease requires the Task's current approved Charter revision",
             ));
         }
         let issued_at = now_rfc3339();
@@ -2160,35 +1735,6 @@ async fn validate_document_revisions(
     Ok(())
 }
 
-fn require_allowed_class(requested: Option<&str>, allowed_json: &str, field: &str) -> Result<()> {
-    let allowed: Value = serde_json::from_str(allowed_json).map_err(|error| {
-        ServiceError::invalid_operation(format!("invalid baseline {field} list: {error}"))
-    })?;
-    // A baseline that declares no classes at all leaves the field
-    // unconstrained: the lease issuer falls back to the server-selected
-    // capability profile. Only a baseline that names classes turns the field
-    // into a required, closed choice.
-    let declares_classes = match &allowed {
-        Value::Array(values) => !values.is_empty(),
-        Value::Null => false,
-        _ => true,
-    };
-    let Some(requested) = requested.filter(|value| !value.trim().is_empty()) else {
-        if declares_classes {
-            return Err(ServiceError::invalid_operation(format!(
-                "repository implementation Tasks require {field}"
-            )));
-        }
-        return Ok(());
-    };
-    if declares_classes && !json_contains_identifier_value(&allowed, requested) {
-        return Err(ServiceError::invalid_operation(format!(
-            "Task {field} is outside the approved execution baseline"
-        )));
-    }
-    Ok(())
-}
-
 fn build_provenance(
     requested: Option<Value>,
     plan_item_id: Option<&str>,
@@ -2339,7 +1885,7 @@ fn build_provenance(
             milestone_definition_revision_ids,
         );
     } else {
-        map.insert("baseline_pending".to_owned(), Value::Bool(true));
+        map.insert("charter_authority".to_owned(), Value::Bool(true));
     }
     map.insert(
         "schema".to_owned(),
@@ -2411,9 +1957,6 @@ mod tests {
     #[test]
     fn provenance_adds_authoritative_adaptive_envelope_digest() {
         let baseline = BaselineContext {
-            lifecycle: "active".to_owned(),
-            current_revision_id: Some("revision-1".to_owned()),
-            revision_lifecycle: "approved".to_owned(),
             charter_revision_id: "charter-revision-1".to_owned(),
             document_revisions_json: "[]".to_owned(),
             plan_items_json: "[]".to_owned(),
@@ -2421,8 +1964,6 @@ mod tests {
             milestone_ids_json: "[]".to_owned(),
             milestone_definition_revision_ids_json: "[]".to_owned(),
             primary_milestone_id: None,
-            capability_classes_json: "[]".to_owned(),
-            risk_classes_json: "[]".to_owned(),
             adaptive_envelope_json: r#"{"allowed_task_operations":["split"],"fixed_outcomes":[],"fixed_acceptance":[],"fixed_risk_classes":[],"forbidden_side_effects":[],"elevated_operations":[]}"#.to_owned(),
             elevated_operations_json: "[]".to_owned(),
             release_policy_revision: "policy-r1".to_owned(),
@@ -2470,7 +2011,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn charter_backed_repository_task_derives_pending_baseline_governance() {
+    async fn charter_backed_repository_task_is_runnable_without_a_baseline() {
         let pool = db::create_sqlite_pool("sqlite::memory:")
             .await
             .expect("pool creates");
@@ -2488,7 +2029,7 @@ mod tests {
             .await
             .expect("implementation task can be recorded before the baseline")
             .expect("repository task receives a governance row");
-        assert!(!governance.runnable);
+        assert!(governance.runnable);
         assert_eq!(
             governance.charter_revision_id.as_deref(),
             Some("charter-revision-1")
@@ -2496,7 +2037,7 @@ mod tests {
         assert!(governance.baseline_id.is_none());
         assert!(governance.capability_class.is_none());
         assert!(governance.risk_class.is_none());
-        assert!(governance.provenance_json.contains("baseline_pending"));
+        assert!(governance.provenance_json.contains("charter_authority"));
     }
 
     fn minimal_task(id: &str, project_id: &str) -> db::Task {
@@ -2576,7 +2117,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn charter_backed_repository_planning_task_is_admitted_only_as_non_runnable() {
+    async fn charter_backed_repository_planning_task_is_runnable_read_only_work() {
         let pool = db::create_sqlite_pool("sqlite::memory:")
             .await
             .expect("pool creates");
@@ -2594,13 +2135,13 @@ mod tests {
             .await
             .expect("discovery plan can be recorded before baseline")
             .expect("repository discovery receives a governance row");
-        assert!(!governance.runnable);
+        assert!(governance.runnable);
         assert_eq!(
             governance.capability_class.as_deref(),
             Some("repository_read")
         );
         assert_eq!(governance.risk_class.as_deref(), Some("low"));
-        assert!(governance.provenance_json.contains("baseline_pending"));
+        assert!(governance.provenance_json.contains("charter_authority"));
     }
 
     #[tokio::test]
@@ -2888,25 +2429,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_only_review_requires_a_governed_result_before_reviewing_anything() {
+    async fn read_only_review_does_not_require_a_baseline() {
         let (_db, service, task) =
             capability_review_fixture("capability-review-ungoverned", "task-1").await;
 
-        // No active baseline and no recorded conflict to evaluate: there is
-        // no governed result yet for an independent reviewer to look at.
-        let error = service
+        service
             .ensure_capability_permits_execution(
                 &task,
                 ExecutionGateCapability::ReadOnlyReview,
                 ExecutionGate::PreBaselineReadOnly,
             )
             .await
-            .expect_err("review has nothing governed to review yet");
-        match error {
-            ServiceError::InvalidOperation { message } => {
-                assert!(message.contains("waiting for plan approval"));
-            }
-            other => panic!("expected InvalidOperation, got {other:?}"),
-        }
+            .expect("Charter-governed work is reviewable without a baseline");
     }
 }

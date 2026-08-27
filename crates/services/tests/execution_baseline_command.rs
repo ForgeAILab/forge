@@ -325,9 +325,9 @@ async fn invalid_historical_active_baseline_is_audited_and_revised_atomically() 
     let correction_revision_id = audit_draft_id.clone();
 
     // A Task already staged against the exact successor carries a persisted
-    // deterministic-blocker disposition. The atomic correction must promote
-    // its governance and clear that disposition immediately; a ten-second
-    // polling scan is not an acceptable recovery mechanism.
+    // disposition and non-runnable governance. Accepting the optional
+    // traceability correction must not rewrite or wake that Task: Task
+    // workflow/governance changes have their own authoritative operations.
     let task = TaskRepo::create(
         &*db,
         db::CreateTask {
@@ -468,7 +468,10 @@ async fn invalid_historical_active_baseline_is_audited_and_revised_atomically() 
         .expect("invalid active baseline reconciliation");
     assert_eq!(
         pending.allowed_actions,
-        vec![ReconciliationResolutionAction::Revised]
+        vec![
+            ReconciliationResolutionAction::Revised,
+            ReconciliationResolutionAction::Retained,
+        ]
     );
     let replacement = pending
         .suggested_replacement_ref
@@ -516,6 +519,7 @@ async fn invalid_historical_active_baseline_is_audited_and_revised_atomically() 
         resolved.reconciliation.state,
         api_types::ReconciliationState::Revised
     );
+    assert!(!resolved.dispatch_woken);
     let (final_pointer, final_lifecycle): (String, String) = sqlx::query_as(
         "SELECT current_revision_id, lifecycle
          FROM project_execution_baseline WHERE id = ?",
@@ -543,17 +547,28 @@ async fn invalid_historical_active_baseline_is_audited_and_revised_atomically() 
     .await
     .expect("successor approval is consumed");
     assert_eq!(approval_lifecycle, "consumed");
-    let woken_task = TaskRepo::get_by_id(&*db, &task.id, false)
+    let unchanged_task = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
-        .expect("woken Task loads")
-        .expect("woken Task exists");
+        .expect("unchanged Task loads")
+        .expect("unchanged Task exists");
     assert!(
-        !woken_task
+        unchanged_task
             .metadata_json
             .as_deref()
             .unwrap_or_default()
             .contains("dispatch_disposition"),
-        "successor activation wakes the exact governed Task"
+        "optional baseline correction must not wake Task dispatch"
+    );
+    let governance_state: (i64, i64) =
+        sqlx::query_as("SELECT runnable, version FROM project_task_governance WHERE task_id = ?")
+            .bind(&task.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("Task governance remains queryable");
+    assert_eq!(
+        governance_state,
+        (0, 1),
+        "optional baseline correction must not promote Task governance"
     );
     let scoped_after =
         ProjectOrchestrationRepo::get_project_reconciliation(&*db, &scoped_reconciliation.id)
@@ -1509,7 +1524,7 @@ async fn approve_and_activate_rejects_a_baseline_that_is_not_a_fresh_proposal() 
     // The already-active baseline no longer has a `proposed` revision: a
     // second, distinct atomic command against the same (now stale) target
     // must fail closed rather than silently re-approving live work. The
-    // already-approved "Start approved work" activation path is the correct
+    // already-approved baseline activation path is the correct
     // route for amending an active baseline, not this one-shot gesture.
     let error = ExecutionBaselineCommandService::new(db.clone())
         .approve_and_activate(ApproveAndActivateExecutionBaselineCommand {

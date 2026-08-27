@@ -104,12 +104,12 @@ describe('BaselineApprovalCard', () => {
     vi.mocked(apiFetch).mockReset()
   })
 
-  it('offers the atomic "Approve plan & start work" gesture for a proposed revision', async () => {
+  it('offers optional traceability approval for a proposed revision', async () => {
     vi.mocked(apiFetch).mockResolvedValue(baselineResponse())
 
     renderCard(<BaselineApprovalCard projectId="project-1" />)
 
-    expect(await screen.findByRole('button', { name: 'Approve plan & start work' })).toBeTruthy()
+    expect(await screen.findByRole('button', { name: 'Approve traceability plan' })).toBeTruthy()
   })
 
   it('commits through the one atomic route and reuses the same idempotency key on retry', async () => {
@@ -121,7 +121,7 @@ describe('BaselineApprovalCard', () => {
     })
 
     renderCard(<BaselineApprovalCard projectId="project-1" />)
-    const button = await screen.findByRole('button', { name: 'Approve plan & start work' })
+    const button = await screen.findByRole('button', { name: 'Approve traceability plan' })
     button.click()
     await screen.findByRole('alert')
     const firstCall = approveAndActivateCall()
@@ -214,7 +214,7 @@ describe('BaselineApprovalCard', () => {
     })
 
     renderCard(<BaselineApprovalCard projectId="project-1" />)
-    const button = await screen.findByRole('button', { name: 'Approve plan & start work' })
+    const button = await screen.findByRole('button', { name: 'Approve traceability plan' })
     button.click()
 
     await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
@@ -233,7 +233,7 @@ describe('BaselineApprovalCard', () => {
     })
 
     renderCard(<BaselineApprovalCard projectId="project-1" />)
-    const button = await screen.findByRole('button', { name: 'Approve plan & start work' })
+    const button = await screen.findByRole('button', { name: 'Approve traceability plan' })
     button.click()
 
     expect(await screen.findByRole('alert')).toHaveProperty(
@@ -261,7 +261,7 @@ describe('BaselineApprovalCard', () => {
 
     expect(await screen.findByText('Draft — not active')).toBeTruthy()
     expect(screen.queryByRole('alert')).toBeNull()
-    expect(screen.queryByRole('button', { name: 'Approve plan & start work' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Approve traceability plan' })).toBeNull()
   })
 
   it('renders nothing while reconciliation is required, even with a newer draft present', async () => {

@@ -112,7 +112,7 @@ async function fetchBaseline(projectId: string): Promise<BaselineResponseWire | 
  * must all render success, never the stale-baseline failure F13 reported.
  * The server's own route performs the same check for the atomic command;
  * this is the client-side half of that contract, and it also covers the
- * separate "Start approved work" activation call. */
+ * separate traceability-plan activation call. */
 function isExactRevisionActive(baseline: BaselineResponseWire | null, revisionId: string) {
   return (
     baseline?.baseline.lifecycle === 'active' &&
@@ -134,16 +134,12 @@ function approvalErrorMessage(cause: unknown): string {
 /**
  * Pinned approval card for the Project Agent Chat.
  *
- * When the agent proposes an execution-baseline revision, the approval is the
- * single gate that starts autonomous work — so the request surfaces here, in
- * the chat, with a review dialog and a one-click approve-and-activate that
- * writes the durable approval receipt through the normal REST contract.
+ * When the agent proposes an execution-baseline revision, this optional
+ * traceability review surfaces in chat. The current approved Charter already
+ * authorizes implementation and Tasks continue according to their workflows.
  *
- * "Approve plan & start work" is one atomic, replay-exact server command
- * (D18/F13): approval, activation, governance promotion, receipt, and events
- * commit together, so a lost response can only ever replay the committed
- * success. "Start approved work" (an already-approved revision) stays the
- * separate exact replay-safe activation call.
+ * Approval and activation remain one atomic, replay-exact server command
+ * (D18/F13), so a lost response can only replay the committed result.
  */
 export function BaselineApprovalCard({
   projectId,
@@ -283,8 +279,8 @@ export function BaselineApprovalCard({
         }
       }
 
-      // step === 'activate': the already-approved "Start approved work"
-      // gesture keeps using the separate exact replay-safe activation call.
+      // step === 'activate': an already-approved traceability plan keeps
+      // using the separate exact replay-safe activation call.
       if (!approval)
         throw new Error('The approval receipt was not returned; refresh and try again.')
       const scope = `activate:${revision.id}`
@@ -417,10 +413,10 @@ export function BaselineApprovalCard({
 
   const stepLabel =
     step === 'approve'
-      ? 'Approve plan & start work'
+      ? 'Approve traceability plan'
       : step === 'approve_correction'
         ? 'Approve corrected plan'
-        : 'Start approved work'
+        : 'Activate traceability plan'
 
   return (
     <section
@@ -436,7 +432,9 @@ export function BaselineApprovalCard({
           <ClipboardText size={16} className="text-primary" aria-hidden />
           <div className="min-w-0">
             <p className="font-mono text-micro font-semibold uppercase tracking-[0.1em] text-primary">
-              {step === 'approve_correction' ? 'Plan repair · user approval' : 'Step 2 of 2 · Start building'}
+              {step === 'approve_correction'
+                ? 'Plan repair · user approval'
+                : 'Optional Task traceability'}
             </p>
             <h2
               id="baseline-approval-heading"
@@ -444,7 +442,7 @@ export function BaselineApprovalCard({
             >
               {step === 'approve_correction'
                 ? 'Approve the corrected implementation plan'
-                : 'Approve the implementation plan'}
+                : 'Review the Task traceability plan'}
             </h2>
           </div>
           <span className="rounded-full border border-border bg-muted/30 px-2 py-0.5 font-mono text-micro uppercase tracking-[0.08em] text-muted-foreground">
@@ -470,7 +468,7 @@ export function BaselineApprovalCard({
       <p className="mt-1.5 max-w-2xl text-xs leading-5 text-muted-foreground">
         {step === 'approve_correction'
           ? 'This approval records the exact corrected successor but does not activate it. The reconciliation review remains the explicit step that replaces the preserved invalid revision.'
-          : 'Your Project is already approved. This one action authorizes every Task covered by this exact plan to change the repository; Forge will not ask you to approve each Task.'}
+          : 'Your Project is already approved. This optional plan links Tasks, milestones, and evidence; approving it does not start or stop implementation. Each Task follows its configured workflow.'}
       </p>
       {actionError ? (
         <p className="mt-2 text-xs leading-5 text-destructive" role="alert">

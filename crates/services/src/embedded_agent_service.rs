@@ -385,7 +385,34 @@ impl EmbeddedAgentService {
                 "provider entry is disconnected",
             ));
         }
+        if !handle.enabled {
+            return Err(ServiceError::invalid_operation(
+                "provider entry is disabled; enable it before starting new work",
+            ));
+        }
         Ok(handle)
+    }
+
+    async fn require_profile_source_enabled(&self, profile: &AgentProfile) -> Result<()> {
+        let Some(credential_ref) = profile.credential_ref.as_deref() else {
+            return Ok(());
+        };
+        let handle = CredentialHandleRepo::get_credential_handle(&*self.db, credential_ref)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("referenced provider entry is unavailable")
+            })?;
+        if handle.status != "configured" {
+            return Err(ServiceError::invalid_operation(
+                "referenced provider entry is disconnected",
+            ));
+        }
+        if !handle.enabled {
+            return Err(ServiceError::invalid_operation(
+                "referenced provider entry is disabled",
+            ));
+        }
+        Ok(())
     }
 
     /// Make one minimal authenticated request against the entry's API to
@@ -776,6 +803,11 @@ impl EmbeddedAgentService {
                 "referenced provider entry is disconnected",
             ));
         }
+        if !handle.enabled {
+            return Err(ServiceError::invalid_operation(
+                "referenced provider entry is disabled",
+            ));
+        }
         if handle.credential_method != "api_key" {
             return Err(ServiceError::invalid_operation(
                 "referenced provider entry cannot drive a CLI harness",
@@ -847,6 +879,7 @@ impl EmbeddedAgentService {
             .await?
             .filter(|profile| profile.identity_id == identity.id)
             .ok_or_else(|| ServiceError::not_found("agent_profile", profile_id.clone()))?;
+        self.require_profile_source_enabled(&profile).await?;
         let canonical = self
             .authorize_scope(&input.actor_user_id, &identity, &input.scope)
             .await?;
@@ -894,6 +927,7 @@ impl EmbeddedAgentService {
             .await?
             .filter(|profile| profile.identity_id == identity.id)
             .ok_or_else(|| ServiceError::not_found("agent_profile", input.profile_id.clone()))?;
+        self.require_profile_source_enabled(&profile).await?;
         if profile.version != input.profile_version {
             return Err(ServiceError::invalid_operation(
                 "frozen Agent Chat Profile revision is no longer available",
@@ -2633,6 +2667,7 @@ mod tests {
             provider: "openai".to_owned(),
             label: "entry".to_owned(),
             status: "configured".to_owned(),
+            enabled: true,
             credential_method: method.to_owned(),
             metadata_json: metadata.to_owned(),
             version: 1,

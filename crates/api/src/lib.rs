@@ -830,6 +830,14 @@ pub fn api_router(state: AppState) -> Router {
                 .delete(routes::providers::delete_provider_entry),
         )
         .route(
+            "/api/v1/providers/{id}/availability",
+            patch(routes::providers::set_provider_entry_availability),
+        )
+        .route(
+            "/api/v1/providers/cli-runtimes/{daemon_id}/{executor_type}/availability",
+            patch(routes::providers::set_cli_runtime_availability),
+        )
+        .route(
             "/api/v1/providers/{id}/test",
             post(routes::providers::test_provider_entry),
         )

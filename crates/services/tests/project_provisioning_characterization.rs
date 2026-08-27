@@ -336,7 +336,7 @@ fn assigned_id(assignments: &[Value], role: &str) -> String {
 }
 
 #[tokio::test]
-async fn repository_success_creates_one_git_repo_link_and_distinct_roles() {
+async fn repository_success_creates_one_git_repo_link_and_usable_role_defaults() {
     let fixture = create_project(false).await;
     let (worker_a, _) = create_native_agent(&fixture.db, "Worker A").await;
     let (worker_b, _) = create_native_agent(&fixture.db, "Worker B").await;
@@ -393,7 +393,6 @@ async fn repository_success_creates_one_git_repo_link_and_distinct_roles() {
     assert_eq!(assignments.len(), 2);
     let coder = assigned_id(&assignments, "coder");
     let reviewer = assigned_id(&assignments, "reviewer");
-    assert_ne!(coder, reviewer, "a valid two-worker setup is independent");
     assert!([worker_a.as_str(), worker_b.as_str()].contains(&coder.as_str()));
     assert!([worker_a.as_str(), worker_b.as_str()].contains(&reviewer.as_str()));
 
@@ -583,7 +582,7 @@ async fn remote_repository_ready_backfill_is_verified_without_local_reprovisioni
 }
 
 #[tokio::test]
-async fn no_eligible_worker_returns_a_durable_setup_blocker() {
+async fn project_agent_can_fill_default_execution_roles() {
     let fixture = create_project(true).await;
     services::project_provisioning::provision_genesis_project(&fixture.db, &fixture.project.id)
         .await
@@ -594,19 +593,16 @@ async fn no_eligible_worker_returns_a_durable_setup_blocker() {
         .expect("Project reloads")
         .expect("Project remains present");
     assert!(project.primary_repo_id.is_some());
-    assert_eq!(role_assignments(&project.settings), Vec::<Value>::new());
+    let assignments = role_assignments(&project.settings);
+    assert_eq!(assignments.len(), 2);
     let operation = provisioning_operation(&fixture.db, &fixture.project.id).await;
-    assert_eq!(operation.status, "setup_required");
-    assert_eq!(operation.current_checkpoint, "repository_linked");
-    assert!(operation.retryable);
-    assert_eq!(
-        operation.last_error_code.as_deref(),
-        Some("worker_roles_required")
-    );
-    assert_eq!(
-        provisioning_error_codes(&fixture.db, &operation.id).await,
-        vec!["worker_roles_required".to_owned()]
-    );
+    assert_eq!(operation.status, "ready");
+    assert_eq!(operation.current_checkpoint, "completed");
+    assert!(!operation.retryable);
+    assert_eq!(operation.last_error_code, None);
+    assert!(provisioning_error_codes(&fixture.db, &operation.id)
+        .await
+        .is_empty());
     let coordinator_id = fixture
         .coordinator_identity_id
         .expect("coordinator fixture identity");
@@ -619,11 +615,13 @@ async fn no_eligible_worker_returns_a_durable_setup_blocker() {
     .await
     .expect("active Project binding reads");
     assert_eq!(binding_identity.as_deref(), Some(coordinator_id.as_str()));
+    assert_eq!(assigned_id(&assignments, "coder"), coordinator_id);
+    assert_eq!(assigned_id(&assignments, "reviewer"), coordinator_id);
     remove_path(&fixture.repo_path).await;
 }
 
 #[tokio::test]
-async fn one_worker_does_not_fall_back_to_self_review() {
+async fn configured_agents_may_fill_multiple_default_roles() {
     let fixture = create_project(true).await;
     let (worker_id, _) = create_native_agent(&fixture.db, "Only Worker").await;
 
@@ -636,31 +634,20 @@ async fn one_worker_does_not_fall_back_to_self_review() {
         .expect("Project reloads")
         .expect("Project remains present");
     let assignments = role_assignments(&project.settings);
-    assert_eq!(
-        assignments.len(),
-        1,
-        "the available Worker remains assigned"
-    );
-    assert_eq!(assigned_id(&assignments, "coder"), worker_id);
-    assert!(assignments.iter().all(|assignment| {
-        assignment.get("role_name").and_then(Value::as_str) != Some("reviewer")
-    }));
+    assert_eq!(assignments.len(), 2);
+    let coordinator_id = fixture
+        .coordinator_identity_id
+        .as_deref()
+        .expect("coordinator identity");
+    for role in ["coder", "reviewer"] {
+        let assigned = assigned_id(&assignments, role);
+        assert!([worker_id.as_str(), coordinator_id].contains(&assigned.as_str()));
+    }
     let operation = provisioning_operation(&fixture.db, &fixture.project.id).await;
-    assert_eq!(operation.status, "setup_required");
-    assert_eq!(operation.current_checkpoint, "repository_linked");
-    assert!(operation.retryable);
-    assert_eq!(
-        operation.last_error_code.as_deref(),
-        Some("independent_reviewer_required")
-    );
-    assert_eq!(
-        provisioning_error_codes(&fixture.db, &operation.id).await,
-        vec!["independent_reviewer_required".to_owned()]
-    );
-    assert_ne!(
-        worker_id,
-        fixture.coordinator_identity_id.unwrap_or_default()
-    );
+    assert_eq!(operation.status, "ready");
+    assert_eq!(operation.current_checkpoint, "completed");
+    assert!(!operation.retryable);
+    assert_eq!(operation.last_error_code, None);
 
     remove_path(&fixture.repo_path).await;
 }
@@ -760,7 +747,8 @@ async fn active_lease_is_not_stolen_but_expired_lease_is_reclaimed() {
         "UPDATE project_provisioning_operation
          SET status = 'provisioning', attempt_count = 0,
              lease_owner = 'other-process', lease_expires_at = ?,
-             retryable = 1, version = version + 1, updated_at = ?
+             retryable = 1, completed_at = NULL,
+             version = version + 1, updated_at = ?
          WHERE project_id = ?",
     )
     .bind(&active_expiry)

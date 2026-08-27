@@ -1047,7 +1047,7 @@ pub struct ApproveProjectExecutionBaselineCommand {
 /// Activation command composite.  The paired milestone/definition manifests
 /// are supplied by the service after it has revalidated the frozen manifest;
 /// SQLite rechecks ownership/currentness while holding its write lock before
-/// promoting milestones and Task governance.
+/// activating the traceability record and its milestone projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivateProjectExecutionBaselineCommand {
     pub project_id: String,
@@ -1068,13 +1068,13 @@ pub struct ActivateProjectExecutionBaselineCommand {
     pub action_execution: Option<CreateAgentActionExecution>,
 }
 
-/// Atomic "approve plan and start work" command composite (D18, F13).  The
+/// Atomic baseline-review acceptance command composite (D18, F13). The
 /// service has already validated the exact persisted proposed review target
 /// and interactive-user authorization; this record commits the approval,
-/// activation, milestone/Task-governance promotion, durable events, and one
+/// activation, milestone projection, durable events, and one
 /// command receipt in a single transaction. Only a freshly proposed baseline
 /// (never a re-approval of an already-active one) may use this command; the
-/// already-approved "Start approved work" gesture keeps using the separate
+/// already-approved activation gesture keeps using the separate
 /// exact replay-safe `activate_project_execution_baseline_command`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApproveAndActivateProjectExecutionBaselineCommand {
@@ -1771,7 +1771,7 @@ pub struct CreatedProjectFromCharterApproval {
 pub trait ProjectOrchestrationRepo: Send + Sync {
     /// Atomically apply one bounded split/sequence/replace Task command.
     /// Implementations must resolve the command receipt before mutable reads,
-    /// then perform the exact adaptive-baseline gate, source Task/version CAS,
+    /// then verify current-Charter traceability, source Task/version CAS,
     /// board CAS, governance insertion, event, and receipt in one writer
     /// transaction.
     async fn apply_adaptive_task_command(
@@ -2193,14 +2193,14 @@ pub trait ProjectOrchestrationRepo: Send + Sync {
         input: ApproveProjectExecutionBaselineCommand,
     ) -> Result<ProjectExecutionBaselineApprovalRecord>;
     /// Atomically consume the exact approval receipt, activate the baseline,
-    /// promote milestones/Task governance, and append event/command receipt.
+    /// update milestone projection, and append event/command receipt.
     async fn activate_project_execution_baseline_command(
         &self,
         input: ActivateProjectExecutionBaselineCommand,
     ) -> Result<ProjectExecutionBaselineRecord>;
     /// Atomically approve and activate the exact freshly proposed revision in
-    /// one transaction/receipt: approval, activation, milestone/Task
-    /// governance promotion, and both durable events commit or roll back
+    /// one transaction/receipt: approval, activation, milestone projection,
+    /// and both durable events commit or roll back
     /// together (D18, F13).
     async fn approve_and_activate_project_execution_baseline_command(
         &self,
@@ -2367,303 +2367,4 @@ pub trait ProjectOrchestrationRepo: Send + Sync {
             "Release persistence is not wired".to_owned(),
         ))
     }
-}
-
-/// Promote preplanned Task governance inside a baseline-activation
-/// transaction.
-///
-/// This is the single shared implementation behind both activation surfaces
-/// (the REST route and `ProjectOrchestrationRepo::activate_project_execution_baseline`).
-/// It mirrors the server-side governance derivation used for new Task
-/// proposals (`derive_active_baseline_governance` in the services crate):
-/// a Task is bound to the exact activated baseline revision, its plan item,
-/// and its milestone (falling back to the baseline's primary milestone).
-///
-/// Two classes of preplanned Tasks are promoted:
-/// 1. Governance rows already bound to the activated `(baseline, revision)`
-///    pair flip to `runnable = 1`.
-/// 2. Non-terminal Tasks whose governance row names a plan item present in
-///    the activated revision but is bound to no baseline (or a stale one)
-///    are re-bound to the activated revision. Governance links are immutable
-///    by trigger, so the stale row is replaced rather than updated; the
-///    replacement becomes runnable only for repository-backed Tasks, exactly
-///    like a fresh proposal would.
-///
-/// The database runnable-guard triggers re-validate every promotion against
-/// the active baseline, current Charter, and the exact user approval receipt,
-/// so this pass can never mint authority the triggers would refuse.
-pub async fn promote_baseline_task_governance_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    project_id: &str,
-    baseline_id: &str,
-    revision_id: &str,
-    now: &str,
-) -> Result<u64> {
-    use sqlx::Row as _;
-
-    let Some(revision) = sqlx::query(
-        "SELECT r.charter_revision_id, r.plan_items_json, r.milestone_id,
-                r.milestone_ids_json, r.milestone_definition_revision_ids_json,
-                r.primary_milestone_id, r.content_digest, r.rendered_digest,
-                r.adaptive_envelope_json
-         FROM project_execution_baseline_revision r
-         JOIN project_execution_baseline b
-           ON b.id = r.baseline_id AND b.project_id = ?
-         WHERE r.id = ? AND r.baseline_id = ?
-           AND b.lifecycle = 'active' AND b.current_revision_id = r.id
-           AND r.lifecycle = 'approved'",
-    )
-    .bind(project_id)
-    .bind(revision_id)
-    .bind(baseline_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    else {
-        return Ok(0);
-    };
-    let charter_revision_id: String = revision.try_get("charter_revision_id")?;
-    let plan_items_json: String = revision.try_get("plan_items_json")?;
-    let revision_milestone_id: Option<String> = revision.try_get("milestone_id")?;
-    let milestone_ids_json: String = revision.try_get("milestone_ids_json")?;
-    let milestone_definition_revision_ids_json: String =
-        revision.try_get("milestone_definition_revision_ids_json")?;
-    let primary_milestone_id: Option<String> = revision.try_get("primary_milestone_id")?;
-    let content_digest: String = revision.try_get("content_digest")?;
-    let rendered_digest: String = revision.try_get("rendered_digest")?;
-    let adaptive_envelope_json: String = revision.try_get("adaptive_envelope_json")?;
-
-    // Nothing is promotable without the current Charter and the exact user
-    // approval receipt the runnable-guard triggers demand.
-    let admitted: i64 = sqlx::query_scalar(
-        "SELECT EXISTS (
-             SELECT 1 FROM project
-             WHERE id = ? AND charter_status = 'charter_backed'
-               AND charter_setup_required = 0
-               AND current_charter_revision_id = ?
-         ) AND EXISTS (
-             SELECT 1 FROM project_execution_baseline_approval
-             WHERE baseline_id = ? AND revision_id = ?
-               AND principal_type = 'user'
-               AND authorization_action = 'project.execution_baseline.approve'
-               AND length(trim(authorization_basis)) > 0
-               AND length(trim(authorization_occurred_at)) > 0
-               AND length(trim(explicit_event)) > 0
-               AND content_digest = ? AND rendered_digest = ?
-               AND lifecycle IN ('active', 'consumed')
-         )",
-    )
-    .bind(project_id)
-    .bind(&charter_revision_id)
-    .bind(baseline_id)
-    .bind(revision_id)
-    .bind(&content_digest)
-    .bind(&rendered_digest)
-    .fetch_one(&mut **tx)
-    .await?;
-    if admitted != 1 {
-        return Ok(0);
-    }
-
-    // 1) Preplanned Tasks already bound to this exact baseline revision.
-    let flipped = sqlx::query(
-        "UPDATE project_task_governance
-         SET runnable = 1, version = version + 1, updated_at = ?
-         WHERE project_id = ? AND baseline_id = ? AND baseline_revision_id = ?
-           AND charter_revision_id = ? AND runnable = 0",
-    )
-    .bind(now)
-    .bind(project_id)
-    .bind(baseline_id)
-    .bind(revision_id)
-    .bind(&charter_revision_id)
-    .execute(&mut **tx)
-    .await?
-    .rows_affected();
-
-    // 2) Non-terminal Tasks that reference a plan item the activated revision
-    //    includes, but whose governance row predates the activation.
-    let plan_item_ids = plan_item_identifiers(&plan_items_json);
-    let mut rebound = 0_u64;
-    if !plan_item_ids.is_empty() {
-        let candidates = sqlx::query(
-            "SELECT g.task_id, g.plan_item_id, g.milestone_id,
-                    g.document_revisions_json, g.capability_class, g.risk_class,
-                    g.replacement_of_task_id, g.provenance_json, g.created_at,
-                    (t.repo_id IS NOT NULL) AS repository_capable
-             FROM project_task_governance g
-             JOIN task t ON t.id = g.task_id AND t.project_id = g.project_id
-             WHERE g.project_id = ?
-               AND g.plan_item_id IS NOT NULL
-               AND NOT (g.baseline_id IS ? AND g.baseline_revision_id IS ?)
-               AND t.deleted_at IS NULL
-               AND t.status NOT IN ('done', 'cancelled')",
-        )
-        .bind(project_id)
-        .bind(baseline_id)
-        .bind(revision_id)
-        .fetch_all(&mut **tx)
-        .await?;
-        let plan_items: serde_json::Value =
-            serde_json::from_str(&plan_items_json).unwrap_or(serde_json::Value::Null);
-        let milestone_ids: serde_json::Value =
-            serde_json::from_str(&milestone_ids_json).unwrap_or(serde_json::Value::Null);
-        for candidate in candidates {
-            let plan_item_id: String = candidate.try_get("plan_item_id")?;
-            if !plan_item_ids.iter().any(|id| id == &plan_item_id) {
-                continue;
-            }
-            let task_id: String = candidate.try_get("task_id")?;
-            let old_milestone_id: Option<String> = candidate.try_get("milestone_id")?;
-            let milestone_id = old_milestone_id
-                .filter(|id| {
-                    revision_milestone_id.as_deref() == Some(id.as_str())
-                        || primary_milestone_id.as_deref() == Some(id.as_str())
-                        || json_names_identifier(&milestone_ids, id)
-                        || json_names_identifier(&plan_items, id)
-                })
-                .or_else(|| primary_milestone_id.clone());
-            let repository_capable: i64 = candidate.try_get("repository_capable")?;
-            let provenance_json = rebound_provenance_json(
-                &candidate.try_get::<String, _>("provenance_json")?,
-                &plan_item_id,
-                baseline_id,
-                revision_id,
-                &content_digest,
-                &rendered_digest,
-                &adaptive_envelope_json,
-                &milestone_definition_revision_ids_json,
-            )?;
-            // Governance links are immutable by trigger: replace the stale
-            // row inside the activation transaction instead of updating it.
-            sqlx::query("DELETE FROM project_task_governance WHERE task_id = ? AND project_id = ?")
-                .bind(&task_id)
-                .bind(project_id)
-                .execute(&mut **tx)
-                .await?;
-            sqlx::query(
-                "INSERT INTO project_task_governance
-                 (task_id, project_id, charter_revision_id, baseline_id,
-                  baseline_revision_id, plan_item_id, milestone_id,
-                  document_revisions_json, capability_class, risk_class,
-                  runnable, replacement_of_task_id, provenance_json,
-                  version, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
-            )
-            .bind(&task_id)
-            .bind(project_id)
-            .bind(&charter_revision_id)
-            .bind(baseline_id)
-            .bind(revision_id)
-            .bind(&plan_item_id)
-            .bind(milestone_id.as_deref())
-            .bind(candidate.try_get::<String, _>("document_revisions_json")?)
-            .bind(candidate.try_get::<Option<String>, _>("capability_class")?)
-            .bind(candidate.try_get::<Option<String>, _>("risk_class")?)
-            .bind(if repository_capable == 1 {
-                1_i64
-            } else {
-                0_i64
-            })
-            .bind(candidate.try_get::<Option<String>, _>("replacement_of_task_id")?)
-            .bind(&provenance_json)
-            .bind(candidate.try_get::<String, _>("created_at")?)
-            .bind(now)
-            .execute(&mut **tx)
-            .await?;
-            rebound += 1;
-        }
-    }
-    Ok(flipped + rebound)
-}
-
-/// The plan-item identifiers a baseline revision covers. The canonical shape
-/// is `[{"id": "..."}]`; plain strings and `plan_item_id` keys are accepted
-/// for parity with the proposal-side identifier matching.
-fn plan_item_identifiers(plan_items_json: &str) -> Vec<String> {
-    let Ok(serde_json::Value::Array(items)) =
-        serde_json::from_str::<serde_json::Value>(plan_items_json)
-    else {
-        return Vec::new();
-    };
-    items
-        .iter()
-        .filter_map(|item| match item {
-            serde_json::Value::String(id) => Some(id.clone()),
-            serde_json::Value::Object(map) => map
-                .get("id")
-                .or_else(|| map.get("plan_item_id"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
-            _ => None,
-        })
-        .filter(|id| !id.trim().is_empty())
-        .collect()
-}
-
-/// Recursive identifier containment matching the proposal-side
-/// `json_contains_identifier` semantics.
-fn json_names_identifier(value: &serde_json::Value, identifier: &str) -> bool {
-    match value {
-        serde_json::Value::String(value) => value == identifier,
-        serde_json::Value::Array(values) => values
-            .iter()
-            .any(|value| json_names_identifier(value, identifier)),
-        serde_json::Value::Object(values) => {
-            ["id", "plan_item_id", "document_revision_id", "milestone_id"]
-                .iter()
-                .any(|key| values.get(*key).and_then(serde_json::Value::as_str) == Some(identifier))
-                || values
-                    .values()
-                    .any(|value| json_names_identifier(value, identifier))
-        }
-        _ => false,
-    }
-}
-
-/// The authoritative provenance envelope for a re-bound governance row,
-/// mirroring the proposal-side `build_provenance` shape.
-#[allow(clippy::too_many_arguments)]
-fn rebound_provenance_json(
-    existing: &str,
-    plan_item_id: &str,
-    baseline_id: &str,
-    revision_id: &str,
-    content_digest: &str,
-    rendered_digest: &str,
-    adaptive_envelope_json: &str,
-    milestone_definition_revision_ids_json: &str,
-) -> Result<String> {
-    use sha2::Digest as _;
-
-    let mut map = match serde_json::from_str::<serde_json::Value>(existing) {
-        Ok(serde_json::Value::Object(map)) => map,
-        _ => serde_json::Map::new(),
-    };
-    map.remove("baseline_pending");
-    for (key, value) in [
-        ("origin_plan_item_id", plan_item_id),
-        ("governing_baseline_id", baseline_id),
-        ("governing_baseline_revision_id", revision_id),
-        ("governing_baseline_content_digest", content_digest),
-        ("governing_baseline_rendered_digest", rendered_digest),
-    ] {
-        map.insert(key.to_owned(), serde_json::Value::String(value.to_owned()));
-    }
-    map.insert(
-        "adaptive_envelope_digest".to_owned(),
-        serde_json::Value::String(hex::encode(sha2::Sha256::digest(
-            adaptive_envelope_json.as_bytes(),
-        ))),
-    );
-    map.insert(
-        "governing_milestone_definition_revision_ids".to_owned(),
-        serde_json::from_str(milestone_definition_revision_ids_json)
-            .unwrap_or(serde_json::Value::Array(Vec::new())),
-    );
-    map.insert(
-        "schema".to_owned(),
-        serde_json::Value::String("forge.task-governance/v1".to_owned()),
-    );
-    serde_json::to_string(&serde_json::Value::Object(map))
-        .map_err(|error| crate::DbError::Check(error.to_string()))
 }

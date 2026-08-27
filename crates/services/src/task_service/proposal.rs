@@ -398,7 +398,7 @@ impl TaskService {
             ));
         }
         let derived_governance = self
-            .derive_active_baseline_governance(&project_id, &payload, &task_type)
+            .derive_task_governance(&project_id, &payload, &task_type)
             .await?;
         let governance = payload.clone().normalized_governance(derived_governance);
         // A proposal with a parent is an adaptive split even when the
@@ -808,18 +808,16 @@ impl TaskService {
         Ok(())
     }
 
-    async fn derive_active_baseline_governance(
+    async fn derive_task_governance(
         &self,
         project_id: &str,
         payload: &TaskProposalPayload,
         task_type: &str,
     ) -> Result<Option<api_types::TaskGovernanceRequest>> {
-        // A read-only planning/discovery Task with no baseline references may
-        // still use the explicit pre-baseline lane. Once the proposal names a
-        // plan item or milestone, however, that traceability must be retained
-        // even when the selected capability is read-only. Otherwise a valid
-        // verification Task is materialized as an ungoverned placeholder and
-        // can never pass the repository runnable gate.
+        // Every implementation Task binds to the current Charter. Optional
+        // active-baseline plan-item or milestone references are preserved as
+        // traceability; they do not authorize the Task or decide whether it
+        // can run.
         let execution_class =
             classify_task_execution(task_type, payload.capability_class.as_deref())?;
         let requests_baseline_traceability =
@@ -827,7 +825,7 @@ impl TaskService {
         let has_governance_shorthand = requests_baseline_traceability
             || payload.capability_class.is_some()
             || payload.risk_class.is_some();
-        if !execution_class.requires_baseline() && !has_governance_shorthand {
+        if !execution_class.is_implementation() && !has_governance_shorthand {
             return Ok(None);
         }
         let charter_revision_id: Option<String> = sqlx::query_scalar(
@@ -842,7 +840,7 @@ impl TaskService {
         let Some(charter_revision_id) = charter_revision_id else {
             return Ok(None);
         };
-        let row = if execution_class.requires_baseline() || requests_baseline_traceability {
+        let row = if requests_baseline_traceability {
             sqlx::query(
                 "SELECT b.id, b.current_revision_id, r.primary_milestone_id
              FROM project_execution_baseline b

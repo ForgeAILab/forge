@@ -262,6 +262,13 @@ reports whether remote provider revocation was `not_supported`, `succeeded`, or
 controls. Refresh tokens rotate inside encrypted storage and are never returned
 by a read endpoint.
 
+The `Providers` tab also provides reversible availability switches. Disable a
+provider entry to disable every Agent using that credential, disable one exact
+daemon/CLI runtime to stop only that installation, or pause an individual Agent
+from the `Agents` tab. Re-enable the same row to restore it; configuration,
+credentials, bindings, and history are preserved. Forge considers only enabled,
+healthy sources when selecting Main, Project, Worker, or reviewer Agents.
+
 ## Main Chat and the Project Agent Workspace
 
 The approved product model has one global Main Agent binding/chat per account
@@ -358,18 +365,17 @@ Use **Continue with Project Agent** to open the Project Chat. The handoff is
 visible there as a bounded, provenance-linked message. It contains approved
 discovery references, not credentials, hidden Main history, or Main authority.
 
-Forge asks for two different user decisions during this flow, not repeated
-approval of the same thing:
+Forge asks for two different user decisions during Product creation, not
+repeated approval of the same thing:
 
-1. **Approve the Project Charter** — create this Project with this outcome and
-   Project Agent.
-2. **Approve plan & start work** — allow the Worker/reviewer Tasks covered by
-   the exact implementation plan to change the repository.
+1. **Approve the Project Charter** — approve this exact outcome, scope, and
+   Project Agent selection.
+2. **Create Project and hand off** — explicitly consume that receipt to create
+   the Project and start its Project Agent.
 
-The second decision is Project-wide for the approved plan. Forge does not ask
-for another approval for each covered Task. A Task created before that decision
-stays visible and links directly to **Approve plan & start work**; it does not
-need to be recreated.
+After creation, the approved Charter is implementation authority. Forge does
+not ask for setup, plan, or per-Task implementation approval. Each Task follows
+its configured workflow and review mode.
 
 ### 3. Read the three readiness dimensions
 
@@ -380,14 +386,15 @@ independent dimensions:
 | Dimension | What it answers | Important states |
 | --- | --- | --- |
 | `coordination_state` | Can the singular Project Chat admit a turn? | `ready`, `setup_required`, `unavailable` |
-| `execution_setup_state` | Are the repository and required Worker/reviewer principals ready? | `provisioning`, `ready`, `setup_required`, `failed`, `unavailable` |
-| `execution_gate` | What does the current baseline permit? | `pre_baseline_read_only`, `baseline_approval_required`, `active`, `reconciliation_required`, `unavailable` |
+| `execution_setup_state` | Is the repository ready? Project Worker/reviewer choices are optional defaults. | `provisioning`, `ready`, `setup_required`, `failed`, `unavailable` |
+| `execution_gate` | Is Charter-backed execution available? Legacy baseline states are display compatibility only. | normally `active`; `unavailable` only when the projection cannot be read |
 
-Project creation can therefore succeed while execution setup is
-`provisioning` or `setup_required`. A ready Project Chat only means planning
-turns are available. A ready execution setup still does not grant repository
-write access until an approved baseline is active. Check each dimension's
-`availability` and `setup_requirements`; never infer one from another.
+Project creation can therefore succeed while repository setup is
+`provisioning` or `setup_required`. Project Agent coordination is useful but
+optional for Task execution. Once the repository is ready, the approved Charter
+authorizes implementation; Task assignments and workflow states decide what
+runs. Check each dimension's `availability`; never infer a successful read from
+another dimension.
 
 ### 4. Select Worker/reviewer defaults and a repository
 
@@ -407,22 +414,18 @@ POST /api/v1/projects/{id}/execution-setup/repository
 {"repo_id":"<repo>","expected_project_version":<version>,"idempotency_key":"..."}
 ```
 
-Forge excludes the active Main and Project Agent identities from Task Workspace
-roles. This setup path chooses defaults and currently prefers a different
-eligible reviewer identity from the Worker. Those selections seed Tasks; they
-do not lock individual Task execution. On a Task, you may explicitly assign any
-enabled, available Project Task agent to Worker or reviewer, including the same
-identity for both roles. Selecting or confirming a role after that role's
+This setup path chooses optional defaults. Those selections seed Tasks; they do
+not lock individual Task execution. On a Task, you may explicitly assign any
+enabled, available configured Agent to Worker or reviewer, including the active
+Main Agent, the Project Agent, and the same identity for both roles. Selecting
+or confirming a role after that role's
 attempt failed also starts one fresh attempt; there is no extra Resume approval.
 A read-only reviewer who needs to make a correction still needs Worker
 authority for the write.
 
-If a required Worker or reviewer default is missing, the projection remains
-`execution_setup_state: setup_required` and names the missing role. Create or
-connect an account-owned agent in Agent Settings, then refresh the projection
-and select it. Individual Tasks may reuse any eligible execution identity for
-both roles. No coordinator is silently promoted to “make the Project
-executable.”
+A missing Worker or reviewer default does not keep the Project in setup. Assign
+an enabled Agent on the Task when its workflow reaches that role. Project
+defaults remain convenient bulk choices and can be changed at any time.
 
 ### 5. Repository provisioning and setup recovery
 
@@ -461,12 +464,12 @@ next turn therefore affects that turn; a queued or leased turn keeps the Profile
 that it was admitted with. This is why a Profile change does not require
 rebinding the Project Chat.
 
-The Project Agent acknowledges the handoff, creates the needed typed Documents
-and milestone definitions, and drafts one execution baseline. The baseline is
-the contract for repository-capable work; it must reference the exact Charter,
-governing Document revisions, plan items, milestone and definition revisions,
-acceptance/evidence matrix, capability/risk classes, reviewer independence
-rules, release policy, and adaptive/rollback envelope.
+The Project Agent acknowledges the handoff, chooses useful defaults, creates
+the first Tasks, and lets their workflows dispatch. It may also draft an
+execution baseline as an optional traceability snapshot linking the exact
+Charter, Documents, plan items, milestones, acceptance/evidence, release policy,
+and rollback information. That snapshot is useful for review and release
+evidence, but it does not authorize implementation.
 
 Baseline lifecycle is intentionally four separate operations:
 
@@ -484,61 +487,57 @@ Baseline lifecycle is intentionally four separate operations:
 4. **Activate.** The same user calls `POST .../execution-baseline/{baseline_id}/activate`
    with the exact `baseline_id`, `revision_id`, `approval_id`, expected Project
    and baseline versions, and digests. Activation atomically advances the active
-   pointer, promotes matching preplanned Tasks, updates reconciliation state,
-   and emits the activation event. A Project Agent action or chat sentence
-   cannot approve or activate a baseline.
+   traceability pointer and emits the activation event; it never changes Task
+   runnable state. A Project Agent action or chat sentence cannot approve or
+   activate a baseline.
 
-The web interface combines steps 3 and 4 behind one explicit **Approve plan &
-start work** action after showing the exact revision. The two server operations
-remain separate for atomic authorization and activation, but they are not two
-user approval prompts.
+The web interface combines steps 3 and 4 behind **Approve traceability plan**.
+Skipping it does not stop Tasks. If the optional traceability revision cannot be
+approved or activated, use its version/digest diagnostics without treating the
+problem as an execution blocker:
 
-Until step 4, `execution_gate` remains read-only or approval-required. If a
-baseline is not executable, use the state and corrective fields rather than
-trying to dispatch around them:
-
-- `baseline_approval_required`: inspect the exact approval target, approve it,
-  then activate it; proposal success is not activation.
+- `baseline_approval_required`: a legacy projection may still report this;
+  implementation continues from the Charter while the optional plan is reviewed.
 - `version_conflict` or `digest_conflict`: refresh the Project/baseline
   projection, compare the current Charter, Documents, milestones, and setup,
   and re-propose from the current revision. Retry the same idempotency key only
   for a lost response to the identical command.
-- `reconciliation_required`: resolve the named stale/missing Charter,
-  Document, milestone, repository, role, or policy input, then create a new
-  exact proposal. Do not edit an immutable proposed revision in place.
+- `reconciliation_required`: open the plain-language reconciliation card. It
+  states the replacement effect and offers **Accept** or **Reject**; technical
+  record details stay collapsed.
 - `setup_required` or `unavailable`: complete or refresh execution setup first;
   a missing Worker/reviewer/repository must not be disguised as a baseline
   problem.
 
 ### 7. Traceable Task execution, review, and Project Agent wake
 
-After setup is `ready` and the baseline gate is `active`, the Project Agent
-creates implementation Tasks in the bound Project through
-`POST /api/v1/projects/{id}/tasks`. Each Task is linked to its Charter revision,
-active baseline/revision, stable plan-item identity, milestone, relevant
-Document revisions, capability class, risk class, and provenance. An
-implementation-shaped Task created before baseline activation may be retained as
-a non-runnable plan, but it cannot receive a repository write lease.
+After Project creation, the Project Agent creates implementation Tasks in the
+bound Project through `POST /api/v1/projects/{id}/tasks`. Each Task is linked to
+the current approved Charter. Baseline/revision, plan-item, milestone, and
+Document links are optional traceability.
 
-When setup, baseline, dependencies, and the current Task version all pass, the
+When repository setup, dependencies, assignment, workflow, source availability,
+and the current Task version all pass, the
 scheduler assigns the selected Worker and issues one Task-scoped Workspace
 lease. `POST /api/v1/tasks/{id}/start`/`resume` and normal workflow scheduling
-use the same admission checks. Main and Project Chat identities never receive
-that lease. Inspect the linked Task, transitions, executions, and Workspace
+use the same admission checks. An Agent serving as Main or Project Agent may
+also receive that lease when explicitly assigned, but the Task session is
+isolated from its chat session. Inspect the linked Task, transitions, executions, and Workspace
 diff through `GET /api/v1/tasks/{id}`, `GET /api/v1/tasks/{id}/transitions`,
 `GET /api/v1/tasks/{id}/executions`, and
 `GET /api/v1/tasks/{id}/diff`.
 
 The normal workflow moves work through its configured active state into review
-and delivery (`working → review → merging → done` in the autonomous preset).
-Review guards run the configured checks. Depending on the active workflow and
-baseline, Forge requests an independent reviewer attestation or an awaiting-
-human approval; remediation is always a separate Worker assignment. The
+and delivery. Choose **Agent review** (`default`), **No review**, or **Human
+required**; `autonomous_v1` remains a compatibility preset. Review guards run
+the configured checks. In human-required mode, either the user or the bound
+Project Agent may accept or reject. A Task may override the Project default. The
 execution record exposes owner health, lease expiry/hard deadline, heartbeat,
 and semantic progress separately. A quiet provider/tool call remains healthy
 while its owner lease is current, and a hard deadline still bounds it.
 
-Terminal execution events feed Attention and the durable `agent-wake-turns`
+Terminal execution events—including explicit stops and cancellations—feed
+Attention and the durable `agent-wake-turns`
 consumer. A relevant Project incident is recorded as exactly one of
 `turn_admitted`, `deterministically_suppressed`, `deferred`, or
 `setup_required`. An admitted wake uses the same responder resolver, current
@@ -548,8 +547,8 @@ chat was temporarily unavailable. The Project Chat shows the resulting wake
 turn, task outcome, review request, or durable retry/setup action.
 
 The resulting audit trail is intentionally traceable: Charter revision and
-digests → approval receipt → Project/handoff/target turn IDs → setup and
-provisioning operation → baseline revision/approval/activation → Task governance
+digests → approval receipt → Project-creation confirmation/handoff/target turn
+IDs → setup and provisioning operation → optional baseline revision/approval/activation → Task governance
 and transitions → Worker execution/Workspace lease → checks/review → Attention
 and wake disposition. Preserve these IDs when diagnosing a response loss or
 conflict; they are the links between chat, Project truth, and repository work.
@@ -559,15 +558,15 @@ conflict; they are the links between chat, Project truth, and repository work.
 | Symptom | What it means | Safe next action |
 | --- | --- | --- |
 | `coordination_state: setup_required` | Main/Project binding or Chat admission is incomplete | Fix the authorized binding/Profile in Agent Settings, then refresh the Chat; no turn is fabricated. |
-| Missing Worker | No eligible Task Worker exists | Create/connect a separate Worker identity, select it in Execution readiness, and retry setup. |
-| Missing reviewer default | Automatic Project setup has not selected a reviewer default | Select another eligible identity for the Project default, or explicitly assign any eligible Task agent on the Task; a separate release-attestation policy may still require independent evidence. |
+| Missing Worker | The Task's current workflow role has no enabled Agent assignment | Assign any enabled configured Agent on the Task; it may also be Main or Project Agent. |
+| Missing reviewer default | No Project-wide reviewer default is selected | Nothing is blocked until a Task workflow needs the role; assign any enabled Agent on that Task, including its Worker. |
 | `execution_setup_state: provisioning` | Durable setup is still reconciling | Refresh the projection; wait for `ready` or follow the recorded retry action. |
 | `execution_setup_state: failed` | A checkpoint stopped with a typed error | Fix the recorded cause and retry the same provisioning operation with its current version and a new idempotency key. |
-| `execution_gate: baseline_approval_required` | The Project exists and setup is ready, but repository work has not been authorized | Use **Approve plan & start work** once; every Task covered by that exact plan can then run without per-Task approval. |
+| `execution_gate: baseline_approval_required` | A legacy projection is showing optional plan review | Review it with **Approve traceability plan** if useful; Task execution already follows the approved Charter. |
 | `version_conflict`, `digest_conflict`, or stale projection | Another command changed the authoritative revision | Refetch current state and re-propose/retry with the correct version; do not overwrite immutable history. |
 | Wake `deferred` or `setup_required` | Delivery could not safely admit a turn yet | Follow the durable retry/setup action; the event remains traceable and is reconsidered after state changes. |
-| `execution_gate: reconciliation_required` | Two authoritative records disagree, or the active governing baseline is itself invalid | Open Project Overview and choose the plain-language action. For a historical baseline repair, **Accept update & resume work** approves and applies the server-prepared correction in one click; there is no second plan approval. Only a Project-wide governing conflict stops unrelated work — a Task-scoped one blocks only that Task. |
-| `policy_denied` on an adaptive command | The verb is valid but an explicitly restricted approved plan did not grant it | Broaden the successor baseline and approve it. New Project Agent plans grant `split`, `sequence`, and `replace` by default; later settings may narrow them. This denial creates no conflict. |
+| `execution_gate: reconciliation_required` | Two traceability records disagree, or the active plan is invalid | Open Project Overview, read the one-sentence replacement effect, then choose **Accept** or **Reject**. Task-scoped conflicts remain scoped and do not freeze unrelated work. |
+| An adaptive split/sequence/replace is needed | The Task shape no longer fits the work | The Project Agent can use any of the three operations under the current Charter; optional plan operation lists do not grant or deny them. |
 | `validation_error` naming `adaptive_envelope.allowed_task_operations` | A plan tried to grant something outside `split`, `sequence`, `replace` | Correct the envelope to those verbs. Command names such as `task.propose` are not adaptive verbs. |
 | A blocked Task showing "implementation committed" | Work is committed and waiting on review, not unstarted | Follow the single next action on the Task's blocker; progress language is derived from real attempt/commit evidence and never regresses to "not started". |
 

@@ -129,9 +129,9 @@
       "gate_config": {
         "reject_target": "planning",
         "max_rejections": 2,
-        "approve_label": "Approve plan",
-        "reject_label": "Reject plan",
-        "requires_user_approval": true,
+        "approve_label": "Continue to implementation",
+        "reject_label": null,
+        "requires_user_approval": false,
         "optional_when_unassigned": true
       },
       "dispatch": {

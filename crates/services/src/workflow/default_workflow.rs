@@ -215,9 +215,12 @@ pub fn default_workflow() -> WorkflowDefinition {
             state.gate_config = Some(GateConfig {
                 reject_target: Some(default_states::PLANNING.to_string()),
                 max_rejections: Some(2),
-                approve_label: Some("Approve plan".to_string()),
-                reject_label: Some("Reject plan".to_string()),
-                requires_user_approval: Some(true),
+                approve_label: Some("Continue to implementation".to_string()),
+                reject_label: None,
+                // Charter approval authorizes implementation. Planning may
+                // still run as an Agent role, but it is not another human
+                // approval boundary.
+                requires_user_approval: Some(false),
                 optional_when_unassigned: Some(true),
             });
             state.triggers.insert(

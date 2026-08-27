@@ -354,8 +354,8 @@ fn is_yaml_path(path: &Path) -> bool {
 
 fn builtin_default_template() -> TemplateDocument {
     TemplateDocument {
-        display_name: "Default".to_owned(),
-        description: "Standard workflow with planning, review, and merge gates".to_owned(),
+        display_name: "Agent review".to_owned(),
+        description: "Plan, implement, then let the assigned reviewer Agent review".to_owned(),
         definition: default_workflow(),
     }
 }
@@ -369,47 +369,49 @@ fn builtin_autonomous_v1_template() -> TemplateDocument {
     }
 }
 
-fn builtin_user_approval_review_template() -> TemplateDocument {
+fn builtin_human_required_template() -> TemplateDocument {
     let mut definition = default_workflow();
-    if let Some(gate_config) = definition
+    if let Some(review) = definition
         .states
         .iter_mut()
         .find(|state| state.name == crate::workflow::default_states::REVIEW)
-        .and_then(|state| state.gate_config.as_mut())
     {
-        gate_config.requires_user_approval = Some(true);
+        review.role = None;
+        review.dispatch = None;
+        if let Some(gate_config) = review.gate_config.as_mut() {
+            gate_config.requires_user_approval = Some(true);
+            gate_config.optional_when_unassigned = Some(false);
+            gate_config.approve_label = Some("Accept".to_owned());
+            gate_config.reject_label = Some("Reject".to_owned());
+        }
     }
 
     TemplateDocument {
-        display_name: "User Approval Review".to_owned(),
-        description: "Default workflow that requires user approval before merging".to_owned(),
+        display_name: "Human required".to_owned(),
+        description: "Wait for the user or the bound Project Agent to accept or reject".to_owned(),
         definition,
     }
 }
 
-fn builtin_no_user_approval_template() -> TemplateDocument {
+fn builtin_no_review_template() -> TemplateDocument {
     let mut definition = default_workflow();
-    if let Some(gate_config) = definition
-        .states
-        .iter_mut()
-        .find(|state| state.name == crate::workflow::default_states::PLANNING)
-        .and_then(|state| state.gate_config.as_mut())
-    {
-        gate_config.requires_user_approval = Some(false);
-        gate_config.reject_label = None;
-    }
-    if let Some(gate_config) = definition
+    if let Some(review) = definition
         .states
         .iter_mut()
         .find(|state| state.name == crate::workflow::default_states::REVIEW)
-        .and_then(|state| state.gate_config.as_mut())
     {
-        gate_config.requires_user_approval = Some(false);
+        review.role = None;
+        review.dispatch = None;
+        if let Some(gate_config) = review.gate_config.as_mut() {
+            gate_config.requires_user_approval = Some(false);
+            gate_config.optional_when_unassigned = Some(true);
+            gate_config.reject_label = None;
+        }
     }
 
     TemplateDocument {
-        display_name: "No User Approval".to_owned(),
-        description: "Default workflow with automatic gate cascades when checks pass".to_owned(),
+        display_name: "No review".to_owned(),
+        description: "Run required checks and continue without a reviewer execution".to_owned(),
         definition,
     }
 }
@@ -418,18 +420,15 @@ fn builtin_templates() -> [(&'static str, TemplateDocument); 4] {
     [
         ("default", builtin_default_template()),
         ("autonomous_v1", builtin_autonomous_v1_template()),
-        (
-            "user-approval-review",
-            builtin_user_approval_review_template(),
-        ),
-        ("no-user-approval", builtin_no_user_approval_template()),
+        ("human-required", builtin_human_required_template()),
+        ("no-review", builtin_no_review_template()),
     ]
 }
 
 fn is_builtin_template_name(name: &str) -> bool {
     matches!(
         name,
-        "default" | "autonomous_v1" | "user-approval-review" | "no-user-approval"
+        "default" | "autonomous_v1" | "human-required" | "no-review"
     )
 }
 
@@ -469,7 +468,7 @@ definition:
             .get_template("default")
             .await
             .expect("default template loads");
-        assert_eq!(template.display_name, "Default");
+        assert_eq!(template.display_name, "Agent review");
         assert_eq!(template.description, builtin_default_template().description);
         assert_eq!(template.definition, builtin_default_template().definition);
     }
@@ -495,18 +494,18 @@ definition:
     }
 
     #[tokio::test]
-    async fn initialize_adds_user_approval_review_template() {
+    async fn initialize_adds_human_required_template() {
         let workflows_dir = temp_workflows_dir();
         let service = WorkflowTemplateService::new(workflows_dir);
 
         service.initialize().await.expect("initialize succeeds");
 
         let template = service
-            .get_template("user-approval-review")
+            .get_template("human-required")
             .await
-            .expect("user approval template loads");
+            .expect("human-required template loads");
         assert!(template.is_builtin);
-        assert_eq!(template.display_name, "User Approval Review");
+        assert_eq!(template.display_name, "Human required");
         let review = template
             .definition
             .states
@@ -543,18 +542,18 @@ definition:
     }
 
     #[tokio::test]
-    async fn initialize_adds_no_user_approval_template() {
+    async fn initialize_adds_no_review_template() {
         let workflows_dir = temp_workflows_dir();
         let service = WorkflowTemplateService::new(workflows_dir);
 
         service.initialize().await.expect("initialize succeeds");
 
         let template = service
-            .get_template("no-user-approval")
+            .get_template("no-review")
             .await
-            .expect("no user approval template loads");
+            .expect("no-review template loads");
         assert!(template.is_builtin);
-        assert_eq!(template.display_name, "No User Approval");
+        assert_eq!(template.display_name, "No review");
         let planning = template
             .definition
             .states
@@ -565,6 +564,14 @@ definition:
         assert!(!gate_config.requires_user_approval());
         assert!(gate_config.optional_when_unassigned());
         assert_eq!(gate_config.reject_label, None);
+        let review = template
+            .definition
+            .states
+            .iter()
+            .find(|state| state.name == crate::workflow::default_states::REVIEW)
+            .expect("review check state exists");
+        assert!(review.role.is_none());
+        assert!(review.dispatch.is_none());
         assert!(!template.definition.configuration.is_empty());
     }
 }

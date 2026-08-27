@@ -9,6 +9,8 @@ import type {
   ProviderEntryResponse,
   ProviderEntryTestResponse,
   RenameProviderEntryRequest,
+  SetCliRuntimeAvailabilityRequest,
+  SetProviderEntryAvailabilityRequest,
   StartProviderAuthorizationRequest,
 } from '@/types/generated'
 import type {
@@ -163,6 +165,27 @@ export function renameProviderEntry(
     method: 'PATCH',
     body: JSON.stringify(input),
   })
+}
+
+export function setProviderEntryAvailability(
+  id: string,
+  input: SetProviderEntryAvailabilityRequest,
+): Promise<ProviderEntryResponse> {
+  return apiFetch<ProviderEntryResponse>(`/providers/${id}/availability`, {
+    method: 'PATCH',
+    body: JSON.stringify(input),
+  })
+}
+
+export function setCliRuntimeAvailability(
+  daemonId: string,
+  executorType: string,
+  input: SetCliRuntimeAvailabilityRequest,
+): Promise<import('@/types/generated').CliRuntimeEntryResponse> {
+  return apiFetch<import('@/types/generated').CliRuntimeEntryResponse>(
+    `/providers/cli-runtimes/${encodeURIComponent(daemonId)}/${encodeURIComponent(executorType)}/availability`,
+    { method: 'PATCH', body: JSON.stringify(input) },
+  )
 }
 
 export function removeProviderEntry(

@@ -331,7 +331,7 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
             "project_mode": "compact",
             "selected_project_agent_identity_id": legacy_identity,
             "selected_project_agent_profile_revision_id": legacy_profile,
-            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@4",
+            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@5",
             "selected_project_agent_policy_digest": legacy_policy
         }),
         &[StatusCode::CREATED, StatusCode::OK],
@@ -352,7 +352,7 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
 }
 
 #[tokio::test]
-async fn v076_project_task_is_gated_by_active_user_approved_baseline() {
+async fn v076_project_task_is_runnable_before_optional_baseline_activation() {
     let workspace = common::TestDir::new("v076-baseline-task-gate");
     let harness = common::test_app(workspace.path(), "v076-baseline-task-gate").await;
     harness
@@ -406,7 +406,7 @@ async fn v076_project_task_is_gated_by_active_user_approved_baseline() {
         &token,
         json!({
             "title": "V076 repository task",
-            "description": "Must remain blocked until the approved baseline is active.",
+            "description": "The approved Charter authorizes work while baseline links remain traceability.",
             "task_type": "task",
             "governance": {
                 "charter_revision_id": fixture.charter_revision_id,
@@ -431,7 +431,7 @@ async fn v076_project_task_is_gated_by_active_user_approved_baseline() {
     .fetch_one(harness.state.db.pool())
     .await
     .expect("repository task governance row");
-    assert_eq!(governance.get::<i64, _>("runnable"), 0);
+    assert_eq!(governance.get::<i64, _>("runnable"), 1);
     assert_eq!(
         governance.get::<String, _>("baseline_id"),
         baseline.baseline_id
@@ -454,13 +454,13 @@ async fn v076_project_task_is_gated_by_active_user_approved_baseline() {
     .await
     .expect("consumed baseline approval");
     assert_eq!(consumed, "consumed");
-    let promoted: i64 =
+    let still_runnable: i64 =
         sqlx::query_scalar("SELECT runnable FROM project_task_governance WHERE task_id = ?")
             .bind(&task_id)
             .fetch_one(harness.state.db.pool())
             .await
-            .expect("promoted repository task governance");
-    assert_eq!(promoted, 1);
+            .expect("repository task governance after optional baseline activation");
+    assert_eq!(still_runnable, 1);
 }
 
 #[tokio::test]
@@ -2922,7 +2922,7 @@ async fn create_genesis_project(app: &Router, token: &str, prefix: &str) -> Gene
         "project_mode": "compact",
         "selected_project_agent_identity_id": project_identity,
         "selected_project_agent_profile_revision_id": project_profile,
-        "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@4",
+        "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@5",
         "selected_project_agent_policy_digest": policy_digest
     });
     let approval = request_json(
@@ -3809,7 +3809,7 @@ fn user_authorization_replay_variants(
 fn user_provenance(summary: &str) -> Value {
     json!({
         "author": {"kind": "user", "id": "test-user-id"},
-        "operating_skill_revision": "forge.project.orchestration/v1@4",
+        "operating_skill_revision": "forge.project.orchestration/v1@5",
         "source_refs": [],
         "change_summary": summary
     })

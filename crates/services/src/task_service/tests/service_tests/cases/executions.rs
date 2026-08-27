@@ -1453,7 +1453,7 @@ async fn failed_reviewer_execution_marks_running_review_failed() {
 }
 
 #[tokio::test]
-async fn passed_reviewer_execution_with_user_approval_gate_waits_for_human() {
+async fn human_required_review_can_be_rejected_by_the_bound_project_agent() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -1576,6 +1576,99 @@ async fn passed_reviewer_execution_with_user_approval_gate_waits_for_human() {
     assert_eq!(comment.content, "Looks good.");
     assert_eq!(comment.author_type, CommentAuthorType::Agent);
     assert_eq!(comment.author_id.as_deref(), Some(agent_id.as_str()));
+
+    // Model the completed implementation attempt that preceded review and
+    // exhaust the optional automatic review-fix retry. This keeps the test
+    // focused on Project-Agent authority instead of launching a follow-up
+    // executor against this deliberately workspace-free fixture.
+    sqlx::query(
+        "INSERT INTO execution (
+             id, task_id, agent_id, role, status, created_at, updated_at
+         ) VALUES (?, ?, ?, 'coder', 'completed', ?, ?)",
+    )
+    .bind(new_uuid_v4())
+    .bind(&task.id)
+    .bind(&agent_id)
+    .bind(now_rfc3339())
+    .bind(now_rfc3339())
+    .execute(db.pool())
+    .await
+    .expect("completed coder attempt creates");
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(r#"{"retry_budgets":{"review":0}}"#)
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .expect("review retry budget updates");
+
+    let agent = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .expect("Project Agent reads")
+        .expect("Project Agent exists");
+    let binding = ProjectAgentBindingRepo::get_active_project_binding(&*db, &project_id)
+        .await
+        .expect("Project Agent binding reads")
+        .expect("Project Agent binding exists");
+    ProjectAgentBindingRepo::replace_project_binding(
+        &*db,
+        ReplaceProjectAgentBinding {
+            project_id: project_id.clone(),
+            expected_version: binding.version,
+            replacement: CreateProjectAgentBinding {
+                id: new_uuid_v4(),
+                project_id: project_id.clone(),
+                identity_id: Some(agent_id.clone()),
+                profile_id: Some(agent.profile_id),
+                state: "active".to_owned(),
+                autonomy_policy_json: "{}".to_owned(),
+                permission_ceiling_json: r#"{"permissions":["propose_task"]}"#.to_owned(),
+                subscriptions_json: "[]".to_owned(),
+                wake_budget: 1,
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+            replacement_reason: Some("test human-required review".to_owned()),
+        },
+    )
+    .await
+    .expect("Project Agent binding updates");
+    crate::test_support::clear_project_execution_role_defaults(&db, &project_id).await;
+
+    let unbound = service
+        .perform_project_agent_review(
+            &project_id,
+            task.id.clone(),
+            false,
+            Some("not authorized".to_owned()),
+            current.version,
+            "another-agent",
+        )
+        .await;
+    assert!(matches!(
+        unbound,
+        Err(ServiceError::InvalidOperation { .. })
+    ));
+
+    let reviewed = service
+        .perform_project_agent_review(
+            &project_id,
+            task.id.clone(),
+            false,
+            Some("Please address the review feedback".to_owned()),
+            current.version,
+            &agent_id,
+        )
+        .await
+        .expect("bound Project Agent rejects human-required review");
+    assert_eq!(reviewed.action, api_types::TaskAction::RequestChanges);
+    assert_eq!(
+        reviewed.task.status,
+        crate::workflow::default_states::IN_PROGRESS
+    );
+    let reviews = ReviewRepo::list_by_task(&*db, &task.id)
+        .await
+        .expect("reviews reload");
+    assert_eq!(reviews[0].status, ReviewStatus::Failed);
 }
 
 #[tokio::test]

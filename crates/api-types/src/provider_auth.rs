@@ -194,6 +194,9 @@ pub struct ProviderEntryResponse {
     pub label: String,
     pub credential_method: String,
     pub status: String,
+    /// Reversible local policy. Disabled entries retain credentials and
+    /// dependents but cannot admit new work.
+    pub enabled: bool,
     pub base_url: Option<String>,
     pub provider_account_id: Option<String>,
     pub used_by: Vec<ProviderEntryAgentRef>,
@@ -229,9 +232,23 @@ pub struct CliRuntimeEntryResponse {
     pub daemon_hostname: Option<String>,
     pub daemon_status: String,
     pub availability: String,
+    /// Reversible account policy for this exact daemon/runtime source.
+    pub enabled: bool,
+    /// Zero means no policy row exists yet; the first availability update
+    /// creates version one.
+    #[ts(type = "number")]
+    pub policy_version: i64,
     pub version: Option<String>,
     pub login_hint: Option<String>,
     pub used_by: Vec<ProviderEntryAgentRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct SetCliRuntimeAvailabilityRequest {
+    pub enabled: bool,
+    #[ts(type = "number")]
+    pub version: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -256,6 +273,14 @@ pub struct CreateProviderEntryRequest {
 #[ts(export)]
 pub struct RenameProviderEntryRequest {
     pub label: String,
+    #[ts(type = "number")]
+    pub version: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct SetProviderEntryAvailabilityRequest {
+    pub enabled: bool,
     #[ts(type = "number")]
     pub version: i64,
 }

@@ -854,13 +854,13 @@ pub const EXECUTION_BASELINE_PROPOSE_COMMAND: &str =
     "project.execution_baseline.propose_for_approval";
 pub const EXECUTION_BASELINE_APPROVE_COMMAND: &str = "project.execution_baseline.approve";
 pub const EXECUTION_BASELINE_ACTIVATE_COMMAND: &str = "project.execution_baseline.activate";
-/// The single atomic "Approve plan and start work" gesture (D18, F13). Binds
+/// The single atomic optional-baseline acceptance gesture (D18, F13). Binds
 /// the exact Project/baseline/revision/content/render identities and one
-/// stable idempotency key, and commits approval, activation, governance
-/// promotion, receipt, and events together. This is deliberately a distinct
+/// stable idempotency key, and commits approval, activation, receipt, and
+/// events together. This is deliberately a distinct
 /// operation/receipt name from `approve`/`activate` above: a replay of one
 /// can never be satisfied by a receipt minted for the other, and the
-/// already-approved "Start approved work" gesture keeps using the separate
+/// already-approved activation gesture keeps using the separate
 /// exact replay-safe `activate` command.
 pub const EXECUTION_BASELINE_APPROVE_AND_ACTIVATE_COMMAND: &str =
     "project.execution_baseline.approve_and_activate";
@@ -934,8 +934,8 @@ pub struct ActivateExecutionBaselineCommand {
     pub action: Option<AgentActionProvenance>,
 }
 
-/// "Approve plan and start work": one atomic command binding the exact
-/// proposed baseline revision the user reviewed. `expected_baseline_version`
+/// Accept and activate one optional traceability baseline in an atomic command
+/// binding the exact proposed revision the user reviewed. `expected_baseline_version`
 /// is the CAS for the still-`proposed` baseline; `expected_project_version`
 /// is the CAS for the Project the baseline activates into. Both must name
 /// the identities observed while the user reviewed this exact revision, the
@@ -1342,8 +1342,8 @@ impl ExecutionBaselineCommandService {
     }
 
     /// Consume the exact current approval and atomically activate the
-    /// baseline, milestone definitions, project pointer, Task governance,
-    /// durable event, and command receipt. Only an interactive user may call
+    /// baseline, milestone definitions, project pointer, durable event, and
+    /// command receipt. Only an interactive user may call
     /// this method successfully.
     pub async fn activate(
         &self,
@@ -1360,12 +1360,6 @@ impl ExecutionBaselineCommandService {
             Some(&command.content_digest),
         )?;
         if let Some(outcome) = self.replay(&context).await? {
-            self.wake_activated_baseline_dispatch(
-                &command.project_id,
-                &command.baseline_id,
-                &command.revision_id,
-            )
-            .await;
             return self.outcome_from_receipt(&outcome, &context).await;
         }
         validate_baseline_authorization(
@@ -1435,23 +1429,17 @@ impl ExecutionBaselineCommandService {
         )
         .await
         .map_err(ServiceError::from)?;
-        self.wake_activated_baseline_dispatch(
-            &command.project_id,
-            &command.baseline_id,
-            &command.revision_id,
-        )
-        .await;
         self.committed_outcome(&context).await
     }
 
-    /// "Approve plan and start work" (D18, F13): one atomic, replay-exact
+    /// Accept and activate an optional baseline (D18, F13): one atomic, replay-exact
     /// command that binds the exact Project/baseline/revision/content/render
     /// identities the user reviewed and commits approval, activation,
-    /// governance promotion, receipt, and events together. A lost HTTP
+    /// receipt and events together. A lost HTTP
     /// response after this commits can only ever be satisfied by replaying
     /// this exact receipt -- it is never re-derived from mutable current
     /// state. Only a freshly `proposed` baseline may use this method; the
-    /// already-approved "Start approved work" gesture keeps using
+    /// already-approved activation gesture keeps using
     /// [`Self::activate`].
     pub async fn approve_and_activate(
         &self,
@@ -1468,12 +1456,6 @@ impl ExecutionBaselineCommandService {
             Some(&command.content_digest),
         )?;
         if let Some(outcome) = self.replay(&context).await? {
-            self.wake_activated_baseline_dispatch(
-                &command.project_id,
-                &command.baseline_id,
-                &command.revision_id,
-            )
-            .await;
             return self.outcome_from_receipt(&outcome, &context).await;
         }
         validate_baseline_authorization(
@@ -1555,41 +1537,7 @@ impl ExecutionBaselineCommandService {
             )
             .await
             .map_err(ServiceError::from)?;
-        self.wake_activated_baseline_dispatch(
-            &command.project_id,
-            &command.baseline_id,
-            &command.revision_id,
-        )
-        .await;
         self.committed_outcome(&context).await
-    }
-
-    async fn wake_activated_baseline_dispatch(
-        &self,
-        project_id: &str,
-        baseline_id: &str,
-        revision_id: &str,
-    ) {
-        if let Err(error) = crate::wake_baseline_task_dispatch(
-            &self.db,
-            project_id,
-            baseline_id,
-            revision_id,
-            "execution_baseline_activated",
-        )
-        .await
-        {
-            // The domain command and receipt are already durable. A response
-            // replay re-attempts this idempotent wake, so never turn a
-            // post-commit scheduling nudge into a false command failure.
-            tracing::warn!(
-                %project_id,
-                %baseline_id,
-                %revision_id,
-                %error,
-                "execution baseline activated but waking affected Task dispatch failed"
-            );
-        }
     }
 
     async fn resolve_revision_base(

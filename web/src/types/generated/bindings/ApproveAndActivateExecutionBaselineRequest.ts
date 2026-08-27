@@ -2,8 +2,8 @@
 import type { MutationEnvelope } from "./MutationEnvelope";
 
 /**
- * "Approve plan and start work" (D18, F13): the one atomic, replay-exact
- * command for the proposed-baseline approval gesture. It binds the exact
+ * Accept and activate an optional traceability baseline (D18, F13): the one
+ * atomic, replay-exact command for this review gesture. It binds the exact
  * revision/content/render identities the user reviewed and, unlike
  * [`ApproveExecutionBaselineRequest`] followed by
  * [`ActivateExecutionBaselineRequest`], commits approval and activation in

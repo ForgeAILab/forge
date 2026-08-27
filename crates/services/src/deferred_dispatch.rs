@@ -182,9 +182,9 @@ fn bounded_safe_message(message: &str) -> String {
 /// so the next scan re-attempts it instead of treating it as an unchanged
 /// blocker. Also clears any time-based deferral for the same Task.
 ///
-/// A Task's own `version` invalidates a disposition for free, but governance
-/// state living outside the `task` row — baseline activation, reconciliation
-/// resolution, an authorized retry — does not touch `version`. Whatever
+/// A Task's own `version` invalidates a disposition for free, but state living
+/// outside the `task` row — reconciliation resolution or an authorized retry
+/// — does not touch `version`. Whatever
 /// commits one of those must call this afterward, or the previously observed
 /// denial keeps the Task quiesced forever.
 pub async fn wake_task_dispatch(db: &db::SqliteDb, task_id: &str, reason: &str) -> Result<()> {
@@ -197,43 +197,4 @@ pub async fn wake_task_dispatch(db: &db::SqliteDb, task_id: &str, reason: &str) 
     }
     tracing::info!(task_id = %task_id, %reason, "task dispatch woken");
     Ok(())
-}
-
-/// Wake every non-terminal Task whose authoritative governance was promoted
-/// to one exact baseline revision. This is intentionally narrower than a
-/// Project-wide wake: unrelated Tasks retain their quiescent dispositions.
-///
-/// The operation is replay-safe. Clearing an already-cleared disposition or
-/// deferral is a no-op, so a command-receipt replay can repair a crash between
-/// the durable baseline commit and this post-commit wake without duplicating
-/// scheduler work.
-pub async fn wake_baseline_task_dispatch(
-    db: &db::SqliteDb,
-    project_id: &str,
-    baseline_id: &str,
-    baseline_revision_id: &str,
-    reason: &str,
-) -> Result<usize> {
-    let task_ids = sqlx::query_scalar::<_, String>(
-        "SELECT task.id
-         FROM project_task_governance governance
-         JOIN task ON task.id = governance.task_id
-                  AND task.project_id = governance.project_id
-         WHERE governance.project_id = ?
-           AND governance.baseline_id = ?
-           AND governance.baseline_revision_id = ?
-           AND governance.runnable = 1
-           AND task.deleted_at IS NULL
-           AND task.status NOT IN ('done', 'cancelled')
-         ORDER BY task.id",
-    )
-    .bind(project_id)
-    .bind(baseline_id)
-    .bind(baseline_revision_id)
-    .fetch_all(db.pool())
-    .await?;
-    for task_id in &task_ids {
-        wake_task_dispatch(db, task_id, reason).await?;
-    }
-    Ok(task_ids.len())
 }

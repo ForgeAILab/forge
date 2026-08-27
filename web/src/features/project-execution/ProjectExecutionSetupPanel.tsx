@@ -127,19 +127,19 @@ function stateDescription(kind: 'coordination' | 'setup' | 'gate', value: string
     if (value === 'unavailable') {
       return 'Forge could not verify execution setup. Refresh the readiness projection before acting.'
     }
-    return 'Worker, independent reviewer, or primary repository setup is still missing.'
+    return 'The Project still needs a primary repository before repository-backed Tasks can run.'
   }
   if (value === 'unavailable') {
     return 'Forge could not verify the execution gate. Refresh the readiness projection before acting.'
   }
-  if (value === 'active') return 'An approved execution baseline is active.'
+  if (value === 'active') return 'The approved Charter allows the Task workflow to run.'
   if (value === 'baseline_approval_required') {
-    return 'Execution setup is ready; an execution baseline still needs approval.'
+    return 'This legacy planning status no longer blocks implementation; refresh Project state.'
   }
   if (value === 'reconciliation_required') {
     return 'Execution is paused until the recorded reconciliation requirement is resolved.'
   }
-  return 'Planning remains available, but execution is read-only until a baseline is active.'
+  return 'This legacy planning status no longer blocks implementation; refresh Project state.'
 }
 
 function compactStateDescription(kind: 'coordination' | 'setup' | 'gate', value: string): string {
@@ -147,17 +147,17 @@ function compactStateDescription(kind: 'coordination' | 'setup' | 'gate', value:
     return 'The Project Agent can plan and coordinate this Project.'
   }
   if (kind === 'setup' && value === 'ready') {
-    return 'The Worker, reviewer, and repository are ready.'
+    return 'The repository is ready; Project defaults and Task assignments remain editable.'
   }
   if (kind === 'gate') {
     if (value === 'active') {
-      return 'Approved Tasks can run without another approval.'
+      return 'The Task workflow can run without another implementation approval.'
     }
     if (value === 'baseline_approval_required') {
-      return 'Approve the implementation plan once to start every covered Task.'
+      return 'Refresh this legacy planning status; it no longer blocks Tasks.'
     }
     if (value === 'pre_baseline_read_only') {
-      return 'The Project Agent still needs to prepare the implementation plan.'
+      return 'Refresh this legacy planning status; it no longer blocks Tasks.'
     }
     if (value === 'reconciliation_required') {
       return 'Review plan changes before repository work resumes.'
@@ -446,9 +446,7 @@ function ActionArea({
   const attemptKeys = useRef<Record<string, { fingerprint: string; key: string }>>({})
   const blocker = data.execution_blocker
   const expectedProjectVersion = asNumber(data.project_version)
-  const reviewerOptions = data.eligible_reviewers.filter(
-    (principal) => principal.identity_id !== data.worker?.identity_id,
-  )
+  const reviewerOptions = data.eligible_reviewers
   const mutationError =
     action === 'select_worker'
       ? workerMutation.error
@@ -607,7 +605,7 @@ function ActionArea({
       return (
         <ActionSelect
           id="execution-independent-reviewer"
-          label="Independent reviewer"
+          label="Reviewer"
           value={reviewerSelection}
           options={reviewerOptions}
           onChange={setReviewerSelection}
@@ -633,9 +631,7 @@ function ActionArea({
       )
     }
 
-    // Every remaining gate (baseline approval, an unstarted implementation
-    // plan, or an outstanding reconciliation — including one the Project's
-    // execution_gate cannot itself distinguish from the others) routes
+    // Any remaining legacy or reconciliation projection routes
     // through the one canonical `execution_blocker.next_action` instead of
     // re-deriving a link from `execution_gate` here. This is also what
     // fixes the dead end a `reconciliation_required` gate used to fall
@@ -732,7 +728,7 @@ function ActionArea({
           : action === 'select_worker'
             ? 'Select or create a Worker before repository-backed execution can proceed.'
             : action === 'select_independent_reviewer'
-              ? 'Select an independent reviewer distinct from the Worker.'
+              ? 'Select any enabled configured Agent. The Worker and reviewer may be the same Agent.'
               : action === 'attach_repository'
                 ? 'Attach the Project’s primary repository explicitly.'
                 : action === 'retry_provisioning'
@@ -921,11 +917,11 @@ export function ProjectExecutionSetupPanel({
             <p className="mt-1 max-w-3xl break-words text-xs leading-5 text-muted-foreground">
               {compact
                 ? data.execution_gate === 'baseline_approval_required'
-                  ? 'Your Project is approved. One final approval starts all work covered by the plan.'
+                  ? 'Your Project is approved. This optional plan adds traceability and does not start Tasks.'
                   : data.execution_gate === 'active'
-                    ? 'Approved work can run without another Task-by-Task approval.'
+                    ? 'Charter-backed Tasks follow their workflow without another implementation approval.'
                     : 'See what Forge still needs before implementation can start.'
-                : 'Coordination, repository setup, and the execution baseline are independent gates. A ready Project Agent Chat does not imply operational execution.'}
+                : 'Project Agent coordination and repository setup are independent. The approved Charter authorizes Tasks; an execution baseline is optional traceability.'}
             </p>
           </div>
         </div>
@@ -955,7 +951,7 @@ export function ProjectExecutionSetupPanel({
             compact={compact}
           />
           <ReadinessRow
-            label={compact ? 'Permission to build' : 'Execution gate'}
+            label={compact ? 'Task workflow' : 'Implementation authority'}
             value={data.execution_gate}
             description={
               compact

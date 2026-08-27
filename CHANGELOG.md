@@ -6,6 +6,24 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Breaking
+
+- An approved Project Charter now authorizes implementation after the user
+  separately confirms Project creation. Execution-baseline approval is optional
+  Task/milestone/evidence traceability and no longer makes Tasks runnable,
+  pauses them when a plan changes, or grants split/sequence/replace authority.
+  Project role selections are optional defaults; any enabled configured Agent,
+  including a Main or Project Agent and the same identity in Worker/reviewer
+  roles, may be assigned per Task. Built-in workflows now expose Agent review,
+  no-review, and human-required modes, and the bound Project Agent may decide a
+  human-required review.
+
+- Provider entries, exact daemon/CLI runtime pairs, and individual Agents can
+  now be disabled and re-enabled independently. Disabled sources immediately
+  make dependent Agents unavailable for all roles without deleting their
+  configuration. Main/Project Chat turns no longer consume Task execution
+  concurrency, and stopped executions notify the configured Project Agent.
+
 ### Added
 
 - Main Chat now starts Product Genesis from clear natural-language new-Project
@@ -21,10 +39,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Project/Project-chat scoped, requires `propose_task`, uses direct command
   receipts without an `AgentAction`, and returns receipt-first replay metadata.
 
-- "Approve plan & start work" is now one atomic, replay-exact command that
+- "Approve traceability plan" is now one atomic, replay-exact command that
   binds the exact Project, baseline, revision, content digest, and render
   version behind a single stable idempotency key, committing approval,
-  activation, governance promotion, receipt, and events together. Route
+  activation, receipt, and events together without granting Task execution
+  authority. Route
   responses are reconstructed from the frozen receipt before mutable current
   state, so a lost response, a post-commit projection failure, a double
   submit, or a Project-version race can no longer report failure for a command
@@ -168,8 +187,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Task workflow-role assignments are now authoritative at execution time.
   Project Worker/reviewer selections seed Tasks but no longer lock a Task to
   those exact identities; any enabled, available Project Task agent may fill a
-  role, including the same identity for Worker and reviewer. Disabled, paused,
-  cross-account, and active coordinator identities remain ineligible.
+  role, including the same identity for Worker and reviewer and an identity
+  currently serving as Main or Project Agent. Disabled, paused, unavailable,
+  and cross-account identities remain ineligible.
   Assigning or confirming a Task role wakes reviews parked by the old blocker,
   retries a stopped role attempt without a separate Resume action, and V105
   keeps that identity's Worker and reviewer runtime contexts role-isolated
@@ -177,7 +197,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   conflict.
 
 - Project Agents now receive the full safe adaptive Task vocabulary — split,
-  sequence, and replace — in every newly materialized execution baseline.
+  sequence, and replace — from the approved Charter, independent of any
+  execution-baseline operation list.
   Historical baselines containing command names such as `task.adaptive` get a
   server-prepared immutable correction that the user can accept and activate
   in one reconciliation click; Forge no longer requires a separate plan
@@ -287,14 +308,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   reconciliation, and Agent Chat memory indexing at the same cursor forever.
   The fallback is shared and characterized with a null-key committed event.
 
-- Project and execution approval are now visibly distinct instead of surfacing
-  a raw "active user-approved execution baseline is required" failure on a
-  Task. Non-terminal implementation Tasks show one plain-language recovery
-  card and link directly to the exact Project approval target. The Project Chat
-  rail uses `Project Agent`, `Build setup`, and `Permission to build`, and the
-  final action reads **Approve plan & start work** while explaining that it
-  covers every Task in the approved plan rather than requiring per-Task
-  approval.
+- Charter approval and Project creation are now visibly distinct. After the
+  user confirms Project creation, implementation starts from the Charter and
+  Task workflow without setup or baseline approval. Optional plan review reads
+  **Approve traceability plan** and explicitly says it does not start or stop
+  Tasks.
 
 - Product Genesis now exposes receipt-backed native operations for the Main
   Agent to list and persist the exact structured Project Agent selection.
@@ -388,7 +406,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   reproduce the server renderer byte-for-byte and recompute both digests, which
   it never can. Every baseline the Project Agent attempted failed with
   "content or rendered review target digest is not canonical", and because an
-  active baseline gates implementation Tasks, no repository work could start.
+  the optional traceability plan could not be recorded.
   These four fields are now derived from `content` on the native agent path
   (the Charter draft already worked this way) and are optional in the tool
   contract. `content.release_policy_digest` is derived the same way and for the
@@ -1003,8 +1021,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Genesis Charter approval is no longer blocked on "No eligible Project
   Agent is selected yet". When the Genesis session has no (eligible)
   preferred Project Agent, the server auto-selects a deterministic eligible
-  one — account-owned, unpaused, current profile, not the active Main
-  Agent, preferring identities without an active Project binding — so both
+  one — account-owned, enabled, healthy, and current-profile, including the
+  active Main Agent or an identity with another Project binding — so both
   the Charter card and the Main Agent's `charter.approval_target` action
   always carry a complete revision set. The card's empty state now only
   appears when the account has no eligible agent at all and links to Agents

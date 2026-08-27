@@ -81,16 +81,16 @@ database for historical provenance.
 | DELETE | `/api/v1/projects/{id}/milestones/{milestone_id}/evidence/{evidence_id}` | Remove a milestone evidence attachment (release pins remain immutable) |
 | GET    | `/api/v1/projects/{id}/overview` | Read the derived Project Overview projection, including hydrated current acceptance-check results and check CAS versions |
 | GET    | `/api/v1/projects/{id}/execution-baseline` | Read the Project's current execution-baseline proposal/approval projection. If the preserved active revision fails the closed adaptive-operation audit, `current_revision` is null, `integrity_issue` names its exact immutable identity/values and reserved correction records, and `proposed_revision` is the valid successor draft |
-| GET    | `/api/v1/projects/{id}/execution-setup` | Read independent coordination, execution-setup, and baseline-gate state plus eligible Worker/reviewer identities |
+| GET    | `/api/v1/projects/{id}/execution-setup` | Read independent coordination and repository-setup state plus optional default Worker/reviewer identities; legacy baseline-gate fields remain projection-only and do not gate Tasks |
 | POST   | `/api/v1/projects/{id}/execution-setup/worker` | Project owner/admin selects an eligible Worker identity with `expected_project_version` and `idempotency_key` |
-| POST   | `/api/v1/projects/{id}/execution-setup/independent-reviewer` | Project owner/admin selects a distinct eligible independent reviewer with `expected_project_version` and `idempotency_key` |
+| POST   | `/api/v1/projects/{id}/execution-setup/independent-reviewer` | Project owner/admin selects an optional reviewer default with `expected_project_version` and `idempotency_key`; it may be the same Agent as the Worker |
 | POST   | `/api/v1/projects/{id}/execution-setup/repository` | Project owner/admin attaches a repository with `expected_project_version` and `idempotency_key` |
 | POST   | `/api/v1/projects/{id}/execution-setup/provisioning/retry` | Project owner/admin retries the durable, finite provisioning operation with `expected_operation_version` and `idempotency_key` |
 | POST   | `/api/v1/projects/{id}/execution-baseline` | Save the first complete or incomplete execution-baseline candidate as a `draft`; the request must carry `operation: "save_draft"`, the candidate content, canonical rendered view/digests, provenance, and `mutation.expected_version: 0` (the baseline id is server-minted) |
 | POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions` | Save an exact digest-bound revision with explicit `operation: "save_draft"` or `"propose_for_approval"`; proposal additionally requires its acceptance/evidence matrix to exactly match the stable IDs, evidence kinds, and revisions of the pinned milestone definitions, and only a valid proposal returns `requires_user_authorization: true` with a frozen `approval_target` |
 | POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions/{revision_id}/approve` | Record the exact authenticated user's baseline approval receipt. For the designated successor of an invalid active revision this remains approval-only: it does not move the active pointer |
-| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions/{revision_id}/approve-and-activate` | "Approve plan and start work": one atomic, replay-exact command that approves and activates the exact freshly proposed revision in a single transaction/receipt (governance promotion and both `approved`/`activated` events included). The request supplies `mutation.expected_version` (Project version) and `expected_baseline_version` (baseline version, still `proposed`). The response is receipt-first: `baseline_id`/`revision_id`/`approval_id`/digests always reflect the committed outcome, `projection` is a best-effort full `ExecutionBaselineResponse` read, and `refresh_required: true` (with `projection: null`) replaces a command failure when only that second read could not be assembled after a successful commit. Before returning a conflict, the route also checks whether the exact requested revision is already the Project's active baseline and renders success if so |
-| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/activate` | Activate the exact user-approved baseline (the already-approved "Start approved work" gesture); the request supplies both `mutation.expected_version` (Project version) and `expected_baseline_version` (baseline version), then atomically promotes matching preplanned Tasks and fills a missing Project primary-milestone pointer from the baseline's primary (or only) active milestone |
+| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions/{revision_id}/approve-and-activate` | "Approve traceability plan": one atomic, replay-exact command that approves and activates the exact freshly proposed optional traceability revision in a single transaction/receipt. It emits `approved`/`activated` events but does not grant, revoke, start, or pause Task execution. The request supplies `mutation.expected_version` and `expected_baseline_version`; the receipt-first response preserves the exact committed IDs/digests and uses `refresh_required: true` when only the follow-up projection read fails |
+| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/activate` | Activate an already-approved optional traceability plan. Activation may advance milestone/plan pointers but never changes Task runnable state |
 | GET    | `/api/v1/projects/{project_id}/reconciliations` | List Project reconciliations with opaque keyset pagination |
 | GET    | `/api/v1/projects/{project_id}/reconciliations/{reconciliation_id}` | Read one reconciliation's conflict, governing/affected records, allowed resolutions, and (once resolved) its resolution |
 | POST   | `/api/v1/projects/{project_id}/reconciliations/{reconciliation_id}/resolve` | User-only: resolve a reconciliation with one of the closed `retained`/`revised`/`cancelled`/`superseded`/`invalidated` actions. `invalid_active_baseline` allows only `revised` with its exact approved successor and activates that successor atomically with resolution |
@@ -104,7 +104,7 @@ database for historical provenance.
 | GET    | `/api/v1/projects/{id}/project_hook_runs` | List project hook run history |
 | POST   | `/api/v1/projects/{id}/repos` | Create repo |
 | GET    | `/api/v1/projects/{id}/repos` | List repos |
-| POST   | `/api/v1/projects/{id}/tasks` | Create a Task; omitted governance is derived from the current Charter and may remain non-runnable until baseline activation |
+| POST   | `/api/v1/projects/{id}/tasks` | Create a Task; omitted governance is derived from the current approved Charter, and a repository-backed Task can run without a baseline |
 | GET    | `/api/v1/projects/{id}/tasks` | List tasks (paginated, filterable) |
 | GET    | `/api/v1/tasks/{id}` | Get task |
 | GET    | `/api/v1/tasks/{id}/prompt-preview?role=&trigger=` | Preview effective prompt without dispatching |
@@ -147,6 +147,9 @@ database for historical provenance.
 | POST   | `/api/v1/agents` | Create an account-owned harness agent; optional `credential_id` references a provider entry for dispatch-time key injection, gated by the capability runtime matrix |
 | GET    | `/api/v1/agents` | List visible agent identities with selected-profile fields |
 | GET    | `/api/v1/agents/{id}` | Get an agent identity with selected-profile fields |
+| PATCH  | `/api/v1/agents/{id}` | Update the Agent definition with optimistic concurrency, including its reversible `paused` state |
+| POST   | `/api/v1/agents/{id}/pause` | Disable one Agent without deleting its provider/runtime configuration |
+| POST   | `/api/v1/agents/{id}/resume` | Re-enable one paused Agent |
 | DELETE | `/api/v1/agents/{id}` | Archive an owned agent identity |
 | GET    | `/api/v1/agents/{id}/discovered-options` | Get adapter model, reasoning, permission, and daemon options for an agent |
 | GET    | `/api/v1/executor-types/{type}/discovered-options` | Get adapter options before creating an agent |
@@ -155,6 +158,8 @@ database for historical provenance.
 | GET    | `/api/v1/providers` | List the account's configured provider entries with usage (referencing agents, last used) plus CLI runtimes discovered on connected daemons |
 | POST   | `/api/v1/providers` | Create an API-key provider entry (`provider`, `label`, `credential`, optional `base_url`; required for `openai_compatible`); never creates an agent |
 | PATCH  | `/api/v1/providers/{id}` | Rename a provider entry with optimistic concurrency |
+| PATCH  | `/api/v1/providers/{id}/availability` | Disable or re-enable this exact provider entry with `expected_version`; every dependent Agent becomes unavailable/eligible accordingly |
+| PATCH  | `/api/v1/providers/cli-runtimes/{daemon_id}/{executor_type}/availability` | Disable or re-enable one exact daemon + CLI executor runtime with optimistic concurrency |
 | POST   | `/api/v1/providers/{id}/test` | Live connection test: one minimal authenticated request against the entry's API; returns `status` (`ok`/`failed`), `latency_ms`, a redacted `message`, and `checked_at` |
 | GET    | `/api/v1/providers/{id}/usage` | Account usage (rate-limit windows) for the entry, e.g. ChatGPT's 5h/weekly windows; `source` is `probe` when live data was fetched, `unknown` (empty `windows`, a `detail` message) otherwise — only ChatGPT-OAuth (Codex backend) entries are probeable today |
 | DELETE | `/api/v1/providers/{id}?version={version}` | Disconnect a provider entry; returns redacted provider-revocation status plus the affected agents, which become visibly unhealthy |
@@ -280,6 +285,17 @@ cannot drive a CLI harness. Harness agents without an entry keep their
 CLI-managed login, and `GET /api/v1/providers` surfaces those CLI runtimes with
 authentication availability, host, and usage.
 
+Availability is reversible at three exact layers. Pausing an Agent disables
+only that identity. `PATCH /providers/{id}/availability` disables one provider
+entry and all Agents that reference it. `PATCH
+/providers/cli-runtimes/{daemon_id}/{executor_type}/availability` disables one
+exact discovered CLI runtime without affecting the same executor on another
+daemon. Re-enabling restores eligibility when the remaining health checks pass;
+none of these operations deletes credentials, Profiles, bindings, or history.
+Any enabled configured Agent may be selected for Main, Project, Worker, or
+reviewer roles. Main/Project Chat turns are coordination work and do not consume
+Task execution concurrency.
+
 OpenAI Platform API keys remain stable. ChatGPT browser/device login and its
 direct Responses adapter are experimental. xAI API keys remain stable while
 OIDC-discovered RFC 8628 device login and the direct Responses adapter are
@@ -375,9 +391,9 @@ current session version, then persist the exact choice with the receipt-backed
 `genesis.project_agent.select` command. Charter prose cannot select or reassign
 an agent. If a persisted preference later becomes ineligible, the projection is
 `null` and approval blocks rather than silently choosing someone else. With no
-preference, the server auto-selects a deterministic eligible agent
-(account-owned, unpaused, current profile, not the active Main Agent,
-preferring identities without an active Project binding). Credential-less CLI
+preference, the server auto-selects a deterministic enabled, healthy,
+account-owned Agent with a current profile. The active Main Agent and Agents
+already bound to Projects remain valid candidates. Credential-less CLI
 bootstrap defaults are excluded from automatic choice but remain available for
 explicit selection when local authentication is managed outside Forge.
 Approval validates the exact identity/profile/skill/policy revision set the
@@ -441,8 +457,8 @@ records are candidate workflow records and are not effective DecisionRecord
 states.
 
 Responses that summarize current Project state are derived by authority domain:
-the approved Charter governs identity/scope, the approved baseline and
-Documents govern execution intent, effective Decisions govern recorded choices,
+the approved Charter governs identity, scope, and implementation authority;
+optional approved baselines and Documents govern traceability, effective Decisions govern recorded choices,
 Task/validation services govern work/check truth, and immutable releases govern
 historic claims. Chat, memory, status cards, and dashboards are retrieval or
 navigation aids only. A cross-domain conflict returns a typed reconciliation
@@ -626,15 +642,14 @@ For `invalid_active_baseline`, the generic action vocabulary is narrowed to
 `revised`. The server prepares and suggests the exact correction revision; it
 may still be a draft. The interactive user's single resolve request is also
 the exact approval event, so the client does not need to propose and approve
-the repair first. Approval, activation, governance promotion, invalid revision
+the repair first. Approval, activation, invalid revision
 supersession, approval consumption, conflict disposition, reconciliation
 transition, receipt, and event are one atomic database command.
 Unrelated Task-scoped reconciliations remain unresolved and cannot widen their
-scope to prevent this governing-baseline repair. After commit Forge wakes only
-non-terminal Tasks whose governance was promoted to the successor revision.
+scope. Task runnable state is unchanged by this traceability repair.
 
-Project Overview presents this repair as **Accept update & resume work** or
-**Reject for now**. Replacement identifiers, digests, affected paths, and the
+Project Overview presents this repair as **Accept** or **Reject**, preceded by a
+one-sentence explanation that Accept replaces the named Agent/record. Replacement identifiers, digests, affected paths, and the
 canonical-conflict record remain available under **Technical details** rather
 than being required form fields. For ordinary reconciliations the web client
 also supplies the exact replacement and audit reason behind a plain-language
@@ -734,10 +749,9 @@ the frozen original Task; reusing the key with changed input or principal is an
 idempotency conflict. A denied or invalid proposal is never listed as a Task.
 The exact closed proposal payload is validated before the command runs. For a
 Charter-backed Project, an omitted governance object is derived from the
-current Charter: implementation Tasks remain non-runnable until a matching
-baseline activates them, while pre-baseline `planning_task` and `discovery`
-claims are restricted to the read-only lane. A proposal that supplies
-`plan_item_id` or `milestone_id` binds those references to the active baseline
+current approved Charter and repository-backed Tasks are runnable immediately.
+`planning_task` and `discovery` use the read-only capability lane. A proposal that supplies
+`plan_item_id` or `milestone_id` binds those optional references to the active baseline
 even when `capability_class` is read-only. Optional
 `depends_on_task_ids` must name accepted, non-cancelled Tasks in the same
 Project and every prerequisite must reach `done` before dispatch.
@@ -758,8 +772,10 @@ includes `source_task_id`, `expected_task_version`,
 `expected_board_revision`, and `rationale`; the action-specific fields are a
 non-empty child `items` list, an ordered Task-id list, or replacement
 `title`/optional `description`. Project, scope, actor, permission,
-governance, and fixed-boundary values are derived from the authenticated
-binding and active baseline; unknown or override fields are rejected. The
+governance and fixed-boundary values are derived from the authenticated
+binding and Task traceability; unknown or override fields are rejected. All
+three verbs are available under the current Charter even when an optional
+baseline lists a narrower set. The
 adapter calls the shared Task command directly, creates no `AgentAction`, and
 returns bounded receipt/event, source Task, Task-id, board-revision, and
 `replayed` fields. Exact retries replay the frozen receipt result before
@@ -966,13 +982,12 @@ the projection plus a non-empty `idempotency_key`; committed receipts replay
 the original accepted command/effect and reject the same key when its input
 changes. The response after a replay is a fresh canonical setup projection,
 so it may include later durable provisioning progress.
-This Project-level setup path chooses provisioning defaults and currently uses
-a distinct eligible reviewer identity from the Worker. Those defaults seed new
-Tasks; they do not lock execution to those exact identities. An explicit Task
-role assignment may select any currently enabled, available, Project-usable
-Task agent, including the same identity for Worker and reviewer. Active Main and
-Project Agent coordinator identities remain excluded by the shared eligibility
-resolver. Provisioning also skips credential-less bootstrap default identities
+This Project-level setup path chooses optional provisioning defaults. Those
+defaults seed new Tasks; they do not lock execution to those exact identities.
+An explicit Task role assignment may select any currently enabled, available,
+Project-usable Agent, including the same identity for Worker and reviewer and
+an Agent currently serving as Main or Project Agent. Provisioning skips
+credential-less bootstrap default identities
 during automatic Worker/reviewer assignment; an owner may still make an
 explicit assignment for a CLI whose authentication is managed locally.
 Provisioning retry delegates to the durable finite
@@ -999,9 +1014,9 @@ response-build time from the project's resolved workflow and the task's current
 
 Task role rows, not Project defaults, authorize Task execution. `PUT
 /api/v1/tasks/{id}/roles/{role_name}` accepts any effectively available
-Project-usable Task agent; the same eligible identity may be assigned to both
+Project-usable Agent; the same eligible identity may be assigned to both
 Worker and reviewer roles. The service rejects disabled, paused, unavailable,
-cross-account, or active coordinator identities before persisting the change,
+or cross-account identities before persisting the change,
 and dispatch rechecks the same boundary before issuing the exact Task-scoped
 Workspace lease. Native runtime context is isolated by Task role, so reusing an
 identity does not reuse Worker capabilities in a reviewer session. A successful
@@ -1010,6 +1025,14 @@ assignment, wakes a Task parked on a stale dispatch blocker. When that role
 selection is newer than the latest stopped attempt for the role, the dispatcher
 treats it as the explicit retry signal and starts one fresh attempt without a
 separate `POST /resume` action.
+
+Built-in workflow templates expose four review choices: `default` (Agent
+review), `no-review`, `human-required`, and the `autonomous_v1` compatibility
+preset. A Task may override the Project default. In `human-required`, either the
+interactive user or the bound Project Agent may accept or reject through the
+normal Task workflow; the Project Agent uses the native ReadyOnly `task.review`
+operation, which validates the exact binding, Project, Task version, CI, and
+evidence before transition. It is not an execution-baseline approval.
 
 ## Execution status and liveness
 

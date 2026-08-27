@@ -137,15 +137,14 @@ Project, Task, or filesystem access; an identity appears in the chat switcher
 only when it is explicitly bound as Main or Project Agent.
 
 Product Genesis stores Project Agent choice as a structured identity reference,
-separate from Charter prose. The Main Agent can list the exact eligible
-identities and persist one selection through receipt-backed native operations;
-Charter approval freezes that same identity/profile/skill/policy set. Once a
-preference exists it is authoritative: an ineligible choice blocks approval
-instead of silently substituting another identity, and a stale client approval
-target that names any different eligible identity or revision set is rejected
-before an approval receipt can commit. Automatic selection and execution-role
-provisioning never choose a credential-less bootstrap default, although a user
-may explicitly select a locally authenticated CLI identity.
+separate from Charter prose. Any configured, enabled, healthy identity may be
+selected, including the active Main Agent or an identity already used by
+another Project. Charter approval freezes the exact identity/profile/skill/
+policy set; Project creation remains a separate explicit user action that
+consumes that approval receipt. Disabled or unhealthy selections fail visibly
+instead of being silently replaced. Automatic selection never chooses a
+credential-less bootstrap default, although a user may explicitly select a
+locally authenticated CLI identity.
 
 The singular role boundary is enforced by the authenticated binding and the
 Task scheduler, not by model instructions:
@@ -159,14 +158,13 @@ Task scheduler, not by model instructions:
 | Interactive user | Authorized account/Project | Exact approvals, setup choices, manual attestations/waivers, and release | Only existing authenticated user controls | Existing user controls |
 | System | Server policy | Readiness, scheduling, leases, recovery, and projections | Not a chat principal; cannot substitute for user approval | Internal only |
 
-Provider/model configuration may be reused across these rows, but principal,
-scope, history, assignment, lease, and attestation provenance are not reused.
-An active Main or Project Agent identity is never silently converted into a
-Task Worker or reviewer. Project execution-role selections are provisioning
-defaults, not an execution-time identity lock: an explicit Task assignment may
-use any currently eligible Project Task agent, and the same identity may fill
-Worker and reviewer roles. A release policy that explicitly requires an
-independent attestation evaluates that evidence separately.
+The same configured identity may fill several rows, but each scope, history,
+assignment, lease, and attestation remains separate. Project execution-role
+selections are optional defaults, not an execution-time identity lock: an
+explicit Task assignment may use any enabled configured Agent, including the
+active Main or Project Agent and the same identity for Worker and reviewer. A
+policy that requires independent evidence evaluates the evidence itself rather
+than forbidding identity reuse globally.
 
 Every persistent agent session binds to one canonical scope:
 
@@ -273,7 +271,7 @@ derives read models from those records. Authority is scoped by domain:
 | Domain | Authoritative record | Owner / final authority |
 | --- | --- | --- |
 | Project identity and scope | approved `ProjectCharterRevision` | User approves; Main Agent recommends before handoff; Project Agent proposes amendments afterward |
-| Execution intent | approved Project Documents and one active execution baseline | Project Agent proposes; user approves the baseline and material changes |
+| Execution traceability | approved Project Documents and an optional active execution baseline | Project Agent proposes; user may approve the traceability snapshot |
 | Consequential choices | effective `DecisionRecord` (`active`, `superseded`, or `invalidated`) | Authorized principal recorded on the decision; candidate/editor records are not effective decisions |
 | Work state | Task, validation, review, and event records | Task/workflow services, assigned workers, reviewers, and authorized users under existing policy |
 | Outcome and release | milestone definition, `ReadinessSnapshot`, and immutable `Mxxx-rN` release manifest | Project Agent proposes; Forge evaluates; user alone releases |
@@ -304,11 +302,11 @@ exact Task version and execution attempt, logical repository binding, resolved
 base ref, role, capability JSON, assigned principal, capability-profile
 revision/digest, issuing principal, issue/expiry timestamps, status, and
 optimistic version. Its database guards require the same Project, Task version,
-repository binding, assigned principal, running execution, approved-baseline
-gate (or the explicit pre-baseline read-only discovery/planning predicate), and
-profile revision/digest; one active lease is allowed per Task and identity
-fields are immutable. Active Main Agent and Project Agent identities are
-ineligible for leases even if a caller tries to assign them a Task role.
+repository binding, assigned principal, running execution, current approved
+Charter traceability, and profile revision/digest; one active lease is allowed
+per Task and identity fields are immutable. Main and Project Agent identities
+are eligible when explicitly assigned to the Task; their chat turns and Task
+executions remain separate scoped sessions.
 Custom workflow execution-role names are retained for assignment matching and
 canonicalized to `worker`; only the dedicated `reviewer` role receives the
 reviewer lease class. Its operation idempotency key is the exact execution
@@ -344,28 +342,27 @@ token exposes the row.
 
 ### Project readiness and execution setup
 
-Project coordination, repository/role setup, and baseline execution are
+Project coordination, repository setup, and Charter-backed execution are
 independent projections. A successful Project/Chat creation or a configured
 repository does not imply the other dimensions:
 
 | Dimension | States | Authority and consequence |
 | --- | --- | --- |
 | `coordination_state` | `setup_required`, `ready`, `unavailable` | Active singular Project-Agent binding plus a ready Project Chat; only `ready` admits a Project-Agent turn. |
-| `execution_setup_state` | `setup_required`, `provisioning`, `ready`, `failed`, `unavailable` | Durable provisioning operation, verified repository linkage/filesystem state, and required eligible Worker/reviewer assignments; implementation dispatch/write leases remain denied until `ready`. |
-| `execution_gate` | `pre_baseline_read_only`, `baseline_approval_required`, `active`, `reconciliation_required`, `unavailable` | Current baseline and reconciliation records; only `active`, together with ready setup and other Task guards, permits repository-mutating implementation. |
+| `execution_setup_state` | `setup_required`, `provisioning`, `ready`, `failed`, `unavailable` | Durable provisioning operation and verified repository linkage/filesystem state; Project role selections are optional defaults. |
+| `execution_gate` | `pre_baseline_read_only`, `baseline_approval_required`, `active`, `reconciliation_required`, `unavailable` | Legacy-compatible projection. A current approved Charter reports `active`; baseline approval does not grant or revoke Task execution. |
 
 The Genesis create/handoff transaction may commit a valid Project while
 execution setup is still `provisioning` or `setup_required`. Provisioning is a
 finite, leased, checkpointed, idempotent operation that reconciles the
-deterministic filesystem target, repository row, Project link, and role set;
+deterministic filesystem target, repository row, and Project link;
 interruption resumes that operation rather than creating a second directory or
-repository. Required Worker and reviewer defaults are derived from the
-workflow/baseline, excluding active coordinator identities. Automatic setup may
-prefer distinct defaults, but those selections do not constrain later explicit
-Task assignments. Missing defaults are typed setup requirements with a
-user/system retry or configuration action, not a best-effort executable
-success. Read-only planning/discovery may remain available under its explicit
-capability before an active baseline.
+repository. Worker and reviewer defaults are derived from the Task workflow
+when useful, but missing defaults do not block setup. Any enabled configured
+Agent—including Main, Project, or the same Agent in both Task roles—may be
+assigned explicitly. Read-only planning/discovery and write-capable
+implementation both derive authority from the current Charter and their Task
+workflow.
 
 #### Canonical execution blocker and capability-aware review
 
@@ -379,11 +376,9 @@ instance (built from the same `coordination_state`/`execution_setup_state`/
 `execution_gate` computation as the table above); `TaskResponse.execution_blocker`
 carries either that same Project-wide blocker or, when the Project itself is
 clear, a reconciliation scoped to only that Task
-(`services::load_task_execution_blocker`). Only a governing-truth conflict
-(currently `invalid_active_baseline`) widens the Project-wide gate; every
-other recorded conflict attaches solely to its own affected Task/plan-item/
-milestone record and leaves unrelated work on the same active plan
-untouched. Every surface that explains a blocker — Project execution setup,
+(`services::load_task_execution_blocker`). Conflicts attach to the smallest
+affected Task/plan-item/milestone or traceability record; an invalid optional
+baseline does not freeze unrelated Task work. Every surface that explains a blocker — Project execution setup,
 Task detail/banner, chat context, phase controls, and activity history —
 renders this projection's copy verbatim; a Task's own
 `execution_evidence` (`ExecutionEvidenceSummary`) is separately derived from
@@ -570,9 +565,9 @@ the integrity ledger as quarantined evidence; the immutable invalid revision
 is never rewritten.
 
 The user sees that server-prepared correction as one plain-language decision:
-**Accept update & resume work** or **Reject for now**. Accepting is the exact
-approval event; it does not lead to a second plan-approval step. One transaction
-approves and activates the successor, promotes Task governance, supersedes
+**Accept** or **Reject**. The card states that Accept replaces the named record
+and keeps technical identifiers collapsed. One transaction approves and
+activates the successor, supersedes
 (without deleting) the invalid revision, consumes the approval, resolves only
 the named reconciliation, and records one receipt/event. It revalidates the
 manifest, digests, Charter, milestones, and optimistic versions first, so any
@@ -586,16 +581,16 @@ any governance lookup, and its outcomes are deliberately distinct:
 | Condition | Outcome | Durable conflict | Execution effect |
 |---|---|---|---|
 | Operation is malformed or unknown | `validation_error` | none | none |
-| Valid operation outside a valid active envelope | `policy_denied` naming the allowed verbs | none | none |
-| An authoritative Task/artifact diverges from its governing baseline | `reconciliation_required` | exact conflict and affected records | smallest affected capability blocked |
-| Active governing baseline is itself invalid | Project-wide `reconciliation_required` | exact governing conflict | repository mutation blocked until successor approval |
+| Valid `split`, `sequence`, or `replace` | allowed by the current Charter | none | normal Task mutation |
+| An authoritative Task/artifact changes an inherited fixed boundary | `reconciliation_required` | exact conflict and affected records | only that change is rejected |
+| Active optional baseline is itself invalid | traceability reconciliation | exact governing conflict | Task execution continues; readiness may remain blocked |
 
 A rejected command that commits no authoritative mutation can never create a
 `project_reconciliation_record`. Creating one requires evidence of two
-diverging authoritative records or an invalid current governing record, and the
+diverging authoritative records or an invalid traceability record, and the
 conflict stores the exact affected paths rather than a generic list. Wanting
-authority beyond the envelope is an explicit successor-baseline or
-reconciliation proposal, not a conflict.
+authority to reshape the Task is not granted by a baseline envelope; the
+Charter already permits the three closed verbs.
 
 #### Reconciliation has one shared, scoped command
 
@@ -630,14 +625,12 @@ blocker projection and keeps changing. Potentially transient failures record no
 disposition and retry on the next scan.
 
 Metadata writes do not bump a Task's `version`, so a disposition stays keyed to
-the state it observed. Governance state living outside the `task` row —
-baseline activation, reconciliation resolution, an authorized retry — must call
-`services::wake_task_dispatch`, which clears the disposition so exactly one
-subsequent scan re-attempts that exact Task. Baseline activation uses
-`wake_baseline_task_dispatch` to select only non-terminal Tasks whose runnable
-governance names the exact activated revision. The wake is safe to replay after
-a lost response or process crash because clearing an absent disposition is a
-no-op.
+the state it observed. Assignment, source availability, reconciliation
+resolution, and authorized retry changes call `services::wake_task_dispatch`,
+which clears the disposition so exactly one subsequent scan re-attempts that
+Task. Optional baseline activation may refresh traceability consumers, but it
+does not change Task runnable state. Clearing an absent disposition remains a
+safe replay no-op.
 
 #### One SSE transport envelope
 
@@ -661,12 +654,11 @@ cannot leave a backgrounded `retry_wait` turn visibly stuck after REST truth
 has advanced to `failed`.
 
 When Task creation omits an explicit governance envelope, Forge derives one
-from the Project's current Charter. Before baseline activation, ordinary
-implementation Tasks are retained as non-runnable instead of being rejected;
-baseline activation promotes matching Tasks. `planning_task` and `discovery`
-Tasks additionally have an explicit pre-baseline lane: they may be claimed only
-with the read-only repository capability and low risk, and both service and
-transactional admission enforce that same predicate.
+from the Project's current approved Charter. A repository-backed Task is
+runnable without a baseline; optional baseline, plan-item, milestone, and
+Document references add immutable traceability only. `planning_task` and
+`discovery` use a read-only repository capability, while implementation Tasks
+use the write capability selected by their workflow and assignment.
 
 #### Milestones, readiness, and immutable releases
 
@@ -803,8 +795,8 @@ It identifies an action `code`, the required principal, target type and id,
 human title/explanation, `action_kind`, canonical route or operation,
 whether it blocks the Project, and the expected version when a compare-and-swap
 mutation is required. The resolver gives conflicts/reconciliation and
-execution setup precedence over downstream work, then baseline approval,
-Task/validation/evidence remediation, readiness, user release, and finally
+repository setup precedence over downstream work, then Task/validation/evidence
+remediation, readiness, user release, and finally
 milestone definition. Clients must render the action's target and operation;
 they must not infer an executable action from a stale badge, Task counts, or a
 free-form message.
@@ -927,11 +919,11 @@ adapter calls `TaskService` directly, so no `AgentAction` or
 receipt/event identity, source and affected Task ids, board revision, and
 `replayed`; receipt-first exact replay bypasses mutable governance checks,
 while a new command is authorized and validated inside the shared transaction.
-A Project's coordination/chat state, execution setup, and baseline gate remain
+A Project's coordination/chat state, repository setup, and execution projection remain
 independent projections. Each setup response carries per-dimension freshness;
 an unavailable source is returned with a bounded retry action and never
 converted into inferred readiness. V087 backfills only database-verifiable
-repository linkage and current workflow/baseline role eligibility. It records
+repository linkage. It records
 local repository initialization as skipped with `filesystem_verified=false`
 until a reconciler verifies the filesystem, and never fabricates identities or
 successful setup. A release or media-pin failure leaves the milestone
@@ -968,6 +960,15 @@ while callback state, PKCE verifiers, device codes, token bundles, and client
 secrets are encrypted beside the existing protected runtime state. A completed
 authorization publishes a provider entry only. Connection, agent creation, and
 binding are deliberately separate transactions.
+
+Availability is an orthogonal, reversible source policy. A provider entry has
+its own enabled bit, CLI policy keys by exact `(daemon_id, executor_type)`, and
+the existing Agent `paused` state controls one identity. Effective health
+intersects these layers, so disabling a source makes every dependent identity
+ineligible for Main, Project, Worker, and reviewer selection without deleting
+configuration, credentials, bindings, or history. Re-enabling recomputes health
+normally. Task concurrency counts only Task execution rows; Main and Project
+chat turns never consume Task quota.
 
 Harness agents may reference a provider entry (`credential_ref` on the active
 profile). At dispatch, `TaskService` asks `EmbeddedAgentService` to inject the
@@ -1280,7 +1281,14 @@ All non-terminal states can transition to `cancelled`. Terminal states: `done`,
 `backlog → todo → planning → in_progress → review → merging → done` and
 `merge_failed`, `blocked`, `cancelled` as auxiliary/failure/terminal states.
 
-The built-in `autonomous_v1` preset lives in
+The built-in workflow choices are:
+
+- `default` / **Agent review** — the assigned reviewer Agent accepts or rejects.
+- `no-review` — required checks run and the Task continues without a reviewer execution.
+- `human-required` — the user or bound Project Agent accepts or rejects.
+- `autonomous_v1` — the single-worker compatibility preset with hard validation and human review.
+
+The `autonomous_v1` preset lives in
 `crates/services/src/workflow/default_autonomous_workflow.rs`. It is a
 single-worker graph: `backlog → ready → working → review → merging → done`,
 with `merge_failed` returning to worker execution and `cancelled` as the
@@ -1291,6 +1299,12 @@ Review rejection and merge repair resume the latest worker thread. The worker
 plans internally, implements, self-tests, repairs failures, and reports
 verification evidence, so the preset has no planning state or plan-checklist
 gate.
+
+These review modes are Task workflow behavior, not Project approval layers.
+Project defaults may select a mode, and an individual Task may override it.
+When an execution is stopped or cancelled, Attention records the exact Task,
+role, reason, and recovery action and admits a wake for the configured Project
+Agent when available.
 
 ### Workflow engine (in progress)
 

@@ -32,6 +32,7 @@ pub const PROJECT_READINESS_OPERATION: &str = "project.readiness";
 pub const PROJECT_RELEASE_OPERATION: &str = "project.release.request";
 pub const TASK_PROPOSE_OPERATION: &str = "task.propose";
 pub const TASK_ADAPTIVE_OPERATION: &str = "task.adaptive";
+pub const TASK_REVIEW_OPERATION: &str = "task.review";
 
 /// The typed native surface that owns an operation's public contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -370,6 +371,17 @@ pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
     },
     OperationContract {
         operation: TASK_ADAPTIVE_OPERATION,
+        surface: OperationSurface::Coordination,
+        exposure: OperationExposure::GenericProposal,
+        input: OperationInputContract::CoordinationEnvelope,
+        setup: OperationSetupExposure::ReadyOnly,
+        supported_scopes: PROJECT_SCOPES,
+        classification: OperationClassification::DirectCommand,
+        permission: OperationPermission::ProposeTask,
+        output: SHARED_ORCHESTRATION_OUTCOME,
+    },
+    OperationContract {
+        operation: TASK_REVIEW_OPERATION,
         surface: OperationSurface::Coordination,
         exposure: OperationExposure::GenericProposal,
         input: OperationInputContract::CoordinationEnvelope,
@@ -770,6 +782,7 @@ fn leaked_operation_name(operation: &str) -> &'static str {
         "delivery.read" => "delivery.read",
         "web.search" => "web.search",
         TASK_PROPOSE_OPERATION => TASK_PROPOSE_OPERATION,
+        TASK_REVIEW_OPERATION => TASK_REVIEW_OPERATION,
         "message.propose" => "message.propose",
         "message.send" => "message.send",
         "commitment.propose" => "commitment.propose",

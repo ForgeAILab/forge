@@ -248,7 +248,31 @@ async fn provider_credential_migration_preserves_legacy_handle_defaults() {
         .expect("handle exists");
     assert_eq!(handle.credential_method, "api_key");
     assert_eq!(handle.metadata_json, "{}");
+    assert!(handle.enabled);
     assert_eq!(handle.version, 1);
+
+    let disabled = CredentialHandleRepo::set_credential_handle_enabled(
+        &db,
+        &id,
+        &owner,
+        false,
+        handle.version,
+        &now_rfc3339(),
+    )
+    .await
+    .expect("provider entry disables");
+    assert!(!disabled.enabled);
+    assert_eq!(disabled.version, 2);
+    let stale = CredentialHandleRepo::set_credential_handle_enabled(
+        &db,
+        &id,
+        &owner,
+        true,
+        handle.version,
+        &now_rfc3339(),
+    )
+    .await;
+    assert!(matches!(stale, Err(DbError::VersionConflict)));
 }
 
 #[tokio::test]
@@ -6403,7 +6427,7 @@ async fn direct_task_status_updates_emit_a_ledger_event_atomically() {
 }
 
 #[tokio::test]
-async fn stale_execution_baseline_cannot_mint_a_running_execution_after_read_gate() {
+async fn non_runnable_governance_cannot_mint_a_running_execution_after_read_gate() {
     let db = sqlite_db().await;
     let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
     let task_id = seed_task(
@@ -6562,9 +6586,10 @@ async fn stale_execution_baseline_cannot_mint_a_running_execution_after_read_gat
     .await
     .expect("runnable governance creates");
 
-    // This represents the race after the service's read-only admission gate:
-    // the exact baseline is superseded before the authoritative execution
-    // INSERT transaction starts.
+    // This represents a readiness race after the service's read-only admission
+    // check: durable Task governance becomes non-runnable before the
+    // authoritative execution INSERT starts. Baseline supersession alone no
+    // longer performs this update.
     sqlx::query(
         "UPDATE project_execution_baseline
          SET lifecycle = 'superseded', version = version + 1, updated_at = ?
@@ -6712,11 +6737,11 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
         vec![
             (
                 "forge.main.project-discovery/v2".to_owned(),
-                "forge.main.project-discovery/v2@3".to_owned(),
+                "forge.main.project-discovery/v2@4".to_owned(),
             ),
             (
                 "forge.project.orchestration/v1".to_owned(),
-                "forge.project.orchestration/v1@4".to_owned(),
+                "forge.project.orchestration/v1@5".to_owned(),
             ),
         ],
         "a seeded operating-skill revision must be repointed in the same release (V081 regression)"
@@ -6724,7 +6749,7 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
     let (body, digest): (String, String) = sqlx::query_as(
         "SELECT canonical_body, content_digest
          FROM operating_skill_revision
-         WHERE id = 'forge.project.orchestration/v1@4'",
+         WHERE id = 'forge.project.orchestration/v1@5'",
     )
     .fetch_one(db.pool())
     .await
@@ -6732,6 +6757,8 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
     assert!(body.contains("Never invent aliases such as `ac-1`"));
     assert!(body.contains("Evidence is mandatory proof, not optional decoration"));
     assert!(body.contains("Never propose or narrate a release from a blocked"));
+    assert!(body.contains("A baseline is not an implementation gate"));
+    assert!(body.contains("Any enabled configured Agent—including this Project Agent—may fill Worker or reviewer roles"));
     assert_eq!(hex::encode(Sha256::digest(body.as_bytes())), digest);
 }
 

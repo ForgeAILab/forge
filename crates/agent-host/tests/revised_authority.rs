@@ -413,12 +413,12 @@ fn task_proposal_schema_declares_plan_item_binding_explicitly() {
             .and_then(Value::as_str)
             .expect("plan_item_id carries usage guidance");
         assert!(
-            plan_item_description.contains("REQUIRED"),
-            "plan_item_id must be marked required for implementation Tasks: {plan_item_description}"
+            plan_item_description.contains("optional traceability"),
+            "plan_item_id must be optional Task traceability: {plan_item_description}"
         );
         assert!(
             plan_item_description.contains("execution baseline"),
-            "plan_item_id guidance names the active baseline as the id source: {plan_item_description}"
+            "plan_item_id guidance identifies its optional baseline source: {plan_item_description}"
         );
     }
 }

@@ -38,6 +38,7 @@ use forge_agent_host::{
     PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION,
     PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
     PROJECT_RELEASE_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_PROPOSE_OPERATION,
+    TASK_REVIEW_OPERATION,
 };
 use reqwest::header::ACCEPT;
 use serde::Deserialize;
@@ -98,6 +99,22 @@ struct AdaptiveTaskChildPayload {
     title: String,
     description: Option<String>,
     assignee_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskReviewPayload {
+    task_id: String,
+    decision: TaskReviewDecision,
+    expected_task_version: i64,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TaskReviewDecision {
+    Accept,
+    Reject,
 }
 
 impl AdaptiveTaskPayload {
@@ -816,6 +833,7 @@ impl CoordinationToolProvider {
             })?;
             let target_id = if operation == TASK_PROPOSE_OPERATION
                 || operation == TASK_ADAPTIVE_OPERATION
+                || operation == TASK_REVIEW_OPERATION
                 || forge_agent_host::is_project_orchestration_operation(operation)
             {
                 Some(
@@ -1055,6 +1073,64 @@ impl CoordinationToolProvider {
         causation_id: Option<String>,
         causation_depth: i64,
     ) -> Result<Value, AgentHostError> {
+        if operation == TASK_REVIEW_OPERATION {
+            let Some(task_service) = self.task_service_handle() else {
+                return Err(AgentHostError::Configuration(
+                    "Task review execution is not wired to a TaskService".to_owned(),
+                ));
+            };
+            let project_id = target_id.ok_or_else(|| {
+                AgentHostError::Authority(
+                    "Task review command has no server-derived Project target".to_owned(),
+                )
+            })?;
+            let payload: TaskReviewPayload =
+                typed_command_payload(operation, scope, &correlation_id, payload)?;
+            let (policy_result, _) = self
+                .actions
+                .evaluate_direct_command_policy(
+                    actor_identity_id,
+                    scope_type_name(scope.scope_type),
+                    &scope.scope_id,
+                    requested_permission,
+                    operation,
+                    None,
+                )
+                .await
+                .map_err(service_error)?;
+            if !matches!(policy_result, AgentActionPolicyResult::Allowed) {
+                return Err(AgentHostError::Authority(
+                    "Task review command policy did not admit execution".to_owned(),
+                ));
+            }
+            let result = task_service
+                .perform_project_agent_review(
+                    &project_id,
+                    payload.task_id,
+                    matches!(payload.decision, TaskReviewDecision::Accept),
+                    payload.reason,
+                    payload.expected_task_version,
+                    actor_identity_id,
+                )
+                .await
+                .map_err(service_error)?;
+            return Ok(json!({
+                "operation": operation,
+                "status": "succeeded",
+                "replayed": false,
+                "materialized": true,
+                "domain_committed": true,
+                "correlation_id": correlation_id,
+                "task_id": result.task.id,
+                "task_status": result.task.status,
+                "decision": match result.action {
+                    api_types::TaskAction::Approve => "accept",
+                    _ => "reject",
+                },
+                "requires_user_authorization": false,
+            }));
+        }
+
         if operation == TASK_ADAPTIVE_OPERATION {
             let Some(task_service) = self.task_service_handle() else {
                 return Err(AgentHostError::Configuration(
@@ -2562,6 +2638,14 @@ fn validate_proposal_payload(operation: &str, payload: &Value) -> Result<(), Age
         serde_json::from_value::<AdaptiveTaskPayload>(payload.clone()).map_err(|_| {
             AgentHostError::Authority(
                 "adaptive Task payload must be one closed split, sequence, or replace command"
+                    .to_owned(),
+            )
+        })?;
+    }
+    if operation == TASK_REVIEW_OPERATION {
+        serde_json::from_value::<TaskReviewPayload>(payload.clone()).map_err(|_| {
+            AgentHostError::Authority(
+                "Task review payload must contain an exact task, version, and accept/reject decision"
                     .to_owned(),
             )
         })?;

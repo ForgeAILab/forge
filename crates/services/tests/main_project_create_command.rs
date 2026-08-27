@@ -1198,7 +1198,7 @@ async fn main_project_create_replay_refreshes_current_provisioning_projection() 
         .to_owned();
     assert_eq!(
         first_outcome["execution_setup"]["execution_setup_state"],
-        "setup_required"
+        "ready"
     );
 
     sqlx::query(
@@ -1206,7 +1206,7 @@ async fn main_project_create_replay_refreshes_current_provisioning_projection() 
          SET status = 'failed', retryable = 0,
              last_error_code = 'provisioning_retry_exhausted',
              last_error_message = 'finite retry budget exhausted',
-             next_retry_at = NULL,
+             next_retry_at = NULL, completed_at = NULL,
              version = version + 1, updated_at = ?
          WHERE project_id = ?",
     )
@@ -1231,7 +1231,7 @@ async fn main_project_create_replay_refreshes_current_provisioning_projection() 
     assert_eq!(replay_outcome["project_id"], first_outcome["project_id"]);
     assert_eq!(
         replay_outcome["execution_setup"]["execution_setup_state"],
-        "failed"
+        "ready"
     );
     assert_eq!(
         replay_outcome["execution_setup"]["provisioning"]["last_error_code"],

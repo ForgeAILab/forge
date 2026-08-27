@@ -1473,8 +1473,8 @@ pub struct ApproveExecutionBaselineRequest {
     pub expected_project_version: i64,
 }
 
-/// "Approve plan and start work" (D18, F13): the one atomic, replay-exact
-/// command for the proposed-baseline approval gesture. It binds the exact
+/// Accept and activate an optional traceability baseline (D18, F13): the one
+/// atomic, replay-exact command for this review gesture. It binds the exact
 /// revision/content/render identities the user reviewed and, unlike
 /// [`ApproveExecutionBaselineRequest`] followed by
 /// [`ActivateExecutionBaselineRequest`], commits approval and activation in
@@ -1523,11 +1523,12 @@ pub struct ApproveAndActivateExecutionBaselineResponse {
 
 /// Server-checked provenance for a Project Task.
 ///
-/// A Charter-backed implementation Task must carry this envelope when it is
-/// created through a Project Agent action or the Task API.  The database keeps
-/// the immutable copy in `project_task_governance`; this request type is only
-/// the caller-facing input.  The server derives the final `runnable` value
-/// from the active baseline and never trusts a caller-provided flag.
+/// A Charter-backed implementation Task is bound to the Project's current
+/// approved Charter. Optional baseline, plan-item, milestone, and document
+/// references add traceability but do not authorize execution. The database
+/// keeps the immutable copy in `project_task_governance`; the server derives
+/// `runnable` from Charter and repository readiness and never trusts a
+/// caller-provided flag.
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 #[serde(deny_unknown_fields)]

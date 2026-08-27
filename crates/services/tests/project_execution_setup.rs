@@ -212,7 +212,7 @@ async fn setup_actions_replay_exactly_and_reconcile_ready_metadata() {
         Err(ServiceError::Db(DbError::IdempotencyConflict))
     ));
 
-    let rejected_same_identity = service
+    let selected_same_identity = service
         .select_execution_principal(
             &project.id,
             ExecutionPrincipalRole::IndependentReviewer,
@@ -223,11 +223,15 @@ async fn setup_actions_replay_exactly_and_reconcile_ready_metadata() {
             },
             OWNER_ID,
         )
-        .await;
-    assert!(matches!(
-        rejected_same_identity,
-        Err(ServiceError::Conflict(_))
-    ));
+        .await
+        .expect("one configured Agent may fill both default roles");
+    assert_eq!(
+        selected_same_identity
+            .independent_reviewer
+            .as_ref()
+            .map(|agent| &agent.identity_id),
+        Some(&worker_id)
+    );
 
     let selected_reviewer = service
         .select_execution_principal(
@@ -235,7 +239,7 @@ async fn setup_actions_replay_exactly_and_reconcile_ready_metadata() {
             ExecutionPrincipalRole::IndependentReviewer,
             &SelectExecutionPrincipalRequest {
                 identity_id: reviewer_id.clone(),
-                expected_project_version: selected_worker.project_version,
+                expected_project_version: selected_same_identity.project_version,
                 idempotency_key: "select-reviewer-1".to_owned(),
             },
             OWNER_ID,
@@ -437,7 +441,7 @@ async fn expired_retry_receipt_replays_the_same_lease_and_returns_fresh_state() 
 }
 
 #[tokio::test]
-async fn coordinator_identity_is_not_eligible_for_setup_actions() {
+async fn project_agent_identity_is_eligible_for_setup_actions() {
     let db = database().await;
     let (coordinator_id, coordinator_profile_id) = native_agent(&db, "Coordinator").await;
     let project = {
@@ -467,14 +471,18 @@ async fn coordinator_identity_is_not_eligible_for_setup_actions() {
             &project.id,
             ExecutionPrincipalRole::Worker,
             &SelectExecutionPrincipalRequest {
-                identity_id: coordinator_id,
+                identity_id: coordinator_id.clone(),
                 expected_project_version: project.version,
                 idempotency_key: "coordinator-as-worker".to_owned(),
             },
             OWNER_ID,
         )
-        .await;
-    assert!(matches!(result, Err(ServiceError::Conflict(_))));
+        .await
+        .expect("configured Project Agent may also be the default worker");
+    assert_eq!(
+        result.worker.as_ref().map(|agent| &agent.identity_id),
+        Some(&coordinator_id)
+    );
 }
 
 #[tokio::test]
@@ -542,18 +550,10 @@ async fn nonexistent_local_repository_does_not_claim_ready_setup() {
     );
 }
 
-/// `PLAN-03` — an implementation Task cannot become runnable before its
-/// Project has an active, user-approved execution baseline.
-///
-/// The Project below is deliberately taken all the way to
-/// `ExecutionSetupState::Ready`: Worker, independent Reviewer, and primary
-/// repository are all committed, and the Project is Charter-backed. The only
-/// missing authority is the user's baseline approval. The Task is therefore
-/// blocked for exactly one reason, and this test asserts the consequence the
-/// governance gate exists to guarantee: no `WorkspaceLease` — and no
-/// workspace or execution that would imply one — is ever created for it.
+/// A Charter-backed implementation Task is claimable without an execution
+/// baseline. Baselines remain optional traceability and planning artifacts.
 #[tokio::test]
-async fn pre_baseline_implementation_task_creates_no_workspace_lease() {
+async fn charter_backed_implementation_task_is_claimable_without_a_baseline() {
     let db = database().await;
     let project = project(&db, "plan03 pre-baseline").await;
     let _operation = operation(&db, &project.id).await;
@@ -587,7 +587,30 @@ async fn pre_baseline_implementation_task_creates_no_workspace_lease() {
         )
         .await
         .expect("independent reviewer selection commits");
-    let repo_id = repo(&db, &project.id).await;
+    let repository_dir = tempfile::tempdir().expect("local repository directory");
+    git::init(repository_dir.path())
+        .await
+        .expect("local repository initializes");
+    tokio::fs::write(
+        repository_dir.path().join("README.md"),
+        "# Charter-backed Task\n",
+    )
+    .await
+    .expect("repository seed file writes");
+    git::commit_all(repository_dir.path(), "seed Charter-backed Task repository")
+        .await
+        .expect("repository seed commit creates");
+    let repo_id = repo_with_local_path(
+        &db,
+        &project.id,
+        Some(
+            repository_dir
+                .path()
+                .to_str()
+                .expect("repository path is UTF-8"),
+        ),
+    )
+    .await;
     let attached = setup
         .attach_primary_repository(
             &project.id,
@@ -603,80 +626,46 @@ async fn pre_baseline_implementation_task_creates_no_workspace_lease() {
     assert_eq!(
         attached.execution_setup_state,
         ExecutionSetupState::Ready,
-        "execution setup must be complete so the baseline is the only remaining gate"
+        "the explicitly configured defaults remain ready"
     );
 
     attach_approved_charter(&db, &project.id).await;
-    let task_id = new_uuid_v4();
-    let now = now_rfc3339();
-    TaskRepo::create(
-        &*db,
-        CreateTask {
-            id: task_id.clone(),
-            project_id: project.id.clone(),
-            repo_id: Some(repo_id.clone()),
-            parent_task_id: None,
-            assignee_type: None,
-            assignee_id: None,
-            title: "implement the pre-baseline core loop".to_owned(),
-            description: None,
-            task_type: "task".to_owned(),
-            status: "backlog".to_owned(),
-            is_automation: false,
-            priority: 0,
-            subtask_order: None,
-            task_state_config: None,
-            merge_config: None,
-            plan: None,
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("implementation Task creates");
-
     let tasks = TaskService::new(Arc::clone(&db), Arc::new(events::EventBus::new(16)));
-    let error = tasks
+    let task = tasks
+        .create_task(
+            project.id.clone(),
+            "implement the Charter-backed core loop",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("Charter-backed implementation Task creates");
+    let task_id = task.id;
+    let claimed = tasks
         .claim_task(task_id.clone(), Assignee::Agent(worker_id.clone()), None)
         .await
-        .expect_err("an implementation Task must not be claimable before baseline approval");
-    let ServiceError::InvalidOperation { message } = &error else {
-        panic!("expected a deterministic governance refusal, got {error:?}");
-    };
-    assert!(
-        message.contains("waiting for plan approval"),
-        "the refusal must name the missing baseline approval, got {message}"
-    );
-
-    for (table, label) in [
-        ("workspace_lease", "WorkspaceLease"),
-        ("workspace", "workspace"),
-        ("execution", "execution"),
-    ] {
-        let count: i64 =
-            sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE task_id = ?"))
-                .bind(&task_id)
-                .fetch_one(db.pool())
-                .await
-                .unwrap_or_else(|error| panic!("{label} count: {error}"));
-        assert_eq!(
-            count, 0,
-            "a refused pre-baseline claim must leave no {label} row"
-        );
-    }
+        .expect("Charter approval authorizes implementation without baseline approval");
+    assert_eq!(claimed.task.status, "in_progress");
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workspace_lease")
+        claimed.task.assignee_id.as_deref(),
+        Some(worker_id.as_str())
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution WHERE task_id = ?")
+            .bind(&task_id)
             .fetch_one(db.pool())
             .await
-            .expect("global WorkspaceLease count"),
-        0,
-        "no WorkspaceLease exists anywhere in the Project before baseline approval"
+            .expect("Task execution count"),
+        1
     );
 }
 
-/// Attach an approved Charter revision so the Project is Charter-backed and
-/// the governance gate applies. This mirrors the server-side approval shape
-/// without granting an execution baseline.
+/// Attach an approved Charter revision so the Project is Charter-backed.
 async fn attach_approved_charter(db: &SqliteDb, project_id: &str) {
     let now = now_rfc3339();
     sqlx::query(
@@ -899,9 +888,9 @@ async fn a_worker_at_capacity_is_still_eligible_for_its_own_role() {
 // projected as a Project-wide gate. These tests reproduce that shape and lock
 // in the fix (D16/D17).
 
-/// A Project created with an active Project Agent binding, so
-/// `coordination_state` is `Ready` from the start and the only remaining
-/// gates are execution setup and the execution baseline.
+/// A Project created with an active Project Agent binding. The fixture later
+/// attaches baseline traceability only to reproduce the preserved conflict;
+/// that record is not Task execution authority.
 async fn coordinated_project(db: &SqliteDb, name: &str) -> Project {
     let (coordinator_id, coordinator_profile_id) =
         native_agent(db, &format!("{name} coordinator")).await;

@@ -279,10 +279,7 @@ async fn main_charter_queries_do_not_create_action_or_receipt_rows() {
         MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION
     );
     assert_eq!(project_agents["session_version"], 1);
-    assert_eq!(
-        project_agents["items"][0]["identity_id"],
-        UNBOUND_IDENTITY_ID
-    );
+    assert_eq!(project_agents["items"][0]["identity_id"], MAIN_IDENTITY_ID);
 
     let read = service
         .execute(

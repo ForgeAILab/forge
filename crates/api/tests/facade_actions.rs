@@ -68,10 +68,32 @@ async fn facade_transitions_are_attributed_to_api_users_for_both_workflows() {
     set_workflow(&harness.app, &autonomous_project, "autonomous_v1").await;
     let (strict_project, _) =
         common::create_project_and_repo(&harness.app, "Strict", &repo_path).await;
+    set_workflow(&harness.app, &strict_project, "human-required").await;
 
-    for (project_id, initial_state, active_state, gate_state) in [
-        (autonomous_project, "ready", "working", "review"),
-        (strict_project, "todo", "in_progress", "planning"),
+    for (
+        project_id,
+        initial_state,
+        active_state,
+        gate_state,
+        request_changes_target,
+        approval_target,
+    ) in [
+        (
+            autonomous_project,
+            "ready",
+            "working",
+            "review",
+            "working",
+            "merging",
+        ),
+        (
+            strict_project,
+            "todo",
+            "in_progress",
+            "review",
+            "in_progress",
+            "merging",
+        ),
     ] {
         let submit_task = create_task(&harness.app, &project_id, "submit").await;
         set_status(&harness, &submit_task.id, active_state).await;
@@ -95,12 +117,7 @@ async fn facade_transitions_are_attributed_to_api_users_for_both_workflows() {
             StatusCode::OK,
         )
         .await;
-        let expected_request_target = if gate_state == "review" {
-            "working"
-        } else {
-            "planning"
-        };
-        assert_api_transition(&harness, &gate_task.id, gate_state, expected_request_target).await;
+        assert_api_transition(&harness, &gate_task.id, gate_state, request_changes_target).await;
 
         set_status(&harness, &gate_task.id, gate_state).await;
         let _approved: TaskResponse = common::json_request(
@@ -111,18 +128,7 @@ async fn facade_transitions_are_attributed_to_api_users_for_both_workflows() {
             StatusCode::OK,
         )
         .await;
-        let expected_approval_target = if gate_state == "planning" {
-            "in_progress"
-        } else {
-            "merging"
-        };
-        assert_api_transition(
-            &harness,
-            &gate_task.id,
-            gate_state,
-            expected_approval_target,
-        )
-        .await;
+        assert_api_transition(&harness, &gate_task.id, gate_state, approval_target).await;
 
         let cancel_task = create_task(&harness.app, &project_id, "cancel").await;
         let _cancelled: TaskResponse = common::json_request(

@@ -32,8 +32,8 @@ pub(super) fn is_io_or_workspace_error(error: &ServiceError) -> bool {
 pub(super) fn is_deterministic_dispatch_refusal(error: &ServiceError) -> bool {
     match error {
         // Governance and admission outcomes: setup a user must complete, an
-        // authority the active baseline does not grant, an unresolved
-        // canonical conflict, or an action this Task cannot currently offer.
+        // unresolved scoped canonical conflict, or an action this Task cannot
+        // currently offer.
         ServiceError::ExecutionSetupRequired { .. }
         | ServiceError::AuthorizationDenied { .. }
         | ServiceError::Conflict(_)

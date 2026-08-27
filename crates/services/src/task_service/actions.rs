@@ -2,8 +2,9 @@ use super::*;
 
 use api_types::{Actor, StateKind, TaskAction, UserActionSource, WorkflowTrigger};
 use db::{
-    Agent, AgentListQuery, AgentRepo, AssigneeKind, ExecutionRepo, PageRequest, ProjectRepo,
-    ReviewRepo, ReviewStatus, SortBy, SortOrder, TaskRepo, TaskRoleAssignmentRepo,
+    Agent, AgentListQuery, AgentRepo, AssigneeKind, ExecutionRepo, PageRequest,
+    ProjectAgentBindingRepo, ProjectRepo, ReviewRepo, ReviewStatus, SortBy, SortOrder, TaskRepo,
+    TaskRoleAssignmentRepo,
 };
 
 #[derive(Debug)]
@@ -13,6 +14,74 @@ pub struct TaskActionResult {
 }
 
 impl TaskService {
+    /// Accept or reject a human-required review through the Project's bound
+    /// Project Agent. The caller supplies the server-derived Project scope;
+    /// this method rejects cross-Project Tasks before exposing their state.
+    pub async fn perform_project_agent_review(
+        &self,
+        project_id: &str,
+        task_id: impl Into<String>,
+        accept: bool,
+        reason: Option<String>,
+        expected_task_version: i64,
+        project_agent_identity_id: &str,
+    ) -> Result<TaskActionResult> {
+        let task_id = task_id.into();
+        let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
+            .await?
+            .filter(|task| task.project_id == project_id)
+            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        let project = ProjectRepo::get_by_id(&*self.db, project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
+        let binding = ProjectAgentBindingRepo::get_active_project_binding(&*self.db, project_id)
+            .await?
+            .filter(|binding| {
+                binding.state == "active"
+                    && binding.identity_id.as_deref() == Some(project_agent_identity_id)
+            })
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "Task review requires the Project's currently configured Project Agent",
+                )
+            })?;
+        debug_assert_eq!(
+            binding.identity_id.as_deref(),
+            Some(project_agent_identity_id)
+        );
+        let actor = Actor::agent(project_agent_identity_id);
+        let workflow =
+            WorkflowEngine::resolve_workflow_for_task(&task, &project.workflow_definition, &actor);
+        let review_gate = workflow
+            .states
+            .iter()
+            .find(|state| state.name == task.status);
+        let human_review = review_gate.is_some_and(|state| {
+            state.canonical_phase == Some(api_types::CanonicalPhase::Review)
+                && state
+                    .gate_config
+                    .as_ref()
+                    .is_some_and(|gate| gate.requires_user_approval())
+        });
+        if !human_review {
+            return Err(ServiceError::invalid_operation(
+                "Task is not waiting for a human-required review decision",
+            ));
+        }
+        self.perform_task_action_as(
+            task_id,
+            if accept {
+                TaskAction::Approve
+            } else {
+                TaskAction::RequestChanges
+            },
+            reason,
+            Some(expected_task_version),
+            actor,
+        )
+        .await
+    }
+
     /// Return intent actions from the resolved workflow capabilities and the
     /// task's current execution/review state. Callers do not need to know the
     /// project's concrete state names.
@@ -40,6 +109,27 @@ impl TaskService {
         reason: Option<String>,
         requested_version: Option<i64>,
     ) -> Result<TaskActionResult> {
+        self.perform_task_action_as(
+            task_id,
+            action,
+            reason,
+            requested_version,
+            Actor::user(UserActionSource::Api),
+        )
+        .await
+    }
+
+    /// Execute a Task action with an already-authorized canonical actor. This
+    /// is used by the bound Project Agent's scoped review action; callers must
+    /// authorize Project ownership before invoking it.
+    pub async fn perform_task_action_as(
+        &self,
+        task_id: impl Into<String>,
+        action: TaskAction,
+        reason: Option<String>,
+        requested_version: Option<i64>,
+        actor: Actor,
+    ) -> Result<TaskActionResult> {
         let task_id = task_id.into();
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
@@ -47,7 +137,6 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let actor = Actor::user(UserActionSource::Api);
         let workflow =
             WorkflowEngine::resolve_workflow_for_task(&task, &project.workflow_definition, &actor);
         // A stale client version is a conflict for every action, not only the ones whose

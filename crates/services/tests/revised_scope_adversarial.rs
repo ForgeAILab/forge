@@ -778,7 +778,7 @@ async fn project_proposal_target_is_derived_from_scope() {
 }
 
 #[tokio::test]
-async fn implementation_proposal_without_plan_item_is_rejected_once_baseline_is_active() {
+async fn implementation_proposal_without_plan_item_uses_charter_authority() {
     let db = database().await;
     project(&db, "project-a").await;
     attach_approved_charter(&db, "project-a").await;
@@ -803,24 +803,23 @@ async fn implementation_proposal_without_plan_item_is_rejected_once_baseline_is_
             }),
         )
         .await
-        .expect_err("an implementation proposal without plan_item_id must fail loudly");
-    let outcome = structured_error(outcome, "task.propose", "project-a");
-    assert_eq!(outcome.code, OutcomeCode::ValidationError);
-    let counts: (i64, i64) = (
-        sqlx::query_scalar("SELECT COUNT(*) FROM task")
-            .fetch_one(db.pool())
-            .await
-            .expect("task count"),
-        sqlx::query_scalar("SELECT COUNT(*) FROM agent_action")
-            .fetch_one(db.pool())
-            .await
-            .expect("action count"),
-    );
-    assert_eq!(
-        counts,
-        (0, 0),
-        "a rejected proposal must not leave a silent unrunnable Task or a stranded action"
-    );
+        .expect("the current Charter authorizes implementation without plan-item traceability");
+    let outcome = success_outcome(outcome, "task.propose", "project-a");
+    let task_id = outcome.result.as_ref().expect("command result")["domain_result"]["task_id"]
+        .as_str()
+        .expect("task id");
+    let (baseline_id, plan_item_id, runnable): (Option<String>, Option<String>, i64) =
+        sqlx::query_as(
+            "SELECT baseline_id, plan_item_id, runnable
+             FROM project_task_governance WHERE task_id = ?",
+        )
+        .bind(task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("Charter-backed Task governance");
+    assert_eq!(baseline_id, None);
+    assert_eq!(plan_item_id, None);
+    assert_eq!(runnable, 1);
 }
 
 #[tokio::test]

@@ -1283,7 +1283,7 @@ async fn receipt_failure_rolls_back_task_governance_event_and_action_execution()
 }
 
 #[tokio::test]
-async fn prebaseline_planning_and_discovery_remain_read_only_non_runnable() {
+async fn charter_backed_planning_and_discovery_are_read_only_and_runnable() {
     let fixture = fixture().await;
     for (suffix, task_type) in [("planning", "planning_task"), ("discovery", "discovery")] {
         let task_payload = payload(
@@ -1327,7 +1327,7 @@ async fn prebaseline_planning_and_discovery_remain_read_only_non_runnable() {
         assert!(governance.1.is_none());
         assert_eq!(governance.2.as_deref(), Some("repository_read"));
         assert_eq!(governance.3.as_deref(), Some("low"));
-        assert_eq!(governance.4, 0);
+        assert_eq!(governance.4, 1);
     }
     assert_eq!(
         count(

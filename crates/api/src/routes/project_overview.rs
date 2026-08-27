@@ -1796,34 +1796,9 @@ fn next_action(context: NextActionContext<'_>) -> Option<ProjectNextAction> {
     }
 
     match execution_setup.execution_gate {
-        api_types::ExecutionGate::BaselineApprovalRequired => {
-            return Some(project_action!(
-                "baseline_approval",
-                "user",
-                "project",
-                project_id,
-                "Approve the execution baseline",
-                "A proposed execution baseline is available but is not active until the user approves it.",
-                "approval",
-                "project.execution_baseline.approve",
-                true,
-                Some(execution_setup.project_version),
-            ));
-        }
-        api_types::ExecutionGate::PreBaselineReadOnly => {
-            return Some(project_action!(
-                "baseline_proposal",
-                "project_agent",
-                "project",
-                project_id,
-                "Prepare the execution baseline",
-                "The Project needs a bounded execution baseline before Tasks can run.",
-                "planning",
-                "project.execution_baseline.propose_for_approval",
-                true,
-                Some(execution_setup.project_version),
-            ));
-        }
+        api_types::ExecutionGate::BaselineApprovalRequired
+        | api_types::ExecutionGate::PreBaselineReadOnly
+        | api_types::ExecutionGate::Active => {}
         api_types::ExecutionGate::ReconciliationRequired
         | api_types::ExecutionGate::Unavailable => {
             // Same underlying `project_reconciliation_record` source as the
@@ -1837,14 +1812,13 @@ fn next_action(context: NextActionContext<'_>) -> Option<ProjectNextAction> {
                 "project",
                 project_id,
                 "Reconcile the execution gate",
-                "The execution gate cannot prove that the current baseline is runnable.",
+                "Forge could not verify the current Charter-backed execution state.",
                 "reconciliation",
                 "project.reconciliation.resolve",
                 true,
                 Some(execution_setup.project_version),
             ));
         }
-        api_types::ExecutionGate::Active => {}
     }
 
     if let Some(milestone) = milestones
@@ -2463,11 +2437,6 @@ mod next_action_parity_tests {
         ),
         ("project.execution_setup.refresh", NextActionTarget::Refresh),
         ("project.execution_setup", NextActionTarget::Rest),
-        ("project.execution_baseline.approve", NextActionTarget::Rest),
-        (
-            "project.execution_baseline.propose_for_approval",
-            NextActionTarget::AutomatedByResponsiblePrincipal,
-        ),
         (
             "task.remediate",
             NextActionTarget::AutomatedByResponsiblePrincipal,
@@ -2687,22 +2656,6 @@ mod next_action_parity_tests {
         fixture.execution_setup = base_execution_setup(
             api_types::CoordinationState::Ready,
             api_types::ExecutionSetupState::Ready,
-            api_types::ExecutionGate::BaselineApprovalRequired,
-        );
-        scenarios.push(("baseline_approval", fixture));
-
-        let mut fixture = Fixture::base();
-        fixture.execution_setup = base_execution_setup(
-            api_types::CoordinationState::Ready,
-            api_types::ExecutionSetupState::Ready,
-            api_types::ExecutionGate::PreBaselineReadOnly,
-        );
-        scenarios.push(("baseline_proposal", fixture));
-
-        let mut fixture = Fixture::base();
-        fixture.execution_setup = base_execution_setup(
-            api_types::CoordinationState::Ready,
-            api_types::ExecutionSetupState::Ready,
             api_types::ExecutionGate::ReconciliationRequired,
         );
         scenarios.push(("execution_gate_reconciliation", fixture));
@@ -2820,5 +2773,37 @@ mod next_action_parity_tests {
             registered_target(&reconciliation_action.route_or_operation),
             NextActionTarget::Rest
         ));
+    }
+
+    #[test]
+    fn legacy_baseline_states_do_not_create_project_next_actions() {
+        for gate in [
+            api_types::ExecutionGate::BaselineApprovalRequired,
+            api_types::ExecutionGate::PreBaselineReadOnly,
+        ] {
+            let mut fixture = Fixture::base();
+            fixture.execution_setup = base_execution_setup(
+                api_types::CoordinationState::Ready,
+                api_types::ExecutionSetupState::Ready,
+                gate,
+            );
+            assert!(next_action(NextActionContext {
+                project_id: "project-1",
+                project_version: 7,
+                charter_setup_required: fixture.charter_setup_required,
+                no_milestones: fixture.no_milestones,
+                execution_setup: &fixture.execution_setup,
+                milestones: &fixture.milestones,
+                documents: &fixture.documents,
+                releases: &fixture.releases,
+                pending_decision_ids: &fixture.pending_decision_ids,
+                task_counts: &fixture.task_counts,
+                failed_task_count: fixture.failed_task_count,
+                checks: &fixture.checks,
+                reconciliation_required: fixture.reconciliation_required,
+                stale: fixture.stale,
+            })
+            .is_none());
+        }
     }
 }

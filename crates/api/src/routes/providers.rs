@@ -9,6 +9,7 @@ use api_types::{
     DetectedCli, DisconnectCredentialResponse, ProviderEntriesResponse, ProviderEntryAgentRef,
     ProviderEntryResponse, ProviderEntryTestResponse, ProviderRevocationStatus,
     ProviderUsageResponse, ProviderUsageWindow, RenameProviderEntryRequest, SessionVersionRequest,
+    SetCliRuntimeAvailabilityRequest, SetProviderEntryAvailabilityRequest,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -56,7 +57,7 @@ pub async fn list_providers(
             entry_response(handle, usage)
         })
         .collect();
-    let cli_runtimes = cli_runtime_entries(&state).await?;
+    let cli_runtimes = cli_runtime_entries(&state, &user.user_id).await?;
     Ok(Json(ProviderEntriesResponse {
         items,
         cli_runtimes,
@@ -161,6 +162,113 @@ pub async fn rename_provider_entry(
     Ok(Json(entry_response(handle, usage)))
 }
 
+pub async fn set_provider_entry_availability(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(id): Path<String>,
+    Json(request): Json<SetProviderEntryAvailabilityRequest>,
+) -> ApiResult<Json<ProviderEntryResponse>> {
+    let handle = CredentialHandleRepo::set_credential_handle_enabled(
+        &*state.db,
+        &id,
+        &user.user_id,
+        request.enabled,
+        request.version,
+        &now_rfc3339(),
+    )
+    .await
+    .map_err(|error| match error {
+        DbError::VersionConflict => ApiError::conflict_with_code(
+            "provider_entry.version_conflict",
+            "provider entry changed before its availability could be updated",
+        ),
+        _ => ApiError::not_found("provider_entry", id.clone()),
+    })?;
+    let usage = CredentialHandleRepo::list_credential_usage(&*state.db, &user.user_id)
+        .await?
+        .into_iter()
+        .filter(|row| row.credential_id == handle.id)
+        .collect();
+    Ok(Json(entry_response(handle, usage)))
+}
+
+pub async fn set_cli_runtime_availability(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path((daemon_id, executor_type)): Path<(String, String)>,
+    Json(request): Json<SetCliRuntimeAvailabilityRequest>,
+) -> ApiResult<Json<CliRuntimeEntryResponse>> {
+    if request.version < 0 {
+        return Err(ApiError::bad_request("version must be zero or greater"));
+    }
+    let daemon = DaemonRepo::get_by_id(&*state.db, &daemon_id)
+        .await?
+        .filter(|daemon| {
+            daemon
+                .owner_id
+                .as_deref()
+                .is_none_or(|owner| owner == user.user_id)
+                && serde_json::from_str::<Vec<DetectedCli>>(&daemon.detected_clis_json)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|cli| cli.kind == executor_type)
+        })
+        .ok_or_else(|| {
+            ApiError::not_found("cli_runtime", format!("{daemon_id}/{executor_type}"))
+        })?;
+    let now = now_rfc3339();
+    let updated = sqlx::query(
+        "UPDATE cli_runtime_policy
+         SET enabled = ?, version = version + 1, updated_at = ?
+         WHERE owner_user_id = ? AND daemon_id = ? AND executor_type = ?
+           AND version = ?",
+    )
+    .bind(request.enabled)
+    .bind(&now)
+    .bind(&user.user_id)
+    .bind(&daemon_id)
+    .bind(&executor_type)
+    .bind(request.version)
+    .execute(state.db.pool())
+    .await?;
+    let changed = if updated.rows_affected() == 1 {
+        true
+    } else if request.version == 0 {
+        sqlx::query(
+            "INSERT OR IGNORE INTO cli_runtime_policy (
+                 owner_user_id, daemon_id, executor_type, enabled,
+                 version, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, 1, ?, ?)",
+        )
+        .bind(&user.user_id)
+        .bind(&daemon_id)
+        .bind(&executor_type)
+        .bind(request.enabled)
+        .bind(&now)
+        .bind(&now)
+        .execute(state.db.pool())
+        .await?
+        .rows_affected()
+            == 1
+    } else {
+        false
+    };
+    if !changed {
+        return Err(ApiError::conflict_with_code(
+            "cli_runtime.version_conflict",
+            "CLI runtime availability changed before it could be updated",
+        ));
+    }
+    let entries = cli_runtime_entries_for_daemon(&state, &user.user_id, daemon).await?;
+    let entry = entries
+        .into_iter()
+        .find(|entry| entry.kind == executor_type)
+        .ok_or_else(|| {
+            ApiError::not_found("cli_runtime", format!("{daemon_id}/{executor_type}"))
+        })?;
+    Ok(Json(entry))
+}
+
 pub async fn delete_provider_entry(
     State(state): State<AppState>,
     user: AuthenticatedUser,
@@ -237,6 +345,7 @@ fn entry_response(handle: CredentialHandle, usage: Vec<CredentialUsage>) -> Prov
         label: handle.label,
         credential_method: handle.credential_method,
         status: handle.status,
+        enabled: handle.enabled,
         base_url,
         provider_account_id,
         used_by: usage.into_iter().map(usage_ref).collect(),
@@ -280,15 +389,24 @@ fn cli_login_hint(kind: &str) -> Option<&'static str> {
     }
 }
 
-async fn cli_runtime_entries(state: &AppState) -> ApiResult<Vec<CliRuntimeEntryResponse>> {
+async fn cli_runtime_entries(
+    state: &AppState,
+    owner_user_id: &str,
+) -> ApiResult<Vec<CliRuntimeEntryResponse>> {
     let daemons = all_daemons(state).await?;
-    let mut used_by: HashMap<String, Vec<ProviderEntryAgentRef>> = HashMap::new();
+    let mut used_by: HashMap<(Option<String>, String), Vec<ProviderEntryAgentRef>> = HashMap::new();
     for agent in all_agents(state).await? {
-        if agent.backend_kind != "cli" || agent.credential_ref.is_some() {
+        if agent.backend_kind != "cli"
+            || agent.credential_ref.is_some()
+            || agent
+                .owner_id
+                .as_deref()
+                .is_some_and(|owner| owner != owner_user_id)
+        {
             continue;
         }
         used_by
-            .entry(agent.executor_type.clone())
+            .entry((agent.daemon_id.clone(), agent.executor_type.clone()))
             .or_default()
             .push(ProviderEntryAgentRef {
                 agent_id: agent.id,
@@ -298,22 +416,80 @@ async fn cli_runtime_entries(state: &AppState) -> ApiResult<Vec<CliRuntimeEntryR
     }
     let mut items = Vec::new();
     for daemon in daemons {
-        let detected: Vec<DetectedCli> =
-            serde_json::from_str(&daemon.detected_clis_json).unwrap_or_default();
-        for cli in detected {
-            items.push(CliRuntimeEntryResponse {
+        if daemon
+            .owner_id
+            .as_deref()
+            .is_some_and(|owner| owner != owner_user_id)
+        {
+            continue;
+        }
+        for mut entry in cli_runtime_entries_for_daemon(state, owner_user_id, daemon).await? {
+            let exact_key = (Some(entry.daemon_id.clone()), entry.kind.clone());
+            let global_key = (None, entry.kind.clone());
+            entry.used_by = used_by.get(&exact_key).cloned().unwrap_or_default();
+            entry
+                .used_by
+                .extend(used_by.get(&global_key).cloned().unwrap_or_default());
+            entry
+                .used_by
+                .sort_by(|left, right| left.agent_name.cmp(&right.agent_name));
+            entry
+                .used_by
+                .dedup_by(|left, right| left.agent_id == right.agent_id);
+            items.push(entry);
+        }
+    }
+    Ok(items)
+}
+
+async fn cli_runtime_entries_for_daemon(
+    state: &AppState,
+    owner_user_id: &str,
+    daemon: Daemon,
+) -> ApiResult<Vec<CliRuntimeEntryResponse>> {
+    let detected: Vec<DetectedCli> =
+        serde_json::from_str(&daemon.detected_clis_json).unwrap_or_default();
+    let policies = sqlx::query(
+        "SELECT executor_type, enabled, version FROM cli_runtime_policy
+         WHERE owner_user_id = ? AND daemon_id = ?",
+    )
+    .bind(owner_user_id)
+    .bind(&daemon.id)
+    .fetch_all(state.db.pool())
+    .await?;
+    let policy_by_executor: HashMap<String, (bool, i64)> = policies
+        .into_iter()
+        .map(|row| {
+            Ok((
+                sqlx::Row::try_get(&row, "executor_type")?,
+                (
+                    sqlx::Row::try_get(&row, "enabled")?,
+                    sqlx::Row::try_get(&row, "version")?,
+                ),
+            ))
+        })
+        .collect::<Result<_, sqlx::Error>>()?;
+    Ok(detected
+        .into_iter()
+        .map(|cli| {
+            let (enabled, policy_version) = policy_by_executor
+                .get(&cli.kind)
+                .copied()
+                .unwrap_or((true, 0));
+            CliRuntimeEntryResponse {
                 daemon_id: daemon.id.clone(),
                 daemon_hostname: Some(daemon.hostname.clone()),
                 daemon_status: daemon.status.to_string(),
                 availability: cli.availability,
+                enabled,
+                policy_version,
                 version: cli.version,
                 login_hint: cli_login_hint(&cli.kind).map(str::to_owned),
-                used_by: used_by.get(&cli.kind).cloned().unwrap_or_default(),
+                used_by: Vec::new(),
                 kind: cli.kind,
-            });
-        }
-    }
-    Ok(items)
+            }
+        })
+        .collect())
 }
 
 async fn all_daemons(state: &AppState) -> ApiResult<Vec<Daemon>> {

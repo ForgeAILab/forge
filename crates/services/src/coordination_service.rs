@@ -17,7 +17,7 @@ use forge_agent_host::{
     operation_contract, OperationClassification, MAIN_CHARTER_DRAFT_OPERATION,
     MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION, MAIN_GENESIS_START_OPERATION,
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_RELEASE_OPERATION, TASK_ADAPTIVE_OPERATION,
-    TASK_PROPOSE_OPERATION,
+    TASK_PROPOSE_OPERATION, TASK_REVIEW_OPERATION,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -1438,7 +1438,8 @@ async fn evaluate_action_policy(
     let direct_allowed = project_draft_allowed
         || main_orchestration_allowed
         || (operation == TASK_ADAPTIVE_OPERATION && requested_permission == "propose_task")
-        || (operation == TASK_PROPOSE_OPERATION && requested_permission == "propose_task");
+        || (operation == TASK_PROPOSE_OPERATION && requested_permission == "propose_task")
+        || (operation == TASK_REVIEW_OPERATION && requested_permission == "propose_task");
     if matches!(classification, OperationClassification::Denied) {
         return Ok((
             AgentActionPolicyResult::Denied,

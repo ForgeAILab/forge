@@ -209,7 +209,7 @@ fn user_authorization(action: &str, event_id: &str) -> AuthorizationProvenance {
         authorization_basis: "interactive_user_reconciliation_resolution".to_owned(),
         action: action.to_owned(),
         event_id: event_id.to_owned(),
-        occurred_at: NOW.to_owned(),
+        occurred_at: db::now_rfc3339(),
     }
 }
 

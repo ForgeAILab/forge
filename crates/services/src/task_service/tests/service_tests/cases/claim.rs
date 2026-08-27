@@ -1,7 +1,7 @@
 use super::super::*;
 
 #[tokio::test]
-async fn orchestration_identity_claim_fails_before_workspace_or_branch_creation() {
+async fn project_agent_identity_can_claim_a_task_role() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let workspace_root = TempDir::new().expect("workspace root creates");
@@ -43,7 +43,7 @@ async fn orchestration_identity_claim_fails_before_workspace_or_branch_creation(
     let task = service
         .create_task(
             project_id,
-            "Orchestration identity must not claim",
+            "Project Agent can also work this Task",
             None,
             None,
             None,
@@ -55,27 +55,24 @@ async fn orchestration_identity_claim_fails_before_workspace_or_branch_creation(
         .await
         .expect("task creates");
 
-    let result = service
+    let claimed = service
         .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
-        .await;
+        .await
+        .expect("Project Agent identity is a usable configured Agent");
 
-    assert!(matches!(
-        result,
-        Err(ServiceError::InvalidOperation { message })
-            if message.contains("Main and Project Agent identities")
-    ));
+    assert_eq!(claimed.task.status, "in_progress");
     assert!(
         WorkspaceRepo::get_by_task_id(&*db, &task.id)
             .await
             .expect("workspace lookup")
-            .is_none(),
-        "rejected orchestration identity must not create a workspace row"
+            .is_some(),
+        "Task role claim creates the Task-scoped workspace"
     );
     assert!(
-        !git::branch_exists(repo_dir.path(), &::workspace::task_branch_name(&task.id))
+        git::branch_exists(repo_dir.path(), &::workspace::task_branch_name(&task.id))
             .await
             .expect("branch lookup"),
-        "rejected orchestration identity must not create a task branch"
+        "Task role claim creates the Task branch"
     );
 }
 

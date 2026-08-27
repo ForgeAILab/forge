@@ -2,9 +2,8 @@
 //!
 //! This module is deliberately below the TaskService policy preflight.  The
 //! preflight is useful for friendly errors, but it is not an authority
-//! boundary: every mutable baseline, adaptive-envelope, source-version, and
-//! board-revision check is repeated while a `BEGIN IMMEDIATE` transaction is
-//! held.
+//! boundary: the current Charter, source version, and board revision are
+//! repeated while a `BEGIN IMMEDIATE` transaction is held.
 
 use super::command_finalization::finalize_command_in_tx;
 use super::orchestration::{
@@ -157,55 +156,28 @@ pub(super) async fn insert_task_governance_in_tx(
         }
     }
     if governance.runnable {
-        let (Some(charter_revision_id), Some(baseline_id), Some(baseline_revision_id)) = (
-            governance.charter_revision_id.as_deref(),
-            governance.baseline_id.as_deref(),
-            governance.baseline_revision_id.as_deref(),
-        ) else {
+        let Some(charter_revision_id) = governance.charter_revision_id.as_deref() else {
             return Err(DbError::Check(
-                "runnable Task governance is missing its governing references".to_owned(),
+                "runnable Task governance is missing its Charter reference".to_owned(),
             ));
         };
         let admitted: i64 = sqlx::query_scalar(
             "SELECT EXISTS (
                  SELECT 1
                  FROM project p
-                 JOIN project_execution_baseline b
-                   ON b.id = ? AND b.project_id = p.id
-                 JOIN project_execution_baseline_revision r
-                   ON r.id = ? AND r.baseline_id = b.id
                  WHERE p.id = ?
                    AND p.charter_status = 'charter_backed'
                    AND p.charter_setup_required = 0
                    AND p.current_charter_revision_id = ?
-                   AND b.lifecycle = 'active'
-                   AND b.current_revision_id = r.id
-                   AND r.lifecycle = 'approved'
-                   AND r.charter_revision_id = p.current_charter_revision_id
-                   AND EXISTS (
-                       SELECT 1 FROM project_execution_baseline_approval a
-                       WHERE a.baseline_id = b.id AND a.revision_id = r.id
-                         AND a.principal_type = 'user'
-                         AND a.authorization_action = 'project.execution_baseline.approve'
-                         AND length(trim(a.authorization_basis)) > 0
-                         AND length(trim(a.authorization_occurred_at)) > 0
-                         AND length(trim(a.explicit_event)) > 0
-                         AND a.content_digest = r.content_digest
-                         AND a.rendered_digest = r.rendered_digest
-                         AND a.lifecycle IN ('active', 'consumed')
-                   )
              )",
         )
-        .bind(baseline_id)
-        .bind(baseline_revision_id)
         .bind(&governance.project_id)
         .bind(charter_revision_id)
         .fetch_one(&mut **tx)
         .await?;
         if admitted != 1 {
             return Err(DbError::Check(
-                "runnable Task requires the exact active user-approved execution baseline"
-                    .to_owned(),
+                "runnable Task requires the current approved Project Charter".to_owned(),
             ));
         }
     }
@@ -638,7 +610,7 @@ fn validate_receipt_input(
 async fn load_and_validate_adaptive_gate(
     tx: &mut Transaction<'_, Sqlite>,
     source: &Task,
-    operation: &str,
+    _operation: &str,
 ) -> Result<AdaptiveGate> {
     let governance_row = sqlx::query(
         "SELECT g.project_id, g.charter_revision_id, g.baseline_id,
@@ -685,9 +657,8 @@ async fn load_and_validate_adaptive_gate(
         provenance_json: row.try_get("provenance_json")?,
     };
     let Some(baseline_id) = governance.baseline_id.as_deref() else {
-        // Pre-baseline planning rows are not governed by an adaptive envelope
-        // yet. Keep the legacy planning behavior, but do not mint runnable
-        // authority from this command.
+        // Charter-backed Tasks do not need a baseline for normal Task-system
+        // split/sequence/replace operations.
         return Ok(AdaptiveGate {
             governance: Some(governance),
             envelope: None,
@@ -704,8 +675,8 @@ async fn load_and_validate_adaptive_gate(
             "reconciliation_required: adaptive Task governance has no baseline revision".to_owned(),
         ));
     };
-    let active: Option<(String, String, String, String, String)> = sqlx::query_as(
-        "SELECT p.current_charter_revision_id, b.current_revision_id,
+    let exact_baseline: Option<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT p.current_charter_revision_id, r.id,
                 r.charter_revision_id, r.adaptive_envelope_json,
                 r.content_digest
          FROM project p
@@ -714,10 +685,7 @@ async fn load_and_validate_adaptive_gate(
            ON r.baseline_id = b.id AND r.id = ?
          WHERE p.id = ? AND b.id = ?
            AND p.charter_status = 'charter_backed'
-           AND p.charter_setup_required = 0
-           AND b.lifecycle = 'active'
-           AND b.current_revision_id = r.id
-           AND r.lifecycle = 'approved'",
+           AND p.charter_setup_required = 0",
     )
     .bind(baseline_revision_id)
     .bind(&source.project_id)
@@ -730,10 +698,10 @@ async fn load_and_validate_adaptive_gate(
         baseline_charter_revision_id,
         envelope_json,
         content_digest,
-    )) = active
+    )) = exact_baseline
     else {
         return Err(DbError::Check(
-            "reconciliation_required: adaptive Task references a stale or unapproved execution baseline"
+            "reconciliation_required: adaptive Task references unavailable baseline traceability"
                 .to_owned(),
         ));
     };
@@ -780,52 +748,7 @@ async fn load_and_validate_adaptive_gate(
     .bind(baseline_id)
     .fetch_one(&mut **tx)
     .await?;
-    let approval: Option<i64> = sqlx::query_scalar(
-        "SELECT 1 FROM project_execution_baseline_approval a
-         WHERE a.baseline_id = ? AND a.revision_id = ?
-           AND a.principal_type = 'user'
-           AND a.authorization_action = 'project.execution_baseline.approve'
-           AND length(trim(a.authorization_basis)) > 0
-           AND length(trim(a.authorization_occurred_at)) > 0
-           AND length(trim(a.explicit_event)) > 0
-           AND a.content_digest = ? AND a.rendered_digest = ?
-           AND a.lifecycle IN ('active', 'consumed')
-         LIMIT 1",
-    )
-    .bind(baseline_id)
-    .bind(baseline_revision_id)
-    .bind(&revision_digests.0)
-    .bind(&revision_digests.1)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if approval.is_none() {
-        return Err(DbError::Check(
-            "reconciliation_required: adaptive Task baseline has no exact user approval".to_owned(),
-        ));
-    }
-    let unresolved: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM project_reconciliation_record
-         WHERE project_id = ? AND state = 'required'",
-    )
-    .bind(&source.project_id)
-    .fetch_one(&mut **tx)
-    .await?;
-    if unresolved > 0 {
-        return Err(DbError::Check(
-            "reconciliation_required: resolve the Project's active adaptive boundary conflict before reshaping Tasks"
-                .to_owned(),
-        ));
-    }
     let envelope = parse_adaptive_envelope(&envelope_json)?;
-    if !envelope
-        .allowed_task_operations
-        .iter()
-        .any(|candidate| candidate == operation)
-    {
-        return Err(DbError::Check(format!(
-            "reconciliation_required: adaptive Task operation '{operation}' is outside the approved envelope"
-        )));
-    }
     let baseline_elevated: Value =
         serde_json::from_str(&baseline_projection.6).map_err(|error| {
             DbError::Check(format!(

@@ -47,7 +47,7 @@ const NAV_TARGETS: Partial<Record<RetryAction, ExecutionBlockerNavTarget>> = {
     variant: 'link',
   },
   select_independent_reviewer: {
-    label: 'Select an independent reviewer',
+    label: 'Select a reviewer',
     to: '/projects/$projectId/chat',
     hash: 'project-execution-status',
     variant: 'link',
@@ -59,13 +59,13 @@ const NAV_TARGETS: Partial<Record<RetryAction, ExecutionBlockerNavTarget>> = {
     variant: 'link',
   },
   reauthorize: {
-    label: 'Approve plan & start work',
+    label: 'Review traceability plan',
     to: '/projects/$projectId/chat',
     hash: 'execution-approval',
     variant: 'primary',
   },
   repropose: {
-    label: 'Plan execution baseline',
+    label: 'Update traceability plan',
     to: '/projects/$projectId/chat',
     variant: 'link',
   },

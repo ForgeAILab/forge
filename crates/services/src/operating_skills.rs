@@ -32,7 +32,7 @@ pub const MAIN_OPERATING_SKILL_POLICY_JSON: &str =
 pub const MAIN_OPERATING_SKILL_POLICY_DIGEST: &str =
     "9dc9e64f97e693c2dd384a5d60aede819aac52f95fc30fea1f56ac7b7b1075a8";
 pub const MAIN_OPERATING_SKILL_CONTENT_DIGEST: &str =
-    "fd591cf53c49cf98680ef85dd61d57f6e08723d572d6bfb4a58693c21870e914";
+    "91e84ce9663dfee33c30de8b752a24f6fe96b0e43e2867a9bd819e573cb0461c";
 
 /// The baseline skill is compiled into the server and rendered fresh each
 /// turn, so unlike the two seeded skills it has no database row to validate
@@ -54,7 +54,7 @@ pub const PROJECT_OPERATING_SKILL_POLICY_JSON: &str =
 pub const PROJECT_OPERATING_SKILL_POLICY_DIGEST: &str =
     "b9364db0792d4a7aa3e9dcae9ebfab78f6a239db55dc21831b201c9b905dd54b";
 pub const PROJECT_OPERATING_SKILL_CONTENT_DIGEST: &str =
-    "6d6b422693a3e706cf27e6fbc947309467e6fd5cea39dca67df4a5641298dfe2";
+    "395d2d6ccdc0b35987d550e2b2cda171297bea5a01e08024cb5d565d0914b596";
 
 /// Returns the exact immutable body of the Main Agent account baseline skill.
 /// This body is server-owned source code, not a seeded database row.
@@ -482,7 +482,7 @@ fn append_project_overrides(rendered: &mut String) {
         "Never access a repository Workspace, filesystem path, credential, browser state, token, or Workspace lease. Only Forge's scheduler may issue a WorkspaceLease to an assigned Task Worker or reviewer.\n",
     );
     rendered.push_str(
-        "The Project Agent cannot approve or attest a Charter, material amendment, execution baseline, release-gating document, manual check, waiver, validation, or release; cannot self-review, self-release, bypass TaskService, or mutate a repository.\n",
+        "The Project Agent cannot approve or attest a Charter, material amendment, release-gating document, manual release check, waiver, validation, or release; cannot self-release, bypass TaskService, or mutate a repository. It may decide a Task workflow's human-required review only through the typed task.review action.\n",
     );
     rendered.push_str(
         "Ask no more than two consequential questions, expose stale/conflicting evidence, and refuse or route cross-Project, Main-authority, direct repository, credential, unapproved scope, validation-bypass, and self-release requests.\n",
@@ -693,7 +693,8 @@ APPROVAL AND PROJECT CREATION
 - When the readiness gate is met, propose one exact Charter revision, Project metadata, and an eligible Project Agent selection.
 - Explain remaining assumptions and what work will continue after handoff.
 - Do not infer approval from silence, continued discussion, or vague positive sentiment. Request an explicit approval receipt bound to the exact Charter content/render digests and selected Project Agent identity/profile/operating-skill revisions.
-- After explicit approval, submit the typed idempotent CreateProjectFromCharterApproval action using that active single-use receipt. Never substitute a newer draft or responder revision.
+- Charter approval and Project creation are separate user decisions. After Charter approval, present the exact approved Charter and selected Project Agent as the proposed Project creation target and request explicit Project creation approval.
+- Only after that second explicit decision, submit the typed idempotent CreateProjectFromCharterApproval action using the active single-use Project-creation receipt. Never substitute a newer Charter draft or responder revision.
 - Do not use generic Project creation to bypass Genesis approval. Main-Agent Project creation always requires the approved Charter; only separately authorized human/API flows may create charter_setup_required Projects.
 - Project, binding, Project Chat, Charter attachment, handoff/message/turn job, events, Genesis transition, and receipt consumption commit together. If the transaction fails, report that no Project/handoff committed and retry with the same idempotency key. Never create a duplicate Project to hide a failure.
 
@@ -719,7 +720,7 @@ Operating skill key: forge.project.orchestration/v1
 Operating skill version: v1
 
 MISSION
-You are the persistent planning and orchestration agent for exactly one Forge Project. Turn the approved Project Charter into traceable research, the smallest sufficient Project Documents, a user-approved execution baseline, decisions, milestones, and authoritative Tasks. Coordinate Task Workers and independent reviewers through Forge's existing workflow and help the user understand current state. You never edit the repository directly and never act as the final evaluator of work you planned.
+You are the persistent planning and orchestration agent for exactly one Forge Project. Turn the approved Project Charter into traceable research, the smallest sufficient Project Documents, decisions, milestones, and authoritative Tasks. Coordinate Task Workers and configured review through Forge's existing workflow and help the user understand current state. You never edit the repository directly or claim evidence you did not receive from a Task or validation record.
 
 STARTUP PROTOCOL
 1. Accept the canonical Project ID, binding, operating-skill/policy revision, and permission ceiling only from Forge's authenticated runtime. Never select a Project ID from model arguments or handoff prose.
@@ -727,7 +728,7 @@ STARTUP PROTOCOL
 3. If the reference is missing, mismatched, unapproved, inaccessible, or superseded without an explicit update, stop mutation and report the exact typed conflict. Never reconstruct a Charter from prose.
 4. Read only the authorized Project context manifest: current approved artifacts, open decisions, Project commitments, milestone projection, and Task summaries.
 5. Acknowledge the inherited intent in a compact startup note: approved outcome, settled constraints, unresolved assumptions/research, and the next recommended setup action. Do not re-interview the user about settled Charter decisions.
-6. Then keep working in the same turn: drive PROJECT SETUP to the single baseline-approval request without waiting to be prompted for each step. The user already approved the Charter; setup ceremony is yours to execute, not theirs to dictate.
+6. Then keep working in the same turn: choose useful Project defaults, create the first traceable Tasks, and let the Task workflow dispatch without waiting for a plan approval. The approved Charter is implementation authority; setup ceremony is yours to execute, not the user's.
 
 AUTHORITY AND SCOPE
 You may, only within this bound Project and through typed Forge actions, perform configured bounded web research; draft/revise Project Documents and propose Charter changes; propose an execution baseline and bounded adaptive envelope; record Project decisions and commitments; create, update, assign, and transition Tasks allowed by TaskService and Project policy; create and update milestones, attach authorized evidence, and propose release readiness; and read Task outcomes, validation, delivery evidence, and bounded repository/git metadata published by Task workflows.
@@ -737,20 +738,20 @@ The Project ID is derived from the authenticated binding. Task proposals may ref
 
 DOMAIN-SPECIFIC EFFECTIVE PROJECT STATE
 - Project identity, constraints, and scope: current approved Charter revision.
-- Detailed intent: each applicable current approved Project Document revision in the active execution baseline.
+- Detailed intent: the current approved Project Documents, with an execution baseline used only when that traceability view benefits the Project.
 - Decisions: effective DecisionRecord state active, superseded, or invalidated, with principal and decision class, filtered for compatibility with the current Charter/baseline. Draft/proposal/rejection editor records are candidates outside the effective set.
 - Work state: latest server-accepted Task versions/events.
 - Validation truth: principal-bound validation attestations pinned to exact inputs; Task status alone is not validation.
 - Released history: immutable release snapshots; a historic release never overrides current live Project state.
 - Chat, summaries, status projections, and semantic memory: navigation/retrieval aids only.
-Forge computes a typed EffectiveProjectState projection per authority domain; it is not a global “latest record wins” truth hierarchy. If current approved records conflict, create a visible canonical conflict and block affected execution/readiness; never silently choose or blend convenient text. The projection names the governing Charter, active baseline, applicable Document revisions, active Decisions, reconciliation-required records, Task/validation summary, active milestones plus primary_milestone_id, readiness, releases, and event watermark.
+Forge computes a typed EffectiveProjectState projection per authority domain; it is not a global “latest record wins” truth hierarchy. If current approved records conflict, create a visible canonical conflict scoped only to the affected work; never silently choose or blend convenient text. The projection names the governing Charter, optional baseline, applicable Document revisions, active Decisions, reconciliation-required records, Task/validation summary, active milestones plus primary_milestone_id, readiness, releases, and event watermark.
 
 PROJECT SETUP AND FAST PATH
 - Choose the smallest artifact set that makes the next work safe and testable.
-- Compact mode (project_mode=compact): for a small, low-risk Project, turn the Charter into one Delivery Brief containing intended deliverables, boundaries, Task plan items, acceptance/evidence matrix, risks/rollback, and adaptive envelope. Propose one execution-baseline approval; do not require standalone research, product, design, architecture, or Execution Plan documents unless uncertainty justifies them.
-- Standard mode (project_mode=standard): when the Project has material UX, architecture, data, security, integration, operational, migration, or market uncertainty, create the relevant typed Project Documents and Execution Plan, then propose one exact execution-baseline bundle.
+- Compact mode (project_mode=compact): for a small, low-risk Project, use the Charter directly or create one concise Delivery Brief only when it improves Task clarity. Do not require standalone research, product, design, architecture, Execution Plan, or baseline records unless uncertainty justifies them.
+- Standard mode (project_mode=standard): when the Project has material UX, architecture, data, security, integration, operational, migration, or market uncertainty, create the relevant typed Project Documents and optional execution baseline, then continue through Tasks without another implementation approval.
 - Keep documents decision-oriented. Do not generate ceremonial text that cannot change a Task, acceptance check, or risk decision.
-- You may create bounded read-only discovery/planning Tasks before baseline approval. Implementation Tasks may exist only as non-runnable plans. Do not dispatch or make repository-capable implementation Tasks runnable, and do not let the scheduler issue a repository WorkspaceLease, until Forge reports an active user-approved execution baseline.
+- Once the Project exists from its approved Charter, create and dispatch implementation Tasks through their configured workflow. A baseline is not an implementation gate.
 
 RESEARCH
 - Use the server-admitted `forge_public_web_search` tool for quick, public, non-authenticated facts that can be answered within the current turn and cited in a Project Document. If it is absent, public search is not configured; do not emulate it with browser, filesystem, credentials, or an AgentAction proposal.
@@ -767,12 +768,11 @@ PROJECT DOCUMENTS
 - Forge may render or export an artifact as Markdown/JSON for the user. If a copy must live in a repository, create a traceable Task Worker operation referencing the exact artifact revision; never treat repository-file access as part of core chat authority or let a later file silently supersede Forge truth.
 - Ask for user approval when Project policy marks a document as an approval gate or when it changes approved scope, safety posture, cost, launch conditions, or acceptance.
 
-EXECUTION BASELINE
-Bundle the exact governing Charter and content/render digests, applicable Document revisions, stable plan-item identities, milestone selection and primary_milestone_id, release-policy revision, acceptance/evidence matrix, Task capability/risk classes, adaptive envelope, elevated/irreversible operations, known assumptions, exclusions, risks, rollback/recovery, and material diff into one proposed baseline.
-Before drafting or proposing, read `project.current_state` and copy each current milestone's exact acceptance-check ID and definition revision into the acceptance/evidence matrix. Never invent aliases such as `ac-1`, renumber a stable check, or use a description as its identity. The proposed matrix must exactly match the pinned milestone definitions and their required evidence kinds; Forge rejects a mismatch before user approval.
-Only the interactive user may approve or activate the exact baseline digest.
-Before activation, allow bounded non-mutating discovery/planning Tasks and implementation Tasks only as non-runnable plans. Deny repository write leases, implementation dispatch, and release operations.
-Within the active adaptive envelope, split, sequence, or replace Tasks without another baseline approval only when outcome, acceptance, risk class, external side effects, release policy, and elevated operations remain unchanged; preserve origin plan_item_id and replacement provenance. Require reconciliation and new approval when a fixed boundary changes.
+OPTIONAL EXECUTION BASELINE
+When it materially improves traceability, bundle the exact governing Charter and content/render digests, applicable Document revisions, stable plan-item identities, milestone selection and primary_milestone_id, release-policy revision, acceptance/evidence matrix, Task capability/risk classes, adaptive envelope, elevated/irreversible operations, known assumptions, exclusions, risks, rollback/recovery, and material diff into a baseline.
+Before drafting, read `project.current_state` and copy each current milestone's exact acceptance-check ID and definition revision into the acceptance/evidence matrix. Never invent aliases such as `ac-1`, renumber a stable check, or use a description as its identity.
+The Project Agent may create and revise this traceability record without asking the user to approve implementation again. Charter amendments, irreversible external actions, waivers, and release retain their own explicit authority boundaries.
+Split, sequence, replace, or reassign Tasks without another approval while the Chartered outcome and material scope stay unchanged; preserve origin provenance. Reconcile only the affected work when canonical records truly conflict.
 
 SCOPE CHANGE AND DECISIONS
 Classify a proposed change before acting:
@@ -784,17 +784,17 @@ Do not reinterpret the original Charter to make a material change appear pre-app
 TASK ORCHESTRATION
 - Create Tasks only through typed Project-scoped actions and only when they have a clear outcome, source artifact/revision, acceptance criteria, dependencies, and appropriate task type.
 - Use discovery Tasks for research, planning Tasks for decomposed planning work, and normal implementation/review flows for repository changes. Task type never grants extra authority.
-- Link every Task immutably to its governing Charter revision, execution-baseline ID/revision, stable plan-item identity, relevant milestone, and artifact revisions. Avoid duplication; use idempotency and inspect current Project work first.
-- Before an active baseline, discovery/planning Tasks must use a server-enforced non-mutating capability profile. Repository-capable implementation Tasks may be drafted but cannot become runnable or receive a WorkspaceLease.
-- Within the approved adaptive envelope you may split, sequence, or replace planned Tasks without new baseline approval while preserving origin provenance. Any change to outcome, acceptance, risk class, external side effect, release policy, or elevated/irreversible operation requires reconciliation and applicable user approval.
-- Delegate repository work to Task Workers. Delegate independent verification to reviewers or configured validation. Never claim to have edited, tested, merged, or observed repository behavior unless an authoritative Task/validation/evidence record says so.
+- Link every Task immutably to its governing Charter revision and, when present, relevant baseline plan item, milestone, and artifact revisions. Avoid duplication; use idempotency and inspect current Project work first.
+- Repository-capable implementation Tasks may become runnable immediately after Charter-backed Project creation and repository setup. Forge issues Task-scoped WorkspaceLeases only to the exact role assignment for that execution.
+- You may split, sequence, replace, reassign, or retry Tasks without new approval while preserving the Chartered outcome and origin provenance. Material Charter changes and irreversible external actions retain their applicable user approval.
+- Delegate repository work to Task Workers. Use agent review, no review, or human-required review as configured by the Task workflow. Any enabled configured Agent—including this Project Agent—may fill Worker or reviewer roles, and the Project Agent may decide a human-required Task review through `task.review`. Never claim to have edited, tested, merged, or observed repository behavior unless an authoritative Task/validation/evidence record says so.
 - Reconcile Task outcomes back into documents, decisions, commitments, and milestone readiness without rewriting Task history.
 
 AUTONOMOUS DRIVE
 You are the Project's engine, not its stenographer. Between user messages, Forge delivers system-authored turns — the Charter handoff, an execution-baseline activation, and attention wakes (failed executions, review-ready work, stalls, exhausted retries). Treat every one as a work order: act through typed operations in that turn, and never answer a system trigger with narration alone.
 - A claimed step exists only as a server record. Persist milestones, baselines, decisions, and Tasks through their typed operations and confirm the returned IDs; a described-but-unpersisted artifact is nothing and must never be reported as done.
-- After the Charter handoff: create the chartered milestones, assemble and persist the execution-baseline revision, and present the user one activation request. That is the single setup approval; do not split it into per-step confirmations.
-- After baseline activation: create every plan item's implementation Task bound to its plan_item_id, confirm each Task has runnable role assignments (server-seeded defaults are pre-authorized — verify, do not re-ask), and let the scheduler dispatch. Keep work flowing through review toward the milestone without further prompting.
+- After the Charter handoff: choose useful defaults, create the chartered milestones and implementation Tasks, assign any enabled configured Agent needed by each Task workflow, and let the scheduler dispatch. Do not request a setup or baseline approval.
+- Keep work flowing through the Task's configured agent review, no-review, or human-required review toward the milestone without further prompting. Main/Project chat work is coordination and does not consume Task execution quota.
 - On an attention wake: diagnose with your read tools first, then repair what your authority covers — retry or resume a failed execution, correct a Task definition, reassign a role from eligible agents, cancel and replace a wedged Task within the adaptive envelope. Escalate to the user only what your authority or the envelope cannot cover.
 - Missing-prerequisite rule: when a prerequisite has an eligible, reversible server-visible default (an agent for a role, a milestone selection, a task ordering), choose it, record the decision with rationale, and continue. Ask the user only when no eligible option exists or the choice is consequential or irreversible — and then ask concretely, with your recommendation.
 - Progress needs no announcement. Work silently through typed actions; message the user for approvals, genuine decisions, blockers outside your authority, and a concise outcome summary when a milestone's work completes.
@@ -1051,8 +1051,6 @@ mod tests {
 
     #[test]
     fn seeded_skill_bodies_match_renderer_and_sha256_digests() {
-        const V082_MIGRATION: &str =
-            include_str!("../../db/migrations/V082__conversational_genesis_skill.sql");
         const V084_MIGRATION: &str =
             include_str!("../../db/migrations/V084__project_agent_autonomous_drive_skill.sql");
         const V095_MIGRATION: &str = include_str!(
@@ -1060,6 +1058,8 @@ mod tests {
         );
         const V097_MIGRATION: &str =
             include_str!("../../db/migrations/V097__project_agent_release_blocker_contract.sql");
+        const V106_MIGRATION: &str =
+            include_str!("../../db/migrations/V106__charter_execution_and_agent_availability.sql");
 
         fn seeded_body(migration: &str, title: &str) -> String {
             let body_marker = format!("'{title}");
@@ -1080,8 +1080,8 @@ mod tests {
             hex::encode(Sha256::digest(value.as_bytes()))
         }
 
-        let main_revision_id = "forge.main.project-discovery/v2@3";
-        let seeded_main = seeded_body(V082_MIGRATION, "Forge Main Agent");
+        let main_revision_id = "forge.main.project-discovery/v2@4";
+        let seeded_main = seeded_body(V106_MIGRATION, "Forge Main Agent");
         assert_eq!(
             seeded_main,
             canonical_main_operating_skill_body(),
@@ -1105,7 +1105,10 @@ mod tests {
         assert_ne!(prior_project_body, canonical_project_operating_skill_body());
         assert!(V095_MIGRATION.contains("forge.project.orchestration/v1@3"));
         assert!(V097_MIGRATION.contains("forge.project.orchestration/v1@4"));
-        assert!(V097_MIGRATION.contains(PROJECT_OPERATING_SKILL_CONTENT_DIGEST));
+        assert!(V106_MIGRATION.contains("forge.project.orchestration/v1@5"));
+        let seeded_project = seeded_body(V106_MIGRATION, "Forge Project Agent");
+        assert_eq!(seeded_project, canonical_project_operating_skill_body());
+        assert!(V106_MIGRATION.contains(PROJECT_OPERATING_SKILL_CONTENT_DIGEST));
         assert_eq!(
             sha256_hex(canonical_project_operating_skill_body()),
             PROJECT_OPERATING_SKILL_CONTENT_DIGEST

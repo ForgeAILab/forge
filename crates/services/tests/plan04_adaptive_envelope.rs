@@ -553,7 +553,7 @@ async fn plan04_split_sequence_replace_preserve_the_approved_boundaries() {
 }
 
 #[tokio::test]
-async fn plan04_crossing_a_fixed_boundary_records_reconciliation_and_blocks() {
+async fn plan04_crossing_a_fixed_boundary_records_reconciliation_without_freezing_valid_work() {
     let (db, service) = fixture().await;
     let governance = api_types::TaskGovernanceRequest {
         charter_revision_id: Some(CHARTER_REVISION_ID.to_owned()),
@@ -608,7 +608,7 @@ async fn plan04_crossing_a_fixed_boundary_records_reconciliation_and_blocks() {
         .expect("task count");
     assert_eq!(task_count, 1, "blocked split creates no replacement Task");
 
-    let blocked_again = service
+    let valid_follow_up = service
         .create_subtasks(
             ROOT_TASK_ID.to_owned(),
             vec![services::NewSubtaskInput {
@@ -618,10 +618,8 @@ async fn plan04_crossing_a_fixed_boundary_records_reconciliation_and_blocks() {
             }],
         )
         .await
-        .expect_err("existing reconciliation remains a hard gate");
-    assert!(
-        matches!(blocked_again, ServiceError::Conflict(message) if message.contains("reconciliation_required"))
-    );
+        .expect("a scoped reconciliation must not freeze valid Task work");
+    assert_eq!(valid_follow_up.len(), 1);
 }
 
 #[tokio::test]
@@ -981,24 +979,24 @@ async fn adaptive_children_count(db: &SqliteDb) -> i64 {
 }
 
 #[tokio::test]
-async fn plan04_adaptive_adapter_rejects_stale_baseline_approval_and_reconciliation() {
-    // A superseded current baseline is not an executable adaptive envelope.
+async fn plan04_adaptive_adapter_uses_charter_authority_not_baseline_approval() {
+    // A superseded optional traceability plan does not revoke Charter-backed
+    // Task operations.
     let stale_baseline = adapter_fixture().await;
     sqlx::query("UPDATE project_execution_baseline SET lifecycle = 'superseded' WHERE id = ?")
         .bind(BASELINE_ID)
         .execute(stale_baseline.db.pool())
         .await
         .expect("supersede baseline");
-    let result = adapter_propose(
+    adapter_propose(
         &stale_baseline,
         TASK_ADAPTIVE_OPERATION,
         adaptive_split_payload(board_revision(&stale_baseline.db).await),
         "plan04-stale-baseline",
     )
     .await
-    .expect_err("stale baseline must reject adaptive split");
-    assert_eq!(structured_error_code(result), "validation_error");
-    assert_eq!(adaptive_children_count(&stale_baseline.db).await, 0);
+    .expect("superseded traceability plan must not reject adaptive split");
+    assert_eq!(adaptive_children_count(&stale_baseline.db).await, 2);
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM project_reconciliation_record
@@ -1007,14 +1005,12 @@ async fn plan04_adaptive_adapter_rejects_stale_baseline_approval_and_reconciliat
         .bind(PROJECT_ID)
         .fetch_one(stale_baseline.db.pool())
         .await
-        .expect("stale baseline reconciliation"),
-        1
+        .expect("superseded plan reconciliation count"),
+        0
     );
 
-    // A baseline approval that was authoritatively revoked is equally stale,
-    // even when the baseline itself remains active. Approval receipts are
-    // immutable apart from their active -> revoked/consumed lifecycle, so use
-    // that allowed state transition instead of forging a digest in place.
+    // Revoking optional plan approval likewise does not revoke Charter-backed
+    // Task operations.
     let stale_approval = adapter_fixture().await;
     sqlx::query(
         "UPDATE project_execution_baseline_approval
@@ -1024,20 +1020,19 @@ async fn plan04_adaptive_adapter_rejects_stale_baseline_approval_and_reconciliat
     .execute(stale_approval.db.pool())
     .await
     .expect("revoke approval receipt");
-    let result = adapter_propose(
+    adapter_propose(
         &stale_approval,
         TASK_ADAPTIVE_OPERATION,
         adaptive_split_payload(board_revision(&stale_approval.db).await),
         "plan04-stale-approval",
     )
     .await
-    .expect_err("stale approval must reject adaptive split");
-    assert_eq!(structured_error_code(result), "validation_error");
-    assert_eq!(adaptive_children_count(&stale_approval.db).await, 0);
+    .expect("revoked traceability approval must not reject adaptive split");
+    assert_eq!(adaptive_children_count(&stale_approval.db).await, 2);
 
-    // Reconciliation is a durable Project gate. Seed it through the native
-    // TaskService seam, then prove the Project-Agent adapter cannot bypass it
-    // with an otherwise valid split payload.
+    // A real fixed-boundary divergence remains recorded, but it is scoped to
+    // that rejected change and does not become a second Project-wide Task
+    // workflow.
     let reconciled = adapter_fixture().await;
     let changed_governance = api_types::TaskGovernanceRequest {
         charter_revision_id: Some(CHARTER_REVISION_ID.to_owned()),
@@ -1070,16 +1065,15 @@ async fn plan04_adaptive_adapter_rejects_stale_baseline_approval_and_reconciliat
         result,
         ServiceError::Conflict(message) if message.contains("reconciliation_required")
     ));
-    let result = adapter_propose(
+    adapter_propose(
         &reconciled,
         TASK_ADAPTIVE_OPERATION,
         adaptive_split_payload(board_revision(&reconciled.db).await),
         "plan04-existing-reconciliation",
     )
     .await
-    .expect_err("existing reconciliation must remain a hard adapter gate");
-    assert_eq!(structured_error_code(result), "validation_error");
-    assert_eq!(adaptive_children_count(&reconciled.db).await, 0);
+    .expect("existing scoped reconciliation must not block valid split");
+    assert_eq!(adaptive_children_count(&reconciled.db).await, 2);
 }
 
 #[tokio::test]
@@ -1106,7 +1100,7 @@ async fn plan04_adaptive_adapter_rejects_changed_acceptance_and_fixed_boundaries
     // before the shared command reaches persistence. No reconciliation is
     // recorded for an input that was never admitted, and no receipt/event is
     // left behind. The in-boundary reconciliation path remains covered by
-    // `plan04_crossing_a_fixed_boundary_records_reconciliation_and_blocks`.
+    // `plan04_crossing_a_fixed_boundary_records_reconciliation_without_freezing_valid_work`.
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM project_reconciliation_record
@@ -1331,40 +1325,23 @@ fn persisted_legacy_adaptive_envelope_fails_naming_the_field() {
     );
 }
 
-/// F9: a *denied no-op* must not create durable conflict truth.
-///
-/// The preserved failed run narrowed an envelope to exclude `replace`, called
-/// it, and the miss recorded a canonical conflict plus a Task-scoped
-/// reconciliation row — which `execution_gate()` then projected as a
-/// Project-wide `ReconciliationRequired`. One rejected command that committed
-/// no mutation stopped every unrelated Task in the Project. A denial is a
-/// policy outcome; only a proven divergence between authoritative records is
-/// reconciliation truth (D14).
+/// The baseline envelope is traceability, not an adaptive-operation grant.
+/// Any normal Task reshape remains available under the current Charter.
 #[tokio::test]
-async fn plan04_denied_adaptive_no_op_creates_no_conflict_or_reconciliation() {
-    // `replace` is valid vocabulary this baseline simply never granted — the
-    // exact live shape.
+async fn plan04_replace_is_allowed_even_when_the_optional_plan_lists_only_split() {
     let (db, service) = fixture_with_allowed_operations(&["split"]).await;
 
-    let error = service
+    let replacement = service
         .replace_task(
             ROOT_TASK_ID.to_owned(),
             "replacement outside the granted envelope",
             Some("same acceptance".to_owned()),
         )
         .await
-        .expect_err("replace is not granted by the narrowed envelope");
-
-    // A denial, not a conflict: the message must name the allowed verbs so the
-    // caller can propose a successor baseline instead of guessing.
-    let rendered = error.to_string();
-    assert!(
-        !rendered.contains("reconciliation_required"),
-        "a denied no-op must not be reported as reconciliation truth: {rendered}"
-    );
-    assert!(
-        rendered.contains("split"),
-        "the denial must name the allowed operations: {rendered}"
+        .expect("replace is normal Charter-backed Task authority");
+    assert_eq!(
+        replacement.title,
+        "replacement outside the granted envelope"
     );
 
     assert_eq!(
@@ -1376,7 +1353,7 @@ async fn plan04_denied_adaptive_no_op_creates_no_conflict_or_reconciliation() {
         .await
         .expect("conflict count"),
         0,
-        "a rejected no-op must create no canonical conflict"
+        "a normal replacement must create no canonical conflict"
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -1387,20 +1364,6 @@ async fn plan04_denied_adaptive_no_op_creates_no_conflict_or_reconciliation() {
         .await
         .expect("reconciliation count"),
         0,
-        "a rejected no-op must create no reconciliation row"
+        "a normal replacement must create no reconciliation row"
     );
-
-    // The Project's execution authority is untouched: the still-granted
-    // operation continues to work.
-    service
-        .create_subtasks(
-            ROOT_TASK_ID.to_owned(),
-            vec![services::NewSubtaskInput {
-                title: "still-granted split".to_owned(),
-                description: Some("same acceptance".to_owned()),
-                assignee_id: None,
-            }],
-        )
-        .await
-        .expect("a denied no-op must not reduce unrelated execution authority");
 }

@@ -123,7 +123,7 @@ async fn execution_setup_routes_enforce_idempotency_policy_and_ready_projection(
     );
     assert_eq!(
         created_setup.execution_gate,
-        api_types::ExecutionGate::PreBaselineReadOnly
+        api_types::ExecutionGate::Active
     );
     let worker_id = create_native_agent(&harness, "API Worker").await;
     let reviewer_id = create_native_agent(&harness, "API Reviewer").await;
@@ -200,7 +200,7 @@ async fn execution_setup_routes_enforce_idempotency_policy_and_ready_projection(
     .await;
     assert_eq!(changed_input.code, "idempotency_conflict");
 
-    let same_identity: ErrorResponse = common::json_request_with_bearer(
+    let same_identity: ProjectExecutionSetupResponse = common::json_request_with_bearer(
         app,
         Method::POST,
         &format!(
@@ -213,10 +213,16 @@ async fn execution_setup_routes_enforce_idempotency_policy_and_ready_projection(
             "expected_project_version": selected_worker.project_version,
             "idempotency_key": "api-reviewer-same"
         }),
-        StatusCode::CONFLICT,
+        StatusCode::OK,
     )
     .await;
-    assert!(same_identity.message.contains("distinct"));
+    assert_eq!(
+        same_identity
+            .independent_reviewer
+            .as_ref()
+            .map(|agent| &agent.identity_id),
+        Some(&worker_id)
+    );
 
     let selected_reviewer: ProjectExecutionSetupResponse = common::json_request_with_bearer(
         app,
@@ -228,7 +234,7 @@ async fn execution_setup_routes_enforce_idempotency_policy_and_ready_projection(
         &token,
         json!({
             "identity_id": reviewer_id,
-            "expected_project_version": selected_worker.project_version,
+            "expected_project_version": same_identity.project_version,
             "idempotency_key": "api-reviewer-1"
         }),
         StatusCode::OK,

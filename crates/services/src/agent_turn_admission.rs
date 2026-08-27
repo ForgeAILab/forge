@@ -12,13 +12,14 @@ use async_trait::async_trait;
 use db::{
     AccountMainAgentBindingRepo, AdmitAgentChatTurn, AdmittedAgentChatTurn, AgentChat,
     AgentChatTransactionRepo, AgentProfileRepo, AgentRepo, CreateAgentChatMessage,
-    CreateAgentChatTurnJob, ProjectAgentBindingRepo, SqliteDb,
+    CreateAgentChatTurnJob, CredentialHandleRepo, ProjectAgentBindingRepo, SqliteDb,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::Row;
 
 use crate::{
+    agent_service::cli_runtime_source_enabled,
     operating_skills::{MAIN_BASELINE_OPERATING_SKILL_REVISION, MAIN_OPERATING_SKILL_KEY},
     Result, ServiceError,
 };
@@ -541,6 +542,17 @@ impl AgentResponderStore for SqliteDb {
         else {
             return Ok(ResolvedAgentResponder::setup(chat));
         };
+        if let Some(credential_ref) = profile.credential_ref.as_deref() {
+            let enabled = CredentialHandleRepo::get_credential_handle(self, credential_ref)
+                .await?
+                .is_some_and(|handle| handle.status == "configured" && handle.enabled);
+            if !enabled {
+                return Ok(ResolvedAgentResponder::unavailable(chat));
+            }
+        }
+        if !cli_runtime_source_enabled(self, &identity).await? {
+            return Ok(ResolvedAgentResponder::unavailable(chat));
+        }
 
         let permission_policy_digest = policy_digest(&permission_json)?;
         let tool_policy_digest = policy_digest(&profile.tool_policy_json)?;

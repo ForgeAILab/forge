@@ -312,6 +312,8 @@ export type { ProviderEntriesResponse } from './bindings/ProviderEntriesResponse
 export type { ProviderEntryTestResponse } from './bindings/ProviderEntryTestResponse'
 export type { CreateProviderEntryRequest } from './bindings/CreateProviderEntryRequest'
 export type { RenameProviderEntryRequest } from './bindings/RenameProviderEntryRequest'
+export type { SetProviderEntryAvailabilityRequest } from './bindings/SetProviderEntryAvailabilityRequest'
+export type { SetCliRuntimeAvailabilityRequest } from './bindings/SetCliRuntimeAvailabilityRequest'
 export type { CreateEmbeddedAgentRequest } from './bindings/CreateEmbeddedAgentRequest'
 export type { StartAgentChatTopicRequest } from './bindings/StartAgentChatTopicRequest'
 export type { StartAgentChatTopicResponse } from './bindings/StartAgentChatTopicResponse'

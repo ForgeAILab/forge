@@ -323,9 +323,9 @@ pub async fn activate_execution_baseline(
     ))
 }
 
-/// "Approve plan and start work" (D18, F13). This is the ONLY route for that
-/// gesture: one atomic command commits approval, activation, governance
-/// promotion, receipt, and events together, so a lost response can only ever
+/// Accept and activate an optional traceability baseline (D18, F13). This is
+/// the single atomic route for that gesture: approval, activation, receipt,
+/// and events commit together, so a lost response can only ever
 /// be satisfied by replaying the frozen receipt -- never by re-deriving a
 /// different outcome from mutable current state. The response is built
 /// receipt-first (8.3.2): the identity fields below always come from the
@@ -427,7 +427,7 @@ pub async fn approve_and_activate_execution_baseline(
 /// error (typically a version or idempotency conflict). If the exact
 /// requested revision is already the Project's active baseline with matching
 /// digests, that is success evidence, not a reason to fail the request --
-/// this is what lets a retried "Approve plan and start work" click render
+/// this is what lets a retried baseline acceptance render
 /// success instead of the stale-baseline failure F13 reported. Any failure
 /// reading current state here is swallowed: the caller falls back to
 /// reporting the original command error.
