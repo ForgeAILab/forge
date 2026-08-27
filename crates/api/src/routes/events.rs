@@ -25,18 +25,20 @@ pub async fn stream_events(
         }
     };
 
+    // One canonical envelope per frame (D20): the frame carries no SSE `event:`
+    // name and the payload's `event_type` is the sole routing discriminator.
+    // A named frame is delivered only to a listener registered under that exact
+    // name, never to `onmessage`, so naming frames here meant the web client —
+    // which routes every frame through `onmessage` — saw none of them and the
+    // whole UI went stale until a reload.
     let stream =
         BroadcastStream::new(state.event_bus.subscribe()).filter_map(|event| match event {
             Ok(event) => {
-                let event_type = event.event_type.clone();
                 let entity_id = event.entity_id.clone();
                 // EventContext is flattened and Serialize-derived, so review/cleanup/merge
                 // contexts pass through SSE without variant-specific routing here.
                 let data = serde_json::to_string(&event).ok()?;
-                Some(Ok(Event::default()
-                    .event(event_type)
-                    .id(entity_id)
-                    .data(data)))
+                Some(Ok(Event::default().id(entity_id).data(data)))
             }
             Err(error) => {
                 let event_type = "events.resync_required";
@@ -46,10 +48,7 @@ pub async fn stream_events(
                     "timestamp": events::event_timestamp(),
                     "reason": error.to_string(),
                 });
-                Some(Ok(Event::default()
-                    .event(event_type)
-                    .id(event_type)
-                    .data(data.to_string())))
+                Some(Ok(Event::default().id(event_type).data(data.to_string())))
             }
         });
     Sse::new(futures_util::StreamExt::take_until(

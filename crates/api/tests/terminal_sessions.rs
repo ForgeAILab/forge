@@ -566,8 +566,12 @@ async fn lifecycle_event_emitted() {
     let stream = String::from_utf8_lossy(&bytes);
 
     assert!(
-        stream.contains("event: task.terminal.session_changed"),
+        stream.contains("\"event_type\":\"task.terminal.session_changed\""),
         "missing terminal SSE event in {stream}"
+    );
+    assert!(
+        !stream.contains("event: "),
+        "SSE frames must stay unnamed so every frame reaches `onmessage`: {stream}"
     );
     assert!(
         stream.contains("\"kind\":\"created\""),

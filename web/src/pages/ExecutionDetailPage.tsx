@@ -304,11 +304,10 @@ export function ExecutionDetailPage({
       setLogsParams((current) => advanceLogParams(current, nextSequenceForLogs(parsedLogs)))
     }
 
+    // Frames are unnamed (D20), so `onmessage` is the only delivery path.
     source.onmessage = handleMessage
-    source.addEventListener('execution.log', handleMessage as EventListener)
 
     return () => {
-      source.removeEventListener('execution.log', handleMessage as EventListener)
       source.close()
     }
   }, [accessToken, executionId, executionQuery.data?.status])

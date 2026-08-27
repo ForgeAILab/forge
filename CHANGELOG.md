@@ -190,6 +190,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- The live event stream reaches the web client again. `GET /api/v1/events`
+  labelled each frame with an SSE `event:` name while the client routed every
+  frame through `onmessage`, which by specification never sees a named frame —
+  so no board, chat, or Task update arrived until a manual page reload. Frames
+  now carry only `id:` and `data:`, matching the single-envelope contract the
+  client already documents; consumers route on the payload's `event_type`.
+
 - Task workflow-role assignments are now authoritative at execution time.
   Project Worker/reviewer selections seed Tasks but no longer lock a Task to
   those exact identities; any enabled, available Project Task agent may fill a
