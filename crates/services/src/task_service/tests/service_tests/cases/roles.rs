@@ -354,6 +354,18 @@ async fn reassign_role_same_assignee_does_not_emit_event() {
         .await
         .expect("initial role assignment succeeds");
     let _ = rx.recv().await.expect("initial event emits");
+    let current_task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task reload succeeds")
+        .expect("task exists");
+    crate::deferred_dispatch::record_dispatch_disposition(
+        &db,
+        &current_task,
+        "repository_write",
+        "stale role blocker",
+    )
+    .await
+    .expect("dispatch disposition records");
 
     service
         .reassign_role(
@@ -365,6 +377,11 @@ async fn reassign_role_same_assignee_does_not_emit_event() {
         .expect("same role assignment succeeds");
 
     assert!(rx.try_recv().is_err());
+    let woken_task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task reload succeeds")
+        .expect("task exists");
+    assert!(crate::deferred_dispatch::dispatch_disposition_for_test(&woken_task).is_none());
 }
 
 #[tokio::test]

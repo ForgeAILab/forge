@@ -751,6 +751,60 @@ async fn attach_approved_charter(db: &SqliteDb, project_id: &str) {
     .expect("approved Charter attaches to Project");
 }
 
+/// Project role selections seed Tasks, but an explicit Task role assignment
+/// may use any currently eligible execution identity. This reproduces the Todo
+/// review failure where the Project default named Reviewer Agent while the
+/// Task explicitly named Coder Agent for `reviewer`.
+#[tokio::test]
+async fn task_role_assignment_is_not_locked_to_the_project_default() {
+    let db = database().await;
+    let project = project(&db, "task role override").await;
+    let (worker_id, _) = native_agent(&db, "Task Worker").await;
+    let (default_reviewer_id, _) = native_agent(&db, "Default Reviewer").await;
+    attach_approved_charter(&db, &project.id).await;
+
+    sqlx::query("UPDATE project SET settings = ?, updated_at = ? WHERE id = ?")
+        .bind(
+            json!({
+                "default_role_assignments": [
+                    {
+                        "role_name": "coder",
+                        "assignee_type": "agent",
+                        "assignee_id": worker_id,
+                    },
+                    {
+                        "role_name": "reviewer",
+                        "assignee_type": "agent",
+                        "assignee_id": default_reviewer_id,
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .bind(now_rfc3339())
+        .bind(&project.id)
+        .execute(db.pool())
+        .await
+        .expect("Project defaults update");
+
+    services::ensure_execution_role_principal(&db, &project.id, "reviewer", &worker_id)
+        .await
+        .expect("the Task's explicit reviewer may differ from the Project default");
+
+    sqlx::query("UPDATE agent_identity SET paused = 1, updated_at = ? WHERE id = ?")
+        .bind(now_rfc3339())
+        .bind(&worker_id)
+        .execute(db.pool())
+        .await
+        .expect("Task Worker pauses");
+    let unavailable =
+        services::ensure_execution_role_principal(&db, &project.id, "reviewer", &worker_id).await;
+    assert!(matches!(
+        unavailable,
+        Err(ServiceError::ExecutionSetupRequired { .. })
+    ));
+}
+
 /// A Worker at its concurrency limit is still the Project's Worker.
 ///
 /// Dispatch re-checks role eligibility *after* the execution it is dispatching

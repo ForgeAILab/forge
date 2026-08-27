@@ -323,14 +323,14 @@ pub async fn is_eligible_execution_identity(
         .any(|agent| agent.id == identity_id))
 }
 
-/// Verify that a repository execution subject is both currently eligible and
-/// the identity selected for the workflow role that is about to run.
+/// Verify that a repository execution subject is currently eligible for the
+/// workflow role that is about to run.
 ///
-/// Eligibility alone is not enough: a stale task-role row can still point at
-/// an otherwise active agent, and coordinator identities must never be
-/// re-used as Workers or independent reviewers.  The canonical projection
-/// resolver is deliberately configured-only here; provisioning is the only
-/// path allowed to choose a deterministic fallback candidate.
+/// The Task's explicit role assignment is authoritative. Project role
+/// selections are defaults used by provisioning and Task creation, not an
+/// execution-time identity allowlist. Eligibility is still re-evaluated here
+/// so disabled, paused, unavailable, cross-account, or coordinator identities
+/// cannot receive a Workspace lease through a stale Task assignment.
 pub async fn ensure_execution_role_principal(
     db: &SqliteDb,
     project_id: &str,
@@ -345,49 +345,28 @@ pub async fn ensure_execution_role_principal(
     }
 
     if !is_eligible_execution_identity(db, project_id, identity_id).await? {
-        let mut requirement =
-            role_setup_requirement("worker", "repository_write", RetryAction::SelectWorker);
-        requirement.role = Some(role.to_owned());
-        return Err(ServiceError::execution_setup_required(
-            "repository execution identity is not active and Project-eligible",
-            vec![requirement],
-        ));
-    }
-
-    let project = ProjectRepo::get_by_id(db, project_id)
-        .await?
-        .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
-    let charter_backed = project.charter_status == "charter_backed"
-        && !project.charter_setup_required
-        && project.current_charter_revision_id.is_some();
-    if !charter_backed {
-        return Ok(());
-    }
-
-    let resolution = resolve_project_execution_roles(db, &project).await?;
-    let is_reviewer = resolution.reviewer_role.as_deref() == Some(role);
-    let expected_identity = if resolution.worker_role.as_deref() == Some(role) {
-        resolution.worker_identity_id.as_deref()
-    } else if is_reviewer {
-        resolution.reviewer_identity_id.as_deref()
-    } else {
-        None
-    };
-    if expected_identity != Some(identity_id) {
-        let (requirement_role, capability, action) = if is_reviewer {
-            (
-                "independent_reviewer",
-                "repository_read",
-                RetryAction::SelectIndependentReviewer,
-            )
-        } else {
-            ("worker", "repository_write", RetryAction::SelectWorker)
-        };
+        let project = ProjectRepo::get_by_id(db, project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
+        let workflow =
+            crate::workflow::engine::WorkflowEngine::resolve_workflow(&project.workflow_definition);
+        let release_policy = active_baseline_release_policy(db, &project).await?;
+        let required = required_execution_roles(&workflow, release_policy.as_ref());
+        let (requirement_role, capability, action) =
+            if required.reviewer_role.as_deref() == Some(role) {
+                (
+                    "reviewer",
+                    "repository_read",
+                    RetryAction::SelectIndependentReviewer,
+                )
+            } else {
+                ("worker", "repository_write", RetryAction::SelectWorker)
+            };
         let mut requirement = role_setup_requirement(requirement_role, capability, action);
         requirement.role = Some(role.to_owned());
         return Err(ServiceError::execution_setup_required(
             format!(
-                "workflow role '{}' is not assigned to its canonical Project execution identity",
+                "workflow role '{}' is assigned to an agent that is not enabled and available for Project Task execution",
                 role
             ),
             vec![requirement],

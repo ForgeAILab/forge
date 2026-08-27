@@ -1238,6 +1238,76 @@ async fn test_agent_session_rotation_is_atomic_and_preserves_lineage() {
 }
 
 #[tokio::test]
+async fn task_context_scopes_are_distinct_per_role_for_the_same_identity() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, identity_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        Some(&identity_id),
+        "review".to_owned(),
+        "same identity, different Task roles",
+    )
+    .await;
+    let now = now_rfc3339();
+
+    let worker = AgentContextScopeRepo::create_context_scope(
+        &db,
+        CreateAgentContextScope {
+            id: new_uuid_v4(),
+            identity_id: identity_id.clone(),
+            scope_type: "task".to_owned(),
+            scope_id: task_id.clone(),
+            project_id: Some(project_id.clone()),
+            task_id: Some(task_id.clone()),
+            task_role: Some("worker".to_owned()),
+            workspace_access: "task_write".to_owned(),
+            authority_json: r#"{"scope":{"kind":"task","role":"worker"}}"#.to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("worker scope creates");
+    let reviewer_input = CreateAgentContextScope {
+        id: new_uuid_v4(),
+        identity_id: identity_id.clone(),
+        scope_type: "task".to_owned(),
+        scope_id: task_id.clone(),
+        project_id: Some(project_id),
+        task_id: Some(task_id.clone()),
+        task_role: Some("reviewer".to_owned()),
+        workspace_access: "task_read".to_owned(),
+        authority_json: r#"{"scope":{"kind":"task","role":"reviewer"}}"#.to_owned(),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    let reviewer = AgentContextScopeRepo::create_context_scope(&db, reviewer_input.clone())
+        .await
+        .expect("reviewer scope creates beside worker scope");
+    let replayed_reviewer = AgentContextScopeRepo::create_context_scope(&db, reviewer_input)
+        .await
+        .expect("reviewer scope creation replays");
+
+    assert_ne!(worker.id, reviewer.id);
+    assert_eq!(worker.scope_id, task_id);
+    assert_eq!(reviewer.scope_id, task_id);
+    assert_eq!(worker.task_role.as_deref(), Some("worker"));
+    assert_eq!(reviewer.task_role.as_deref(), Some("reviewer"));
+    assert_eq!(replayed_reviewer.id, reviewer.id);
+    assert_eq!(
+        AgentContextScopeRepo::list_context_scopes(&db, &identity_id)
+            .await
+            .expect("context scopes list")
+            .into_iter()
+            .filter(|scope| scope.scope_type == "task" && scope.scope_id == task_id)
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn test_list_agents_usable_in_project() {
     let db = sqlite_db().await;
     let now = now_rfc3339();

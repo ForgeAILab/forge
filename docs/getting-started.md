@@ -389,7 +389,7 @@ turns are available. A ready execution setup still does not grant repository
 write access until an approved baseline is active. Check each dimension's
 `availability` and `setup_requirements`; never infer one from another.
 
-### 4. Select a Worker, independent reviewer, and repository
+### 4. Select Worker/reviewer defaults and a repository
 
 The Project Agent can continue with documents and planning while setup is
 incomplete. The Project owner/admin completes setup from the panel, or through
@@ -408,18 +408,21 @@ POST /api/v1/projects/{id}/execution-setup/repository
 ```
 
 Forge excludes the active Main and Project Agent identities from Task Workspace
-roles. The independent reviewer must be a different eligible identity from the
-Worker; reusing the same provider or model is fine, reusing the same principal
-is not. A reviewer who needs to make a correction receives a separate Worker
-assignment rather than a wider reviewer lease.
+roles. This setup path chooses defaults and currently prefers a different
+eligible reviewer identity from the Worker. Those selections seed Tasks; they
+do not lock individual Task execution. On a Task, you may explicitly assign any
+enabled, available Project Task agent to Worker or reviewer, including the same
+identity for both roles. Selecting or confirming a role after that role's
+attempt failed also starts one fresh attempt; there is no extra Resume approval.
+A read-only reviewer who needs to make a correction still needs Worker
+authority for the write.
 
-If a required Worker or reviewer is missing, the projection remains
+If a required Worker or reviewer default is missing, the projection remains
 `execution_setup_state: setup_required` and names the missing role. Create or
-connect another account-owned agent in Agent Settings, then refresh the
-projection and select it. If only one eligible execution identity exists, do
-not assign it as its own reviewer; setup must remain blocked until a distinct
-principal is available. No coordinator is silently promoted to “make the
-Project executable.”
+connect an account-owned agent in Agent Settings, then refresh the projection
+and select it. Individual Tasks may reuse any eligible execution identity for
+both roles. No coordinator is silently promoted to “make the Project
+executable.”
 
 ### 5. Repository provisioning and setup recovery
 
@@ -557,7 +560,7 @@ conflict; they are the links between chat, Project truth, and repository work.
 | --- | --- | --- |
 | `coordination_state: setup_required` | Main/Project binding or Chat admission is incomplete | Fix the authorized binding/Profile in Agent Settings, then refresh the Chat; no turn is fabricated. |
 | Missing Worker | No eligible Task Worker exists | Create/connect a separate Worker identity, select it in Execution readiness, and retry setup. |
-| Missing independent reviewer | Review policy requires a distinct reviewer | Create/select another eligible identity; never assign the Worker as its own reviewer. |
+| Missing reviewer default | Automatic Project setup has not selected a reviewer default | Select another eligible identity for the Project default, or explicitly assign any eligible Task agent on the Task; a separate release-attestation policy may still require independent evidence. |
 | `execution_setup_state: provisioning` | Durable setup is still reconciling | Refresh the projection; wait for `ready` or follow the recorded retry action. |
 | `execution_setup_state: failed` | A checkpoint stopped with a typed error | Fix the recorded cause and retry the same provisioning operation with its current version and a new idempotency key. |
 | `execution_gate: baseline_approval_required` | The Project exists and setup is ready, but repository work has not been authorized | Use **Approve plan & start work** once; every Task covered by that exact plan can then run without per-Task approval. |

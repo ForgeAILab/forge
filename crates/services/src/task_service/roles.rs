@@ -100,6 +100,17 @@ impl TaskService {
         let task = self.validate_reassignable_task(&input.task_id).await?;
         self.enforce_mode_specific_role_guards(&task, &input.role_name, Some(&input))
             .await?;
+        if input.assignee_type == Some(AssigneeKind::Agent) {
+            if let Some(identity_id) = input.assignee_id.as_deref() {
+                crate::ensure_execution_role_principal(
+                    &self.db,
+                    &task.project_id,
+                    &input.role_name,
+                    identity_id,
+                )
+                .await?;
+            }
+        }
         let previous = TaskRoleAssignmentRepo::get_by_task_and_role(
             &*self.db,
             &input.task_id,
@@ -107,9 +118,14 @@ impl TaskService {
         )
         .await?;
         if same_assignment(previous.as_ref(), Some(&input)) {
-            return TaskRoleAssignmentRepo::assign(&*self.db, input)
-                .await
-                .map_err(Into::into);
+            let assignment = TaskRoleAssignmentRepo::assign(&*self.db, input).await?;
+            crate::wake_task_dispatch(
+                &self.db,
+                &assignment.task_id,
+                "task role assignment confirmed",
+            )
+            .await?;
+            return Ok(assignment);
         }
 
         let is_coder_role =
@@ -124,6 +140,12 @@ impl TaskService {
                 Some(&assignment),
                 RoleReassignmentEventFlags::default(),
             );
+            crate::wake_task_dispatch(
+                &self.db,
+                &assignment.task_id,
+                "task role assignment changed",
+            )
+            .await?;
             return Ok(assignment);
         }
 
@@ -141,6 +163,12 @@ impl TaskService {
                 Some(&assignment),
                 RoleReassignmentEventFlags::default(),
             );
+            crate::wake_task_dispatch(
+                &self.db,
+                &assignment.task_id,
+                "task role assignment changed",
+            )
+            .await?;
             return Ok(assignment);
         };
 
@@ -186,6 +214,12 @@ impl TaskService {
                 transitioned_to_todo: true,
             },
         );
+        crate::wake_task_dispatch(
+            &self.db,
+            &assignment.task_id,
+            "task role assignment changed",
+        )
+        .await?;
         Ok(assignment)
     }
 
@@ -215,6 +249,7 @@ impl TaskService {
                 None,
                 RoleReassignmentEventFlags::default(),
             );
+            crate::wake_task_dispatch(&self.db, task_id, "task role assignment removed").await?;
             return Ok(());
         }
 
@@ -229,6 +264,7 @@ impl TaskService {
                 None,
                 RoleReassignmentEventFlags::default(),
             );
+            crate::wake_task_dispatch(&self.db, task_id, "task role assignment removed").await?;
             return Ok(());
         };
 
@@ -272,6 +308,7 @@ impl TaskService {
                 transitioned_to_todo: true,
             },
         );
+        crate::wake_task_dispatch(&self.db, task_id, "task role assignment removed").await?;
         Ok(())
     }
 

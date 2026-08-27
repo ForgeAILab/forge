@@ -1,7 +1,7 @@
 use api_types::{StateKind, WorkflowDefinition};
 use db::{
     ExecutionRepo, ExecutionStatus, PageRequest, ResumePolicy, ReviewRepo, ReviewStatus, SortBy,
-    SortOrder,
+    SortOrder, TaskRoleAssignmentRepo,
 };
 use serde_json::Value;
 
@@ -176,10 +176,32 @@ pub(super) async fn latest_stopped_execution_blocks_dispatch(
         return Ok(false);
     }
 
-    Ok(matches!(
-        execution.resume_policy,
-        None | Some(ResumePolicy::Manual)
-    ))
+    let requires_explicit_retry =
+        matches!(execution.resume_policy, None | Some(ResumePolicy::Manual));
+    if !requires_explicit_retry {
+        return Ok(false);
+    }
+
+    // Reassigning or confirming the Task role after an attempt stopped is an
+    // explicit recovery decision. The assignment timestamp is durable and
+    // scoped to this exact Task/role, so it can authorize one fresh dispatcher
+    // attempt without weakening the default no-auto-retry rule for failures or
+    // manual stops. A newly stopped attempt will again be newer and block.
+    let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(db, task_id, role_name).await?;
+    let assignment_is_newer = assignment.is_some_and(|assignment| {
+        let Ok(assignment_updated_at) =
+            chrono::DateTime::parse_from_rfc3339(&assignment.updated_at)
+        else {
+            return false;
+        };
+        let Ok(execution_updated_at) = chrono::DateTime::parse_from_rfc3339(&execution.updated_at)
+        else {
+            return false;
+        };
+        assignment_updated_at > execution_updated_at
+    });
+
+    Ok(!assignment_is_newer)
 }
 
 pub(super) async fn has_running_execution_for_roles(

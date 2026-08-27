@@ -165,6 +165,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Task workflow-role assignments are now authoritative at execution time.
+  Project Worker/reviewer selections seed Tasks but no longer lock a Task to
+  those exact identities; any enabled, available Project Task agent may fill a
+  role, including the same identity for Worker and reviewer. Disabled, paused,
+  cross-account, and active coordinator identities remain ineligible.
+  Assigning or confirming a Task role wakes reviews parked by the old blocker,
+  retries a stopped role attempt without a separate Resume action, and V105
+  keeps that identity's Worker and reviewer runtime contexts role-isolated
+  under the same canonical Task instead of failing with a scope-linkage
+  conflict.
+
 - Project Agents now receive the full safe adaptive Task vocabulary — split,
   sequence, and replace — in every newly materialized execution baseline.
   Historical baselines containing command names such as `task.adaptive` get a

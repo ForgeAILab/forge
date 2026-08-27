@@ -934,6 +934,67 @@ async fn dispatcher_recovers_undispatched_reviewer_task() {
 }
 
 #[tokio::test]
+async fn reviewer_assignment_after_stopped_attempt_dispatches_without_separate_resume() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let task = seed_task(&db, &project_id, &repo_id, "review retry", "review", 0).await;
+    assign_role(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::REVIEWER,
+        &agent_id,
+    )
+    .await;
+    seed_cancelled_execution(
+        &db,
+        &task.id,
+        &agent_id,
+        crate::workflow::default_roles::REVIEWER,
+        None,
+        None,
+    )
+    .await;
+
+    TaskRoleAssignmentRepo::assign(
+        &*db,
+        CreateTaskRoleAssignment {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            role_name: crate::workflow::default_roles::REVIEWER.to_owned(),
+            assignee_type: Some(db::AssigneeKind::Agent),
+            assignee_id: Some(agent_id.clone()),
+            created_at: "2099-01-01T00:00:00Z".to_owned(),
+            updated_at: "2099-01-01T00:00:00Z".to_owned(),
+        },
+    )
+    .await
+    .expect("reviewer assignment confirms after stopped attempt");
+
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+
+    assert_eq!(dispatched, 1);
+    let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("reviewer execution spawned in time")
+        .expect("reviewer execution context received");
+    assert_eq!(ctx.task_id, task.id);
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(
+            &*db,
+            &task.id,
+            crate::workflow::default_roles::REVIEWER
+        )
+        .await
+        .expect("reviewer execution count loads"),
+        2
+    );
+}
+
+#[tokio::test]
 async fn dispatcher_respects_priority_ordering() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");

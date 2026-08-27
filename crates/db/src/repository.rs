@@ -161,6 +161,7 @@ pub trait AgentContextScopeRepo: Send + Sync {
         identity_id: &str,
         scope_type: &str,
         scope_id: &str,
+        task_role: Option<&str>,
     ) -> Result<Option<AgentContextScope>>;
     async fn list_context_scopes(&self, identity_id: &str) -> Result<Vec<AgentContextScope>>;
 }

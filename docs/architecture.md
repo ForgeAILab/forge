@@ -155,15 +155,18 @@ Task scheduler, not by model instructions:
 | Main Agent | Account / Main Chat | Genesis discovery, bounded research, Charter proposal/readiness, exact Project create/handoff, bounded portfolio projection | No Project-local Documents, Tasks, assignments, milestones, validation, waiver, release, or repository access | Denied |
 | Project Agent | One bound Project / Project Chat | Project Documents, Decisions, baseline draft/proposal, Task and assignment coordination, milestone/evidence/readiness/release-candidate proposals | No other Project, private Main history, credentials, repository/filesystem, self-validation, baseline approval/activation, waiver, or release | Denied |
 | Task Worker | One assigned Task / attempt | Work allowed by the scheduler-issued capability profile | No portfolio, Genesis, unrelated Project/Task, approval, or release authority | Task-scoped lease |
-| Reviewer/validator | One assigned review/check | Independent review or attestation allowed by policy | Read-only by default; remediation requires a separate Worker assignment and may not review its own work | Read-only by default |
+| Reviewer/validator | One assigned review/check | Review or attestation allowed by policy | Read-only by default; remediation requires Worker authority, while any explicitly required independent attestation remains a separate policy gate | Read-only by default |
 | Interactive user | Authorized account/Project | Exact approvals, setup choices, manual attestations/waivers, and release | Only existing authenticated user controls | Existing user controls |
 | System | Server policy | Readiness, scheduling, leases, recovery, and projections | Not a chat principal; cannot substitute for user approval | Internal only |
 
 Provider/model configuration may be reused across these rows, but principal,
 scope, history, assignment, lease, and attestation provenance are not reused.
 An active Main or Project Agent identity is never silently converted into a
-Task Worker or reviewer, and an independent reviewer is never the same
-identity as the Worker it reviews.
+Task Worker or reviewer. Project execution-role selections are provisioning
+defaults, not an execution-time identity lock: an explicit Task assignment may
+use any currently eligible Project Task agent, and the same identity may fill
+Worker and reviewer roles. A release policy that explicitly requires an
+independent attestation evaluates that evidence separately.
 
 Every persistent agent session binds to one canonical scope:
 
@@ -181,6 +184,10 @@ authority. Each admitted turn separately freezes its binding, identity,
 Profile, operating-skill, and policy revisions, so editing an identity can
 rotate the next native session without either mutating an earlier turn's
 provenance or falsely reporting that the same Chat scope changed authority.
+Task context scopes retain the Task ID as their canonical `scope_id`, but V105
+makes their persistence key role-specific. One identity can therefore hold a
+write-capable Worker session and a read-only reviewer session for the same Task
+without reusing capabilities or conflicting over stored scope linkage.
 
 ### Main and Project Agent Chats
 
@@ -307,12 +314,15 @@ canonicalized to `worker`; only the dedicated `reviewer` role receives the
 reviewer lease class. Its operation idempotency key is the exact execution
 attempt ID: claim inserts the execution and lease in one transaction, and each
 retry/follow-up creates a fresh child execution with its own lease. A matching
-role assignment is authoritative for that execution role (for example, an
-independent reviewer may differ from the Task's primary worker). On a
+Task role assignment is authoritative for that execution role. Project
+`default_role_assignments` seed new Tasks and provisioning, but changing a
+Project default neither invalidates nor rewrites an explicit Task assignment.
+The same eligible identity may fill Worker and reviewer roles. On a
 `legacy_unverified` Project only, an explicit manual execution selection is the
 assignment boundary when neither the role nor Task has an assignee; an existing
 applicable assignment still must match. Charter-backed Projects always require
-the exact Task Worker/reviewer role or Task assignment.
+the exact Task Worker/reviewer role or Task assignment, not equality with the
+Project default for that role.
 `WorkspaceLeaseRepo` provides CAS renewal/revoke and bounded expiry operations.
 The heartbeat renews an active lease before its deadline only while the exact
 execution is still running and its Task, assignment, governance, repository,
@@ -349,12 +359,13 @@ execution setup is still `provisioning` or `setup_required`. Provisioning is a
 finite, leased, checkpointed, idempotent operation that reconciles the
 deterministic filesystem target, repository row, Project link, and role set;
 interruption resumes that operation rather than creating a second directory or
-repository. Required Worker and (when policy requires it) independent-reviewer
-roles are derived from the workflow/baseline, excluding active coordinator
-identities. Missing roles are typed setup requirements with a user/system retry
-or configuration action, not a best-effort executable success. Read-only
-planning/discovery may remain available under its explicit capability before an
-active baseline.
+repository. Required Worker and reviewer defaults are derived from the
+workflow/baseline, excluding active coordinator identities. Automatic setup may
+prefer distinct defaults, but those selections do not constrain later explicit
+Task assignments. Missing defaults are typed setup requirements with a
+user/system retry or configuration action, not a best-effort executable
+success. Read-only planning/discovery may remain available under its explicit
+capability before an active baseline.
 
 #### Canonical execution blocker and capability-aware review
 
@@ -382,9 +393,9 @@ once an attempt or commit exists, even while the Task is blocked.
 Gate evaluation is capability-aware
 (`task_service::governance::{ensure_task_runnable, ensure_task_reviewable}`).
 Repository mutation (the `worker` WorkspaceLease role) requires the Project
-gate to be `active` with no applicable conflict outstanding. Independent
-read-only review of an already-committed result (the dedicated `reviewer`
-role) may continue past an outstanding conflict as long as every currently
+gate to be `active` with no applicable conflict outstanding. Read-only review
+of an already-committed result (the dedicated `reviewer` role) may continue
+past an outstanding conflict as long as every currently
 applicable one is acceptance/evidence/risk/reviewer/release neutral — it
 never touches one of the baseline's fixed-boundary fields (fixed outcomes,
 fixed acceptance, fixed risk classes, forbidden side effects, release policy,
@@ -1434,6 +1445,16 @@ Roles are declared by workflow (`roles[]`) and states can require a role
 auto-assigns the claimed state's role to the claiming identity when no
 assignment exists; a conflicting pre-assignment returns HTTP 409. Replacing or
 selecting a new profile therefore does not rewrite Task ownership/history.
+Project-level role selections are defaults used to seed those rows; they are
+not a per-Task allowlist. An explicit Task role may name any enabled, available,
+Project-usable Task execution identity, including the same identity for Worker
+and reviewer. Assignment and dispatch both recheck effective availability,
+account/Project scope, coordinator exclusion, and the exact Task-scoped lease.
+Changing or confirming a Task role clears any stale deferred-dispatch
+disposition so a previously blocked Task is reconsidered. When the role choice
+is newer than a stopped attempt for that role, it is also the explicit retry
+signal; the dispatcher starts one fresh attempt without a separate Resume
+action, and any newly stopped attempt blocks again.
 
 CLI profiles continue through the existing executor/daemon path. A compatible
 native profile enters work through the same claim, assignment, workflow,

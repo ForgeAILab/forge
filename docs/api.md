@@ -126,6 +126,9 @@ database for historical provenance.
 | POST   | `/api/v1/tasks/{id}/review` | Re-run the CI steps without changing state |
 | GET    | `/api/v1/tasks/{id}/diff` | Get task workspace diff |
 | GET    | `/api/v1/tasks/{id}/transitions` | Audit log of state transitions |
+| GET    | `/api/v1/tasks/{id}/roles` | List explicit Task role assignments |
+| PUT    | `/api/v1/tasks/{id}/roles/{role_name}` | Assign any currently eligible Project Task agent to this role; Project defaults do not constrain the identity |
+| DELETE | `/api/v1/tasks/{id}/roles/{role_name}` | Remove an explicit Task role assignment |
 | POST   | `/api/v1/tasks/{id}/comments` | Create task comment |
 | GET    | `/api/v1/tasks/{id}/comments` | List task comments (paginated) |
 | DELETE | `/api/v1/comments/{id}` | Delete user-authored comment |
@@ -963,12 +966,15 @@ the projection plus a non-empty `idempotency_key`; committed receipts replay
 the original accepted command/effect and reject the same key when its input
 changes. The response after a replay is a fresh canonical setup projection,
 so it may include later durable provisioning progress.
-The reviewer must be a distinct eligible identity from the Worker. Provider
-and model reuse is allowed when the identities are distinct, while active Main
-and Project Agent coordinator identities are excluded by the shared
-eligibility resolver. Provisioning also skips credential-less bootstrap default
-identities during automatic Worker/reviewer assignment; an owner may still make
-an explicit assignment for a CLI whose authentication is managed locally.
+This Project-level setup path chooses provisioning defaults and currently uses
+a distinct eligible reviewer identity from the Worker. Those defaults seed new
+Tasks; they do not lock execution to those exact identities. An explicit Task
+role assignment may select any currently enabled, available, Project-usable
+Task agent, including the same identity for Worker and reviewer. Active Main and
+Project Agent coordinator identities remain excluded by the shared eligibility
+resolver. Provisioning also skips credential-less bootstrap default identities
+during automatic Worker/reviewer assignment; an owner may still make an
+explicit assignment for a CLI whose authentication is managed locally.
 Provisioning retry delegates to the durable finite
 operation and never creates a second repository as a retry side effect.
 
@@ -990,6 +996,20 @@ names, and state kind, with unknown states defaulting to `working`.
 response-build time from the project's resolved workflow and the task's current
 `status`; it is not persisted. The value is one of `backlog`, `ready`,
 `working`, `review`, or `done`. Cancelled workflow states map to `done`.
+
+Task role rows, not Project defaults, authorize Task execution. `PUT
+/api/v1/tasks/{id}/roles/{role_name}` accepts any effectively available
+Project-usable Task agent; the same eligible identity may be assigned to both
+Worker and reviewer roles. The service rejects disabled, paused, unavailable,
+cross-account, or active coordinator identities before persisting the change,
+and dispatch rechecks the same boundary before issuing the exact Task-scoped
+Workspace lease. Native runtime context is isolated by Task role, so reusing an
+identity does not reuse Worker capabilities in a reviewer session. A successful
+assignment, including confirming the current
+assignment, wakes a Task parked on a stale dispatch blocker. When that role
+selection is newer than the latest stopped attempt for the role, the dispatcher
+treats it as the explicit retry signal and starts one fresh attempt without a
+separate `POST /resume` action.
 
 ## Execution status and liveness
 

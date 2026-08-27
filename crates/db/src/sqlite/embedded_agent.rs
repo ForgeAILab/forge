@@ -159,7 +159,7 @@ impl AgentContextScopeRepo for SqliteDb {
                 task_id, task_role, workspace_access, authority_json,
                 version, created_at, updated_at
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-             ON CONFLICT(identity_id, scope_type, scope_id) DO NOTHING",
+             ON CONFLICT DO NOTHING",
         )
         .bind(&input.id)
         .bind(&input.identity_id)
@@ -176,7 +176,12 @@ impl AgentContextScopeRepo for SqliteDb {
         .await?;
 
         let mut scope = self
-            .get_context_scope_for_identity(&input.identity_id, &input.scope_type, &input.scope_id)
+            .get_context_scope_for_identity(
+                &input.identity_id,
+                &input.scope_type,
+                &input.scope_id,
+                input.task_role.as_deref(),
+            )
             .await?
             .ok_or(DbError::NotFound)?;
         if scope.project_id != input.project_id
@@ -220,6 +225,7 @@ impl AgentContextScopeRepo for SqliteDb {
                         &input.identity_id,
                         &input.scope_type,
                         &input.scope_id,
+                        input.task_role.as_deref(),
                     )
                     .await?
                     .ok_or(DbError::NotFound)?;
@@ -255,21 +261,37 @@ impl AgentContextScopeRepo for SqliteDb {
         identity_id: &str,
         scope_type: &str,
         scope_id: &str,
+        task_role: Option<&str>,
     ) -> Result<Option<AgentContextScope>> {
         if !matches!(scope_type, "account" | "project" | "agent_chat" | "task") {
             return Ok(None);
         }
-        sqlx::query(
-            "SELECT * FROM agent_context_scope
-             WHERE identity_id = ? AND scope_type = ? AND scope_id = ?",
-        )
-        .bind(identity_id)
-        .bind(scope_type)
-        .bind(scope_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .map(map_context_scope)
-        .transpose()
+        let row = if scope_type == "task" {
+            let Some(task_role) = task_role else {
+                return Ok(None);
+            };
+            sqlx::query(
+                "SELECT * FROM agent_context_scope
+                 WHERE identity_id = ? AND scope_type = ? AND scope_id = ? AND task_role = ?",
+            )
+            .bind(identity_id)
+            .bind(scope_type)
+            .bind(scope_id)
+            .bind(task_role)
+            .fetch_optional(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT * FROM agent_context_scope
+                 WHERE identity_id = ? AND scope_type = ? AND scope_id = ?",
+            )
+            .bind(identity_id)
+            .bind(scope_type)
+            .bind(scope_id)
+            .fetch_optional(&self.pool)
+            .await?
+        };
+        row.map(map_context_scope).transpose()
     }
 
     async fn list_context_scopes(&self, identity_id: &str) -> Result<Vec<AgentContextScope>> {
