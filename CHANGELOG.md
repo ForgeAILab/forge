@@ -190,6 +190,35 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- A released milestone can be read back when it carries more than one piece of
+  evidence. The release transaction digests `evidence_pins` in the order it
+  built them, but the read path returned pins ordered by pin id — and pin ids
+  are freshly minted UUIDs, so the two orders agreed only by accident. The
+  snapshot digest could not reproduce and both `GET /projects/{id}/releases/
+  {release_id}` and the milestone release history answered `400`. The frozen
+  evidence metadata is the immutable record of what was digested, so it now
+  defines the read order. Existing single-evidence releases were unaffected,
+  which is why release coverage did not catch it.
+
+- A proposed execution baseline can be approved after a reload. The read
+  projection picked `proposed_revision` as "any revision that is not the
+  current one", but a revision awaiting approval *becomes* the current
+  revision — so it surfaced an older draft, the approval card saw lifecycle
+  `draft` and offered no action, and the baseline stayed `proposed` forever.
+  That also blocked manual attestation, which requires an active baseline, and
+  with it evidence, readiness, and release. The projection now prefers the
+  revision that is actually proposed, and rebuilds the frozen `approval_target`
+  and `requires_user_authorization` on every read instead of returning them
+  only on the propose command's own response.
+
+- Task media uploads now carry a server-derived SHA-256 checksum. The V076
+  promotion trigger minted each upload's Project media asset with a NULL
+  checksum, and milestone evidence attachment compares the caller's checksum
+  against that column, so no Task attachment could ever become milestone
+  evidence — on the exact path the Project Overview points at for evidence
+  capture. Forge holds the bytes at upload, so it derives the digest itself
+  rather than trusting an asserted one.
+
 - The live event stream reaches the web client again. `GET /api/v1/events`
   labelled each frame with an SSE `event:` name while the client routed every
   frame through `onmessage`, which by specification never sees a named frame —

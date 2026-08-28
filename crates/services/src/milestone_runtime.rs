@@ -7,7 +7,10 @@
 //! cached overview or a previous `ready_for_release` state as release
 //! authority.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use api_types::{
     canonical_digest_with_schema, AcceptanceCheckResultStatus, AcceptanceEvidenceRequirement,
@@ -3546,13 +3549,26 @@ impl MilestoneRuntime {
                 })
             })
             .collect::<crate::Result<Vec<_>>>()
-            .and_then(|pins| {
+            .and_then(|mut pins| {
                 if pins.len() != frozen.len() {
                     return Err(crate::ServiceError::InvalidOperation {
                         message: "release evidence pin set does not match frozen metadata"
                             .to_owned(),
                     });
                 }
+                // The release digest was taken over the pin order the release
+                // transaction produced, while this query returns them by pin id.
+                // Pin ids are fresh UUIDs, so the two orders agree only by
+                // accident and the snapshot digest could never reproduce for a
+                // release carrying more than one piece of evidence. The frozen
+                // metadata is the immutable record of what was digested, so it
+                // is what defines the order here.
+                let order: HashMap<&str, usize> = frozen
+                    .iter()
+                    .enumerate()
+                    .map(|(index, pin)| (pin.id.as_str(), index))
+                    .collect();
+                pins.sort_by_key(|pin| order.get(pin.id.as_str()).copied().unwrap_or(usize::MAX));
                 Ok(pins)
             })
     }
