@@ -8,6 +8,7 @@ use axum::{
     },
     response::{IntoResponse, Response},
 };
+use sha2::{Digest, Sha256};
 
 use super::*;
 use crate::routes::auth::AuthenticatedUser;
@@ -117,6 +118,26 @@ pub async fn upload_media(
             return Err(error.into());
         }
     };
+
+    // The V076 promotion trigger mints this upload's Project media asset with a
+    // NULL checksum, and milestone evidence attachment compares the caller's
+    // checksum against that column. A NULL never matches, so every Task
+    // attachment was permanently ineligible as milestone evidence — on the very
+    // path the Project Overview points at for evidence capture. Forge is holding
+    // the bytes here, so derive the digest rather than trust an asserted one.
+    let checksum = hex::encode(Sha256::digest(&upload.bytes));
+    if let Err(error) = db::SharedMediaRepo::set_media_asset_checksum(
+        &*state.db,
+        &created.id,
+        created.byte_size,
+        &checksum,
+        &now_rfc3339(),
+    )
+    .await
+    {
+        remove_file_if_exists(&path)?;
+        return Err(error.into());
+    }
 
     publish_media_uploaded(&state, &created);
     Ok((StatusCode::CREATED, Json(media_response(created))))
