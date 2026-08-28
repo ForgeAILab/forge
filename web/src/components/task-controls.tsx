@@ -9,6 +9,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/cn'
+import { isAgentUsable } from '@/lib/agent-availability'
 import { productTerm } from '@/lib/i18n'
 import { getStateColors } from '@/lib/workflow-utils'
 import type { Agent } from '@/types/generated'
@@ -220,10 +221,10 @@ export function AgentAssigneeDropdown({
     value?.type === 'user'
       ? members
         ? selectedMember
-          ? selectedMember.display_name ?? selectedMember.email
+          ? (selectedMember.display_name ?? selectedMember.email)
           : 'Unknown user'
         : 'Human'
-      : selectedAgent?.name ?? fallbackName ?? selectedAgentId
+      : (selectedAgent?.name ?? fallbackName ?? selectedAgentId)
   const isHuman = value?.type === 'user'
   const isChip = variant === 'chip'
   const avatarSize = isChip ? 'xs' : 'sm'
@@ -242,18 +243,26 @@ export function AgentAssigneeDropdown({
   }, [])
 
   useEffect(() => {
-    if (!open) { setQuery(''); return }
+    if (!open) {
+      setQuery('')
+      return
+    }
     updatePosition()
     requestAnimationFrame(() => searchRef.current?.focus())
 
     const onMouseDown = (e: globalThis.MouseEvent) => {
       if (
-        dropdownRef.current && !dropdownRef.current.contains(e.target as Node) &&
-        triggerRef.current && !triggerRef.current.contains(e.target as Node)
-      ) setOpen(false)
+        dropdownRef.current &&
+        !dropdownRef.current.contains(e.target as Node) &&
+        triggerRef.current &&
+        !triggerRef.current.contains(e.target as Node)
+      )
+        setOpen(false)
     }
     const onScroll = () => updatePosition()
-    const onKey = (e: globalThis.KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false)
+    }
     document.addEventListener('mousedown', onMouseDown)
     document.addEventListener('keydown', onKey)
     window.addEventListener('scroll', onScroll, true)
@@ -266,9 +275,10 @@ export function AgentAssigneeDropdown({
 
   const normalizedQuery = query.toLowerCase()
 
+  const availableAgents = agents.filter(isAgentUsable)
   const filtered = normalizedQuery
-    ? agents.filter((a) => a.name.toLowerCase().includes(normalizedQuery))
-    : agents
+    ? availableAgents.filter((a) => a.name.toLowerCase().includes(normalizedQuery))
+    : availableAgents
 
   const filteredMembers = members
     ? normalizedQuery
@@ -308,7 +318,12 @@ export function AgentAssigneeDropdown({
           className,
         )}
         disabled={disabled}
-        onClick={() => { if (!disabled) { if (!open) updatePosition(); setOpen((v) => !v) } }}
+        onClick={() => {
+          if (!disabled) {
+            if (!open) updatePosition()
+            setOpen((v) => !v)
+          }
+        }}
       >
         <span className="flex min-w-0 items-center gap-1.5">
           {selectedName && selectedAgentId ? (
@@ -320,11 +335,7 @@ export function AgentAssigneeDropdown({
                 placeholderBox,
               )}
             >
-              {isHuman ? (
-                <UserCircle size={isChip ? 12 : 16} weight="fill" />
-              ) : (
-                <span>—</span>
-              )}
+              {isHuman ? <UserCircle size={isChip ? 12 : 16} weight="fill" /> : <span>—</span>}
             </span>
           )}
           {isChip && roleLabel ? (
@@ -362,7 +373,9 @@ export function AgentAssigneeDropdown({
                 placeholder="Search agents…"
                 className="min-w-0 flex-1 bg-transparent py-0.5 text-xs outline-none placeholder:text-muted-foreground"
                 onChange={(e) => setQuery(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Escape') setOpen(false) }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape') setOpen(false)
+                }}
               />
             </div>
 
@@ -389,7 +402,9 @@ export function AgentAssigneeDropdown({
                       <span className="block truncate text-sm font-medium">
                         {member.display_name ?? member.email}
                       </span>
-                      <span className="mt-0.5 block text-xs text-muted-foreground">{member.role}</span>
+                      <span className="mt-0.5 block text-xs text-muted-foreground">
+                        {member.role}
+                      </span>
                     </span>
                     {selected ? <Check size={14} className="shrink-0 text-primary" /> : null}
                   </button>
@@ -416,7 +431,9 @@ export function AgentAssigneeDropdown({
                   {manualSelected ? <Check size={14} className="shrink-0 text-primary" /> : null}
                 </button>
               )}
-              {filtered.length === 0 && !showHuman && (!filteredMembers || filteredMembers.length === 0) ? (
+              {filtered.length === 0 &&
+              !showHuman &&
+              (!filteredMembers || filteredMembers.length === 0) ? (
                 <p className="px-2 py-3 text-center text-xs text-muted-foreground">No matches</p>
               ) : (
                 filtered.map((agent) => {

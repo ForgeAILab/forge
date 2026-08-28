@@ -56,6 +56,7 @@ import {
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { cn } from '@/lib/cn'
+import { usableAgents } from '@/lib/agent-availability'
 import { useLayoutStore } from '@/stores/layout'
 import { useAuthStore } from '@/stores/auth'
 import { clearDeletedProjectScope, resolveNextProjectId } from '@/stores/project-scope'
@@ -172,7 +173,7 @@ function ProjectSwitcher({
 
   const projects = projectsQuery.data?.pages.flatMap((page) => page.items) ?? []
   const currentProject = projects.find((p) => p.id === projectId)
-  const availableAgents = (agentsQuery.data?.items ?? []).filter((agent) => !agent.paused)
+  const availableAgents = usableAgents(agentsQuery.data?.items ?? [])
 
   const fetchNextProjectsPage = () => {
     if (projectsQuery.hasNextPage && !projectsQuery.isFetchingNextPage) {

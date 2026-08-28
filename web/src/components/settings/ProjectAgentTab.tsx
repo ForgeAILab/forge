@@ -5,7 +5,7 @@ import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
-import { Select } from '@/components/ui/select'
+import { Select, type SelectOption } from '@/components/ui/select'
 import { cn } from '@/lib/cn'
 import {
   EmptyPanel,
@@ -23,6 +23,7 @@ import {
 } from '@/features/federation/hooks'
 import type { ProjectAgentBindingInput } from '@/features/federation/types'
 import { ApiError } from '@/api/client'
+import { isAgentUsable } from '@/lib/agent-availability'
 import { agentSummary } from './MainAgentBindingCard'
 
 function policyValues(policy: Record<string, unknown> | null | undefined): string[] {
@@ -49,7 +50,24 @@ export function ProjectAgentTab({
   const setBinding = useSetProjectAgentBindingMutation(projectId)
   const bindingMissing = bindingQuery.error instanceof ApiError && bindingQuery.error.status === 404
   const agents = agentsQuery.data?.items ?? []
+  const availableAgents = agents.filter(isAgentUsable)
   const selectedAgent = agents.find((agent) => agent.id === identityId)
+  const selectedAgentUsable = selectedAgent ? isAgentUsable(selectedAgent) : false
+  const currentIdentityId = bindingQuery.data?.identity_id ?? null
+  const identityOptions: SelectOption[] = availableAgents.map((agent) => ({
+    value: agent.id,
+    label: `${agent.name} · ${agent.provider ?? agent.executor_type}`,
+  }))
+  if (currentIdentityId && !availableAgents.some((agent) => agent.id === currentIdentityId)) {
+    const currentAgent = agents.find((agent) => agent.id === currentIdentityId)
+    identityOptions.unshift({
+      value: currentIdentityId,
+      label: currentAgent
+        ? `${currentAgent.name} · currently unavailable`
+        : 'Current binding · unavailable in roster',
+      disabled: true,
+    })
+  }
   // A Project that has not been through Product Genesis carries a placeholder
   // binding whose ceiling is `{}`. That is present but grants nothing, so `??`
   // would save an empty ceiling and leave the Project Agent with no tools.
@@ -117,23 +135,26 @@ export function ProjectAgentTab({
       />
     )
   }
-  if (agents.length === 0) {
+  if (availableAgents.length === 0 && !currentIdentityId) {
     return (
       <Card
         id={`project-agent-${projectId}`}
-        className={cn('space-y-6 p-4 sm:p-5', highlighted && 'border-primary ring-2 ring-primary/30')}
+        className={cn(
+          'space-y-6 p-4 sm:p-5',
+          highlighted && 'border-primary ring-2 ring-primary/30',
+        )}
       >
         <div>
           <SectionKicker>{projectName ?? 'Project Agent'}</SectionKicker>
-          <h2 className="mt-1 text-page font-semibold tracking-tight">Connect one Project Agent</h2>
+          <h2 className="mt-1 text-page font-semibold tracking-tight">No usable Project Agent</h2>
           <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
-            A Project has one durable Agent Chat and one binding. Create an agent in Agent settings
-            before selecting it here.
+            A Project has one durable Agent Chat and one binding. Enable an agent and its provider
+            or runtime before selecting it here.
           </p>
         </div>
         <EmptyPanel
-          title="No agents yet"
-          description="Agents stay in Agent settings until you explicitly choose one for this Project."
+          title="No usable agents"
+          description="Disabled or unavailable agents stay in Agent settings, but cannot accept a new Project binding."
           icon={<Robot size={19} />}
         />
         <Link
@@ -176,10 +197,7 @@ export function ProjectAgentTab({
               <Select
                 id="project-agent-identity"
                 value={identityId}
-                options={agents.map((agent) => ({
-                  value: agent.id,
-                  label: `${agent.name} · ${agent.provider ?? agent.executor_type}`,
-                }))}
+                options={identityOptions}
                 placeholder="Select agent"
                 onChange={(next) => {
                   setIdentityId(next)
@@ -189,7 +207,7 @@ export function ProjectAgentTab({
               />
               <p className="text-xs leading-5 text-muted-foreground">
                 {selectedAgent
-                  ? agentSummary(selectedAgent)
+                  ? `${agentSummary(selectedAgent)}${selectedAgentUsable ? '' : ' · unavailable for new work'}`
                   : 'Only the selected agent is bound to the Project. Creating an agent does not grant it Project access.'}
               </p>
             </div>
@@ -214,8 +232,8 @@ export function ProjectAgentTab({
                 id="project-agent-wake-budget-help"
                 className="text-xs leading-5 text-muted-foreground"
               >
-                Maximum policy-admitted background wakes per rolling hour. Chat messages,
-                Project handoffs, and Task executions do not use this budget.
+                Maximum policy-admitted background wakes per rolling hour. Chat messages, Project
+                handoffs, and Task executions do not use this budget.
               </p>
             </div>
 
@@ -225,7 +243,9 @@ export function ProjectAgentTab({
               </span>
               <div className="flex h-9 items-center gap-2 rounded-md border border-border-subtle bg-muted/20 px-3">
                 <StateBadge
-                  status={bindingQuery.data?.state ?? (bindingMissing ? 'setup_required' : 'unknown')}
+                  status={
+                    bindingQuery.data?.state ?? (bindingMissing ? 'setup_required' : 'unknown')
+                  }
                   label={bindingMissing ? 'Not configured' : undefined}
                 />
                 <span className="font-mono text-micro text-muted-foreground">
@@ -275,7 +295,10 @@ export function ProjectAgentTab({
           </p>
         ) : null}
         <div className="flex flex-wrap items-center gap-3">
-          <Button type="submit" disabled={setBinding.isPending || !identityId}>
+          <Button
+            type="submit"
+            disabled={setBinding.isPending || !identityId || !selectedAgentUsable}
+          >
             {setBinding.isPending
               ? 'Saving…'
               : bindingMissing

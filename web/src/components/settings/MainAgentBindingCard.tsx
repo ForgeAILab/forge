@@ -2,10 +2,15 @@ import { useEffect, useMemo, useState } from 'react'
 import { ShieldCheck } from '@phosphor-icons/react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
-import { Select } from '@/components/ui/select'
+import { Select, type SelectOption } from '@/components/ui/select'
 import { Card } from '@/components/ui/card'
 import { ErrorPanel, SectionKicker, StateBadge } from '@/features/federation/components'
-import { humanize, isDirectAgent, numberValue, runtimeDisplayNames } from '@/features/federation/format'
+import {
+  humanize,
+  isDirectAgent,
+  numberValue,
+  runtimeDisplayNames,
+} from '@/features/federation/format'
 import {
   isVersionConflict,
   useMainAgentBindingQuery,
@@ -13,6 +18,7 @@ import {
 } from '@/features/federation/hooks'
 import type { FederatedAgent, MainAgentBindingInput } from '@/features/federation/types'
 import { ApiError } from '@/api/client'
+import { isAgentUsable } from '@/lib/agent-availability'
 
 /** One-line harness/model summary of an agent, as shown under binding pickers. */
 export function agentSummary(agent: FederatedAgent): string {
@@ -35,6 +41,8 @@ export function MainAgentBindingCard({
   const [formError, setFormError] = useState<string | null>(null)
   const bindingMissing = bindingQuery.error instanceof ApiError && bindingQuery.error.status === 404
   const selectedAgent = agents.find((agent) => agent.id === identityId)
+  const availableAgents = useMemo(() => agents.filter(isAgentUsable), [agents])
+  const selectedAgentUsable = selectedAgent ? isAgentUsable(selectedAgent) : false
 
   useEffect(() => {
     if (!bindingQuery.data) return
@@ -42,16 +50,23 @@ export function MainAgentBindingCard({
   }, [bindingQuery.data])
 
   const identityOptions = useMemo(() => {
-    const options = agents.map((agent) => ({
+    const options: SelectOption[] = availableAgents.map((agent) => ({
       value: agent.id,
       label: `${agent.name} · ${agent.provider ?? agent.executor_type}`,
     }))
     const currentIdentity = bindingQuery.data?.identity_id
-    if (currentIdentity && !agents.some((agent) => agent.id === currentIdentity)) {
-      options.unshift({ value: currentIdentity, label: 'Current binding · unavailable in roster' })
+    if (currentIdentity && !availableAgents.some((agent) => agent.id === currentIdentity)) {
+      const currentAgent = agents.find((agent) => agent.id === currentIdentity)
+      options.unshift({
+        value: currentIdentity,
+        label: currentAgent
+          ? `${currentAgent.name} · currently unavailable`
+          : 'Current binding · unavailable in roster',
+        disabled: true,
+      })
     }
     return options
-  }, [agents, bindingQuery.data?.identity_id])
+  }, [agents, availableAgents, bindingQuery.data?.identity_id])
 
   async function save() {
     if (!identityId) {
@@ -115,9 +130,10 @@ export function MainAgentBindingCard({
         />
       </div>
 
-      {agents.length === 0 ? (
+      {availableAgents.length === 0 && !bindingQuery.data?.identity_id ? (
         <div className="mt-5 rounded-md border border-border-subtle bg-background/60 px-3 py-3 text-sm text-muted-foreground">
-          Create an agent before selecting a Main Agent.
+          No usable agents are available. Enable an agent and its provider or runtime before
+          selecting a Main Agent.
         </div>
       ) : (
         <div className="mt-5 max-w-md space-y-2">
@@ -139,7 +155,10 @@ export function MainAgentBindingCard({
             aria-label="Main Agent"
           />
           {selectedAgent ? (
-            <p className="text-xs leading-5 text-muted-foreground">{agentSummary(selectedAgent)}</p>
+            <p className="text-xs leading-5 text-muted-foreground">
+              {agentSummary(selectedAgent)}
+              {!selectedAgentUsable ? ' · unavailable for new work' : ''}
+            </p>
           ) : null}
         </div>
       )}
@@ -154,7 +173,7 @@ export function MainAgentBindingCard({
         </div>
         <Button
           onClick={() => void save()}
-          disabled={setBinding.isPending || !identityId || agents.length === 0}
+          disabled={setBinding.isPending || !identityId || !selectedAgentUsable}
         >
           {setBinding.isPending ? 'Saving…' : bindingMissing ? 'Set Main Agent' : 'Save Main Agent'}
         </Button>

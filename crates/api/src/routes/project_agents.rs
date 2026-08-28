@@ -4,6 +4,7 @@ use axum::{
     Json,
 };
 use db::{AgentRepo, ExecutionRepo, ProjectMember, ProjectMemberRepo};
+use services::agent_service::compute_effective_status;
 
 use crate::{
     errors::{ApiError, ApiResult},
@@ -28,8 +29,17 @@ pub async fn list_project_agents(
     let mut responses = Vec::with_capacity(agents.len());
     for agent in agents {
         let active_task_count = AgentRepo::count_active_tasks(&*state.db, &agent.id).await?;
+        let effective_status = compute_effective_status(&state.db, &agent)
+            .await?
+            .as_str()
+            .to_owned();
         let stats = ExecutionRepo::stats_by_agent(&*state.db, &agent.id).await?;
-        responses.push(agent_response(agent, Some(active_task_count), None, stats));
+        responses.push(agent_response(
+            agent,
+            Some(active_task_count),
+            Some(effective_status),
+            stats,
+        ));
     }
 
     Ok(Json(responses))

@@ -1,12 +1,8 @@
-import {
-  ArrowCounterClockwise,
-  ChatCircleDots,
-  GitBranch,
-  Lightning,
-} from '@phosphor-icons/react'
+import { ArrowCounterClockwise, ChatCircleDots, GitBranch, Lightning } from '@phosphor-icons/react'
 import type { AgentChatEntry } from '@/features/agent-chat/types'
 import type { FederatedAgent } from '@/features/federation/types'
 import { StateBadge } from '@/features/federation/components'
+import { isAgentUsable } from '@/lib/agent-availability'
 
 interface ActivationPath {
   id: string
@@ -21,10 +17,7 @@ function scopeLabel(entry: AgentChatEntry): string {
   return entry.kind === 'main' ? 'Main Chat' : (entry.project_name ?? 'Project Agent Chat')
 }
 
-function activeAgentChatScopes(
-  agentId: string,
-  entries: AgentChatEntry[],
-): string[] {
+function activeAgentChatScopes(agentId: string, entries: AgentChatEntry[]): string[] {
   const scopes: string[] = []
   for (const entry of entries) {
     if (entry.identity_id === agentId && entry.binding_state === 'active') {
@@ -44,7 +37,7 @@ export function AgentActivationSummary({
   const scopes = activeAgentChatScopes(agent.id, chatEntries)
   const scopeList = scopes.join(', ')
   const effectiveStatus = agent.effective_status ?? agent.status
-  const available = !agent.paused && ['active', 'busy', 'idle'].includes(effectiveStatus)
+  const available = isAgentUsable(agent)
   const paths: ActivationPath[] = [
     {
       id: 'chat-message',
@@ -99,13 +92,15 @@ export function AgentActivationSummary({
             When this agent runs
           </h3>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
-            Settings are frozen when a new turn or Task execution is admitted. Later edits apply
-            to the next admission.
+            Settings are frozen when a new turn or Task execution is admitted. Later edits apply to
+            the next admission.
           </p>
         </div>
         <StateBadge
           status={available ? 'active' : effectiveStatus}
-          label={available ? 'Eligible for new work' : agent.paused ? 'Agent disabled' : 'Unavailable'}
+          label={
+            available ? 'Eligible for new work' : agent.paused ? 'Agent disabled' : 'Unavailable'
+          }
         />
       </div>
 
@@ -149,15 +144,14 @@ export function AgentActivationSummary({
           <div>
             <p className="font-medium text-foreground">Attention-producing events</p>
             <p className="mt-1">
-              Task transitions to blocked, review, failed, or done; execution failure,
-              cancellation, stall, or progress warning; validation/review/retry incidents;
-              runtime unavailability; required questions/interactions; budget thresholds; and
-              overdue commitments.
+              Task transitions to blocked, review, failed, or done; execution failure, cancellation,
+              stall, or progress warning; validation/review/retry incidents; runtime unavailability;
+              required questions/interactions; budget thresholds; and overdue commitments.
             </p>
           </div>
           <p>
-            Event subscriptions are server-defined today. The stored binding subscriptions value
-            is not currently a user-configurable per-event filter.
+            Event subscriptions are server-defined today. The stored binding subscriptions value is
+            not currently a user-configurable per-event filter.
           </p>
         </div>
       </details>
