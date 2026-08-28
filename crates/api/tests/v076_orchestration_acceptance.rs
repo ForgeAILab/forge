@@ -331,7 +331,7 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
             "project_mode": "compact",
             "selected_project_agent_identity_id": legacy_identity,
             "selected_project_agent_profile_revision_id": legacy_profile,
-            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@5",
+            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@6",
             "selected_project_agent_policy_digest": legacy_policy
         }),
         &[StatusCode::CREATED, StatusCode::OK],
@@ -2922,7 +2922,7 @@ async fn create_genesis_project(app: &Router, token: &str, prefix: &str) -> Gene
         "project_mode": "compact",
         "selected_project_agent_identity_id": project_identity,
         "selected_project_agent_profile_revision_id": project_profile,
-        "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@5",
+        "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@6",
         "selected_project_agent_policy_digest": policy_digest
     });
     let approval = request_json(
@@ -3809,7 +3809,7 @@ fn user_authorization_replay_variants(
 fn user_provenance(summary: &str) -> Value {
     json!({
         "author": {"kind": "user", "id": "test-user-id"},
-        "operating_skill_revision": "forge.project.orchestration/v1@5",
+        "operating_skill_revision": "forge.project.orchestration/v1@6",
         "source_refs": [],
         "change_summary": summary
     })

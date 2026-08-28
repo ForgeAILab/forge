@@ -1793,15 +1793,18 @@ async fn materialize_check_definitions_in_tx(
         }
         // Only check kinds with an authoritative server projection are
         // admitted into a release-gating definition.  A check result cannot
-        // be supplied by the caller for task/document/media/git sources, and
+        // be supplied by the caller for document/media/git sources, and
         // silently accepting those definitions would make every such gate
         // permanently or accidentally missing.  Policy waivers remain a
         // valid definition kind because their authority is the immutable
-        // user Decision written by the waiver route.
+        // user Decision written by the waiver route, and `task_validation`
+        // joins them because `project.validation` writes its result with a
+        // server-derived, receipt-backed provenance.
         if !matches!(
             check.source_kind,
             api_types::AcceptanceCheckSourceKind::Manual
                 | api_types::AcceptanceCheckSourceKind::PolicyWaiver
+                | api_types::AcceptanceCheckSourceKind::TaskValidation
         ) {
             return Err(ApiError::bad_request(
                 "this acceptance check source kind is not currently admitted without an authoritative projection",

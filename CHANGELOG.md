@@ -36,8 +36,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   only sees the code that Task changed. Forge derives the governing Charter
   revision, active approved baseline revision, and check version server-side,
   and refuses `manual` checks on this path: a human attestation remains the
-  user-only route. Readiness now accepts a `task_validation` result as release
-  authority alongside `manual` and `policy_waiver`.
+  user-only route. `task_validation` is admitted as a definable check kind at
+  the milestone definition, REST, and persistence boundaries, and readiness
+  accepts its result as release authority alongside `manual` and
+  `policy_waiver`. The Project Agent operating skill (revision
+  `forge.project.orchestration/v1@6`) now directs the Agent to prefer
+  `task_validation` for anything it can settle by exercising the delivered
+  software, and to leave `manual` for judgment only a person can make.
 
 - Agent details now include a plain-language activation summary showing which
   Main/Project Chat bindings route messages to the Agent, when Project

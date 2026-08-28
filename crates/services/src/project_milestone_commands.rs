@@ -1007,6 +1007,7 @@ fn validate_checks(content: &MilestoneDefinitionContent, materialize: bool) -> R
                 check.source_kind,
                 api_types::AcceptanceCheckSourceKind::Manual
                     | api_types::AcceptanceCheckSourceKind::PolicyWaiver
+                    | api_types::AcceptanceCheckSourceKind::TaskValidation
             )
         {
             return Err(ServiceError::invalid_operation(

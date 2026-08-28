@@ -54,7 +54,7 @@ pub const PROJECT_OPERATING_SKILL_POLICY_JSON: &str =
 pub const PROJECT_OPERATING_SKILL_POLICY_DIGEST: &str =
     "b9364db0792d4a7aa3e9dcae9ebfab78f6a239db55dc21831b201c9b905dd54b";
 pub const PROJECT_OPERATING_SKILL_CONTENT_DIGEST: &str =
-    "395d2d6ccdc0b35987d550e2b2cda171297bea5a01e08024cb5d565d0914b596";
+    "b1f9cfb648c1cd1c8b5a7b61852aa1dc92d165376e4a43407029a0d3ffd30f38";
 
 /// Returns the exact immutable body of the Main Agent account baseline skill.
 /// This body is server-owned source code, not a seeded database row.
@@ -803,6 +803,7 @@ MILESTONES AND EVIDENCE
 - A milestone is an outcome/release contract, not a manually maintained percentage or substitute Task board.
 - Define its outcome, included/excluded scope, acceptance checks, linked artifact revisions, Task selection, evidence expectations, and optional human-facing version label. Every required acceptance check has one required evidence requirement with the same stable ID. Evidence is mandatory proof, not optional decoration.
 - Preserve existing stable check IDs across milestone revisions. Use `manual` only when an authorized user must make a genuinely human observation or judgment; never treat repository test output as a manual attestation. A manual result and its required evidence are separate inputs, and you may request but never record the user's result.
+- Prefer `task_validation` for any check you can settle by exercising the delivered software yourself, and record its result with `project.validation` (`record`). That is the integrated view a Task review cannot give you: a review only sees the code one Task changed, while an acceptance check asserts the whole outcome still behaves — including features delivered earlier that later work must not break. A `manual` check makes the user do that by hand, so choose it only for judgment a person alone can make.
 - Multiple milestones may be active; primary_milestone_id identifies the single outcome emphasized in the Overview.
 - Live progress is derived from current Tasks and validation. Report concrete counts/states and failed or missing checks; do not imply that completion equals release.
 - Propose standalone readiness only. Forge alone computes an immutable ReadinessSnapshot from the approved release policy and principal-bound inputs. The snapshot references exact evidence attachments/digests and creates no release pins. You may not approve or attest a release-gating Document, manual check, waiver, validation, or release on the user's behalf.
@@ -1058,6 +1059,8 @@ mod tests {
         );
         const V097_MIGRATION: &str =
             include_str!("../../db/migrations/V097__project_agent_release_blocker_contract.sql");
+        const V108_MIGRATION: &str =
+            include_str!("../../db/migrations/V108__project_agent_records_validation.sql");
         const V106_MIGRATION: &str =
             include_str!("../../db/migrations/V106__charter_execution_and_agent_availability.sql");
 
@@ -1106,9 +1109,10 @@ mod tests {
         assert!(V095_MIGRATION.contains("forge.project.orchestration/v1@3"));
         assert!(V097_MIGRATION.contains("forge.project.orchestration/v1@4"));
         assert!(V106_MIGRATION.contains("forge.project.orchestration/v1@5"));
-        let seeded_project = seeded_body(V106_MIGRATION, "Forge Project Agent");
+        assert!(V108_MIGRATION.contains("forge.project.orchestration/v1@6"));
+        let seeded_project = seeded_body(V108_MIGRATION, "Forge Project Agent");
         assert_eq!(seeded_project, canonical_project_operating_skill_body());
-        assert!(V106_MIGRATION.contains(PROJECT_OPERATING_SKILL_CONTENT_DIGEST));
+        assert!(V108_MIGRATION.contains(PROJECT_OPERATING_SKILL_CONTENT_DIGEST));
         assert_eq!(
             sha256_hex(canonical_project_operating_skill_body()),
             PROJECT_OPERATING_SKILL_CONTENT_DIGEST

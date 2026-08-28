@@ -6741,7 +6741,7 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
             ),
             (
                 "forge.project.orchestration/v1".to_owned(),
-                "forge.project.orchestration/v1@5".to_owned(),
+                "forge.project.orchestration/v1@6".to_owned(),
             ),
         ],
         "a seeded operating-skill revision must be repointed in the same release (V081 regression)"
@@ -6749,7 +6749,7 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
     let (body, digest): (String, String) = sqlx::query_as(
         "SELECT canonical_body, content_digest
          FROM operating_skill_revision
-         WHERE id = 'forge.project.orchestration/v1@5'",
+         WHERE id = 'forge.project.orchestration/v1@6'",
     )
     .fetch_one(db.pool())
     .await
