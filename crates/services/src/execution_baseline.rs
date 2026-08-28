@@ -1824,11 +1824,26 @@ impl ExecutionBaselineQueryService {
         .await?
         .into_iter()
         .collect();
-        let proposed_revision = revisions.iter().find(|candidate| {
-            current_revision_id.as_deref() != Some(candidate.id.as_str())
-                && !invalid_revision_ids.contains(&candidate.id)
-        });
-        let proposed_revision = proposed_revision
+        // A revision awaiting approval becomes the baseline's current revision,
+        // so excluding the current revision here hid the very revision the user
+        // has to act on and surfaced an older draft in its place. The approval
+        // card then saw lifecycle `draft`, offered no step, and the baseline sat
+        // at `proposed` forever — which blocks manual attestation, and with it
+        // evidence, readiness, and release. Prefer the revision that is actually
+        // proposed; otherwise keep reporting the newest non-current revision, so
+        // a draft opened beside an already-active baseline still surfaces.
+        let proposed_record = revisions
+            .iter()
+            .find(|candidate| {
+                candidate.lifecycle == "proposed" && !invalid_revision_ids.contains(&candidate.id)
+            })
+            .or_else(|| {
+                revisions.iter().find(|candidate| {
+                    current_revision_id.as_deref() != Some(candidate.id.as_str())
+                        && !invalid_revision_ids.contains(&candidate.id)
+                })
+            });
+        let proposed_revision = proposed_record
             .map(|revision| self.render_revision(baseline, &revisions, &revision.id))
             .transpose()?;
         let approvals = ProjectOrchestrationRepo::list_project_execution_baseline_approvals(
@@ -1857,13 +1872,31 @@ impl ExecutionBaselineQueryService {
         })
         .transpose()?;
 
+        // The frozen approval target used to exist only on the propose command's
+        // own response, so reloading the page lost it. Rebuild it from the stored
+        // proposed revision while that revision is still unapproved, so the
+        // documented contract holds on every read.
+        // The approval this projection reports can belong to the *current*
+        // revision, so testing `approval.is_none()` would let a consumed
+        // approval on an already-active revision suppress the target for a
+        // genuinely unapproved one. Ask about this exact revision instead.
+        let approval_target = proposed_revision
+            .as_ref()
+            .filter(|revision| revision.lifecycle == ExecutionBaselineLifecycle::Proposed)
+            .filter(|revision| {
+                approval
+                    .as_ref()
+                    .is_none_or(|approval| approval.revision_id != revision.id)
+            })
+            .map(approval_target_for);
+
         Ok(ExecutionBaselineResponse {
             baseline: render_baseline(baseline)?,
             current_revision,
             proposed_revision,
             approval,
-            approval_target: None,
-            requires_user_authorization: false,
+            requires_user_authorization: approval_target.is_some(),
+            approval_target,
             integrity_issue: integrity.map(|integrity| ExecutionBaselineIntegrityIssue {
                 revision_id: integrity.revision_id,
                 baseline_id: integrity.baseline_id,
@@ -1999,6 +2032,26 @@ fn render_baseline(record: &ProjectExecutionBaselineRecord) -> Result<ExecutionB
         created_at: record.created_at.clone(),
         updated_at: record.updated_at.clone(),
     })
+}
+
+/// Rebuild the frozen approval target from a stored proposed revision. Every
+/// field the propose command froze is persisted on the revision, so a reload
+/// reproduces the same target instead of losing it with the command response.
+fn approval_target_for(
+    revision: &ExecutionBaselineRevision,
+) -> api_types::ExecutionBaselineApprovalTarget {
+    api_types::ExecutionBaselineApprovalTarget {
+        baseline_id: revision.baseline_id.clone(),
+        revision_id: revision.id.clone(),
+        revision: revision.revision_number,
+        content: revision.content.clone(),
+        rendered_view: revision.rendered_view.clone(),
+        render_version: revision.render_version.clone(),
+        content_digest: revision.content_digest.clone(),
+        render_digest: revision.render_digest.clone(),
+        provenance: revision.provenance.clone(),
+        requires_user_authorization: true,
+    }
 }
 
 fn parse_baseline_lifecycle(value: &str) -> Result<ExecutionBaselineLifecycle> {
