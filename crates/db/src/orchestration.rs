@@ -1343,6 +1343,17 @@ pub struct CreateProjectMilestoneCheckResult {
     pub created_at: String,
 }
 
+/// One append-only acceptance-check result together with the command receipt
+/// that authorizes it. Non-`manual` results are produced by an agent through
+/// `project.validation`, so the receipt is what readiness later verifies; a
+/// `manual` result stays a user-only route and never travels this path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendProjectMilestoneCheckResultCommand {
+    pub result: CreateProjectMilestoneCheckResult,
+    pub command_receipt: Option<CreateCommandReceipt>,
+    pub action_execution: Option<CreateAgentActionExecution>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectReadinessSnapshotRecord {
     pub id: String,
@@ -2305,7 +2316,7 @@ pub trait ProjectOrchestrationRepo: Send + Sync {
     }
     async fn append_project_milestone_check_result(
         &self,
-        input: CreateProjectMilestoneCheckResult,
+        input: AppendProjectMilestoneCheckResultCommand,
     ) -> Result<ProjectMilestoneCheckResultRecord> {
         let _ = input;
         Err(crate::DbError::Check(

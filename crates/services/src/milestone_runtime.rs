@@ -3629,11 +3629,13 @@ fn validation_results_from_rows(
         }
         let source_kind: String = row.try_get("source_kind")?;
         match source_kind.as_str() {
-            // The current admission path materializes only these two closed
-            // source kinds. Other enum values remain schema-compatible for
-            // historical rows, but cannot become release authority until a
-            // server-owned projection supplies their exact provenance.
-            "manual" | "policy_waiver" => {}
+            // Each of these has a server-owned admission path that supplies
+            // exact provenance: `manual` through the user attestation route,
+            // `policy_waiver` through the user waiver, and `task_validation`
+            // through the receipt-backed `project.validation` command. The
+            // remaining enum values stay schema-compatible for historical rows
+            // but cannot become release authority until they have one too.
+            "manual" | "policy_waiver" | "task_validation" => {}
             other => {
                 return Err(crate::ServiceError::InvalidOperation {
                     message: format!("unknown persisted check result source kind {other}"),

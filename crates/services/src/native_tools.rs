@@ -37,8 +37,8 @@ use forge_agent_host::{
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
     PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION,
     PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
-    PROJECT_RELEASE_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_PROPOSE_OPERATION,
-    TASK_REVIEW_OPERATION,
+    PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION,
+    TASK_PROPOSE_OPERATION, TASK_REVIEW_OPERATION,
 };
 use reqwest::header::ACCEPT;
 use serde::Deserialize;
@@ -935,6 +935,7 @@ impl CoordinationToolProvider {
             | PROJECT_EXECUTION_BASELINE_OPERATION
             | PROJECT_MILESTONE_OPERATION
             | PROJECT_EVIDENCE_OPERATION
+            | PROJECT_VALIDATION_OPERATION
             | PROJECT_READINESS_OPERATION
             | PROJECT_RELEASE_OPERATION => {
                 let project_id = self
@@ -2368,9 +2369,9 @@ fn retry_for_current(operation: &str, current: &CurrentVersionOrRevision) -> Ret
             _ if current.resource_type == "project" => "expected_project_version",
             PROJECT_EXECUTION_BASELINE_OPERATION => "expected_baseline_version",
             PROJECT_DOCUMENT_OPERATION => "expected_document_version",
-            PROJECT_MILESTONE_OPERATION | PROJECT_EVIDENCE_OPERATION => {
-                "expected_milestone_version"
-            }
+            PROJECT_MILESTONE_OPERATION
+            | PROJECT_EVIDENCE_OPERATION
+            | PROJECT_VALIDATION_OPERATION => "expected_milestone_version",
             PROJECT_READINESS_OPERATION | PROJECT_RELEASE_OPERATION => "milestone_version",
             _ => "expected_version",
         };

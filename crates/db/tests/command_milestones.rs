@@ -737,3 +737,151 @@ async fn readiness_and_release_commands_are_atomic_and_replay_exactly() {
             .expect("released lifecycle");
     assert_eq!(lifecycle, "released");
 }
+
+/// An agent-observed acceptance result is receipt-backed and replays exactly.
+///
+/// `task_validation` exists because an acceptance check asserts integrated
+/// behaviour, which is wider than the one Task under review: a check can cover
+/// a feature delivered earlier that later work has to keep working. Recording
+/// it is therefore its own authorized command rather than a by-product of a
+/// single Task's review, and like every other Project command it commits the
+/// row, its domain event, and its receipt in one transaction.
+#[tokio::test]
+async fn agent_validation_results_commit_with_a_receipt_and_replay_exactly() {
+    let db = database().await;
+    project(&db).await;
+
+    let milestone_id = "milestone-validation";
+    let revision_id = "milestone-validation-revision";
+    let check_id = "check-integrated-behaviour";
+    let create = CreateProjectMilestoneCommand {
+        milestone: CreateProjectMilestone {
+            id: milestone_id.to_owned(),
+            project_id: PROJECT_ID.to_owned(),
+            expected_project_version: 1,
+            milestone_sequence: 1,
+            milestone_key: "M001".to_owned(),
+            display_label: Some("Validation milestone".to_owned()),
+            created_at: NOW.to_owned(),
+            updated_at: NOW.to_owned(),
+        },
+        revision: CreateProjectMilestoneRevision {
+            acceptance_checks_json: serde_json::json!([{
+                "id": check_id,
+                "description": "Feature A still works alongside feature B",
+                "required": true,
+                "source_kind": "task_validation",
+                "expected_result": "passed",
+            }])
+            .to_string(),
+            ..milestone_revision(revision_id, milestone_id, 1, 0, None, "approved")
+        },
+        allocate_project_sequence: false,
+        check_definitions: vec![db::CreateProjectMilestoneCheck {
+            id: check_id.to_owned(),
+            project_id: PROJECT_ID.to_owned(),
+            milestone_id: milestone_id.to_owned(),
+            definition_revision_id: revision_id.to_owned(),
+            expected_milestone_version: 1,
+            check_key: check_id.to_owned(),
+            description: "Feature A still works alongside feature B".to_owned(),
+            required: true,
+            source_kind: "task_validation".to_owned(),
+            expected_result: "passed".to_owned(),
+            evidence_required: false,
+            created_at: NOW.to_owned(),
+            updated_at: NOW.to_owned(),
+        }],
+        command_receipt: Some(receipt(
+            "project.milestone",
+            "validation-milestone-create",
+            "digest-validation-milestone-create",
+            serde_json::json!({
+                "project_id": PROJECT_ID,
+                "milestone_id": milestone_id,
+                "revision_id": revision_id,
+            }),
+        )),
+        action_execution: None,
+    };
+    ProjectOrchestrationRepo::create_project_milestone_command(&db, create)
+        .await
+        .expect("milestone with an agent-verifiable check");
+
+    let result_id = "validation-result-1";
+    let command = db::AppendProjectMilestoneCheckResultCommand {
+        result: db::CreateProjectMilestoneCheckResult {
+            id: result_id.to_owned(),
+            project_id: PROJECT_ID.to_owned(),
+            milestone_id: milestone_id.to_owned(),
+            check_id: check_id.to_owned(),
+            definition_revision_id: revision_id.to_owned(),
+            outcome: "passed".to_owned(),
+            source_kind: "task_validation".to_owned(),
+            source_manifest_json: serde_json::json!({
+                "result": "Exercised feature A and feature B together after B landed.",
+                "governing_revision_ids": ["charter-revision-1", "baseline-revision-1"],
+            })
+            .to_string(),
+            input_digest: "digest-validation-observation".to_owned(),
+            // This test pins the command/receipt/replay contract; the
+            // governing revision columns have their own cross-Project triggers
+            // and are exercised by the readiness suite.
+            governing_charter_revision_id: None,
+            governing_baseline_revision_id: None,
+            principal_type: "agent".to_owned(),
+            principal_id: "project-agent-1".to_owned(),
+            authorization_basis: "project_agent_binding_policy".to_owned(),
+            authorization_action: "project.validation.record".to_owned(),
+            authorization_occurred_at: NOW.to_owned(),
+            expected_version: 1,
+            explicit_event: "agent-action:validation-1".to_owned(),
+            idempotency_key: "validation-record-1".to_owned(),
+            created_at: NOW.to_owned(),
+        },
+        command_receipt: Some(receipt(
+            "project.validation",
+            "validation-record-1",
+            "digest-validation-record-1",
+            serde_json::json!({
+                "project_id": PROJECT_ID,
+                "milestone_id": milestone_id,
+                "check_id": check_id,
+                "result_id": result_id,
+            }),
+        )),
+        action_execution: None,
+    };
+
+    let recorded =
+        ProjectOrchestrationRepo::append_project_milestone_check_result(&db, command.clone())
+            .await
+            .expect("agent validation result commits");
+    assert_eq!(recorded.id, result_id);
+    assert_eq!(recorded.source_kind, "task_validation");
+    assert_eq!(recorded.principal_type, "agent");
+
+    let replay = ProjectOrchestrationRepo::append_project_milestone_check_result(&db, command)
+        .await
+        .expect("agent validation result replays");
+    assert_eq!(
+        recorded, replay,
+        "a response-loss retry replays the receipt"
+    );
+
+    let receipts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM command_receipt WHERE operation = 'project.validation'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("receipt count");
+    assert_eq!(receipts, 1, "the replay must not mint a second receipt");
+
+    let events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type = 'project.milestone.check.recorded'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("event count");
+    assert_eq!(events, 1, "the result is announced exactly once");
+}

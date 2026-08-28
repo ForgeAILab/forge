@@ -24,7 +24,7 @@ use forge_agent_host::{
     is_allowed_project_direct_payload, is_project_orchestration_operation,
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
     PROJECT_EVIDENCE_OPERATION, PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION,
-    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
+    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -38,8 +38,9 @@ use crate::{
     NewCommandContext, ProjectArtifactCommandService, ProjectCharterCommandService,
     ProjectCharterRevisionCommand, ProjectCommandAuthorization, ProjectDocumentApprovalCommand,
     ProjectDocumentRevisionCommand, ProjectEvidenceCommand, ProjectMilestoneCommandService,
-    ProposeExecutionBaselineForApprovalCommand, Result, SaveExecutionBaselineDraftCommand,
-    ServiceError, EXECUTION_BASELINE_PROPOSE_COMMAND, EXECUTION_BASELINE_SAVE_DRAFT_COMMAND,
+    ProjectValidationCommand, ProposeExecutionBaselineForApprovalCommand, Result,
+    SaveExecutionBaselineDraftCommand, ServiceError, EXECUTION_BASELINE_PROPOSE_COMMAND,
+    EXECUTION_BASELINE_SAVE_DRAFT_COMMAND,
 };
 
 #[cfg(test)]
@@ -212,6 +213,7 @@ impl ProjectOrchestrationActionService {
             }
             PROJECT_MILESTONE_OPERATION
             | PROJECT_EVIDENCE_OPERATION
+            | PROJECT_VALIDATION_OPERATION
             | PROJECT_READINESS_OPERATION
             | PROJECT_RELEASE_OPERATION => {
                 let milestone_id = payload
@@ -427,6 +429,10 @@ impl ProjectOrchestrationActionService {
                 )
                 .await?
             }
+            PROJECT_VALIDATION_OPERATION => {
+                self.materialize_validation(&action, &input.project_id, &payload, Some(&context))
+                    .await?
+            }
             PROJECT_READINESS_OPERATION => {
                 self.materialize_readiness_request(
                     &action,
@@ -588,6 +594,15 @@ impl ProjectOrchestrationActionService {
                 )
                 .await?
             }
+            PROJECT_VALIDATION_OPERATION => {
+                self.materialize_validation(
+                    &action,
+                    &project_id,
+                    &payload,
+                    command_context.as_ref(),
+                )
+                .await?
+            }
             PROJECT_READINESS_OPERATION => {
                 self.materialize_readiness_request(
                     &action,
@@ -690,7 +705,10 @@ impl ProjectOrchestrationActionService {
                 versions.insert(key.to_owned(), value);
             }
         }
-        if action.operation == PROJECT_EVIDENCE_OPERATION {
+        if matches!(
+            action.operation.as_str(),
+            PROJECT_EVIDENCE_OPERATION | PROJECT_VALIDATION_OPERATION
+        ) {
             let expected_milestone_version = payload
                 .get("expected_milestone_version")
                 .and_then(Value::as_i64)
@@ -1599,6 +1617,100 @@ impl ProjectOrchestrationActionService {
             "milestone_id": milestone_id,
             "attachment_id": attachment.id,
             "asset_id": asset_id,
+            "domain_committed": true,
+        }))
+    }
+
+    /// Record one agent-observed acceptance-check result. The check's own
+    /// source kind decides whether this path is legal at all, so the command
+    /// service -- not this materializer -- owns that refusal.
+    async fn materialize_validation(
+        &self,
+        action: &AgentAction,
+        project_id: &str,
+        payload: &Value,
+        command_context: Option<&CommandContext>,
+    ) -> Result<Value> {
+        let context = command_context.ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "Project validation execution requires a canonical command context",
+            )
+        })?;
+        let milestone_id = string(payload, "milestone_id")?;
+        let check_id = string(payload, "check_id")?;
+        let expected_milestone_version = payload
+            .get("expected_milestone_version")
+            .or_else(|| payload.get("milestone_version"))
+            .and_then(Value::as_i64)
+            .filter(|value| *value >= 1)
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "expected_milestone_version must be a positive integer",
+                )
+            })?;
+        let authorization_event_id = format!("agent-action:{}", action.id);
+        let authorization = ProjectCommandAuthorization {
+            principal_type: context.principal().principal_type().to_owned(),
+            principal_id: context.principal().principal_id().to_owned(),
+            policy_result: context
+                .authorization_provenance
+                .as_ref()
+                .map_or_else(|| "allowed".to_owned(), |value| value.policy_result.clone()),
+            policy_revision: context
+                .authorization_provenance
+                .as_ref()
+                .and_then(|value| value.policy_revision.clone()),
+            policy_digest: context
+                .authorization_provenance
+                .as_ref()
+                .and_then(|value| value.policy_digest.clone()),
+            requested_permission: context
+                .authorization_provenance
+                .as_ref()
+                .and_then(|value| value.requested_permission.clone()),
+            correlation_id: context.correlation_id().to_owned(),
+            causation_id: context.causation_id.clone(),
+            causation_depth: context.causation_depth,
+            authorization_event_id: authorization_event_id.clone(),
+            authorization_basis: "project_agent_binding_policy".to_owned(),
+            authorization_action: "project.validation.record".to_owned(),
+            authorization_occurred_at: action.created_at.clone(),
+            authorization_json: json!({
+                "principal": {
+                    "kind": context.principal().principal_type(),
+                    "id": context.principal().principal_id(),
+                },
+                "authorization_basis": "project_agent_binding_policy",
+                "action": "project.validation.record",
+                "event_id": authorization_event_id,
+                "occurred_at": action.created_at,
+            })
+            .to_string(),
+        };
+        let recorded = ProjectArtifactCommandService::new(Arc::clone(&self.db))
+            .record_validation_with_context(
+                ProjectValidationCommand {
+                    project_id: project_id.to_owned(),
+                    milestone_id: milestone_id.clone(),
+                    check_id: check_id.clone(),
+                    definition_revision_id: string(payload, "definition_revision_id")?,
+                    status: string(payload, "status")?,
+                    result: string(payload, "result")?,
+                    input_digest: string(payload, "input_digest")?,
+                    expected_milestone_version,
+                    idempotency_key: context.idempotency_key().to_owned(),
+                    authorization,
+                },
+                context.clone(),
+            )
+            .await?;
+        Ok(json!({
+            "operation": PROJECT_VALIDATION_OPERATION,
+            "project_id": project_id,
+            "milestone_id": milestone_id,
+            "check_id": check_id,
+            "result_id": recorded.id,
+            "outcome": recorded.outcome,
             "domain_committed": true,
         }))
     }

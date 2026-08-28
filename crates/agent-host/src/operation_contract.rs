@@ -17,8 +17,8 @@ use crate::operation_catalog::{
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
     PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION,
     PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
-    PROJECT_RELEASE_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_PROPOSE_OPERATION,
-    TASK_REVIEW_OPERATION,
+    PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION,
+    TASK_PROPOSE_OPERATION, TASK_REVIEW_OPERATION,
 };
 
 pub(crate) fn object_schema(properties: Value, required: &[&str]) -> Value {
@@ -576,7 +576,7 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
             "Project Agent may save a draft (draft_revision or revise) or propose a complete execution baseline for user approval (propose_approval). The shared command service validates exact Project-owned ArtifactRefs, versions, digests, milestones, policy, and reconciliation state. Approval and activation are user-only and never exposed here.",
         ),
         PROJECT_MILESTONE_OPERATION => object_schema(
-            json!({"action":{"enum":["define","revise","set_primary"]},"milestone_id":string_or_null_schema(),"display_label":string_or_null_schema(),"expected_milestone_version":{"type":"integer","minimum":1},"primary_milestone_id":string_or_null_schema(),"content":{"type":"object","properties":{"name":{"type":"string","minLength":1},"outcome":{"type":"string","minLength":1},"included_scope":string_array_schema(),"excluded_scope":string_array_schema(),"charter_revision":{"oneOf":[artifact_ref_schema(),{"type":"null"}]},"document_revisions":{"type":"array","items":artifact_ref_schema()},"task_ids":string_array_schema(),"dependencies":string_array_schema(),"risks":{"type":"array","items":charter_risk_schema()},"acceptance_checks":{"type":"array","items":object_schema(json!({"id":{"type":"string","minLength":1,"description":"Stable canonical id; preserve it across milestone revisions."},"description":{"type":"string","minLength":1},"required":{"type":"boolean"},"source_kind":{"type":"string","enum":["manual","policy_waiver"],"description":"Only source kinds with a current authoritative result path are admitted. Use manual only for a genuinely human observation; automated output belongs in required evidence."},"expected_result":{"type":"string","minLength":1},"latest_result":string_or_null_schema(),"latest_result_id":string_or_null_schema(),"latest_result_digest":string_or_null_schema()}), &["id","description","required","source_kind","expected_result"])},"evidence_requirements":{"type":"array","items":object_schema(json!({"id":{"type":"string","minLength":1,"description":"Use the exact acceptance-check id this evidence proves."},"description":{"type":"string","minLength":1},"required":{"type":"boolean"},"evidence_kind":{"type":["string","null"],"enum":["screenshot","walkthrough_video","log","report","other",null]},"check_definition_revision":string_or_null_schema()}), &["id","description","required"])},"known_issues":string_array_schema(),"target_date":string_or_null_schema()},"additionalProperties":false}}),
+            json!({"action":{"enum":["define","revise","set_primary"]},"milestone_id":string_or_null_schema(),"display_label":string_or_null_schema(),"expected_milestone_version":{"type":"integer","minimum":1},"primary_milestone_id":string_or_null_schema(),"content":{"type":"object","properties":{"name":{"type":"string","minLength":1},"outcome":{"type":"string","minLength":1},"included_scope":string_array_schema(),"excluded_scope":string_array_schema(),"charter_revision":{"oneOf":[artifact_ref_schema(),{"type":"null"}]},"document_revisions":{"type":"array","items":artifact_ref_schema()},"task_ids":string_array_schema(),"dependencies":string_array_schema(),"risks":{"type":"array","items":charter_risk_schema()},"acceptance_checks":{"type":"array","items":object_schema(json!({"id":{"type":"string","minLength":1,"description":"Stable canonical id; preserve it across milestone revisions."},"description":{"type":"string","minLength":1},"required":{"type":"boolean"},"source_kind":{"type":"string","enum":["manual","policy_waiver","task_validation"],"description":"Only source kinds with a current authoritative result path are admitted. Use manual for a genuinely human observation, and task_validation for an integrated check an agent can run and record through project.validation."},"expected_result":{"type":"string","minLength":1},"latest_result":string_or_null_schema(),"latest_result_id":string_or_null_schema(),"latest_result_digest":string_or_null_schema()}), &["id","description","required","source_kind","expected_result"])},"evidence_requirements":{"type":"array","items":object_schema(json!({"id":{"type":"string","minLength":1,"description":"Use the exact acceptance-check id this evidence proves."},"description":{"type":"string","minLength":1},"required":{"type":"boolean"},"evidence_kind":{"type":["string","null"],"enum":["screenshot","walkthrough_video","log","report","other",null]},"check_definition_revision":string_or_null_schema()}), &["id","description","required"])},"known_issues":string_array_schema(),"target_date":string_or_null_schema()},"additionalProperties":false}}),
             &["action", "expected_milestone_version"],
         ),
         PROJECT_EVIDENCE_OPERATION => object_schema(
@@ -589,6 +589,19 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
                 "caption",
                 "kind",
                 "checksum",
+            ],
+        ),
+        PROJECT_VALIDATION_OPERATION => object_schema(
+            json!({"action":{"const":"record"},"milestone_id":{"type":"string","minLength":1},"milestone_version":{"type":"integer","minimum":1},"check_id":{"type":"string","minLength":1,"description":"Stable acceptance-check id on the milestone's current definition revision. The check's source_kind must not be manual."},"definition_revision_id":{"type":"string","minLength":1},"status":{"type":"string","enum":["pass","fail","blocked","stale","unavailable"]},"result":{"type":"string","minLength":1,"description":"What was actually observed, in the Agent's own words."},"input_digest":{"type":"string","minLength":1,"description":"Digest of the exact inputs observed, so a repeat of the same observation replays instead of appending."},"governing_revision_ids":string_array_schema()}),
+            &[
+                "action",
+                "milestone_id",
+                "milestone_version",
+                "check_id",
+                "definition_revision_id",
+                "status",
+                "result",
+                "input_digest",
             ],
         ),
         PROJECT_READINESS_OPERATION => object_schema(
@@ -1314,7 +1327,7 @@ mod tests {
         let check = &milestone["properties"]["content"]["properties"]["acceptance_checks"]["items"];
         assert_eq!(
             check["properties"]["source_kind"]["enum"],
-            json!(["manual", "policy_waiver"])
+            json!(["manual", "policy_waiver", "task_validation"])
         );
         let evidence =
             &milestone["properties"]["content"]["properties"]["evidence_requirements"]["items"];

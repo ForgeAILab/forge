@@ -28,6 +28,7 @@ pub const PROJECT_DECISION_OPERATION: &str = "project.decision";
 pub const PROJECT_EXECUTION_BASELINE_OPERATION: &str = "project.execution_baseline";
 pub const PROJECT_MILESTONE_OPERATION: &str = "project.milestone";
 pub const PROJECT_EVIDENCE_OPERATION: &str = "project.evidence";
+pub const PROJECT_VALIDATION_OPERATION: &str = "project.validation";
 pub const PROJECT_READINESS_OPERATION: &str = "project.readiness";
 pub const PROJECT_RELEASE_OPERATION: &str = "project.release.request";
 pub const TASK_PROPOSE_OPERATION: &str = "task.propose";
@@ -327,6 +328,17 @@ pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
     },
     OperationContract {
         operation: PROJECT_EVIDENCE_OPERATION,
+        surface: OperationSurface::ProjectOrchestration,
+        exposure: OperationExposure::TypedProposal,
+        input: OperationInputContract::ProposalEnvelope,
+        setup: OperationSetupExposure::ReadyOnly,
+        supported_scopes: PROJECT_SCOPES,
+        classification: OperationClassification::ApprovalRequiredAction,
+        permission: OperationPermission::ProposeProject,
+        output: SHARED_ORCHESTRATION_OUTCOME,
+    },
+    OperationContract {
+        operation: PROJECT_VALIDATION_OPERATION,
         surface: OperationSurface::ProjectOrchestration,
         exposure: OperationExposure::TypedProposal,
         input: OperationInputContract::ProposalEnvelope,
@@ -664,6 +676,11 @@ pub fn is_allowed_project_direct_payload(operation: &str, payload: &Value) -> bo
             )
         }
         PROJECT_EVIDENCE_OPERATION => action == Some("attach"),
+        // Recording an agent-observed validation result is bounded and
+        // append-only: it names one immutable check on the current definition
+        // revision and carries its own receipt. The `manual` source kind stays
+        // outside this path -- a user attestation is only ever a user's.
+        PROJECT_VALIDATION_OPERATION => action == Some("record"),
         PROJECT_READINESS_OPERATION => action == Some("evaluate"),
         // A release candidate is a consequential approval/audit proposal even
         // though it does not perform the final immutable release itself.  It

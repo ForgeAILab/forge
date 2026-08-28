@@ -28,6 +28,7 @@ use crate::{
 };
 
 pub const PROJECT_EVIDENCE_COMMAND: &str = "project.evidence";
+pub const PROJECT_VALIDATION_COMMAND: &str = "project.validation";
 
 /// The authorization information that is common to all transports.  The
 /// adapter is responsible for authenticating this data; this service owns its
@@ -62,6 +63,25 @@ pub struct ProjectEvidenceCommand {
     pub caption: String,
     pub evidence_kind: String,
     pub checksum: String,
+    pub expected_milestone_version: i64,
+    pub idempotency_key: String,
+    pub authorization: ProjectCommandAuthorization,
+}
+
+/// One agent-observed acceptance-check result. Integrated behaviour is what a
+/// milestone check actually asserts, and that is wider than the Task under
+/// review: a check can cover a feature delivered earlier that this Task's work
+/// has to keep working. So the observation is recorded as its own authorized
+/// command rather than derived from a single Task's review.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectValidationCommand {
+    pub project_id: String,
+    pub milestone_id: String,
+    pub check_id: String,
+    pub definition_revision_id: String,
+    pub status: String,
+    pub result: String,
+    pub input_digest: String,
     pub expected_milestone_version: i64,
     pub idempotency_key: String,
     pub authorization: ProjectCommandAuthorization,
@@ -188,6 +208,188 @@ impl ProjectArtifactCommandService {
         }
         let context = command_context(&command, action)?;
         self.attach_evidence_with_context(command, context).await
+    }
+
+    /// Record one agent-observed acceptance-check result. `manual` checks are
+    /// deliberately unreachable here: a human attestation is only ever a
+    /// human's, and readiness enforces that separately when it reads the row
+    /// back. Everything else about the row -- the governing Charter and
+    /// baseline revisions, the definition revision, the check version -- is
+    /// derived here rather than accepted from the caller.
+    pub(crate) async fn record_validation_with_context(
+        &self,
+        command: ProjectValidationCommand,
+        context: CommandContext,
+    ) -> Result<db::ProjectMilestoneCheckResultRecord> {
+        if context.operation() != PROJECT_VALIDATION_COMMAND
+            || context.canonical_scope().scope_type() != CommandScopeType::Project
+            || context.canonical_scope().scope_id() != command.project_id
+            || context.principal().principal_type() != command.authorization.principal_type
+            || context.principal().principal_id() != command.authorization.principal_id
+        {
+            return Err(ServiceError::invalid_operation(
+                "validation command context does not match its Project authorization",
+            ));
+        }
+        if command.result.trim().is_empty() || command.input_digest.trim().is_empty() {
+            return Err(ServiceError::invalid_operation(
+                "a validation result requires an observation and an input digest",
+            ));
+        }
+        if !matches!(
+            command.status.as_str(),
+            "pass" | "fail" | "blocked" | "stale" | "unavailable"
+        ) {
+            return Err(ServiceError::invalid_operation(
+                "validation status must be pass, fail, blocked, stale, or unavailable",
+            ));
+        }
+        authorize_project_principal(&self.db, &command.project_id, &command.authorization).await?;
+
+        let milestone =
+            ProjectOrchestrationRepo::get_project_milestone(&*self.db, &command.milestone_id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found("project_milestone", &command.milestone_id)
+                })?;
+        if milestone.project_id != command.project_id {
+            return Err(ServiceError::NotFound {
+                entity: "milestone",
+                id: command.milestone_id,
+            });
+        }
+        if milestone.version != command.expected_milestone_version {
+            return Err(ServiceError::Db(db::DbError::VersionConflict));
+        }
+        let current_definition_revision_id = milestone
+            .current_definition_revision_id
+            .clone()
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("the milestone has no current definition revision")
+            })?;
+        if command.definition_revision_id != current_definition_revision_id {
+            return Err(ServiceError::conflict(
+                "the acceptance check belongs to a superseded milestone definition revision",
+            ));
+        }
+
+        let check = sqlx::query(
+            "SELECT version, source_kind FROM project_milestone_check
+             WHERE id = ? AND project_id = ? AND milestone_id = ?
+               AND definition_revision_id = ?",
+        )
+        .bind(&command.check_id)
+        .bind(&command.project_id)
+        .bind(&command.milestone_id)
+        .bind(&current_definition_revision_id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .ok_or_else(|| ServiceError::not_found("project_milestone_check", &command.check_id))?;
+        let source_kind: String = check.try_get("source_kind")?;
+        if source_kind == "manual" {
+            return Err(ServiceError::invalid_operation(
+                "a manual acceptance check is attested by a user, not recorded by an agent",
+            ));
+        }
+        let expected_check_version: i64 = check.try_get("version")?;
+
+        // The governing Charter and active approved baseline are the release
+        // authority this observation is bound to. Readiness re-derives both
+        // when it reads the result, so deriving them here keeps a stale caller
+        // from binding a result to authority that has already moved.
+        let governance = sqlx::query(
+            "SELECT p.current_charter_revision_id,
+                    b.current_revision_id AS baseline_revision_id
+             FROM project p
+             JOIN project_execution_baseline b
+               ON b.project_id = p.id AND b.lifecycle = 'active'
+             JOIN project_execution_baseline_revision r
+               ON r.id = b.current_revision_id AND r.baseline_id = b.id
+              AND r.lifecycle = 'approved'
+             WHERE p.id = ?
+             ORDER BY b.updated_at DESC, b.id DESC
+             LIMIT 1",
+        )
+        .bind(&command.project_id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .ok_or_else(|| {
+            ServiceError::conflict(
+                "recording a validation result requires the current active approved execution baseline",
+            )
+        })?;
+        let governing_charter_revision_id: String = governance
+            .try_get::<Option<String>, _>("current_charter_revision_id")?
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                ServiceError::conflict(
+                    "recording a validation result requires the current approved Project Charter",
+                )
+            })?;
+        let governing_baseline_revision_id: String = governance.try_get("baseline_revision_id")?;
+
+        let result_id = new_uuid_v4();
+        let now = now_rfc3339();
+        let source_manifest = json!({
+            "result": command.result.clone(),
+            "governing_revision_ids": [
+                governing_charter_revision_id.clone(),
+                governing_baseline_revision_id.clone(),
+            ],
+            "check_definition_revision_id": current_definition_revision_id.clone(),
+            "observed_by": {
+                "kind": command.authorization.principal_type.clone(),
+                "id": command.authorization.principal_id.clone(),
+            },
+        });
+        let result_json = json!({
+            "operation": PROJECT_VALIDATION_COMMAND,
+            "project_id": command.project_id,
+            "milestone_id": command.milestone_id,
+            "check_id": command.check_id,
+            "result_id": result_id,
+            "outcome": command.status,
+            "domain_committed": true,
+        })
+        .to_string();
+        let (mut receipt, execution) = validation_command_bundle(&context, &result_json);
+        if let Some(execution) = execution.as_ref() {
+            receipt.agent_action_execution_id = Some(execution.id.clone());
+        }
+        ProjectOrchestrationRepo::append_project_milestone_check_result(
+            &*self.db,
+            db::AppendProjectMilestoneCheckResultCommand {
+                result: db::CreateProjectMilestoneCheckResult {
+                    id: result_id,
+                    project_id: command.project_id.clone(),
+                    milestone_id: command.milestone_id.clone(),
+                    check_id: command.check_id.clone(),
+                    definition_revision_id: current_definition_revision_id,
+                    outcome: command.status.clone(),
+                    source_kind,
+                    source_manifest_json: source_manifest.to_string(),
+                    input_digest: command.input_digest.clone(),
+                    governing_charter_revision_id: Some(governing_charter_revision_id),
+                    governing_baseline_revision_id: Some(governing_baseline_revision_id),
+                    principal_type: command.authorization.principal_type.clone(),
+                    principal_id: command.authorization.principal_id.clone(),
+                    authorization_basis: command.authorization.authorization_basis.clone(),
+                    authorization_action: command.authorization.authorization_action.clone(),
+                    authorization_occurred_at: command
+                        .authorization
+                        .authorization_occurred_at
+                        .clone(),
+                    expected_version: expected_check_version,
+                    explicit_event: command.authorization.authorization_event_id.clone(),
+                    idempotency_key: command.idempotency_key.clone(),
+                    created_at: now,
+                },
+                command_receipt: Some(receipt),
+                action_execution: execution,
+            },
+        )
+        .await
+        .map_err(Into::into)
     }
 
     /// Native Project Agent execution supplies the already-authorized command
@@ -1596,6 +1798,36 @@ fn command_context(
     CommandContext::from_authorized_input(context, command).map_err(|error| {
         ServiceError::invalid_operation(format!("evidence command digest: {error}"))
     })
+}
+
+/// Pair the receipt with the AgentAction execution record when the command
+/// arrived through an admitted Action, so both land in the same transaction.
+fn validation_command_bundle(
+    context: &CommandContext,
+    outcome_json: &str,
+) -> (CreateCommandReceipt, Option<CreateAgentActionExecution>) {
+    let receipt = create_receipt(context, outcome_json);
+    let execution = context.action_provenance.as_ref().map(|provenance| {
+        let committed_at = now_rfc3339();
+        CreateAgentActionExecution {
+            id: new_uuid_v4(),
+            action_id: provenance.action_id.clone(),
+            expected_action_version: provenance.expected_action_version,
+            attempt: provenance.attempt,
+            status: AgentActionExecutionStatus::Succeeded,
+            result_json: Some(outcome_json.to_owned()),
+            error: None,
+            executed_by_type: provenance.executed_by_type.clone(),
+            executed_by_id: provenance.executed_by_id.clone(),
+            idempotency_key: provenance.execution_idempotency_key.clone(),
+            action_status: AgentActionStatus::Executed,
+            action_outcome_json: Some(outcome_json.to_owned()),
+            created_at: committed_at.clone(),
+            completed_at: Some(committed_at.clone()),
+            updated_at: committed_at,
+        }
+    });
+    (receipt, execution)
 }
 
 fn create_receipt(context: &CommandContext, outcome_json: &str) -> CreateCommandReceipt {

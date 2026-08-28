@@ -256,7 +256,7 @@ pub use project_agent_selection::{
 pub use project_artifact_commands::{
     ProjectArtifactCommandService, ProjectCommandAuthorization, ProjectDocumentApprovalCommand,
     ProjectDocumentCreateCommand, ProjectDocumentRevisionCommand, ProjectEvidenceCommand,
-    PROJECT_EVIDENCE_COMMAND,
+    ProjectValidationCommand, PROJECT_EVIDENCE_COMMAND,
 };
 pub use project_charter_commands::{
     ProjectCharterApprovalCommand, ProjectCharterApprovalCommandOutcome,

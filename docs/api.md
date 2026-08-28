@@ -833,6 +833,21 @@ adapter never approves or activates a baseline and applies the same shared
 ArtifactRef, milestone-definition, Charter, policy, version, digest, and
 reconciliation checks as REST.
 
+Project Agent validation results use the typed `project.validation` operation.
+A `record` payload must include the current positive
+`expected_milestone_version` alongside `milestone_id`, `check_id`,
+`definition_revision_id`, `status`, `result`, and `input_digest`. It exists
+because an acceptance check asserts *integrated* behaviour, which is wider than
+the single Task under review: a check can cover a feature delivered earlier
+that later work must keep working, and a Task review only looks at the code
+that Task changed. The command derives the governing Charter revision, the
+active approved baseline revision, and the check version itself rather than
+accepting them, and it refuses any check whose `source_kind` is `manual` —
+a human attestation stays the user-only `checks/{check_id}/result` route.
+Acceptance checks may therefore declare `task_validation` as a `source_kind`,
+and readiness treats a receipt-backed `task_validation` result as release
+authority exactly as it treats a user attestation.
+
 Project Agent evidence proposals use the typed `project.evidence` operation.
 An `attach` payload must include the current positive
 `expected_milestone_version` alongside `milestone_id`, `asset_id`, `caption`,

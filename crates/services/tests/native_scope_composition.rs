@@ -32,8 +32,8 @@ use forge_agent_host::{
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
     PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION,
     PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
-    PROJECT_RELEASE_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_PROPOSE_OPERATION,
-    TASK_REVIEW_OPERATION,
+    PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION,
+    TASK_PROPOSE_OPERATION, TASK_REVIEW_OPERATION,
 };
 use serde_json::{json, Value};
 use services::{CoordinationToolProvider, TaskService};
@@ -848,6 +848,10 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
         (
             PROJECT_EVIDENCE_OPERATION,
             project_proposal_arguments(PROJECT_EVIDENCE_OPERATION, "attach", "matrix-evidence"),
+        ),
+        (
+            PROJECT_VALIDATION_OPERATION,
+            project_proposal_arguments(PROJECT_VALIDATION_OPERATION, "record", "matrix-validation"),
         ),
         (
             PROJECT_READINESS_OPERATION,

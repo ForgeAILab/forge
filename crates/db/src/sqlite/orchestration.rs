@@ -131,7 +131,12 @@ async fn materialize_milestone_check_definitions_in_tx(
             || check.expected_milestone_version != revision.expected_milestone_version
             || check.check_key != check.id
             || check.description.trim().is_empty()
-            || !matches!(check.source_kind.as_str(), "manual" | "policy_waiver")
+            // `task_validation` joins the definable kinds now that
+            // `project.validation` gives it a receipt-backed result path.
+            || !matches!(
+                check.source_kind.as_str(),
+                "manual" | "policy_waiver" | "task_validation"
+            )
             || check.evidence_required != required_evidence_ids.contains(&check.id)
             || check.updated_at != revision.created_at
             || check.created_at.trim().is_empty()
@@ -7908,8 +7913,13 @@ impl ProjectOrchestrationRepo for SqliteDb {
 
     async fn append_project_milestone_check_result(
         &self,
-        input: CreateProjectMilestoneCheckResult,
+        command: AppendProjectMilestoneCheckResultCommand,
     ) -> Result<ProjectMilestoneCheckResultRecord> {
+        let AppendProjectMilestoneCheckResultCommand {
+            result: input,
+            command_receipt,
+            action_execution,
+        } = command;
         if input.principal_type.trim().is_empty()
             || input.principal_id.trim().is_empty()
             || input.authorization_basis.trim().is_empty()
@@ -7920,6 +7930,20 @@ impl ProjectOrchestrationRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
         let mut tx = crate::begin_immediate(self.pool()).await?;
+        validate_command_scope(command_receipt.as_ref(), "project", &input.project_id)?;
+        if let Some(receipt) =
+            resolve_command_replay(self, &mut tx, command_receipt.as_ref()).await?
+        {
+            validate_replay_action_bundle(&mut tx, &receipt, action_execution.as_ref()).await?;
+            let result_id = command_outcome_string(&receipt, "result_id")?;
+            let row = sqlx::query("SELECT * FROM project_milestone_check_result WHERE id = ?")
+                .bind(&result_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(DbError::IdempotencyConflict)?;
+            tx.commit().await?;
+            return map_milestone_result(row);
+        }
         if let Some(existing) =
             sqlx::query("SELECT * FROM project_milestone_check_result WHERE idempotency_key = ?")
                 .bind(&input.idempotency_key)
@@ -8017,6 +8041,41 @@ impl ProjectOrchestrationRepo for SqliteDb {
         if advanced.rows_affected() != 1 {
             return Err(DbError::VersionConflict);
         }
+        let (actor_type, actor_id, correlation_id, causation_id, causation_depth) =
+            command_event_provenance(
+                command_receipt.as_ref(),
+                input.principal_type.clone(),
+                Some(input.principal_id.clone()),
+                input.id.clone(),
+                None,
+                0,
+            );
+        let event = CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "project.milestone.check.recorded".to_owned(),
+            entity_type: "project_milestone_check_result".to_owned(),
+            entity_id: input.id.clone(),
+            actor_type,
+            actor_id,
+            scope_type: "project".to_owned(),
+            scope_id: input.project_id.clone(),
+            correlation_id,
+            causation_id,
+            causation_depth,
+            dedupe_key: Some(format!("milestone-check-recorded:{}", input.id)),
+            payload_json: serde_json::json!({
+                "project_id": input.project_id.clone(),
+                "milestone_id": input.milestone_id.clone(),
+                "check_id": input.check_id.clone(),
+                "definition_revision_id": input.definition_revision_id.clone(),
+                "source_kind": input.source_kind.clone(),
+                "outcome": input.outcome.clone(),
+            })
+            .to_string(),
+            created_at: input.created_at.clone(),
+        };
+        DomainEventRepo::append_event_in_tx(self, &mut tx, &event).await?;
+        finalize_command_in_tx(self, &mut tx, &event.id, command_receipt, action_execution).await?;
         let row = sqlx::query("SELECT * FROM project_milestone_check_result WHERE id = ?")
             .bind(&input.id)
             .fetch_one(&mut *tx)

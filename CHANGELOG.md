@@ -26,6 +26,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Acceptance checks can be satisfied by an Agent. A check may now declare
+  `task_validation` as its `source_kind`, and the Project Agent records its
+  result through the new typed `project.validation` operation (`record`), which
+  is receipt-backed and replay-exact like every other Project command. This
+  exists because an acceptance check asserts integrated behaviour, which is
+  wider than the one Task under review — a check often covers a feature
+  delivered earlier that later work has to keep working, while a Task review
+  only sees the code that Task changed. Forge derives the governing Charter
+  revision, active approved baseline revision, and check version server-side,
+  and refuses `manual` checks on this path: a human attestation remains the
+  user-only route. Readiness now accepts a `task_validation` result as release
+  authority alongside `manual` and `policy_waiver`.
+
 - Agent details now include a plain-language activation summary showing which
   Main/Project Chat bindings route messages to the Agent, when Project
   handoffs and background Attention may admit a turn, when Task workflow role
