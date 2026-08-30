@@ -8,6 +8,67 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **The execution baseline is removed.** Forge pinned approved intent three
+  times: the Project Charter revision, the milestone definition revision, and
+  an execution baseline revision that mostly stored pointers back to the first
+  two plus a release policy. The policy was never interpreted — readiness reads
+  acceptance checks and evidence requirements from the milestone definition and
+  nothing from the policy's thirteen rule lists — so the baseline enforced
+  nothing while creating a third artifact that had to be approved, activated,
+  and continuously reconciled against the two that already governed. A Project
+  could deliver every acceptance check and still be told it had "no active
+  approved execution baseline".
+
+  Readiness is now: every required acceptance check on the approved milestone
+  definition has a current passing result, and required evidence is attached.
+  Two immutable pins remain — the Charter revision and the milestone definition
+  revision — both digested into `readiness_digest` and re-verified at release.
+
+  Removed: the `project.execution_baseline` MCP/native operation; the
+  `GET/POST /api/v1/projects/{id}/execution-baseline` routes and its
+  `/revisions`, `/approve`, `/approve-and-activate`, and `/activate`
+  sub-routes; the `ExecutionBaseline*` API types; the `project_execution_baseline`,
+  `project_execution_baseline_revision`, `project_execution_baseline_approval`,
+  and `execution_baseline_revision_integrity` tables. `baseline_id`,
+  `baseline_revision_id`, `baseline_digest`, `release_policy_revision`, and
+  `release_policy_digest` are dropped from readiness snapshots, releases, Task
+  governance, check results, and Decisions. `project.readiness` (`evaluate`)
+  no longer takes baseline or release-policy arguments, and `project.decision`
+  no longer takes `baseline_id`/`baseline_revision_id`.
+
+  Approving a milestone definition now makes the milestone active — baseline
+  activation used to perform that transition. A Charter amendment revokes the
+  `runnable` flag on Task governance bound to the superseded Charter revision,
+  which is what baseline supersession used to do indirectly.
+
+  Project Agent operating skill `forge.project.orchestration/v1@10` drops every
+  baseline instruction, including the one that told the Agent to stop and ask
+  the user to approve a baseline before reporting a delivery as validated.
+
+- A workflow-dispatched implementation execution is no longer failed for
+  committing nothing when the Task branch already carries the work. The
+  no-op guard now measures the branch against its own starting point
+  (`workspace.before_sha`) rather than against this pass's HEAD, so a
+  redispatch onto a branch that already holds the implementation — exactly what
+  the Project Agent does to unstick a stalled Task — can do verification-only
+  work and complete.
+
+- Recording an acceptance-check result now requires naming the run that made
+  the observation. `project.validation` (`record`) takes a required
+  `observed_task_id`, and Forge verifies that Task belongs to the Project and
+  actually reached a delivered state; an optional `evidence_asset_id` links the
+  captured artifact backing it. Both are written into the validation manifest
+  that readiness reads back. This closes a hole where the Project Agent — whose
+  session has no workspace and no process by construction — could record
+  first-hand observations of software behaviour it had no way to perform, and
+  have them accepted as release authority.
+
+- The coder dispatch prompt's completion-handoff block is replaced by a worklog
+  contract. Coders now append entries with `task.worklog` as they work instead
+  of ending with a `Summary | Deliverables | Verification | Deviations | Next
+  Step` block; Forge posts the final completion summary itself once the
+  execution is accepted.
+
 - An approved Project Charter now authorizes implementation after the user
   separately confirms Project creation. Execution-baseline approval is optional
   Task/milestone/evidence traceability and no longer makes Tasks runnable,
@@ -26,6 +87,28 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Agents can now produce the evidence they are asked for. `task.evidence`
+  (`capture`) registers an artifact a Task run actually produced — a screenshot,
+  recording, or report by workspace-relative `path`, or verbatim command output
+  as inline `content` — storing the bytes in the same media store the user
+  upload routes use and returning the `asset_id` a milestone evidence
+  attachment references. The operation exists only in the Task scope, and a
+  test pins that boundary: a Project Agent session has no workspace and no
+  process, so anything it "captured" would be authored rather than observed.
+  Captured artifacts are promoted to project-scoped media assets, so one
+  artifact from a single verification run can back every acceptance check it
+  demonstrates.
+
+- Task worklogs give each role an inspectable account of what the previous one
+  did. `task.worklog` (`append`) records a `progress`, `decision`, `validation`,
+  or `blocker` entry, and Forge derives the Task, execution, role, and identity
+  from the session rather than accepting them — an agent can say what it did,
+  not who it was. Migration `V110` adds `execution_id`, `role`, `worklog_kind`,
+  and an idempotency key to `task_comment` so a retried turn appends once.
+  Comments already flow into the next role's dispatch context, so the reviewer
+  reads the coder's account without either rewriting the other's. A worklog
+  entry never moves a Task and never satisfies an acceptance check.
+
 - Acceptance checks can be satisfied by an Agent. A check may now declare
   `task_validation` as its `source_kind`, and the Project Agent records its
   result through the new typed `project.validation` operation (`record`), which
@@ -40,9 +123,23 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   the milestone definition, REST, and persistence boundaries, and readiness
   accepts its result as release authority alongside `manual` and
   `policy_waiver`. The Project Agent operating skill (revision
-  `forge.project.orchestration/v1@6`) now directs the Agent to prefer
+  `forge.project.orchestration/v1@8`) now directs the Agent to prefer
   `task_validation` for anything it can settle by exercising the delivered
   software, and to leave `manual` for judgment only a person can make.
+
+- A delivery follow-up wake now carries a server-authored work order instead of
+  a generic instruction. When a Task completes, Forge resolves the milestones
+  that delivery was meant to satisfy and names, in the wake message, each one's
+  `milestone_id`, version, current definition revision, whether every bound Task
+  is now done, and every required acceptance check still missing an
+  authoritative result — split into the ones the Agent settles itself and the
+  ones only the user can attest. The turn's postcondition follows the same
+  order: while agent-settleable checks are outstanding the turn must commit a
+  validation result, and only once they are settled does it owe a readiness
+  evaluation. A Project with no active approved execution baseline owes neither;
+  the wake says the baseline is missing and asks for approval, where it
+  previously imposed a readiness postcondition no turn in that Project could
+  satisfy.
 
 - Agent details now include a plain-language activation summary showing which
   Main/Project Chat bindings route messages to the Agent, when Project
@@ -207,6 +304,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   illegal state transition.
 
 ### Fixed
+
+- An acceptance-check result recorded through `project.validation` now persists.
+  The operation accepted the same status vocabulary as the user-facing manual
+  attestation route (`pass`, `fail`, `blocked`, `stale`, `unavailable`) but
+  wrote it straight into the `outcome` column, whose vocabulary is `passed`,
+  `failed`, `missing`, `stale`, `waived` — so every status except `stale` aborted
+  the write on a constraint violation instead of settling the check. The status
+  is now translated exactly as the manual route translates it.
 
 - A released milestone can be read back when it carries more than one piece of
   evidence. The release transaction digests `evidence_pins` in the order it

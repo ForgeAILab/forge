@@ -74,9 +74,12 @@ Merge-fix boundary:
 - Must not rewrite the feature or add unrelated cleanup.
 - Red flags: redesigns, formatting churn outside conflicted areas, unrelated fixes.";
 
-const CODER_HANDOFF_CONTRACT: &str = "\
-Completion handoff: End your response with a handoff block containing sections Summary | Deliverables | Verification | Deviations | Next Step.
-List any verification not run with the reason. For UI/runtime behavior changes, include proof media (screenshot or log snippet) or explain why proof could not be captured.";
+const CODER_WORKLOG_CONTRACT: &str = "\
+Worklog: append entries with `task.worklog` (append) as you work, so the reviewer reads what you actually did.
+Write one after a meaningful milestone -- your initial approach, a completed slice, validation results, a deviation, a blocker -- and not for every tool call or file edit.
+Use kind `progress`, `decision`, `validation`, or `blocker`. Forge derives the Task, execution, role, and identity from your session, and posts the final completion summary itself once the execution is accepted, so no separate handoff block is needed.
+Proof of behaviour is a captured artifact, not prose: when a change alters UI or runtime behaviour, capture it with `task.evidence` (capture) -- a screenshot or recording by `path`, or verbatim command output as `content` -- and say in the worklog what you captured. If you could not capture proof, say so and why.
+A worklog entry never moves the Task and never satisfies an acceptance check.";
 
 fn coder_system(ctx: &AgentDispatchContext, extra_role_boundary: Option<&str>) -> String {
     let has_plan = ctx
@@ -93,7 +96,7 @@ fn coder_system(ctx: &AgentDispatchContext, extra_role_boundary: Option<&str>) -
         system.push_str(extra_role_boundary);
     }
     system.push_str("\n\n");
-    system.push_str(CODER_HANDOFF_CONTRACT);
+    system.push_str(CODER_WORKLOG_CONTRACT);
     system.push_str("\n\nProof of work for app-touching changes: If your task modifies user-facing UI or runtime behavior, capture a screenshot (or short walkthrough video) demonstrating the change. Upload it with forge-ctl task media upload --task-id <id> --file <path> and post a comment with forge-ctl task media comment --task-id <id> --content validation-notes --media-url <url> before transitioning to review.");
     if has_plan {
         system.push_str(" A planner agent already investigated and produced a plan — do not redo that work. Treat the provided plan as instructions to execute now.");

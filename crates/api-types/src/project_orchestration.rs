@@ -1108,32 +1108,6 @@ pub struct PendingDecisionSummary {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[ts(export)]
-pub enum ExecutionBaselineLifecycle {
-    Draft,
-    Proposed,
-    Approved,
-    Active,
-    Superseded,
-    Revoked,
-}
-
-/// Explicit intent for a Project execution-baseline write.
-///
-/// A draft is never implicitly promoted to a proposal.  The REST revision
-/// endpoint and the typed Project-Agent adapter must name which command they
-/// are invoking so the same payload cannot change lifecycle semantics by
-/// transport convention.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[ts(export)]
-pub enum ExecutionBaselineWriteOperation {
-    SaveDraft,
-    ProposeForApproval,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 #[serde(deny_unknown_fields)]
@@ -1226,301 +1200,6 @@ pub struct AdaptiveEnvelope {
     pub elevated_operations: Vec<String>,
 }
 
-/// The frozen release policy carried by an execution baseline.
-///
-/// A baseline must bind the concrete checks, evidence, review, dependency,
-/// side-effect, and correction rules that were in force when the user
-/// approved it.  The policy digest is derived from this closed value by the
-/// server; the surrounding revision/digest fields are indexed projections
-/// used by admission queries and must match it exactly.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-#[ts(export)]
-pub struct ExecutionBaselineReleasePolicy {
-    pub schema_version: String,
-    pub revision: String,
-    #[serde(default)]
-    pub required_check_definition_revisions: Vec<String>,
-    #[serde(default)]
-    pub reviewer_independence_rules: Vec<String>,
-    #[serde(default)]
-    pub manual_attestation_rules: Vec<String>,
-    #[serde(default)]
-    pub waiver_rules: Vec<String>,
-    #[serde(default)]
-    pub evidence_kinds: Vec<String>,
-    #[serde(default)]
-    pub evidence_contexts: Vec<String>,
-    #[serde(default)]
-    pub evidence_freshness_rules: Vec<String>,
-    #[serde(default)]
-    pub dependency_rules: Vec<String>,
-    #[serde(default)]
-    pub stale_input_rules: Vec<String>,
-    #[serde(default)]
-    pub forbidden_side_effects: Vec<String>,
-    #[serde(default)]
-    pub known_issue_rules: Vec<String>,
-    #[serde(default)]
-    pub correction_rules: Vec<String>,
-    #[serde(default)]
-    pub purge_rules: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[ts(export)]
-#[serde(deny_unknown_fields)]
-pub struct ExecutionBaselineContent {
-    pub charter_revision: ArtifactRef,
-    #[serde(default)]
-    pub document_revisions: Vec<ArtifactRef>,
-    #[serde(default)]
-    pub plan_item_ids: Vec<String>,
-    #[serde(default)]
-    pub milestone_ids: Vec<String>,
-    /// Immutable definition revision paired positionally with each milestone.
-    /// Activation revalidates these exact revisions before promoting the
-    /// milestone projection.
-    pub milestone_definition_revision_ids: Vec<String>,
-    #[serde(default)]
-    pub primary_milestone_id: Option<String>,
-    pub release_policy_revision: String,
-    pub release_policy_digest: String,
-    /// The exact frozen release-policy contract whose canonical digest must
-    /// equal `release_policy_digest`.
-    pub release_policy: ExecutionBaselineReleasePolicy,
-    #[serde(default)]
-    pub acceptance_evidence_matrix: Vec<AcceptanceEvidenceRequirement>,
-    #[serde(default)]
-    pub capability_classes: Vec<String>,
-    #[serde(default)]
-    pub risk_classes: Vec<String>,
-    #[serde(default)]
-    pub reviewer_independence_rules: Vec<String>,
-    #[serde(default)]
-    pub elevated_operations: Vec<String>,
-    pub adaptive_envelope: AdaptiveEnvelope,
-    #[serde(default)]
-    pub rollback_and_recovery: Vec<String>,
-    #[serde(default)]
-    pub exclusions: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[ts(export)]
-#[serde(deny_unknown_fields)]
-pub struct ExecutionBaselineRevision {
-    pub id: String,
-    pub baseline_id: String,
-    pub project_id: String,
-    pub revision_number: i64,
-    #[serde(default)]
-    pub base_revision_id: Option<String>,
-    pub lifecycle: ExecutionBaselineLifecycle,
-    pub schema_version: String,
-    pub content: ExecutionBaselineContent,
-    pub rendered_view: String,
-    pub render_version: String,
-    pub content_digest: String,
-    pub render_digest: String,
-    pub provenance: RevisionProvenance,
-    pub created_at: String,
-    #[serde(default)]
-    pub activated_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[ts(export)]
-#[serde(deny_unknown_fields)]
-pub struct ExecutionBaseline {
-    pub id: String,
-    pub project_id: String,
-    #[serde(default)]
-    pub current_revision_id: Option<String>,
-    pub lifecycle: ExecutionBaselineLifecycle,
-    pub version: i64,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[ts(export)]
-#[serde(deny_unknown_fields)]
-pub struct ExecutionBaselineApproval {
-    pub id: String,
-    pub baseline_id: String,
-    pub revision_id: String,
-    pub content_digest: String,
-    pub render_digest: String,
-    pub expected_project_version: i64,
-    pub approved_by: PrincipalRef,
-    pub authorization: AuthorizationProvenance,
-    pub approved_at: String,
-    pub idempotency_key: String,
-}
-
-/// Immutable approval target returned by the proposal command.  This is a
-/// copy of the frozen command outcome at the public boundary; callers must
-/// approve exactly these identifiers, digests, and rendered fields.
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[ts(export)]
-#[serde(deny_unknown_fields)]
-pub struct ExecutionBaselineApprovalTarget {
-    pub baseline_id: String,
-    pub revision_id: String,
-    pub revision: i64,
-    pub content: ExecutionBaselineContent,
-    pub rendered_view: String,
-    pub render_version: String,
-    pub content_digest: String,
-    pub render_digest: String,
-    pub provenance: RevisionProvenance,
-    pub requires_user_authorization: bool,
-}
-
-/// Data-preserving diagnosis for a historical current revision that cannot
-/// be represented by the closed execution-baseline schema. The immutable
-/// revision remains stored; `successor_revision_id` is a non-authoritative
-/// correction draft until an explicit user approval and reconciliation.
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[ts(export)]
-#[serde(deny_unknown_fields)]
-pub struct ExecutionBaselineIntegrityIssue {
-    pub revision_id: String,
-    pub baseline_id: String,
-    pub field_path: String,
-    pub invalid_values: Vec<String>,
-    pub diagnostic: String,
-    #[serde(default)]
-    pub successor_revision_id: Option<String>,
-    #[serde(default)]
-    pub conflict_id: Option<String>,
-    #[serde(default)]
-    pub reconciliation_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[ts(export)]
-#[serde(deny_unknown_fields)]
-pub struct ExecutionBaselineResponse {
-    pub baseline: ExecutionBaseline,
-    #[serde(default)]
-    pub current_revision: Option<ExecutionBaselineRevision>,
-    /// A proposed/approved successor that is not authoritative until
-    /// activation.  This is populated when an active baseline is being
-    /// superseded so callers can approve and activate the exact revision
-    /// without mistaking it for the currently runnable revision.
-    #[serde(default)]
-    pub proposed_revision: Option<ExecutionBaselineRevision>,
-    #[serde(default)]
-    pub approval: Option<ExecutionBaselineApproval>,
-    /// Exact immutable target returned by a proposal command.  Query-only
-    /// responses leave this absent and set `requires_user_authorization` to
-    /// false.
-    #[serde(default)]
-    pub approval_target: Option<ExecutionBaselineApprovalTarget>,
-    #[serde(default)]
-    pub requires_user_authorization: bool,
-    /// Present only when the authoritative current pointer names a preserved
-    /// historical revision rejected by the closed baseline schema.
-    #[serde(default)]
-    pub integrity_issue: Option<ExecutionBaselineIntegrityIssue>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-#[ts(export)]
-pub struct CreateExecutionBaselineRequest {
-    pub mutation: MutationEnvelope,
-    /// The collection endpoint creates only a first `draft`; `propose_for_approval`
-    /// is rejected there because proposal always targets an existing baseline.
-    pub operation: ExecutionBaselineWriteOperation,
-    pub base_revision_id: Option<String>,
-    pub content: ExecutionBaselineContent,
-    pub rendered_view: String,
-    pub render_version: String,
-    pub content_digest: String,
-    pub render_digest: String,
-    pub provenance: RevisionProvenance,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-#[ts(export)]
-pub struct SaveExecutionBaselineRevisionRequest {
-    pub mutation: MutationEnvelope,
-    pub operation: ExecutionBaselineWriteOperation,
-    pub base_revision_id: Option<String>,
-    pub content: ExecutionBaselineContent,
-    pub rendered_view: String,
-    pub render_version: String,
-    pub content_digest: String,
-    pub render_digest: String,
-    pub provenance: RevisionProvenance,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-#[ts(export)]
-pub struct ApproveExecutionBaselineRequest {
-    pub mutation: MutationEnvelope,
-    pub revision_id: String,
-    pub content_digest: String,
-    pub render_digest: String,
-    /// Project version observed while the user reviewed this exact revision.
-    /// Activation performs a second CAS against the then-current Project
-    /// version; this value remains part of the durable approval receipt.
-    pub expected_project_version: i64,
-}
-
-/// Accept and activate an optional traceability baseline (D18, F13): the one
-/// atomic, replay-exact command for this review gesture. It binds the exact
-/// revision/content/render identities the user reviewed and, unlike
-/// [`ApproveExecutionBaselineRequest`] followed by
-/// [`ActivateExecutionBaselineRequest`], commits approval and activation in
-/// a single server transaction under one idempotency key. The web must reuse
-/// the same `mutation.idempotency_key` across retries of this exact click so
-/// a lost response replays the committed outcome instead of surfacing a
-/// false failure.
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-#[ts(export)]
-pub struct ApproveAndActivateExecutionBaselineRequest {
-    pub mutation: MutationEnvelope,
-    pub revision_id: String,
-    pub content_digest: String,
-    pub render_digest: String,
-    /// Exact baseline version observed while the user reviewed the proposed
-    /// revision. `mutation.expected_version` is the Project version CAS, the
-    /// same convention [`ActivateExecutionBaselineRequest`] uses.
-    pub expected_baseline_version: i64,
-}
-
-/// Response for [`ApproveAndActivateExecutionBaselineRequest`] (D18, F13).
-///
-/// The identity fields are always populated once the command has committed:
-/// they are reconstructed from the frozen command receipt, never re-derived
-/// from mutable current state, so the caller can trust `revision_id` is now
-/// the Project's active revision even if nothing else in this response could
-/// be assembled. `projection` is the full baseline view for rendering; if
-/// re-reading it after a successful commit fails, `projection` is absent and
-/// `refresh_required` is `true` instead of the whole response failing -- a
-/// commit-truthful adapter never turns a successful write into a reported
-/// failure because a subsequent read could not be assembled.
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-#[ts(export)]
-pub struct ApproveAndActivateExecutionBaselineResponse {
-    pub baseline_id: String,
-    pub revision_id: String,
-    pub approval_id: String,
-    pub content_digest: String,
-    pub render_digest: String,
-    #[serde(default)]
-    pub projection: Option<ExecutionBaselineResponse>,
-    pub refresh_required: bool,
-}
-
 /// Server-checked provenance for a Project Task.
 ///
 /// A Charter-backed implementation Task is bound to the Project's current
@@ -1535,10 +1214,6 @@ pub struct ApproveAndActivateExecutionBaselineResponse {
 pub struct TaskGovernanceRequest {
     #[serde(default)]
     pub charter_revision_id: Option<String>,
-    #[serde(default)]
-    pub baseline_id: Option<String>,
-    #[serde(default)]
-    pub baseline_revision_id: Option<String>,
     #[serde(default)]
     pub plan_item_id: Option<String>,
     #[serde(default)]
@@ -1944,11 +1619,6 @@ pub struct ReadinessSnapshot {
     /// from the mutable milestone returned later.
     pub expected_milestone_version: i64,
     pub milestone_definition_revision_id: String,
-    pub baseline_id: String,
-    pub baseline_revision_id: String,
-    pub baseline_digest: String,
-    pub release_policy_revision: String,
-    pub release_policy_digest: String,
     pub input_manifest: Vec<ReadinessInput>,
     pub source_event_watermark: String,
     pub result: ReadinessResult,
@@ -2171,9 +1841,6 @@ pub struct ReleaseSnapshot {
     pub readiness_snapshot_id: String,
     pub readiness_digest: String,
     pub source_event_watermark: String,
-    pub baseline_id: String,
-    pub baseline_revision_id: String,
-    pub baseline_digest: String,
     pub charter_revision: ArtifactRef,
     #[serde(default)]
     pub document_revisions: Vec<ArtifactRef>,
@@ -2187,8 +1854,6 @@ pub struct ReleaseSnapshot {
     pub repository_references: Vec<String>,
     pub evidence_pins: Vec<EvidencePin>,
     pub waived_check_ids: Vec<String>,
-    pub release_policy_revision: String,
-    pub release_policy_digest: String,
     pub released_by: PrincipalRef,
     pub authorization: AuthorizationProvenance,
     pub released_at: String,
@@ -2645,8 +2310,6 @@ pub struct DecisionCandidateContext {
     /// Exact governing execution-baseline revision for this candidate, when
     /// the decision is an implementation choice inside an active baseline.
     #[serde(default)]
-    pub governing_baseline_revision_id: Option<String>,
-    #[serde(default)]
     pub supersedes_decision_id: Option<String>,
     #[serde(default)]
     pub invalidates_decision_id: Option<String>,
@@ -2747,27 +2410,9 @@ pub struct DecisionRecordListResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 #[ts(export)]
-pub struct ActivateExecutionBaselineRequest {
-    pub mutation: MutationEnvelope,
-    pub baseline_id: String,
-    pub revision_id: String,
-    pub approval_id: String,
-    /// Exact baseline version observed while the user reviewed the approval.
-    /// `mutation.expected_version` remains the Project version CAS.
-    pub expected_baseline_version: i64,
-    pub content_digest: String,
-    pub render_digest: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-#[ts(export)]
 pub struct EvaluateMilestoneReadinessRequest {
     pub mutation: MutationEnvelope,
     pub milestone_id: String,
-    pub baseline_id: String,
-    pub baseline_revision_id: String,
-    pub release_policy_revision: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -3113,20 +2758,9 @@ mod tests {
     #[test]
     fn mutation_and_governance_envelopes_reject_unknown_fields() {
         let task_governance = json!({
-            "baseline_id": "baseline-1",
+            "milestone_id": "milestone-1",
             "unknown": "must fail"
         });
         assert!(serde_json::from_value::<TaskGovernanceRequest>(task_governance).is_err());
-
-        let mut content = json!({
-            "charter_revision": {
-                "artifact_id": "charter-1",
-                "revision_id": "revision-1",
-                "content_digest": "content-1"
-            },
-            "milestone_definition_revision_ids": []
-        });
-        content["charter_revision"]["unexpected"] = json!("must fail");
-        assert!(serde_json::from_value::<ExecutionBaselineContent>(content).is_err());
     }
 }

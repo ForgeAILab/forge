@@ -14,13 +14,13 @@ import type { WorkflowExceptionSummary } from "./WorkflowExceptionSummary";
 import type { WorkflowHealthSummary } from "./WorkflowHealthSummary";
 import type { WorkspaceResponse } from "./WorkspaceResponse";
 
-export type TaskResponse = { id: string, project_id: string, repo_id: string | null, parent_task_id: string | null, assignee_type: string | null, assignee_id: string | null, title: string, description: string | null, task_type: TaskType, status: string, canonical_phase: CanonicalPhase, awaiting_human: boolean, priority: bigint, board_position: number, subtask_order: bigint | null, role_assignments: Array<TaskRoleAssignmentResponse>, remaining_retries: Record<string, number>, execution_actions: Array<ExecutionAction>, error_annotation: TaskAnnotation | null, blocked: InterruptionMetadata | null, failed: InterruptionMetadata | null, workflow_health: WorkflowHealthSummary | null, workflow_exception: WorkflowExceptionSummary | null, execution_observability: TaskExecutionObservability, task_state_config: Record<string, unknown> | null, review_passed_at: string | null, archived_at: string | null, workspace: WorkspaceResponse | null, plan_progress: PlanProgressSummary | null, plan_artifact: PlanArtifactDetail | null, external_issue_number: bigint | null, external_issue_url: string | null,
+export type TaskResponse = { id: string, project_id: string, repo_id: string | null, parent_task_id: string | null, assignee_type: string | null, assignee_id: string | null, title: string, description: string | null, task_type: TaskType, status: string, canonical_phase: CanonicalPhase, awaiting_human: boolean, priority: bigint, board_position: number, subtask_order: bigint | null, role_assignments: Array<TaskRoleAssignmentResponse>, remaining_retries: Record<string, number>, execution_actions: Array<ExecutionAction>, error_annotation: TaskAnnotation | null, blocked: InterruptionMetadata | null, failed: InterruptionMetadata | null, workflow_health: WorkflowHealthSummary | null, workflow_exception: WorkflowExceptionSummary | null, execution_observability: TaskExecutionObservability, task_state_config: Record<string, unknown> | null, review_passed_at: string | null, archived_at: string | null, workspace: WorkspaceResponse | null, plan_progress: PlanProgressSummary | null, plan_artifact: PlanArtifactDetail | null, external_issue_number: bigint | null, external_issue_url: string | null, 
 /**
  * Canonical attempt/execution/commit evidence for this Task (D17, F12).
  * Progress language everywhere else must derive from this value; it can
  * never be overridden to show "not started" once evidence exists.
  */
-execution_evidence: ExecutionEvidenceSummary,
+execution_evidence: ExecutionEvidenceSummary, 
 /**
  * The one canonical execution blocker for this Task (D16/D17), or
  * `None` when nothing blocks this Task's execution right now. A

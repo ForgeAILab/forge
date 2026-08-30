@@ -939,51 +939,6 @@ mod tests {
             Some(RetryAction::RetryProvisioning)
         );
     }
-
-    #[tokio::test]
-    async fn baseline_state_does_not_gate_task_execution() {
-        let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
-        run_migrations(&pool).await.expect("migrations");
-        let db = SqliteDb::new(pool);
-        let now = now_rfc3339();
-        ProjectRepo::create(
-            &db,
-            CreateProject {
-                id: "projection-baseline-project".to_owned(),
-                name: "Projection baseline project".to_owned(),
-                settings: "{}".to_owned(),
-                workflow_definition: "{}".to_owned(),
-                primary_repo_id: None,
-                owner_id: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-        )
-        .await
-        .expect("project");
-        sqlx::query(
-            "INSERT INTO project_execution_baseline
-                (id, project_id, lifecycle, version, created_at, updated_at)
-             VALUES ('baseline-active', 'projection-baseline-project', 'active', 1, ?, ?),
-                    ('baseline-draft', 'projection-baseline-project', 'draft', 1, ?, ?)",
-        )
-        .bind(&now)
-        .bind(&now)
-        .bind(&now)
-        .bind("9999-01-01T00:00:00Z")
-        .execute(db.pool())
-        .await
-        .expect("baselines");
-
-        assert_eq!(
-            execution_gate(&db, "projection-baseline-project")
-                .await
-                .expect("gate")
-                .0,
-            ExecutionGate::Active
-        );
-    }
-
     #[tokio::test]
     async fn optional_gate_source_failure_does_not_block_execution() {
         let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");

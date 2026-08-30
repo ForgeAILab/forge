@@ -127,6 +127,58 @@ impl WorkspaceManager {
         Ok(worktree_path)
     }
 
+    /// Create a detached worktree for reading and running only.
+    ///
+    /// No branch is created, so the checkout never occupies the task branch
+    /// namespace and there is nothing for work to accumulate on. Callers use
+    /// this for copies that exist to be exercised rather than edited.
+    pub async fn create_detached_worktree_named(
+        &self,
+        repo_url: &str,
+        owner_id: &str,
+        name: &str,
+        base_branch: &str,
+    ) -> Result<PathBuf> {
+        let owner_root = self.root.join(owner_id);
+        let worktree_path = owner_root.join(name);
+
+        if fs::try_exists(&worktree_path).await? {
+            return Err(WorkspaceError::AlreadyExists);
+        }
+        fs::create_dir_all(&owner_root).await?;
+
+        let _repo_cache_guard = if let Some(locks) = &self.repo_cache_locks {
+            Some(locks.acquire(repo_url).await)
+        } else {
+            None
+        };
+
+        let mut args = vec![
+            "worktree".to_string(),
+            "add".to_string(),
+            "--detach".to_string(),
+            worktree_path.to_string_lossy().to_string(),
+        ];
+        if !base_branch.is_empty() {
+            args.push(base_branch.to_string());
+        }
+
+        let output = git_command()
+            .args(&args)
+            .current_dir(repo_url)
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(git::GitError::CommandFailed {
+                command: format!("git {}", args.join(" ")),
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            }
+            .into());
+        }
+        Ok(worktree_path)
+    }
+
     pub async fn recover_worktree(
         &self,
         repo_url: &str,

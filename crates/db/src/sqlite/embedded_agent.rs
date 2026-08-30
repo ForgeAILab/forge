@@ -192,9 +192,9 @@ impl AgentContextScopeRepo for SqliteDb {
         sqlx::query(
             "INSERT INTO agent_context_scope (
                 id, identity_id, scope_type, scope_id, project_id,
-                task_id, task_role, workspace_access, authority_json,
-                version, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                task_id, task_role, workspace_access, workspace_path,
+                authority_json, version, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
              ON CONFLICT DO NOTHING",
         )
         .bind(&input.id)
@@ -205,6 +205,7 @@ impl AgentContextScopeRepo for SqliteDb {
         .bind(input.task_id.as_deref())
         .bind(input.task_role.as_deref())
         .bind(&input.workspace_access)
+        .bind(input.workspace_path.as_deref())
         .bind(&input.authority_json)
         .bind(&input.created_at)
         .bind(&input.updated_at)
@@ -681,6 +682,7 @@ fn map_context_scope(row: SqliteRow) -> Result<AgentContextScope> {
         task_id: row.try_get("task_id")?,
         task_role: row.try_get("task_role")?,
         workspace_access: row.try_get("workspace_access")?,
+        workspace_path: row.try_get("workspace_path")?,
         authority_json: row.try_get("authority_json")?,
         version: row.try_get("version")?,
         created_at: row.try_get("created_at")?,

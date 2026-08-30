@@ -11,4 +11,4 @@ governing_charter_revision_id: string | null,
  * Exact governing execution-baseline revision for this candidate, when
  * the decision is an implementation choice inside an active baseline.
  */
-governing_baseline_revision_id: string | null, supersedes_decision_id: string | null, invalidates_decision_id: string | null, };
+supersedes_decision_id: string | null, invalidates_decision_id: string | null, };

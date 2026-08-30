@@ -133,6 +133,26 @@ pub async fn is_worktree_clean(worktree_path: &Path) -> Result<bool> {
     Ok(output.is_empty())
 }
 
+/// Whether the worktree holds changes that would alter what the repository
+/// delivers.
+///
+/// Verifying software means running it, and running it leaves incidental
+/// artifacts behind -- `__pycache__`, `.pytest_cache`, `target/`, coverage
+/// files. Those are not authored content, and treating them as "this role
+/// wrote to the worktree" makes an honest verification run indistinguishable
+/// from a write-access violation. Tracked modifications still count, so a
+/// read-only role that edits a real file is still caught.
+pub async fn has_authored_changes(worktree_path: &Path) -> Result<bool> {
+    let output = run_git(
+        worktree_path,
+        // `-uno` hides untracked files; tracked adds, edits, deletes, and
+        // renames all still report.
+        &["status", "--porcelain", "-uno"],
+    )
+    .await?;
+    Ok(!output.is_empty())
+}
+
 /// List uncommitted worktree changes using git porcelain output.
 pub async fn status_porcelain(worktree_path: &Path) -> Result<Vec<String>> {
     let output = run_git(worktree_path, &["status", "--porcelain"]).await?;
@@ -471,6 +491,39 @@ mod tests {
         commit_all(&repo_path, "initial commit").await.unwrap();
 
         (dir, repo_path)
+    }
+
+    /// A reviewer runs the software it is reviewing, and running it leaves
+    /// caches behind. Untracked build output must not read as authored work,
+    /// or an honest verification run fails as a write-access violation.
+    #[tokio::test]
+    async fn authored_changes_ignore_untracked_build_output() {
+        let (_dir, repo_path) = setup_repo().await;
+        assert!(!has_authored_changes(&repo_path).await.unwrap());
+
+        fs::create_dir_all(repo_path.join("tests/__pycache__"))
+            .await
+            .unwrap();
+        fs::write(repo_path.join("tests/__pycache__/test.pyc"), "cache")
+            .await
+            .unwrap();
+        assert!(
+            !has_authored_changes(&repo_path).await.unwrap(),
+            "test caches are not authored work"
+        );
+        assert!(
+            !is_worktree_clean(&repo_path).await.unwrap(),
+            "the worktree is genuinely not pristine; only authorship is in question"
+        );
+
+        // A tracked edit is still a write, and must still be caught.
+        fs::write(repo_path.join("README.md"), "# Test edited")
+            .await
+            .unwrap();
+        assert!(
+            has_authored_changes(&repo_path).await.unwrap(),
+            "editing a tracked file is authored work"
+        );
     }
 
     #[tokio::test]

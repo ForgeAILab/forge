@@ -48,9 +48,6 @@ const release = {
     readiness_snapshot_id: 'readiness-2',
     readiness_digest: 'readiness-digest',
     source_event_watermark: 'event-900',
-    baseline_id: 'baseline-1',
-    baseline_revision_id: 'baseline-revision-3',
-    baseline_digest: 'baseline-digest',
     charter_revision: {
       artifact_id: 'charter-1',
       revision_id: 'charter-revision-2',
@@ -79,8 +76,6 @@ const release = {
       },
     ],
     waived_check_ids: [],
-    release_policy_revision: 'release-policy-v2',
-    release_policy_digest: 'release-policy-digest',
     released_by: { kind: 'user', id: 'user-1', display_name: 'Test User' },
     authorization: {
       principal: { kind: 'user', id: 'user-1', display_name: 'Test User' },
@@ -117,8 +112,6 @@ describe('ProjectReleasePage', () => {
     expect(screen.getByRole('heading', { name: 'release-identity-2' })).toBeTruthy()
     expect(screen.getByText('Source watermark')).toBeTruthy()
     expect(screen.getByText('event-900')).toBeTruthy()
-    expect(screen.getByText('Baseline digest')).toBeTruthy()
-    expect(screen.getByText('baseline-digest')).toBeTruthy()
     expect(screen.getByText('Milestone definition revision')).toBeTruthy()
     expect(screen.getByText('milestone-revision-2')).toBeTruthy()
     expect(screen.getByText('milestone-definition-digest')).toBeTruthy()

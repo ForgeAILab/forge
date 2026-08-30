@@ -105,6 +105,7 @@ async fn memory_source_authority_is_immutable_and_text_cannot_expand_scope() {
             task_id: None,
             task_role: None,
             workspace_access: "deny".to_owned(),
+            workspace_path: None,
             authority_json: json!({
                 "issued_to_user_id": "not-a-text-field",
                 "scope": { "type": "project", "project_id": project_a }
@@ -358,6 +359,7 @@ async fn context_manifest_sources_require_the_manifest_scope_before_retrieval() 
             task_id: None,
             task_role: None,
             workspace_access: "deny".to_owned(),
+            workspace_path: None,
             authority_json: "{}".to_owned(),
             created_at: now.clone(),
             updated_at: now,

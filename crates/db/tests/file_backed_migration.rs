@@ -1,11 +1,10 @@
 use db::{
     create_sqlite_pool, run_migrations, run_migrations_from, AgentActionPolicyResult,
     AgentActionRepo, AgentActionStatus, AgentChatRepo, AgentCommitmentRepo, AgentCommitmentStatus,
-    AgentContextScopeRepo, AgentInboxKind, AgentInboxRepo, AgentInboxStatus, AgentLcmRepo,
-    AgentRepo, AgentSessionRepo, AgentStatus, CreateAgent, CreateAgentAction,
-    CreateAgentCommitment, CreateAgentContextScope, CreateAgentInboxItem, CreateAgentLcmTimeline,
-    CreateAgentSession, CreateContextManifest, CreateContextManifestSource, CreateDomainEvent,
-    CreateForgeMemorySourceBinding, CreateTask, DomainEventRepo, MemoryItem,
+    AgentInboxKind, AgentInboxRepo, AgentInboxStatus, AgentLcmRepo, AgentRepo, AgentSessionRepo,
+    AgentStatus, CreateAgent, CreateAgentAction, CreateAgentCommitment, CreateAgentInboxItem,
+    CreateAgentLcmTimeline, CreateAgentSession, CreateContextManifest, CreateContextManifestSource,
+    CreateDomainEvent, CreateForgeMemorySourceBinding, CreateTask, DomainEventRepo, MemoryItem,
     ScopedMemoryRepository, SqliteDb, TaskRepo, User, UserRepo,
 };
 use std::{
@@ -858,24 +857,38 @@ async fn agent_chat_scope_rebuild_preserves_legacy_rows_and_relationships() {
         .expect("main chat lookup")
         .expect("main chat exists");
     assert_eq!(chat.account_id.as_deref(), Some(account_id));
-    let scope = AgentContextScopeRepo::create_context_scope(
-        &db,
-        CreateAgentContextScope {
-            id: "scope-rebuild-context".to_owned(),
-            identity_id: identity.id.clone(),
-            scope_type: "account".to_owned(),
-            scope_id: account_id.to_owned(),
-            project_id: None,
-            task_id: None,
-            task_role: None,
-            workspace_access: "deny".to_owned(),
-            authority_json: "{}".to_owned(),
-            created_at: now.to_owned(),
-            updated_at: now.to_owned(),
-        },
+    // The repository writes today's column set; this schema is frozen at
+    // migration 73, before `workspace_path` existed. Insert the legacy row
+    // shape directly so the rebuild is exercised on genuinely old data.
+    sqlx::query(
+        "INSERT INTO agent_context_scope (
+            id, identity_id, scope_type, scope_id, project_id, task_id,
+            task_role, workspace_access, authority_json, created_at, updated_at
+         ) VALUES (?, ?, 'account', ?, NULL, NULL, NULL, 'deny', '{}', ?, ?)",
     )
+    .bind("scope-rebuild-context")
+    .bind(&identity.id)
+    .bind(account_id)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
     .await
     .expect("legacy context scope creates");
+    let scope = db::AgentContextScope {
+        id: "scope-rebuild-context".to_owned(),
+        identity_id: identity.id.clone(),
+        scope_type: "account".to_owned(),
+        scope_id: account_id.to_owned(),
+        project_id: None,
+        task_id: None,
+        task_role: None,
+        workspace_access: "deny".to_owned(),
+        workspace_path: None,
+        authority_json: "{}".to_owned(),
+        version: 1,
+        created_at: now.to_owned(),
+        updated_at: now.to_owned(),
+    };
     let session = AgentSessionRepo::create_agent_session(
         &db,
         CreateAgentSession {

@@ -26,7 +26,6 @@ const MAX_LIMIT: i64 = 64;
 pub struct ProjectEffectiveStateProjection {
     pub project: ProjectIdentityProjection,
     pub governing_charter: Option<CharterReferenceProjection>,
-    pub active_execution_baseline: Option<ExecutionBaselineReferenceProjection>,
     pub approved_documents: Vec<ApprovedDocumentProjection>,
     pub active_decisions: Vec<DecisionProjection>,
     pub invalidated_decisions: Vec<DecisionProjection>,
@@ -85,21 +84,6 @@ pub struct CharterReferenceProjection {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ExecutionBaselineReferenceProjection {
-    pub id: String,
-    pub revision_id: String,
-    pub revision: i64,
-    pub version: i64,
-    pub lifecycle: String,
-    pub charter_revision_id: String,
-    pub content_digest: String,
-    pub render_digest: String,
-    pub release_policy_revision: String,
-    pub release_policy_digest: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct ApprovedDocumentProjection {
     pub id: String,
     pub kind: String,
@@ -128,7 +112,6 @@ pub struct DecisionProjection {
     pub explicit_event: String,
     pub authorization_occurred_at: String,
     pub charter_revision_id: Option<String>,
-    pub baseline_revision_id: Option<String>,
     pub source_refs: Vec<Value>,
     pub affected_records: Value,
     pub created_at: String,
@@ -257,11 +240,6 @@ pub struct ReadinessSnapshotProjection {
     pub id: String,
     pub milestone_id: String,
     pub definition_revision_id: String,
-    pub baseline_id: String,
-    pub baseline_revision_id: String,
-    pub baseline_digest: String,
-    pub release_policy_revision: String,
-    pub release_policy_digest: String,
     pub event_watermark: String,
     pub outcome: String,
     pub blocking_reasons: Vec<Value>,
@@ -279,9 +257,6 @@ pub struct ReleaseProjection {
     pub release_identifier: String,
     pub readiness_snapshot_id: String,
     pub readiness_digest: String,
-    pub baseline_id: String,
-    pub baseline_revision_id: String,
-    pub baseline_digest: String,
     pub snapshot_digest: String,
     pub created_at: String,
 }
@@ -291,7 +266,6 @@ pub struct ReleaseProjection {
 pub struct UnreleasedChangesProjection {
     pub document_ids: Vec<String>,
     pub decision_candidate_ids: Vec<String>,
-    pub baseline_revision_ids: Vec<String>,
     pub active_milestone_ids: Vec<String>,
     pub reconciliation_ids: Vec<String>,
 }
@@ -357,37 +331,6 @@ pub async fn load_effective_project_state(
     })
     .transpose()?;
 
-    let active_execution_baseline = sqlx::query(
-        "SELECT b.id, b.current_revision_id AS revision_id, b.version,
-                b.lifecycle, r.revision, r.charter_revision_id,
-                r.content_digest, r.rendered_digest,
-                r.release_policy_revision, r.release_policy_digest
-         FROM project_execution_baseline b
-         JOIN project_execution_baseline_revision r
-           ON r.id = b.current_revision_id AND r.baseline_id = b.id
-         WHERE b.project_id = ? AND b.lifecycle = 'active'
-           AND r.lifecycle = 'approved'
-         ORDER BY b.updated_at DESC, b.id DESC LIMIT 1",
-    )
-    .bind(project_id)
-    .fetch_optional(db.pool())
-    .await?
-    .map(|row| {
-        Ok::<_, sqlx::Error>(ExecutionBaselineReferenceProjection {
-            id: row.try_get("id")?,
-            revision_id: row.try_get("revision_id")?,
-            revision: row.try_get("revision")?,
-            version: row.try_get("version")?,
-            lifecycle: row.try_get("lifecycle")?,
-            charter_revision_id: row.try_get("charter_revision_id")?,
-            content_digest: row.try_get("content_digest")?,
-            render_digest: row.try_get("rendered_digest")?,
-            release_policy_revision: row.try_get("release_policy_revision")?,
-            release_policy_digest: row.try_get("release_policy_digest")?,
-        })
-    })
-    .transpose()?;
-
     let approved_documents = sqlx::query(
         "SELECT d.id, d.kind, d.title, d.current_approved_revision_id AS revision_id,
                 d.version, d.lifecycle, r.revision, r.content_digest,
@@ -422,7 +365,7 @@ pub async fn load_effective_project_state(
         "SELECT id, state, decision_class, question, selected_outcome,
                 rationale, principal_type, principal_id, authority_basis,
                 authorization_action, explicit_event, authorization_occurred_at,
-                charter_revision_id, baseline_revision_id, source_refs_json,
+                charter_revision_id, source_refs_json,
                 affected_records_json, created_at
          FROM project_decision
          WHERE project_id = ? AND state IN ('active', 'invalidated')
@@ -449,7 +392,6 @@ pub async fn load_effective_project_state(
             explicit_event: row.try_get("explicit_event")?,
             authorization_occurred_at: row.try_get("authorization_occurred_at")?,
             charter_revision_id: row.try_get("charter_revision_id")?,
-            baseline_revision_id: row.try_get("baseline_revision_id")?,
             source_refs: json_value_array(row.try_get("source_refs_json")?)?,
             affected_records: json_object_value(row.try_get("affected_records_json")?)?,
             created_at: row.try_get("created_at")?,
@@ -684,9 +626,8 @@ pub async fn load_effective_project_state(
     validate_primary_milestone_pointer(&active_milestones, primary_milestone_id.as_deref())?;
 
     let readiness_rows = sqlx::query(
-        "SELECT id, milestone_id, definition_revision_id, baseline_id,
-                baseline_revision_id, baseline_digest, release_policy_revision,
-                release_policy_digest, event_watermark, outcome,
+        "SELECT id, milestone_id, definition_revision_id,
+                event_watermark, outcome,
                 blocking_reasons_json, readiness_digest, created_at
          FROM project_readiness_snapshot
          WHERE project_id = ?
@@ -706,11 +647,6 @@ pub async fn load_effective_project_state(
             id: row.try_get("id")?,
             milestone_id: milestone_id.clone(),
             definition_revision_id: row.try_get("definition_revision_id")?,
-            baseline_id: row.try_get("baseline_id")?,
-            baseline_revision_id: row.try_get("baseline_revision_id")?,
-            baseline_digest: row.try_get("baseline_digest")?,
-            release_policy_revision: row.try_get("release_policy_revision")?,
-            release_policy_digest: row.try_get("release_policy_digest")?,
             event_watermark: row.try_get("event_watermark")?,
             outcome: row.try_get("outcome")?,
             blocking_reasons: json_value_array(row.try_get("blocking_reasons_json")?)?,
@@ -725,7 +661,7 @@ pub async fn load_effective_project_state(
     let releases = sqlx::query(
         "SELECT id, milestone_id, release_sequence, release_revision,
                 release_identifier, readiness_snapshot_id, readiness_digest,
-                baseline_id, baseline_revision_id, baseline_digest, snapshot_digest,
+                snapshot_digest,
                 created_at
          FROM project_release
          WHERE project_id = ?
@@ -745,9 +681,6 @@ pub async fn load_effective_project_state(
             release_identifier: row.try_get("release_identifier")?,
             readiness_snapshot_id: row.try_get("readiness_snapshot_id")?,
             readiness_digest: row.try_get("readiness_digest")?,
-            baseline_id: row.try_get("baseline_id")?,
-            baseline_revision_id: row.try_get("baseline_revision_id")?,
-            baseline_digest: row.try_get("baseline_digest")?,
             snapshot_digest: row.try_get("snapshot_digest")?,
             created_at: row.try_get("created_at")?,
         })
@@ -769,16 +702,6 @@ pub async fn load_effective_project_state(
         "SELECT id FROM project_decision_candidate
          WHERE project_id = ? AND lifecycle IN ('draft', 'proposed')
          ORDER BY updated_at DESC, id DESC LIMIT ?",
-    )
-    .bind(project_id)
-    .bind(limit)
-    .fetch_all(db.pool())
-    .await?;
-    let baseline_revision_ids = sqlx::query_scalar::<_, String>(
-        "SELECT r.id FROM project_execution_baseline_revision r
-         JOIN project_execution_baseline b ON b.id = r.baseline_id
-         WHERE b.project_id = ? AND r.lifecycle IN ('draft', 'proposed')
-         ORDER BY r.created_at DESC, r.id DESC LIMIT ?",
     )
     .bind(project_id)
     .bind(limit)
@@ -809,7 +732,6 @@ pub async fn load_effective_project_state(
     let projection = ProjectEffectiveStateProjection {
         project: identity,
         governing_charter,
-        active_execution_baseline,
         approved_documents,
         active_decisions,
         invalidated_decisions,
@@ -835,7 +757,6 @@ pub async fn load_effective_project_state(
         unreleased_changes: UnreleasedChangesProjection {
             document_ids,
             decision_candidate_ids,
-            baseline_revision_ids,
             active_milestone_ids,
             reconciliation_ids,
         },
@@ -896,42 +817,6 @@ fn validate_effective_state(projection: &ProjectEffectiveStateProjection) -> Res
         if charter.revision < 1 || charter.version < 1 {
             return Err(ServiceError::invalid_operation(
                 "Project effective state has an invalid Charter revision",
-            ));
-        }
-    }
-    if let Some(baseline) = projection.active_execution_baseline.as_ref() {
-        for (field, value) in [
-            ("Execution baseline id", baseline.id.as_str()),
-            (
-                "Execution baseline revision id",
-                baseline.revision_id.as_str(),
-            ),
-            (
-                "Execution baseline Charter revision id",
-                baseline.charter_revision_id.as_str(),
-            ),
-            (
-                "Execution baseline content digest",
-                baseline.content_digest.as_str(),
-            ),
-            (
-                "Execution baseline render digest",
-                baseline.render_digest.as_str(),
-            ),
-            (
-                "Execution baseline release-policy revision",
-                baseline.release_policy_revision.as_str(),
-            ),
-            (
-                "Execution baseline release-policy digest",
-                baseline.release_policy_digest.as_str(),
-            ),
-        ] {
-            require_nonempty(field, value)?;
-        }
-        if baseline.revision < 1 || baseline.version < 1 {
-            return Err(ServiceError::invalid_operation(
-                "Project effective state has an invalid execution baseline revision",
             ));
         }
     }
@@ -1018,9 +903,6 @@ fn validate_effective_state(projection: &ProjectEffectiveStateProjection) -> Res
             return Err(ServiceError::invalid_operation(
                 "Project Decision affected records exceed the runtime bound",
             ));
-        }
-        if let Some(revision_id) = decision.baseline_revision_id.as_deref() {
-            require_nonempty("Project Decision baseline revision id", revision_id)?;
         }
         if let Some(revision_id) = decision.charter_revision_id.as_deref() {
             require_nonempty("Project Decision Charter revision id", revision_id)?;
@@ -1211,23 +1093,6 @@ fn validate_effective_state(projection: &ProjectEffectiveStateProjection) -> Res
                 "Readiness definition revision id",
                 readiness.definition_revision_id.as_str(),
             ),
-            ("Readiness baseline id", readiness.baseline_id.as_str()),
-            (
-                "Readiness baseline revision id",
-                readiness.baseline_revision_id.as_str(),
-            ),
-            (
-                "Readiness baseline digest",
-                readiness.baseline_digest.as_str(),
-            ),
-            (
-                "Readiness release-policy revision",
-                readiness.release_policy_revision.as_str(),
-            ),
-            (
-                "Readiness release-policy digest",
-                readiness.release_policy_digest.as_str(),
-            ),
             (
                 "Readiness event watermark",
                 readiness.event_watermark.as_str(),
@@ -1258,15 +1123,6 @@ fn validate_effective_state(projection: &ProjectEffectiveStateProjection) -> Res
                 "Project release readiness digest",
                 release.readiness_digest.as_str(),
             ),
-            ("Project release baseline id", release.baseline_id.as_str()),
-            (
-                "Project release baseline revision id",
-                release.baseline_revision_id.as_str(),
-            ),
-            (
-                "Project release baseline digest",
-                release.baseline_digest.as_str(),
-            ),
             (
                 "Project release snapshot digest",
                 release.snapshot_digest.as_str(),
@@ -1286,7 +1142,6 @@ fn validate_effective_state(projection: &ProjectEffectiveStateProjection) -> Res
         .document_ids
         .iter()
         .chain(projection.unreleased_changes.decision_candidate_ids.iter())
-        .chain(projection.unreleased_changes.baseline_revision_ids.iter())
         .chain(projection.unreleased_changes.active_milestone_ids.iter())
         .chain(projection.unreleased_changes.reconciliation_ids.iter())
     {
@@ -1471,7 +1326,6 @@ mod tests {
                 updated_at: "now".to_owned(),
             },
             governing_charter: None,
-            active_execution_baseline: None,
             approved_documents: Vec::new(),
             active_decisions: Vec::new(),
             invalidated_decisions: Vec::new(),
@@ -1497,7 +1351,6 @@ mod tests {
             unreleased_changes: UnreleasedChangesProjection {
                 document_ids: Vec::new(),
                 decision_candidate_ids: Vec::new(),
-                baseline_revision_ids: Vec::new(),
                 active_milestone_ids: Vec::new(),
                 reconciliation_ids: Vec::new(),
             },
@@ -1508,7 +1361,6 @@ mod tests {
         };
         let value = serde_json::to_value(&projection).expect("projection serializes");
         assert!(value.get("governing_charter").is_some());
-        assert!(value.get("active_execution_baseline").is_some());
         assert!(value.get("approved_documents").is_some());
         assert!(value.get("reconciliation_required").is_some());
         assert!(value.get("canonical_conflicts").is_some());
@@ -1540,7 +1392,6 @@ mod tests {
                 updated_at: "now".to_owned(),
             },
             governing_charter: None,
-            active_execution_baseline: None,
             approved_documents: Vec::new(),
             active_decisions: Vec::new(),
             invalidated_decisions: Vec::new(),
@@ -1566,7 +1417,6 @@ mod tests {
             unreleased_changes: UnreleasedChangesProjection {
                 document_ids: Vec::new(),
                 decision_candidate_ids: Vec::new(),
-                baseline_revision_ids: Vec::new(),
                 active_milestone_ids: Vec::new(),
                 reconciliation_ids: Vec::new(),
             },
@@ -1611,7 +1461,6 @@ mod tests {
                 updated_at: "now".to_owned(),
             },
             governing_charter: None,
-            active_execution_baseline: None,
             approved_documents: Vec::new(),
             active_decisions: Vec::new(),
             invalidated_decisions: Vec::new(),
@@ -1647,7 +1496,6 @@ mod tests {
             unreleased_changes: UnreleasedChangesProjection {
                 document_ids: Vec::new(),
                 decision_candidate_ids: Vec::new(),
-                baseline_revision_ids: Vec::new(),
                 active_milestone_ids: Vec::new(),
                 reconciliation_ids: Vec::new(),
             },

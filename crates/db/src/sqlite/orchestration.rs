@@ -932,82 +932,10 @@ fn map_decision(row: SqliteRow) -> Result<ProjectDecisionRecord> {
         explicit_event: required_string(&row, "explicit_event")?,
         authorization_occurred_at: required_string(&row, "authorization_occurred_at")?,
         charter_revision_id: optional_string(&row, "charter_revision_id")?,
-        baseline_revision_id: optional_string(&row, "baseline_revision_id")?,
         source_refs_json: required_string(&row, "source_refs_json")?,
         affected_records_json: required_string(&row, "affected_records_json")?,
         supersedes_decision_id: optional_string(&row, "supersedes_decision_id")?,
         created_at: required_string(&row, "created_at")?,
-    })
-}
-
-fn map_baseline(row: SqliteRow) -> Result<ProjectExecutionBaselineRecord> {
-    Ok(ProjectExecutionBaselineRecord {
-        id: required_string(&row, "id")?,
-        project_id: required_string(&row, "project_id")?,
-        current_revision_id: optional_string(&row, "current_revision_id")?,
-        lifecycle: required_string(&row, "lifecycle")?,
-        version: row.try_get("version")?,
-        created_at: required_string(&row, "created_at")?,
-        updated_at: required_string(&row, "updated_at")?,
-    })
-}
-
-fn map_baseline_revision(row: SqliteRow) -> Result<ProjectExecutionBaselineRevisionRecord> {
-    Ok(ProjectExecutionBaselineRevisionRecord {
-        id: required_string(&row, "id")?,
-        baseline_id: required_string(&row, "baseline_id")?,
-        revision: row.try_get("revision")?,
-        base_revision: row.try_get("base_revision")?,
-        base_revision_id: optional_string(&row, "base_revision_id")?,
-        lifecycle: required_string(&row, "lifecycle")?,
-        charter_revision_id: required_string(&row, "charter_revision_id")?,
-        document_revisions_json: required_string(&row, "document_revisions_json")?,
-        plan_items_json: required_string(&row, "plan_items_json")?,
-        milestone_id: optional_string(&row, "milestone_id")?,
-        milestone_ids_json: required_string(&row, "milestone_ids_json")?,
-        milestone_definition_revision_ids_json: required_string(
-            &row,
-            "milestone_definition_revision_ids_json",
-        )?,
-        primary_milestone_id: optional_string(&row, "primary_milestone_id")?,
-        release_policy_json: required_string(&row, "release_policy_json")?,
-        release_policy_revision: required_string(&row, "release_policy_revision")?,
-        release_policy_digest: required_string(&row, "release_policy_digest")?,
-        acceptance_matrix_json: required_string(&row, "acceptance_matrix_json")?,
-        capability_classes_json: required_string(&row, "capability_classes_json")?,
-        risk_classes_json: required_string(&row, "risk_classes_json")?,
-        adaptive_envelope_json: required_string(&row, "adaptive_envelope_json")?,
-        elevated_operations_json: required_string(&row, "elevated_operations_json")?,
-        exclusions_json: required_string(&row, "exclusions_json")?,
-        rollback_recovery_json: required_string(&row, "rollback_recovery_json")?,
-        schema_version: required_string(&row, "schema_version")?,
-        render_version: required_string(&row, "render_version")?,
-        rendered_view: required_string(&row, "rendered_view")?,
-        content_digest: required_string(&row, "content_digest")?,
-        rendered_digest: required_string(&row, "rendered_digest")?,
-        source_refs_json: required_string(&row, "source_refs_json")?,
-        created_at: required_string(&row, "created_at")?,
-    })
-}
-
-fn map_baseline_approval(row: SqliteRow) -> Result<ProjectExecutionBaselineApprovalRecord> {
-    Ok(ProjectExecutionBaselineApprovalRecord {
-        id: required_string(&row, "id")?,
-        baseline_id: required_string(&row, "baseline_id")?,
-        revision_id: required_string(&row, "revision_id")?,
-        expected_project_version: row.try_get("expected_project_version")?,
-        principal_type: required_string(&row, "principal_type")?,
-        principal_id: required_string(&row, "principal_id")?,
-        authorization_basis: required_string(&row, "authorization_basis")?,
-        authorization_action: required_string(&row, "authorization_action")?,
-        authorization_occurred_at: required_string(&row, "authorization_occurred_at")?,
-        explicit_event: required_string(&row, "explicit_event")?,
-        content_digest: required_string(&row, "content_digest")?,
-        rendered_digest: required_string(&row, "rendered_digest")?,
-        lifecycle: required_string(&row, "lifecycle")?,
-        idempotency_key: required_string(&row, "idempotency_key")?,
-        created_at: required_string(&row, "created_at")?,
-        updated_at: required_string(&row, "updated_at")?,
     })
 }
 
@@ -1093,7 +1021,6 @@ fn map_milestone_result(row: SqliteRow) -> Result<ProjectMilestoneCheckResultRec
         source_manifest_json: required_string(&row, "source_manifest_json")?,
         input_digest: required_string(&row, "input_digest")?,
         governing_charter_revision_id: optional_string(&row, "governing_charter_revision_id")?,
-        governing_baseline_revision_id: optional_string(&row, "governing_baseline_revision_id")?,
         principal_type: required_string(&row, "principal_type")?,
         principal_id: required_string(&row, "principal_id")?,
         authorization_basis: required_string(&row, "authorization_basis")?,
@@ -1112,11 +1039,6 @@ fn map_readiness(row: SqliteRow) -> Result<ProjectReadinessSnapshotRecord> {
         project_id: required_string(&row, "project_id")?,
         milestone_id: required_string(&row, "milestone_id")?,
         definition_revision_id: required_string(&row, "definition_revision_id")?,
-        baseline_id: required_string(&row, "baseline_id")?,
-        baseline_revision_id: required_string(&row, "baseline_revision_id")?,
-        baseline_digest: required_string(&row, "baseline_digest")?,
-        release_policy_revision: required_string(&row, "release_policy_revision")?,
-        release_policy_digest: required_string(&row, "release_policy_digest")?,
         input_manifest_json: required_string(&row, "input_manifest_json")?,
         event_watermark: required_string(&row, "event_watermark")?,
         outcome: required_string(&row, "outcome")?,
@@ -1150,11 +1072,6 @@ fn map_release(row: SqliteRow) -> Result<ProjectReleaseRecord> {
         milestone_revision_id: required_string(&row, "milestone_revision_id")?,
         readiness_snapshot_id: required_string(&row, "readiness_snapshot_id")?,
         readiness_digest: required_string(&row, "readiness_digest")?,
-        baseline_id: required_string(&row, "baseline_id")?,
-        baseline_revision_id: required_string(&row, "baseline_revision_id")?,
-        baseline_digest: required_string(&row, "baseline_digest")?,
-        release_policy_revision: required_string(&row, "release_policy_revision")?,
-        release_policy_digest: required_string(&row, "release_policy_digest")?,
         summary: required_string(&row, "summary")?,
         changelog: required_string(&row, "changelog")?,
         known_issues_json: required_string(&row, "known_issues_json")?,
@@ -3954,38 +3871,18 @@ impl ProjectOrchestrationRepo for SqliteDb {
         };
 
         if expected_approval_type == "charter_amendment" {
-            // A Charter amendment invalidates active execution derived from
-            // the old Charter.  Governance rows are immutable except for the
-            // runnable projection, which is explicitly CAS-versioned here.
-            sqlx::query(
-                "UPDATE project_execution_baseline
-                 SET lifecycle = 'superseded', version = version + 1, updated_at = ?
-                 WHERE project_id = ? AND lifecycle = 'active'
-                   AND EXISTS (
-                       SELECT 1 FROM project_execution_baseline_revision r
-                       WHERE r.id = project_execution_baseline.current_revision_id
-                         AND r.baseline_id = project_execution_baseline.id
-                         AND r.charter_revision_id != ?
-                   )",
-            )
-            .bind(&approval.updated_at)
-            .bind(&input.project_id)
-            .bind(&approval.revision_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(orchestration_write_error)?;
+            // A Charter amendment invalidates execution authorized by the
+            // superseded Charter revision. The governance row's runnable
+            // projection is the CAS-versioned exception to its immutability.
             sqlx::query(
                 "UPDATE project_task_governance
                  SET runnable = 0, version = version + 1, updated_at = ?
                  WHERE project_id = ? AND runnable = 1
-                   AND baseline_id IN (
-                       SELECT id FROM project_execution_baseline
-                       WHERE project_id = ? AND lifecycle = 'superseded'
-                   )",
+                   AND (charter_revision_id IS NULL OR charter_revision_id != ?)",
             )
             .bind(&approval.updated_at)
             .bind(&input.project_id)
-            .bind(&input.project_id)
+            .bind(&approval.revision_id)
             .execute(&mut *tx)
             .await
             .map_err(orchestration_write_error)?;
@@ -5544,12 +5441,12 @@ impl ProjectOrchestrationRepo for SqliteDb {
                 id, project_id, state, decision_class, question, context_json,
                 options_json, selected_outcome, rationale, principal_type,
                 principal_id, authority_basis, authorization_action, explicit_event,
-                authorization_occurred_at, charter_revision_id, baseline_revision_id,
+                authorization_occurred_at, charter_revision_id,
                 source_refs_json, affected_records_json, supersedes_decision_id,
                 created_at
              ) VALUES (
                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
              )",
         )
         .bind(&input.id)
@@ -5568,7 +5465,6 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .bind(&input.explicit_event)
         .bind(&input.authorization_occurred_at)
         .bind(input.charter_revision_id.as_deref())
-        .bind(input.baseline_revision_id.as_deref())
         .bind(&input.source_refs_json)
         .bind(&input.affected_records_json)
         .bind(input.supersedes_decision_id.as_deref())
@@ -5612,7 +5508,6 @@ impl ProjectOrchestrationRepo for SqliteDb {
                     "decision_class": input.decision_class.clone(),
                     "supersedes_decision_id": input.supersedes_decision_id.clone(),
                     "charter_revision_id": input.charter_revision_id.clone(),
-                    "baseline_revision_id": input.baseline_revision_id.clone(),
                 })
                 .to_string(),
                 created_at: input.created_at.clone(),
@@ -5702,12 +5597,12 @@ impl ProjectOrchestrationRepo for SqliteDb {
                 id, project_id, state, decision_class, question, context_json,
                 options_json, selected_outcome, rationale, principal_type,
                 principal_id, authority_basis, authorization_action, explicit_event,
-                authorization_occurred_at, charter_revision_id, baseline_revision_id,
+                authorization_occurred_at, charter_revision_id,
                 source_refs_json, affected_records_json, supersedes_decision_id,
                 created_at
              ) VALUES (
                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
              )",
         )
         .bind(&decision.id)
@@ -5726,7 +5621,6 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .bind(&decision.explicit_event)
         .bind(&decision.authorization_occurred_at)
         .bind(decision.charter_revision_id.as_deref())
-        .bind(decision.baseline_revision_id.as_deref())
         .bind(&decision.source_refs_json)
         .bind(&decision.affected_records_json)
         .bind(decision.supersedes_decision_id.as_deref())
@@ -5776,7 +5670,6 @@ impl ProjectOrchestrationRepo for SqliteDb {
                 "decision_class": decision.decision_class.clone(),
                 "supersedes_decision_id": decision.supersedes_decision_id.clone(),
                 "charter_revision_id": decision.charter_revision_id.clone(),
-                "baseline_revision_id": decision.baseline_revision_id.clone(),
             })
             .to_string(),
             created_at: decision.created_at.clone(),
@@ -5945,12 +5838,12 @@ impl ProjectOrchestrationRepo for SqliteDb {
                 id, project_id, state, decision_class, question, context_json,
                 options_json, selected_outcome, rationale, principal_type,
                 principal_id, authority_basis, authorization_action, explicit_event,
-                authorization_occurred_at, charter_revision_id, baseline_revision_id,
+                authorization_occurred_at, charter_revision_id,
                 source_refs_json, affected_records_json, supersedes_decision_id,
                 created_at
              ) VALUES (
                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
              )",
         )
         .bind(&decision.id)
@@ -5969,7 +5862,6 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .bind(&decision.explicit_event)
         .bind(&decision.authorization_occurred_at)
         .bind(decision.charter_revision_id.as_deref())
-        .bind(decision.baseline_revision_id.as_deref())
         .bind(&decision.source_refs_json)
         .bind(&decision.affected_records_json)
         .bind(decision.supersedes_decision_id.as_deref())
@@ -6242,637 +6134,6 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .collect()
     }
 
-    async fn create_project_execution_baseline(
-        &self,
-        input: CreateProjectExecutionBaseline,
-    ) -> Result<ProjectExecutionBaselineRecord> {
-        // The shell primary key is server-minted (matching the Charter
-        // precedent): agent payloads routinely fabricate identifiers, so a
-        // caller-supplied id is never trusted as a primary key.
-        let id = new_uuid_v4();
-        sqlx::query(
-            "INSERT INTO project_execution_baseline (
-                id, project_id, current_revision_id, lifecycle, version,
-                created_at, updated_at
-             ) VALUES (?, ?, NULL, 'draft', 1, ?, ?)",
-        )
-        .bind(&id)
-        .bind(&input.project_id)
-        .bind(&input.created_at)
-        .bind(&input.updated_at)
-        .execute(self.pool())
-        .await
-        .map_err(check_error)?;
-        self.get_project_execution_baseline(&id)
-            .await?
-            .ok_or(DbError::NotFound)
-    }
-
-    async fn get_project_execution_baseline(
-        &self,
-        id: &str,
-    ) -> Result<Option<ProjectExecutionBaselineRecord>> {
-        select_one(
-            "SELECT * FROM project_execution_baseline WHERE id = ?",
-            self.pool(),
-            id,
-            map_baseline,
-        )
-        .await
-    }
-
-    async fn get_project_execution_baseline_for_project(
-        &self,
-        project_id: &str,
-    ) -> Result<Option<ProjectExecutionBaselineRecord>> {
-        sqlx::query(
-            "SELECT * FROM project_execution_baseline
-             WHERE project_id = ?
-             ORDER BY CASE lifecycle
-                        WHEN 'active' THEN 0
-                        WHEN 'approved' THEN 1
-                        WHEN 'proposed' THEN 2
-                        WHEN 'draft' THEN 3
-                        ELSE 4
-                      END,
-                      updated_at DESC, id DESC
-             LIMIT 1",
-        )
-        .bind(project_id)
-        .fetch_optional(self.pool())
-        .await?
-        .map(map_baseline)
-        .transpose()
-    }
-
-    async fn create_project_execution_baseline_revision(
-        &self,
-        input: CreateProjectExecutionBaselineRevision,
-    ) -> Result<ProjectExecutionBaselineRevisionRecord> {
-        let mut tx = crate::begin_immediate(self.pool()).await?;
-        let baseline = sqlx::query(
-            "SELECT version, current_revision_id
-             FROM project_execution_baseline WHERE id = ?",
-        )
-        .bind(&input.baseline_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(DbError::NotFound)?;
-        let baseline_version: i64 = baseline.try_get("version")?;
-        if baseline_version != input.expected_baseline_version {
-            return Err(DbError::VersionConflict);
-        }
-        let current_revision_id: Option<String> = baseline.try_get("current_revision_id")?;
-        if input.base_revision > 0 {
-            let Some(current_revision_id) = current_revision_id else {
-                return Err(DbError::VersionConflict);
-            };
-            let Some(base_revision_id) = input.base_revision_id.as_deref() else {
-                return Err(DbError::VersionConflict);
-            };
-            if current_revision_id != base_revision_id {
-                return Err(DbError::VersionConflict);
-            }
-            let base_matches: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM project_execution_baseline_revision
-                 WHERE id = ? AND baseline_id = ? AND revision = ? LIMIT 1",
-            )
-            .bind(base_revision_id)
-            .bind(&input.baseline_id)
-            .bind(input.base_revision)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if base_matches.is_none() {
-                return Err(DbError::VersionConflict);
-            }
-        } else if input.base_revision_id.is_some() || current_revision_id.is_some() {
-            return Err(DbError::VersionConflict);
-        }
-        let revision: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(revision), 0) + 1
-             FROM project_execution_baseline_revision WHERE baseline_id = ?",
-        )
-        .bind(&input.baseline_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        sqlx::query(
-            "INSERT INTO project_execution_baseline_revision (
-                id, baseline_id, revision, base_revision, base_revision_id, lifecycle,
-                charter_revision_id, document_revisions_json, plan_items_json,
-                milestone_id, milestone_ids_json, milestone_definition_revision_ids_json,
-                primary_milestone_id, release_policy_json,
-                release_policy_revision, release_policy_digest,
-                acceptance_matrix_json, capability_classes_json, risk_classes_json,
-                adaptive_envelope_json, elevated_operations_json, exclusions_json,
-                rollback_recovery_json, schema_version, render_version,
-                rendered_view, content_digest, rendered_digest, source_refs_json, created_at
-             ) VALUES (
-                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-             )",
-        )
-        .bind(&input.id)
-        .bind(&input.baseline_id)
-        .bind(revision)
-        .bind(input.base_revision)
-        .bind(input.base_revision_id.as_deref())
-        .bind(&input.lifecycle)
-        .bind(&input.charter_revision_id)
-        .bind(&input.document_revisions_json)
-        .bind(&input.plan_items_json)
-        .bind(input.milestone_id.as_deref())
-        .bind(&input.milestone_ids_json)
-        .bind(&input.milestone_definition_revision_ids_json)
-        .bind(input.primary_milestone_id.as_deref())
-        .bind(&input.release_policy_json)
-        .bind(&input.release_policy_revision)
-        .bind(&input.release_policy_digest)
-        .bind(&input.acceptance_matrix_json)
-        .bind(&input.capability_classes_json)
-        .bind(&input.risk_classes_json)
-        .bind(&input.adaptive_envelope_json)
-        .bind(&input.elevated_operations_json)
-        .bind(&input.exclusions_json)
-        .bind(&input.rollback_recovery_json)
-        .bind(&input.schema_version)
-        .bind(&input.render_version)
-        .bind(&input.rendered_view)
-        .bind(&input.content_digest)
-        .bind(&input.rendered_digest)
-        .bind(&input.source_refs_json)
-        .bind(&input.created_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(check_error)?;
-        let advanced = sqlx::query(
-            "UPDATE project_execution_baseline
-             SET current_revision_id = ?, version = version + 1, updated_at = ?
-             WHERE id = ? AND version = ?",
-        )
-        .bind(&input.id)
-        .bind(&input.created_at)
-        .bind(&input.baseline_id)
-        .bind(input.expected_baseline_version)
-        .execute(&mut *tx)
-        .await
-        .map_err(check_error)?;
-        if advanced.rows_affected() != 1 {
-            return Err(DbError::VersionConflict);
-        }
-        let row = sqlx::query("SELECT * FROM project_execution_baseline_revision WHERE id = ?")
-            .bind(&input.id)
-            .fetch_one(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        map_baseline_revision(row)
-    }
-
-    async fn get_project_execution_baseline_revision(
-        &self,
-        id: &str,
-    ) -> Result<Option<ProjectExecutionBaselineRevisionRecord>> {
-        select_one(
-            "SELECT * FROM project_execution_baseline_revision WHERE id = ?",
-            self.pool(),
-            id,
-            map_baseline_revision,
-        )
-        .await
-    }
-
-    async fn list_project_execution_baseline_revisions(
-        &self,
-        baseline_id: &str,
-    ) -> Result<Vec<ProjectExecutionBaselineRevisionRecord>> {
-        sqlx::query(
-            "SELECT * FROM project_execution_baseline_revision
-             WHERE baseline_id = ?
-             ORDER BY revision DESC, id DESC",
-        )
-        .bind(baseline_id)
-        .fetch_all(self.pool())
-        .await?
-        .into_iter()
-        .map(map_baseline_revision)
-        .collect()
-    }
-
-    async fn list_project_execution_baseline_approvals(
-        &self,
-        baseline_id: &str,
-    ) -> Result<Vec<ProjectExecutionBaselineApprovalRecord>> {
-        sqlx::query(
-            "SELECT * FROM project_execution_baseline_approval
-             WHERE baseline_id = ?
-             ORDER BY created_at DESC, id DESC",
-        )
-        .bind(baseline_id)
-        .fetch_all(self.pool())
-        .await?
-        .into_iter()
-        .map(map_baseline_approval)
-        .collect()
-    }
-
-    async fn approve_project_execution_baseline(
-        &self,
-        input: ApproveProjectExecutionBaseline,
-    ) -> Result<ProjectExecutionBaselineApprovalRecord> {
-        if input.principal_type != "user"
-            || input.principal_id.trim().is_empty()
-            || input.authorization_basis.trim().is_empty()
-            || input.authorization_action.trim().is_empty()
-            || input.explicit_event.trim().is_empty()
-            || !valid_authorization_timestamp(&input.authorization_occurred_at)
-        {
-            return Err(DbError::VersionConflict);
-        }
-        let mut tx = crate::begin_immediate(self.pool()).await?;
-        if let Some(existing) = sqlx::query(
-            "SELECT * FROM project_execution_baseline_approval
-             WHERE idempotency_key = ?",
-        )
-        .bind(&input.idempotency_key)
-        .fetch_optional(&mut *tx)
-        .await?
-        .map(map_baseline_approval)
-        .transpose()?
-        {
-            if existing.id != input.id
-                || existing.baseline_id != input.baseline_id
-                || existing.revision_id != input.revision_id
-                || existing.expected_project_version != input.expected_project_version
-                || existing.content_digest != input.content_digest
-                || existing.rendered_digest != input.rendered_digest
-                || existing.principal_type != input.principal_type
-                || existing.principal_id != input.principal_id
-                || existing.authorization_basis != input.authorization_basis
-                || existing.authorization_action != input.authorization_action
-                || existing.authorization_occurred_at != input.authorization_occurred_at
-                || existing.explicit_event != input.explicit_event
-            {
-                return Err(DbError::VersionConflict);
-            }
-            tx.commit().await?;
-            return Ok(existing);
-        }
-        let target = sqlx::query(
-            "SELECT lifecycle FROM project_execution_baseline_revision
-             WHERE id = ? AND baseline_id = ? AND content_digest = ?
-               AND rendered_digest = ?",
-        )
-        .bind(&input.revision_id)
-        .bind(&input.baseline_id)
-        .bind(&input.content_digest)
-        .bind(&input.rendered_digest)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(DbError::VersionConflict)?;
-        let target_lifecycle: String = target.try_get("lifecycle")?;
-        if matches!(target_lifecycle.as_str(), "revoked" | "superseded") {
-            return Err(DbError::VersionConflict);
-        }
-        let baseline = sqlx::query(
-            "SELECT version, lifecycle, project_id FROM project_execution_baseline
-             WHERE id = ?",
-        )
-        .bind(&input.baseline_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        let baseline_version: i64 = baseline.try_get("version")?;
-        if baseline_version != input.expected_baseline_version {
-            return Err(DbError::VersionConflict);
-        }
-        let baseline_project_id: String = baseline.try_get("project_id")?;
-        let project_version: i64 = sqlx::query_scalar("SELECT version FROM project WHERE id = ?")
-            .bind(&baseline_project_id)
-            .fetch_one(&mut *tx)
-            .await?;
-        if project_version != input.expected_project_version {
-            return Err(DbError::VersionConflict);
-        }
-        sqlx::query(
-            "UPDATE project_execution_baseline_revision SET lifecycle = 'superseded'
-             WHERE baseline_id = ? AND lifecycle = 'approved' AND id != ?",
-        )
-        .bind(&input.baseline_id)
-        .bind(&input.revision_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(check_error)?;
-        let approved = sqlx::query(
-            "UPDATE project_execution_baseline_revision SET lifecycle = 'approved'
-             WHERE id = ? AND baseline_id = ? AND lifecycle != 'approved'",
-        )
-        .bind(&input.revision_id)
-        .bind(&input.baseline_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(check_error)?;
-        if approved.rows_affected() != 1 {
-            return Err(DbError::VersionConflict);
-        }
-        let baseline_approved = sqlx::query(
-            "UPDATE project_execution_baseline
-             SET lifecycle = 'approved', current_revision_id = ?,
-                 version = version + 1, updated_at = ?
-             WHERE id = ? AND version = ? AND lifecycle IN ('draft', 'proposed', 'approved')",
-        )
-        .bind(&input.revision_id)
-        .bind(&input.updated_at)
-        .bind(&input.baseline_id)
-        .bind(input.expected_baseline_version)
-        .execute(&mut *tx)
-        .await
-        .map_err(check_error)?;
-        if baseline_approved.rows_affected() != 1 {
-            return Err(DbError::VersionConflict);
-        }
-        sqlx::query(
-            "INSERT INTO project_execution_baseline_approval (
-                id, baseline_id, revision_id, expected_project_version,
-                principal_type, principal_id,
-                authorization_basis, authorization_action, explicit_event,
-                authorization_occurred_at, content_digest, rendered_digest,
-                lifecycle, idempotency_key, created_at,
-                updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)",
-        )
-        .bind(&input.id)
-        .bind(&input.baseline_id)
-        .bind(&input.revision_id)
-        .bind(input.expected_project_version)
-        .bind(&input.principal_type)
-        .bind(&input.principal_id)
-        .bind(&input.authorization_basis)
-        .bind(&input.authorization_action)
-        .bind(&input.explicit_event)
-        .bind(&input.authorization_occurred_at)
-        .bind(&input.content_digest)
-        .bind(&input.rendered_digest)
-        .bind(&input.idempotency_key)
-        .bind(&input.created_at)
-        .bind(&input.updated_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(check_error)?;
-        let row = sqlx::query("SELECT * FROM project_execution_baseline_approval WHERE id = ?")
-            .bind(&input.id)
-            .fetch_one(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        map_baseline_approval(row)
-    }
-
-    async fn activate_project_execution_baseline(
-        &self,
-        input: ActivateProjectExecutionBaseline,
-    ) -> Result<ProjectExecutionBaselineRecord> {
-        let mut tx = crate::begin_immediate(self.pool()).await?;
-        let approval = sqlx::query(
-            "SELECT a.baseline_id, a.revision_id, a.content_digest,
-                    a.rendered_digest, a.lifecycle, b.version, b.project_id
-             FROM project_execution_baseline_approval a
-             JOIN project_execution_baseline b ON b.id = a.baseline_id
-             WHERE a.id = ?",
-        )
-        .bind(&input.approval_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(DbError::NotFound)?;
-        let lifecycle: String = approval.try_get("lifecycle")?;
-        if lifecycle != "active" {
-            if lifecycle == "consumed" {
-                let baseline_id: String = approval.try_get("baseline_id")?;
-                tx.commit().await?;
-                return self
-                    .get_project_execution_baseline(&baseline_id)
-                    .await?
-                    .ok_or(DbError::NotFound);
-            }
-            return Err(DbError::VersionConflict);
-        }
-        let baseline_id: String = approval.try_get("baseline_id")?;
-        let revision_id: String = approval.try_get("revision_id")?;
-        let project_id: String = approval.try_get("project_id")?;
-        let baseline_version: i64 = approval.try_get("version")?;
-        if baseline_version != input.expected_baseline_version {
-            return Err(DbError::VersionConflict);
-        }
-        let project_version: i64 = sqlx::query_scalar("SELECT version FROM project WHERE id = ?")
-            .bind(&project_id)
-            .fetch_one(&mut *tx)
-            .await?;
-        if project_version != input.expected_project_version {
-            return Err(DbError::VersionConflict);
-        }
-        let exact: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM project_execution_baseline_revision
-             WHERE id = ? AND baseline_id = ?
-               AND content_digest = (SELECT content_digest FROM project_execution_baseline_approval WHERE id = ?)
-               AND rendered_digest = (SELECT rendered_digest FROM project_execution_baseline_approval WHERE id = ?)",
-        )
-        .bind(&revision_id)
-        .bind(&baseline_id)
-        .bind(&input.approval_id)
-        .bind(&input.approval_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if exact.is_none() {
-            return Err(DbError::VersionConflict);
-        }
-        let baseline_revision = sqlx::query(
-            "SELECT milestone_id, milestone_ids_json, primary_milestone_id
-             FROM project_execution_baseline_revision
-             WHERE id = ? AND baseline_id = ?",
-        )
-        .bind(&revision_id)
-        .bind(&baseline_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        let mut included_milestone_ids: Vec<String> =
-            serde_json::from_str(&baseline_revision.try_get::<String, _>("milestone_ids_json")?)
-                .map_err(|error| {
-                    DbError::Check(format!("invalid baseline milestone ids: {error}"))
-                })?;
-        if let Some(milestone_id) =
-            baseline_revision.try_get::<Option<String>, _>("milestone_id")?
-        {
-            if !included_milestone_ids.iter().any(|id| id == &milestone_id) {
-                included_milestone_ids.push(milestone_id);
-            }
-        }
-        let primary_milestone_id =
-            baseline_revision.try_get::<Option<String>, _>("primary_milestone_id")?;
-        if let Some(primary_milestone_id) = primary_milestone_id.as_deref() {
-            if !included_milestone_ids
-                .iter()
-                .any(|id| id == primary_milestone_id)
-            {
-                return Err(DbError::VersionConflict);
-            }
-        }
-        // A baseline activation is the lifecycle gate for its included
-        // milestones. Validate every reference before changing any row so a
-        // cross-Project, cancelled, or otherwise invalid milestone cannot
-        // leave a partially activated baseline.
-        for milestone_id in &included_milestone_ids {
-            let milestone =
-                sqlx::query("SELECT project_id, lifecycle FROM project_milestone WHERE id = ?")
-                    .bind(milestone_id)
-                    .fetch_optional(&mut *tx)
-                    .await?
-                    .ok_or(DbError::VersionConflict)?;
-            let milestone_project_id: String = milestone.try_get("project_id")?;
-            let milestone_lifecycle: String = milestone.try_get("lifecycle")?;
-            if milestone_project_id != project_id
-                || !matches!(
-                    milestone_lifecycle.as_str(),
-                    "planned" | "active" | "ready_for_release" | "released"
-                )
-            {
-                return Err(DbError::VersionConflict);
-            }
-        }
-        let prior_active: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM project_execution_baseline
-             WHERE project_id = ? AND lifecycle = 'active' AND id != ? LIMIT 1",
-        )
-        .bind(&project_id)
-        .bind(&baseline_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if let Some(prior_active) = prior_active {
-            let superseded = sqlx::query(
-                "UPDATE project_execution_baseline SET lifecycle = 'superseded',
-                     version = version + 1, updated_at = ?
-                 WHERE id = ? AND lifecycle = 'active'",
-            )
-            .bind(&input.updated_at)
-            .bind(prior_active)
-            .execute(&mut *tx)
-            .await
-            .map_err(check_error)?;
-            if superseded.rows_affected() != 1 {
-                return Err(DbError::VersionConflict);
-            }
-        }
-        let active = sqlx::query(
-            "UPDATE project_execution_baseline SET lifecycle = 'active',
-                 current_revision_id = ?, version = version + 1, updated_at = ?
-             WHERE id = ? AND version = ? AND lifecycle IN ('draft', 'proposed', 'approved')",
-        )
-        .bind(&revision_id)
-        .bind(&input.updated_at)
-        .bind(&baseline_id)
-        .bind(input.expected_baseline_version)
-        .execute(&mut *tx)
-        .await
-        .map_err(check_error)?;
-        if active.rows_affected() != 1 {
-            return Err(DbError::VersionConflict);
-        }
-        for milestone_id in &included_milestone_ids {
-            let activated = sqlx::query(
-                "UPDATE project_milestone
-                 SET lifecycle = 'active', version = version + 1, updated_at = ?
-                 WHERE id = ? AND project_id = ? AND lifecycle = 'planned'",
-            )
-            .bind(&input.updated_at)
-            .bind(milestone_id)
-            .bind(&project_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(check_error)?;
-            if activated.rows_affected() == 0 {
-                let lifecycle: String = sqlx::query_scalar(
-                    "SELECT lifecycle FROM project_milestone
-                     WHERE id = ? AND project_id = ?",
-                )
-                .bind(milestone_id)
-                .bind(&project_id)
-                .fetch_one(&mut *tx)
-                .await?;
-                if !matches!(
-                    lifecycle.as_str(),
-                    "active" | "ready_for_release" | "released"
-                ) {
-                    return Err(DbError::VersionConflict);
-                }
-            }
-        }
-        let project_update = sqlx::query(
-            "UPDATE project SET primary_milestone_id = COALESCE(?, primary_milestone_id),
-                 version = version + 1, updated_at = ?
-             WHERE id = ? AND version = ?",
-        )
-        .bind(primary_milestone_id.as_deref())
-        .bind(&input.updated_at)
-        .bind(&project_id)
-        .bind(input.expected_project_version)
-        .execute(&mut *tx)
-        .await
-        .map_err(check_error)?;
-        if project_update.rows_affected() != 1 {
-            return Err(DbError::VersionConflict);
-        }
-        let consumed = sqlx::query(
-            "UPDATE project_execution_baseline_approval
-             SET lifecycle = 'consumed', updated_at = ?
-             WHERE id = ? AND lifecycle = 'active'",
-        )
-        .bind(&input.updated_at)
-        .bind(&input.approval_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(check_error)?;
-        if consumed.rows_affected() != 1 {
-            return Err(DbError::VersionConflict);
-        }
-        let row = sqlx::query("SELECT * FROM project_execution_baseline WHERE id = ?")
-            .bind(&baseline_id)
-            .fetch_one(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        map_baseline(row)
-    }
-
-    async fn save_project_execution_baseline_draft_command(
-        &self,
-        input: SaveProjectExecutionBaselineRevisionCommand,
-    ) -> Result<ProjectExecutionBaselineRevisionRecord> {
-        save_project_execution_baseline_revision_command(self, input, false).await
-    }
-
-    async fn propose_project_execution_baseline_command(
-        &self,
-        input: SaveProjectExecutionBaselineRevisionCommand,
-    ) -> Result<ProjectExecutionBaselineRevisionRecord> {
-        save_project_execution_baseline_revision_command(self, input, true).await
-    }
-
-    async fn approve_project_execution_baseline_command(
-        &self,
-        input: ApproveProjectExecutionBaselineCommand,
-    ) -> Result<ProjectExecutionBaselineApprovalRecord> {
-        approve_project_execution_baseline_command(self, input).await
-    }
-
-    async fn activate_project_execution_baseline_command(
-        &self,
-        input: ActivateProjectExecutionBaselineCommand,
-    ) -> Result<ProjectExecutionBaselineRecord> {
-        activate_project_execution_baseline_command(self, input).await
-    }
-
-    async fn approve_and_activate_project_execution_baseline_command(
-        &self,
-        input: ApproveAndActivateProjectExecutionBaselineCommand,
-    ) -> Result<ProjectExecutionBaselineRecord> {
-        approve_and_activate_project_execution_baseline_command(self, input).await
-    }
-
     async fn create_project_milestone(
         &self,
         input: CreateProjectMilestone,
@@ -7059,8 +6320,15 @@ impl ProjectOrchestrationRepo for SqliteDb {
             .map_err(check_error)?
         } else {
             sqlx::query(
+                // An approved definition is what makes a milestone active
+                // work. Baseline activation used to perform this transition;
+                // the approved Charter and its milestone definition are the
+                // authority now, so the pointer advance carries it.
                 "UPDATE project_milestone
-                 SET current_definition_revision_id = ?, version = version + 1,
+                 SET current_definition_revision_id = ?,
+                     lifecycle = CASE WHEN lifecycle = 'planned'
+                                      THEN 'active' ELSE lifecycle END,
+                     version = version + 1,
                      updated_at = ?
                  WHERE id = ? AND version = ?",
             )
@@ -7192,8 +6460,15 @@ impl ProjectOrchestrationRepo for SqliteDb {
             .map_err(check_error)?
         } else {
             sqlx::query(
+                // An approved definition is what makes a milestone active
+                // work. Baseline activation used to perform this transition;
+                // the approved Charter and its milestone definition are the
+                // authority now, so the pointer advance carries it.
                 "UPDATE project_milestone
-                 SET current_definition_revision_id = ?, version = version + 1,
+                 SET current_definition_revision_id = ?,
+                     lifecycle = CASE WHEN lifecycle = 'planned'
+                                      THEN 'active' ELSE lifecycle END,
+                     version = version + 1,
                      updated_at = ?
                  WHERE id = ? AND version = 1",
             )
@@ -7374,8 +6649,15 @@ impl ProjectOrchestrationRepo for SqliteDb {
             .map_err(orchestration_write_error)?
         } else {
             sqlx::query(
+                // An approved definition is what makes a milestone active
+                // work. Baseline activation used to perform this transition;
+                // the approved Charter and its milestone definition are the
+                // authority now, so the pointer advance carries it.
                 "UPDATE project_milestone
-                 SET current_definition_revision_id = ?, version = version + 1,
+                 SET current_definition_revision_id = ?,
+                     lifecycle = CASE WHEN lifecycle = 'planned'
+                                      THEN 'active' ELSE lifecycle END,
+                     version = version + 1,
                      updated_at = ?
                  WHERE id = ? AND version = 1",
             )
@@ -7602,8 +6884,15 @@ impl ProjectOrchestrationRepo for SqliteDb {
             .map_err(orchestration_write_error)?
         } else {
             sqlx::query(
+                // An approved definition is what makes a milestone active
+                // work. Baseline activation used to perform this transition;
+                // the approved Charter and its milestone definition are the
+                // authority now, so the pointer advance carries it.
                 "UPDATE project_milestone
-                 SET current_definition_revision_id = ?, version = version + 1,
+                 SET current_definition_revision_id = ?,
+                     lifecycle = CASE WHEN lifecycle = 'planned'
+                                      THEN 'active' ELSE lifecycle END,
+                     version = version + 1,
                      updated_at = ?
                  WHERE id = ? AND project_id = ? AND version = ?",
             )
@@ -7962,7 +7251,6 @@ impl ProjectOrchestrationRepo for SqliteDb {
                 || existing.input_digest != input.input_digest
                 || existing.outcome != input.outcome
                 || existing.governing_charter_revision_id != input.governing_charter_revision_id
-                || existing.governing_baseline_revision_id != input.governing_baseline_revision_id
                 || existing.principal_type != input.principal_type
                 || existing.principal_id != input.principal_id
                 || existing.authorization_basis != input.authorization_basis
@@ -7997,11 +7285,11 @@ impl ProjectOrchestrationRepo for SqliteDb {
             "INSERT INTO project_milestone_check_result (
                 id, project_id, milestone_id, check_id, definition_revision_id,
                 outcome, source_kind, source_manifest_json, input_digest,
-                governing_charter_revision_id, governing_baseline_revision_id,
+                governing_charter_revision_id,
                 principal_type, principal_id, authorization_basis,
                 authorization_action, authorization_occurred_at, expected_version,
                 explicit_event, idempotency_key, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&input.id)
         .bind(&input.project_id)
@@ -8013,7 +7301,6 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .bind(&input.source_manifest_json)
         .bind(&input.input_digest)
         .bind(input.governing_charter_revision_id.as_deref())
-        .bind(input.governing_baseline_revision_id.as_deref())
         .bind(&input.principal_type)
         .bind(&input.principal_id)
         .bind(&input.authorization_basis)
@@ -8110,11 +7397,6 @@ impl ProjectOrchestrationRepo for SqliteDb {
                 || existing.project_id != input.project_id
                 || existing.milestone_id != input.milestone_id
                 || existing.definition_revision_id != input.definition_revision_id
-                || existing.baseline_id != input.baseline_id
-                || existing.baseline_revision_id != input.baseline_revision_id
-                || existing.baseline_digest != input.baseline_digest
-                || existing.release_policy_revision != input.release_policy_revision
-                || existing.release_policy_digest != input.release_policy_digest
                 || existing.input_manifest_json != input.input_manifest_json
                 || existing.event_watermark != input.event_watermark
                 || existing.outcome != input.outcome
@@ -8163,56 +7445,22 @@ impl ProjectOrchestrationRepo for SqliteDb {
         if definition_matches.is_none() {
             return Err(DbError::VersionConflict);
         }
-        let baseline_matches: Option<i64> = sqlx::query_scalar(
-            "SELECT 1
-             FROM project_execution_baseline b
-             JOIN project_execution_baseline_revision r
-               ON r.id = ? AND r.baseline_id = b.id
-             WHERE b.id = ? AND b.project_id = ?
-               AND b.lifecycle = 'active'
-               AND b.current_revision_id = r.id
-               AND r.lifecycle = 'approved'
-               AND r.content_digest = ?
-               AND r.release_policy_revision = ?
-               AND r.release_policy_digest = ?
-             LIMIT 1",
-        )
-        .bind(&input.baseline_revision_id)
-        .bind(&input.baseline_id)
-        .bind(&input.project_id)
-        .bind(&input.baseline_digest)
-        .bind(&input.release_policy_revision)
-        .bind(&input.release_policy_digest)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if baseline_matches.is_none()
-            || input.release_policy_revision.trim().is_empty()
-            || input.release_policy_digest.trim().is_empty()
-        {
-            return Err(DbError::VersionConflict);
-        }
         sqlx::query(
             "INSERT INTO project_readiness_snapshot (
-                id, project_id, milestone_id, definition_revision_id, baseline_id,
-                baseline_revision_id, baseline_digest, release_policy_revision,
-                release_policy_digest, input_manifest_json, event_watermark, outcome,
+                id, project_id, milestone_id, definition_revision_id,
+                input_manifest_json, event_watermark, outcome,
                 blocking_reasons_json, check_results_json,
                 waiver_manifest_json, evidence_manifest_json, commit_context_json,
                 computing_policy_revision, readiness_digest, principal_type,
                 principal_id, authorization_basis, authorization_action,
                 authorization_occurred_at, expected_milestone_version,
                 explicit_event, idempotency_key, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&input.id)
         .bind(&input.project_id)
         .bind(&input.milestone_id)
         .bind(&input.definition_revision_id)
-        .bind(&input.baseline_id)
-        .bind(&input.baseline_revision_id)
-        .bind(&input.baseline_digest)
-        .bind(&input.release_policy_revision)
-        .bind(&input.release_policy_digest)
         .bind(&input.input_manifest_json)
         .bind(&input.event_watermark)
         .bind(&input.outcome)
@@ -8366,55 +7614,21 @@ impl ProjectOrchestrationRepo for SqliteDb {
         if definition_matches.is_none() {
             return Err(DbError::VersionConflict);
         }
-        let baseline_matches: Option<i64> = sqlx::query_scalar(
-            "SELECT 1
-             FROM project_execution_baseline b
-             JOIN project_execution_baseline_revision r
-               ON r.id = ? AND r.baseline_id = b.id
-             WHERE b.id = ? AND b.project_id = ?
-               AND b.lifecycle = 'active'
-               AND b.current_revision_id = r.id
-               AND r.lifecycle = 'approved'
-               AND r.content_digest = ?
-               AND r.release_policy_revision = ?
-               AND r.release_policy_digest = ?
-             LIMIT 1",
-        )
-        .bind(&input.baseline_revision_id)
-        .bind(&input.baseline_id)
-        .bind(&input.project_id)
-        .bind(&input.baseline_digest)
-        .bind(&input.release_policy_revision)
-        .bind(&input.release_policy_digest)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if baseline_matches.is_none()
-            || input.release_policy_revision.trim().is_empty()
-            || input.release_policy_digest.trim().is_empty()
-        {
-            return Err(DbError::VersionConflict);
-        }
         sqlx::query(
             "INSERT INTO project_readiness_snapshot (
-                id, project_id, milestone_id, definition_revision_id, baseline_id,
-                baseline_revision_id, baseline_digest, release_policy_revision,
-                release_policy_digest, input_manifest_json, event_watermark, outcome,
+                id, project_id, milestone_id, definition_revision_id,
+                input_manifest_json, event_watermark, outcome,
                 blocking_reasons_json, check_results_json, waiver_manifest_json,
                 evidence_manifest_json, commit_context_json, computing_policy_revision,
                 readiness_digest, principal_type, principal_id, authorization_basis,
                 authorization_action, authorization_occurred_at,
                 expected_milestone_version, explicit_event, idempotency_key, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&input.id)
         .bind(&input.project_id)
         .bind(&input.milestone_id)
         .bind(&input.definition_revision_id)
-        .bind(&input.baseline_id)
-        .bind(&input.baseline_revision_id)
-        .bind(&input.baseline_digest)
-        .bind(&input.release_policy_revision)
-        .bind(&input.release_policy_digest)
         .bind(&input.input_manifest_json)
         .bind(&input.event_watermark)
         .bind(&input.outcome)
@@ -8539,11 +7753,6 @@ impl ProjectOrchestrationRepo for SqliteDb {
                 || existing.milestone_revision_id != input.milestone_revision_id
                 || existing.readiness_snapshot_id != input.readiness_snapshot_id
                 || existing.readiness_digest != input.readiness_digest
-                || existing.baseline_id != input.baseline_id
-                || existing.baseline_revision_id != input.baseline_revision_id
-                || existing.baseline_digest != input.baseline_digest
-                || existing.release_policy_revision != input.release_policy_revision
-                || existing.release_policy_digest != input.release_policy_digest
                 || existing.summary != input.summary
                 || existing.changelog != input.changelog
                 || existing.known_issues_json != input.known_issues_json
@@ -8614,8 +7823,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
         let readiness = sqlx::query(
-            "SELECT definition_revision_id, baseline_id, baseline_revision_id,
-                    baseline_digest, release_policy_revision, release_policy_digest
+            "SELECT definition_revision_id
              FROM project_readiness_snapshot
              WHERE id = ? AND project_id = ? AND milestone_id = ?
                AND readiness_digest = ? AND outcome = 'ready'",
@@ -8628,43 +7836,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .await?
         .ok_or(DbError::VersionConflict)?;
         let definition_revision_id: String = readiness.try_get("definition_revision_id")?;
-        let readiness_baseline_id: String = readiness.try_get("baseline_id")?;
-        let readiness_baseline_revision_id: String = readiness.try_get("baseline_revision_id")?;
-        let readiness_baseline_digest: String = readiness.try_get("baseline_digest")?;
-        let readiness_policy_revision: String = readiness.try_get("release_policy_revision")?;
-        let readiness_policy_digest: String = readiness.try_get("release_policy_digest")?;
-        if definition_revision_id != input.milestone_revision_id
-            || readiness_baseline_id != input.baseline_id
-            || readiness_baseline_revision_id != input.baseline_revision_id
-            || readiness_baseline_digest != input.baseline_digest
-            || readiness_policy_revision != input.release_policy_revision
-            || readiness_policy_digest != input.release_policy_digest
-        {
-            return Err(DbError::VersionConflict);
-        }
-        let baseline_matches: Option<i64> = sqlx::query_scalar(
-            "SELECT 1
-             FROM project_execution_baseline b
-             JOIN project_execution_baseline_revision r
-               ON r.id = ? AND r.baseline_id = b.id
-             WHERE b.id = ? AND b.project_id = ?
-               AND b.lifecycle = 'active'
-               AND b.current_revision_id = r.id
-               AND r.lifecycle = 'approved'
-               AND r.content_digest = ?
-               AND r.release_policy_revision = ?
-               AND r.release_policy_digest = ?
-             LIMIT 1",
-        )
-        .bind(&input.baseline_revision_id)
-        .bind(&input.baseline_id)
-        .bind(&input.project_id)
-        .bind(&input.baseline_digest)
-        .bind(&input.release_policy_revision)
-        .bind(&input.release_policy_digest)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if baseline_matches.is_none() {
+        if definition_revision_id != input.milestone_revision_id {
             return Err(DbError::VersionConflict);
         }
         if let Some(charter_revision_id) = input.charter_revision_id.as_deref() {
@@ -8689,8 +7861,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
             "INSERT INTO project_release (
                 id, project_id, milestone_id, release_sequence, release_revision,
                 release_identifier, milestone_revision_id, readiness_snapshot_id,
-                readiness_digest, baseline_id, baseline_revision_id, baseline_digest,
-                release_policy_revision, release_policy_digest, summary, changelog,
+                readiness_digest, summary, changelog,
                 known_issues_json,
                 charter_revision_id, document_revisions_json, decision_ids_json,
                 task_references_json, validation_references_json, git_references_json,
@@ -8701,8 +7872,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
              ) VALUES (
                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                 ?, ?, ?, ?, ?
+                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
              )",
         )
         .bind(&input.id)
@@ -8714,11 +7884,6 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .bind(&input.milestone_revision_id)
         .bind(&input.readiness_snapshot_id)
         .bind(&input.readiness_digest)
-        .bind(&input.baseline_id)
-        .bind(&input.baseline_revision_id)
-        .bind(&input.baseline_digest)
-        .bind(&input.release_policy_revision)
-        .bind(&input.release_policy_digest)
         .bind(&input.summary)
         .bind(&input.changelog)
         .bind(&input.known_issues_json)
@@ -8864,8 +8029,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
         let readiness = sqlx::query(
-            "SELECT definition_revision_id, baseline_id, baseline_revision_id,
-                    baseline_digest, release_policy_revision, release_policy_digest
+            "SELECT definition_revision_id
              FROM project_readiness_snapshot
              WHERE id = ? AND project_id = ? AND milestone_id = ?
                AND readiness_digest = ? AND outcome = 'ready'",
@@ -8878,43 +8042,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .await?
         .ok_or(DbError::VersionConflict)?;
         let definition_revision_id: String = readiness.try_get("definition_revision_id")?;
-        let readiness_baseline_id: String = readiness.try_get("baseline_id")?;
-        let readiness_baseline_revision_id: String = readiness.try_get("baseline_revision_id")?;
-        let readiness_baseline_digest: String = readiness.try_get("baseline_digest")?;
-        let readiness_policy_revision: String = readiness.try_get("release_policy_revision")?;
-        let readiness_policy_digest: String = readiness.try_get("release_policy_digest")?;
-        if definition_revision_id != input.milestone_revision_id
-            || readiness_baseline_id != input.baseline_id
-            || readiness_baseline_revision_id != input.baseline_revision_id
-            || readiness_baseline_digest != input.baseline_digest
-            || readiness_policy_revision != input.release_policy_revision
-            || readiness_policy_digest != input.release_policy_digest
-        {
-            return Err(DbError::VersionConflict);
-        }
-        let baseline_matches: Option<i64> = sqlx::query_scalar(
-            "SELECT 1
-             FROM project_execution_baseline b
-             JOIN project_execution_baseline_revision r
-               ON r.id = ? AND r.baseline_id = b.id
-             WHERE b.id = ? AND b.project_id = ?
-               AND b.lifecycle = 'active'
-               AND b.current_revision_id = r.id
-               AND r.lifecycle = 'approved'
-               AND r.content_digest = ?
-               AND r.release_policy_revision = ?
-               AND r.release_policy_digest = ?
-             LIMIT 1",
-        )
-        .bind(&input.baseline_revision_id)
-        .bind(&input.baseline_id)
-        .bind(&input.project_id)
-        .bind(&input.baseline_digest)
-        .bind(&input.release_policy_revision)
-        .bind(&input.release_policy_digest)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if baseline_matches.is_none() {
+        if definition_revision_id != input.milestone_revision_id {
             return Err(DbError::VersionConflict);
         }
         if let Some(charter_revision_id) = input.charter_revision_id.as_deref() {
@@ -8939,8 +8067,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
             "INSERT INTO project_release (
                 id, project_id, milestone_id, release_sequence, release_revision,
                 release_identifier, milestone_revision_id, readiness_snapshot_id,
-                readiness_digest, baseline_id, baseline_revision_id, baseline_digest,
-                release_policy_revision, release_policy_digest, summary, changelog,
+                readiness_digest, summary, changelog,
                 known_issues_json, charter_revision_id, document_revisions_json,
                 decision_ids_json, task_references_json, validation_references_json,
                 git_references_json, evidence_references_json, waivers_json,
@@ -8949,7 +8076,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
                 schema_version, snapshot_digest, idempotency_key, created_at
              ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
              )",
         )
         .bind(&input.id)
@@ -8961,11 +8088,6 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .bind(&input.milestone_revision_id)
         .bind(&input.readiness_snapshot_id)
         .bind(&input.readiness_digest)
-        .bind(&input.baseline_id)
-        .bind(&input.baseline_revision_id)
-        .bind(&input.baseline_digest)
-        .bind(&input.release_policy_revision)
-        .bind(&input.release_policy_digest)
         .bind(&input.summary)
         .bind(&input.changelog)
         .bind(&input.known_issues_json)
@@ -10228,12 +9350,12 @@ impl ProjectOrchestrationRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
 
-        // Compact Projects start with one explicit, planned M001. Acceptance
+        // Compact Projects start with one explicit M001. Acceptance
         // statements already approved in the Charter become manual checks
         // with required, check-linked evidence; the Project Agent may refine
-        // the immutable definition later. A milestone is not runnable or
-        // release-authoritative until a user approves and activates an
-        // execution baseline containing it.
+        // the immutable definition later. Approving the Charter approves the
+        // work, so the milestone becomes active with its approved definition
+        // rather than waiting on a second artifact.
         if project_mode == "compact" {
             let milestone_id = new_uuid_v4();
             let milestone_revision_id = new_uuid_v4();
@@ -10378,8 +9500,15 @@ impl ProjectOrchestrationRepo for SqliteDb {
                 .map_err(orchestration_write_error)?;
             }
             let milestone_pointer = sqlx::query(
+                // An approved definition is what makes a milestone active
+                // work. Baseline activation used to perform this transition;
+                // the approved Charter and its milestone definition are the
+                // authority now, so the pointer advance carries it.
                 "UPDATE project_milestone
-                 SET current_definition_revision_id = ?, version = version + 1,
+                 SET current_definition_revision_id = ?,
+                     lifecycle = CASE WHEN lifecycle = 'planned'
+                                      THEN 'active' ELSE lifecycle END,
+                     version = version + 1,
                      updated_at = ? WHERE id = ? AND project_id = ?",
             )
             .bind(&milestone_revision_id)
@@ -11054,34 +10183,6 @@ impl ProjectOrchestrationRepo for SqliteDb {
         if current_version != input.expected_version {
             return Err(DbError::VersionConflict);
         }
-        let conflict_code: String = sqlx::query_scalar(
-            "SELECT conflict.conflict_code
-             FROM project_reconciliation_record reconciliation
-             JOIN project_canonical_conflict conflict
-               ON conflict.id = reconciliation.conflict_id
-             WHERE reconciliation.id = ?",
-        )
-        .bind(&input.id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if conflict_code == "invalid_active_baseline" {
-            if input.action != "revised" {
-                return Err(DbError::VersionConflict);
-            }
-            let replacement = input
-                .invalid_baseline_replacement
-                .as_ref()
-                .ok_or(DbError::VersionConflict)?;
-            activate_invalid_baseline_successor_in_tx(
-                &mut tx,
-                &input.id,
-                replacement,
-                &input.updated_at,
-            )
-            .await?;
-        } else if input.invalid_baseline_replacement.is_some() {
-            return Err(DbError::VersionConflict);
-        }
         sqlx::query(
             "INSERT INTO project_reconciliation_resolution (
                 id, reconciliation_id, action, principal_type, principal_id,
@@ -11151,2256 +10252,5 @@ impl ProjectOrchestrationRepo for SqliteDb {
             map_reconciliation_resolution,
         )
         .await
-    }
-}
-
-async fn activate_invalid_baseline_successor_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    reconciliation_id: &str,
-    input: &ResolveInvalidActiveBaseline,
-    updated_at: &str,
-) -> Result<()> {
-    if input.milestone_ids.is_empty()
-        || input.milestone_ids.len() != input.milestone_definition_revision_ids.len()
-        || input.milestone_ids.iter().any(|id| id.trim().is_empty())
-        || input
-            .milestone_definition_revision_ids
-            .iter()
-            .any(|id| id.trim().is_empty())
-        || input.milestone_ids.iter().enumerate().any(|(index, id)| {
-            input
-                .milestone_ids
-                .iter()
-                .take(index)
-                .any(|prior| prior == id)
-        })
-        || input
-            .milestone_definition_revision_ids
-            .iter()
-            .enumerate()
-            .any(|(index, id)| {
-                input
-                    .milestone_definition_revision_ids
-                    .iter()
-                    .take(index)
-                    .any(|prior| prior == id)
-            })
-        || input
-            .primary_milestone_id
-            .as_deref()
-            .is_some_and(|id| !input.milestone_ids.iter().any(|candidate| candidate == id))
-    {
-        return Err(DbError::VersionConflict);
-    }
-
-    let context = sqlx::query(
-        "SELECT reconciliation.project_id, reconciliation.record_type,
-                reconciliation.record_id, reconciliation.governing_record_type,
-                reconciliation.governing_record_id, conflict.conflict_code,
-                conflict.conflicting_record_id
-         FROM project_reconciliation_record reconciliation
-         JOIN project_canonical_conflict conflict
-           ON conflict.id = reconciliation.conflict_id
-         WHERE reconciliation.id = ? AND reconciliation.state = 'required'",
-    )
-    .bind(reconciliation_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or(DbError::VersionConflict)?;
-    if context.try_get::<String, _>("project_id")? != input.project_id
-        || context.try_get::<String, _>("record_type")? != "execution_baseline_revision"
-        || context.try_get::<String, _>("record_id")? != input.invalid_revision_id
-        || context.try_get::<String, _>("governing_record_type")? != "execution_baseline"
-        || context.try_get::<String, _>("governing_record_id")? != input.baseline_id
-        || context.try_get::<String, _>("conflict_code")? != "invalid_active_baseline"
-        || context.try_get::<String, _>("conflicting_record_id")? != input.invalid_revision_id
-    {
-        return Err(DbError::VersionConflict);
-    }
-    let invalid_marked: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM execution_baseline_revision_integrity
-         WHERE revision_id = ? AND baseline_id = ? AND project_id = ?",
-    )
-    .bind(&input.invalid_revision_id)
-    .bind(&input.baseline_id)
-    .bind(&input.project_id)
-    .fetch_one(&mut **tx)
-    .await?;
-    let successor_marked: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM execution_baseline_revision_integrity
-         WHERE revision_id = ?",
-    )
-    .bind(&input.successor_revision_id)
-    .fetch_one(&mut **tx)
-    .await?;
-    if invalid_marked != 1 || successor_marked != 0 {
-        return Err(DbError::VersionConflict);
-    }
-
-    validate_persisted_baseline_manifest_in_tx(
-        tx,
-        &input.project_id,
-        &input.baseline_id,
-        &input.successor_revision_id,
-        true,
-    )
-    .await?;
-
-    if input.create_approval {
-        if input.approval_principal_id.trim().is_empty()
-            || input.approval_authorization_basis.trim().is_empty()
-            || input.approval_authorization_action != "project.execution_baseline.approve"
-            || input.approval_explicit_event.trim().is_empty()
-            || input.approval_idempotency_key.trim().is_empty()
-            || !valid_authorization_timestamp(&input.approval_authorization_occurred_at)
-        {
-            return Err(DbError::VersionConflict);
-        }
-        let approved = sqlx::query(
-            "UPDATE project_execution_baseline_revision
-             SET lifecycle = 'approved'
-             WHERE id = ? AND baseline_id = ?
-               AND lifecycle IN ('draft', 'proposed', 'approved')",
-        )
-        .bind(&input.successor_revision_id)
-        .bind(&input.baseline_id)
-        .execute(&mut **tx)
-        .await
-        .map_err(orchestration_write_error)?;
-        if approved.rows_affected() != 1 {
-            return Err(DbError::VersionConflict);
-        }
-        sqlx::query(
-            "INSERT INTO project_execution_baseline_approval (
-                 id, baseline_id, revision_id, expected_project_version,
-                 principal_type, principal_id, authorization_basis,
-                 authorization_action, authorization_occurred_at, explicit_event,
-                 content_digest, rendered_digest, lifecycle, idempotency_key,
-                 created_at, updated_at
-             ) VALUES (?, ?, ?, ?, 'user', ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)",
-        )
-        .bind(&input.approval_id)
-        .bind(&input.baseline_id)
-        .bind(&input.successor_revision_id)
-        .bind(input.expected_project_version)
-        .bind(&input.approval_principal_id)
-        .bind(&input.approval_authorization_basis)
-        .bind(&input.approval_authorization_action)
-        .bind(&input.approval_authorization_occurred_at)
-        .bind(&input.approval_explicit_event)
-        .bind(&input.content_digest)
-        .bind(&input.rendered_digest)
-        .bind(&input.approval_idempotency_key)
-        .bind(updated_at)
-        .bind(updated_at)
-        .execute(&mut **tx)
-        .await
-        .map_err(orchestration_write_error)?;
-    }
-
-    let target = sqlx::query(
-        "SELECT baseline.version AS baseline_version,
-                baseline.lifecycle AS baseline_lifecycle,
-                baseline.current_revision_id,
-                revision.lifecycle AS revision_lifecycle,
-                revision.charter_revision_id,
-                revision.content_digest, revision.rendered_digest,
-                approval.expected_project_version,
-                approval.principal_type, approval.principal_id,
-                approval.authorization_action,
-                approval.lifecycle AS approval_lifecycle,
-                approval.content_digest AS approval_content_digest,
-                approval.rendered_digest AS approval_rendered_digest
-         FROM project_execution_baseline baseline
-         JOIN project_execution_baseline_revision revision
-           ON revision.id = ? AND revision.baseline_id = baseline.id
-         JOIN project_execution_baseline_approval approval
-           ON approval.id = ? AND approval.baseline_id = baseline.id
-          AND approval.revision_id = revision.id
-         WHERE baseline.id = ? AND baseline.project_id = ?",
-    )
-    .bind(&input.successor_revision_id)
-    .bind(&input.approval_id)
-    .bind(&input.baseline_id)
-    .bind(&input.project_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or(DbError::VersionConflict)?;
-    if target.try_get::<i64, _>("baseline_version")? != input.expected_baseline_version
-        || target.try_get::<String, _>("baseline_lifecycle")? != "active"
-        || target
-            .try_get::<Option<String>, _>("current_revision_id")?
-            .as_deref()
-            != Some(input.invalid_revision_id.as_str())
-        || target.try_get::<String, _>("revision_lifecycle")? != "approved"
-        || target.try_get::<String, _>("charter_revision_id")? != input.charter_revision_id
-        || target.try_get::<String, _>("content_digest")? != input.content_digest
-        || target.try_get::<String, _>("rendered_digest")? != input.rendered_digest
-        || target.try_get::<i64, _>("expected_project_version")? != input.expected_project_version
-        || target.try_get::<String, _>("principal_type")? != "user"
-        || target.try_get::<String, _>("principal_id")? != input.approval_principal_id
-        || target.try_get::<String, _>("authorization_action")?
-            != input.approval_authorization_action
-        || target.try_get::<String, _>("approval_lifecycle")? != "active"
-        || target.try_get::<String, _>("approval_content_digest")? != input.content_digest
-        || target.try_get::<String, _>("approval_rendered_digest")? != input.rendered_digest
-    {
-        return Err(DbError::VersionConflict);
-    }
-
-    let project_version: i64 = sqlx::query_scalar(
-        "SELECT version FROM project
-         WHERE id = ? AND charter_status = 'charter_backed'
-           AND charter_setup_required = 0 AND current_charter_revision_id = ?",
-    )
-    .bind(&input.project_id)
-    .bind(&input.charter_revision_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or(DbError::VersionConflict)?;
-    if project_version != input.expected_project_version {
-        return Err(DbError::VersionConflict);
-    }
-
-    for (milestone_id, definition_id) in input
-        .milestone_ids
-        .iter()
-        .zip(&input.milestone_definition_revision_ids)
-    {
-        let current_definition_id: Option<String> = sqlx::query_scalar(
-            "SELECT current_definition_revision_id FROM project_milestone
-             WHERE id = ? AND project_id = ?",
-        )
-        .bind(milestone_id)
-        .bind(&input.project_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .flatten();
-        if current_definition_id.as_deref() != Some(definition_id.as_str()) {
-            return Err(DbError::VersionConflict);
-        }
-        let definition_lifecycle: String = sqlx::query_scalar(
-            "SELECT lifecycle FROM project_milestone_revision
-             WHERE id = ? AND milestone_id = ?",
-        )
-        .bind(definition_id)
-        .bind(milestone_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .ok_or(DbError::VersionConflict)?;
-        if definition_lifecycle == "proposed" {
-            sqlx::query(
-                "UPDATE project_milestone_revision SET lifecycle = 'approved'
-                 WHERE id = ? AND milestone_id = ? AND lifecycle = 'proposed'",
-            )
-            .bind(definition_id)
-            .bind(milestone_id)
-            .execute(&mut **tx)
-            .await
-            .map_err(orchestration_write_error)?;
-        } else if definition_lifecycle != "approved" {
-            return Err(DbError::VersionConflict);
-        }
-    }
-
-    let baseline_updated = sqlx::query(
-        "UPDATE project_execution_baseline
-         SET lifecycle = 'active', current_revision_id = ?,
-             version = version + 1, updated_at = ?
-         WHERE id = ? AND project_id = ? AND version = ?
-           AND lifecycle = 'active' AND current_revision_id = ?",
-    )
-    .bind(&input.successor_revision_id)
-    .bind(updated_at)
-    .bind(&input.baseline_id)
-    .bind(&input.project_id)
-    .bind(input.expected_baseline_version)
-    .bind(&input.invalid_revision_id)
-    .execute(&mut **tx)
-    .await
-    .map_err(orchestration_write_error)?;
-    if baseline_updated.rows_affected() != 1 {
-        return Err(DbError::VersionConflict);
-    }
-    sqlx::query(
-        "UPDATE project_execution_baseline_revision SET lifecycle = 'superseded'
-         WHERE baseline_id = ? AND lifecycle = 'approved' AND id != ?",
-    )
-    .bind(&input.baseline_id)
-    .bind(&input.successor_revision_id)
-    .execute(&mut **tx)
-    .await
-    .map_err(orchestration_write_error)?;
-    for milestone_id in &input.milestone_ids {
-        let updated = sqlx::query(
-            "UPDATE project_milestone
-             SET lifecycle = CASE WHEN lifecycle = 'planned' THEN 'active' ELSE lifecycle END,
-                 version = version + 1, updated_at = ?
-             WHERE id = ? AND project_id = ?
-               AND lifecycle IN ('planned', 'active', 'ready_for_release', 'released')",
-        )
-        .bind(updated_at)
-        .bind(milestone_id)
-        .bind(&input.project_id)
-        .execute(&mut **tx)
-        .await
-        .map_err(orchestration_write_error)?;
-        if updated.rows_affected() != 1 {
-            return Err(DbError::VersionConflict);
-        }
-    }
-    let project_updated = sqlx::query(
-        "UPDATE project
-         SET primary_milestone_id = COALESCE(
-                 primary_milestone_id,
-                 (SELECT id FROM project_milestone
-                  WHERE id = ? AND project_id = ? AND lifecycle = 'active')),
-             version = version + 1, updated_at = ?
-         WHERE id = ? AND version = ?",
-    )
-    .bind(input.primary_milestone_id.as_deref())
-    .bind(&input.project_id)
-    .bind(updated_at)
-    .bind(&input.project_id)
-    .bind(input.expected_project_version)
-    .execute(&mut **tx)
-    .await
-    .map_err(orchestration_write_error)?;
-    if project_updated.rows_affected() != 1 {
-        return Err(DbError::VersionConflict);
-    }
-    let approval_consumed = sqlx::query(
-        "UPDATE project_execution_baseline_approval
-         SET lifecycle = 'consumed', updated_at = ?
-         WHERE id = ? AND lifecycle = 'active'",
-    )
-    .bind(updated_at)
-    .bind(&input.approval_id)
-    .execute(&mut **tx)
-    .await
-    .map_err(orchestration_write_error)?;
-    if approval_consumed.rows_affected() != 1 {
-        return Err(DbError::VersionConflict);
-    }
-    sqlx::query(
-        "UPDATE execution_baseline_revision_integrity SET updated_at = ?
-         WHERE revision_id = ?",
-    )
-    .bind(updated_at)
-    .bind(&input.invalid_revision_id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
-/// Freeze the authoritative post-commit identity into the receipt before the
-/// transaction is finalized.  Revision numbers and baseline versions are
-/// allocated/advanced under the write lock, so a service-created optimistic
-/// outcome cannot be replayed with a placeholder (or with a later mutable
-/// projection).  Action execution mirrors the exact same frozen JSON.
-#[allow(clippy::too_many_arguments)]
-fn freeze_baseline_receipt_outcome(
-    receipt: &mut Option<CreateCommandReceipt>,
-    action_execution: &mut Option<CreateAgentActionExecution>,
-    baseline_id: &str,
-    revision_id: &str,
-    revision: i64,
-    lifecycle: &str,
-    baseline_version: i64,
-    proposing: bool,
-    source_refs_json: &str,
-    rendered_view: &str,
-    render_version: &str,
-    content_digest: &str,
-    rendered_digest: &str,
-) -> Result<()> {
-    let Some(receipt) = receipt.as_mut() else {
-        return Ok(());
-    };
-    let mut outcome: serde_json::Value = serde_json::from_str(&receipt.outcome_json)
-        .map_err(|error| DbError::Check(format!("baseline receipt outcome is invalid: {error}")))?;
-    let object = outcome.as_object_mut().ok_or_else(|| {
-        DbError::Check("baseline receipt outcome must be a JSON object".to_owned())
-    })?;
-    object.insert("baseline_id".to_owned(), serde_json::json!(baseline_id));
-    object.insert("revision_id".to_owned(), serde_json::json!(revision_id));
-    object.insert("revision".to_owned(), serde_json::json!(revision));
-    object.insert("lifecycle".to_owned(), serde_json::json!(lifecycle));
-    object.insert(
-        "baseline_version".to_owned(),
-        serde_json::json!(baseline_version),
-    );
-    object.insert("receipt_id".to_owned(), serde_json::json!(receipt.id));
-    if proposing {
-        let manifest: serde_json::Value =
-            serde_json::from_str(source_refs_json).map_err(|error| {
-                DbError::Check(format!(
-                    "baseline manifest is invalid while freezing receipt: {error}"
-                ))
-            })?;
-        let target = object
-            .entry("approval_target".to_owned())
-            .or_insert_with(|| serde_json::json!({}));
-        let target = target.as_object_mut().ok_or_else(|| {
-            DbError::Check("baseline approval_target must be a JSON object".to_owned())
-        })?;
-        target.insert("baseline_id".to_owned(), serde_json::json!(baseline_id));
-        target.insert("revision_id".to_owned(), serde_json::json!(revision_id));
-        target.insert("revision".to_owned(), serde_json::json!(revision));
-        target.insert(
-            "requires_user_authorization".to_owned(),
-            serde_json::json!(true),
-        );
-        if let Some(content) = manifest.get("content") {
-            target.insert("content".to_owned(), content.clone());
-        }
-        if let Some(provenance) = manifest.get("provenance") {
-            target.insert("provenance".to_owned(), provenance.clone());
-        }
-        target.insert("rendered_view".to_owned(), serde_json::json!(rendered_view));
-        target.insert(
-            "render_version".to_owned(),
-            serde_json::json!(render_version),
-        );
-        target.insert(
-            "content_digest".to_owned(),
-            serde_json::json!(content_digest),
-        );
-        target.insert(
-            "render_digest".to_owned(),
-            serde_json::json!(rendered_digest),
-        );
-    }
-    let frozen = serde_json::to_string(&outcome).map_err(|error| {
-        DbError::Check(format!(
-            "baseline receipt outcome cannot serialize: {error}"
-        ))
-    })?;
-    receipt.outcome_json = frozen.clone();
-    if let Some(action) = action_execution.as_mut() {
-        action.result_json = Some(frozen.clone());
-        action.action_outcome_json = Some(frozen);
-    }
-    Ok(())
-}
-
-async fn ensure_baseline_reconciliation_clear_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    project_id: &str,
-    allow_invalid_baseline_correction: bool,
-) -> Result<()> {
-    let required: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)
-         FROM project_reconciliation_record reconciliation
-         JOIN project_canonical_conflict conflict
-           ON conflict.id = reconciliation.conflict_id
-         WHERE reconciliation.project_id = ?
-           AND reconciliation.state = 'required'
-           AND (? = 0 OR conflict.conflict_code != 'invalid_active_baseline')",
-    )
-    .bind(project_id)
-    .bind(i64::from(allow_invalid_baseline_correction))
-    .fetch_one(&mut **tx)
-    .await?;
-    if required > 0 {
-        return Err(DbError::VersionConflict);
-    }
-    Ok(())
-}
-
-fn manifest_string(value: &serde_json::Value, key: &str) -> Result<String> {
-    value
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| DbError::VersionConflict)
-}
-
-fn manifest_string_array(value: &serde_json::Value, key: &str) -> Result<Vec<String>> {
-    value
-        .get(key)
-        .and_then(serde_json::Value::as_array)
-        .ok_or(DbError::VersionConflict)?
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_owned)
-                .ok_or(DbError::VersionConflict)
-        })
-        .collect()
-}
-
-async fn validate_manifest_artifact_ref_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    project_id: &str,
-    reference: &serde_json::Value,
-    charter: bool,
-    require_approved: bool,
-) -> Result<()> {
-    let artifact_id = manifest_string(reference, "artifact_id")?;
-    let revision_id = manifest_string(reference, "revision_id")?;
-    let content_digest = manifest_string(reference, "content_digest")?;
-    let render_version = reference
-        .get("render_version")
-        .and_then(serde_json::Value::as_str)
-        .ok_or(DbError::VersionConflict)?;
-    let render_digest = reference
-        .get("render_digest")
-        .and_then(serde_json::Value::as_str)
-        .ok_or(DbError::VersionConflict)?;
-    let sql = if charter {
-        "SELECT c.id AS artifact_id, r.content_digest, r.render_version,
-                r.rendered_digest, r.lifecycle
-         FROM project_charter_revision r
-         JOIN project_charter c ON c.id = r.charter_id
-         WHERE r.id = ? AND c.project_id = ?"
-    } else {
-        "SELECT d.id AS artifact_id, r.content_digest, r.render_version,
-                r.rendered_digest, r.lifecycle
-         FROM project_document_revision r
-         JOIN project_document d ON d.id = r.document_id
-         WHERE r.id = ? AND d.project_id = ?"
-    };
-    let row = sqlx::query(sql)
-        .bind(&revision_id)
-        .bind(project_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .ok_or(DbError::VersionConflict)?;
-    let persisted_artifact_id: String = row.try_get("artifact_id")?;
-    let persisted_content_digest: String = row.try_get("content_digest")?;
-    let persisted_render_version: String = row.try_get("render_version")?;
-    let persisted_render_digest: String = row.try_get("rendered_digest")?;
-    let lifecycle: String = row.try_get("lifecycle")?;
-    if persisted_artifact_id != artifact_id
-        || persisted_content_digest != content_digest
-        || persisted_render_version != render_version
-        || persisted_render_digest != render_digest
-        || (require_approved && lifecycle != "approved")
-    {
-        return Err(DbError::VersionConflict);
-    }
-    Ok(())
-}
-
-/// Revalidate the complete immutable baseline manifest while the command
-/// transaction owns the SQLite writer lock. Pool-level service validation is
-/// useful for fast feedback, but this closes the race with Charter,
-/// Document, milestone-definition, and persisted-projection changes between
-/// validation and approval/activation.
-async fn validate_persisted_baseline_manifest_in_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    project_id: &str,
-    baseline_id: &str,
-    revision_id: &str,
-    complete: bool,
-) -> Result<()> {
-    let row = sqlx::query(
-        "SELECT schema_version, render_version, rendered_view,
-                content_digest, rendered_digest, source_refs_json,
-                lifecycle, charter_revision_id, release_policy_revision,
-                release_policy_digest
-         FROM project_execution_baseline_revision
-         WHERE id = ? AND baseline_id = ?",
-    )
-    .bind(revision_id)
-    .bind(baseline_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or(DbError::VersionConflict)?;
-    let schema_version: String = row.try_get("schema_version")?;
-    let render_version: String = row.try_get("render_version")?;
-    let rendered_view: String = row.try_get("rendered_view")?;
-    let content_digest: String = row.try_get("content_digest")?;
-    let rendered_digest: String = row.try_get("rendered_digest")?;
-    let source_refs_json: String = row.try_get("source_refs_json")?;
-    let lifecycle: String = row.try_get("lifecycle")?;
-    if schema_version != "forge.execution-baseline/v1"
-        || render_version != "forge.execution-baseline-render/v1"
-        || matches!(lifecycle.as_str(), "superseded" | "revoked")
-    {
-        return Err(DbError::VersionConflict);
-    }
-    let manifest: serde_json::Value =
-        serde_json::from_str(&source_refs_json).map_err(|_| DbError::VersionConflict)?;
-    if manifest.get("schema").and_then(serde_json::Value::as_str)
-        != Some("forge.execution-baseline-manifest/v1")
-        || manifest
-            .get("rendered_view")
-            .and_then(serde_json::Value::as_str)
-            != Some(rendered_view.as_str())
-    {
-        return Err(DbError::VersionConflict);
-    }
-    let content = manifest.get("content").ok_or(DbError::VersionConflict)?;
-    let charter = content
-        .get("charter_revision")
-        .ok_or(DbError::VersionConflict)?;
-    let charter_revision_id = manifest_string(charter, "revision_id")?;
-    if charter_revision_id != row.try_get::<String, _>("charter_revision_id")? {
-        return Err(DbError::VersionConflict);
-    }
-    let project = sqlx::query(
-        "SELECT charter_status, charter_setup_required, current_charter_revision_id
-         FROM project WHERE id = ?",
-    )
-    .bind(project_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or(DbError::NotFound)?;
-    if complete
-        && (project.try_get::<String, _>("charter_status")? != "charter_backed"
-            || project.try_get::<i64, _>("charter_setup_required")? != 0
-            || project
-                .try_get::<Option<String>, _>("current_charter_revision_id")?
-                .as_deref()
-                != Some(charter_revision_id.as_str()))
-    {
-        return Err(DbError::VersionConflict);
-    }
-    validate_manifest_artifact_ref_in_tx(tx, project_id, charter, true, complete).await?;
-
-    let documents = content
-        .get("document_revisions")
-        .and_then(serde_json::Value::as_array)
-        .ok_or(DbError::VersionConflict)?;
-    for document in documents {
-        validate_manifest_artifact_ref_in_tx(tx, project_id, document, false, complete).await?;
-    }
-
-    let plan_items = content
-        .get("plan_item_ids")
-        .and_then(serde_json::Value::as_array)
-        .ok_or(DbError::VersionConflict)?;
-    let capabilities = content
-        .get("capability_classes")
-        .and_then(serde_json::Value::as_array)
-        .ok_or(DbError::VersionConflict)?;
-    let risks = content
-        .get("risk_classes")
-        .and_then(serde_json::Value::as_array)
-        .ok_or(DbError::VersionConflict)?;
-    let milestones = manifest_string_array(content, "milestone_ids")?;
-    let definitions = manifest_string_array(content, "milestone_definition_revision_ids")?;
-    if complete
-        && (plan_items.is_empty()
-            || capabilities.is_empty()
-            || risks.is_empty()
-            || milestones.is_empty()
-            || milestones.len() != definitions.len())
-    {
-        return Err(DbError::VersionConflict);
-    }
-    if milestones.len() != definitions.len()
-        || milestones
-            .iter()
-            .enumerate()
-            .any(|(index, value)| milestones.iter().take(index).any(|prior| prior == value))
-        || definitions
-            .iter()
-            .enumerate()
-            .any(|(index, value)| definitions.iter().take(index).any(|prior| prior == value))
-    {
-        return Err(DbError::VersionConflict);
-    }
-    if let Some(primary) = content
-        .get("primary_milestone_id")
-        .and_then(serde_json::Value::as_str)
-    {
-        if !milestones.iter().any(|value| value == primary) {
-            return Err(DbError::VersionConflict);
-        }
-    }
-    let release_policy_revision = manifest_string(content, "release_policy_revision")?;
-    let release_policy_digest = manifest_string(content, "release_policy_digest")?;
-    if release_policy_revision != row.try_get::<String, _>("release_policy_revision")?
-        || release_policy_digest != row.try_get::<String, _>("release_policy_digest")?
-    {
-        return Err(DbError::VersionConflict);
-    }
-    for (milestone_id, definition_id) in milestones.iter().zip(&definitions) {
-        let milestone = sqlx::query(
-            "SELECT current_definition_revision_id
-             FROM project_milestone WHERE id = ? AND project_id = ?",
-        )
-        .bind(milestone_id)
-        .bind(project_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .ok_or(DbError::VersionConflict)?;
-        if complete
-            && milestone
-                .try_get::<Option<String>, _>("current_definition_revision_id")?
-                .as_deref()
-                != Some(definition_id.as_str())
-        {
-            return Err(DbError::VersionConflict);
-        }
-        let definition = sqlx::query(
-            "SELECT lifecycle, charter_revision_id
-             FROM project_milestone_revision
-             WHERE id = ? AND milestone_id = ?",
-        )
-        .bind(definition_id)
-        .bind(milestone_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .ok_or(DbError::VersionConflict)?;
-        if complete
-            && !matches!(
-                definition.try_get::<String, _>("lifecycle")?.as_str(),
-                "proposed" | "approved"
-            )
-        {
-            return Err(DbError::VersionConflict);
-        }
-        if complete
-            && definition
-                .try_get::<Option<String>, _>("charter_revision_id")?
-                .as_deref()
-                != Some(charter_revision_id.as_str())
-        {
-            return Err(DbError::VersionConflict);
-        }
-    }
-    // The persisted row's two digests are the final gate. The service has
-    // already computed the canonical policy/content digests; checking that
-    // the manifest points at those exact columns prevents an adapter from
-    // swapping a valid manifest into another revision.
-    if content_digest.trim().is_empty() || rendered_digest.trim().is_empty() {
-        return Err(DbError::VersionConflict);
-    }
-    Ok(())
-}
-
-/// Shared implementation for the draft/proposal baseline composites.  The
-/// lifecycle is deliberately selected by the service entry point; adapters
-/// cannot turn a draft into an approval request by changing a payload flag.
-async fn save_project_execution_baseline_revision_command(
-    db: &SqliteDb,
-    input: SaveProjectExecutionBaselineRevisionCommand,
-    proposing: bool,
-) -> Result<ProjectExecutionBaselineRevisionRecord> {
-    let mut tx = crate::begin_immediate(db.pool()).await?;
-    let mut owned_receipt = input.command_receipt.clone();
-    let mut owned_action_execution = input.action_execution.clone();
-    let command_receipt = owned_receipt.as_ref();
-    validate_command_scope(command_receipt, "project", &input.project_id)?;
-    if let Some(receipt) = resolve_command_replay(db, &mut tx, command_receipt).await? {
-        let baseline_id = command_outcome_string(&receipt, "baseline_id")?;
-        let revision_id = command_outcome_string(&receipt, "revision_id")?;
-        validate_command_outcome_identity(
-            &receipt,
-            &[("baseline_id", &baseline_id), ("revision_id", &revision_id)],
-        )?;
-        validate_replay_action_bundle(&mut tx, &receipt, owned_action_execution.as_ref()).await?;
-        let row = sqlx::query(
-            "SELECT r.* FROM project_execution_baseline_revision r
-             JOIN project_execution_baseline b ON b.id = r.baseline_id
-             WHERE r.id = ? AND r.baseline_id = ? AND b.project_id = ?",
-        )
-        .bind(&revision_id)
-        .bind(&baseline_id)
-        .bind(&input.project_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(DbError::IdempotencyConflict)?;
-        let revision = map_baseline_revision(row)?;
-        tx.commit().await?;
-        return Ok(revision);
-    }
-    if proposing {
-        ensure_baseline_reconciliation_clear_in_tx(&mut tx, &input.project_id, true).await?;
-    }
-
-    let lifecycle = if proposing { "proposed" } else { "draft" };
-    if input.lifecycle != lifecycle {
-        return Err(DbError::Check(
-            "execution baseline command lifecycle does not match its operation".to_owned(),
-        ));
-    }
-    let now = input.created_at.clone();
-    let baseline_id = input.baseline_id.clone().unwrap_or_else(new_uuid_v4);
-    let baseline = sqlx::query(
-        "SELECT project_id, lifecycle, version, current_revision_id
-         FROM project_execution_baseline WHERE id = ?",
-    )
-    .bind(&baseline_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let baseline_exists = baseline.is_some();
-    let (_baseline_lifecycle, baseline_version, current_revision_id) = if let Some(row) = baseline {
-        let project_id: String = row.try_get("project_id")?;
-        if project_id != input.project_id {
-            return Err(DbError::VersionConflict);
-        }
-        (
-            row.try_get::<String, _>("lifecycle")?,
-            row.try_get::<i64, _>("version")?,
-            row.try_get::<Option<String>, _>("current_revision_id")?,
-        )
-    } else {
-        sqlx::query(
-            "INSERT INTO project_execution_baseline (
-                id, project_id, current_revision_id, lifecycle, version,
-                created_at, updated_at
-             ) VALUES (?, ?, NULL, 'draft', 1, ?, ?)",
-        )
-        .bind(&baseline_id)
-        .bind(&input.project_id)
-        .bind(&now)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await
-        .map_err(orchestration_write_error)?;
-        ("draft".to_owned(), 1, None)
-    };
-    if baseline_exists && input.expected_baseline_version != Some(baseline_version) {
-        return Err(DbError::VersionConflict);
-    }
-    if !baseline_exists && input.expected_baseline_version.is_some() {
-        return Err(DbError::VersionConflict);
-    }
-
-    if input.base_revision > 0 {
-        let Some(base_revision_id) = input.base_revision_id.as_deref() else {
-            return Err(DbError::VersionConflict);
-        };
-        if current_revision_id.as_deref() != Some(base_revision_id) {
-            return Err(DbError::VersionConflict);
-        }
-        let base_matches: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM project_execution_baseline_revision
-             WHERE id = ? AND baseline_id = ? AND revision = ? LIMIT 1",
-        )
-        .bind(base_revision_id)
-        .bind(&baseline_id)
-        .bind(input.base_revision)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if base_matches.is_none() {
-            return Err(DbError::VersionConflict);
-        }
-    } else if input.base_revision_id.is_some() || current_revision_id.is_some() {
-        return Err(DbError::VersionConflict);
-    }
-
-    let revision_number: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(revision), 0) + 1
-         FROM project_execution_baseline_revision WHERE baseline_id = ?",
-    )
-    .bind(&baseline_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    sqlx::query(
-        "INSERT INTO project_execution_baseline_revision (
-            id, baseline_id, revision, base_revision, base_revision_id, lifecycle,
-            charter_revision_id, document_revisions_json, plan_items_json,
-            milestone_id, milestone_ids_json, milestone_definition_revision_ids_json,
-            primary_milestone_id, release_policy_json,
-            release_policy_revision, release_policy_digest, acceptance_matrix_json,
-            capability_classes_json, risk_classes_json, adaptive_envelope_json,
-            elevated_operations_json, exclusions_json, rollback_recovery_json,
-            schema_version, render_version, rendered_view, content_digest,
-            rendered_digest, source_refs_json, created_at
-         ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?, ?, ?
-         )",
-    )
-    .bind(&input.revision_id)
-    .bind(&baseline_id)
-    .bind(revision_number)
-    .bind(input.base_revision)
-    .bind(input.base_revision_id.as_deref())
-    .bind(lifecycle)
-    .bind(&input.charter_revision_id)
-    .bind(&input.document_revisions_json)
-    .bind(&input.plan_items_json)
-    .bind(input.milestone_id.as_deref())
-    .bind(&input.milestone_ids_json)
-    .bind(&input.milestone_definition_revision_ids_json)
-    .bind(input.primary_milestone_id.as_deref())
-    .bind(&input.release_policy_json)
-    .bind(&input.release_policy_revision)
-    .bind(&input.release_policy_digest)
-    .bind(&input.acceptance_matrix_json)
-    .bind(&input.capability_classes_json)
-    .bind(&input.risk_classes_json)
-    .bind(&input.adaptive_envelope_json)
-    .bind(&input.elevated_operations_json)
-    .bind(&input.exclusions_json)
-    .bind(&input.rollback_recovery_json)
-    .bind(&input.schema_version)
-    .bind(&input.render_version)
-    .bind(&input.rendered_view)
-    .bind(&input.content_digest)
-    .bind(&input.rendered_digest)
-    .bind(&input.source_refs_json)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await
-    .map_err(orchestration_write_error)?;
-
-    if proposing {
-        validate_persisted_baseline_manifest_in_tx(
-            &mut tx,
-            &input.project_id,
-            &baseline_id,
-            &input.revision_id,
-            true,
-        )
-        .await?;
-    }
-
-    // A draft/proposal is the visible pointer only before activation. An
-    // active baseline keeps its approved current pointer while a successor
-    // is being drafted/proposed.
-    let advanced = sqlx::query(
-        "UPDATE project_execution_baseline
-         SET lifecycle = CASE WHEN lifecycle IN ('draft', 'proposed') THEN ? ELSE lifecycle END,
-             current_revision_id = CASE WHEN lifecycle IN ('draft', 'proposed') THEN ? ELSE current_revision_id END,
-             version = version + 1, updated_at = ?
-         WHERE id = ? AND version = ?",
-    )
-    .bind(lifecycle)
-    .bind(&input.revision_id)
-    .bind(&now)
-    .bind(&baseline_id)
-    .bind(baseline_version)
-    .execute(&mut *tx)
-    .await
-    .map_err(orchestration_write_error)?;
-    if advanced.rows_affected() != 1 {
-        return Err(DbError::VersionConflict);
-    }
-
-    freeze_baseline_receipt_outcome(
-        &mut owned_receipt,
-        &mut owned_action_execution,
-        &baseline_id,
-        &input.revision_id,
-        revision_number,
-        lifecycle,
-        baseline_version + 1,
-        proposing,
-        &input.source_refs_json,
-        &input.rendered_view,
-        &input.render_version,
-        &input.content_digest,
-        &input.rendered_digest,
-    )?;
-    let command_receipt = owned_receipt.as_ref();
-    let outcome = command_receipt
-        .map(|receipt| receipt.outcome_json.clone())
-        .unwrap_or_else(|| {
-            serde_json::json!({
-                "operation": if proposing { "propose_for_approval" } else { "save_draft" },
-                "project_id": input.project_id,
-                "baseline_id": baseline_id,
-                "revision_id": input.revision_id,
-                "revision": revision_number,
-                "lifecycle": lifecycle,
-                "domain_committed": true
-            })
-            .to_string()
-        });
-    let (actor_type, actor_id, correlation_id, causation_id, causation_depth) =
-        command_event_provenance(
-            command_receipt,
-            "system".to_owned(),
-            None,
-            input.revision_id.clone(),
-            None,
-            0,
-        );
-    let event = CreateDomainEvent {
-        id: new_uuid_v4(),
-        event_type: if proposing {
-            "project.execution_baseline.proposed".to_owned()
-        } else {
-            "project.execution_baseline.draft_saved".to_owned()
-        },
-        entity_type: "execution_baseline".to_owned(),
-        entity_id: baseline_id.clone(),
-        actor_type,
-        actor_id,
-        scope_type: "project".to_owned(),
-        scope_id: input.project_id.clone(),
-        correlation_id,
-        causation_id,
-        causation_depth,
-        dedupe_key: command_receipt.map(|receipt| {
-            format!(
-                "execution-baseline:{}:{}",
-                receipt.operation, receipt.idempotency_key
-            )
-        }),
-        payload_json: serde_json::json!({
-            "operation": if proposing { "propose_for_approval" } else { "save_draft" },
-            "project_id": input.project_id,
-            "baseline_id": baseline_id,
-            "revision_id": input.revision_id,
-            "revision": revision_number,
-            "lifecycle": lifecycle,
-            "result": serde_json::from_str::<serde_json::Value>(&outcome)
-                .unwrap_or_else(|_| serde_json::json!({"domain_committed": true})),
-        })
-        .to_string(),
-        created_at: now,
-    };
-    DomainEventRepo::append_event_in_tx(db, &mut tx, &event).await?;
-    finalize_command_in_tx(
-        db,
-        &mut tx,
-        &event.id,
-        owned_receipt,
-        owned_action_execution,
-    )
-    .await?;
-    let row = sqlx::query("SELECT * FROM project_execution_baseline_revision WHERE id = ?")
-        .bind(&input.revision_id)
-        .fetch_one(&mut *tx)
-        .await?;
-    let revision = map_baseline_revision(row)?;
-    tx.commit().await?;
-    Ok(revision)
-}
-
-async fn approve_project_execution_baseline_command(
-    db: &SqliteDb,
-    input: ApproveProjectExecutionBaselineCommand,
-) -> Result<ProjectExecutionBaselineApprovalRecord> {
-    let mut tx = crate::begin_immediate(db.pool()).await?;
-    let mut owned_receipt = input.command_receipt.clone();
-    let mut owned_action_execution = input.action_execution.clone();
-    let command_receipt = owned_receipt.as_ref();
-    let project_id: String =
-        sqlx::query_scalar("SELECT project_id FROM project_execution_baseline WHERE id = ?")
-            .bind(&input.baseline_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(DbError::NotFound)?;
-    validate_command_scope(command_receipt, "project", &project_id)?;
-    if let Some(receipt) = resolve_command_replay(db, &mut tx, command_receipt).await? {
-        let approval_id = command_outcome_string(&receipt, "approval_id")?;
-        validate_replay_action_bundle(&mut tx, &receipt, owned_action_execution.as_ref()).await?;
-        let row = sqlx::query(
-            "SELECT * FROM project_execution_baseline_approval
-             WHERE id = ? AND baseline_id = ?",
-        )
-        .bind(&approval_id)
-        .bind(&input.baseline_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(DbError::IdempotencyConflict)?;
-        let approval = map_baseline_approval(row)?;
-        if approval.revision_id != input.revision_id {
-            return Err(DbError::IdempotencyConflict);
-        }
-        tx.commit().await?;
-        return Ok(approval);
-    }
-    ensure_baseline_reconciliation_clear_in_tx(&mut tx, &project_id, true).await?;
-
-    if let Some(receipt) = command_receipt {
-        if receipt.principal_type != "user"
-            || receipt.principal_id != input.principal_id
-            || receipt.operation != "project.execution_baseline.approve"
-        {
-            return Err(DbError::VersionConflict);
-        }
-    }
-
-    if input.principal_type != "user"
-        || input.principal_id.trim().is_empty()
-        || input.authorization_action != "project.execution_baseline.approve"
-        || input.authorization_basis.trim().is_empty()
-        || input.explicit_event.trim().is_empty()
-        || !valid_authorization_timestamp(&input.authorization_occurred_at)
-    {
-        return Err(DbError::VersionConflict);
-    }
-    let baseline = sqlx::query(
-        "SELECT project_id, lifecycle, version
-         FROM project_execution_baseline WHERE id = ?",
-    )
-    .bind(&input.baseline_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    let baseline_project_id: String = baseline.try_get("project_id")?;
-    if baseline_project_id != project_id {
-        return Err(DbError::VersionConflict);
-    }
-    let baseline_lifecycle: String = baseline.try_get("lifecycle")?;
-    let baseline_version: i64 = baseline.try_get("version")?;
-    if baseline_version != input.expected_baseline_version
-        || !matches!(
-            baseline_lifecycle.as_str(),
-            "draft" | "proposed" | "approved" | "active"
-        )
-    {
-        return Err(DbError::VersionConflict);
-    }
-    let project_version: i64 = sqlx::query_scalar("SELECT version FROM project WHERE id = ?")
-        .bind(&project_id)
-        .fetch_one(&mut *tx)
-        .await?;
-    if project_version != input.expected_project_version {
-        return Err(DbError::VersionConflict);
-    }
-    let revision = sqlx::query(
-        "SELECT lifecycle, content_digest, rendered_digest
-         FROM project_execution_baseline_revision
-         WHERE id = ? AND baseline_id = ?",
-    )
-    .bind(&input.revision_id)
-    .bind(&input.baseline_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or(DbError::NotFound)?;
-    let revision_lifecycle: String = revision.try_get("lifecycle")?;
-    if matches!(revision_lifecycle.as_str(), "superseded" | "revoked")
-        || revision.try_get::<String, _>("content_digest")? != input.content_digest
-        || revision.try_get::<String, _>("rendered_digest")? != input.rendered_digest
-    {
-        return Err(DbError::VersionConflict);
-    }
-    validate_persisted_baseline_manifest_in_tx(
-        &mut tx,
-        &project_id,
-        &input.baseline_id,
-        &input.revision_id,
-        true,
-    )
-    .await?;
-    if sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM project_execution_baseline_approval
-         WHERE baseline_id = ? AND revision_id = ? AND principal_type = 'user'
-           AND authorization_action = 'project.execution_baseline.approve'
-           AND content_digest = ? AND rendered_digest = ?
-           AND lifecycle IN ('active', 'consumed')",
-    )
-    .bind(&input.baseline_id)
-    .bind(&input.revision_id)
-    .bind(&input.content_digest)
-    .bind(&input.rendered_digest)
-    .fetch_one(&mut *tx)
-    .await?
-        > 0
-    {
-        return Err(DbError::VersionConflict);
-    }
-
-    if baseline_lifecycle != "active" {
-        sqlx::query(
-            "UPDATE project_execution_baseline_revision SET lifecycle = 'superseded'
-             WHERE baseline_id = ? AND lifecycle = 'approved' AND id != ?",
-        )
-        .bind(&input.baseline_id)
-        .bind(&input.revision_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(orchestration_write_error)?;
-    }
-    let approved = sqlx::query(
-        "UPDATE project_execution_baseline_revision SET lifecycle = 'approved'
-         WHERE id = ? AND baseline_id = ? AND lifecycle IN ('proposed', 'approved')",
-    )
-    .bind(&input.revision_id)
-    .bind(&input.baseline_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(orchestration_write_error)?;
-    if approved.rows_affected() != 1 {
-        return Err(DbError::VersionConflict);
-    }
-    let baseline_update = if baseline_lifecycle == "active" {
-        sqlx::query(
-            "UPDATE project_execution_baseline
-             SET version = version + 1, updated_at = ?
-             WHERE id = ? AND version = ? AND lifecycle = 'active'",
-        )
-        .bind(&input.updated_at)
-        .bind(&input.baseline_id)
-        .bind(input.expected_baseline_version)
-        .execute(&mut *tx)
-        .await
-        .map_err(orchestration_write_error)?
-    } else {
-        sqlx::query(
-            "UPDATE project_execution_baseline
-             SET lifecycle = 'approved', current_revision_id = ?,
-                 version = version + 1, updated_at = ?
-             WHERE id = ? AND version = ?
-               AND lifecycle IN ('draft', 'proposed', 'approved')",
-        )
-        .bind(&input.revision_id)
-        .bind(&input.updated_at)
-        .bind(&input.baseline_id)
-        .bind(input.expected_baseline_version)
-        .execute(&mut *tx)
-        .await
-        .map_err(orchestration_write_error)?
-    };
-    if baseline_update.rows_affected() != 1 {
-        return Err(DbError::VersionConflict);
-    }
-    if baseline_lifecycle != "active" {
-        sqlx::query(
-            "UPDATE project_execution_baseline_approval
-             SET lifecycle = 'revoked', updated_at = ?
-             WHERE baseline_id = ? AND lifecycle = 'active' AND revision_id != ?",
-        )
-        .bind(&input.updated_at)
-        .bind(&input.baseline_id)
-        .bind(&input.revision_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(orchestration_write_error)?;
-    }
-    sqlx::query(
-        "INSERT INTO project_execution_baseline_approval (
-            id, baseline_id, revision_id, expected_project_version,
-            principal_type, principal_id, authorization_basis,
-            authorization_action, authorization_occurred_at, explicit_event,
-            content_digest, rendered_digest, lifecycle, idempotency_key,
-            created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)",
-    )
-    .bind(&input.id)
-    .bind(&input.baseline_id)
-    .bind(&input.revision_id)
-    .bind(input.expected_project_version)
-    .bind(&input.principal_type)
-    .bind(&input.principal_id)
-    .bind(&input.authorization_basis)
-    .bind(&input.authorization_action)
-    .bind(&input.authorization_occurred_at)
-    .bind(&input.explicit_event)
-    .bind(&input.content_digest)
-    .bind(&input.rendered_digest)
-    .bind(&input.idempotency_key)
-    .bind(&input.created_at)
-    .bind(&input.updated_at)
-    .execute(&mut *tx)
-    .await
-    .map_err(orchestration_write_error)?;
-
-    freeze_baseline_receipt_outcome(
-        &mut owned_receipt,
-        &mut owned_action_execution,
-        &input.baseline_id,
-        &input.revision_id,
-        0,
-        "approved",
-        input.expected_baseline_version + 1,
-        false,
-        "",
-        "",
-        "",
-        &input.content_digest,
-        &input.rendered_digest,
-    )?;
-    let command_receipt = owned_receipt.as_ref();
-    let outcome = command_receipt
-        .map(|receipt| receipt.outcome_json.clone())
-        .unwrap_or_else(|| {
-            serde_json::json!({
-                "operation": "approve",
-                "project_id": project_id,
-                "baseline_id": input.baseline_id,
-                "revision_id": input.revision_id,
-                "approval_id": input.id,
-                "content_digest": input.content_digest,
-                "render_digest": input.rendered_digest,
-                "requires_user_authorization": false,
-                "domain_committed": true
-            })
-            .to_string()
-        });
-    let (actor_type, actor_id, correlation_id, causation_id, causation_depth) =
-        command_event_provenance(
-            command_receipt,
-            input.principal_type.clone(),
-            Some(input.principal_id.clone()),
-            input.id.clone(),
-            None,
-            0,
-        );
-    let event = CreateDomainEvent {
-        id: new_uuid_v4(),
-        event_type: "project.execution_baseline.approved".to_owned(),
-        entity_type: "execution_baseline".to_owned(),
-        entity_id: input.baseline_id.clone(),
-        actor_type,
-        actor_id,
-        scope_type: "project".to_owned(),
-        scope_id: project_id,
-        correlation_id,
-        causation_id,
-        causation_depth,
-        dedupe_key: command_receipt.map(|receipt| {
-            format!(
-                "execution-baseline:{}:{}",
-                receipt.operation, receipt.idempotency_key
-            )
-        }),
-        payload_json: serde_json::json!({
-            "operation": "approve",
-            "baseline_id": input.baseline_id,
-            "revision_id": input.revision_id,
-            "approval_id": input.id,
-            "result": serde_json::from_str::<serde_json::Value>(&outcome)
-                .unwrap_or_else(|_| serde_json::json!({"domain_committed": true})),
-        })
-        .to_string(),
-        created_at: input.created_at.clone(),
-    };
-    DomainEventRepo::append_event_in_tx(db, &mut tx, &event).await?;
-    finalize_command_in_tx(
-        db,
-        &mut tx,
-        &event.id,
-        owned_receipt,
-        owned_action_execution,
-    )
-    .await?;
-    let row = sqlx::query("SELECT * FROM project_execution_baseline_approval WHERE id = ?")
-        .bind(&input.id)
-        .fetch_one(&mut *tx)
-        .await?;
-    let approval = map_baseline_approval(row)?;
-    tx.commit().await?;
-    Ok(approval)
-}
-
-async fn activate_project_execution_baseline_command(
-    db: &SqliteDb,
-    input: ActivateProjectExecutionBaselineCommand,
-) -> Result<ProjectExecutionBaselineRecord> {
-    let mut tx = crate::begin_immediate(db.pool()).await?;
-    let mut owned_receipt = input.command_receipt.clone();
-    let mut owned_action_execution = input.action_execution.clone();
-    let command_receipt = owned_receipt.as_ref();
-    validate_command_scope(command_receipt, "project", &input.project_id)?;
-    if let Some(receipt) = resolve_command_replay(db, &mut tx, command_receipt).await? {
-        let baseline_id = command_outcome_string(&receipt, "baseline_id")?;
-        let revision_id = command_outcome_string(&receipt, "revision_id")?;
-        validate_replay_action_bundle(&mut tx, &receipt, owned_action_execution.as_ref()).await?;
-        let row = sqlx::query(
-            "SELECT * FROM project_execution_baseline
-             WHERE id = ? AND project_id = ?",
-        )
-        .bind(&baseline_id)
-        .bind(&input.project_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(DbError::IdempotencyConflict)?;
-        let baseline = map_baseline(row)?;
-        if baseline.current_revision_id.as_deref() != Some(revision_id.as_str())
-            && baseline.lifecycle != "superseded"
-        {
-            return Err(DbError::IdempotencyConflict);
-        }
-        tx.commit().await?;
-        return Ok(baseline);
-    }
-    ensure_baseline_reconciliation_clear_in_tx(&mut tx, &input.project_id, false).await?;
-
-    if let Some(receipt) = command_receipt {
-        if receipt.principal_type != "user"
-            || receipt.operation != "project.execution_baseline.activate"
-        {
-            return Err(DbError::VersionConflict);
-        }
-    }
-
-    if input.milestone_ids.is_empty()
-        || input.milestone_ids.len() != input.milestone_definition_revision_ids.len()
-        || input.milestone_ids.iter().any(|id| id.trim().is_empty())
-        || input
-            .milestone_definition_revision_ids
-            .iter()
-            .any(|id| id.trim().is_empty())
-        || input.milestone_ids.iter().enumerate().any(|(index, id)| {
-            input
-                .milestone_ids
-                .iter()
-                .take(index)
-                .any(|prior| prior == id)
-        })
-        || input
-            .milestone_definition_revision_ids
-            .iter()
-            .enumerate()
-            .any(|(index, id)| {
-                input
-                    .milestone_definition_revision_ids
-                    .iter()
-                    .take(index)
-                    .any(|prior| prior == id)
-            })
-    {
-        return Err(DbError::VersionConflict);
-    }
-    if input
-        .primary_milestone_id
-        .as_deref()
-        .is_some_and(|id| !input.milestone_ids.iter().any(|candidate| candidate == id))
-    {
-        return Err(DbError::VersionConflict);
-    }
-    validate_persisted_baseline_manifest_in_tx(
-        &mut tx,
-        &input.project_id,
-        &input.baseline_id,
-        &input.revision_id,
-        true,
-    )
-    .await?;
-
-    let approval = sqlx::query(
-        "SELECT a.baseline_id, a.revision_id, a.expected_project_version,
-                a.principal_type, a.principal_id, a.authorization_basis,
-                a.authorization_action, a.authorization_occurred_at,
-                a.explicit_event, a.content_digest, a.rendered_digest,
-                a.lifecycle, b.project_id, b.version,
-                b.lifecycle AS baseline_lifecycle, r.lifecycle AS revision_lifecycle,
-                r.charter_revision_id, r.content_digest AS revision_content_digest,
-                r.rendered_digest AS revision_rendered_digest
-         FROM project_execution_baseline_approval a
-         JOIN project_execution_baseline b ON b.id = a.baseline_id
-         JOIN project_execution_baseline_revision r
-           ON r.id = a.revision_id AND r.baseline_id = a.baseline_id
-         WHERE a.id = ?",
-    )
-    .bind(&input.approval_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or(DbError::NotFound)?;
-    let exact = approval.try_get::<String, _>("baseline_id")? == input.baseline_id
-        && approval.try_get::<String, _>("revision_id")? == input.revision_id
-        && approval.try_get::<String, _>("project_id")? == input.project_id
-        && approval.try_get::<i64, _>("expected_project_version")?
-            == input.expected_project_version
-        && approval.try_get::<String, _>("principal_type")? == "user"
-        && approval.try_get::<String, _>("authorization_action")?
-            == "project.execution_baseline.approve"
-        && !approval
-            .try_get::<String, _>("authorization_basis")?
-            .trim()
-            .is_empty()
-        && !approval
-            .try_get::<String, _>("authorization_occurred_at")?
-            .trim()
-            .is_empty()
-        && valid_authorization_timestamp(
-            &approval.try_get::<String, _>("authorization_occurred_at")?,
-        )
-        && !approval
-            .try_get::<String, _>("explicit_event")?
-            .trim()
-            .is_empty()
-        && approval.try_get::<String, _>("content_digest")? == input.content_digest
-        && approval.try_get::<String, _>("rendered_digest")? == input.rendered_digest
-        && approval.try_get::<String, _>("revision_content_digest")? == input.content_digest
-        && approval.try_get::<String, _>("revision_rendered_digest")? == input.rendered_digest
-        && approval.try_get::<String, _>("lifecycle")? == "active"
-        && matches!(
-            approval
-                .try_get::<String, _>("baseline_lifecycle")?
-                .as_str(),
-            "approved" | "active" | "proposed"
-        )
-        && approval.try_get::<String, _>("revision_lifecycle")? == "approved";
-    if !exact {
-        return Err(DbError::VersionConflict);
-    }
-    let baseline_version: i64 = approval.try_get("version")?;
-    if baseline_version != input.expected_baseline_version {
-        return Err(DbError::VersionConflict);
-    }
-    let current_project_version: i64 = sqlx::query_scalar(
-        "SELECT version FROM project
-         WHERE id = ? AND charter_status = 'charter_backed'
-           AND charter_setup_required = 0 AND current_charter_revision_id = ?",
-    )
-    .bind(&input.project_id)
-    .bind(&input.charter_revision_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or(DbError::VersionConflict)?;
-    if current_project_version != input.expected_project_version {
-        return Err(DbError::VersionConflict);
-    }
-
-    for (milestone_id, expected_definition_id) in input
-        .milestone_ids
-        .iter()
-        .zip(&input.milestone_definition_revision_ids)
-    {
-        let milestone = sqlx::query(
-            "SELECT lifecycle, current_definition_revision_id
-             FROM project_milestone WHERE id = ? AND project_id = ?",
-        )
-        .bind(milestone_id)
-        .bind(&input.project_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(DbError::VersionConflict)?;
-        let current_definition_id: Option<String> =
-            milestone.try_get("current_definition_revision_id")?;
-        if current_definition_id.as_deref() != Some(expected_definition_id.as_str()) {
-            return Err(DbError::VersionConflict);
-        }
-        let definition_lifecycle: String = sqlx::query_scalar(
-            "SELECT lifecycle FROM project_milestone_revision
-             WHERE id = ? AND milestone_id = ?",
-        )
-        .bind(expected_definition_id)
-        .bind(milestone_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(DbError::VersionConflict)?;
-        if definition_lifecycle == "proposed" {
-            sqlx::query(
-                "UPDATE project_milestone_revision SET lifecycle = 'approved'
-                 WHERE id = ? AND milestone_id = ? AND lifecycle = 'proposed'",
-            )
-            .bind(expected_definition_id)
-            .bind(milestone_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(orchestration_write_error)?;
-        } else if definition_lifecycle != "approved" {
-            return Err(DbError::VersionConflict);
-        }
-    }
-
-    let prior_active: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM project_execution_baseline
-         WHERE project_id = ? AND lifecycle = 'active' AND id != ? LIMIT 1",
-    )
-    .bind(&input.project_id)
-    .bind(&input.baseline_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if let Some(prior_active) = prior_active {
-        sqlx::query(
-            "UPDATE project_execution_baseline
-             SET lifecycle = 'superseded', version = version + 1, updated_at = ?
-             WHERE id = ? AND lifecycle = 'active'",
-        )
-        .bind(&input.updated_at)
-        .bind(&prior_active)
-        .execute(&mut *tx)
-        .await
-        .map_err(orchestration_write_error)?;
-    }
-
-    let active = sqlx::query(
-        "UPDATE project_execution_baseline
-         SET lifecycle = 'active', current_revision_id = ?,
-             version = version + 1, updated_at = ?
-         WHERE id = ? AND project_id = ? AND version = ?
-           AND lifecycle IN ('approved', 'active', 'proposed')",
-    )
-    .bind(&input.revision_id)
-    .bind(&input.updated_at)
-    .bind(&input.baseline_id)
-    .bind(&input.project_id)
-    .bind(input.expected_baseline_version)
-    .execute(&mut *tx)
-    .await
-    .map_err(orchestration_write_error)?;
-    if active.rows_affected() != 1 {
-        return Err(DbError::VersionConflict);
-    }
-
-    for milestone_id in &input.milestone_ids {
-        let updated = sqlx::query(
-            "UPDATE project_milestone
-             SET lifecycle = CASE WHEN lifecycle = 'planned' THEN 'active' ELSE lifecycle END,
-                 version = version + 1, updated_at = ?
-             WHERE id = ? AND project_id = ?
-               AND lifecycle IN ('planned', 'active', 'ready_for_release', 'released')",
-        )
-        .bind(&input.updated_at)
-        .bind(milestone_id)
-        .bind(&input.project_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(orchestration_write_error)?;
-        if updated.rows_affected() != 1 {
-            return Err(DbError::VersionConflict);
-        }
-    }
-    sqlx::query(
-        "UPDATE project_execution_baseline_revision SET lifecycle = 'superseded'
-         WHERE baseline_id = ? AND lifecycle = 'approved' AND id != ?",
-    )
-    .bind(&input.baseline_id)
-    .bind(&input.revision_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(orchestration_write_error)?;
-    let project_update = sqlx::query(
-        "UPDATE project
-         SET primary_milestone_id = COALESCE(
-                 primary_milestone_id,
-                 (SELECT id FROM project_milestone
-                  WHERE id = ? AND project_id = ? AND lifecycle = 'active')),
-             version = version + 1, updated_at = ?
-         WHERE id = ? AND version = ?",
-    )
-    .bind(input.primary_milestone_id.as_deref())
-    .bind(&input.project_id)
-    .bind(&input.updated_at)
-    .bind(&input.project_id)
-    .bind(input.expected_project_version)
-    .execute(&mut *tx)
-    .await
-    .map_err(orchestration_write_error)?;
-    if project_update.rows_affected() != 1 {
-        return Err(DbError::VersionConflict);
-    }
-    let consumed = sqlx::query(
-        "UPDATE project_execution_baseline_approval
-         SET lifecycle = 'consumed', updated_at = ?
-         WHERE id = ? AND lifecycle = 'active'",
-    )
-    .bind(&input.updated_at)
-    .bind(&input.approval_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(orchestration_write_error)?;
-    if consumed.rows_affected() != 1 {
-        return Err(DbError::VersionConflict);
-    }
-
-    freeze_baseline_receipt_outcome(
-        &mut owned_receipt,
-        &mut owned_action_execution,
-        &input.baseline_id,
-        &input.revision_id,
-        0,
-        "active",
-        input.expected_baseline_version + 1,
-        false,
-        "",
-        "",
-        "",
-        &input.content_digest,
-        &input.rendered_digest,
-    )?;
-    let command_receipt = owned_receipt.as_ref();
-    let outcome = command_receipt
-        .map(|receipt| receipt.outcome_json.clone())
-        .unwrap_or_else(|| {
-            serde_json::json!({
-                "operation": "activate",
-                "project_id": input.project_id,
-                "baseline_id": input.baseline_id,
-                "revision_id": input.revision_id,
-                "approval_id": input.approval_id,
-                "content_digest": input.content_digest,
-                "render_digest": input.rendered_digest,
-                "domain_committed": true
-            })
-            .to_string()
-        });
-    let (actor_type, actor_id, correlation_id, causation_id, causation_depth) =
-        command_event_provenance(
-            command_receipt,
-            "user".to_owned(),
-            None,
-            input.idempotency_key.clone(),
-            None,
-            0,
-        );
-    let event = CreateDomainEvent {
-        id: new_uuid_v4(),
-        // This event name is consumed by WakeTurnConsumer and is part of the
-        // existing public event contract.
-        event_type: "project.execution_baseline.activated".to_owned(),
-        entity_type: "execution_baseline".to_owned(),
-        entity_id: input.baseline_id.clone(),
-        actor_type,
-        actor_id,
-        scope_type: "project".to_owned(),
-        scope_id: input.project_id.clone(),
-        correlation_id,
-        causation_id,
-        causation_depth,
-        dedupe_key: command_receipt.map(|receipt| {
-            format!(
-                "execution-baseline:{}:{}",
-                receipt.operation, receipt.idempotency_key
-            )
-        }),
-        payload_json: serde_json::json!({
-            "operation": "activate",
-            "project_id": input.project_id,
-            "baseline_id": input.baseline_id,
-            "revision_id": input.revision_id,
-            "approval_id": input.approval_id,
-            "result": serde_json::from_str::<serde_json::Value>(&outcome)
-                .unwrap_or_else(|_| serde_json::json!({"domain_committed": true})),
-        })
-        .to_string(),
-        created_at: input.updated_at.clone(),
-    };
-    DomainEventRepo::append_event_in_tx(db, &mut tx, &event).await?;
-    finalize_command_in_tx(
-        db,
-        &mut tx,
-        &event.id,
-        owned_receipt,
-        owned_action_execution,
-    )
-    .await?;
-    let row = sqlx::query("SELECT * FROM project_execution_baseline WHERE id = ?")
-        .bind(&input.baseline_id)
-        .fetch_one(&mut *tx)
-        .await?;
-    let baseline = map_baseline(row)?;
-    tx.commit().await?;
-    Ok(baseline)
-}
-
-/// Atomic baseline-review acceptance (D18, F13). This is deliberately
-/// not a thin wrapper around the two standalone commands above: D3 requires
-/// one commit for the whole gesture, so the approval and activation domain
-/// mutations, both durable events, and the single frozen command receipt
-/// share one `BEGIN IMMEDIATE` transaction.  Every CAS guard below matches
-/// its standalone counterpart exactly; the only narrowing is that this
-/// command only ever targets a revision that is still `proposed` on a
-/// baseline that is still `proposed` -- the fresh-proposal path this gesture
-/// exists for. Approving an already-active baseline's amendment keeps using
-/// the separate approve/activate pair.
-async fn approve_and_activate_project_execution_baseline_command(
-    db: &SqliteDb,
-    input: ApproveAndActivateProjectExecutionBaselineCommand,
-) -> Result<ProjectExecutionBaselineRecord> {
-    let mut tx = crate::begin_immediate(db.pool()).await?;
-    let mut owned_receipt = input.command_receipt.clone();
-    let mut owned_action_execution = input.action_execution.clone();
-    let command_receipt = owned_receipt.as_ref();
-    validate_command_scope(command_receipt, "project", &input.project_id)?;
-
-    // Idempotent replay: once the receipt exists it is the sole authority,
-    // even if this exact revision has since been superseded by a later
-    // activation -- the caller asked "is my committed command's outcome
-    // durable", not "is my revision still the newest".
-    if let Some(receipt) = resolve_command_replay(db, &mut tx, command_receipt).await? {
-        let baseline_id = command_outcome_string(&receipt, "baseline_id")?;
-        let revision_id = command_outcome_string(&receipt, "revision_id")?;
-        validate_replay_action_bundle(&mut tx, &receipt, owned_action_execution.as_ref()).await?;
-        let row = sqlx::query(
-            "SELECT * FROM project_execution_baseline
-             WHERE id = ? AND project_id = ?",
-        )
-        .bind(&baseline_id)
-        .bind(&input.project_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(DbError::IdempotencyConflict)?;
-        let baseline = map_baseline(row)?;
-        if baseline.current_revision_id.as_deref() != Some(revision_id.as_str())
-            && baseline.lifecycle != "superseded"
-        {
-            return Err(DbError::IdempotencyConflict);
-        }
-        tx.commit().await?;
-        return Ok(baseline);
-    }
-    ensure_baseline_reconciliation_clear_in_tx(&mut tx, &input.project_id, false).await?;
-
-    if let Some(receipt) = command_receipt {
-        if receipt.principal_type != "user"
-            || receipt.principal_id != input.principal_id
-            || receipt.operation != "project.execution_baseline.approve_and_activate"
-        {
-            return Err(DbError::VersionConflict);
-        }
-    }
-    if input.principal_type != "user"
-        || input.principal_id.trim().is_empty()
-        || input.authorization_basis.trim().is_empty()
-        || input.explicit_event.trim().is_empty()
-        || !valid_authorization_timestamp(&input.authorization_occurred_at)
-    {
-        return Err(DbError::VersionConflict);
-    }
-
-    // ---- approve the exact proposed revision -------------------------------
-    let baseline_row = sqlx::query(
-        "SELECT project_id, lifecycle, version
-         FROM project_execution_baseline WHERE id = ?",
-    )
-    .bind(&input.baseline_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or(DbError::NotFound)?;
-    let baseline_project_id: String = baseline_row.try_get("project_id")?;
-    if baseline_project_id != input.project_id {
-        return Err(DbError::VersionConflict);
-    }
-    let baseline_lifecycle: String = baseline_row.try_get("lifecycle")?;
-    let baseline_version: i64 = baseline_row.try_get("version")?;
-    if baseline_version != input.expected_baseline_version || baseline_lifecycle != "proposed" {
-        return Err(DbError::VersionConflict);
-    }
-    let project_version: i64 = sqlx::query_scalar("SELECT version FROM project WHERE id = ?")
-        .bind(&input.project_id)
-        .fetch_one(&mut *tx)
-        .await?;
-    if project_version != input.expected_project_version {
-        return Err(DbError::VersionConflict);
-    }
-    let revision_row = sqlx::query(
-        "SELECT lifecycle, content_digest, rendered_digest
-         FROM project_execution_baseline_revision
-         WHERE id = ? AND baseline_id = ?",
-    )
-    .bind(&input.revision_id)
-    .bind(&input.baseline_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or(DbError::NotFound)?;
-    if revision_row.try_get::<String, _>("lifecycle")? != "proposed"
-        || revision_row.try_get::<String, _>("content_digest")? != input.content_digest
-        || revision_row.try_get::<String, _>("rendered_digest")? != input.rendered_digest
-    {
-        return Err(DbError::VersionConflict);
-    }
-    validate_persisted_baseline_manifest_in_tx(
-        &mut tx,
-        &input.project_id,
-        &input.baseline_id,
-        &input.revision_id,
-        true,
-    )
-    .await?;
-
-    // A fresh proposal never leaves a stray 'approved' revision or 'active'
-    // approval behind, but the standalone approve command guards against it
-    // defensively; mirror that guard here rather than assuming it away.
-    sqlx::query(
-        "UPDATE project_execution_baseline_revision SET lifecycle = 'superseded'
-         WHERE baseline_id = ? AND lifecycle = 'approved' AND id != ?",
-    )
-    .bind(&input.baseline_id)
-    .bind(&input.revision_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(orchestration_write_error)?;
-    let approved_revision = sqlx::query(
-        "UPDATE project_execution_baseline_revision SET lifecycle = 'approved'
-         WHERE id = ? AND baseline_id = ? AND lifecycle = 'proposed'",
-    )
-    .bind(&input.revision_id)
-    .bind(&input.baseline_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(orchestration_write_error)?;
-    if approved_revision.rows_affected() != 1 {
-        return Err(DbError::VersionConflict);
-    }
-    let approved_baseline = sqlx::query(
-        "UPDATE project_execution_baseline
-         SET lifecycle = 'approved', current_revision_id = ?,
-             version = version + 1, updated_at = ?
-         WHERE id = ? AND version = ? AND lifecycle = 'proposed'",
-    )
-    .bind(&input.revision_id)
-    .bind(&input.updated_at)
-    .bind(&input.baseline_id)
-    .bind(input.expected_baseline_version)
-    .execute(&mut *tx)
-    .await
-    .map_err(orchestration_write_error)?;
-    if approved_baseline.rows_affected() != 1 {
-        return Err(DbError::VersionConflict);
-    }
-    sqlx::query(
-        "UPDATE project_execution_baseline_approval
-         SET lifecycle = 'revoked', updated_at = ?
-         WHERE baseline_id = ? AND lifecycle = 'active' AND revision_id != ?",
-    )
-    .bind(&input.updated_at)
-    .bind(&input.baseline_id)
-    .bind(&input.revision_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(orchestration_write_error)?;
-    sqlx::query(
-        "INSERT INTO project_execution_baseline_approval (
-            id, baseline_id, revision_id, expected_project_version,
-            principal_type, principal_id, authorization_basis,
-            authorization_action, authorization_occurred_at, explicit_event,
-            content_digest, rendered_digest, lifecycle, idempotency_key,
-            created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)",
-    )
-    .bind(&input.approval_id)
-    .bind(&input.baseline_id)
-    .bind(&input.revision_id)
-    .bind(input.expected_project_version)
-    .bind(&input.principal_type)
-    .bind(&input.principal_id)
-    .bind(&input.authorization_basis)
-    .bind("project.execution_baseline.approve")
-    .bind(&input.authorization_occurred_at)
-    .bind(&input.explicit_event)
-    .bind(&input.content_digest)
-    .bind(&input.rendered_digest)
-    .bind(&input.idempotency_key)
-    .bind(&input.created_at)
-    .bind(&input.updated_at)
-    .execute(&mut *tx)
-    .await
-    .map_err(orchestration_write_error)?;
-
-    let (
-        approve_actor_type,
-        approve_actor_id,
-        approve_correlation_id,
-        approve_causation_id,
-        approve_causation_depth,
-    ) = command_event_provenance(
-        command_receipt,
-        input.principal_type.clone(),
-        Some(input.principal_id.clone()),
-        input.approval_id.clone(),
-        None,
-        0,
-    );
-    let approved_event = CreateDomainEvent {
-        id: new_uuid_v4(),
-        event_type: "project.execution_baseline.approved".to_owned(),
-        entity_type: "execution_baseline".to_owned(),
-        entity_id: input.baseline_id.clone(),
-        actor_type: approve_actor_type,
-        actor_id: approve_actor_id,
-        scope_type: "project".to_owned(),
-        scope_id: input.project_id.clone(),
-        correlation_id: approve_correlation_id,
-        causation_id: approve_causation_id,
-        causation_depth: approve_causation_depth,
-        dedupe_key: command_receipt.map(|receipt| {
-            format!(
-                "execution-baseline:{}:approved:{}",
-                receipt.operation, receipt.idempotency_key
-            )
-        }),
-        payload_json: serde_json::json!({
-            "operation": "approve",
-            "baseline_id": input.baseline_id,
-            "revision_id": input.revision_id,
-            "approval_id": input.approval_id,
-        })
-        .to_string(),
-        created_at: input.created_at.clone(),
-    };
-    DomainEventRepo::append_event_in_tx(db, &mut tx, &approved_event).await?;
-
-    // ---- activate the just-approved revision -------------------------------
-    let expected_baseline_version_after_approve = input.expected_baseline_version + 1;
-
-    if input.milestone_ids.is_empty()
-        || input.milestone_ids.len() != input.milestone_definition_revision_ids.len()
-        || input.milestone_ids.iter().any(|id| id.trim().is_empty())
-        || input
-            .milestone_definition_revision_ids
-            .iter()
-            .any(|id| id.trim().is_empty())
-        || input.milestone_ids.iter().enumerate().any(|(index, id)| {
-            input
-                .milestone_ids
-                .iter()
-                .take(index)
-                .any(|prior| prior == id)
-        })
-        || input
-            .milestone_definition_revision_ids
-            .iter()
-            .enumerate()
-            .any(|(index, id)| {
-                input
-                    .milestone_definition_revision_ids
-                    .iter()
-                    .take(index)
-                    .any(|prior| prior == id)
-            })
-    {
-        return Err(DbError::VersionConflict);
-    }
-    if input
-        .primary_milestone_id
-        .as_deref()
-        .is_some_and(|id| !input.milestone_ids.iter().any(|candidate| candidate == id))
-    {
-        return Err(DbError::VersionConflict);
-    }
-
-    for (milestone_id, expected_definition_id) in input
-        .milestone_ids
-        .iter()
-        .zip(&input.milestone_definition_revision_ids)
-    {
-        let milestone = sqlx::query(
-            "SELECT lifecycle, current_definition_revision_id
-             FROM project_milestone WHERE id = ? AND project_id = ?",
-        )
-        .bind(milestone_id)
-        .bind(&input.project_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(DbError::VersionConflict)?;
-        let current_definition_id: Option<String> =
-            milestone.try_get("current_definition_revision_id")?;
-        if current_definition_id.as_deref() != Some(expected_definition_id.as_str()) {
-            return Err(DbError::VersionConflict);
-        }
-        let definition_lifecycle: String = sqlx::query_scalar(
-            "SELECT lifecycle FROM project_milestone_revision
-             WHERE id = ? AND milestone_id = ?",
-        )
-        .bind(expected_definition_id)
-        .bind(milestone_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(DbError::VersionConflict)?;
-        if definition_lifecycle == "proposed" {
-            sqlx::query(
-                "UPDATE project_milestone_revision SET lifecycle = 'approved'
-                 WHERE id = ? AND milestone_id = ? AND lifecycle = 'proposed'",
-            )
-            .bind(expected_definition_id)
-            .bind(milestone_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(orchestration_write_error)?;
-        } else if definition_lifecycle != "approved" {
-            return Err(DbError::VersionConflict);
-        }
-    }
-
-    let prior_active: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM project_execution_baseline
-         WHERE project_id = ? AND lifecycle = 'active' AND id != ? LIMIT 1",
-    )
-    .bind(&input.project_id)
-    .bind(&input.baseline_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if let Some(prior_active) = prior_active {
-        sqlx::query(
-            "UPDATE project_execution_baseline
-             SET lifecycle = 'superseded', version = version + 1, updated_at = ?
-             WHERE id = ? AND lifecycle = 'active'",
-        )
-        .bind(&input.updated_at)
-        .bind(&prior_active)
-        .execute(&mut *tx)
-        .await
-        .map_err(orchestration_write_error)?;
-    }
-
-    let active = sqlx::query(
-        "UPDATE project_execution_baseline
-         SET lifecycle = 'active', current_revision_id = ?,
-             version = version + 1, updated_at = ?
-         WHERE id = ? AND project_id = ? AND version = ? AND lifecycle = 'approved'",
-    )
-    .bind(&input.revision_id)
-    .bind(&input.updated_at)
-    .bind(&input.baseline_id)
-    .bind(&input.project_id)
-    .bind(expected_baseline_version_after_approve)
-    .execute(&mut *tx)
-    .await
-    .map_err(orchestration_write_error)?;
-    if active.rows_affected() != 1 {
-        return Err(DbError::VersionConflict);
-    }
-
-    for milestone_id in &input.milestone_ids {
-        let updated = sqlx::query(
-            "UPDATE project_milestone
-             SET lifecycle = CASE WHEN lifecycle = 'planned' THEN 'active' ELSE lifecycle END,
-                 version = version + 1, updated_at = ?
-             WHERE id = ? AND project_id = ?
-               AND lifecycle IN ('planned', 'active', 'ready_for_release', 'released')",
-        )
-        .bind(&input.updated_at)
-        .bind(milestone_id)
-        .bind(&input.project_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(orchestration_write_error)?;
-        if updated.rows_affected() != 1 {
-            return Err(DbError::VersionConflict);
-        }
-    }
-    sqlx::query(
-        "UPDATE project_execution_baseline_revision SET lifecycle = 'superseded'
-         WHERE baseline_id = ? AND lifecycle = 'approved' AND id != ?",
-    )
-    .bind(&input.baseline_id)
-    .bind(&input.revision_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(orchestration_write_error)?;
-    let project_update = sqlx::query(
-        "UPDATE project
-         SET primary_milestone_id = COALESCE(
-                 primary_milestone_id,
-                 (SELECT id FROM project_milestone
-                  WHERE id = ? AND project_id = ? AND lifecycle = 'active')),
-             version = version + 1, updated_at = ?
-         WHERE id = ? AND version = ?",
-    )
-    .bind(input.primary_milestone_id.as_deref())
-    .bind(&input.project_id)
-    .bind(&input.updated_at)
-    .bind(&input.project_id)
-    .bind(input.expected_project_version)
-    .execute(&mut *tx)
-    .await
-    .map_err(orchestration_write_error)?;
-    if project_update.rows_affected() != 1 {
-        return Err(DbError::VersionConflict);
-    }
-    let consumed = sqlx::query(
-        "UPDATE project_execution_baseline_approval
-         SET lifecycle = 'consumed', updated_at = ?
-         WHERE id = ? AND lifecycle = 'active'",
-    )
-    .bind(&input.updated_at)
-    .bind(&input.approval_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(orchestration_write_error)?;
-    if consumed.rows_affected() != 1 {
-        return Err(DbError::VersionConflict);
-    }
-
-    freeze_baseline_receipt_outcome(
-        &mut owned_receipt,
-        &mut owned_action_execution,
-        &input.baseline_id,
-        &input.revision_id,
-        0,
-        "active",
-        expected_baseline_version_after_approve + 1,
-        false,
-        "",
-        "",
-        "",
-        &input.content_digest,
-        &input.rendered_digest,
-    )?;
-    let command_receipt = owned_receipt.as_ref();
-    let outcome = command_receipt
-        .map(|receipt| receipt.outcome_json.clone())
-        .unwrap_or_else(|| {
-            serde_json::json!({
-                "operation": "approve_and_activate",
-                "project_id": input.project_id,
-                "baseline_id": input.baseline_id,
-                "revision_id": input.revision_id,
-                "approval_id": input.approval_id,
-                "content_digest": input.content_digest,
-                "render_digest": input.rendered_digest,
-                "domain_committed": true
-            })
-            .to_string()
-        });
-    let (actor_type, actor_id, correlation_id, causation_id, causation_depth) =
-        command_event_provenance(
-            command_receipt,
-            "user".to_owned(),
-            None,
-            input.idempotency_key.clone(),
-            None,
-            0,
-        );
-    let activated_event = CreateDomainEvent {
-        id: new_uuid_v4(),
-        // This event name is consumed by WakeTurnConsumer and is part of the
-        // existing public event contract.
-        event_type: "project.execution_baseline.activated".to_owned(),
-        entity_type: "execution_baseline".to_owned(),
-        entity_id: input.baseline_id.clone(),
-        actor_type,
-        actor_id,
-        scope_type: "project".to_owned(),
-        scope_id: input.project_id.clone(),
-        correlation_id,
-        causation_id,
-        causation_depth,
-        dedupe_key: command_receipt.map(|receipt| {
-            format!(
-                "execution-baseline:{}:{}",
-                receipt.operation, receipt.idempotency_key
-            )
-        }),
-        payload_json: serde_json::json!({
-            "operation": "approve_and_activate",
-            "project_id": input.project_id,
-            "baseline_id": input.baseline_id,
-            "revision_id": input.revision_id,
-            "approval_id": input.approval_id,
-            "result": serde_json::from_str::<serde_json::Value>(&outcome)
-                .unwrap_or_else(|_| serde_json::json!({"domain_committed": true})),
-        })
-        .to_string(),
-        created_at: input.updated_at.clone(),
-    };
-    DomainEventRepo::append_event_in_tx(db, &mut tx, &activated_event).await?;
-    finalize_command_in_tx(
-        db,
-        &mut tx,
-        &activated_event.id,
-        owned_receipt,
-        owned_action_execution,
-    )
-    .await?;
-    let row = sqlx::query("SELECT * FROM project_execution_baseline WHERE id = ?")
-        .bind(&input.baseline_id)
-        .fetch_one(&mut *tx)
-        .await?;
-    let baseline = map_baseline(row)?;
-    tx.commit().await?;
-    Ok(baseline)
-}
-
-#[cfg(test)]
-mod direct_project_command_tests {
-    use super::{direct_project_command_permission, is_direct_project_command_operation};
-
-    #[test]
-    fn direct_operation_catalog_includes_the_baseline_proposal_receipt_name() {
-        assert!(is_direct_project_command_operation(
-            "project.execution_baseline.propose_for_approval"
-        ));
-        assert!(is_direct_project_command_operation("task.adaptive"));
-        assert_eq!(
-            direct_project_command_permission("task.adaptive"),
-            Some("propose_task")
-        );
-        assert_eq!(
-            direct_project_command_permission("project.document"),
-            Some("propose_project")
-        );
-        assert!(!is_direct_project_command_operation(
-            "project.execution_baseline.propose_approval"
-        ));
     }
 }

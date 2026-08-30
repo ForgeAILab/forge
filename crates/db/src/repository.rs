@@ -1703,6 +1703,9 @@ pub struct CreateAgentContextScope {
     pub authority_json: String,
     pub created_at: String,
     pub updated_at: String,
+    /// Set only for a `project_verify` scope, which owns its workspace
+    /// directly rather than through the Task `workspace` table.
+    pub workspace_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2264,6 +2267,15 @@ pub struct CreateTaskComment {
     pub author_id: Option<String>,
     pub author_name: String,
     pub content: String,
+    /// Execution that produced this entry, when an agent worklog append wrote
+    /// it. User-authored comments carry no execution provenance.
+    pub execution_id: Option<String>,
+    /// Workflow role holding the workspace when the entry was written.
+    pub role: Option<String>,
+    /// `progress`, `decision`, `validation`, or `blocker` for a worklog entry.
+    pub worklog_kind: Option<String>,
+    /// Server-derived key so a retried turn appends once.
+    pub idempotency_key: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

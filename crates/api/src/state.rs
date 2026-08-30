@@ -247,6 +247,16 @@ impl AppState {
         );
         execution_events.set_task_service(Arc::downgrade(&task_service));
         embedded_agent_service.set_task_service(Arc::clone(&task_service));
+        // Task sessions capture evidence into the same media store the user
+        // upload routes write to, so a captured artifact and an uploaded one
+        // are the same kind of asset to everything downstream.
+        embedded_agent_service.set_media_root(effective_config.forge.data_dir.join("media"));
+        // Provisions the Project Agent's disposable verification checkout, so
+        // it can exercise the delivered software instead of reasoning about it.
+        embedded_agent_service.set_workspace_root(
+            workspace_root.clone(),
+            effective_config.forge.data_dir.join("projects"),
+        );
         daemon_connections.set_embedded_execution_context(
             Arc::downgrade(&task_service),
             Arc::clone(&task_executor),
@@ -342,6 +352,16 @@ impl AppState {
     pub fn with_effective_config(mut self, config: ForgeConfig) -> Self {
         self.embedded_agent_service
             .set_public_search_config(Some(config.public_search.clone()));
+        // The constructor only had `ForgeConfig::default()`, so every data-dir
+        // path resolved against `~/.forge` rather than the server's actual
+        // `--data-dir`. Re-point them here, where the real configuration first
+        // becomes available.
+        self.embedded_agent_service
+            .set_media_root(config.forge.data_dir.join("media"));
+        self.embedded_agent_service.set_workspace_root(
+            config.workspace.root.clone(),
+            config.forge.data_dir.join("projects"),
+        );
         self.oauth_service = Arc::new(services::OAuthService::new(
             Arc::clone(&self.db),
             Arc::clone(&self.auth_service),

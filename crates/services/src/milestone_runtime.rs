@@ -7,20 +7,17 @@
 //! cached overview or a previous `ready_for_release` state as release
 //! authority.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use api_types::{
     canonical_digest_with_schema, AcceptanceCheckResultStatus, AcceptanceEvidenceRequirement,
     ArtifactRef, AuthorizationProvenance, EvidenceAttachment, EvidenceAvailability, EvidenceKind,
-    ExecutionBaselineReleasePolicy, MilestoneAcceptanceCheck, MilestoneDefinitionContent,
-    MilestoneDefinitionLifecycle, MilestoneDefinitionRevision, MilestoneLifecycle,
-    MilestoneProjectionReason, MilestoneProjectionReasonKind, PrincipalKind, PrincipalRef,
-    ProjectMilestone, ProjectRelease, ReadinessFreshness, ReadinessFreshnessStatus, ReadinessInput,
-    ReadinessReason, ReadinessResult, ReadinessSnapshot, ReleaseDecisionReference, ReleaseSnapshot,
-    ReleaseTaskReference, ReleaseValidationReference, RevisionProvenance, ValidationResult,
+    MilestoneAcceptanceCheck, MilestoneDefinitionContent, MilestoneDefinitionLifecycle,
+    MilestoneDefinitionRevision, MilestoneLifecycle, MilestoneProjectionReason,
+    MilestoneProjectionReasonKind, PrincipalKind, PrincipalRef, ProjectMilestone, ProjectRelease,
+    ReadinessFreshness, ReadinessFreshnessStatus, ReadinessInput, ReadinessReason, ReadinessResult,
+    ReadinessSnapshot, ReleaseDecisionReference, ReleaseSnapshot, ReleaseTaskReference,
+    ReleaseValidationReference, RevisionProvenance, ValidationResult,
 };
 use chrono::{DateTime, Utc};
 use db::{
@@ -60,223 +57,41 @@ struct ReadinessRecheck {
     task_states: Vec<ReadinessTaskState>,
 }
 
-/// Exact active-baseline inputs that govern one readiness evaluation.
+/// Milestone-internal acceptance contract.
 ///
-/// The acceptance matrix is intentionally retained as typed data here rather
-/// than treated as an opaque part of `baseline_digest`: readiness must fail
-/// closed when the approved baseline names checks that the pinned milestone
-/// definition does not actually contain.
-struct ActiveBaselineInputs {
-    baseline_digest: String,
-    stored_policy_revision: String,
-    release_policy_digest: String,
-    required_check_definition_revisions: Vec<String>,
-    milestone_ids: Vec<String>,
-    milestone_definition_revision_ids: Vec<String>,
-    acceptance_matrix: Vec<AcceptanceEvidenceRequirement>,
-}
-
-fn baseline_definition_contract_reasons(
-    milestone_id: &str,
+/// Readiness authority is the approved Charter plus the milestone's own
+/// acceptance matrix. This check keeps that matrix self-consistent: a
+/// required acceptance check must have a required evidence requirement under
+/// the same stable id, so a milestone cannot demand proof it never asks
+/// anyone to attach.
+fn milestone_definition_contract_reasons(
     definition: &MilestoneDefinitionRevision,
-    baseline: &ActiveBaselineInputs,
 ) -> Vec<ReadinessReason> {
-    let reason = |code: &str, message: String, source_ids: Vec<String>| ReadinessReason {
-        code: code.to_owned(),
-        message,
-        blocking: true,
-        check_id: None,
-        source_ids,
-    };
-
-    if baseline.milestone_ids.len() != baseline.milestone_definition_revision_ids.len() {
-        return vec![reason(
-            "baseline_manifest_reconciliation_required",
-            "reconciliation_required: the active baseline milestone manifest is malformed"
-                .to_owned(),
-            vec![milestone_id.to_owned()],
-        )];
-    }
-    let matching_indices = baseline
-        .milestone_ids
-        .iter()
-        .enumerate()
-        .filter_map(|(index, candidate)| (candidate == milestone_id).then_some(index))
-        .collect::<Vec<_>>();
-    let [index] = matching_indices.as_slice() else {
-        return vec![reason(
-            "baseline_milestone_reconciliation_required",
-            "reconciliation_required: the readiness milestone is not governed exactly once by the active baseline"
-                .to_owned(),
-            vec![milestone_id.to_owned()],
-        )];
-    };
-    if baseline.milestone_definition_revision_ids[*index] != definition.id {
-        return vec![reason(
-            "baseline_definition_reconciliation_required",
-            "reconciliation_required: the active baseline does not pin the milestone's current definition revision"
-                .to_owned(),
-            vec![
-                milestone_id.to_owned(),
-                baseline.milestone_definition_revision_ids[*index].clone(),
-                definition.id.clone(),
-            ],
-        )];
-    }
-
-    let required_check_revisions = baseline
-        .required_check_definition_revisions
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    let acceptance_ids = definition
-        .content
-        .acceptance_checks
-        .iter()
-        .map(|check| check.id.as_str())
-        .collect::<HashSet<_>>();
-    let evidence_ids = definition
-        .content
-        .evidence_requirements
-        .iter()
-        .map(|requirement| requirement.id.as_str())
-        .collect::<HashSet<_>>();
     let mut reasons = Vec::new();
-    let mut matrix_ids = HashSet::<String>::new();
-    for requirement in &baseline.acceptance_matrix {
-        let requirement_id = requirement.id.trim();
-        let check_definition_revision = requirement
-            .check_definition_revision
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        if requirement_id.is_empty()
-            || requirement.description.trim().is_empty()
-            || !matrix_ids.insert(requirement_id.to_owned())
-        {
-            reasons.push(reason(
-                "baseline_matrix_reconciliation_required",
-                "reconciliation_required: the active-baseline acceptance/evidence matrix contains an empty or duplicate requirement"
-                    .to_owned(),
-                vec![requirement.id.clone()],
-            ));
-        }
-        match check_definition_revision {
-            Some(revision) if required_check_revisions.contains(revision) => {}
-            Some(revision) => reasons.push(reason(
-                "baseline_check_definition_reconciliation_required",
-                format!(
-                    "reconciliation_required: active-baseline requirement '{}' references check definition '{}' outside the release policy",
-                    requirement.id, revision
-                ),
-                vec![requirement.id.clone(), revision.to_owned()],
-            )),
-            None => reasons.push(reason(
-                "baseline_check_definition_reconciliation_required",
-                format!(
-                    "reconciliation_required: active-baseline requirement '{}' does not name a check definition revision",
-                    requirement.id
-                ),
-                vec![requirement.id.clone()],
-            )),
-        }
-    }
-
     for check in definition
         .content
         .acceptance_checks
         .iter()
         .filter(|check| check.required)
     {
-        let evidence_requirement = definition
+        if !definition
             .content
             .evidence_requirements
             .iter()
-            .find(|requirement| requirement.required && requirement.id == check.id);
-        let Some(evidence_requirement) = evidence_requirement else {
-            reasons.push(reason(
-                "milestone_evidence_contract_reconciliation_required",
-                format!(
+            .any(|requirement| requirement.required && requirement.id == check.id)
+        {
+            reasons.push(ReadinessReason {
+                code: "milestone_evidence_contract_reconciliation_required".to_owned(),
+                message: format!(
                     "reconciliation_required: required acceptance check '{}' has no required evidence requirement with the same stable id",
                     check.id
                 ),
-                vec![check.id.clone(), definition.id.clone()],
-            ));
-            continue;
-        };
-        let matrix_requirement = baseline
-            .acceptance_matrix
-            .iter()
-            .find(|requirement| requirement.id == check.id);
-        let Some(matrix_requirement) = matrix_requirement else {
-            continue;
-        };
-        if !matrix_requirement.required
-            || matrix_requirement.description != check.description
-            || matrix_requirement.evidence_kind != evidence_requirement.evidence_kind
-            || matrix_requirement.check_definition_revision.as_deref()
-                != Some(definition.id.as_str())
-        {
-            reasons.push(reason(
-                "baseline_requirement_semantics_reconciliation_required",
-                format!(
-                    "reconciliation_required: active-baseline requirement '{}' does not exactly match the pinned milestone check, evidence kind, and definition revision",
-                    check.id
-                ),
-                vec![check.id.clone(), definition.id.clone()],
-            ));
+                blocking: true,
+                check_id: Some(check.id.clone()),
+                source_ids: vec![check.id.clone(), definition.id.clone()],
+            });
         }
     }
-
-    let mut definition_ids = definition
-        .content
-        .acceptance_checks
-        .iter()
-        .filter(|check| check.required)
-        .map(|check| check.id.clone())
-        .chain(
-            definition
-                .content
-                .evidence_requirements
-                .iter()
-                .filter(|requirement| requirement.required)
-                .map(|requirement| requirement.id.clone()),
-        )
-        .collect::<Vec<_>>();
-    definition_ids.sort();
-    definition_ids.dedup();
-    let mut definition_only = definition_ids
-        .iter()
-        .filter(|id| !matrix_ids.contains(id.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut matrix_only = if baseline.milestone_ids.len() == 1 {
-        matrix_ids
-            .iter()
-            .filter(|id| {
-                !acceptance_ids.contains(id.as_str()) && !evidence_ids.contains(id.as_str())
-            })
-            .cloned()
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    definition_only.sort();
-    matrix_only.sort();
-    if !definition_only.is_empty() || !matrix_only.is_empty() {
-        let mut source_ids = definition_only.clone();
-        source_ids.extend(matrix_only.clone());
-        reasons.push(reason(
-            "baseline_requirement_reconciliation_required",
-            format!(
-                "reconciliation_required: active-baseline requirement IDs do not match the pinned milestone definition (definition-only: [{}]; matrix-only: [{}])",
-                definition_only.join(", "),
-                matrix_only.join(", ")
-            ),
-            source_ids,
-        ));
-    }
-
     reasons
 }
 
@@ -449,16 +264,10 @@ impl MilestoneRuntime {
         authorization: &AuthorizationProvenance,
         milestone_id: &str,
         expected_milestone_version: i64,
-        baseline_id: &str,
-        baseline_revision_id: &str,
-        release_policy_revision: &str,
     ) -> crate::Result<ReadinessSnapshot> {
         if expected_milestone_version < 1
             || project_id.trim().is_empty()
             || milestone_id.trim().is_empty()
-            || baseline_id.trim().is_empty()
-            || baseline_revision_id.trim().is_empty()
-            || release_policy_revision.trim().is_empty()
         {
             return Err(crate::ServiceError::InvalidOperation {
                 message: "readiness candidate references are incomplete".to_owned(),
@@ -508,19 +317,7 @@ impl MilestoneRuntime {
         let mut definition = definition_from_record(definition_record, project_id)?;
         self.hydrate_charter_in_tx(&mut tx, project_id, &mut definition)
             .await?;
-        let baseline = self
-            .baseline_inputs_in_tx(
-                &mut tx,
-                project_id,
-                baseline_id,
-                baseline_revision_id,
-                release_policy_revision,
-            )
-            .await?;
-        let baseline_contract_reasons =
-            baseline_definition_contract_reasons(milestone_id, &definition, &baseline);
-        let baseline_digest = baseline.baseline_digest;
-        let release_policy_digest = baseline.release_policy_digest;
+        let definition_contract_reasons = milestone_definition_contract_reasons(&definition);
         let check_results = self
             .check_results_in_tx(
                 &mut tx,
@@ -532,9 +329,6 @@ impl MilestoneRuntime {
                     .charter_revision
                     .as_ref()
                     .map(|charter| charter.revision_id.as_str()),
-                baseline_revision_id,
-                release_policy_revision,
-                &release_policy_digest,
             )
             .await?;
         let evidence = self
@@ -556,11 +350,6 @@ impl MilestoneRuntime {
                 milestone_id,
                 &revision_id,
                 definition.content.charter_revision.as_ref(),
-                baseline_id,
-                baseline_revision_id,
-                &baseline_digest,
-                release_policy_revision,
-                &release_policy_digest,
                 &check_results,
                 &evidence,
                 &waiver_ids,
@@ -573,11 +362,6 @@ impl MilestoneRuntime {
         let evaluation = evaluate_readiness(ReadinessEvaluationInput {
             milestone: project_milestone_from_record(milestone)?,
             definition,
-            baseline_id: baseline_id.to_owned(),
-            baseline_revision_id: baseline_revision_id.to_owned(),
-            baseline_digest,
-            release_policy_revision: release_policy_revision.to_owned(),
-            release_policy_digest,
             source_event_watermark,
             computing_policy_revision: COMPUTING_POLICY_REVISION.to_owned(),
             input_manifest,
@@ -587,7 +371,7 @@ impl MilestoneRuntime {
             task_states,
             document_states,
             commit_build_check_context,
-            baseline_contract_reasons,
+            definition_contract_reasons,
             authorization: authorization.clone(),
         })
         .map_err(map_orchestration_error)?;
@@ -609,9 +393,6 @@ impl MilestoneRuntime {
         authorization: &AuthorizationProvenance,
         milestone_id: &str,
         expected_milestone_version: i64,
-        baseline_id: &str,
-        baseline_revision_id: &str,
-        release_policy_revision: &str,
         idempotency_key: &str,
     ) -> crate::Result<ReadinessSnapshot> {
         if idempotency_key.trim().is_empty() {
@@ -622,8 +403,8 @@ impl MilestoneRuntime {
 
         // Read and write the complete readiness candidate on one connection.
         // SQLite's write transaction is opened before any source reload; this
-        // prevents a check/evidence/baseline mutation from being observed
-        // after the candidate was computed but before the lifecycle CAS.
+        // prevents a check/evidence mutation from being observed after the
+        // candidate was computed but before the lifecycle CAS.
         let mut tx = db::begin_immediate(self.db.pool()).await?;
         if let Some(existing) = sqlx::query(
             "SELECT * FROM project_readiness_snapshot
@@ -638,9 +419,6 @@ impl MilestoneRuntime {
         {
             if existing.milestone_id != milestone_id
                 || existing.expected_milestone_version != expected_milestone_version
-                || existing.baseline_id != baseline_id
-                || existing.baseline_revision_id != baseline_revision_id
-                || existing.release_policy_revision != release_policy_revision
                 || existing.principal_type != principal_kind_name(actor.kind)
                 || existing.principal_id != actor.id
                 || existing.principal_type != principal_kind_name(authorization.principal.kind)
@@ -656,16 +434,6 @@ impl MilestoneRuntime {
             return readiness_from_record(existing);
         }
         validate_authorization(authorization, actor, "project.milestone.readiness")?;
-        if baseline_id.trim().is_empty()
-            || baseline_revision_id.trim().is_empty()
-            || release_policy_revision.trim().is_empty()
-        {
-            return Err(crate::ServiceError::InvalidOperation {
-                message:
-                    "readiness requires explicit active baseline and release-policy references"
-                        .to_owned(),
-            });
-        }
         if actor.kind == PrincipalKind::Agent {
             let bound_agent = self
                 .project_agent_principal_in_tx(&mut tx, project_id)
@@ -717,19 +485,7 @@ impl MilestoneRuntime {
         let mut definition = definition_from_record(definition_record, project_id)?;
         self.hydrate_charter_in_tx(&mut tx, project_id, &mut definition)
             .await?;
-        let baseline = self
-            .baseline_inputs_in_tx(
-                &mut tx,
-                project_id,
-                baseline_id,
-                baseline_revision_id,
-                release_policy_revision,
-            )
-            .await?;
-        let baseline_contract_reasons =
-            baseline_definition_contract_reasons(milestone_id, &definition, &baseline);
-        let baseline_digest = baseline.baseline_digest;
-        let release_policy_digest = baseline.release_policy_digest;
+        let definition_contract_reasons = milestone_definition_contract_reasons(&definition);
         let check_results = self
             .check_results_in_tx(
                 &mut tx,
@@ -741,9 +497,6 @@ impl MilestoneRuntime {
                     .charter_revision
                     .as_ref()
                     .map(|charter| charter.revision_id.as_str()),
-                baseline_revision_id,
-                release_policy_revision,
-                &release_policy_digest,
             )
             .await?;
         let evidence = self
@@ -765,11 +518,6 @@ impl MilestoneRuntime {
                 milestone_id,
                 &revision_id,
                 definition.content.charter_revision.as_ref(),
-                baseline_id,
-                baseline_revision_id,
-                &baseline_digest,
-                release_policy_revision,
-                &release_policy_digest,
                 &check_results,
                 &evidence,
                 &waiver_ids,
@@ -782,11 +530,6 @@ impl MilestoneRuntime {
         let evaluation = evaluate_readiness(ReadinessEvaluationInput {
             milestone: project_milestone_from_record(milestone.clone())?,
             definition,
-            baseline_id: baseline_id.to_owned(),
-            baseline_revision_id: baseline_revision_id.to_owned(),
-            baseline_digest,
-            release_policy_revision: release_policy_revision.to_owned(),
-            release_policy_digest,
             source_event_watermark,
             computing_policy_revision: COMPUTING_POLICY_REVISION.to_owned(),
             input_manifest,
@@ -796,7 +539,7 @@ impl MilestoneRuntime {
             task_states: task_states.clone(),
             document_states: document_states.clone(),
             commit_build_check_context,
-            baseline_contract_reasons,
+            definition_contract_reasons,
             authorization: authorization.clone(),
         })
         .map_err(map_orchestration_error)?;
@@ -1021,7 +764,6 @@ impl MilestoneRuntime {
                 &mut tx,
                 project_id,
                 milestone_id,
-                &candidate_snapshot.baseline_revision_id,
                 definition
                     .content
                     .charter_revision
@@ -1124,12 +866,6 @@ impl MilestoneRuntime {
             || current_candidate.readiness_digest != verified.readiness_digest
             || current_candidate.definition_revision_id
                 != candidate_snapshot.milestone_definition_revision_id
-            || current_candidate.baseline_id != candidate_snapshot.baseline_id
-            || current_candidate.baseline_revision_id != candidate_snapshot.baseline_revision_id
-            || current_candidate.baseline_digest != candidate_snapshot.baseline_digest
-            || current_candidate.release_policy_revision
-                != candidate_snapshot.release_policy_revision
-            || current_candidate.release_policy_digest != candidate_snapshot.release_policy_digest
         {
             return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
         }
@@ -1137,15 +873,14 @@ impl MilestoneRuntime {
             "INSERT INTO project_release (
                 id, project_id, milestone_id, release_sequence, release_revision,
                 release_identifier, milestone_revision_id, readiness_snapshot_id,
-                readiness_digest, baseline_id, baseline_revision_id, baseline_digest,
-                release_policy_revision, release_policy_digest, summary, changelog,
+                readiness_digest, summary, changelog,
                 known_issues_json, charter_revision_id, document_revisions_json, decision_ids_json,
                 task_references_json, validation_references_json, git_references_json,
                 evidence_references_json, waivers_json, releasing_principal_type,
                 releasing_principal_id, authorization_basis, authorization_action,
                 explicit_event, authorization_occurred_at, schema_version,
                 snapshot_digest, idempotency_key, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&release_id)
         .bind(project_id)
@@ -1156,11 +891,6 @@ impl MilestoneRuntime {
         .bind(&snapshot.milestone_definition_revision_id)
         .bind(readiness_snapshot_id)
         .bind(&snapshot.readiness_digest)
-        .bind(&candidate_snapshot.baseline_id)
-        .bind(&candidate_snapshot.baseline_revision_id)
-        .bind(&candidate_snapshot.baseline_digest)
-        .bind(&candidate_snapshot.release_policy_revision)
-        .bind(&candidate_snapshot.release_policy_digest)
         .bind(&snapshot.summary)
         .bind(serde_json::to_string(&snapshot.changelog).map_err(json_error)?)
         .bind(serde_json::to_string(&snapshot.known_issues).map_err(json_error)?)
@@ -1796,100 +1526,6 @@ impl MilestoneRuntime {
         .map_err(crate::ServiceError::from)
     }
 
-    /// Return the exact active/approved baseline and the policy revision it
-    /// actually stores.  An empty baseline is retained as an input for a
-    /// blocked candidate; a ready candidate is rejected later when the
-    /// candidate and recomputation cannot agree on these exact values.
-    async fn baseline_inputs_in_tx(
-        &self,
-        tx: &mut Transaction<'_, Sqlite>,
-        project_id: &str,
-        baseline_id: &str,
-        baseline_revision_id: &str,
-        release_policy_revision: &str,
-    ) -> crate::Result<ActiveBaselineInputs> {
-        if baseline_id.trim().is_empty() || baseline_revision_id.trim().is_empty() {
-            return Err(crate::ServiceError::InvalidOperation {
-                message: "readiness requires explicit baseline and baseline revision references"
-                    .to_owned(),
-            });
-        }
-        let row = sqlx::query(
-            "SELECT b.lifecycle AS baseline_lifecycle,
-                    b.current_revision_id,
-                    r.lifecycle AS revision_lifecycle,
-                    r.content_digest,
-                    r.release_policy_revision,
-                    r.release_policy_digest,
-                    r.release_policy_json,
-                    r.milestone_ids_json,
-                    r.milestone_definition_revision_ids_json,
-                    r.acceptance_matrix_json
-             FROM project_execution_baseline b
-             JOIN project_execution_baseline_revision r
-               ON r.id = ? AND r.baseline_id = b.id
-             WHERE b.id = ? AND b.project_id = ?",
-        )
-        .bind(baseline_revision_id)
-        .bind(baseline_id)
-        .bind(project_id)
-        .fetch_optional(&mut **tx)
-        .await?;
-        let Some(row) = row else {
-            return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
-        };
-        let baseline_lifecycle: String = row.try_get("baseline_lifecycle")?;
-        let current_revision_id: String = row.try_get("current_revision_id")?;
-        let revision_lifecycle: String = row.try_get("revision_lifecycle")?;
-        let stored_policy_revision: String = row.try_get("release_policy_revision")?;
-        let release_policy_json: String = row.try_get("release_policy_json")?;
-        if baseline_lifecycle != "active"
-            || revision_lifecycle != "approved"
-            || current_revision_id != baseline_revision_id
-            || stored_policy_revision != release_policy_revision
-        {
-            return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
-        }
-        let policy_envelope: Value =
-            parse_json_required(&release_policy_json, "execution baseline release policy")?;
-        let policy_value = policy_envelope.get("policy").cloned().ok_or_else(|| {
-            crate::ServiceError::InvalidOperation {
-                message: "execution baseline release policy payload is missing".to_owned(),
-            }
-        })?;
-        let policy: ExecutionBaselineReleasePolicy =
-            serde_json::from_value(policy_value).map_err(json_error)?;
-        let computed_policy_digest =
-            crate::execution_baseline::release_policy_digest(&policy).map_err(json_error)?;
-        if policy.schema_version != crate::EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA
-            || policy.revision != stored_policy_revision
-            || computed_policy_digest != row.try_get::<String, _>("release_policy_digest")?
-        {
-            return Err(crate::ServiceError::InvalidOperation {
-                message: "active baseline contains a malformed release policy reference".to_owned(),
-            });
-        }
-        validate_persisted_release_policy(&policy)?;
-        Ok(ActiveBaselineInputs {
-            baseline_digest: row.try_get("content_digest")?,
-            stored_policy_revision,
-            release_policy_digest: row.try_get("release_policy_digest")?,
-            required_check_definition_revisions: policy.required_check_definition_revisions,
-            milestone_ids: parse_json_required(
-                &row.try_get::<String, _>("milestone_ids_json")?,
-                "execution baseline milestone ids",
-            )?,
-            milestone_definition_revision_ids: parse_json_required(
-                &row.try_get::<String, _>("milestone_definition_revision_ids_json")?,
-                "execution baseline milestone definition revision ids",
-            )?,
-            acceptance_matrix: parse_json_required(
-                &row.try_get::<String, _>("acceptance_matrix_json")?,
-                "execution baseline acceptance/evidence matrix",
-            )?,
-        })
-    }
-
     async fn hydrate_charter_in_tx(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
@@ -1959,9 +1595,6 @@ impl MilestoneRuntime {
         milestone_id: &str,
         definition_revision_id: &str,
         charter_revision_id: Option<&str>,
-        baseline_revision_id: &str,
-        release_policy_revision: &str,
-        release_policy_digest: &str,
     ) -> crate::Result<Vec<ValidationResult>> {
         let rows = sqlx::query(
             "SELECT r.* FROM project_milestone_check_result r
@@ -1979,9 +1612,6 @@ impl MilestoneRuntime {
             project_id,
             definition_revision_id,
             charter_revision_id,
-            baseline_revision_id,
-            release_policy_revision,
-            release_policy_digest,
         )
     }
 
@@ -2109,7 +1739,6 @@ impl MilestoneRuntime {
         tx: &mut Transaction<'_, Sqlite>,
         project_id: &str,
         milestone_id: &str,
-        baseline_revision_id: &str,
         charter_revision_id: Option<&str>,
     ) -> crate::Result<Vec<ReleaseDecisionReference>> {
         let rows = sqlx::query(
@@ -2118,20 +1747,18 @@ impl MilestoneRuntime {
                     principal_type, principal_id, authority_basis,
                     authorization_action, explicit_event,
                     authorization_occurred_at, charter_revision_id,
-                    baseline_revision_id, source_refs_json,
+                    source_refs_json,
                     affected_records_json, supersedes_decision_id, created_at
              FROM project_decision
              WHERE project_id = ? AND state = 'active'
                AND (
                     json_extract(affected_records_json, '$.milestone_id') = ?
-                    OR baseline_revision_id = ?
                     OR (? IS NOT NULL AND charter_revision_id = ?)
                )
              ORDER BY id ASC",
         )
         .bind(project_id)
         .bind(milestone_id)
-        .bind(baseline_revision_id)
         .bind(charter_revision_id)
         .bind(charter_revision_id)
         .fetch_all(&mut **tx)
@@ -2181,7 +1808,6 @@ impl MilestoneRuntime {
                     "decision source_refs",
                 )?;
                 let charter_revision_id: Option<String> = row.try_get("charter_revision_id")?;
-                let baseline_revision_id: Option<String> = row.try_get("baseline_revision_id")?;
                 let supersedes_decision_id: Option<String> =
                     row.try_get("supersedes_decision_id")?;
                 let created_at: String = row.try_get("created_at")?;
@@ -2201,7 +1827,6 @@ impl MilestoneRuntime {
                         "selected_outcome": selected_outcome,
                         "rationale": rationale,
                         "charter_revision_id": charter_revision_id,
-                        "baseline_revision_id": baseline_revision_id,
                         "source_refs": source_refs,
                         "affected_records": affected,
                         "supersedes_decision_id": supersedes_decision_id,
@@ -2295,11 +1920,6 @@ impl MilestoneRuntime {
         milestone_id: &str,
         definition_revision_id: &str,
         charter: Option<&ArtifactRef>,
-        baseline_id: &str,
-        baseline_revision_id: &str,
-        baseline_digest: &str,
-        release_policy_revision: &str,
-        release_policy_digest: &str,
         checks: &[ValidationResult],
         evidence: &[EvidenceAttachment],
         waiver_ids: &[String],
@@ -2411,43 +2031,6 @@ impl MilestoneRuntime {
                 observed_at: charter_source.try_get("created_at")?,
             });
         }
-        if !baseline_id.is_empty() {
-            let baseline_source = sqlx::query(
-                "SELECT b.version, r.created_at
-                 FROM project_execution_baseline b
-                 JOIN project_execution_baseline_revision r
-                   ON r.id = ? AND r.baseline_id = b.id
-                 WHERE b.id = ? AND b.project_id = ? AND b.current_revision_id = r.id",
-            )
-            .bind(baseline_revision_id)
-            .bind(baseline_id)
-            .bind(project_id)
-            .fetch_one(&mut **tx)
-            .await?;
-            inputs.push(ReadinessInput {
-                source_kind: "baseline".to_owned(),
-                source_id: baseline_id.to_owned(),
-                source_version: baseline_source.try_get("version")?,
-                source_digest: baseline_digest.to_owned(),
-                observed_at: baseline_source.try_get("created_at")?,
-            });
-        }
-        let policy_observed_at = if !baseline_id.is_empty() {
-            inputs
-                .iter()
-                .find(|input| input.source_kind == "baseline")
-                .map(|input| input.observed_at.clone())
-                .unwrap_or_else(|| definition_observed_at.clone())
-        } else {
-            definition_observed_at.clone()
-        };
-        inputs.push(ReadinessInput {
-            source_kind: "release_policy".to_owned(),
-            source_id: release_policy_revision.to_owned(),
-            source_version: 1,
-            source_digest: release_policy_digest.to_owned(),
-            observed_at: policy_observed_at,
-        });
         for result in checks {
             inputs.push(ReadinessInput {
                 source_kind: "validation".to_owned(),
@@ -2868,28 +2451,7 @@ impl MilestoneRuntime {
             return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
         }
 
-        let baseline_id = candidate.baseline_id.clone();
-        let baseline_revision_id = candidate.baseline_revision_id.clone();
-        let release_policy_revision = candidate.release_policy_revision.clone();
-        let baseline = self
-            .baseline_inputs_in_tx(
-                tx,
-                project_id,
-                &baseline_id,
-                &baseline_revision_id,
-                &release_policy_revision,
-            )
-            .await?;
-        let baseline_contract_reasons =
-            baseline_definition_contract_reasons(milestone_id, &definition, &baseline);
-        if baseline.stored_policy_revision != release_policy_revision
-            || baseline.baseline_digest != candidate.baseline_digest
-            || baseline.release_policy_digest != candidate.release_policy_digest
-        {
-            return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
-        }
-        let baseline_digest = baseline.baseline_digest;
-        let release_policy_digest = baseline.release_policy_digest;
+        let definition_contract_reasons = milestone_definition_contract_reasons(&definition);
 
         let check_results = self
             .check_results_in_tx(
@@ -2902,9 +2464,6 @@ impl MilestoneRuntime {
                     .charter_revision
                     .as_ref()
                     .map(|charter| charter.revision_id.as_str()),
-                &baseline_revision_id,
-                &release_policy_revision,
-                &release_policy_digest,
             )
             .await?;
         let evidence = self.evidence_in_tx(tx, project_id, milestone_id).await?;
@@ -2922,11 +2481,6 @@ impl MilestoneRuntime {
                 milestone_id,
                 &expected_revision_id,
                 definition.content.charter_revision.as_ref(),
-                &baseline_id,
-                &baseline_revision_id,
-                &baseline_digest,
-                &release_policy_revision,
-                &release_policy_digest,
                 &check_results,
                 &evidence,
                 &waiver_ids,
@@ -2966,11 +2520,6 @@ impl MilestoneRuntime {
                 ..project_milestone_from_record(milestone.clone())?
             },
             definition: definition.clone(),
-            baseline_id,
-            baseline_revision_id,
-            baseline_digest,
-            release_policy_revision,
-            release_policy_digest,
             // Preserve the candidate's immutable diagnostic watermark while
             // recomputing its governed inputs.  The current watermark is
             // returned separately by `readiness_freshness`; using it here
@@ -2984,7 +2533,7 @@ impl MilestoneRuntime {
             task_states: task_states.clone(),
             document_states: document_states.clone(),
             commit_build_check_context,
-            baseline_contract_reasons,
+            definition_contract_reasons,
             authorization: candidate_snapshot.authorization.clone(),
         })
         .map_err(map_orchestration_error)?;
@@ -3155,18 +2704,7 @@ impl MilestoneRuntime {
                 )
             })?;
         let readiness = readiness_from_record(readiness)?;
-        if record.baseline_id.trim().is_empty()
-            || record.baseline_revision_id.trim().is_empty()
-            || record.baseline_digest.trim().is_empty()
-            || record.release_policy_revision.trim().is_empty()
-            || record.release_policy_digest.trim().is_empty()
-            || record.readiness_digest != readiness.readiness_digest
-            || record.baseline_id != readiness.baseline_id
-            || record.baseline_revision_id != readiness.baseline_revision_id
-            || record.baseline_digest != readiness.baseline_digest
-            || record.release_policy_revision != readiness.release_policy_revision
-            || record.release_policy_digest != readiness.release_policy_digest
-        {
+        if record.readiness_digest != readiness.readiness_digest {
             return Err(crate::ServiceError::InvalidOperation {
                 message: "immutable release authority references disagree with readiness"
                     .to_owned(),
@@ -3242,9 +2780,6 @@ impl MilestoneRuntime {
             readiness_snapshot_id: readiness.id,
             readiness_digest: record.readiness_digest.clone(),
             source_event_watermark: readiness.source_event_watermark.clone(),
-            baseline_id: record.baseline_id.clone(),
-            baseline_revision_id: record.baseline_revision_id.clone(),
-            baseline_digest: record.baseline_digest.clone(),
             charter_revision,
             document_revisions: parse_json_required(
                 &record.document_revisions_json,
@@ -3268,8 +2803,6 @@ impl MilestoneRuntime {
             )?,
             evidence_pins: pins,
             waived_check_ids: parse_json_required(&record.waivers_json, "release waivers")?,
-            release_policy_revision: record.release_policy_revision,
-            release_policy_digest: record.release_policy_digest,
             released_by: releasing_principal,
             authorization: release_authorization,
             released_at: record.created_at.clone(),
@@ -3617,9 +3150,6 @@ fn validation_results_from_rows(
     project_id: &str,
     expected_definition_revision_id: &str,
     expected_charter_revision_id: Option<&str>,
-    expected_baseline_revision_id: &str,
-    expected_policy_revision: &str,
-    expected_policy_digest: &str,
 ) -> crate::Result<Vec<ValidationResult>> {
     let mut latest = std::collections::BTreeMap::<String, ValidationResult>::new();
     for row in rows {
@@ -3669,12 +3199,6 @@ fn validation_results_from_rows(
         let manifest_definition_revision_id = source_manifest
             .get("check_definition_revision_id")
             .and_then(Value::as_str);
-        let manifest_policy_revision = source_manifest
-            .get("governing_policy_revision")
-            .and_then(Value::as_str);
-        let manifest_policy_digest = source_manifest
-            .get("governing_policy_digest")
-            .and_then(Value::as_str);
         let manifest_governing_revision_ids: Option<Vec<String>> = source_manifest
             .get("governing_revision_ids")
             .cloned()
@@ -3683,24 +3207,15 @@ fn validation_results_from_rows(
             .map_err(|error| crate::ServiceError::InvalidOperation {
                 message: format!("invalid validation governing revisions: {error}"),
             })?;
-        let expected_governing_revision_ids =
-            expected_charter_revision_id.map(|charter_revision_id| {
-                vec![
-                    charter_revision_id.to_owned(),
-                    expected_baseline_revision_id.to_owned(),
-                ]
-            });
         let persisted_charter_revision_id: Option<String> =
             row.try_get("governing_charter_revision_id")?;
-        let persisted_baseline_revision_id: Option<String> =
-            row.try_get("governing_baseline_revision_id")?;
+        // The approved Charter is the whole governing authority for a result.
+        let expected_revision_ids =
+            expected_charter_revision_id.map(|charter| vec![charter.to_owned()]);
         if definition_revision_id != expected_definition_revision_id
             || manifest_definition_revision_id != Some(expected_definition_revision_id)
-            || manifest_policy_revision != Some(expected_policy_revision)
-            || manifest_policy_digest != Some(expected_policy_digest)
-            || manifest_governing_revision_ids.as_ref() != expected_governing_revision_ids.as_ref()
+            || manifest_governing_revision_ids.as_ref() != expected_revision_ids.as_ref()
             || persisted_charter_revision_id.as_deref() != expected_charter_revision_id
-            || persisted_baseline_revision_id.as_deref() != Some(expected_baseline_revision_id)
         {
             return Err(crate::ServiceError::InvalidOperation {
                 message: "immutable validation result is stale for the active authority".to_owned(),
@@ -4128,9 +3643,6 @@ fn release_snapshot(
         readiness_snapshot_id: readiness.id.clone(),
         readiness_digest: readiness.readiness_digest.clone(),
         source_event_watermark: readiness.source_event_watermark.clone(),
-        baseline_id: readiness.baseline_id.clone(),
-        baseline_revision_id: readiness.baseline_revision_id.clone(),
-        baseline_digest: readiness.baseline_digest.clone(),
         charter_revision,
         document_revisions: definition.content.document_revisions.clone(),
         included_decisions: included_decisions.to_vec(),
@@ -4184,8 +3696,6 @@ fn release_snapshot(
             })
             .collect::<crate::Result<Vec<_>>>()?,
         waived_check_ids: readiness.waiver_ids.clone(),
-        release_policy_revision: readiness.release_policy_revision.clone(),
-        release_policy_digest: readiness.release_policy_digest.clone(),
         released_by: actor.clone(),
         authorization: authorization.clone(),
         released_at: released_at.to_owned(),
@@ -4207,25 +3717,18 @@ async fn insert_readiness(
     sqlx::query(
         "INSERT INTO project_readiness_snapshot (
             id, project_id, milestone_id, definition_revision_id,
-            baseline_id, baseline_revision_id, baseline_digest,
-            release_policy_revision, release_policy_digest,
             input_manifest_json, event_watermark, outcome, blocking_reasons_json,
             check_results_json, waiver_manifest_json, evidence_manifest_json,
             commit_context_json, computing_policy_revision, readiness_digest,
             principal_type, principal_id, authorization_basis, authorization_action,
             expected_milestone_version, explicit_event, authorization_occurred_at,
             idempotency_key, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&snapshot.id)
     .bind(&snapshot.project_id)
     .bind(&snapshot.milestone_id)
     .bind(&snapshot.milestone_definition_revision_id)
-    .bind(&snapshot.baseline_id)
-    .bind(&snapshot.baseline_revision_id)
-    .bind(&snapshot.baseline_digest)
-    .bind(&snapshot.release_policy_revision)
-    .bind(&snapshot.release_policy_digest)
     .bind(serde_json::to_string(&snapshot.input_manifest).map_err(json_error)?)
     .bind(&snapshot.source_event_watermark)
     .bind(readiness_result_name(snapshot.result))
@@ -4548,11 +4051,6 @@ fn readiness_from_record(
         || record.milestone_id.trim().is_empty()
         || record.definition_revision_id.trim().is_empty()
         || record.expected_milestone_version <= 0
-        || record.baseline_id.trim().is_empty()
-        || record.baseline_revision_id.trim().is_empty()
-        || record.baseline_digest.trim().is_empty()
-        || record.release_policy_revision.trim().is_empty()
-        || record.release_policy_digest.trim().is_empty()
         || record.event_watermark.trim().is_empty()
         || record.computing_policy_revision.trim().is_empty()
         || record.readiness_digest.trim().is_empty()
@@ -4668,11 +4166,6 @@ fn readiness_from_record(
         milestone_id: record.milestone_id,
         expected_milestone_version: record.expected_milestone_version,
         milestone_definition_revision_id: record.definition_revision_id,
-        baseline_id: record.baseline_id,
-        baseline_revision_id: record.baseline_revision_id,
-        baseline_digest: record.baseline_digest,
-        release_policy_revision: record.release_policy_revision,
-        release_policy_digest: record.release_policy_digest,
         input_manifest,
         source_event_watermark: record.event_watermark,
         result,
@@ -4698,11 +4191,6 @@ fn readiness_from_record(
 fn readiness_inputs_match(candidate: &ReadinessSnapshot, recomputed: &ReadinessEvaluation) -> bool {
     candidate.expected_milestone_version == recomputed.expected_milestone_version
         && candidate.milestone_definition_revision_id == recomputed.milestone_definition_revision_id
-        && candidate.baseline_id == recomputed.baseline_id
-        && candidate.baseline_revision_id == recomputed.baseline_revision_id
-        && candidate.baseline_digest == recomputed.baseline_digest
-        && candidate.release_policy_revision == recomputed.release_policy_revision
-        && candidate.release_policy_digest == recomputed.release_policy_digest
         && candidate.input_manifest == recomputed.ordered_input_manifest
         && candidate.result == recomputed.result
         && candidate.reasons == recomputed.reasons
@@ -4785,11 +4273,6 @@ fn readiness_record_from_row(
         project_id: row.try_get("project_id")?,
         milestone_id: row.try_get("milestone_id")?,
         definition_revision_id: row.try_get("definition_revision_id")?,
-        baseline_id: row.try_get("baseline_id")?,
-        baseline_revision_id: row.try_get("baseline_revision_id")?,
-        baseline_digest: row.try_get("baseline_digest")?,
-        release_policy_revision: row.try_get("release_policy_revision")?,
-        release_policy_digest: row.try_get("release_policy_digest")?,
         input_manifest_json: row.try_get("input_manifest_json")?,
         event_watermark: row.try_get("event_watermark")?,
         outcome: row.try_get("outcome")?,
@@ -4823,11 +4306,6 @@ fn release_record_from_row(row: sqlx::sqlite::SqliteRow) -> db::Result<ProjectRe
         milestone_revision_id: row.try_get("milestone_revision_id")?,
         readiness_snapshot_id: row.try_get("readiness_snapshot_id")?,
         readiness_digest: row.try_get("readiness_digest")?,
-        baseline_id: row.try_get("baseline_id")?,
-        baseline_revision_id: row.try_get("baseline_revision_id")?,
-        baseline_digest: row.try_get("baseline_digest")?,
-        release_policy_revision: row.try_get("release_policy_revision")?,
-        release_policy_digest: row.try_get("release_policy_digest")?,
         summary: row.try_get("summary")?,
         changelog: row.try_get("changelog")?,
         known_issues_json: row.try_get("known_issues_json")?,
@@ -4932,206 +4410,6 @@ fn valid_authorization_timestamp(value: &str) -> bool {
     };
     let elapsed = Utc::now().signed_duration_since(timestamp.with_timezone(&Utc));
     elapsed.num_seconds().abs() <= MAX_AUTHORIZATION_CLOCK_SKEW_SECONDS
-}
-
-/// The release policy is persisted as a closed typed payload, not as an
-/// arbitrary bag of strings.  Re-validate every admission rule when loading
-/// an active baseline so a corrupt row cannot become readiness authority just
-/// because its digest column happens to match.
-fn validate_persisted_release_policy(policy: &ExecutionBaselineReleasePolicy) -> crate::Result<()> {
-    if policy.schema_version != crate::EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA
-        || policy.revision.trim().is_empty()
-    {
-        return Err(crate::ServiceError::InvalidOperation {
-            message: "active baseline release policy has an invalid schema or revision".to_owned(),
-        });
-    }
-    validate_policy_identifiers(
-        "required_check_definition_revisions",
-        &policy.required_check_definition_revisions,
-        true,
-    )?;
-    validate_policy_literals(
-        "reviewer_independence_rules",
-        &policy.reviewer_independence_rules,
-        &["independent-reviewer"],
-        true,
-    )?;
-    validate_policy_literals(
-        "manual_attestation_rules",
-        &policy.manual_attestation_rules,
-        &["manual-attestation"],
-        false,
-    )?;
-    validate_policy_literals(
-        "waiver_rules",
-        &policy.waiver_rules,
-        &["user-waiver"],
-        false,
-    )?;
-    validate_policy_literals(
-        "evidence_kinds",
-        &policy.evidence_kinds,
-        &[
-            "artifact",
-            "ci-log",
-            "media",
-            "review-report",
-            "test-report",
-        ],
-        true,
-    )?;
-    validate_policy_literals(
-        "evidence_contexts",
-        &policy.evidence_contexts,
-        &[
-            "commit",
-            "external",
-            "milestone",
-            "project",
-            "repository",
-            "task",
-        ],
-        true,
-    )?;
-    validate_policy_literals(
-        "evidence_freshness_rules",
-        &policy.evidence_freshness_rules,
-        &[
-            "current-baseline",
-            "current-charter",
-            "current-commit",
-            "current-milestone",
-        ],
-        true,
-    )?;
-    validate_policy_literals(
-        "dependency_rules",
-        &policy.dependency_rules,
-        &[
-            "dependencies-green",
-            "dependencies-reviewed",
-            "no-blocked-dependencies",
-        ],
-        true,
-    )?;
-    validate_policy_literals(
-        "stale_input_rules",
-        &policy.stale_input_rules,
-        &["stale-baseline-blocks", "stale-evidence-blocks"],
-        true,
-    )?;
-    validate_policy_literals(
-        "forbidden_side_effects",
-        &policy.forbidden_side_effects,
-        &[
-            "credential-access",
-            "cross-project-write",
-            "force-push",
-            "merge",
-            "publish",
-            "release",
-        ],
-        true,
-    )?;
-    validate_policy_literals(
-        "known_issue_rules",
-        &policy.known_issue_rules,
-        &[
-            "known-issue-blocks",
-            "known-issue-waiver",
-            "record-known-issue",
-        ],
-        true,
-    )?;
-    validate_policy_literals(
-        "correction_rules",
-        &policy.correction_rules,
-        &[
-            "correct-before-release",
-            "correction-required",
-            "rerun-failed-checks",
-        ],
-        true,
-    )?;
-    validate_policy_literals(
-        "purge_rules",
-        &policy.purge_rules,
-        &[
-            "purge-invalid-evidence",
-            "purge-revoked-evidence",
-            "purge-stale-evidence",
-        ],
-        true,
-    )?;
-    Ok(())
-}
-
-/// Validate the closed release-policy contract at API admission boundaries.
-/// The same validator is used when a baseline is reloaded for readiness or
-/// release, so manual checks and waivers cannot accept an opaque vector bag
-/// merely because its digest column was recomputed.
-pub fn validate_release_policy(policy: &ExecutionBaselineReleasePolicy) -> Result<(), String> {
-    validate_persisted_release_policy(policy).map_err(|error| error.to_string())
-}
-
-fn validate_policy_identifiers(
-    field: &str,
-    values: &[String],
-    required: bool,
-) -> crate::Result<()> {
-    if required && values.is_empty() {
-        return Err(crate::ServiceError::InvalidOperation {
-            message: format!("active baseline release policy field {field} is empty"),
-        });
-    }
-    let mut seen = HashSet::new();
-    let mut previous: Option<&str> = None;
-    for value in values {
-        if value.trim() != value
-            || value.is_empty()
-            || !value.chars().all(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':')
-            })
-            || !seen.insert(value.as_str())
-            || previous.is_some_and(|previous| previous >= value.as_str())
-        {
-            return Err(crate::ServiceError::InvalidOperation {
-                message: format!("active baseline release policy field {field} is not canonical"),
-            });
-        }
-        previous = Some(value);
-    }
-    Ok(())
-}
-
-fn validate_policy_literals(
-    field: &str,
-    values: &[String],
-    supported: &[&str],
-    required: bool,
-) -> crate::Result<()> {
-    if required && values.is_empty() {
-        return Err(crate::ServiceError::InvalidOperation {
-            message: format!("active baseline release policy field {field} is empty"),
-        });
-    }
-    let mut seen = HashSet::new();
-    let mut previous: Option<&str> = None;
-    for value in values {
-        if value.trim() != value
-            || value.is_empty()
-            || !supported.contains(&value.as_str())
-            || !seen.insert(value.as_str())
-            || previous.is_some_and(|previous| previous >= value.as_str())
-        {
-            return Err(crate::ServiceError::InvalidOperation {
-                message: format!("active baseline release policy field {field} is not canonical"),
-            });
-        }
-        previous = Some(value);
-    }
-    Ok(())
 }
 
 fn map_orchestration_error(error: MilestoneOrchestrationError) -> crate::ServiceError {

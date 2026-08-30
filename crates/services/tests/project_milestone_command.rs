@@ -10,9 +10,9 @@
 use std::sync::Arc;
 
 use api_types::{
-    AcceptanceCheckSourceKind, AcceptanceEvidenceRequirement, ExecutionBaselineReleasePolicy,
-    MilestoneAcceptanceCheck, MilestoneDefinitionContent, MilestoneDefinitionLifecycle,
-    PrincipalKind, PrincipalRef, RevisionProvenance,
+    AcceptanceCheckSourceKind, AcceptanceEvidenceRequirement, MilestoneAcceptanceCheck,
+    MilestoneDefinitionContent, MilestoneDefinitionLifecycle, PrincipalKind, PrincipalRef,
+    RevisionProvenance,
 };
 use db::{
     create_sqlite_pool, run_migrations, AgentActionExecutionStatus, AgentActionPolicyResult,
@@ -28,9 +28,6 @@ use forge_agent_host::{
     PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
 };
 use serde_json::{json, Value};
-use services::execution_baseline::{
-    release_policy_digest, EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA,
-};
 use services::{
     MilestoneRuntime, ProjectCommandAuthorization, ProjectMilestoneCommandService,
     ProjectMilestoneDefinitionCommand, ProjectPrimaryMilestoneCommand,
@@ -43,39 +40,9 @@ const PROFILE_ID: &str = "milestone-command-profile";
 const PROJECT_ID: &str = "milestone-command-project";
 const MILESTONE_ID: &str = "milestone-command-milestone";
 const MILESTONE_REVISION_ID: &str = "milestone-command-revision";
-const BASELINE_ID: &str = "milestone-command-baseline";
-const BASELINE_REVISION_ID: &str = "milestone-command-baseline-revision";
 const CHARTER_ID: &str = "milestone-command-charter";
 const CHARTER_REVISION_ID: &str = "milestone-command-charter-revision";
 const NOW: &str = "2026-08-20T00:00:00.000Z";
-
-fn baseline_release_policy() -> (String, String) {
-    let policy = ExecutionBaselineReleasePolicy {
-        schema_version: EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA.to_owned(),
-        revision: "policy@1".to_owned(),
-        required_check_definition_revisions: vec!["check-1".to_owned()],
-        reviewer_independence_rules: vec!["independent-reviewer".to_owned()],
-        manual_attestation_rules: vec!["manual-attestation".to_owned()],
-        waiver_rules: vec!["user-waiver".to_owned()],
-        evidence_kinds: vec!["test-report".to_owned()],
-        evidence_contexts: vec!["repository".to_owned()],
-        evidence_freshness_rules: vec!["current-commit".to_owned()],
-        dependency_rules: vec!["dependencies-green".to_owned()],
-        stale_input_rules: vec!["stale-baseline-blocks".to_owned()],
-        forbidden_side_effects: vec!["publish".to_owned()],
-        known_issue_rules: vec!["record-known-issue".to_owned()],
-        correction_rules: vec!["correct-before-release".to_owned()],
-        purge_rules: vec!["purge-invalid-evidence".to_owned()],
-    };
-    let digest = release_policy_digest(&policy).expect("baseline policy digest");
-    let envelope = json!({
-        "revision": policy.revision.clone(),
-        "digest": digest.clone(),
-        "policy": policy,
-    })
-    .to_string();
-    (envelope, digest)
-}
 
 async fn database() -> Arc<SqliteDb> {
     let pool = create_sqlite_pool("sqlite::memory:")
@@ -89,7 +56,7 @@ async fn fixture() -> Arc<SqliteDb> {
     fixture_with_acceptance_matrix("[]").await
 }
 
-async fn fixture_with_acceptance_matrix(acceptance_matrix_json: &str) -> Arc<SqliteDb> {
+async fn fixture_with_acceptance_matrix(_acceptance_matrix_json: &str) -> Arc<SqliteDb> {
     let db = database().await;
     UserRepo::create_user(
         &*db,
@@ -255,136 +222,7 @@ async fn fixture_with_acceptance_matrix(acceptance_matrix_json: &str) -> Arc<Sql
     .execute(db.pool())
     .await
     .expect("milestone pointer updates");
-    sqlx::query(
-        "INSERT INTO project_execution_baseline
-            (id, project_id, current_revision_id, lifecycle, version,
-             created_at, updated_at)
-         VALUES (?, ?, ?, 'active', 1, ?, ?)",
-    )
-    .bind(BASELINE_ID)
-    .bind(PROJECT_ID)
-    .bind(BASELINE_REVISION_ID)
-    .bind(NOW)
-    .bind(NOW)
-    .execute(db.pool())
-    .await
-    .expect("baseline creates");
-    let (release_policy_json, release_policy_digest) = baseline_release_policy();
-    sqlx::query(
-        "INSERT INTO project_execution_baseline_revision
-            (id, baseline_id, revision, base_revision, base_revision_id,
-             lifecycle, charter_revision_id, document_revisions_json,
-             plan_items_json, milestone_id, milestone_ids_json,
-             milestone_definition_revision_ids_json, primary_milestone_id,
-             release_policy_json, release_policy_revision,
-             release_policy_digest, acceptance_matrix_json,
-             capability_classes_json, risk_classes_json, adaptive_envelope_json,
-             elevated_operations_json, exclusions_json, rollback_recovery_json,
-             schema_version, render_version, rendered_view, content_digest,
-             rendered_digest, source_refs_json, created_at)
-         VALUES (?, ?, 1, 0, NULL, 'approved', ?, '[]', '[]', ?, ?, ?, NULL,
-                 ?, 'policy@1', ?, ?, '[]', '[]', '{}',
-                 '[]', '[]', '{}', 'baseline@1', 'baseline-render@1',
-                 '# Baseline', 'baseline-digest-1', 'baseline-rendered-1',
-                 '[]', ?)",
-    )
-    .bind(BASELINE_REVISION_ID)
-    .bind(BASELINE_ID)
-    .bind(CHARTER_REVISION_ID)
-    .bind(MILESTONE_ID)
-    .bind(format!("[\"{MILESTONE_ID}\"]"))
-    .bind(format!("[\"{MILESTONE_REVISION_ID}\"]"))
-    .bind(release_policy_json)
-    .bind(release_policy_digest)
-    .bind(acceptance_matrix_json)
-    .bind(NOW)
-    .execute(db.pool())
-    .await
-    .expect("baseline revision creates");
     db
-}
-
-#[tokio::test]
-async fn readiness_persists_reconciliation_when_baseline_matrix_is_absent_from_current_definition()
-{
-    let matrix = json!([{
-        "id": "missing-check",
-        "description": "A check the approved baseline requires",
-        "required": true,
-        "evidence_kind": "test-report",
-        "check_definition_revision": "check-1",
-    }]);
-    let db = fixture_with_acceptance_matrix(&matrix.to_string()).await;
-    let snapshot = ProjectMilestoneCommandService::new(Arc::clone(&db))
-        .request_readiness(readiness_command("inconsistent-baseline"), None)
-        .await
-        .expect("an inconsistent baseline must produce a canonical non-ready snapshot");
-
-    assert_eq!(snapshot.outcome, "blocked");
-    assert!(snapshot
-        .blocking_reasons_json
-        .contains("reconciliation_required"));
-    assert!(snapshot.blocking_reasons_json.contains("missing-check"));
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM project_readiness_snapshot WHERE project_id = ?",
-        )
-        .bind(PROJECT_ID)
-        .fetch_one(db.pool())
-        .await
-        .expect("readiness snapshot count"),
-        1
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM domain_event
-             WHERE scope_type = 'project' AND scope_id = ?
-               AND event_type = 'milestone.readiness.evaluated'",
-        )
-        .bind(PROJECT_ID)
-        .fetch_one(db.pool())
-        .await
-        .expect("readiness event count"),
-        1
-    );
-    let lifecycle: String =
-        sqlx::query_scalar("SELECT lifecycle FROM project_milestone WHERE id = ?")
-            .bind(MILESTONE_ID)
-            .fetch_one(db.pool())
-            .await
-            .expect("milestone lifecycle");
-    assert_eq!(lifecycle, "active");
-    let reconciliation: String =
-        sqlx::query_scalar("SELECT reconciliation_reason_json FROM project_milestone WHERE id = ?")
-            .bind(MILESTONE_ID)
-            .fetch_one(db.pool())
-            .await
-            .expect("milestone reconciliation projection");
-    assert!(reconciliation.contains("reconciliation_required"));
-    assert!(reconciliation.contains("missing-check"));
-
-    let error = ProjectMilestoneCommandService::new(Arc::clone(&db))
-        .request_release(
-            release_command("blocked-release-candidate", &snapshot),
-            None,
-        )
-        .await
-        .expect_err("a blocked readiness result cannot become a release candidate");
-    let message = error.to_string();
-    assert!(message.contains("readiness is blocked"));
-    assert!(message.contains("reconciliation_required"));
-    assert!(message.contains("do not claim Known Issues: None"));
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM command_receipt
-             WHERE operation = ? AND idempotency_key = 'blocked-release-candidate'",
-        )
-        .bind(PROJECT_RELEASE_OPERATION)
-        .fetch_one(db.pool())
-        .await
-        .expect("blocked release candidate receipt count"),
-        0
-    );
 }
 
 struct ReceiptInput<'a> {
@@ -696,11 +534,6 @@ fn readiness_snapshot(id: &str, key: &str) -> CreateProjectReadinessSnapshotComm
             project_id: PROJECT_ID.to_owned(),
             milestone_id: MILESTONE_ID.to_owned(),
             definition_revision_id: MILESTONE_REVISION_ID.to_owned(),
-            baseline_id: BASELINE_ID.to_owned(),
-            baseline_revision_id: BASELINE_REVISION_ID.to_owned(),
-            baseline_digest: "baseline-digest-1".to_owned(),
-            release_policy_revision: "policy@1".to_owned(),
-            release_policy_digest: baseline_release_policy().1,
             input_manifest_json: "[]".to_owned(),
             event_watermark: "watermark-1".to_owned(),
             outcome: "ready".to_owned(),
@@ -734,9 +567,6 @@ fn readiness_command(key: &str) -> ProjectReadinessRequestCommand {
         project_id: PROJECT_ID.to_owned(),
         milestone_id: MILESTONE_ID.to_owned(),
         expected_milestone_version: 1,
-        baseline_id: BASELINE_ID.to_owned(),
-        baseline_revision_id: BASELINE_REVISION_ID.to_owned(),
-        release_policy_revision: "policy@1".to_owned(),
         idempotency_key: key.to_owned(),
         authenticated_user_id: Some(USER_ID.to_owned()),
         authorization: user_authorization("project.milestone.readiness", key),
@@ -1849,7 +1679,7 @@ async fn readiness_freshness_rechecks_inputs_not_project_event_watermarks() {
     .bind(MILESTONE_ID)
     .execute(db.pool())
     .await
-    .expect("mutate governed baseline input");
+    .expect("mutate governed readiness input");
     let stale = runtime
         .readiness_freshness(PROJECT_ID, MILESTONE_ID, &readiness.id)
         .await

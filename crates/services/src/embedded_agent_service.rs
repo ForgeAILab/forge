@@ -49,6 +49,10 @@ pub struct EmbeddedAgentService {
     protected_store: Arc<SqliteProtectedRuntimeStore>,
     native_backend: Arc<NativeAgentRuntimeBackend>,
     tool_provider: Arc<CoordinationToolProvider>,
+    /// Root under which a Project Agent's disposable verification checkout is
+    /// provisioned. Absent until the server wires it, in which case a Project
+    /// Agent keeps its filesystem-denied scope.
+    workspace_root: Arc<std::sync::RwLock<Option<(std::path::PathBuf, std::path::PathBuf)>>>,
 }
 
 /// Create a direct (embedded-runtime) agent referencing an existing provider
@@ -243,6 +247,7 @@ impl EmbeddedAgentService {
             db,
             protected_store,
             native_backend,
+            workspace_root: Arc::new(std::sync::RwLock::new(None)),
             tool_provider,
         }
     }
@@ -257,6 +262,53 @@ impl EmbeddedAgentService {
     /// actions execute inline through the normal Task creation path.
     pub fn set_task_service(&self, task_service: Arc<crate::TaskService>) {
         self.tool_provider.set_task_service(task_service);
+    }
+
+    /// Attach the media storage root so a Task session can capture the
+    /// artifacts its run produced as authoritative evidence.
+    pub fn set_media_root(&self, media_root: std::path::PathBuf) {
+        self.tool_provider.set_media_root(media_root);
+    }
+
+    /// Attach the workspace root used to provision a Project Agent's
+    /// disposable verification checkout, and the data-dir root holding each
+    /// Project's durable `.forge` directory.
+    pub fn set_workspace_root(
+        &self,
+        workspace_root: std::path::PathBuf,
+        project_docs_root: std::path::PathBuf,
+    ) {
+        if let Ok(mut slot) = self.workspace_root.write() {
+            *slot = Some((workspace_root, project_docs_root));
+        }
+    }
+
+    fn workspace_roots(&self) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        self.workspace_root
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
+    /// Resolve the Project Agent's workspace, provisioning it on first use.
+    pub async fn project_agent_workspace(&self, project_id: &str) -> Option<std::path::PathBuf> {
+        let (_, workspaces_root) = self.workspace_roots()?;
+        match crate::task_service::workspace::ensure_project_agent_workspace(
+            &self.db,
+            &workspaces_root,
+            project_id,
+        )
+        .await
+        {
+            Ok(workspace) => workspace,
+            // A Project Agent without a workspace still works; it just cannot
+            // exercise the software. Log rather than swallow, so the reason is
+            // visible instead of showing up later as a denied scope.
+            Err(error) => {
+                tracing::warn!(%error, project_id, "Project Agent workspace unavailable");
+                None
+            }
+        }
     }
 
     pub fn native_backend(&self) -> Arc<NativeAgentRuntimeBackend> {
@@ -1049,10 +1101,20 @@ impl EmbeddedAgentService {
             ));
         }
 
+        // A Project Agent Chat carries its own workspace, so the frozen session
+        // must resolve the same access the turn will assert. Building `Deny`
+        // here and `ProjectVerify` at turn time is a binding mismatch, which
+        // the runtime correctly refuses.
+        let workspace_access = match project_id.as_deref() {
+            Some(project_id) if self.project_agent_workspace(project_id).await.is_some() => {
+                WorkspaceAccess::ProjectVerify
+            }
+            _ => WorkspaceAccess::Deny,
+        };
         let canonical = CanonicalScope {
             scope_type: CanonicalScopeType::AgentChat,
             scope_id: chat_id.clone(),
-            workspace_access: WorkspaceAccess::Deny,
+            workspace_access,
         };
         canonical
             .validate()
@@ -1081,6 +1143,13 @@ impl EmbeddedAgentService {
         authority_json: Value,
     ) -> Result<AgentSession> {
         let now = now_rfc3339();
+        let project_workspace_path = match (canonical.workspace_access, project_id.as_deref()) {
+            (WorkspaceAccess::ProjectVerify, Some(project_id)) => self
+                .project_agent_workspace(project_id)
+                .await
+                .map(|path| path.to_string_lossy().into_owned()),
+            _ => None,
+        };
         let scope = AgentContextScopeRepo::create_context_scope(
             &*self.db,
             CreateAgentContextScope {
@@ -1092,6 +1161,13 @@ impl EmbeddedAgentService {
                 task_id,
                 task_role,
                 workspace_access: workspace_access_name(canonical.workspace_access).to_owned(),
+                // A `project_verify` scope owns its workspace directly; every
+                // other scope leaves this NULL and the Task `workspace` table
+                // stays the authority.
+                workspace_path: match canonical.workspace_access {
+                    WorkspaceAccess::ProjectVerify => project_workspace_path.clone(),
+                    _ => None,
+                },
                 authority_json: authority_json.to_string(),
                 created_at: now.clone(),
                 updated_at: now.clone(),
@@ -1485,10 +1561,23 @@ impl EmbeddedAgentService {
                         return Err(ServiceError::not_found("agent_chat", chat_id.clone()));
                     }
                 }
+                // A Project Agent Chat holds a disposable verification
+                // checkout when the Project has a repository, so the Agent can
+                // exercise the delivered software rather than reason about it.
+                // There is no write tool in that composition and the checkout
+                // is never a delivery worktree.
+                let workspace_access = match chat.project_id.as_deref() {
+                    Some(project_id)
+                        if self.project_agent_workspace(project_id).await.is_some() =>
+                    {
+                        WorkspaceAccess::ProjectVerify
+                    }
+                    _ => WorkspaceAccess::Deny,
+                };
                 Ok(CanonicalScope {
                     scope_type: CanonicalScopeType::AgentChat,
                     scope_id: chat_id.clone(),
-                    workspace_access: WorkspaceAccess::Deny,
+                    workspace_access,
                 })
             }
             RequestedCanonicalScope::Task { task_id, role } => {
@@ -2168,6 +2257,7 @@ fn workspace_access_name(access: WorkspaceAccess) -> &'static str {
         WorkspaceAccess::Deny => "deny",
         WorkspaceAccess::TaskRead => "task_read",
         WorkspaceAccess::TaskWrite => "task_write",
+        WorkspaceAccess::ProjectVerify => "project_verify",
     }
 }
 
@@ -2176,6 +2266,7 @@ fn parse_workspace_access(value: &str) -> Result<WorkspaceAccess> {
         "deny" => Ok(WorkspaceAccess::Deny),
         "task_read" => Ok(WorkspaceAccess::TaskRead),
         "task_write" => Ok(WorkspaceAccess::TaskWrite),
+        "project_verify" => Ok(WorkspaceAccess::ProjectVerify),
         _ => Err(ServiceError::invalid_operation(
             "stored workspace access is invalid",
         )),
@@ -2290,7 +2381,7 @@ fn scope_permission_set(
             WorkspaceAccess::TaskWrite => {
                 vec!["read_task", "read_memory", "task_read", "task_write"]
             }
-            WorkspaceAccess::Deny => Vec::new(),
+            WorkspaceAccess::Deny | WorkspaceAccess::ProjectVerify => Vec::new(),
         },
     };
     if scope.scope_type == CanonicalScopeType::AgentChat && project_agent_chat {

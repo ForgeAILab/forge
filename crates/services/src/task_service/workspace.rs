@@ -375,6 +375,68 @@ async fn create_fresh_workspace(
     Ok(workspace)
 }
 
+/// Ensure the Project Agent's own workspace.
+///
+/// This is the Agent's working directory, not a delivery worktree. It holds
+/// `forge/` -- the durable place it keeps notes, decisions, and helper scripts
+/// that later runs and other agents pick up -- and `checkout/`, a disposable
+/// copy of the repository it can read and run so it can exercise the delivered
+/// software instead of reasoning about whether it works.
+///
+/// `checkout/` is a detached git worktree: a real working copy on no branch,
+/// so it never occupies the task branch namespace and nothing accumulates on
+/// it. The Agent has a shell there, so it can of course run `git` -- what it
+/// does not have is a write tool for source, a branch anything merges, or a
+/// push path. The guarantee is that its edits go nowhere, not that git is
+/// disabled.
+pub async fn ensure_project_agent_workspace(
+    db: &SqliteDb,
+    workspaces_root: &Path,
+    project_id: &str,
+) -> Result<Option<PathBuf>> {
+    // `git worktree add` runs with the repository as its working directory, so
+    // a relative workspaces root (a `--data-dir ./test` server) would resolve
+    // the checkout *inside the repository*. Anchor it absolutely first.
+    let workspaces_root = &std::fs::canonicalize(workspaces_root).unwrap_or_else(|_| {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(workspaces_root))
+            .unwrap_or_else(|_| workspaces_root.to_path_buf())
+    });
+    let workspace = workspaces_root.join(project_id);
+    std::fs::create_dir_all(workspace.join(PROJECT_AGENT_DOCS_DIR)).map_err(|error| {
+        ServiceError::invalid_operation(format!("Project Agent workspace is unavailable: {error}"))
+    })?;
+    let Some(repo_id) = ProjectRepo::get_by_id(db, project_id)
+        .await?
+        .and_then(|project| project.primary_repo_id)
+    else {
+        // No repository yet: the Agent still gets its durable docs directory.
+        return Ok(Some(workspace));
+    };
+    let Some(repo) = RepoRepo::get_by_id(db, &repo_id).await? else {
+        return Ok(Some(workspace));
+    };
+    if !workspace.join(PROJECT_AGENT_CHECKOUT_DIR).is_dir() {
+        let source = resolve_repo_source(&repo, workspaces_root).await?;
+        let manager = WorkspaceManager::new(workspaces_root.to_path_buf());
+        manager
+            .create_detached_worktree_named(
+                &source,
+                project_id,
+                PROJECT_AGENT_CHECKOUT_DIR,
+                &repo.default_branch,
+            )
+            .await
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+    }
+    Ok(Some(workspace))
+}
+
+/// The one directory a Project Agent may write to, inside its workspace.
+pub const PROJECT_AGENT_DOCS_DIR: &str = "forge";
+/// The read-and-run copy of the repository inside that workspace.
+pub const PROJECT_AGENT_CHECKOUT_DIR: &str = "checkout";
+
 async fn resolve_repo_source(repo: &db::Repo, workspace_root: &std::path::Path) -> Result<String> {
     if let Some(local_path) = repo
         .local_path

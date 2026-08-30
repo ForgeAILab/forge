@@ -407,7 +407,7 @@ impl TaskService {
         // create_task_with_governance applies to ordinary split requests.
         if let Some(parent) = parent.as_ref() {
             if let Some(source_governance) = self.adaptive_task_governance(parent).await? {
-                if source_governance.baseline_id.is_some() {
+                if source_governance.charter_revision_id.is_some() {
                     let requested = governance.as_ref().ok_or_else(|| {
                         ServiceError::Conflict(
                             "reconciliation_required: adaptive Task proposal must carry the exact parent governance envelope"
@@ -522,8 +522,6 @@ impl TaskService {
             task_id: task_id.clone(),
             project_id: project_id.clone(),
             charter_revision_id: governance.charter_revision_id,
-            baseline_id: governance.baseline_id,
-            baseline_revision_id: governance.baseline_revision_id,
             plan_item_id: governance.plan_item_id,
             milestone_id: governance.milestone_id,
             document_revisions_json: governance.document_revisions_json,
@@ -820,9 +818,9 @@ impl TaskService {
         // can run.
         let execution_class =
             classify_task_execution(task_type, payload.capability_class.as_deref())?;
-        let requests_baseline_traceability =
+        let requests_milestone_traceability =
             payload.plan_item_id.is_some() || payload.milestone_id.is_some();
-        let has_governance_shorthand = requests_baseline_traceability
+        let has_governance_shorthand = requests_milestone_traceability
             || payload.capability_class.is_some()
             || payload.risk_class.is_some();
         if !execution_class.is_implementation() && !has_governance_shorthand {
@@ -840,37 +838,19 @@ impl TaskService {
         let Some(charter_revision_id) = charter_revision_id else {
             return Ok(None);
         };
-        let row = if requests_baseline_traceability {
-            sqlx::query(
-                "SELECT b.id, b.current_revision_id, r.primary_milestone_id
-             FROM project_execution_baseline b
-             JOIN project_execution_baseline_revision r
-               ON r.id = b.current_revision_id AND r.baseline_id = b.id
-             WHERE b.project_id = ? AND b.lifecycle = 'active'
-               AND r.lifecycle = 'approved'
-             ORDER BY b.updated_at DESC, b.id DESC LIMIT 1",
-            )
-            .bind(project_id)
-            .fetch_optional(self.db.pool())
-            .await?
+        // The Project's own primary milestone pointer is the traceability
+        // default; there is no separate approved artifact to read it from.
+        let primary_milestone_id: Option<String> = if requests_milestone_traceability {
+            sqlx::query_scalar("SELECT primary_milestone_id FROM project WHERE id = ?")
+                .bind(project_id)
+                .fetch_optional(self.db.pool())
+                .await?
+                .flatten()
         } else {
             None
         };
-        let baseline_id = row.as_ref().map(|row| row.try_get("id")).transpose()?;
-        let baseline_revision_id = row
-            .as_ref()
-            .map(|row| row.try_get::<Option<String>, _>("current_revision_id"))
-            .transpose()?
-            .flatten();
-        let primary_milestone_id = row
-            .as_ref()
-            .map(|row| row.try_get::<Option<String>, _>("primary_milestone_id"))
-            .transpose()?
-            .flatten();
         Ok(Some(api_types::TaskGovernanceRequest {
             charter_revision_id: Some(charter_revision_id),
-            baseline_id,
-            baseline_revision_id,
             plan_item_id: payload.plan_item_id.clone(),
             milestone_id: payload.milestone_id.clone().or(primary_milestone_id),
             document_revision_ids: Vec::new(),

@@ -82,6 +82,13 @@ pub struct ProjectValidationCommand {
     pub status: String,
     pub result: String,
     pub input_digest: String,
+    /// The Task whose run produced this observation, when a Task produced it.
+    /// Absent when the Project Agent exercised the software itself in its own
+    /// workspace checkout. When present it is verified, so a named Task is
+    /// always a Task that really ran.
+    pub observed_task_id: Option<String>,
+    /// Optional artifact captured by that Task through `task.evidence`.
+    pub evidence_asset_id: Option<String>,
     pub expected_milestone_version: i64,
     pub idempotency_key: String,
     pub authorization: ProjectCommandAuthorization,
@@ -236,15 +243,57 @@ impl ProjectArtifactCommandService {
                 "a validation result requires an observation and an input digest",
             ));
         }
-        if !matches!(
-            command.status.as_str(),
-            "pass" | "fail" | "blocked" | "stale" | "unavailable"
-        ) {
-            return Err(ServiceError::invalid_operation(
+        // The agent speaks the same acceptance-check vocabulary the user-facing
+        // manual attestation route speaks; the persisted outcome column has its
+        // own narrower vocabulary. Translating here is what makes a recorded
+        // observation land at all -- an untranslated `pass` fails the outcome
+        // CHECK constraint instead of settling the check.
+        let outcome = validation_outcome(&command.status).ok_or_else(|| {
+            ServiceError::invalid_operation(
                 "validation status must be pass, fail, blocked, stale, or unavailable",
-            ));
-        }
+            )
+        })?;
         authorize_project_principal(&self.db, &command.project_id, &command.authorization).await?;
+
+        // A cited Task must be one that really ran. The citation itself is
+        // optional -- the Project Agent can exercise the software in its own
+        // workspace -- but a named Task is always verified, so provenance is
+        // either genuinely absent or genuinely true, never merely asserted.
+        if let Some(observed_task_id) = command.observed_task_id.as_deref() {
+            let observed_task_status: Option<String> = sqlx::query_scalar(
+                "SELECT status FROM task
+                 WHERE id = ? AND project_id = ? AND deleted_at IS NULL",
+            )
+            .bind(observed_task_id)
+            .bind(&command.project_id)
+            .fetch_optional(self.db.pool())
+            .await?;
+            let observed_task_status = observed_task_status.ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "observed_task_id must name a Task in this Project that produced the observation",
+                )
+            })?;
+            if !matches!(observed_task_status.as_str(), "done" | "review" | "merging") {
+                return Err(ServiceError::invalid_operation(
+                    "the observed Task has not produced a delivered result to validate against",
+                ));
+            }
+        }
+        if let Some(asset_id) = command.evidence_asset_id.as_deref() {
+            let asset_belongs: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM media_asset
+                 WHERE id = ? AND project_id = ? AND deleted_at IS NULL",
+            )
+            .bind(asset_id)
+            .bind(&command.project_id)
+            .fetch_optional(self.db.pool())
+            .await?;
+            if asset_belongs.is_none() {
+                return Err(ServiceError::invalid_operation(
+                    "evidence_asset_id must name a captured artifact in this Project",
+                ));
+            }
+        }
 
         let milestone =
             ProjectOrchestrationRepo::get_project_milestone(&*self.db, &command.milestone_id)
@@ -293,31 +342,17 @@ impl ProjectArtifactCommandService {
         }
         let expected_check_version: i64 = check.try_get("version")?;
 
-        // The governing Charter and active approved baseline are the release
-        // authority this observation is bound to. Readiness re-derives both
-        // when it reads the result, so deriving them here keeps a stale caller
-        // from binding a result to authority that has already moved.
+        // The approved Charter is the authority this observation binds to.
+        // Readiness re-derives it when it reads the result, so deriving it
+        // here keeps a stale caller from binding a result to authority that
+        // has already moved.
         let governance = sqlx::query(
-            "SELECT p.current_charter_revision_id,
-                    b.current_revision_id AS baseline_revision_id
-             FROM project p
-             JOIN project_execution_baseline b
-               ON b.project_id = p.id AND b.lifecycle = 'active'
-             JOIN project_execution_baseline_revision r
-               ON r.id = b.current_revision_id AND r.baseline_id = b.id
-              AND r.lifecycle = 'approved'
-             WHERE p.id = ?
-             ORDER BY b.updated_at DESC, b.id DESC
-             LIMIT 1",
+            "SELECT p.current_charter_revision_id FROM project p WHERE p.id = ? LIMIT 1",
         )
         .bind(&command.project_id)
         .fetch_optional(self.db.pool())
         .await?
-        .ok_or_else(|| {
-            ServiceError::conflict(
-                "recording a validation result requires the current active approved execution baseline",
-            )
-        })?;
+        .ok_or_else(|| ServiceError::not_found("project", &command.project_id))?;
         let governing_charter_revision_id: String = governance
             .try_get::<Option<String>, _>("current_charter_revision_id")?
             .filter(|value| !value.trim().is_empty())
@@ -326,21 +361,16 @@ impl ProjectArtifactCommandService {
                     "recording a validation result requires the current approved Project Charter",
                 )
             })?;
-        let governing_baseline_revision_id: String = governance.try_get("baseline_revision_id")?;
-
         let result_id = new_uuid_v4();
         let now = now_rfc3339();
-        let source_manifest = json!({
-            "result": command.result.clone(),
-            "governing_revision_ids": [
-                governing_charter_revision_id.clone(),
-                governing_baseline_revision_id.clone(),
-            ],
-            "check_definition_revision_id": current_definition_revision_id.clone(),
-            "observed_by": {
-                "kind": command.authorization.principal_type.clone(),
-                "id": command.authorization.principal_id.clone(),
-            },
+        let source_manifest = validation_source_manifest(ValidationManifestInputs {
+            result: &command.result,
+            governing_charter_revision_id: &governing_charter_revision_id,
+            check_definition_revision_id: &current_definition_revision_id,
+            principal_type: &command.authorization.principal_type,
+            principal_id: &command.authorization.principal_id,
+            observed_task_id: command.observed_task_id.as_deref(),
+            evidence_asset_id: command.evidence_asset_id.as_deref(),
         });
         let result_json = json!({
             "operation": PROJECT_VALIDATION_COMMAND,
@@ -348,7 +378,7 @@ impl ProjectArtifactCommandService {
             "milestone_id": command.milestone_id,
             "check_id": command.check_id,
             "result_id": result_id,
-            "outcome": command.status,
+            "outcome": outcome,
             "domain_committed": true,
         })
         .to_string();
@@ -365,12 +395,11 @@ impl ProjectArtifactCommandService {
                     milestone_id: command.milestone_id.clone(),
                     check_id: command.check_id.clone(),
                     definition_revision_id: current_definition_revision_id,
-                    outcome: command.status.clone(),
+                    outcome: outcome.to_owned(),
                     source_kind,
                     source_manifest_json: source_manifest.to_string(),
                     input_digest: command.input_digest.clone(),
                     governing_charter_revision_id: Some(governing_charter_revision_id),
-                    governing_baseline_revision_id: Some(governing_baseline_revision_id),
                     principal_type: command.authorization.principal_type.clone(),
                     principal_id: command.authorization.principal_id.clone(),
                     authorization_basis: command.authorization.authorization_basis.clone(),
@@ -1718,6 +1747,57 @@ fn action_execution(
     })
 }
 
+/// Translate the acceptance-check status vocabulary an Agent records into the
+/// persisted outcome vocabulary readiness reads back. This mirrors the manual
+/// attestation route's mapping so a human attestation and an agent-recorded
+/// validation of the same observation persist identically. `pending` and
+/// `waived` are absent on purpose: an Agent records what it observed, and a
+/// waiver is the user's alone.
+fn validation_outcome(status: &str) -> Option<&'static str> {
+    match status {
+        "pass" => Some("passed"),
+        "fail" => Some("failed"),
+        "blocked" | "unavailable" => Some("missing"),
+        "stale" => Some("stale"),
+        _ => None,
+    }
+}
+
+/// Every field readiness reads back out of a validation result, in one place.
+///
+/// `milestone_runtime` re-derives the governing Charter, definition
+/// revision, and release policy and rejects the result as "stale for the active
+/// authority" when any of them is absent or different. That makes this manifest
+/// a contract with the reader, not a free-form provenance note: a field the
+/// user attestation route writes and this one omits does not merely lose
+/// detail, it makes every result recorded here permanently unusable.
+struct ValidationManifestInputs<'a> {
+    result: &'a str,
+    governing_charter_revision_id: &'a str,
+    check_definition_revision_id: &'a str,
+    principal_type: &'a str,
+    principal_id: &'a str,
+    observed_task_id: Option<&'a str>,
+    evidence_asset_id: Option<&'a str>,
+}
+
+fn validation_source_manifest(inputs: ValidationManifestInputs<'_>) -> Value {
+    json!({
+        "result": inputs.result,
+        // Readiness compares this against the approved Charter revision it
+        // re-derives. The Charter is the whole governing authority, and the
+        // Charter alone is what the observation is bound to.
+        "governing_revision_ids": [inputs.governing_charter_revision_id],
+        "check_definition_revision_id": inputs.check_definition_revision_id,
+        "observed_by": {
+            "kind": inputs.principal_type,
+            "id": inputs.principal_id,
+            "task_id": inputs.observed_task_id,
+            "evidence_asset_id": inputs.evidence_asset_id,
+        },
+    })
+}
+
 fn validate_evidence_command(command: &ProjectEvidenceCommand) -> Result<()> {
     for (field, value) in [
         ("project_id", command.project_id.as_str()),
@@ -1851,5 +1931,70 @@ fn create_receipt(context: &CommandContext, outcome_json: &str) -> CreateCommand
         agent_action_execution_id: None,
         outcome_json: outcome_json.to_owned(),
         committed_at: now_rfc3339(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validation_outcome, validation_source_manifest, ValidationManifestInputs};
+
+    /// The persisted `outcome` column admits exactly this vocabulary
+    /// (`project_milestone_check_result`'s CHECK constraint). An Agent status
+    /// that reaches the insert untranslated aborts the write instead of
+    /// settling the check, so the mapping is the contract worth pinning.
+    #[test]
+    fn every_recordable_status_maps_into_the_persisted_outcome_vocabulary() {
+        const PERSISTED: [&str; 5] = ["passed", "failed", "missing", "stale", "waived"];
+        for status in ["pass", "fail", "blocked", "stale", "unavailable"] {
+            let outcome = validation_outcome(status)
+                .unwrap_or_else(|| panic!("{status} is an admitted validation status"));
+            assert!(
+                PERSISTED.contains(&outcome),
+                "{status} maps to {outcome}, which the outcome CHECK constraint rejects"
+            );
+        }
+        assert_eq!(validation_outcome("pass"), Some("passed"));
+        assert_eq!(validation_outcome("fail"), Some("failed"));
+        // A waiver is the user's alone, and `pending` is the absence of an
+        // observation rather than one an Agent can report.
+        assert_eq!(validation_outcome("waived"), None);
+        assert_eq!(validation_outcome("pending"), None);
+        assert_eq!(validation_outcome("passed"), None);
+    }
+
+    /// Readiness rejects any validation result whose manifest does not carry
+    /// the governing Charter revision and check definition revision
+    /// (`milestone_runtime`'s "stale for the active authority" gate). The
+    /// Agent record path and the user attestation route must therefore write
+    /// the same manifest shape -- a field present in one and absent in the
+    /// other makes every result from that path unusable.
+    #[test]
+    fn recorded_manifest_carries_every_field_readiness_reads_back() {
+        let manifest = validation_source_manifest(ValidationManifestInputs {
+            result: "Exercised the delivered CLI end to end.",
+            governing_charter_revision_id: "charter-revision-1",
+            check_definition_revision_id: "definition-revision-1",
+            principal_type: "agent",
+            principal_id: "project-agent-1",
+            observed_task_id: Some("task-1"),
+            evidence_asset_id: Some("asset-1"),
+        });
+        // These keys are read back verbatim by `milestone_runtime`'s readiness
+        // gate; a missing one is not a lost detail, it makes the result
+        // permanently "stale for the active authority".
+        assert_eq!(
+            manifest["check_definition_revision_id"],
+            "definition-revision-1"
+        );
+        assert_eq!(
+            manifest["governing_revision_ids"],
+            serde_json::json!(["charter-revision-1"]),
+            "the approved Charter is the whole governing authority"
+        );
+        assert_eq!(manifest["observed_by"]["kind"], "agent");
+        // Provenance travels with the observation: which run produced it, and
+        // which captured artifact backs it.
+        assert_eq!(manifest["observed_by"]["task_id"], "task-1");
+        assert_eq!(manifest["observed_by"]["evidence_asset_id"], "asset-1");
     }
 }

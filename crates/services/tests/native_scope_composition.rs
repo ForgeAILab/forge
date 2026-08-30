@@ -31,9 +31,10 @@ use forge_agent_host::{
     MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION, MIGRATED_OPERATION_CONTRACTS,
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
     PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION,
-    PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
+    PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION,
     PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION,
-    TASK_PROPOSE_OPERATION, TASK_REVIEW_OPERATION,
+    TASK_EVIDENCE_OPERATION, TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION,
+    TASK_WORKLOG_OPERATION,
 };
 use serde_json::{json, Value};
 use services::{CoordinationToolProvider, TaskService};
@@ -834,14 +835,6 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
             ),
         ),
         (
-            PROJECT_EXECUTION_BASELINE_OPERATION,
-            project_proposal_arguments(
-                PROJECT_EXECUTION_BASELINE_OPERATION,
-                "draft_revision",
-                "matrix-baseline",
-            ),
-        ),
-        (
             PROJECT_MILESTONE_OPERATION,
             project_proposal_arguments(PROJECT_MILESTONE_OPERATION, "revise", "matrix-milestone"),
         ),
@@ -1026,6 +1019,96 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
     });
     assert_outcome_operation(&adoption, PROJECT_CHARTER_ADOPTION_OPERATION);
     covered_operations.insert(PROJECT_CHARTER_ADOPTION_OPERATION.to_owned());
+
+    // The remaining migrated contracts are asserted by composition exposure
+    // rather than by invocation. `project.observations` and `task.recover` are
+    // Project-scoped; `task.worklog` and `task.evidence` are Task-scoped and
+    // need a leased Task session this fixture does not build. Exposure is the
+    // property this test is named for: every migrated contract must be
+    // surfaced by scope composition in a scope that supports it.
+    let project_read = project
+        .tools()
+        .into_iter()
+        .find(|tool| tool.spec().name == "forge_project_orchestration_read")
+        .expect("Project read tool");
+    let project_read_operations = project_read.spec().input_schema["properties"]["operation"]
+        ["enum"]
+        .as_array()
+        .expect("Project read operation enum")
+        .clone();
+    assert!(
+        project_read_operations
+            .iter()
+            .any(|value| value == PROJECT_OBSERVATIONS_OPERATION),
+        "Project read composition must expose {PROJECT_OBSERVATIONS_OPERATION}"
+    );
+    covered_operations.insert(PROJECT_OBSERVATIONS_OPERATION.to_owned());
+
+    let project_propose_operations = project
+        .tools()
+        .into_iter()
+        .find(|tool| tool.spec().name == "forge_scope_propose")
+        .expect("Project propose tool")
+        .spec()
+        .input_schema["properties"]["operation"]["enum"]
+        .as_array()
+        .expect("Project propose operation enum")
+        .clone();
+    assert!(
+        project_propose_operations
+            .iter()
+            .any(|value| value == TASK_RECOVER_OPERATION),
+        "Project propose composition must expose {TASK_RECOVER_OPERATION}"
+    );
+    covered_operations.insert(TASK_RECOVER_OPERATION.to_owned());
+
+    let task_composition = ScopeToolComposition::for_scope_with_permissions_and_project_context(
+        AGENT_ID,
+        CanonicalScope {
+            scope_type: CanonicalScopeType::Task,
+            scope_id: source_task_id.to_owned(),
+            workspace_access: WorkspaceAccess::TaskWrite,
+        },
+        Some("coder"),
+        Some("/tmp/forge-scope-composition-worktree"),
+        &{
+            let mut permissions = broad_permissions();
+            // Task-scope evidence capture is admitted at read level; the
+            // session's write authority is the bounded worktree tools.
+            permissions.insert("task_read".to_owned());
+            permissions
+        },
+        ProjectChatToolContext {
+            is_project_agent_chat: false,
+            charter_setup_required: false,
+        },
+        Some(Arc::new(fixture.provider.clone())),
+    )
+    .expect("Task composition");
+    let task_tool_names = task_composition
+        .tools()
+        .into_iter()
+        .map(|tool| tool.spec().name.clone())
+        .collect::<Vec<_>>();
+    let task_propose_operations = task_composition
+        .tools()
+        .into_iter()
+        .find(|tool| tool.spec().name == "forge_scope_propose")
+        .unwrap_or_else(|| panic!("Task propose tool among {task_tool_names:?}"))
+        .spec()
+        .input_schema["properties"]["operation"]["enum"]
+        .as_array()
+        .expect("Task propose operation enum")
+        .clone();
+    for operation in [TASK_WORKLOG_OPERATION, TASK_EVIDENCE_OPERATION] {
+        assert!(
+            task_propose_operations
+                .iter()
+                .any(|value| value == operation),
+            "Task propose composition must expose {operation}"
+        );
+        covered_operations.insert(operation.to_owned());
+    }
 
     let expected_operations = MIGRATED_OPERATION_CONTRACTS
         .iter()

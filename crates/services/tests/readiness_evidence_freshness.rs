@@ -158,11 +158,6 @@ fn input(evidence: Vec<EvidenceAttachment>) -> ReadinessEvaluationInput {
     ReadinessEvaluationInput {
         milestone: milestone(),
         definition: definition(),
-        baseline_id: "baseline-1".to_owned(),
-        baseline_revision_id: "baseline-r1".to_owned(),
-        baseline_digest: "baseline-digest".to_owned(),
-        release_policy_revision: "policy-r1".to_owned(),
-        release_policy_digest: "policy-digest".to_owned(),
         source_event_watermark: "event-10".to_owned(),
         computing_policy_revision: "compute-r1".to_owned(),
         input_manifest: vec![ReadinessInput {
@@ -194,7 +189,7 @@ fn input(evidence: Vec<EvidenceAttachment>) -> ReadinessEvaluationInput {
         commit_build_check_context: vec![
             serde_json::to_string(&current_context).expect("readiness context serializes")
         ],
-        baseline_contract_reasons: Vec::new(),
+        definition_contract_reasons: Vec::new(),
         authorization: AuthorizationProvenance {
             principal: principal(PrincipalKind::User, "user-1"),
             authorization_basis: "release-review".to_owned(),

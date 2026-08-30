@@ -1,12 +1,10 @@
 use db::{
-    create_sqlite_pool, run_migrations, ActivateProjectExecutionBaseline, AgentActionPolicyResult,
-    AgentActionRepo, AgentActionStatus, AgentRepo, AgentStatus, ApproveProjectExecutionBaseline,
-    CreateAgentAction, CreateAgentActionExecution, CreateAgentIdentity, CreateAgentProfile,
-    CreateCommandReceipt, CreateDomainEvent, CreateProject, CreateProjectCanonicalConflict,
-    CreateProjectCharter, CreateProjectCharterRevision, CreateProjectExecutionBaseline,
-    CreateProjectExecutionBaselineRevision, CreateProjectFromCharterApproval,
-    CreateProjectReconciliation, DbError, ProjectOrchestrationRepo, ResolveProjectReconciliation,
-    SqliteDb, User, UserRepo,
+    create_sqlite_pool, run_migrations, AgentActionPolicyResult, AgentActionRepo,
+    AgentActionStatus, AgentRepo, AgentStatus, CreateAgentAction, CreateAgentActionExecution,
+    CreateAgentIdentity, CreateAgentProfile, CreateCommandReceipt, CreateDomainEvent,
+    CreateProject, CreateProjectCanonicalConflict, CreateProjectCharter,
+    CreateProjectCharterRevision, CreateProjectFromCharterApproval, CreateProjectReconciliation,
+    DbError, ProjectOrchestrationRepo, ResolveProjectReconciliation, SqliteDb, User, UserRepo,
 };
 use sha2::{Digest, Sha256};
 use sqlx::Row;
@@ -460,7 +458,9 @@ async fn charter_approval_create_is_atomic_and_replay_safe() {
     .fetch_one(db.pool())
     .await
     .expect("compact bootstrap milestone");
-    assert_eq!(milestone_lifecycle, "planned");
+    // Approving the Charter approves the work: M001 lands with its approved
+    // definition and is active, with no second artifact to wait on.
+    assert_eq!(milestone_lifecycle, "active");
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM project_milestone
@@ -470,7 +470,7 @@ async fn charter_approval_create_is_atomic_and_replay_safe() {
         .fetch_one(db.pool())
         .await
         .expect("active milestone count"),
-        0
+        1
     );
 
     let replay = ProjectOrchestrationRepo::create_project_from_charter_approval(&db, input)
@@ -616,7 +616,6 @@ async fn charter_approval_create_is_atomic_and_replay_safe() {
             replacement_ref_type: None,
             replacement_ref_id: None,
             replacement_ref_revision: None,
-            invalid_baseline_replacement: None,
             occurred_at: now.clone(),
             idempotency_key: "project-resolution-key".to_owned(),
             updated_at: now.clone(),
@@ -988,167 +987,6 @@ async fn charter_approval_create_rolls_back_on_invalid_handoff_packet() {
     .await
     .expect("Genesis state");
     assert_eq!(genesis_lifecycle, "ready_for_project");
-}
-
-#[tokio::test]
-async fn compact_milestone_activates_only_with_approved_baseline() {
-    let (db, genesis_id, _main_chat_id, now) = fixture().await;
-    let (_charter_id, revision_id) = approval_fixture(&db, &genesis_id, &now).await;
-    let input = create_input(
-        "orchestration-approval",
-        "baseline-project",
-        "baseline-handoff",
-        "baseline-message",
-        "baseline-turn",
-        &now,
-        r#"{"schema_version":"forge.project-charter-handoff/v1","project":{"id":"baseline-project","name":"Compact Orchestration Project","mode":"compact"},"target":{},"source":{"identity_id":"orchestration-main-identity","profile_revision_id":"orchestration-main-profile"}}"#,
-    );
-    let created = ProjectOrchestrationRepo::create_project_from_charter_approval(&db, input)
-        .await
-        .expect("atomic Project creation");
-    let milestone_id: String = sqlx::query_scalar(
-        "SELECT id FROM project_milestone WHERE project_id = ? AND milestone_key = 'M001'",
-    )
-    .bind(&created.project.id)
-    .fetch_one(db.pool())
-    .await
-    .expect("M001");
-    let milestone_definition_revision_id: String = sqlx::query_scalar(
-        "SELECT current_definition_revision_id FROM project_milestone WHERE id = ?",
-    )
-    .bind(&milestone_id)
-    .fetch_one(db.pool())
-    .await
-    .expect("M001 definition revision");
-    assert_eq!(
-        sqlx::query_scalar::<_, String>("SELECT lifecycle FROM project_milestone WHERE id = ?",)
-            .bind(&milestone_id)
-            .fetch_one(db.pool())
-            .await
-            .expect("planned M001"),
-        "planned"
-    );
-
-    let baseline = ProjectOrchestrationRepo::create_project_execution_baseline(
-        &db,
-        CreateProjectExecutionBaseline {
-            project_id: created.project.id.clone(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("baseline");
-    let baseline_content_digest = digest("baseline-content");
-    let baseline_rendered_digest = digest("baseline-rendered");
-    let revision = ProjectOrchestrationRepo::create_project_execution_baseline_revision(
-        &db,
-        CreateProjectExecutionBaselineRevision {
-            id: "baseline-revision-1".to_owned(),
-            baseline_id: baseline.id.clone(),
-            expected_baseline_version: baseline.version,
-            base_revision: 0,
-            base_revision_id: None,
-            lifecycle: "proposed".to_owned(),
-            charter_revision_id: revision_id,
-            document_revisions_json: "[]".to_owned(),
-            plan_items_json: "[]".to_owned(),
-            milestone_id: Some(milestone_id.clone()),
-            milestone_ids_json: format!("[\"{milestone_id}\"]"),
-            milestone_definition_revision_ids_json: format!(
-                "[\"{milestone_definition_revision_id}\"]"
-            ),
-            primary_milestone_id: Some(milestone_id.clone()),
-            release_policy_json: "{}".to_owned(),
-            release_policy_revision: "release-policy@1".to_owned(),
-            release_policy_digest: "release-policy-digest".to_owned(),
-            acceptance_matrix_json: "[]".to_owned(),
-            capability_classes_json: "[]".to_owned(),
-            risk_classes_json: "[]".to_owned(),
-            adaptive_envelope_json: "{}".to_owned(),
-            elevated_operations_json: "[]".to_owned(),
-            exclusions_json: "[]".to_owned(),
-            rollback_recovery_json: "{}".to_owned(),
-            schema_version: "forge.project-orchestration/v1".to_owned(),
-            render_version: "1".to_owned(),
-            rendered_view: "# Baseline".to_owned(),
-            content_digest: baseline_content_digest.clone(),
-            rendered_digest: baseline_rendered_digest.clone(),
-            source_refs_json: "[]".to_owned(),
-            created_at: now.clone(),
-        },
-    )
-    .await
-    .expect("baseline revision");
-    let approval = ProjectOrchestrationRepo::approve_project_execution_baseline(
-        &db,
-        ApproveProjectExecutionBaseline {
-            id: "baseline-approval".to_owned(),
-            baseline_id: baseline.id.clone(),
-            revision_id: revision.id.clone(),
-            expected_baseline_version: baseline.version + 1,
-            expected_project_version: created.project.version,
-            principal_type: "user".to_owned(),
-            principal_id: ACCOUNT_ID.to_owned(),
-            authorization_basis: "explicit baseline approval".to_owned(),
-            authorization_action: "project.execution_baseline.approve".to_owned(),
-            explicit_event: "approve baseline".to_owned(),
-            authorization_occurred_at: now.clone(),
-            content_digest: baseline_content_digest,
-            rendered_digest: baseline_rendered_digest,
-            idempotency_key: "baseline-approval-key".to_owned(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("baseline approval");
-    assert!(sqlx::query(
-        "UPDATE project_execution_baseline_approval
-         SET principal_id = 'tampered' WHERE id = ?",
-    )
-    .bind(&approval.id)
-    .execute(db.pool())
-    .await
-    .is_err());
-    assert!(
-        sqlx::query("DELETE FROM project_execution_baseline_approval WHERE id = ?")
-            .bind(&approval.id)
-            .execute(db.pool())
-            .await
-            .is_err()
-    );
-    let active_baseline = ProjectOrchestrationRepo::activate_project_execution_baseline(
-        &db,
-        ActivateProjectExecutionBaseline {
-            approval_id: approval.id,
-            expected_baseline_version: baseline.version + 2,
-            expected_project_version: created.project.version,
-            idempotency_key: "baseline-activation-key".to_owned(),
-            updated_at: now,
-        },
-    )
-    .await
-    .expect("baseline activation");
-    assert_eq!(active_baseline.lifecycle, "active");
-    assert_eq!(
-        sqlx::query_scalar::<_, String>("SELECT lifecycle FROM project_milestone WHERE id = ?",)
-            .bind(&milestone_id)
-            .fetch_one(db.pool())
-            .await
-            .expect("active M001"),
-        "active"
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, Option<String>>(
-            "SELECT primary_milestone_id FROM project WHERE id = ?",
-        )
-        .bind(&created.project.id)
-        .fetch_one(db.pool())
-        .await
-        .expect("primary milestone"),
-        Some(milestone_id)
-    );
 }
 
 #[tokio::test]

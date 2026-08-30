@@ -160,7 +160,7 @@ async fn workflow_dispatched_commitless_completion_fails_and_schedules_retry() {
             .error
             .as_deref()
             .unwrap_or_default()
-            .contains("without repository changes"),
+            .contains("nothing committed on the Task branch"),
         "error names the commit-less completion: {:?}",
         updated.error
     );

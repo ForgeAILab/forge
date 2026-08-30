@@ -387,7 +387,7 @@ independent dimensions:
 | --- | --- | --- |
 | `coordination_state` | Can the singular Project Chat admit a turn? | `ready`, `setup_required`, `unavailable` |
 | `execution_setup_state` | Is the repository ready? Project Worker/reviewer choices are optional defaults. | `provisioning`, `ready`, `setup_required`, `failed`, `unavailable` |
-| `execution_gate` | Is Charter-backed execution available? Legacy baseline states are display compatibility only. | normally `active`; `unavailable` only when the projection cannot be read |
+| `execution_gate` | Is Charter-backed execution available? | normally `active`; `unavailable` only when the projection cannot be read |
 
 Project creation can therefore succeed while repository setup is
 `provisioning` or `setup_required`. Project Agent coordination is useful but
@@ -454,7 +454,7 @@ handoff remain intact. A stale version or changed idempotency input is a
 conflict: refetch the projection and use a new key, rather than guessing a
 version.
 
-### 6. Project Chat, current Profile, and the execution baseline
+### 6. Project Chat and the current Profile
 
 The Project binding names an identity, not a permanently frozen Profile. When a
 new user message, handoff, retry, or autonomous wake is admitted, Forge resolves
@@ -464,57 +464,30 @@ next turn therefore affects that turn; a queued or leased turn keeps the Profile
 that it was admitted with. This is why a Profile change does not require
 rebinding the Project Chat.
 
-The Project Agent acknowledges the handoff, chooses useful defaults, creates
-the first Tasks, and lets their workflows dispatch. It may also draft an
-execution baseline as an optional traceability snapshot linking the exact
-Charter, Documents, plan items, milestones, acceptance/evidence, release policy,
-and rollback information. That snapshot is useful for review and release
-evidence, but it does not authorize implementation.
+The Project Agent acknowledges the handoff, chooses useful defaults, creates the
+first Tasks, and lets their workflows dispatch. The approved Charter is the
+implementation authority: there is no second artifact to approve before work
+starts.
 
-Baseline lifecycle is intentionally four separate operations:
+If a Project cannot make progress, read the diagnostic rather than treating it
+as an approval gate:
 
-1. **Save a draft.** `POST /api/v1/projects/{id}/execution-baseline` with
-   `operation: "save_draft"` appends an immutable `draft` revision. It does not
-   request or imply user authorization.
-2. **Propose for approval.** The Project Agent calls
-   `POST /api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions` with
-   `operation: "propose_for_approval"` and the current baseline version. A
-   complete candidate returns `requires_user_authorization: true` and a frozen
-   `approval_target` containing the exact revision and digests.
-3. **Approve the exact revision.** The interactive user reviews that target and
-   calls `POST .../revisions/{revision_id}/approve`. Approval is bound to the
-   current Project version, content digest, render digest, and user receipt.
-4. **Activate.** The same user calls `POST .../execution-baseline/{baseline_id}/activate`
-   with the exact `baseline_id`, `revision_id`, `approval_id`, expected Project
-   and baseline versions, and digests. Activation atomically advances the active
-   traceability pointer and emits the activation event; it never changes Task
-   runnable state. A Project Agent action or chat sentence cannot approve or
-   activate a baseline.
-
-The web interface combines steps 3 and 4 behind **Approve traceability plan**.
-Skipping it does not stop Tasks. If the optional traceability revision cannot be
-approved or activated, use its version/digest diagnostics without treating the
-problem as an execution blocker:
-
-- `baseline_approval_required`: a legacy projection may still report this;
-  implementation continues from the Charter while the optional plan is reviewed.
-- `version_conflict` or `digest_conflict`: refresh the Project/baseline
-  projection, compare the current Charter, Documents, milestones, and setup,
-  and re-propose from the current revision. Retry the same idempotency key only
-  for a lost response to the identical command.
+- `version_conflict` or `digest_conflict`: refresh the Project projection,
+  compare the current Charter, Documents, milestones, and setup, and re-propose
+  from the current revision. Retry the same idempotency key only for a lost
+  response to the identical command.
 - `reconciliation_required`: open the plain-language reconciliation card. It
   states the replacement effect and offers **Accept** or **Reject**; technical
   record details stay collapsed.
 - `setup_required` or `unavailable`: complete or refresh execution setup first;
-  a missing Worker/reviewer/repository must not be disguised as a baseline
-  problem.
+  a missing Worker/reviewer/repository is a setup problem, not a governance one.
 
 ### 7. Traceable Task execution, review, and Project Agent wake
 
 After Project creation, the Project Agent creates implementation Tasks in the
 bound Project through `POST /api/v1/projects/{id}/tasks`. Each Task is linked to
-the current approved Charter. Baseline/revision, plan-item, milestone, and
-Document links are optional traceability.
+the current approved Charter. Plan-item, milestone, and Document links are
+optional traceability.
 
 When repository setup, dependencies, assignment, workflow, source availability,
 and the current Task version all pass, the
@@ -548,7 +521,7 @@ turn, task outcome, review request, or durable retry/setup action.
 
 The resulting audit trail is intentionally traceable: Charter revision and
 digests → approval receipt → Project-creation confirmation/handoff/target turn
-IDs → setup and provisioning operation → optional baseline revision/approval/activation → Task governance
+IDs → setup and provisioning operation → Task governance
 and transitions → Worker execution/Workspace lease → checks/review → Attention
 and wake disposition. Preserve these IDs when diagnosing a response loss or
 conflict; they are the links between chat, Project truth, and repository work.
@@ -562,7 +535,6 @@ conflict; they are the links between chat, Project truth, and repository work.
 | Missing reviewer default | No Project-wide reviewer default is selected | Nothing is blocked until a Task workflow needs the role; assign any enabled Agent on that Task, including its Worker. |
 | `execution_setup_state: provisioning` | Durable setup is still reconciling | Refresh the projection; wait for `ready` or follow the recorded retry action. |
 | `execution_setup_state: failed` | A checkpoint stopped with a typed error | Fix the recorded cause and retry the same provisioning operation with its current version and a new idempotency key. |
-| `execution_gate: baseline_approval_required` | A legacy projection is showing optional plan review | Review it with **Approve traceability plan** if useful; Task execution already follows the approved Charter. |
 | `version_conflict`, `digest_conflict`, or stale projection | Another command changed the authoritative revision | Refetch current state and re-propose/retry with the correct version; do not overwrite immutable history. |
 | Wake `deferred` or `setup_required` | Delivery could not safely admit a turn yet | Follow the durable retry/setup action; the event remains traceable and is reconsidered after state changes. |
 | `execution_gate: reconciliation_required` | Two traceability records disagree, or the active plan is invalid | Open Project Overview, read the one-sentence replacement effect, then choose **Accept** or **Reject**. Task-scoped conflicts remain scoped and do not freeze unrelated work. |

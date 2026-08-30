@@ -228,7 +228,8 @@ impl SqliteProtectedRuntimeStore {
                     chat.project_id AS agent_chat_project_id,
                     binding.permission_ceiling_json AS binding_permission_ceiling,
                     bound_project.charter_setup_required AS project_charter_setup_required,
-                    workspace.worktree_path
+                    COALESCE(workspace.worktree_path, scope.workspace_path)
+                        AS worktree_path
              FROM agent_session AS session
              JOIN agent_identity AS identity
                ON identity.id = session.identity_id
@@ -328,6 +329,7 @@ impl SqliteProtectedRuntimeStore {
             "deny" => crate::WorkspaceAccess::Deny,
             "task_read" => crate::WorkspaceAccess::TaskRead,
             "task_write" => crate::WorkspaceAccess::TaskWrite,
+            "project_verify" => crate::WorkspaceAccess::ProjectVerify,
             _ => {
                 return Err(crate::AgentHostError::Authority(
                     "persisted workspace access is invalid".to_owned(),
@@ -381,11 +383,21 @@ impl SqliteProtectedRuntimeStore {
                 "Task session has no active persisted workspace".to_owned(),
             ));
         }
+        // A Project Agent Chat owns its verification workspace; every other
+        // non-Task scope remains filesystem-denied.
         if !matches!(scope.scope_type, crate::CanonicalScopeType::Task)
+            && scope.workspace_access != crate::WorkspaceAccess::ProjectVerify
             && persisted_workspace_path.is_some()
         {
             return Err(crate::AgentHostError::Authority(
                 "non-Task session is bound to a workspace".to_owned(),
+            ));
+        }
+        if scope.workspace_access == crate::WorkspaceAccess::ProjectVerify
+            && persisted_workspace_path.is_none()
+        {
+            return Err(crate::AgentHostError::Authority(
+                "Project verification session has no persisted workspace".to_owned(),
             ));
         }
         if identity_paused != 0 || identity_archived_at.is_some() {
@@ -1318,7 +1330,7 @@ fn scope_permission_set(
             crate::WorkspaceAccess::TaskWrite => {
                 vec!["read_task", "read_memory", "task_read", "task_write"]
             }
-            crate::WorkspaceAccess::Deny => vec![],
+            crate::WorkspaceAccess::Deny | crate::WorkspaceAccess::ProjectVerify => vec![],
         },
     };
     if matches!(scope_type, crate::CanonicalScopeType::AgentChat) && project_agent_chat {

@@ -917,11 +917,8 @@ async fn coordinated_project(db: &SqliteDb, name: &str) -> Project {
 /// Take a Project through Worker/reviewer/repository setup and an approved
 /// Charter so only the execution baseline remains ungoverned, then attach one
 /// active, user-approved execution baseline revision with a real adaptive
-/// envelope. Returns `(repo_id, baseline_id, revision_id)`.
-async fn ready_project_with_active_baseline(
-    db: &Arc<SqliteDb>,
-    project: &Project,
-) -> (String, String, String) {
+/// envelope. Returns `(repo_id, charter_revision_id)`.
+async fn ready_project(db: &Arc<SqliteDb>, project: &Project) -> (String, String) {
     let (worker_id, _) = native_agent(db, "F12 Worker").await;
     let (reviewer_id, _) = native_agent(db, "F12 Reviewer").await;
     let setup = ProjectExecutionSetupService::new(Arc::clone(db));
@@ -976,93 +973,12 @@ async fn ready_project_with_active_baseline(
     .expect("charter revision id reads")
     .expect("current charter revision is set");
 
-    let baseline_id = format!("{}-baseline", project.id);
-    let revision_id = format!("{}-baseline-revision", project.id);
-    let now = now_rfc3339();
-    let envelope = json!({
-        "allowed_task_operations": ["split", "sequence", "replace"],
-        "fixed_outcomes": ["ship-the-approved-outcome"],
-        "fixed_acceptance": ["acceptance-r1"],
-        "fixed_risk_classes": ["low"],
-        "forbidden_side_effects": [],
-        "elevated_operations": [],
-    });
-    sqlx::query(
-        "INSERT INTO project_execution_baseline
-         (id, project_id, current_revision_id, lifecycle, version, created_at, updated_at)
-         VALUES (?, ?, ?, 'active', 1, ?, ?)",
-    )
-    .bind(&baseline_id)
-    .bind(&project.id)
-    .bind(&revision_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("baseline inserts");
-    sqlx::query(
-        "INSERT INTO project_execution_baseline_revision
-         (id, baseline_id, revision, base_revision, lifecycle,
-          charter_revision_id, document_revisions_json, plan_items_json,
-          milestone_id, milestone_ids_json, milestone_definition_revision_ids_json,
-          primary_milestone_id, release_policy_json, release_policy_revision,
-          release_policy_digest, acceptance_matrix_json, capability_classes_json,
-          risk_classes_json, adaptive_envelope_json, elevated_operations_json,
-          exclusions_json, rollback_recovery_json, schema_version, render_version,
-          rendered_view, content_digest, rendered_digest, source_refs_json, created_at)
-         VALUES (?, ?, 1, 0, 'approved', ?, '[]', '[\"plan-1\"]', NULL, '[]', '[]', NULL,
-                 '{}', 'release-r1', 'release-digest',
-                 '[{\"id\":\"acceptance-r1\",\"description\":\"acceptance\",\"required\":true}]',
-                 '[\"repository_write\"]', '[\"low\"]', ?, '[]', '[]', '{}', 'baseline@1',
-                 'baseline-render@1', '# F12 baseline', 'f12-baseline-content',
-                 'f12-baseline-rendered', '[]', ?)",
-    )
-    .bind(&revision_id)
-    .bind(&baseline_id)
-    .bind(&charter_revision_id)
-    .bind(envelope.to_string())
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("baseline revision inserts");
-    sqlx::query(
-        "INSERT INTO project_execution_baseline_approval
-         (id, baseline_id, revision_id, expected_project_version,
-          principal_type, principal_id, authorization_basis,
-          authorization_action, explicit_event, authorization_occurred_at,
-          content_digest, rendered_digest, lifecycle, idempotency_key,
-          created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'user', ?, 'explicit approval',
-                 'project.execution_baseline.approve', 'f12-approval-event', ?,
-                 'f12-baseline-content', 'f12-baseline-rendered', 'active', ?, ?, ?)",
-    )
-    .bind(format!("{}-approval", project.id))
-    .bind(&baseline_id)
-    .bind(&revision_id)
-    .bind(attached.project_version)
-    .bind(OWNER_ID)
-    .bind(&now)
-    .bind(format!("{}-approval-key", project.id))
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("baseline approval inserts");
-
-    (repo_id, baseline_id, revision_id)
+    (repo_id, charter_revision_id)
 }
 
 /// Create a repository-backed implementation Task with governance bound to
-/// the exact active/approved baseline revision, so `ensure_task_runnable`'s
-/// traceability check admits it.
-async fn governed_task(
-    db: &SqliteDb,
-    project_id: &str,
-    repo_id: &str,
-    baseline_id: &str,
-    revision_id: &str,
-    title: &str,
-) -> String {
+/// the approved Charter, so `ensure_task_runnable` admits it.
+async fn governed_task(db: &SqliteDb, project_id: &str, repo_id: &str, title: &str) -> String {
     let task_id = new_uuid_v4();
     let now = now_rfc3339();
     TaskRepo::create(
@@ -1100,18 +1016,15 @@ async fn governed_task(
     .expect("current charter revision is set");
     sqlx::query(
         "INSERT INTO project_task_governance
-         (task_id, project_id, charter_revision_id, baseline_id,
-          baseline_revision_id, plan_item_id, milestone_id,
+         (task_id, project_id, charter_revision_id, plan_item_id, milestone_id,
           document_revisions_json, capability_class, risk_class, runnable,
           replacement_of_task_id, provenance_json, version, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, NULL, NULL, '[]', 'repository_write', 'low',
+         VALUES (?, ?, ?, NULL, NULL, '[]', 'repository_write', 'low',
                  1, NULL, '{}', 1, ?, ?)",
     )
     .bind(&task_id)
     .bind(project_id)
     .bind(&charter_revision_id)
-    .bind(baseline_id)
-    .bind(revision_id)
     .bind(&now)
     .bind(&now)
     .execute(db.pool())
@@ -1149,8 +1062,6 @@ async fn insert_task_scoped_reconciliation(
     db: &SqliteDb,
     project_id: &str,
     task_id: &str,
-    baseline_id: &str,
-    revision_id: &str,
     conflict_code: &str,
     affected_paths: &[&str],
 ) {
@@ -1164,14 +1075,16 @@ async fn insert_task_scoped_reconciliation(
              conflicting_record_digest, affected_paths_json, conflict_code, description,
              detected_by_type, detected_by_id, authorization_basis, authorization_action,
              explicit_event, authorization_occurred_at, idempotency_key, created_at
-         ) VALUES (?, ?, 'execution', 'execution_baseline', ?, '1', 'f12-baseline-content',
+         ) VALUES (?, ?, 'execution', 'project_charter', ?, '1', 'charter-content',
                    'task', ?, '1', 'task-digest', ?, ?, ?, 'system', 'test-fixture',
                    'adaptive_task_boundary', 'task.adaptive.reject', 'task.adaptive.split.rejected',
                    ?, ?, ?)",
     )
     .bind(&conflict_id)
     .bind(project_id)
-    .bind(baseline_id)
+    // The approved Charter is the governing record now that the baseline is
+    // gone; the conflict is still scoped to the exact Task.
+    .bind(project_id)
     .bind(task_id)
     .bind(serde_json::to_string(affected_paths).expect("affected paths encode"))
     .bind(conflict_code)
@@ -1187,15 +1100,14 @@ async fn insert_task_scoped_reconciliation(
              id, project_id, conflict_id, record_type, record_id, record_revision, record_digest,
              governing_record_type, governing_record_id, governing_record_revision,
              governing_record_digest, state, current_resolution_id, version, created_at, updated_at
-         ) VALUES (?, ?, ?, 'task', ?, '1', 'task-digest', 'execution_baseline', ?, ?,
-                   'f12-baseline-content', 'required', NULL, 1, ?, ?)",
+         ) VALUES (?, ?, ?, 'task', ?, '1', 'task-digest', 'project_charter', ?, '1',
+                   'charter-content', 'required', NULL, 1, ?, ?)",
     )
     .bind(format!("{task_id}-reconciliation"))
     .bind(project_id)
     .bind(&conflict_id)
     .bind(task_id)
-    .bind(baseline_id)
-    .bind(revision_id)
+    .bind(project_id)
     .bind(&now)
     .bind(&now)
     .execute(db.pool())
@@ -1210,14 +1122,11 @@ async fn insert_task_scoped_reconciliation(
 async fn task_with_executions_and_a_commit_is_never_not_started() {
     let db = database().await;
     let project = coordinated_project(&db, "f12 progress language").await;
-    let (repo_id, baseline_id, revision_id) =
-        ready_project_with_active_baseline(&db, &project).await;
+    let (repo_id, _charter_revision_id) = ready_project(&db, &project).await;
     let task_id = governed_task(
         &db,
         &project.id,
         &repo_id,
-        &baseline_id,
-        &revision_id,
         "task with attempts and a commit",
     )
     .await;
@@ -1253,27 +1162,16 @@ async fn task_with_executions_and_a_commit_is_never_not_started() {
 async fn reconciliation_required_blocker_never_renders_baseline_approval_copy() {
     let db = database().await;
     let project = coordinated_project(&db, "f12 reconciliation copy").await;
-    let (repo_id, baseline_id, revision_id) =
-        ready_project_with_active_baseline(&db, &project).await;
-    let task_id = governed_task(
-        &db,
-        &project.id,
-        &repo_id,
-        &baseline_id,
-        &revision_id,
-        "task blocked by reconciliation",
-    )
-    .await;
+    let (repo_id, _charter_revision_id) = ready_project(&db, &project).await;
+    let task_id = governed_task(&db, &project.id, &repo_id, "task blocked by reconciliation").await;
     insert_execution(&db, &task_id, "executor", "failed", false).await;
     insert_execution(&db, &task_id, "executor", "completed", true).await;
     insert_task_scoped_reconciliation(
         &db,
         &project.id,
         &task_id,
-        &baseline_id,
-        &revision_id,
         "adaptive_task_governance_stale",
-        &["baseline_id", "baseline_revision_id"],
+        &["charter_revision_id"],
     )
     .await;
 
@@ -1323,14 +1221,11 @@ async fn reconciliation_required_blocker_never_renders_baseline_approval_copy() 
 async fn task_scoped_reconciliation_does_not_block_the_project_gate() {
     let db = database().await;
     let project = coordinated_project(&db, "f12 scoped reconciliation").await;
-    let (repo_id, baseline_id, revision_id) =
-        ready_project_with_active_baseline(&db, &project).await;
+    let (repo_id, _charter_revision_id) = ready_project(&db, &project).await;
     let blocked_task_id = governed_task(
         &db,
         &project.id,
         &repo_id,
-        &baseline_id,
-        &revision_id,
         "task with its own reconciliation",
     )
     .await;
@@ -1338,8 +1233,6 @@ async fn task_scoped_reconciliation_does_not_block_the_project_gate() {
         &db,
         &project.id,
         &repo_id,
-        &baseline_id,
-        &revision_id,
         "unrelated task under the same active plan",
     )
     .await;
@@ -1347,10 +1240,8 @@ async fn task_scoped_reconciliation_does_not_block_the_project_gate() {
         &db,
         &project.id,
         &blocked_task_id,
-        &baseline_id,
-        &revision_id,
         "adaptive_task_governance_stale",
-        &["baseline_id", "baseline_revision_id"],
+        &["charter_revision_id"],
     )
     .await;
 

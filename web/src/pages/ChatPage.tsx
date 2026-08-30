@@ -21,7 +21,6 @@ import {
   useSendAgentChatMessageMutation,
 } from '@/features/agent-chat/hooks'
 import type { AgentChatEntry } from '@/features/agent-chat/types'
-import { BaselineApprovalCard } from '@/features/agent-chat/BaselineApprovalCard'
 import { MainChatTopicControl } from '@/features/agent-chat/MainChatTopicControl'
 import { ProjectCharterApprovalCard } from '@/features/project-charter/ProjectCharterApprovalCard'
 import { ProjectExecutionSetupPanel } from '@/features/project-execution/ProjectExecutionSetupPanel'
@@ -234,7 +233,6 @@ export function ChatPage({ projectId }: { projectId?: string }) {
               projectId={projectId}
               className="mx-0 mt-3 sm:mx-0 sm:p-3"
             />
-            <BaselineApprovalCard projectId={projectId} className="mx-0 mt-3 sm:mx-0 sm:p-3" />
           </aside>
         ) : null}
         <div

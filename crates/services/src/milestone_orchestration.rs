@@ -297,11 +297,6 @@ pub fn validate_release_actor(
 pub struct ReadinessEvaluationInput {
     pub milestone: ProjectMilestone,
     pub definition: MilestoneDefinitionRevision,
-    pub baseline_id: String,
-    pub baseline_revision_id: String,
-    pub baseline_digest: String,
-    pub release_policy_revision: String,
-    pub release_policy_digest: String,
     pub source_event_watermark: String,
     pub computing_policy_revision: String,
     pub input_manifest: Vec<ReadinessInput>,
@@ -317,11 +312,11 @@ pub struct ReadinessEvaluationInput {
     /// by a cached overview projection.
     pub document_states: Vec<ReadinessDocumentState>,
     pub commit_build_check_context: Vec<String>,
-    /// Reconciliation blockers discovered while joining the active baseline
-    /// to the milestone definition. These are governed readiness inputs, not
-    /// transport errors: they must be digested and persisted in a non-ready
-    /// snapshot so operators can reconcile the exact conflict.
-    pub baseline_contract_reasons: Vec<ReadinessReason>,
+    /// Reconciliation blockers discovered inside the milestone definition
+    /// itself. These are governed readiness inputs, not transport errors:
+    /// they must be digested and persisted in a non-ready snapshot so
+    /// operators can reconcile the exact conflict.
+    pub definition_contract_reasons: Vec<ReadinessReason>,
     /// The authority receipt is part of the candidate identity. A caller
     /// cannot replay the same idempotency key with different provenance.
     pub authorization: AuthorizationProvenance,
@@ -355,11 +350,6 @@ pub struct ReadinessEvaluation {
     pub project_id: String,
     pub milestone_id: String,
     pub milestone_definition_revision_id: String,
-    pub baseline_id: String,
-    pub baseline_revision_id: String,
-    pub baseline_digest: String,
-    pub release_policy_revision: String,
-    pub release_policy_digest: String,
     pub ordered_input_manifest: Vec<ReadinessInput>,
     pub source_event_watermark: String,
     pub result: ReadinessResult,
@@ -388,11 +378,6 @@ impl ReadinessEvaluation {
             milestone_id: self.milestone_id,
             expected_milestone_version: self.expected_milestone_version,
             milestone_definition_revision_id: self.milestone_definition_revision_id,
-            baseline_id: self.baseline_id,
-            baseline_revision_id: self.baseline_revision_id,
-            baseline_digest: self.baseline_digest,
-            release_policy_revision: self.release_policy_revision,
-            release_policy_digest: self.release_policy_digest,
             input_manifest: self.ordered_input_manifest,
             source_event_watermark: self.source_event_watermark,
             result: self.result,
@@ -460,7 +445,7 @@ pub fn evaluate_readiness(
     let mut commit_build_check_context = input.commit_build_check_context;
     commit_build_check_context.sort();
 
-    let mut reasons = input.baseline_contract_reasons;
+    let mut reasons = input.definition_contract_reasons;
     let mut has_failed = false;
     let mut has_stale = false;
     let mut has_blocked = !reasons.is_empty();
@@ -516,19 +501,11 @@ pub fn evaluate_readiness(
         });
     }
 
-    if input.baseline_id.is_empty()
-        || input.baseline_revision_id.is_empty()
-        || input.baseline_digest.is_empty()
-        || input.release_policy_revision.is_empty()
-        || input.release_policy_digest.is_empty()
-        || input.computing_policy_revision.is_empty()
-    {
+    if input.computing_policy_revision.is_empty() {
         has_stale = true;
         reasons.push(ReadinessReason {
             code: "policy_reference_missing".to_owned(),
-            message:
-                "active baseline, release policy, and computing policy references are required"
-                    .to_owned(),
+            message: "the computing policy reference is required".to_owned(),
             blocking: true,
             check_id: None,
             source_ids: Vec::new(),
@@ -603,11 +580,6 @@ pub fn evaluate_readiness(
         milestone_version: input.milestone.version,
         milestone_definition_revision_id: &input.definition.id,
         milestone_definition_digest: &input.definition.content_digest,
-        baseline_id: &input.baseline_id,
-        baseline_revision_id: &input.baseline_revision_id,
-        baseline_digest: &input.baseline_digest,
-        release_policy_revision: &input.release_policy_revision,
-        release_policy_digest: &input.release_policy_digest,
         source_event_watermark: &input.source_event_watermark,
         computing_policy_revision: &input.computing_policy_revision,
         input_manifest: &ordered_input_manifest,
@@ -631,11 +603,6 @@ pub fn evaluate_readiness(
         project_id: input.milestone.project_id,
         milestone_id: input.milestone.id,
         milestone_definition_revision_id: input.definition.id,
-        baseline_id: input.baseline_id,
-        baseline_revision_id: input.baseline_revision_id,
-        baseline_digest: input.baseline_digest,
-        release_policy_revision: input.release_policy_revision,
-        release_policy_digest: input.release_policy_digest,
         ordered_input_manifest,
         source_event_watermark: input.source_event_watermark,
         result,
@@ -1088,11 +1055,6 @@ struct ReadinessDigestPayload<'a> {
     milestone_version: i64,
     milestone_definition_revision_id: &'a str,
     milestone_definition_digest: &'a str,
-    baseline_id: &'a str,
-    baseline_revision_id: &'a str,
-    baseline_digest: &'a str,
-    release_policy_revision: &'a str,
-    release_policy_digest: &'a str,
     source_event_watermark: &'a str,
     computing_policy_revision: &'a str,
     input_manifest: &'a [ReadinessInput],
@@ -1196,13 +1158,7 @@ pub fn verify_release_candidate(
             field: "readiness_snapshot_contents",
         });
     }
-    if candidate.milestone_definition_revision_id != recomputed.milestone_definition_revision_id
-        || candidate.baseline_id != recomputed.baseline_id
-        || candidate.baseline_revision_id != recomputed.baseline_revision_id
-        || candidate.baseline_digest != recomputed.baseline_digest
-        || candidate.release_policy_revision != recomputed.release_policy_revision
-        || candidate.release_policy_digest != recomputed.release_policy_digest
-    {
+    if candidate.milestone_definition_revision_id != recomputed.milestone_definition_revision_id {
         return Err(MilestoneOrchestrationError::ReleaseCandidateMismatch {
             field: "readiness_source_references",
         });
@@ -1447,11 +1403,6 @@ mod tests {
                     }]
                 },
             ),
-            baseline_id: "baseline-1".to_owned(),
-            baseline_revision_id: "baseline-r1".to_owned(),
-            baseline_digest: "baseline-digest".to_owned(),
-            release_policy_revision: "policy-r1".to_owned(),
-            release_policy_digest: "policy-digest".to_owned(),
             source_event_watermark: "event-10".to_owned(),
             computing_policy_revision: "compute-r1".to_owned(),
             input_manifest: vec![
@@ -1490,7 +1441,7 @@ mod tests {
                 observed_at: "2026-08-13T00:00:00Z".to_owned(),
             }],
             commit_build_check_context: vec!["commit:abc".to_owned()],
-            baseline_contract_reasons: Vec::new(),
+            definition_contract_reasons: Vec::new(),
             authorization: AuthorizationProvenance {
                 principal: principal(PrincipalKind::User, "user-1"),
                 authorization_basis: "release-review".to_owned(),

@@ -71,6 +71,13 @@ pub struct SendAgentChatMessageInput {
 }
 
 #[derive(Debug, Clone)]
+pub struct RetryAgentChatTurnInput {
+    pub actor_user_id: String,
+    pub chat_id: String,
+    pub turn_job_id: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct CancelAgentChatTurnInput {
     pub actor_user_id: String,
     pub chat_id: String,
@@ -526,6 +533,109 @@ where
         )
         .await
         .map_err(Into::into)
+    }
+
+    /// Re-run a terminally failed turn from its own triggering message.
+    ///
+    /// A failed turn used to be unrecoverable: the only way to make the Agent
+    /// try again was to send the same text a second time, which appends a
+    /// duplicate user message and loses the fact that this was one request. A
+    /// retry keeps the original message and admits a fresh turn against it.
+    ///
+    /// Authority is resolved anew rather than copied from the failed job. That
+    /// is the point of retrying after a fix: a turn that died because its model,
+    /// binding, or policy was wrong must pick up the corrected one, not replay
+    /// the configuration that failed.
+    pub async fn retry_turn(&self, input: RetryAgentChatTurnInput) -> Result<AgentChatTurnJob> {
+        let chat = self
+            .get_authorized_chat(&input.actor_user_id, &input.chat_id)
+            .await?;
+        let job = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*self.db, &input.turn_job_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent_chat_turn", input.turn_job_id.clone()))?;
+        if job.chat_id != chat.id {
+            return Err(ServiceError::not_found(
+                "agent_chat_turn",
+                input.turn_job_id,
+            ));
+        }
+        if job.status != AgentChatTurnState::Failed {
+            return Err(ServiceError::Conflict(
+                "only a failed Agent Chat turn can be retried".to_owned(),
+            ));
+        }
+        // One live turn per chat: retrying while another is in flight would
+        // race two responders onto the same conversation.
+        let in_flight = AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&*self.db, &chat.id)
+            .await?
+            .into_iter()
+            .any(|other| {
+                matches!(
+                    other.status,
+                    AgentChatTurnState::Queued
+                        | AgentChatTurnState::Leased
+                        | AgentChatTurnState::RetryWait
+                )
+            });
+        if in_flight {
+            return Err(ServiceError::Conflict(
+                "another Agent Chat turn is already in flight".to_owned(),
+            ));
+        }
+        let message =
+            AgentChatMessageRepo::get_agent_chat_message(&*self.db, &job.triggering_message_id)
+                .await?
+                .filter(|message| message.chat_id == chat.id)
+                .ok_or_else(|| {
+                    ServiceError::not_found("agent_chat_message", job.triggering_message_id.clone())
+                })?;
+
+        let attempt = job.attempt_count.saturating_add(1);
+        let dedupe_key = format!("retry:{}:{}", job.id, attempt);
+        let content_digest = content_digest(&message.content)
+            .map_err(|_| ServiceError::invalid_operation("retry content digest failed"))?;
+        let prepared = AgentTurnAdmissionService::new(Arc::clone(&self.db))
+            .prepare(AgentTurnPrepareInput {
+                chat: &chat,
+                trigger: AgentTurnTrigger::UserMessage,
+                dedupe_key: &dedupe_key,
+                content_digest: &content_digest,
+                causation_id: job.causation_id.as_deref(),
+                causation_depth: job.causation_depth,
+                source_responder: None,
+            })
+            .await?;
+        let now = now_rfc3339();
+        let turn = prepared.apply_to_turn(CreateAgentChatTurnJob {
+            id: new_uuid_v4(),
+            chat_id: chat.id.clone(),
+            triggering_message_id: message.id.clone(),
+            responder_identity_id: String::new(),
+            profile_id: String::new(),
+            responder_binding_id: None,
+            responder_binding_version: None,
+            responder_identity_version: None,
+            profile_version: None,
+            operating_skill_revision_id: None,
+            policy_revision: None,
+            policy_digest: None,
+            permission_policy_digest: None,
+            tool_policy_digest: None,
+            admission_digest: None,
+            canonical_scope_provenance_json: None,
+            canonical_scope_type: String::new(),
+            canonical_scope_id: String::new(),
+            dedupe_key: dedupe_key.clone(),
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            correlation_id: job.correlation_id.clone(),
+            causation_id: job.causation_id.clone(),
+            causation_depth: job.causation_depth,
+            created_at: now.clone(),
+            updated_at: now,
+        })?;
+        AgentChatTurnJobRepo::create_agent_chat_turn_job(&*self.db, turn)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn append_success(

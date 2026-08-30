@@ -714,6 +714,13 @@ impl TaskService {
         // dispatcher's `dispatch.target_role` metadata), write-capable
         // implementation executions are measured; user-launched/claimed runs
         // and non-git worktrees are exempt.
+        //
+        // The measurement is the Task branch's own starting point, not this
+        // pass's HEAD. A redispatch onto a branch that already carries the
+        // implementation -- exactly what the Project Agent does to unstick a
+        // stalled Task -- has legitimate verification-only work to do, and
+        // failing it for committing nothing would punish the recovery path
+        // for succeeding.
         let noop_completion_baseline = if read_only_head.is_none()
             && matches!(
                 execution.role.as_str(),
@@ -725,10 +732,10 @@ impl TaskService {
                 .and_then(|dispatch| dispatch.get("target_role"))
                 .is_some()
         {
-            git::get_current_sha(std::path::Path::new(&workspace.worktree_path))
-                .await
-                .ok()
-                .map(|head| (head, task.status.clone(), task.version))
+            workspace
+                .before_sha
+                .clone()
+                .map(|branch_point| (branch_point, task.status.clone(), task.version))
         } else {
             None
         };
@@ -868,9 +875,13 @@ impl TaskService {
         let mut discarded_read_only_changes = false;
         let restore_result = if let Some(head) = read_only_head.as_deref() {
             let worktree_path = std::path::Path::new(&workspace.worktree_path);
-            discarded_read_only_changes =
-                !git::is_worktree_clean(worktree_path).await.unwrap_or(true)
-                    || git::get_current_sha(worktree_path).await.ok().as_deref() != Some(head);
+            // Untracked build output is not authored work. A reviewer that runs
+            // the test suite necessarily leaves caches behind, and failing that
+            // execution punishes the verification the role exists to perform.
+            discarded_read_only_changes = git::has_authored_changes(worktree_path)
+                .await
+                .unwrap_or(false)
+                || git::get_current_sha(worktree_path).await.ok().as_deref() != Some(head);
             git::restore_worktree(worktree_path, head)
                 .await
                 .map_err(ServiceError::from)
@@ -952,14 +963,16 @@ impl TaskService {
         // verification turn) moves status/version and is exempt.
         let mut completed_without_repository_effect = false;
         if result.status == ExecutionOutcome::Completed {
-            if let Some((baseline_head, status_before, version_before)) =
+            if let Some((branch_point, status_before, version_before)) =
                 noop_completion_baseline.as_ref()
             {
                 let worktree_path = std::path::Path::new(&workspace.worktree_path);
                 let clean = git::is_worktree_clean(worktree_path).await.unwrap_or(false);
-                let head_unchanged = git::get_current_sha(worktree_path).await.ok().as_deref()
-                    == Some(baseline_head.as_str());
-                if clean && head_unchanged {
+                // Nothing committed on this branch at all, not merely nothing
+                // committed by this pass.
+                let branch_empty = git::get_current_sha(worktree_path).await.ok().as_deref()
+                    == Some(branch_point.as_str());
+                if clean && branch_empty {
                     let task_after = TaskRepo::get_by_id(&*self.db, &task.id, false)
                         .await?
                         .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
@@ -968,9 +981,9 @@ impl TaskService {
                         completed_without_repository_effect = true;
                         result.status = ExecutionOutcome::Failed;
                         result.error = Some(
-                            "execution completed without repository changes or a workflow \
-                             transition; implement the task in the worktree and commit the \
-                             result, or advance the workflow with a reason"
+                            "execution completed with nothing committed on the Task branch \
+                             and no workflow transition; implement the task in the worktree \
+                             and commit the result, or advance the workflow with a reason"
                                 .to_owned(),
                         );
                     }
@@ -1263,9 +1276,10 @@ impl TaskService {
                 )
             } else {
                 format!(
-                    "Execution {} completed without repository changes or a workflow \
-                     transition. Next attempt: implement the task in the worktree and \
-                     commit the result, or advance the workflow with an explicit reason.",
+                    "Execution {} completed with nothing committed on the Task branch and \
+                     no workflow transition. Next attempt: implement the task in the \
+                     worktree and commit the result, or advance the workflow with an \
+                     explicit reason.",
                     updated.id
                 )
             };

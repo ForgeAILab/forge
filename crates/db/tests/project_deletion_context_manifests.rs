@@ -109,6 +109,7 @@ async fn project_with_context_manifest(db: &SqliteDb) -> (String, String) {
             task_id: None,
             task_role: None,
             workspace_access: "deny".to_owned(),
+            workspace_path: None,
             authority_json: "{}".to_owned(),
             created_at: NOW.to_owned(),
             updated_at: NOW.to_owned(),

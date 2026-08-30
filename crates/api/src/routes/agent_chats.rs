@@ -280,6 +280,25 @@ pub async fn cancel_agent_chat_turn(
     Ok(Json(turn_response(job)))
 }
 
+/// Re-run a failed turn from its own triggering message, with freshly
+/// resolved authority. Nothing is re-sent: the original message stays the one
+/// request it always was.
+pub async fn retry_agent_chat_turn(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path((chat_id, turn_id)): Path<(String, String)>,
+) -> ApiResult<Json<AgentChatTurnJobResponse>> {
+    let job = state
+        .agent_chat_service
+        .retry_turn(services::RetryAgentChatTurnInput {
+            actor_user_id: user.user_id,
+            chat_id,
+            turn_job_id: turn_id,
+        })
+        .await?;
+    Ok(Json(turn_response(job)))
+}
+
 /// List the caller's Main Chat topics, oldest first. Earlier topics remain
 /// inspectable/searchable here even though a new Main turn's episodic
 /// context is bounded to the current one (D21/F18).

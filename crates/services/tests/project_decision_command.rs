@@ -31,8 +31,6 @@ const PROFILE_ID: &str = "decision-command-profile";
 const PROJECT_ID: &str = "decision-command-project";
 const CHARTER_ID: &str = "decision-command-charter";
 const CHARTER_REVISION_ID: &str = "decision-command-charter-revision";
-const BASELINE_ID: &str = "decision-command-baseline";
-const BASELINE_REVISION_ID: &str = "decision-command-baseline-revision";
 const NOW: &str = "2026-08-20T00:00:00.000Z";
 
 struct Fixture {
@@ -180,55 +178,6 @@ async fn fixture() -> Fixture {
     .await
     .expect("Project Charter pointer sets");
 
-    sqlx::query(
-        "INSERT INTO project_execution_baseline
-            (id, project_id, current_revision_id, lifecycle, version,
-             created_at, updated_at)
-         VALUES (?, ?, ?, 'active', 2, ?, ?)",
-    )
-    .bind(BASELINE_ID)
-    .bind(PROJECT_ID)
-    .bind(BASELINE_REVISION_ID)
-    .bind(NOW)
-    .bind(NOW)
-    .execute(db.pool())
-    .await
-    .expect("baseline creates");
-    sqlx::query(
-        "INSERT INTO project_execution_baseline_revision
-            (id, baseline_id, revision, base_revision, lifecycle,
-             charter_revision_id, document_revisions_json, plan_items_json,
-             milestone_ids_json, milestone_definition_revision_ids_json,
-             release_policy_json, release_policy_revision, release_policy_digest,
-             acceptance_matrix_json, capability_classes_json, risk_classes_json,
-             adaptive_envelope_json, elevated_operations_json, exclusions_json,
-             rollback_recovery_json, schema_version, render_version, rendered_view,
-             content_digest, rendered_digest, source_refs_json, created_at)
-         VALUES (?, ?, 1, 0, 'approved', ?, '[]', '[]', '[]', '[]', '{}',
-                 'policy-1', 'policy-digest', '[]', '[]', '[]', ?, '[]', '[]',
-                 '{}', 'forge.execution-baseline/v1',
-                 'forge.execution-baseline-render/v1', '# Decision Baseline',
-                 'baseline-content-digest', 'baseline-render-digest', '[]', ?)",
-    )
-    .bind(BASELINE_REVISION_ID)
-    .bind(BASELINE_ID)
-    .bind(CHARTER_REVISION_ID)
-    .bind(
-        json!({
-            "allowed_task_operations": [],
-            "fixed_outcomes": [],
-            "fixed_acceptance": [],
-            "fixed_risk_classes": [],
-            "forbidden_side_effects": [],
-            "elevated_operations": [],
-        })
-        .to_string(),
-    )
-    .bind(NOW)
-    .execute(db.pool())
-    .await
-    .expect("baseline revision creates");
-
     Fixture {
         db,
         project_version: 1,
@@ -239,8 +188,6 @@ fn action_payload(action: &str, expected_project_version: i64, decision_id: Opti
     let mut payload = json!({
         "action": action,
         "decision_class": "project_implementation",
-        "baseline_id": BASELINE_ID,
-        "baseline_revision_id": BASELINE_REVISION_ID,
         "expected_project_version": expected_project_version,
         "question": "Which implementation choice should the Project use?",
         "options": ["option-a", "option-b"],
@@ -428,7 +375,6 @@ fn agent_effective_command(
             .to_owned(),
         context: DecisionCandidateContext {
             summary: Some("A bounded implementation choice.".to_owned()),
-            governing_baseline_revision_id: Some(BASELINE_REVISION_ID.to_owned()),
             ..DecisionCandidateContext::default()
         },
         options: vec!["option-a".to_owned(), "option-b".to_owned()],
@@ -437,7 +383,6 @@ fn agent_effective_command(
         decision_class: DecisionClass::ProjectImplementation,
         authority_basis: "active_execution_baseline_adaptive_envelope".to_owned(),
         charter_revision_id: Some(CHARTER_REVISION_ID.to_owned()),
-        baseline_revision_id: Some(BASELINE_REVISION_ID.to_owned()),
         source_refs: Vec::new(),
         supersedes_decision_id: None,
         state: "active".to_owned(),
@@ -568,7 +513,6 @@ fn user_candidate_command(
         question: question.to_owned(),
         context: DecisionCandidateContext {
             summary: Some("A bounded implementation choice.".to_owned()),
-            governing_baseline_revision_id: Some(BASELINE_REVISION_ID.to_owned()),
             ..DecisionCandidateContext::default()
         },
         options: vec!["option-a".to_owned(), "option-b".to_owned()],
@@ -1532,7 +1476,6 @@ async fn approve_candidate_rejects_historical_malformed_options() {
             "affected_task_ids": [],
             "affected_milestone_ids": [],
             "governing_charter_revision_id": null,
-            "governing_baseline_revision_id": BASELINE_REVISION_ID,
             "supersedes_decision_id": null,
             "invalidates_decision_id": null,
             "decision_class": "project_implementation",

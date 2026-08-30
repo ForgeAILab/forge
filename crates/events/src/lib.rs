@@ -67,6 +67,15 @@ pub enum EventContext {
         project_id: String,
         previous_reason: Option<String>,
     },
+    /// The Project Agent stopped responding to open incidents because its wake
+    /// budget is spent. Autonomy has halted with work still outstanding, which
+    /// is a user-visible stall rather than routine suppression: nothing will
+    /// move until the window rolls over or the user says something.
+    ProjectAutonomyStalled {
+        project_id: String,
+        open_incidents: i64,
+        reason: String,
+    },
     TaskFailed {
         project_id: String,
         reason: String,

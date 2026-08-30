@@ -9,9 +9,12 @@
 use std::{
     collections::BTreeSet,
     net::{IpAddr, Ipv6Addr},
+    path::{Component, Path, PathBuf},
     sync::{Arc, RwLock},
     time::Duration,
 };
+
+use sha2::{Digest, Sha256};
 
 use api_types::{
     ApprovalTarget, CanonicalScopeRef as OutcomeScopeRef, CurrentVersionOrRevision,
@@ -36,9 +39,10 @@ use forge_agent_host::{
     MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
     PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION,
-    PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
+    PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION,
     PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION,
-    TASK_PROPOSE_OPERATION, TASK_REVIEW_OPERATION,
+    TASK_EVIDENCE_OPERATION, TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION,
+    TASK_WORKLOG_OPERATION,
 };
 use reqwest::header::ACCEPT;
 use serde::Deserialize;
@@ -187,6 +191,9 @@ pub struct CoordinationToolProvider {
     /// `task.adaptive` commands inline, so native proposals materialize
     /// through the durable command receipt path without a separate caller.
     task_service: Arc<RwLock<Option<Arc<TaskService>>>>,
+    /// Root of the media store. Evidence capture writes the bytes it was given
+    /// here before recording the Task media row that references them.
+    media_root: Arc<RwLock<Option<PathBuf>>>,
 }
 
 impl std::fmt::Debug for CoordinationToolProvider {
@@ -207,12 +214,24 @@ impl CoordinationToolProvider {
             project_actions: ProjectOrchestrationActionService::new(Arc::clone(&db)),
             public_search: Arc::new(RwLock::new(None)),
             task_service: Arc::new(RwLock::new(None)),
+            media_root: Arc::new(RwLock::new(None)),
             db,
         }
     }
 
     /// Attach the shared TaskService so admitted Task commands execute inline
     /// through the shared receipt-backed command paths.
+    /// Attach the media storage root so Task sessions can capture evidence.
+    pub fn set_media_root(&self, media_root: PathBuf) {
+        if let Ok(mut slot) = self.media_root.write() {
+            *slot = Some(media_root);
+        }
+    }
+
+    fn media_root_handle(&self) -> Option<PathBuf> {
+        self.media_root.read().ok().and_then(|slot| slot.clone())
+    }
+
     pub fn set_task_service(&self, task_service: Arc<TaskService>) {
         if let Ok(mut slot) = self.task_service.write() {
             *slot = Some(task_service);
@@ -504,6 +523,397 @@ impl CoordinationToolProvider {
     /// Returns the bounded Project projection used by the Project Agent
     /// orchestration tool.  It intentionally contains no repository path,
     /// Workspace lease, credential, or cross-Project metadata.
+    /// Capture one artifact this Task run produced as authoritative evidence.
+    ///
+    /// This is deliberately the only evidence-*producing* operation in the
+    /// system, and it is deliberately Task-scoped. A Project Agent session has
+    /// no workspace and no process by construction, so anything it "captured"
+    /// would be authored rather than observed. A Task session has both, so the
+    /// artifact it registers here is a real product of a real run.
+    /// Append one entry to the Task worklog the next role will read.
+    ///
+    /// Provenance is server-derived on purpose: the Task comes from the bound
+    /// scope, the execution and role from the run that is actually holding the
+    /// workspace, and the identity from the session. An agent can write what it
+    /// did; it cannot assert who it was or which run it belonged to.
+    async fn execute_task_worklog_append(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        arguments: &Value,
+        payload: &Value,
+    ) -> Result<Value, AgentHostError> {
+        if scope.scope_type != CanonicalScopeType::Task {
+            return Err(AgentHostError::Authority(
+                "a worklog entry belongs to a Task session".to_owned(),
+            ));
+        }
+        let task_id = scope.scope_id.clone();
+        let kind = payload
+            .get("kind")
+            .and_then(Value::as_str)
+            .filter(|value| matches!(*value, "progress" | "decision" | "validation" | "blocker"))
+            .ok_or_else(|| {
+                AgentHostError::Runtime(
+                    "kind must be progress, decision, validation, or blocker".to_owned(),
+                )
+            })?
+            .to_owned();
+        let summary = payload
+            .get("summary")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AgentHostError::Runtime("summary is required".to_owned()))?;
+        if summary.chars().count() > MAX_WORKLOG_SUMMARY_CHARS {
+            return Err(AgentHostError::Runtime(format!(
+                "summary exceeds the {MAX_WORKLOG_SUMMARY_CHARS} character worklog limit"
+            )));
+        }
+
+        // The run holding the workspace is the one that authored this entry.
+        let execution: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT id, role FROM execution
+             WHERE task_id = ? AND agent_id = ? AND status = 'running'
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&task_id)
+        .bind(actor_identity_id)
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+        let (execution_id, role) = match execution {
+            Some((id, role)) => (Some(id), role),
+            None => (None, None),
+        };
+
+        let idempotency_key = correlation_id(arguments, TASK_WORKLOG_OPERATION, scope);
+        let now = db::now_rfc3339();
+        let created = db::TaskCommentRepo::create_comment(
+            &*self.db,
+            db::CreateTaskComment {
+                id: db::new_uuid_v4(),
+                task_id: task_id.clone(),
+                author_type: db::CommentAuthorType::Agent,
+                author_id: Some(actor_identity_id.to_owned()),
+                author_name: role.clone().unwrap_or_else(|| "agent".to_owned()),
+                content: summary.to_owned(),
+                execution_id,
+                role: role.clone(),
+                worklog_kind: Some(kind.clone()),
+                idempotency_key: Some(idempotency_key),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+
+        Ok(json!({
+            "operation": TASK_WORKLOG_OPERATION,
+            "task_id": task_id,
+            "comment_id": created.id,
+            "kind": kind,
+            "execution_id": created.execution_id,
+            "role": created.role,
+            "domain_committed": true,
+        }))
+    }
+
+    async fn execute_task_evidence_capture(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        payload: &Value,
+    ) -> Result<Value, AgentHostError> {
+        if scope.scope_type != CanonicalScopeType::Task {
+            return Err(AgentHostError::Authority(
+                "evidence capture requires a Task scope with a workspace".to_owned(),
+            ));
+        }
+        let task_id = scope.scope_id.clone();
+        let kind = payload
+            .get("kind")
+            .and_then(Value::as_str)
+            .filter(|value| {
+                matches!(
+                    *value,
+                    "screenshot" | "walkthrough_video" | "log" | "report" | "other"
+                )
+            })
+            .ok_or_else(|| {
+                AgentHostError::Runtime(
+                    "kind must be screenshot, walkthrough_video, log, report, or other".to_owned(),
+                )
+            })?
+            .to_owned();
+        let caption = payload
+            .get("caption")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                AgentHostError::Runtime("caption describing the artifact is required".to_owned())
+            })?
+            .to_owned();
+        let path = payload
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let content = payload
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty());
+        // One source of bytes, never both: a caller supplying each would leave
+        // the stored artifact ambiguous about what was actually observed.
+        let (bytes, default_name, content_type) = match (path, content) {
+            (Some(path), None) => {
+                let root = self.task_workspace_root(&task_id).await?;
+                let resolved = resolve_workspace_artifact(&root, path)?;
+                let bytes = std::fs::read(&resolved).map_err(|error| {
+                    AgentHostError::Runtime(format!("captured artifact is unreadable: {error}"))
+                })?;
+                let name = resolved
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("artifact")
+                    .to_owned();
+                let content_type = content_type_for(&name, &kind);
+                (bytes, name, content_type)
+            }
+            (None, Some(content)) => (
+                content.as_bytes().to_vec(),
+                format!("{kind}.txt"),
+                "text/plain".to_owned(),
+            ),
+            (Some(_), Some(_)) => {
+                return Err(AgentHostError::Runtime(
+                    "supply either path or content, not both".to_owned(),
+                ));
+            }
+            (None, None) => {
+                return Err(AgentHostError::Runtime(
+                    "evidence capture requires either a workspace path or inline content"
+                        .to_owned(),
+                ));
+            }
+        };
+        if bytes.is_empty() {
+            return Err(AgentHostError::Runtime(
+                "captured artifact is empty".to_owned(),
+            ));
+        }
+        if bytes.len() as i64 > MAX_CAPTURED_EVIDENCE_BYTES {
+            return Err(AgentHostError::Runtime(format!(
+                "captured artifact exceeds the {MAX_CAPTURED_EVIDENCE_BYTES} byte capture limit"
+            )));
+        }
+        let filename = payload
+            .get("filename")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && !value.contains('/') && !value.contains('\\'))
+            .map_or(default_name, str::to_owned);
+
+        let media_root = self.media_root_handle().ok_or_else(|| {
+            AgentHostError::Configuration("media storage is not configured".to_owned())
+        })?;
+        let media_id = db::new_uuid_v4();
+        let storage_key = format!("{task_id}/{media_id}__{filename}");
+        let destination = safe_media_destination(&media_root, &storage_key)?;
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                AgentHostError::Runtime(format!("media storage is unavailable: {error}"))
+            })?;
+        }
+        std::fs::write(&destination, &bytes).map_err(|error| {
+            AgentHostError::Runtime(format!("captured artifact could not be stored: {error}"))
+        })?;
+
+        let byte_size = bytes.len() as i64;
+        let created = db::TaskMediaRepo::create_media(
+            &*self.db,
+            db::CreateTaskMedia {
+                id: media_id.clone(),
+                task_id: task_id.clone(),
+                display_filename: filename.clone(),
+                content_type,
+                byte_size,
+                storage_key,
+                author_type: db::CommentAuthorType::Agent,
+                author_id: Some(actor_identity_id.to_owned()),
+                author_name: "Agent".to_owned(),
+                created_at: db::now_rfc3339(),
+            },
+        )
+        .await
+        .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+
+        // Milestone evidence attachment compares the caller's checksum against
+        // this column; a Task artifact without one can never back a check.
+        let checksum = hex::encode(Sha256::digest(&bytes));
+        db::SharedMediaRepo::set_media_asset_checksum(
+            &*self.db,
+            &created.id,
+            byte_size,
+            &checksum,
+            &db::now_rfc3339(),
+        )
+        .await
+        .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+        let asset = db::SharedMediaRepo::get_media_asset_for_task_media(&*self.db, &created.id)
+            .await
+            .map_err(|error| AgentHostError::Runtime(error.to_string()))?
+            .ok_or_else(|| {
+                AgentHostError::Runtime("captured artifact has no media asset".to_owned())
+            })?;
+
+        Ok(json!({
+            "operation": TASK_EVIDENCE_OPERATION,
+            "task_id": task_id,
+            "media_id": created.id,
+            "asset_id": asset.id,
+            "checksum": checksum,
+            "byte_size": byte_size,
+            "kind": kind,
+            "caption": caption,
+            "domain_committed": true,
+        }))
+    }
+
+    async fn task_workspace_root(&self, task_id: &str) -> Result<PathBuf, AgentHostError> {
+        let path: Option<String> = sqlx::query_scalar(
+            "SELECT worktree_path FROM workspace
+             WHERE task_id = ? AND status != 'cleaned'
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+        path.filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                AgentHostError::Runtime(
+                    "this Task has no active workspace to capture an artifact from".to_owned(),
+                )
+            })
+    }
+
+    /// Return what Task runs actually reported: worklog entries with the
+    /// execution and role that wrote them, and the artifacts those runs
+    /// captured.
+    ///
+    /// Captured text comes back inline. That is the point of the operation: an
+    /// Agent that cannot run anything still has to be able to read what the run
+    /// found before it cites that run as authority, and before it decides the
+    /// outcome needs a corrective Task.
+    async fn project_observations_read(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        arguments: Value,
+    ) -> Result<Value, AgentHostError> {
+        let project_id = self
+            .authorization
+            .project_orchestration_target(actor_identity_id, scope)
+            .await
+            .map_err(native_scope_error)?;
+        let limit = arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, 50) as i64;
+        let task_filter = arguments
+            .get("task_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+
+        let worklog = sqlx::query(
+            "SELECT c.id, c.task_id, c.worklog_kind, c.role, c.execution_id,
+                    c.content, c.created_at, t.title
+             FROM task_comment c
+             JOIN task t ON t.id = c.task_id
+             WHERE t.project_id = ? AND t.deleted_at IS NULL
+               AND c.author_type = 'agent'
+               AND (? IS NULL OR c.task_id = ?)
+             ORDER BY c.created_at DESC, c.id DESC LIMIT ?",
+        )
+        .bind(&project_id)
+        .bind(task_filter.as_deref())
+        .bind(task_filter.as_deref())
+        .bind(limit)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(|_| AgentHostError::ProtectedPersistence)?;
+
+        let artifacts = sqlx::query(
+            "SELECT a.id AS asset_id, m.task_id, a.display_filename, a.content_type,
+                    a.byte_size, a.checksum, a.storage_key, m.created_at
+             FROM task_media m
+             JOIN media_asset a ON a.legacy_task_media_id = m.id
+             JOIN task t ON t.id = m.task_id
+             WHERE t.project_id = ? AND t.deleted_at IS NULL AND m.deleted_at IS NULL
+               AND (? IS NULL OR m.task_id = ?)
+             ORDER BY m.created_at DESC, m.id DESC LIMIT ?",
+        )
+        .bind(&project_id)
+        .bind(task_filter.as_deref())
+        .bind(task_filter.as_deref())
+        .bind(limit)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(|_| AgentHostError::ProtectedPersistence)?;
+
+        let media_root = self.media_root_handle();
+        let artifacts = artifacts
+            .into_iter()
+            .map(|row| {
+                let content_type: String = row.try_get("content_type").unwrap_or_default();
+                let byte_size: i64 = row.try_get("byte_size").unwrap_or_default();
+                let storage_key: String = row.try_get("storage_key").unwrap_or_default();
+                // Text is what an Agent can actually evaluate; binary artifacts
+                // are named so the user can open them, never inlined.
+                let content = (content_type.starts_with("text/")
+                    && byte_size <= MAX_INLINE_ARTIFACT_BYTES)
+                    .then_some(media_root.as_ref())
+                    .flatten()
+                    .and_then(|root| safe_media_destination(root, &storage_key).ok())
+                    .and_then(|path| std::fs::read_to_string(path).ok())
+                    .map(|text| truncate(&text, MAX_INLINE_ARTIFACT_CHARS));
+                json!({
+                    "asset_id": row.try_get::<String, _>("asset_id").unwrap_or_default(),
+                    "task_id": row.try_get::<String, _>("task_id").unwrap_or_default(),
+                    "filename": row.try_get::<String, _>("display_filename").unwrap_or_default(),
+                    "content_type": content_type,
+                    "byte_size": byte_size,
+                    "checksum": row.try_get::<Option<String>, _>("checksum").unwrap_or_default(),
+                    "captured_at": row.try_get::<String, _>("created_at").unwrap_or_default(),
+                    "content": content,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(json!({
+            "scope": {"type": "project", "id": project_id},
+            "worklog": worklog
+                .into_iter()
+                .map(|row| json!({
+                    "id": row.try_get::<String, _>("id").unwrap_or_default(),
+                    "task_id": row.try_get::<String, _>("task_id").unwrap_or_default(),
+                    "task_title": truncate(&row.try_get::<String, _>("title").unwrap_or_default(), 160),
+                    "kind": row.try_get::<Option<String>, _>("worklog_kind").unwrap_or_default(),
+                    "role": row.try_get::<Option<String>, _>("role").unwrap_or_default(),
+                    "execution_id": row.try_get::<Option<String>, _>("execution_id").unwrap_or_default(),
+                    "summary": truncate(&row.try_get::<String, _>("content").unwrap_or_default(), 2_000),
+                    "created_at": row.try_get::<String, _>("created_at").unwrap_or_default(),
+                }))
+                .collect::<Vec<_>>(),
+            "artifacts": artifacts,
+        }))
+    }
+
     async fn project_current_state_read(
         &self,
         actor_identity_id: &str,
@@ -825,6 +1235,16 @@ impl CoordinationToolProvider {
                 .execute_main_genesis_charter_draft(actor_identity_id, scope, arguments, payload)
                 .await;
         }
+        if operation == TASK_WORKLOG_OPERATION {
+            return self
+                .execute_task_worklog_append(actor_identity_id, scope, &arguments, &payload)
+                .await;
+        }
+        if operation == TASK_EVIDENCE_OPERATION {
+            return self
+                .execute_task_evidence_capture(actor_identity_id, scope, &payload)
+                .await;
+        }
         if classification == OperationClassification::DirectCommand {
             let requested_permission = descriptor.required_permission.ok_or_else(|| {
                 AgentHostError::Authority(
@@ -834,6 +1254,7 @@ impl CoordinationToolProvider {
             let target_id = if operation == TASK_PROPOSE_OPERATION
                 || operation == TASK_ADAPTIVE_OPERATION
                 || operation == TASK_REVIEW_OPERATION
+                || operation == TASK_RECOVER_OPERATION
                 || forge_agent_host::is_project_orchestration_operation(operation)
             {
                 Some(
@@ -932,7 +1353,6 @@ impl CoordinationToolProvider {
                 (Some("project".to_owned()), Some(project_id))
             }
             PROJECT_DOCUMENT_OPERATION
-            | PROJECT_EXECUTION_BASELINE_OPERATION
             | PROJECT_MILESTONE_OPERATION
             | PROJECT_EVIDENCE_OPERATION
             | PROJECT_VALIDATION_OPERATION
@@ -1128,6 +1548,95 @@ impl CoordinationToolProvider {
                     api_types::TaskAction::Approve => "accept",
                     _ => "reject",
                 },
+                "requires_user_authorization": false,
+            }));
+        }
+
+        if operation == TASK_RECOVER_OPERATION {
+            let Some(task_service) = self.task_service_handle() else {
+                return Err(AgentHostError::Configuration(
+                    "Task recovery execution is not wired to a TaskService".to_owned(),
+                ));
+            };
+            let project_id = target_id.ok_or_else(|| {
+                AgentHostError::Authority(
+                    "Task recovery command has no server-derived Project target".to_owned(),
+                )
+            })?;
+            let task_id = payload
+                .get("task_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| AgentHostError::Runtime("task_id is required".to_owned()))?;
+            let reason = payload
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    AgentHostError::Runtime(
+                        "state what stopped this Task before recovering it".to_owned(),
+                    )
+                })?
+                .to_owned();
+            let action = match payload.get("action").and_then(Value::as_str) {
+                Some("resume_session") => api_types::RecoveryAction::ResumeSession,
+                Some("reexecute") => api_types::RecoveryAction::Reexecute,
+                Some("reset_to_initial") => api_types::RecoveryAction::ResetToInitial,
+                Some("reset_retry_window") => api_types::RecoveryAction::ResetRetryWindow,
+                _ => {
+                    return Err(AgentHostError::Runtime(
+                        "action must be resume_session, reexecute, reset_to_initial, or \
+                         reset_retry_window"
+                            .to_owned(),
+                    ));
+                }
+            };
+            // The Task must belong to the bound Project: recovery is repair
+            // authority over this Project's work, never a handle on another's.
+            let owns_task: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM task WHERE id = ? AND project_id = ? AND deleted_at IS NULL",
+            )
+            .bind(&task_id)
+            .bind(&project_id)
+            .fetch_optional(self.db.pool())
+            .await
+            .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+            if owns_task.is_none() {
+                return Err(AgentHostError::Authority(
+                    "task_id must name a Task in this Project".to_owned(),
+                ));
+            }
+            let (policy_result, _) = self
+                .actions
+                .evaluate_direct_command_policy(
+                    actor_identity_id,
+                    scope_type_name(scope.scope_type),
+                    &scope.scope_id,
+                    requested_permission,
+                    operation,
+                    None,
+                )
+                .await
+                .map_err(service_error)?;
+            if !matches!(policy_result, AgentActionPolicyResult::Allowed) {
+                return Err(AgentHostError::Authority(
+                    "Task recovery command policy did not admit execution".to_owned(),
+                ));
+            }
+            let task = task_service
+                .recover_task(task_id, action, Some(reason), None)
+                .await
+                .map_err(service_error)?;
+            return Ok(json!({
+                "operation": operation,
+                "status": "succeeded",
+                "replayed": false,
+                "materialized": true,
+                "domain_committed": true,
+                "correlation_id": correlation_id,
+                "task_id": task.id,
+                "task_status": task.status,
                 "requires_user_authorization": false,
             }));
         }
@@ -2099,6 +2608,10 @@ impl ForgeToolProvider for CoordinationToolProvider {
                 self.project_current_state_read(actor_identity_id, scope, arguments)
                     .await
             }
+            PROJECT_OBSERVATIONS_OPERATION => {
+                self.project_observations_read(actor_identity_id, scope, arguments)
+                    .await
+            }
             "memory.read" => {
                 self.memory_read(actor_identity_id, scope, arguments, false)
                     .await
@@ -2367,7 +2880,6 @@ fn retry_for_current(operation: &str, current: &CurrentVersionOrRevision) -> Ret
     if let Some(version) = current.version {
         let field = match operation {
             _ if current.resource_type == "project" => "expected_project_version",
-            PROJECT_EXECUTION_BASELINE_OPERATION => "expected_baseline_version",
             PROJECT_DOCUMENT_OPERATION => "expected_document_version",
             PROJECT_MILESTONE_OPERATION
             | PROJECT_EVIDENCE_OPERATION
@@ -2378,10 +2890,7 @@ fn retry_for_current(operation: &str, current: &CurrentVersionOrRevision) -> Ret
         retry.arguments.insert(field.to_owned(), json!(version));
     }
     if let Some(revision_id) = current.revision_id.as_deref() {
-        if matches!(
-            operation,
-            PROJECT_EXECUTION_BASELINE_OPERATION | PROJECT_DOCUMENT_OPERATION
-        ) {
+        if matches!(operation, PROJECT_DOCUMENT_OPERATION) {
             retry
                 .arguments
                 .insert("base_revision_id".to_owned(), json!(revision_id));
@@ -2928,6 +3437,7 @@ fn workspace_access_name(access: WorkspaceAccess) -> &'static str {
         WorkspaceAccess::Deny => "deny",
         WorkspaceAccess::TaskRead => "task_read",
         WorkspaceAccess::TaskWrite => "task_write",
+        WorkspaceAccess::ProjectVerify => "project_verify",
     }
 }
 
@@ -2954,6 +3464,93 @@ fn permission_set(value: &str) -> BTreeSet<String> {
 
 fn truncate(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
+}
+
+/// A captured artifact is evidence, not a transfer channel: keep it small
+/// enough that a runaway capture cannot fill the media store.
+const MAX_CAPTURED_EVIDENCE_BYTES: i64 = 25 * 1024 * 1024;
+
+/// A worklog entry is a summary the next role reads, not a transcript.
+const MAX_WORKLOG_SUMMARY_CHARS: usize = 4_000;
+
+/// Inline only what an Agent can read and act on; anything larger is named
+/// rather than pasted into a turn.
+const MAX_INLINE_ARTIFACT_BYTES: i64 = 256 * 1024;
+const MAX_INLINE_ARTIFACT_CHARS: usize = 8_000;
+
+/// Resolve a caller-supplied artifact path inside the Task workspace.
+/// Traversal, absolute paths, and symlinked escapes are all rejected: the
+/// capture surface must never read a file the Task session could not read.
+fn resolve_workspace_artifact(root: &Path, relative: &str) -> Result<PathBuf, AgentHostError> {
+    let candidate = Path::new(relative);
+    if candidate.is_absolute() {
+        return Err(AgentHostError::Authority(
+            "captured artifact path must be workspace-relative".to_owned(),
+        ));
+    }
+    if candidate
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(AgentHostError::Authority(
+            "captured artifact path escapes the Task workspace".to_owned(),
+        ));
+    }
+    let joined = root.join(candidate);
+    let canonical_root = root.canonicalize().map_err(|error| {
+        AgentHostError::Runtime(format!("Task workspace is unavailable: {error}"))
+    })?;
+    let canonical = joined.canonicalize().map_err(|error| {
+        AgentHostError::Runtime(format!("captured artifact does not exist: {error}"))
+    })?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(AgentHostError::Authority(
+            "captured artifact path escapes the Task workspace".to_owned(),
+        ));
+    }
+    if !canonical.is_file() {
+        return Err(AgentHostError::Runtime(
+            "captured artifact is not a file".to_owned(),
+        ));
+    }
+    Ok(canonical)
+}
+
+/// Build the on-disk destination for a storage key without letting the key
+/// itself walk out of the media root.
+fn safe_media_destination(root: &Path, storage_key: &str) -> Result<PathBuf, AgentHostError> {
+    let candidate = Path::new(storage_key);
+    if candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(AgentHostError::Authority(
+            "media storage key is invalid".to_owned(),
+        ));
+    }
+    Ok(root.join(candidate))
+}
+
+fn content_type_for(filename: &str, kind: &str) -> String {
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "png" => "image/png".to_owned(),
+        "jpg" | "jpeg" => "image/jpeg".to_owned(),
+        "gif" => "image/gif".to_owned(),
+        "webp" => "image/webp".to_owned(),
+        "webm" => "video/webm".to_owned(),
+        "mp4" => "video/mp4".to_owned(),
+        "json" => "application/json".to_owned(),
+        "txt" | "log" | "md" => "text/plain".to_owned(),
+        _ if kind == "screenshot" => "image/png".to_owned(),
+        _ if kind == "walkthrough_video" => "video/webm".to_owned(),
+        _ => "application/octet-stream".to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -3127,60 +3724,6 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn nested_baseline_approval_target_is_projected_into_outcome() {
-        let scope = CanonicalScope {
-            scope_type: CanonicalScopeType::Project,
-            scope_id: "project-1".to_owned(),
-            workspace_access: WorkspaceAccess::Deny,
-        };
-        let result = json!({
-            "receipt_id": "receipt-1",
-            "requires_user_authorization": true,
-            "domain_result": {
-                "baseline_version": 3,
-                "approval_target": {
-                    "baseline_id": "baseline-1",
-                    "revision_id": "revision-1",
-                    "revision": 0,
-                    "content_digest": "content-digest",
-                    "render_digest": "render-digest",
-                    "requires_user_authorization": true
-                }
-            }
-        });
-        let outcome = CoordinationToolProvider::structured_success(
-            PROJECT_EXECUTION_BASELINE_OPERATION,
-            &scope,
-            "correlation-1",
-            result,
-            true,
-        )
-        .expect("structured baseline outcome");
-        assert_eq!(outcome["code"], "approval_required");
-        assert_eq!(
-            outcome["approval_target"]["target_type"],
-            "execution_baseline"
-        );
-        assert_eq!(outcome["approval_target"]["target_id"], "baseline-1");
-        assert_eq!(
-            outcome["approval_target"]["operation"],
-            PROJECT_EXECUTION_BASELINE_OPERATION
-        );
-        assert_eq!(outcome["approval_target"]["version"], 3);
-        assert_eq!(outcome["approval_target"]["revision_id"], "revision-1");
-        assert_eq!(outcome["approval_target"]["revision"], 0);
-        assert_eq!(
-            outcome["approval_target"]["content_digest"],
-            "content-digest"
-        );
-        assert_eq!(
-            outcome["approval_target"]["rendered_digest"],
-            "render-digest"
-        );
-    }
-
     #[test]
     fn session_action_payload_is_bounded_and_allowlisted() {
         assert!(validate_proposal_payload("session.action", &json!({"action":"cancel"}),).is_ok());

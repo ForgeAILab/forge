@@ -1506,7 +1506,6 @@ async fn decision_candidate_effective_and_rejection_commands_are_atomic() {
         explicit_event: "decision-approved".to_owned(),
         authorization_occurred_at: now.to_owned(),
         charter_revision_id: None,
-        baseline_revision_id: None,
         source_refs_json: candidate.source_refs_json.clone(),
         affected_records_json: "{}".to_owned(),
         supersedes_decision_id: None,

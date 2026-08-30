@@ -120,19 +120,6 @@ async fn main() {
 
     let db = Arc::new(db::SqliteDb::new(pool));
     let event_bus = Arc::new(events::EventBus::with_default_capacity());
-    match services::audit_execution_baseline_integrity(Arc::clone(&db)).await {
-        Ok(audit) if audit.invalid_revisions > 0 => info!(
-            invalid_revisions = audit.invalid_revisions,
-            active_blockers = audit.active_blockers,
-            successor_drafts = audit.successor_drafts,
-            "execution baseline integrity audit completed"
-        ),
-        Ok(_) => {}
-        Err(error) => {
-            error!(%error, "execution baseline integrity audit failed");
-            std::process::exit(1);
-        }
-    }
     let mut registry = cli_adapters::default_registry();
     if cli.demo {
         registry.register(Box::new(cli_adapters::NullAdapter::new()));
@@ -291,7 +278,10 @@ async fn main() {
     ));
     let mut coordination_consumer_handle =
         coordination_consumer.start(state.shutdown_signal.subscribe());
-    let attention_projection = Arc::new(services::AttentionService::new(Arc::clone(&state.db)));
+    let attention_projection = Arc::new(
+        services::AttentionService::new(Arc::clone(&state.db))
+            .with_event_bus(Arc::clone(&state.event_bus)),
+    );
     let mut attention_projection_handle =
         attention_projection.start(state.shutdown_signal.subscribe());
     let wake_turn_consumer = Arc::new(services::WakeTurnConsumer::new(

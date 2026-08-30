@@ -416,46 +416,6 @@ async fn seed_charter_backed_compact_project(harness: &common::Harness, project_
 
 async fn seed_compact_milestone_readiness_and_release(harness: &common::Harness, project_id: &str) {
     let now = db::now_rfc3339();
-    let release_policy: api_types::ExecutionBaselineReleasePolicy = serde_json::from_value(json!({
-        "schema_version": services::EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA,
-        "revision": "policy-r1",
-        "required_check_definition_revisions": ["overview-milestone-valid-r1"],
-        "reviewer_independence_rules": ["independent-reviewer"],
-        "manual_attestation_rules": ["manual-attestation"],
-        "waiver_rules": ["user-waiver"],
-        "evidence_kinds": ["media"],
-        "evidence_contexts": ["milestone"],
-        "evidence_freshness_rules": ["current-milestone"],
-        "dependency_rules": ["dependencies-green"],
-        "stale_input_rules": ["stale-baseline-blocks"],
-        "forbidden_side_effects": ["cross-project-write"],
-        "known_issue_rules": ["known-issue-blocks"],
-        "correction_rules": ["correction-required"],
-        "purge_rules": ["purge-stale-evidence"]
-    }))
-    .expect("closed overview release policy parses");
-    let release_policy_digest = api_types::canonical_digest_with_schema(
-        services::EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA,
-        &release_policy,
-    )
-    .expect("compute overview release policy digest");
-    let release_policy_json = json!({
-        "revision": "policy-r1",
-        "digest": release_policy_digest,
-        "policy": release_policy,
-    })
-    .to_string();
-    sqlx::query(
-        "INSERT INTO project_execution_baseline (
-            id, project_id, lifecycle, version, created_at, updated_at
-         ) VALUES ('overview-baseline', ?, 'active', 1, ?, ?)",
-    )
-    .bind(project_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(harness.state.db.pool())
-    .await
-    .expect("insert overview baseline");
     sqlx::query(
         "INSERT INTO project_milestone (
             id, project_id, milestone_sequence, milestone_key, display_label,
@@ -491,38 +451,6 @@ async fn seed_compact_milestone_readiness_and_release(harness: &common::Harness,
     .execute(harness.state.db.pool())
     .await
     .expect("insert valid overview definition");
-    sqlx::query(
-        "INSERT INTO project_execution_baseline_revision (
-            id, baseline_id, revision, base_revision, lifecycle,
-            charter_revision_id, document_revisions_json, plan_items_json,
-            milestone_id, primary_milestone_id, milestone_ids_json,
-            milestone_definition_revision_ids_json, release_policy_json,
-            release_policy_revision, release_policy_digest, acceptance_matrix_json,
-            capability_classes_json, risk_classes_json, adaptive_envelope_json,
-            elevated_operations_json, exclusions_json, rollback_recovery_json,
-            schema_version, render_version, rendered_view, content_digest, rendered_digest,
-            source_refs_json, created_at
-         ) VALUES ('overview-baseline-r1', 'overview-baseline', 1, 0, 'approved',
-            'overview-charter-r1', '[]', '[]', 'overview-milestone-valid',
-            'overview-milestone-valid', '[\"overview-milestone-valid\"]',
-            '[\"overview-milestone-valid-r1\"]', ?, 'policy-r1', ?,
-            '[]', '{}', '{}', '{}', '[]', '[]', '{}', 'baseline-test', 'v1',
-            '# Bounded baseline', 'baseline-digest-r1', 'baseline-render-r1', '[]', ?)",
-    )
-    .bind(&release_policy_json)
-    .bind(&release_policy_digest)
-    .bind(&now)
-    .execute(harness.state.db.pool())
-    .await
-    .expect("insert overview baseline revision");
-    sqlx::query(
-        "UPDATE project_execution_baseline
-         SET current_revision_id = 'overview-baseline-r1'
-         WHERE id = 'overview-baseline'",
-    )
-    .execute(harness.state.db.pool())
-    .await
-    .expect("point overview baseline at revision");
     sqlx::query("UPDATE project SET primary_milestone_id = ? WHERE id = ?")
         .bind("overview-milestone-valid")
         .bind(project_id)
@@ -556,9 +484,6 @@ async fn seed_compact_milestone_readiness_and_release(harness: &common::Harness,
             &readiness_authorization,
             "overview-milestone-valid",
             1,
-            "overview-baseline",
-            "overview-baseline-r1",
-            "policy-r1",
             "overview-readiness-idem",
         )
         .await
@@ -590,9 +515,6 @@ async fn seed_compact_milestone_readiness_and_release(harness: &common::Harness,
         readiness_snapshot_id: readiness.id.clone(),
         readiness_digest: readiness.readiness_digest.clone(),
         source_event_watermark: readiness.source_event_watermark.clone(),
-        baseline_id: "overview-baseline".to_owned(),
-        baseline_revision_id: "overview-baseline-r1".to_owned(),
-        baseline_digest: "baseline-digest-r1".to_owned(),
         charter_revision: api_types::ArtifactRef {
             artifact_id: "overview-charter".to_owned(),
             revision_id: "overview-charter-r1".to_owned(),
@@ -607,8 +529,6 @@ async fn seed_compact_milestone_readiness_and_release(harness: &common::Harness,
         repository_references: Vec::new(),
         evidence_pins: Vec::new(),
         waived_check_ids: Vec::new(),
-        release_policy_revision: "policy-r1".to_owned(),
-        release_policy_digest: release_policy_digest.clone(),
         released_by: releasing_principal,
         authorization: release_authorization,
         released_at: now.clone(),
@@ -621,8 +541,7 @@ async fn seed_compact_milestone_readiness_and_release(harness: &common::Harness,
         "INSERT INTO project_release (
             id, project_id, milestone_id, release_sequence, release_revision,
             release_identifier, milestone_revision_id, readiness_snapshot_id,
-            readiness_digest, baseline_id, baseline_revision_id, baseline_digest,
-            release_policy_revision, release_policy_digest, summary, changelog,
+            readiness_digest, summary, changelog,
             known_issues_json, charter_revision_id, document_revisions_json,
             decision_ids_json, task_references_json, validation_references_json,
             git_references_json, evidence_references_json, waivers_json,
@@ -632,8 +551,7 @@ async fn seed_compact_milestone_readiness_and_release(harness: &common::Harness,
             created_at
          ) VALUES ('overview-release-valid', ?, 'overview-milestone-valid', 1, 1,
             'M001-r1', 'overview-milestone-valid-r1', ?,
-            ?, 'overview-baseline', 'overview-baseline-r1',
-            'baseline-digest-r1', 'policy-r1', ?, 'First release',
+            ?, 'First release',
             '[\"Bounded product shipped\"]', '[]', 'overview-charter-r1', '[]',
             '[]', '[]', '[]', '[]', '[]', '[]', 'user', 'test-user-id',
             'test', 'project.milestone.release', ?, 'release.created',
@@ -643,7 +561,6 @@ async fn seed_compact_milestone_readiness_and_release(harness: &common::Harness,
     .bind(project_id)
     .bind(&readiness.id)
     .bind(&readiness.readiness_digest)
-    .bind(&release_policy_digest)
     .bind(&now)
     .bind(&release_snapshot.snapshot_digest)
     .bind(&now)
@@ -695,17 +612,11 @@ async fn project_overview_projects_current_compact_readiness_and_release() {
     );
     assert_eq!(overview.active_milestones.len(), 1);
     assert_eq!(overview.active_milestones[0].milestone.canonical_id, "M001");
-    let readiness = overview.active_milestones[0]
+    overview.active_milestones[0]
         .latest_readiness
         .as_ref()
         .expect("current readiness");
-    assert_eq!(readiness.baseline_digest, "baseline-digest-r1");
-    assert_eq!(readiness.release_policy_revision, "policy-r1");
     assert_eq!(overview.releases.len(), 1);
-    assert_eq!(
-        overview.releases[0].snapshot.release_policy_revision,
-        "policy-r1"
-    );
     assert_eq!(
         overview.releases[0].snapshot.changelog,
         vec!["Bounded product shipped".to_owned()]
@@ -723,7 +634,6 @@ async fn project_overview_projects_current_compact_readiness_and_release() {
     )
     .await;
     assert_eq!(release.id, "overview-release-valid");
-    assert_eq!(release.snapshot.release_policy_revision, "policy-r1");
 }
 
 #[tokio::test]

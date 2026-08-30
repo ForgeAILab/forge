@@ -8,8 +8,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use api_types::{
-    AdaptiveEnvelope, ArtifactRef, DecisionCandidateContext, DecisionClass, ProvenanceRef,
-    ProvenanceSourceKind,
+    ArtifactRef, DecisionCandidateContext, DecisionClass, ProvenanceRef, ProvenanceSourceKind,
 };
 use db::{
     new_uuid_v4, now_rfc3339, AgentAction, AgentActionExecutionStatus, AgentActionStatus,
@@ -62,7 +61,6 @@ pub struct ProjectDecisionEffectiveCommand {
     pub decision_class: DecisionClass,
     pub authority_basis: String,
     pub charter_revision_id: Option<String>,
-    pub baseline_revision_id: Option<String>,
     pub source_refs: Vec<ProvenanceRef>,
     pub supersedes_decision_id: Option<String>,
     pub state: String,
@@ -122,48 +120,41 @@ impl ProjectDecisionCommandService {
                 "Project Agent decisions must use the project_implementation class",
             ));
         }
-        let baseline_id = payload_string(payload, "baseline_id")?;
-        let baseline_revision_id = payload_string(payload, "baseline_revision_id")?;
-        let baseline = sqlx::query(
-            "SELECT r.charter_revision_id,
-                    r.content_digest AS baseline_content_digest,
-                    r.render_version AS baseline_render_version,
-                    r.rendered_digest AS baseline_render_digest,
-                    r.document_revisions_json, r.milestone_id,
-                    r.milestone_ids_json, r.primary_milestone_id,
-                    r.adaptive_envelope_json
-             FROM project_execution_baseline AS b
-             JOIN project_execution_baseline_revision AS r
-               ON r.id = b.current_revision_id
-             WHERE b.id = ? AND b.project_id = ? AND b.lifecycle = 'active'
-               AND b.current_revision_id = ? AND r.lifecycle = 'approved'
-             LIMIT 1",
+        // The approved Charter governs an Agent decision. Its revision, and
+        // the Documents approved under it, are the artifact set a decision may
+        // name; anything outside that is reconciliation_required.
+        let charter = sqlx::query(
+            "SELECT c.id AS artifact_id, p.current_charter_revision_id,
+                    r.content_digest, r.render_version, r.rendered_digest,
+                    r.lifecycle
+             FROM project AS p
+             JOIN project_charter AS c ON c.project_id = p.id
+             JOIN project_charter_revision AS r
+               ON r.id = p.current_charter_revision_id AND r.charter_id = c.id
+             WHERE p.id = ? LIMIT 1",
         )
-        .bind(&baseline_id)
         .bind(project_id)
-        .bind(&baseline_revision_id)
         .fetch_optional(self.db.pool())
         .await?
         .ok_or_else(|| {
-            ServiceError::conflict(
-                "Project decision must reference the exact approved revision of the active baseline",
-            )
+            ServiceError::conflict("Project decision requires the current approved Project Charter")
         })?;
-        let baseline_charter_revision_id: String = baseline.try_get("charter_revision_id")?;
-        let baseline_document_revisions: Vec<ArtifactRef> =
-            serde_json::from_str(&baseline.try_get::<String, _>("document_revisions_json")?)
-                .map_err(|_| {
-                    ServiceError::invalid_operation(
-                        "active baseline Document references are invalid",
-                    )
-                })?;
-        let baseline_milestone_id: Option<String> = baseline.try_get("milestone_id")?;
-        let baseline_milestone_ids_json: String = baseline.try_get("milestone_ids_json")?;
-        let baseline_primary_milestone_id: Option<String> =
-            baseline.try_get("primary_milestone_id")?;
-        let adaptive_envelope = parse_agent_adaptive_envelope(
-            &baseline.try_get::<String, _>("adaptive_envelope_json")?,
-        )?;
+        let charter_artifact_id: String = charter.try_get("artifact_id")?;
+        let charter_revision_id: String = charter.try_get("current_charter_revision_id")?;
+        let charter_content_digest: String = charter.try_get("content_digest")?;
+        let charter_render_version: String = charter.try_get("render_version")?;
+        let charter_render_digest: String = charter.try_get("rendered_digest")?;
+        let charter_lifecycle: String = charter.try_get("lifecycle")?;
+        if charter_content_digest.trim().is_empty()
+            || charter_render_version.trim().is_empty()
+            || charter_render_digest.trim().is_empty()
+            || charter_lifecycle != "approved"
+        {
+            return Err(ServiceError::invalid_operation(
+                "governing Charter references are missing exact immutable digests",
+            ));
+        }
+
         let affected_artifact_refs: Vec<ArtifactRef> = payload_vec(
             payload,
             "affected_artifact_refs",
@@ -186,13 +177,10 @@ impl ProjectDecisionCommandService {
                  FROM task AS t
                  JOIN project_task_governance AS g ON g.task_id = t.id
                  WHERE t.id = ? AND t.project_id = ?
-                   AND g.baseline_id = ? AND g.baseline_revision_id = ?
                  LIMIT 1",
             )
             .bind(task_id)
             .bind(project_id)
-            .bind(&baseline_id)
-            .bind(&baseline_revision_id)
             .fetch_optional(self.db.pool())
             .await?;
             if governed.is_none() {
@@ -202,76 +190,45 @@ impl ProjectDecisionCommandService {
             }
         }
 
-        let baseline_charter = sqlx::query(
-            "SELECT c.id AS artifact_id, r.content_digest, r.render_version,
-                    r.rendered_digest, r.lifecycle
-             FROM project_charter_revision AS r
-             JOIN project_charter AS c ON c.id = r.charter_id
-             WHERE r.id = ? AND c.project_id = ? LIMIT 1",
+        let mut governing_artifacts = sqlx::query(
+            "SELECT d.id AS artifact_id, r.id AS revision_id, r.content_digest,
+                    r.render_version, r.rendered_digest
+             FROM project_document AS d
+             JOIN project_document_revision AS r
+               ON r.id = d.current_approved_revision_id AND r.document_id = d.id
+             WHERE d.project_id = ? AND r.lifecycle = 'approved'",
         )
-        .bind(&baseline_charter_revision_id)
         .bind(project_id)
-        .fetch_optional(self.db.pool())
+        .fetch_all(self.db.pool())
         .await?
-        .ok_or_else(|| {
-            ServiceError::conflict("active baseline Charter is outside Project scope")
-        })?;
-        let baseline_charter_id: String = baseline_charter.try_get("artifact_id")?;
-        let baseline_charter_content_digest: String = baseline_charter.try_get("content_digest")?;
-        let baseline_charter_render_version: String = baseline_charter.try_get("render_version")?;
-        let baseline_charter_render_digest: String = baseline_charter.try_get("rendered_digest")?;
-        let baseline_charter_lifecycle: String = baseline_charter.try_get("lifecycle")?;
-        let baseline_content_digest: String = baseline.try_get("baseline_content_digest")?;
-        let baseline_render_version: String = baseline.try_get("baseline_render_version")?;
-        let baseline_render_digest: String = baseline.try_get("baseline_render_digest")?;
-        if baseline_charter_content_digest.trim().is_empty()
-            || baseline_charter_render_version.trim().is_empty()
-            || baseline_charter_render_digest.trim().is_empty()
-            || baseline_content_digest.trim().is_empty()
-            || baseline_render_version.trim().is_empty()
-            || baseline_render_digest.trim().is_empty()
-            || baseline_charter_lifecycle != "approved"
-        {
-            return Err(ServiceError::invalid_operation(
-                "active baseline references are missing exact immutable digests",
-            ));
-        }
-        let mut baseline_artifacts = baseline_document_revisions;
-        baseline_artifacts.push(ArtifactRef {
-            artifact_id: baseline_charter_id,
-            revision_id: baseline_charter_revision_id.clone(),
-            content_digest: baseline_charter_content_digest,
-            render_version: Some(baseline_charter_render_version),
-            render_digest: Some(baseline_charter_render_digest),
+        .into_iter()
+        .map(|row| {
+            Ok::<_, sqlx::Error>(ArtifactRef {
+                artifact_id: row.try_get("artifact_id")?,
+                revision_id: row.try_get("revision_id")?,
+                content_digest: row.try_get("content_digest")?,
+                render_version: Some(row.try_get("render_version")?),
+                render_digest: Some(row.try_get("rendered_digest")?),
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+        governing_artifacts.push(ArtifactRef {
+            artifact_id: charter_artifact_id,
+            revision_id: charter_revision_id.clone(),
+            content_digest: charter_content_digest,
+            render_version: Some(charter_render_version),
+            render_digest: Some(charter_render_digest),
         });
-        baseline_artifacts.push(ArtifactRef {
-            artifact_id: baseline_id.clone(),
-            revision_id: baseline_revision_id.clone(),
-            content_digest: baseline_content_digest,
-            render_version: Some(baseline_render_version),
-            render_digest: Some(baseline_render_digest),
-        });
-        let references_inside_baseline = affected_artifact_refs.iter().all(|reference| {
-            baseline_artifacts
+        let references_governed = affected_artifact_refs.iter().all(|reference| {
+            governing_artifacts
                 .iter()
                 .any(|allowed| allowed == reference)
         });
-        let milestones_inside_baseline = affected_milestone_ids.iter().all(|milestone_id| {
-            baseline_milestone_id.as_deref() == Some(milestone_id.as_str())
-                || baseline_primary_milestone_id.as_deref() == Some(milestone_id.as_str())
-                || json_contains_agent_identifier(&baseline_milestone_ids_json, milestone_id)
-        });
         let selected_outcome = payload_optional_string(payload, "selected_outcome");
-        let outcome_inside_envelope =
-            agent_outcome_inside_envelope(&adaptive_envelope, selected_outcome.as_deref());
-        let reconciliation_reason = if !references_inside_baseline {
-            Some("affected artifact is outside the active baseline".to_owned())
-        } else if !milestones_inside_baseline {
-            Some("affected milestone is outside the active baseline".to_owned())
-        } else if !outcome_inside_envelope {
-            Some("selected outcome is outside the active adaptive envelope".to_owned())
-        } else {
+        let reconciliation_reason = if references_governed {
             None
+        } else {
+            Some("affected artifact is outside the approved Charter".to_owned())
         };
         let expected_project_version = payload_integer(payload, "expected_project_version")?;
         let question = payload_string(payload, "question")?;
@@ -279,15 +236,14 @@ impl ProjectDecisionCommandService {
         let rationale = payload_optional_string(payload, "rationale");
         let decision_context = DecisionCandidateContext {
             summary: Some(reconciliation_reason.as_ref().map_or_else(
-                || "Implementation choice inside the active execution baseline".to_owned(),
+                || "Implementation choice inside the approved Charter".to_owned(),
                 |reason| format!("reconciliation_required: {reason}"),
             )),
             constraints: Vec::new(),
             affected_artifact_refs,
             affected_task_ids,
             affected_milestone_ids,
-            governing_charter_revision_id: None,
-            governing_baseline_revision_id: Some(baseline_revision_id.clone()),
+            governing_charter_revision_id: Some(charter_revision_id.clone()),
             supersedes_decision_id: None,
             invalidates_decision_id: None,
         };
@@ -331,10 +287,8 @@ impl ProjectDecisionCommandService {
                             selected_outcome,
                             rationale,
                             decision_class: DecisionClass::ProjectImplementation,
-                            authority_basis: "active_execution_baseline_adaptive_envelope"
-                                .to_owned(),
-                            charter_revision_id: Some(baseline_charter_revision_id),
-                            baseline_revision_id: Some(baseline_revision_id),
+                            authority_basis: "approved_project_charter".to_owned(),
+                            charter_revision_id: Some(charter_revision_id.clone()),
                             source_refs: source_refs.clone(),
                             supersedes_decision_id: None,
                             state: "active".to_owned(),
@@ -557,7 +511,6 @@ impl ProjectDecisionCommandService {
                     explicit_event: command.authorization.authorization_event_id,
                     authorization_occurred_at: command.authorization.authorization_occurred_at,
                     charter_revision_id: command.charter_revision_id,
-                    baseline_revision_id: command.baseline_revision_id,
                     source_refs_json: serde_json::to_string(&command.source_refs)
                         .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
                     affected_records_json,
@@ -708,7 +661,6 @@ impl ProjectDecisionCommandService {
                     charter_revision_id: candidate_context
                         .governing_charter_revision_id
                         .or(project.current_charter_revision_id),
-                    baseline_revision_id: candidate_context.governing_baseline_revision_id,
                     source_refs_json: candidate.source_refs_json,
                     affected_records_json,
                     supersedes_decision_id: target_id,
@@ -1261,18 +1213,9 @@ async fn validate_decision_context(
              WHERE c.project_id = ? AND c.id = ? AND r.id = ? AND r.content_digest = ?
              UNION ALL
              SELECT r.render_version, r.rendered_digest
-             FROM project_execution_baseline_revision r
-             JOIN project_execution_baseline b ON b.id = r.baseline_id
-             WHERE b.project_id = ? AND b.id = ? AND r.id = ? AND r.content_digest = ?
-             UNION ALL
-             SELECT r.render_version, r.rendered_digest
              FROM project_milestone_revision r JOIN project_milestone m ON m.id = r.milestone_id
              WHERE m.project_id = ? AND m.id = ? AND r.id = ? AND r.content_digest = ? LIMIT 1",
         )
-        .bind(project_id)
-        .bind(&artifact.artifact_id)
-        .bind(&artifact.revision_id)
-        .bind(&artifact.content_digest)
         .bind(project_id)
         .bind(&artifact.artifact_id)
         .bind(&artifact.revision_id)
@@ -1324,23 +1267,6 @@ async fn validate_decision_context(
             return Err(ServiceError::not_found(
                 "decision_reference",
                 charter_revision_id,
-            ));
-        }
-    }
-    if let Some(baseline_revision_id) = context.governing_baseline_revision_id.as_deref() {
-        let exists: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM project_execution_baseline_revision r
-             JOIN project_execution_baseline b ON b.id = r.baseline_id
-             WHERE r.id = ? AND b.project_id = ? LIMIT 1",
-        )
-        .bind(baseline_revision_id)
-        .bind(project_id)
-        .fetch_optional(db.pool())
-        .await?;
-        if exists.is_none() {
-            return Err(ServiceError::not_found(
-                "decision_reference",
-                baseline_revision_id,
             ));
         }
     }
@@ -1413,76 +1339,6 @@ fn payload_vec<T: serde::de::DeserializeOwned>(
             .unwrap_or_else(|| Value::Array(Vec::new())),
     )
     .map_err(|_| ServiceError::invalid_operation(message))
-}
-
-fn parse_agent_adaptive_envelope(value: &str) -> Result<AdaptiveEnvelope> {
-    let value: Value = serde_json::from_str(value).map_err(|error| {
-        ServiceError::invalid_operation(format!(
-            "active execution baseline adaptive envelope is invalid: {error}"
-        ))
-    })?;
-    let object = value.as_object().ok_or_else(|| {
-        ServiceError::invalid_operation(
-            "active execution baseline adaptive envelope must be an object",
-        )
-    })?;
-    const FIELDS: [&str; 6] = [
-        "allowed_task_operations",
-        "fixed_outcomes",
-        "fixed_acceptance",
-        "fixed_risk_classes",
-        "forbidden_side_effects",
-        "elevated_operations",
-    ];
-    if object.len() != FIELDS.len() || FIELDS.iter().any(|field| !object.contains_key(*field)) {
-        return Err(ServiceError::invalid_operation(
-            "active execution baseline adaptive envelope must contain exactly its required arrays",
-        ));
-    }
-    for field in FIELDS {
-        if !object.get(field).is_some_and(Value::is_array)
-            || object
-                .get(field)
-                .and_then(Value::as_array)
-                .is_some_and(|values| values.iter().any(|value| !value.is_string()))
-        {
-            return Err(ServiceError::invalid_operation(format!(
-                "active execution baseline adaptive envelope field {field} must be a string array"
-            )));
-        }
-    }
-    serde_json::from_value(value).map_err(|error| {
-        ServiceError::invalid_operation(format!(
-            "active execution baseline adaptive envelope is invalid: {error}"
-        ))
-    })
-}
-
-fn agent_outcome_inside_envelope(
-    envelope: &AdaptiveEnvelope,
-    selected_outcome: Option<&str>,
-) -> bool {
-    envelope.fixed_outcomes.is_empty()
-        || selected_outcome.is_some_and(|outcome| {
-            envelope
-                .fixed_outcomes
-                .iter()
-                .any(|fixed| fixed.as_str() == outcome)
-        })
-}
-
-fn json_contains_agent_identifier(value: &str, identifier: &str) -> bool {
-    fn contains(value: &Value, identifier: &str) -> bool {
-        match value {
-            Value::String(value) => value == identifier,
-            Value::Array(values) => values.iter().any(|value| contains(value, identifier)),
-            Value::Object(values) => values.values().any(|value| contains(value, identifier)),
-            Value::Null | Value::Bool(_) | Value::Number(_) => false,
-        }
-    }
-    serde_json::from_str::<Value>(value)
-        .ok()
-        .is_some_and(|value| contains(&value, identifier))
 }
 
 fn agent_authorization(
@@ -1562,7 +1418,6 @@ async fn load_decision(
             explicit_event: row.try_get("explicit_event")?,
             authorization_occurred_at: row.try_get("authorization_occurred_at")?,
             charter_revision_id: row.try_get("charter_revision_id")?,
-            baseline_revision_id: row.try_get("baseline_revision_id")?,
             source_refs_json: row.try_get("source_refs_json")?,
             affected_records_json: row.try_get("affected_records_json")?,
             supersedes_decision_id: row.try_get("supersedes_decision_id")?,

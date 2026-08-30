@@ -18,19 +18,14 @@ use crate::{
     TaskRepo,
 };
 use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
 use sqlx::{Row, Sqlite, Transaction};
 
 const ADAPTIVE_TASK_COMMAND: &str = "task.adaptive";
-const FIXED_BOUNDARY_DIGEST_SCHEMA: &str = "forge.task-governance/fixed-boundary/v1";
-const ADAPTIVE_ENVELOPE_DIGEST_SCHEMA: &str = "forge.task-governance/adaptive-envelope/v1";
 
 #[derive(Debug, Clone)]
 struct SourceGovernance {
     project_id: String,
     charter_revision_id: Option<String>,
-    baseline_id: Option<String>,
-    baseline_revision_id: Option<String>,
     plan_item_id: Option<String>,
     milestone_id: Option<String>,
     document_revisions_json: String,
@@ -44,10 +39,6 @@ struct SourceGovernance {
 struct AdaptiveGate {
     governance: Option<SourceGovernance>,
     envelope: Option<ParsedAdaptiveEnvelope>,
-    baseline_content_digest: Option<String>,
-    baseline_rendered_digest: Option<String>,
-    release_policy_revision: Option<String>,
-    release_policy_digest: Option<String>,
     adaptive_envelope_digest: Option<String>,
     fixed_boundary_digest: Option<String>,
 }
@@ -60,66 +51,6 @@ struct ParsedAdaptiveEnvelope {
     fixed_risk_classes: Vec<String>,
     forbidden_side_effects: Vec<String>,
     elevated_operations: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct FixedBoundary<'a> {
-    fixed_outcomes: &'a [String],
-    fixed_acceptance: &'a [String],
-    fixed_risk_classes: &'a [String],
-    forbidden_side_effects: &'a [String],
-    release_policy_revision: &'a str,
-    release_policy_digest: &'a str,
-    elevated_operations: &'a [String],
-}
-
-fn canonical_digest_with_schema<T: serde::Serialize>(schema: &str, value: &T) -> Result<String> {
-    let value = serde_json::to_value(value).map_err(|error| {
-        DbError::Check(format!("canonical adaptive boundary is invalid: {error}"))
-    })?;
-    let envelope = json!({
-        "schema_version": schema,
-        "value": canonicalize_json(&value),
-    });
-    let bytes = serde_json::to_vec(&canonicalize_json(&envelope)).map_err(|error| {
-        DbError::Check(format!("canonical adaptive boundary is invalid: {error}"))
-    })?;
-    Ok(hex::encode(Sha256::digest(bytes)))
-}
-
-fn canonicalize_json(value: &Value) -> Value {
-    match value {
-        Value::Object(object) => {
-            let mut sorted = object
-                .iter()
-                .map(|(key, value)| (key.clone(), canonicalize_json(value)))
-                .collect::<Vec<_>>();
-            sorted.sort_by(|left, right| left.0.cmp(&right.0));
-            Value::Object(sorted.into_iter().collect())
-        }
-        Value::Array(values) => Value::Array(values.iter().map(canonicalize_json).collect()),
-        scalar => scalar.clone(),
-    }
-}
-
-fn fixed_boundary_digests(
-    envelope: &ParsedAdaptiveEnvelope,
-    release_policy_revision: &str,
-    release_policy_digest: &str,
-) -> Result<(String, String)> {
-    let fixed = FixedBoundary {
-        fixed_outcomes: &envelope.fixed_outcomes,
-        fixed_acceptance: &envelope.fixed_acceptance,
-        fixed_risk_classes: &envelope.fixed_risk_classes,
-        forbidden_side_effects: &envelope.forbidden_side_effects,
-        release_policy_revision,
-        release_policy_digest,
-        elevated_operations: &envelope.elevated_operations,
-    };
-    Ok((
-        canonical_digest_with_schema(FIXED_BOUNDARY_DIGEST_SCHEMA, &fixed)?,
-        canonical_digest_with_schema(ADAPTIVE_ENVELOPE_DIGEST_SCHEMA, envelope)?,
-    ))
 }
 
 /// Shared governance insertion used by Task proposals and every adaptive
@@ -183,18 +114,16 @@ pub(super) async fn insert_task_governance_in_tx(
     }
     sqlx::query(
         "INSERT INTO project_task_governance
-         (task_id, project_id, charter_revision_id, baseline_id,
-          baseline_revision_id, plan_item_id, milestone_id,
+         (task_id, project_id, charter_revision_id,
+          plan_item_id, milestone_id,
           document_revisions_json, capability_class, risk_class,
           runnable, replacement_of_task_id, provenance_json,
           version, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
     )
     .bind(&governance.task_id)
     .bind(&governance.project_id)
     .bind(governance.charter_revision_id.as_deref())
-    .bind(governance.baseline_id.as_deref())
-    .bind(governance.baseline_revision_id.as_deref())
     .bind(governance.plan_item_id.as_deref())
     .bind(governance.milestone_id.as_deref())
     .bind(&governance.document_revisions_json)
@@ -524,10 +453,6 @@ pub(super) async fn apply_adaptive_task_command(
                 "id": receipt_input.principal_id,
             },
             "governance": {
-                "baseline_content_digest": gate.baseline_content_digest,
-                "baseline_rendered_digest": gate.baseline_rendered_digest,
-                "release_policy_revision": gate.release_policy_revision,
-                "release_policy_digest": gate.release_policy_digest,
                 "adaptive_envelope_digest": gate.adaptive_envelope_digest,
                 "fixed_boundary_digest": gate.fixed_boundary_digest,
                 "adaptive_envelope": gate.envelope,
@@ -613,16 +538,11 @@ async fn load_and_validate_adaptive_gate(
     _operation: &str,
 ) -> Result<AdaptiveGate> {
     let governance_row = sqlx::query(
-        "SELECT g.project_id, g.charter_revision_id, g.baseline_id,
-                g.baseline_revision_id, g.plan_item_id, g.milestone_id,
+        "SELECT g.project_id, g.charter_revision_id,
+                g.plan_item_id, g.milestone_id,
                 g.document_revisions_json, g.capability_class, g.risk_class,
-                g.runnable, g.replacement_of_task_id, g.provenance_json,
-                r.adaptive_envelope_json, r.content_digest,
-                r.rendered_digest, r.release_policy_revision,
-                r.release_policy_digest
+                g.runnable, g.replacement_of_task_id, g.provenance_json
          FROM project_task_governance g
-         LEFT JOIN project_execution_baseline_revision r
-           ON r.id = g.baseline_revision_id AND r.baseline_id = g.baseline_id
          WHERE g.task_id = ? AND g.project_id = ?",
     )
     .bind(&source.id)
@@ -635,10 +555,6 @@ async fn load_and_validate_adaptive_gate(
         return Ok(AdaptiveGate {
             governance: None,
             envelope: None,
-            baseline_content_digest: None,
-            baseline_rendered_digest: None,
-            release_policy_revision: None,
-            release_policy_digest: None,
             adaptive_envelope_digest: None,
             fixed_boundary_digest: None,
         });
@@ -646,8 +562,6 @@ async fn load_and_validate_adaptive_gate(
     let governance = SourceGovernance {
         project_id: row.try_get("project_id")?,
         charter_revision_id: row.try_get("charter_revision_id")?,
-        baseline_id: row.try_get("baseline_id")?,
-        baseline_revision_id: row.try_get("baseline_revision_id")?,
         plan_item_id: row.try_get("plan_item_id")?,
         milestone_id: row.try_get("milestone_id")?,
         document_revisions_json: row.try_get("document_revisions_json")?,
@@ -656,380 +570,16 @@ async fn load_and_validate_adaptive_gate(
         runnable: row.try_get::<i64, _>("runnable")? == 1,
         provenance_json: row.try_get("provenance_json")?,
     };
-    let Some(baseline_id) = governance.baseline_id.as_deref() else {
-        // Charter-backed Tasks do not need a baseline for normal Task-system
-        // split/sequence/replace operations.
-        return Ok(AdaptiveGate {
-            governance: Some(governance),
-            envelope: None,
-            baseline_content_digest: None,
-            baseline_rendered_digest: None,
-            release_policy_revision: None,
-            release_policy_digest: None,
-            adaptive_envelope_digest: None,
-            fixed_boundary_digest: None,
-        });
-    };
-    let Some(baseline_revision_id) = governance.baseline_revision_id.as_deref() else {
-        return Err(DbError::Check(
-            "reconciliation_required: adaptive Task governance has no baseline revision".to_owned(),
-        ));
-    };
-    let exact_baseline: Option<(String, String, String, String, String)> = sqlx::query_as(
-        "SELECT p.current_charter_revision_id, r.id,
-                r.charter_revision_id, r.adaptive_envelope_json,
-                r.content_digest
-         FROM project p
-         JOIN project_execution_baseline b ON b.project_id = p.id
-         JOIN project_execution_baseline_revision r
-           ON r.baseline_id = b.id AND r.id = ?
-         WHERE p.id = ? AND b.id = ?
-           AND p.charter_status = 'charter_backed'
-           AND p.charter_setup_required = 0",
-    )
-    .bind(baseline_revision_id)
-    .bind(&source.project_id)
-    .bind(baseline_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    let Some((
-        charter_revision_id,
-        current_revision_id,
-        baseline_charter_revision_id,
-        envelope_json,
-        content_digest,
-    )) = exact_baseline
-    else {
-        return Err(DbError::Check(
-            "reconciliation_required: adaptive Task references unavailable baseline traceability"
-                .to_owned(),
-        ));
-    };
-    if governance.charter_revision_id.as_deref() != Some(charter_revision_id.as_str())
-        || baseline_charter_revision_id != charter_revision_id
-        || current_revision_id != baseline_revision_id
-    {
-        return Err(DbError::Check(
-            "reconciliation_required: adaptive Task Charter/baseline binding is stale".to_owned(),
-        ));
-    }
-    let revision_digests: (String, String, String, String) = sqlx::query_as(
-        "SELECT content_digest, rendered_digest, release_policy_revision,
-                release_policy_digest
-         FROM project_execution_baseline_revision
-         WHERE id = ? AND baseline_id = ?",
-    )
-    .bind(baseline_revision_id)
-    .bind(baseline_id)
-    .fetch_one(&mut **tx)
-    .await?;
-    if revision_digests.0 != content_digest {
-        return Err(DbError::Check(
-            "reconciliation_required: baseline digest changed while admitting adaptive Task"
-                .to_owned(),
-        ));
-    }
-    let baseline_projection: (
-        String,
-        String,
-        String,
-        Option<String>,
-        String,
-        String,
-        String,
-    ) = sqlx::query_as(
-        "SELECT document_revisions_json, plan_items_json, milestone_ids_json,
-                    primary_milestone_id, capability_classes_json, risk_classes_json,
-                    elevated_operations_json
-             FROM project_execution_baseline_revision
-             WHERE id = ? AND baseline_id = ?",
-    )
-    .bind(baseline_revision_id)
-    .bind(baseline_id)
-    .fetch_one(&mut **tx)
-    .await?;
-    let envelope = parse_adaptive_envelope(&envelope_json)?;
-    let baseline_elevated: Value =
-        serde_json::from_str(&baseline_projection.6).map_err(|error| {
-            DbError::Check(format!(
-                "reconciliation_required: baseline elevated operations are invalid: {error}"
-            ))
-        })?;
-    if baseline_elevated != json!(envelope.elevated_operations) {
-        return Err(DbError::Check(
-            "reconciliation_required: baseline elevated operations differ from its adaptive envelope"
-                .to_owned(),
-        ));
-    }
-    validate_source_against_baseline(
-        &governance,
-        &envelope,
-        &baseline_projection,
-        &revision_digests.0,
-        &revision_digests.1,
-        &revision_digests.2,
-        &revision_digests.3,
-    )?;
-    let (fixed_boundary_digest, adaptive_envelope_digest) =
-        fixed_boundary_digests(&envelope, &revision_digests.2, &revision_digests.3)?;
+    // Readiness authority is the approved Charter plus the milestone's own
+    // acceptance matrix. Task-system split/sequence/replace operations are
+    // protected by Task/board CAS and receipts/events; they need no separate
+    // pinned artifact to authorize them.
     Ok(AdaptiveGate {
         governance: Some(governance),
-        envelope: Some(envelope),
-        baseline_content_digest: Some(revision_digests.0),
-        baseline_rendered_digest: Some(revision_digests.1),
-        release_policy_revision: Some(revision_digests.2),
-        release_policy_digest: Some(revision_digests.3),
-        adaptive_envelope_digest: Some(adaptive_envelope_digest),
-        fixed_boundary_digest: Some(fixed_boundary_digest),
+        envelope: None,
+        adaptive_envelope_digest: None,
+        fixed_boundary_digest: None,
     })
-}
-
-fn parse_adaptive_envelope(value: &str) -> Result<ParsedAdaptiveEnvelope> {
-    let parsed: Value = serde_json::from_str(value).map_err(|error| {
-        DbError::Check(format!(
-            "reconciliation_required: governing adaptive envelope is invalid: {error}"
-        ))
-    })?;
-    let object = parsed.as_object().ok_or_else(|| {
-        DbError::Check(
-            "reconciliation_required: governing adaptive envelope must be an object".to_owned(),
-        )
-    })?;
-    const FIELDS: [&str; 6] = [
-        "allowed_task_operations",
-        "fixed_outcomes",
-        "fixed_acceptance",
-        "fixed_risk_classes",
-        "forbidden_side_effects",
-        "elevated_operations",
-    ];
-    if object.len() != FIELDS.len() || FIELDS.iter().any(|field| !object.contains_key(*field)) {
-        return Err(DbError::Check(
-            "reconciliation_required: governing adaptive envelope is incomplete".to_owned(),
-        ));
-    }
-    if FIELDS.iter().any(|field| {
-        !object.get(*field).is_some_and(Value::is_array)
-            || object
-                .get(*field)
-                .and_then(Value::as_array)
-                .is_some_and(|values| values.iter().any(|value| !value.is_string()))
-    }) {
-        return Err(DbError::Check(
-            "reconciliation_required: governing adaptive envelope contains a non-string boundary"
-                .to_owned(),
-        ));
-    }
-    let strings = |field: &str| -> Result<Vec<String>> {
-        object
-            .get(field)
-            .and_then(Value::as_array)
-            .ok_or_else(|| DbError::Check("adaptive envelope field is not an array".to_owned()))
-            .and_then(|values| {
-                values
-                    .iter()
-                    .map(|value| {
-                        value.as_str().map(str::to_owned).ok_or_else(|| {
-                            DbError::Check("adaptive envelope boundary is not a string".to_owned())
-                        })
-                    })
-                    .collect()
-            })
-    };
-    Ok(ParsedAdaptiveEnvelope {
-        allowed_task_operations: strings("allowed_task_operations")?,
-        fixed_outcomes: strings("fixed_outcomes")?,
-        fixed_acceptance: strings("fixed_acceptance")?,
-        fixed_risk_classes: strings("fixed_risk_classes")?,
-        forbidden_side_effects: strings("forbidden_side_effects")?,
-        elevated_operations: strings("elevated_operations")?,
-    })
-}
-
-fn validate_source_against_baseline(
-    governance: &SourceGovernance,
-    envelope: &ParsedAdaptiveEnvelope,
-    baseline_projection: &(
-        String,
-        String,
-        String,
-        Option<String>,
-        String,
-        String,
-        String,
-    ),
-    baseline_content_digest: &str,
-    baseline_rendered_digest: &str,
-    release_policy_revision: &str,
-    release_policy_digest: &str,
-) -> Result<()> {
-    let provenance: Value = serde_json::from_str(&governance.provenance_json).map_err(|error| {
-        DbError::Check(format!(
-            "reconciliation_required: Task governance provenance is invalid: {error}"
-        ))
-    })?;
-    let provenance = provenance.as_object().ok_or_else(|| {
-        DbError::Check(
-            "reconciliation_required: Task governance provenance must be an object".to_owned(),
-        )
-    })?;
-    if provenance.contains_key("fixed_risk_class") {
-        return Err(DbError::Check(
-            "reconciliation_required: singular fixed_risk_class provenance is unsupported"
-                .to_owned(),
-        ));
-    }
-    let (fixed_boundary_digest, adaptive_envelope_digest) =
-        fixed_boundary_digests(envelope, release_policy_revision, release_policy_digest)?;
-    let expected = [
-        ("fixed_outcomes", json!(envelope.fixed_outcomes)),
-        ("fixed_acceptance", json!(envelope.fixed_acceptance)),
-        ("fixed_risk_classes", json!(envelope.fixed_risk_classes)),
-        (
-            "forbidden_side_effects",
-            json!(envelope.forbidden_side_effects),
-        ),
-        (
-            "release_policy_revision",
-            Value::String(release_policy_revision.to_owned()),
-        ),
-        (
-            "release_policy_digest",
-            Value::String(release_policy_digest.to_owned()),
-        ),
-        ("elevated_operations", json!(envelope.elevated_operations)),
-        (
-            "governing_baseline_content_digest",
-            Value::String(baseline_content_digest.to_owned()),
-        ),
-        (
-            "governing_baseline_rendered_digest",
-            Value::String(baseline_rendered_digest.to_owned()),
-        ),
-    ];
-    for (field, value) in expected {
-        if let Some(existing) = provenance.get(field) {
-            if existing != &value {
-                return Err(DbError::Check(format!(
-                    "reconciliation_required: Task governance fixed boundary '{field}' differs from the active baseline"
-                )));
-            }
-        }
-    }
-    for (field, expected) in [
-        ("fixed_boundary_digest", fixed_boundary_digest),
-        ("adaptive_envelope_digest", adaptive_envelope_digest),
-    ] {
-        if let Some(existing) = provenance.get(field) {
-            if existing.as_str() != Some(expected.as_str()) {
-                return Err(DbError::Check(format!(
-                    "reconciliation_required: Task governance digest '{field}' differs from the active baseline"
-                )));
-            }
-        }
-    }
-    if let Some(risk) = governance
-        .risk_class
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        if !envelope
-            .fixed_risk_classes
-            .iter()
-            .any(|value| value == risk)
-        {
-            return Err(DbError::Check(
-                "reconciliation_required: Task risk class differs from the active fixed boundary"
-                    .to_owned(),
-            ));
-        }
-    }
-    if let Some(capability) = governance.capability_class.as_deref() {
-        if json_array_declares_values(&baseline_projection.4)
-            && !json_contains_identifier(&baseline_projection.4, capability)
-        {
-            return Err(DbError::Check(
-                "reconciliation_required: Task capability class differs from the active baseline"
-                    .to_owned(),
-            ));
-        }
-    }
-    if let Some(risk) = governance.risk_class.as_deref() {
-        if json_array_declares_values(&baseline_projection.5)
-            && !json_contains_identifier(&baseline_projection.5, risk)
-        {
-            return Err(DbError::Check(
-                "reconciliation_required: Task risk class differs from the active baseline"
-                    .to_owned(),
-            ));
-        }
-    }
-    if let Some(plan_item_id) = governance.plan_item_id.as_deref() {
-        if !json_contains_identifier(&baseline_projection.1, plan_item_id) {
-            return Err(DbError::Check(
-                "reconciliation_required: Task plan item differs from the active baseline"
-                    .to_owned(),
-            ));
-        }
-    }
-    if let Some(milestone_id) = governance.milestone_id.as_deref() {
-        let in_milestones = json_contains_identifier(&baseline_projection.2, milestone_id)
-            || baseline_projection.3.as_deref() == Some(milestone_id);
-        if !in_milestones {
-            return Err(DbError::Check(
-                "reconciliation_required: Task milestone differs from the active baseline"
-                    .to_owned(),
-            ));
-        }
-    }
-    let document_revisions: Value = serde_json::from_str(&governance.document_revisions_json)
-        .map_err(|error| {
-            DbError::Check(format!(
-                "reconciliation_required: Task document references are invalid: {error}"
-            ))
-        })?;
-    if let Value::Array(revisions) = document_revisions {
-        for revision in revisions {
-            let identifier = revision
-                .as_str()
-                .or_else(|| revision.get("id").and_then(Value::as_str))
-                .or_else(|| revision.get("document_revision_id").and_then(Value::as_str));
-            if let Some(identifier) = identifier {
-                if !json_contains_identifier(&baseline_projection.0, identifier) {
-                    return Err(DbError::Check(
-                        "reconciliation_required: Task document reference differs from the active baseline"
-                            .to_owned(),
-                    ));
-                }
-            }
-        }
-    } else {
-        return Err(DbError::Check(
-            "reconciliation_required: Task document references must be an array".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn json_contains_identifier(raw: &str, identifier: &str) -> bool {
-    fn contains(value: &Value, identifier: &str) -> bool {
-        match value {
-            Value::String(value) => value == identifier,
-            Value::Array(values) => values.iter().any(|value| contains(value, identifier)),
-            Value::Object(values) => values.values().any(|value| contains(value, identifier)),
-            Value::Null | Value::Bool(_) | Value::Number(_) => false,
-        }
-    }
-    serde_json::from_str::<Value>(raw)
-        .ok()
-        .is_some_and(|value| contains(&value, identifier))
-}
-
-fn json_array_declares_values(raw: &str) -> bool {
-    serde_json::from_str::<Value>(raw)
-        .ok()
-        .and_then(|value| value.as_array().map(|values| !values.is_empty()))
-        .unwrap_or(true)
 }
 
 fn apply_authoritative_provenance_fields(
@@ -1042,24 +592,11 @@ fn apply_authoritative_provenance_fields(
                 .to_owned(),
         ));
     }
-    let (
-        Some(envelope),
-        Some(content_digest),
-        Some(rendered_digest),
-        Some(policy_revision),
-        Some(policy_digest),
-        Some(envelope_digest),
-        Some(boundary_digest),
-    ) = (
+    let (Some(envelope), Some(envelope_digest), Some(boundary_digest)) = (
         gate.envelope.as_ref(),
-        gate.baseline_content_digest.as_deref(),
-        gate.baseline_rendered_digest.as_deref(),
-        gate.release_policy_revision.as_deref(),
-        gate.release_policy_digest.as_deref(),
         gate.adaptive_envelope_digest.as_deref(),
         gate.fixed_boundary_digest.as_deref(),
-    )
-    else {
+    ) else {
         return Ok(());
     };
     let authoritative = [
@@ -1070,23 +607,7 @@ fn apply_authoritative_provenance_fields(
             "forbidden_side_effects",
             json!(&envelope.forbidden_side_effects),
         ),
-        (
-            "release_policy_revision",
-            Value::String(policy_revision.to_owned()),
-        ),
-        (
-            "release_policy_digest",
-            Value::String(policy_digest.to_owned()),
-        ),
         ("elevated_operations", json!(&envelope.elevated_operations)),
-        (
-            "governing_baseline_content_digest",
-            Value::String(content_digest.to_owned()),
-        ),
-        (
-            "governing_baseline_rendered_digest",
-            Value::String(rendered_digest.to_owned()),
-        ),
         (
             "adaptive_envelope_digest",
             Value::String(envelope_digest.to_owned()),
@@ -1100,7 +621,7 @@ fn apply_authoritative_provenance_fields(
         if let Some(existing) = provenance.get(field) {
             if existing != &value {
                 return Err(DbError::Check(format!(
-                    "reconciliation_required: Task governance fixed boundary '{field}' differs from the active baseline"
+                    "reconciliation_required: Task governance fixed boundary '{field}' differs from its adaptive envelope"
                 )));
             }
         }
@@ -1156,8 +677,6 @@ fn adaptive_child_governance(
         task_id: child_task_id.to_owned(),
         project_id: source_governance.project_id.clone(),
         charter_revision_id: source_governance.charter_revision_id.clone(),
-        baseline_id: source_governance.baseline_id.clone(),
-        baseline_revision_id: source_governance.baseline_revision_id.clone(),
         plan_item_id: source_governance.plan_item_id.clone(),
         milestone_id: source_governance.milestone_id.clone(),
         document_revisions_json: source_governance.document_revisions_json.clone(),
@@ -1209,17 +728,6 @@ pub(super) async fn validate_parent_proposal_in_tx(
     if parent_governance_exists.is_none() {
         return Ok(governance);
     }
-    let baseline_id: Option<String> = sqlx::query_scalar(
-        "SELECT baseline_id FROM project_task_governance
-         WHERE task_id = ? AND project_id = ?",
-    )
-    .bind(&parent.id)
-    .bind(&task.project_id)
-    .fetch_one(&mut **tx)
-    .await?;
-    if baseline_id.is_none() {
-        return Ok(governance);
-    }
     // A generic parent proposal is admitted only when it carries the exact
     // source governance projection and passes the same active adaptive gate;
     // missing or changed governance cannot use `task.propose` as a bypass.
@@ -1240,8 +748,6 @@ pub(super) async fn validate_parent_proposal_in_tx(
         return Err(DbError::IdempotencyConflict);
     }
     if requested.charter_revision_id != source.charter_revision_id
-        || requested.baseline_id != source.baseline_id
-        || requested.baseline_revision_id != source.baseline_revision_id
         || requested.plan_item_id != source.plan_item_id
         || requested.milestone_id != source.milestone_id
         || requested.document_revisions_json != source.document_revisions_json

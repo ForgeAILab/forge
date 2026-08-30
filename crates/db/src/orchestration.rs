@@ -421,10 +421,6 @@ pub struct ResolveProjectReconciliation {
     pub replacement_ref_type: Option<String>,
     pub replacement_ref_id: Option<String>,
     pub replacement_ref_revision: Option<String>,
-    /// Present only for `invalid_active_baseline` + `revised`. The repository
-    /// validates and activates this exact approved successor inside the same
-    /// transaction as the reconciliation resolution.
-    pub invalid_baseline_replacement: Option<ResolveInvalidActiveBaseline>,
     pub occurred_at: String,
     pub idempotency_key: String,
     pub updated_at: String,
@@ -435,33 +431,6 @@ pub struct ResolveProjectReconciliation {
     /// The command receipt bound to `domain_event` by
     /// `finalize_command_in_tx` inside the same transaction.
     pub command_receipt: CreateCommandReceipt,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolveInvalidActiveBaseline {
-    pub project_id: String,
-    pub baseline_id: String,
-    pub invalid_revision_id: String,
-    pub successor_revision_id: String,
-    pub approval_id: String,
-    /// `true` when the reconciliation click is also the user's exact approval
-    /// of the server-generated correction revision. The repository creates
-    /// and consumes that approval inside the same repair transaction.
-    pub create_approval: bool,
-    pub approval_principal_id: String,
-    pub approval_authorization_basis: String,
-    pub approval_authorization_action: String,
-    pub approval_authorization_occurred_at: String,
-    pub approval_explicit_event: String,
-    pub approval_idempotency_key: String,
-    pub expected_baseline_version: i64,
-    pub expected_project_version: i64,
-    pub charter_revision_id: String,
-    pub milestone_ids: Vec<String>,
-    pub milestone_definition_revision_ids: Vec<String>,
-    pub primary_milestone_id: Option<String>,
-    pub content_digest: String,
-    pub rendered_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -766,7 +735,6 @@ pub struct ProjectDecisionRecord {
     pub explicit_event: String,
     pub authorization_occurred_at: String,
     pub charter_revision_id: Option<String>,
-    pub baseline_revision_id: Option<String>,
     pub source_refs_json: String,
     pub affected_records_json: String,
     pub supersedes_decision_id: Option<String>,
@@ -792,7 +760,6 @@ pub struct CreateProjectDecision {
     pub explicit_event: String,
     pub authorization_occurred_at: String,
     pub charter_revision_id: Option<String>,
-    pub baseline_revision_id: Option<String>,
     pub source_refs_json: String,
     pub affected_records_json: String,
     pub supersedes_decision_id: Option<String>,
@@ -836,270 +803,6 @@ pub struct RejectProjectDecisionCandidateCommand {
     pub command_receipt: Option<CreateCommandReceipt>,
     pub action_execution: Option<CreateAgentActionExecution>,
     pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectExecutionBaselineRecord {
-    pub id: String,
-    pub project_id: String,
-    pub current_revision_id: Option<String>,
-    pub lifecycle: String,
-    pub version: i64,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-/// The baseline shell primary key is server-minted: agent/client payloads
-/// routinely carry fabricated identifiers, so callers never supply one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateProjectExecutionBaseline {
-    pub project_id: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectExecutionBaselineRevisionRecord {
-    pub id: String,
-    pub baseline_id: String,
-    pub revision: i64,
-    pub base_revision: i64,
-    pub base_revision_id: Option<String>,
-    pub lifecycle: String,
-    pub charter_revision_id: String,
-    pub document_revisions_json: String,
-    pub plan_items_json: String,
-    pub milestone_id: Option<String>,
-    pub milestone_ids_json: String,
-    pub milestone_definition_revision_ids_json: String,
-    pub primary_milestone_id: Option<String>,
-    pub release_policy_json: String,
-    pub release_policy_revision: String,
-    pub release_policy_digest: String,
-    pub acceptance_matrix_json: String,
-    pub capability_classes_json: String,
-    pub risk_classes_json: String,
-    pub adaptive_envelope_json: String,
-    pub elevated_operations_json: String,
-    pub exclusions_json: String,
-    pub rollback_recovery_json: String,
-    pub schema_version: String,
-    pub render_version: String,
-    pub rendered_view: String,
-    pub content_digest: String,
-    pub rendered_digest: String,
-    pub source_refs_json: String,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateProjectExecutionBaselineRevision {
-    pub id: String,
-    pub baseline_id: String,
-    pub expected_baseline_version: i64,
-    pub base_revision: i64,
-    pub base_revision_id: Option<String>,
-    pub lifecycle: String,
-    pub charter_revision_id: String,
-    pub document_revisions_json: String,
-    pub plan_items_json: String,
-    pub milestone_id: Option<String>,
-    pub milestone_ids_json: String,
-    pub milestone_definition_revision_ids_json: String,
-    pub primary_milestone_id: Option<String>,
-    pub release_policy_json: String,
-    pub release_policy_revision: String,
-    pub release_policy_digest: String,
-    pub acceptance_matrix_json: String,
-    pub capability_classes_json: String,
-    pub risk_classes_json: String,
-    pub adaptive_envelope_json: String,
-    pub elevated_operations_json: String,
-    pub exclusions_json: String,
-    pub rollback_recovery_json: String,
-    pub schema_version: String,
-    pub render_version: String,
-    pub rendered_view: String,
-    pub content_digest: String,
-    pub rendered_digest: String,
-    pub source_refs_json: String,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectExecutionBaselineApprovalRecord {
-    pub id: String,
-    pub baseline_id: String,
-    pub revision_id: String,
-    pub expected_project_version: i64,
-    pub principal_type: String,
-    pub principal_id: String,
-    pub authorization_basis: String,
-    pub authorization_action: String,
-    pub authorization_occurred_at: String,
-    pub explicit_event: String,
-    pub content_digest: String,
-    pub rendered_digest: String,
-    pub lifecycle: String,
-    pub idempotency_key: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApproveProjectExecutionBaseline {
-    pub id: String,
-    pub baseline_id: String,
-    pub revision_id: String,
-    pub expected_baseline_version: i64,
-    pub expected_project_version: i64,
-    pub principal_type: String,
-    pub principal_id: String,
-    pub authorization_basis: String,
-    pub authorization_action: String,
-    pub authorization_occurred_at: String,
-    pub explicit_event: String,
-    pub content_digest: String,
-    pub rendered_digest: String,
-    pub idempotency_key: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActivateProjectExecutionBaseline {
-    pub approval_id: String,
-    pub expected_baseline_version: i64,
-    pub expected_project_version: i64,
-    pub idempotency_key: String,
-    pub updated_at: String,
-}
-
-/// Transactional command input for saving or proposing an execution-baseline
-/// revision.  The service owns the lifecycle/validation decision; SQLite
-/// owns the shell, immutable revision, event, receipt, and optional action
-/// execution composite.  `baseline_id` is optional because the first shell is
-/// server-minted and a replay must resolve its authoritative id from the
-/// frozen command receipt.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SaveProjectExecutionBaselineRevisionCommand {
-    pub project_id: String,
-    pub baseline_id: Option<String>,
-    pub revision_id: String,
-    pub expected_baseline_version: Option<i64>,
-    pub base_revision: i64,
-    pub base_revision_id: Option<String>,
-    pub lifecycle: String,
-    pub charter_revision_id: String,
-    pub document_revisions_json: String,
-    pub plan_items_json: String,
-    pub milestone_id: Option<String>,
-    pub milestone_ids_json: String,
-    pub milestone_definition_revision_ids_json: String,
-    pub primary_milestone_id: Option<String>,
-    pub release_policy_json: String,
-    pub release_policy_revision: String,
-    pub release_policy_digest: String,
-    pub acceptance_matrix_json: String,
-    pub capability_classes_json: String,
-    pub risk_classes_json: String,
-    pub adaptive_envelope_json: String,
-    pub elevated_operations_json: String,
-    pub exclusions_json: String,
-    pub rollback_recovery_json: String,
-    pub schema_version: String,
-    pub render_version: String,
-    pub rendered_view: String,
-    pub content_digest: String,
-    pub rendered_digest: String,
-    pub source_refs_json: String,
-    pub created_at: String,
-    pub command_receipt: Option<CreateCommandReceipt>,
-    pub action_execution: Option<CreateAgentActionExecution>,
-}
-
-/// Approval command composite.  The service has already validated the exact
-/// persisted review target and interactive-user authorization; this record
-/// keeps those claims in the same transaction as the baseline lifecycle and
-/// command receipt.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApproveProjectExecutionBaselineCommand {
-    pub id: String,
-    pub baseline_id: String,
-    pub revision_id: String,
-    pub expected_baseline_version: i64,
-    pub expected_project_version: i64,
-    pub principal_type: String,
-    pub principal_id: String,
-    pub authorization_basis: String,
-    pub authorization_action: String,
-    pub authorization_occurred_at: String,
-    pub explicit_event: String,
-    pub content_digest: String,
-    pub rendered_digest: String,
-    pub idempotency_key: String,
-    pub created_at: String,
-    pub updated_at: String,
-    pub command_receipt: Option<CreateCommandReceipt>,
-    pub action_execution: Option<CreateAgentActionExecution>,
-}
-
-/// Activation command composite.  The paired milestone/definition manifests
-/// are supplied by the service after it has revalidated the frozen manifest;
-/// SQLite rechecks ownership/currentness while holding its write lock before
-/// activating the traceability record and its milestone projection.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActivateProjectExecutionBaselineCommand {
-    pub project_id: String,
-    pub baseline_id: String,
-    pub revision_id: String,
-    pub approval_id: String,
-    pub expected_baseline_version: i64,
-    pub expected_project_version: i64,
-    pub charter_revision_id: String,
-    pub milestone_ids: Vec<String>,
-    pub milestone_definition_revision_ids: Vec<String>,
-    pub primary_milestone_id: Option<String>,
-    pub content_digest: String,
-    pub rendered_digest: String,
-    pub idempotency_key: String,
-    pub updated_at: String,
-    pub command_receipt: Option<CreateCommandReceipt>,
-    pub action_execution: Option<CreateAgentActionExecution>,
-}
-
-/// Atomic baseline-review acceptance command composite (D18, F13). The
-/// service has already validated the exact persisted proposed review target
-/// and interactive-user authorization; this record commits the approval,
-/// activation, milestone projection, durable events, and one
-/// command receipt in a single transaction. Only a freshly proposed baseline
-/// (never a re-approval of an already-active one) may use this command; the
-/// already-approved activation gesture keeps using the separate
-/// exact replay-safe `activate_project_execution_baseline_command`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApproveAndActivateProjectExecutionBaselineCommand {
-    pub project_id: String,
-    pub baseline_id: String,
-    pub revision_id: String,
-    pub approval_id: String,
-    pub expected_baseline_version: i64,
-    pub expected_project_version: i64,
-    pub principal_type: String,
-    pub principal_id: String,
-    pub authorization_basis: String,
-    pub authorization_occurred_at: String,
-    pub explicit_event: String,
-    pub content_digest: String,
-    pub rendered_digest: String,
-    pub charter_revision_id: String,
-    pub milestone_ids: Vec<String>,
-    pub milestone_definition_revision_ids: Vec<String>,
-    pub primary_milestone_id: Option<String>,
-    pub idempotency_key: String,
-    pub created_at: String,
-    pub updated_at: String,
-    pub command_receipt: Option<CreateCommandReceipt>,
-    pub action_execution: Option<CreateAgentActionExecution>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1307,7 +1010,6 @@ pub struct ProjectMilestoneCheckResultRecord {
     pub source_manifest_json: String,
     pub input_digest: String,
     pub governing_charter_revision_id: Option<String>,
-    pub governing_baseline_revision_id: Option<String>,
     pub principal_type: String,
     pub principal_id: String,
     pub authorization_basis: String,
@@ -1331,7 +1033,6 @@ pub struct CreateProjectMilestoneCheckResult {
     pub source_manifest_json: String,
     pub input_digest: String,
     pub governing_charter_revision_id: Option<String>,
-    pub governing_baseline_revision_id: Option<String>,
     pub principal_type: String,
     pub principal_id: String,
     pub authorization_basis: String,
@@ -1360,11 +1061,6 @@ pub struct ProjectReadinessSnapshotRecord {
     pub project_id: String,
     pub milestone_id: String,
     pub definition_revision_id: String,
-    pub baseline_id: String,
-    pub baseline_revision_id: String,
-    pub baseline_digest: String,
-    pub release_policy_revision: String,
-    pub release_policy_digest: String,
     pub input_manifest_json: String,
     pub event_watermark: String,
     pub outcome: String,
@@ -1392,11 +1088,6 @@ pub struct CreateProjectReadinessSnapshot {
     pub project_id: String,
     pub milestone_id: String,
     pub definition_revision_id: String,
-    pub baseline_id: String,
-    pub baseline_revision_id: String,
-    pub baseline_digest: String,
-    pub release_policy_revision: String,
-    pub release_policy_digest: String,
     pub input_manifest_json: String,
     pub event_watermark: String,
     pub outcome: String,
@@ -1442,11 +1133,6 @@ pub struct ProjectReleaseRecord {
     pub milestone_revision_id: String,
     pub readiness_snapshot_id: String,
     pub readiness_digest: String,
-    pub baseline_id: String,
-    pub baseline_revision_id: String,
-    pub baseline_digest: String,
-    pub release_policy_revision: String,
-    pub release_policy_digest: String,
     pub summary: String,
     pub changelog: String,
     pub known_issues_json: String,
@@ -1482,11 +1168,6 @@ pub struct CreateProjectRelease {
     pub milestone_revision_id: String,
     pub readiness_snapshot_id: String,
     pub readiness_digest: String,
-    pub baseline_id: String,
-    pub baseline_revision_id: String,
-    pub baseline_digest: String,
-    pub release_policy_revision: String,
-    pub release_policy_digest: String,
     pub summary: String,
     pub changelog: String,
     pub known_issues_json: String,
@@ -1564,8 +1245,6 @@ pub struct CreateProjectTaskGovernance {
     pub task_id: String,
     pub project_id: String,
     pub charter_revision_id: Option<String>,
-    pub baseline_id: Option<String>,
-    pub baseline_revision_id: Option<String>,
     pub plan_item_id: Option<String>,
     pub milestone_id: Option<String>,
     pub document_revisions_json: String,
@@ -2099,124 +1778,6 @@ pub trait ProjectOrchestrationRepo: Send + Sync {
             "Project decision persistence is not wired".to_owned(),
         ))
     }
-
-    async fn create_project_execution_baseline(
-        &self,
-        input: CreateProjectExecutionBaseline,
-    ) -> Result<ProjectExecutionBaselineRecord> {
-        let _ = input;
-        Err(crate::DbError::Check(
-            "Execution baseline persistence is not wired".to_owned(),
-        ))
-    }
-    async fn get_project_execution_baseline(
-        &self,
-        id: &str,
-    ) -> Result<Option<ProjectExecutionBaselineRecord>> {
-        let _ = id;
-        Err(crate::DbError::Check(
-            "Execution baseline persistence is not wired".to_owned(),
-        ))
-    }
-    /// Resolve the Project's authoritative baseline projection target. The
-    /// lifecycle ordering is part of the repository query contract so every
-    /// transport observes the same current candidate.
-    async fn get_project_execution_baseline_for_project(
-        &self,
-        project_id: &str,
-    ) -> Result<Option<ProjectExecutionBaselineRecord>> {
-        let _ = project_id;
-        Err(crate::DbError::Check(
-            "Execution baseline persistence is not wired".to_owned(),
-        ))
-    }
-    async fn get_project_execution_baseline_revision(
-        &self,
-        id: &str,
-    ) -> Result<Option<ProjectExecutionBaselineRevisionRecord>> {
-        let _ = id;
-        Err(crate::DbError::Check(
-            "Execution baseline persistence is not wired".to_owned(),
-        ))
-    }
-    async fn list_project_execution_baseline_revisions(
-        &self,
-        baseline_id: &str,
-    ) -> Result<Vec<ProjectExecutionBaselineRevisionRecord>> {
-        let _ = baseline_id;
-        Err(crate::DbError::Check(
-            "Execution baseline persistence is not wired".to_owned(),
-        ))
-    }
-    async fn list_project_execution_baseline_approvals(
-        &self,
-        baseline_id: &str,
-    ) -> Result<Vec<ProjectExecutionBaselineApprovalRecord>> {
-        let _ = baseline_id;
-        Err(crate::DbError::Check(
-            "Execution baseline persistence is not wired".to_owned(),
-        ))
-    }
-    async fn approve_project_execution_baseline(
-        &self,
-        input: ApproveProjectExecutionBaseline,
-    ) -> Result<ProjectExecutionBaselineApprovalRecord> {
-        let _ = input;
-        Err(crate::DbError::Check(
-            "Execution baseline persistence is not wired".to_owned(),
-        ))
-    }
-    async fn create_project_execution_baseline_revision(
-        &self,
-        input: CreateProjectExecutionBaselineRevision,
-    ) -> Result<ProjectExecutionBaselineRevisionRecord> {
-        let _ = input;
-        Err(crate::DbError::Check(
-            "Execution baseline persistence is not wired".to_owned(),
-        ))
-    }
-    async fn activate_project_execution_baseline(
-        &self,
-        input: ActivateProjectExecutionBaseline,
-    ) -> Result<ProjectExecutionBaselineRecord> {
-        let _ = input;
-        Err(crate::DbError::Check(
-            "Execution baseline persistence is not wired".to_owned(),
-        ))
-    }
-    /// Atomically append a draft baseline revision (and, for a first draft,
-    /// its server-minted baseline shell) with its durable event/receipt.
-    async fn save_project_execution_baseline_draft_command(
-        &self,
-        input: SaveProjectExecutionBaselineRevisionCommand,
-    ) -> Result<ProjectExecutionBaselineRevisionRecord>;
-    /// Atomically append a complete proposed baseline revision with its
-    /// durable event/receipt. The service has already applied the stricter
-    /// approval-target validation; the repository repeats CAS/scope guards.
-    async fn propose_project_execution_baseline_command(
-        &self,
-        input: SaveProjectExecutionBaselineRevisionCommand,
-    ) -> Result<ProjectExecutionBaselineRevisionRecord>;
-    /// Atomically persist the exact user approval receipt and advance the
-    /// baseline's approval projection.
-    async fn approve_project_execution_baseline_command(
-        &self,
-        input: ApproveProjectExecutionBaselineCommand,
-    ) -> Result<ProjectExecutionBaselineApprovalRecord>;
-    /// Atomically consume the exact approval receipt, activate the baseline,
-    /// update milestone projection, and append event/command receipt.
-    async fn activate_project_execution_baseline_command(
-        &self,
-        input: ActivateProjectExecutionBaselineCommand,
-    ) -> Result<ProjectExecutionBaselineRecord>;
-    /// Atomically approve and activate the exact freshly proposed revision in
-    /// one transaction/receipt: approval, activation, milestone projection,
-    /// and both durable events commit or roll back
-    /// together (D18, F13).
-    async fn approve_and_activate_project_execution_baseline_command(
-        &self,
-        input: ApproveAndActivateProjectExecutionBaselineCommand,
-    ) -> Result<ProjectExecutionBaselineRecord>;
 
     async fn create_project_milestone(
         &self,

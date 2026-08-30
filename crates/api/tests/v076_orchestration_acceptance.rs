@@ -49,8 +49,6 @@ struct GenesisFixture {
 
 #[derive(Debug, Clone)]
 struct BaselineFixture {
-    baseline_id: String,
-    baseline_revision_id: String,
     baseline_version: i64,
     approval_expected_baseline_version: i64,
     approval_expected_project_version: i64,
@@ -331,7 +329,7 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
             "project_mode": "compact",
             "selected_project_agent_identity_id": legacy_identity,
             "selected_project_agent_profile_revision_id": legacy_profile,
-            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@6",
+            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@10",
             "selected_project_agent_policy_digest": legacy_policy
         }),
         &[StatusCode::CREATED, StatusCode::OK],
@@ -352,125 +350,12 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
 }
 
 #[tokio::test]
-async fn v076_project_task_is_runnable_before_optional_baseline_activation() {
-    let workspace = common::TestDir::new("v076-baseline-task-gate");
-    let harness = common::test_app(workspace.path(), "v076-baseline-task-gate").await;
-    harness
-        .state
-        .workflow_template_service
-        .initialize()
-        .await
-        .expect("builtin workflows initialize");
-    let app = &harness.app;
-    let token = common::test_jwt();
-    let fixture = create_genesis_project(app, &token, "v076-baseline").await;
-
-    // Genesis provisioning already registered an initialized primary
-    // repository, which is what makes the Task below repository-capable.
-    let baseline = create_baseline(app, &token, &fixture, false).await;
-    let baseline_approval = sqlx::query(
-        "SELECT principal_type, principal_id, lifecycle, baseline_id,
-                revision_id, content_digest, rendered_digest
-         FROM project_execution_baseline_approval WHERE id = ?",
-    )
-    .bind(&baseline.approval_id)
-    .fetch_one(harness.state.db.pool())
-    .await
-    .expect("user baseline approval");
-    assert_eq!(baseline_approval.get::<String, _>("principal_type"), "user");
-    assert_eq!(
-        baseline_approval.get::<String, _>("principal_id"),
-        "test-user-id"
-    );
-    assert_eq!(baseline_approval.get::<String, _>("lifecycle"), "active");
-    assert_eq!(
-        baseline_approval.get::<String, _>("baseline_id"),
-        baseline.baseline_id
-    );
-    assert_eq!(
-        baseline_approval.get::<String, _>("revision_id"),
-        baseline.baseline_revision_id
-    );
-    assert_eq!(
-        baseline_approval.get::<String, _>("content_digest"),
-        baseline.content_digest
-    );
-    assert_eq!(
-        baseline_approval.get::<String, _>("rendered_digest"),
-        baseline.render_digest
-    );
-    let task = request_json(
-        app,
-        Method::POST,
-        &format!("/api/v1/projects/{}/tasks", fixture.project_id),
-        &token,
-        json!({
-            "title": "V076 repository task",
-            "description": "The approved Charter authorizes work while baseline links remain traceability.",
-            "task_type": "task",
-            "governance": {
-                "charter_revision_id": fixture.charter_revision_id,
-                "baseline_id": baseline.baseline_id,
-                "baseline_revision_id": baseline.baseline_revision_id,
-                "plan_item_id": "v076-plan-item-1",
-                "milestone_id": fixture.milestone_id,
-                "document_revision_ids": [],
-                "capability_class": "repository_write",
-                "risk_class": "low"
-            }
-        }),
-        &[StatusCode::CREATED, StatusCode::OK],
-    )
-    .await;
-    let task_id = required_string(&task, &["id"]);
-    let governance = sqlx::query(
-        "SELECT runnable, baseline_id, baseline_revision_id, milestone_id
-         FROM project_task_governance WHERE task_id = ?",
-    )
-    .bind(&task_id)
-    .fetch_one(harness.state.db.pool())
-    .await
-    .expect("repository task governance row");
-    assert_eq!(governance.get::<i64, _>("runnable"), 1);
-    assert_eq!(
-        governance.get::<String, _>("baseline_id"),
-        baseline.baseline_id
-    );
-    assert_eq!(
-        governance.get::<String, _>("baseline_revision_id"),
-        baseline.baseline_revision_id
-    );
-    assert_eq!(
-        governance.get::<String, _>("milestone_id"),
-        fixture.milestone_id
-    );
-
-    activate_baseline(app, &token, &fixture, &baseline).await;
-    let consumed: String = sqlx::query_scalar(
-        "SELECT lifecycle FROM project_execution_baseline_approval WHERE id = ?",
-    )
-    .bind(&baseline.approval_id)
-    .fetch_one(harness.state.db.pool())
-    .await
-    .expect("consumed baseline approval");
-    assert_eq!(consumed, "consumed");
-    let still_runnable: i64 =
-        sqlx::query_scalar("SELECT runnable FROM project_task_governance WHERE task_id = ?")
-            .bind(&task_id)
-            .fetch_one(harness.state.db.pool())
-            .await
-            .expect("repository task governance after optional baseline activation");
-    assert_eq!(still_runnable, 1);
-}
-
-#[tokio::test]
 async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
     let workspace = common::TestDir::new("v076-typed-project-proposals");
     let harness = common::test_app(workspace.path(), "v076-typed-project-proposals").await;
     let app = &harness.app;
     let token = common::test_jwt();
     let fixture = create_genesis_project(app, &token, "v076-typed").await;
-    let baseline = create_active_baseline(app, &token, &fixture).await;
 
     // A repository implementation proposal must carry the exact active
     // baseline plan item and milestone. The direct command still derives the
@@ -490,8 +375,6 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
             "role_assignments": [],
             "governance": {
                 "charter_revision_id": fixture.charter_revision_id,
-                "baseline_id": baseline.baseline_id,
-                "baseline_revision_id": baseline.baseline_revision_id,
                 "plan_item_id": "v076-plan-item-2",
                 "milestone_id": fixture.milestone_id,
                 "capability_class": "repository_write",
@@ -510,7 +393,7 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
     let derived = &governed_proposal;
     let derived_task_id = required_string(derived, &["task", "id"]);
     let derived_governance = sqlx::query(
-        "SELECT charter_revision_id, baseline_id, baseline_revision_id, runnable
+        "SELECT charter_revision_id, runnable
          FROM project_task_governance WHERE task_id = ?",
     )
     .bind(&derived_task_id)
@@ -520,18 +403,6 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
     assert_eq!(
         derived_governance.get::<String, _>("charter_revision_id"),
         fixture.charter_revision_id
-    );
-    assert_eq!(
-        derived_governance
-            .get::<Option<String>, _>("baseline_id")
-            .as_deref(),
-        Some(baseline.baseline_id.as_str())
-    );
-    assert_eq!(
-        derived_governance
-            .get::<Option<String>, _>("baseline_revision_id")
-            .as_deref(),
-        Some(baseline.baseline_revision_id.as_str())
     );
     assert_eq!(derived_governance.get::<i64, _>("runnable"), 1);
 
@@ -552,8 +423,6 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
             "role_assignments": [],
             "governance": {
                 "charter_revision_id": fixture.charter_revision_id,
-                "baseline_id": baseline.baseline_id,
-                "baseline_revision_id": baseline.baseline_revision_id,
                 "plan_item_id": "v076-plan-item-1",
                 "milestone_id": fixture.milestone_id,
                 "capability_class": "repository_write",
@@ -776,8 +645,6 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
                     "selected_outcome": "yes",
                     "rationale": "The acceptance suite covers the approved path.",
                     "decision_class": "project_implementation",
-                    "baseline_id": baseline.baseline_id,
-                    "baseline_revision_id": baseline.baseline_revision_id,
                     "expected_project_version": project_after_baseline["version"],
                     "affected_artifact_refs": [],
                     "affected_task_ids": [],
@@ -849,7 +716,6 @@ async fn v076_project_evidence_is_scoped_pinned_and_user_attested() {
     let app = &harness.app;
     let token = common::test_jwt();
     let fixture = create_genesis_project(app, &token, "v076-evidence").await;
-    let baseline = create_active_baseline(app, &token, &fixture).await;
 
     let project = request_json(
         app,
@@ -1050,8 +916,6 @@ async fn v076_project_evidence_is_scoped_pinned_and_user_attested() {
             "description": "The Task upload is reused by Project evidence.",
             "governance": {
                 "charter_revision_id": fixture.charter_revision_id,
-                "baseline_id": baseline.baseline_id,
-                "baseline_revision_id": baseline.baseline_revision_id,
                 "plan_item_id": "v076-plan-item-1",
                 "milestone_id": fixture.milestone_id,
                 "document_revision_ids": [],
@@ -1300,7 +1164,7 @@ async fn v076_project_evidence_is_scoped_pinned_and_user_attested() {
 
     // The evidence participates in the exact readiness candidate and is
     // pinned by the user-approved immutable release.
-    record_passed_check(app, &harness, &token, &fixture, &baseline).await;
+    record_passed_check(app, &harness, &token, &fixture).await;
     let readiness = request_json(
         app,
         Method::POST,
@@ -1318,10 +1182,7 @@ async fn v076_project_evidence_is_scoped_pinned_and_user_attested() {
                     "v076-evidence-readiness-event"
                 )
             },
-            "milestone_id": fixture.milestone_id,
-            "baseline_id": baseline.baseline_id,
-            "baseline_revision_id": baseline.baseline_revision_id,
-            "release_policy_revision": "v076-policy-r1"
+            "milestone_id": fixture.milestone_id
         }),
         &[StatusCode::OK],
     )
@@ -1466,8 +1327,7 @@ async fn v076_ready_milestone_releases_once_and_rejects_cross_project_scope() {
     let app = &harness.app;
     let token = common::test_jwt();
     let fixture = create_genesis_project(app, &token, "v076-release").await;
-    let baseline = create_active_baseline(app, &token, &fixture).await;
-    record_passed_check(app, &harness, &token, &fixture, &baseline).await;
+    record_passed_check(app, &harness, &token, &fixture).await;
     let current_milestone = request_json(
         app,
         Method::GET,
@@ -1495,10 +1355,7 @@ async fn v076_ready_milestone_releases_once_and_rejects_cross_project_scope() {
                 "idempotency_key": "v076-readiness",
                 "authorization": user_authorization("project.milestone.readiness", "v076-readiness-event")
             },
-            "milestone_id": fixture.milestone_id,
-            "baseline_id": baseline.baseline_id,
-            "baseline_revision_id": baseline.baseline_revision_id,
-            "release_policy_revision": "v076-policy-r1"
+            "milestone_id": fixture.milestone_id
         }),
         &[StatusCode::OK],
     )
@@ -1706,17 +1563,11 @@ async fn v076_ready_milestone_releases_once_and_rejects_cross_project_scope() {
         inspected["snapshot"]["readiness_digest"],
         json!(readiness_digest)
     );
-    assert_eq!(
-        inspected["snapshot"]["release_policy_revision"],
-        json!("v076-policy-r1")
-    );
     assert!(!required_string(&inspected["snapshot"], &["snapshot_digest"]).is_empty());
 
     let release_row = sqlx::query(
         "SELECT project_id, milestone_id, release_sequence, release_revision,
                 release_identifier, readiness_snapshot_id, readiness_digest,
-                baseline_id, baseline_revision_id, baseline_digest,
-                release_policy_revision, release_policy_digest,
                 releasing_principal_type, releasing_principal_id,
                 authorization_basis, explicit_event, schema_version,
                 snapshot_digest, idempotency_key
@@ -1747,28 +1598,6 @@ async fn v076_ready_milestone_releases_once_and_rejects_cross_project_scope() {
     assert_eq!(
         release_row.get::<String, _>("readiness_digest"),
         readiness_digest
-    );
-    assert_eq!(
-        release_row.get::<String, _>("baseline_id"),
-        baseline.baseline_id
-    );
-    assert_eq!(
-        release_row.get::<String, _>("baseline_revision_id"),
-        baseline.baseline_revision_id
-    );
-    assert_eq!(
-        release_row.get::<String, _>("baseline_digest"),
-        baseline.content_digest
-    );
-    assert_eq!(
-        release_row.get::<String, _>("release_policy_revision"),
-        "v076-policy-r1"
-    );
-    assert_eq!(
-        release_row.get::<String, _>("release_policy_digest"),
-        readiness["release_policy_digest"]
-            .as_str()
-            .expect("readiness policy digest")
     );
     assert_eq!(
         release_row.get::<String, _>("releasing_principal_type"),
@@ -1850,8 +1679,7 @@ async fn v076_relevant_post_readiness_mutation_conflicts_with_release() {
     let app = &harness.app;
     let token = common::test_jwt();
     let fixture = create_genesis_project(app, &token, "v076-readiness-mutation").await;
-    let baseline = create_active_baseline(app, &token, &fixture).await;
-    record_passed_check(app, &harness, &token, &fixture, &baseline).await;
+    record_passed_check(app, &harness, &token, &fixture).await;
 
     let current_milestone = request_json(
         app,
@@ -1882,10 +1710,7 @@ async fn v076_relevant_post_readiness_mutation_conflicts_with_release() {
                     "v076-readiness-mutation-readiness-event"
                 )
             },
-            "milestone_id": fixture.milestone_id,
-            "baseline_id": baseline.baseline_id,
-            "baseline_revision_id": baseline.baseline_revision_id,
-            "release_policy_revision": "v076-policy-r1"
+            "milestone_id": fixture.milestone_id
         }),
         &[StatusCode::OK],
     )
@@ -1945,10 +1770,7 @@ async fn v076_relevant_post_readiness_mutation_conflicts_with_release() {
             "status": "pass",
             "result": "passed after readiness with new authoritative input",
             "input_digest": "v076-check-input-after-readiness",
-            "governing_revision_ids": [
-                fixture.charter_revision_id,
-                baseline.baseline_revision_id
-            ]
+            "governing_revision_ids": [fixture.charter_revision_id]
         }),
         &[StatusCode::OK],
     )
@@ -1982,552 +1804,15 @@ async fn v076_relevant_post_readiness_mutation_conflicts_with_release() {
     assert!(conflict.get("message").is_some());
 }
 
-#[tokio::test]
-async fn v076_user_authority_receipts_are_exact_replays_across_gates() {
-    let workspace = common::TestDir::new("v076-authority-replay-matrix");
-    let harness = common::test_app(workspace.path(), "v076-authority-replay-matrix").await;
-    let app = &harness.app;
-    let token = common::test_jwt();
-    let fixture = create_genesis_project(app, &token, "v076-authority").await;
-    let baseline = create_baseline(app, &token, &fixture, false).await;
-
-    // Baseline approval binds both the user receipt and the exact revision
-    // digests. It must remain replay-safe even after the baseline version has
-    // advanced from the approval itself.
-    let approval_body = json!({
-        "mutation": {
-            "expected_version": baseline.approval_expected_baseline_version,
-            "idempotency_key": "v076-baseline-approve",
-            "authorization": baseline.approval_authorization.clone()
-        },
-        "revision_id": baseline.baseline_revision_id,
-        "content_digest": baseline.content_digest,
-        "render_digest": baseline.render_digest,
-        "expected_project_version": baseline.approval_expected_project_version
-    });
-    let approval_replay = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/execution-baseline/{}/revisions/{}/approve",
-            fixture.project_id, baseline.baseline_id, baseline.baseline_revision_id
-        ),
-        &token,
-        approval_body.clone(),
-        &[StatusCode::OK],
-    )
-    .await;
-    assert_eq!(approval_replay["baseline"]["lifecycle"], json!("approved"));
-    for (label, altered) in user_authorization_replay_variants(&approval_body, false) {
-        let conflict = request_json(
-            app,
-            Method::POST,
-            &format!(
-                "/api/v1/projects/{}/execution-baseline/{}/revisions/{}/approve",
-                fixture.project_id, baseline.baseline_id, baseline.baseline_revision_id
-            ),
-            &token,
-            altered,
-            &[StatusCode::CONFLICT],
-        )
-        .await;
-        assert_eq!(conflict["code"], json!("idempotency_conflict"), "{label}");
-    }
-    for (label, altered) in [
-        ("baseline approval revision", {
-            let mut value = approval_body.clone();
-            value["revision_id"] = json!("v076-different-baseline-revision");
-            value
-        }),
-        ("baseline approval content digest", {
-            let mut value = approval_body.clone();
-            value["content_digest"] = json!("v076-different-baseline-digest");
-            value
-        }),
-    ] {
-        let conflict = request_json(
-            app,
-            Method::POST,
-            &format!(
-                "/api/v1/projects/{}/execution-baseline/{}/revisions/{}/approve",
-                fixture.project_id, baseline.baseline_id, baseline.baseline_revision_id
-            ),
-            &token,
-            altered,
-            &[StatusCode::CONFLICT],
-        )
-        .await;
-        assert_eq!(conflict["code"], json!("idempotency_conflict"), "{label}");
-    }
-
-    // The URL target is part of the replay identity too. A stale or
-    // substituted revision in the path must not be re-authorized (or leak a
-    // not-found) after this key has already committed.
-    let approval_target_conflict = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/execution-baseline/{}/revisions/v076-different-path-revision/approve",
-            fixture.project_id, baseline.baseline_id
-        ),
-        &token,
-        approval_body.clone(),
-        &[StatusCode::CONFLICT],
-    )
-    .await;
-    assert_eq!(
-        approval_target_conflict["code"],
-        json!("idempotency_conflict")
-    );
-
-    // Activation is a second user-only receipt. Its exact approval id,
-    // revision and rendered/content digests are part of the replay identity.
-    let project = request_json(
-        app,
-        Method::GET,
-        &format!("/api/v1/projects/{}", fixture.project_id),
-        &token,
-        Value::Null,
-        &[StatusCode::OK],
-    )
-    .await;
-    let activation_body = json!({
-        "mutation": {
-            "expected_version": project["version"],
-            "idempotency_key": "v076-baseline-activate",
-            "authorization": user_authorization(
-                "project.execution_baseline.activate",
-                "v076-baseline-activate-event"
-            )
-        },
-        "baseline_id": baseline.baseline_id,
-        "revision_id": baseline.baseline_revision_id,
-        "approval_id": baseline.approval_id,
-        "expected_baseline_version": baseline.baseline_version,
-        "content_digest": baseline.content_digest,
-        "render_digest": baseline.render_digest
-    });
-    let activation = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/execution-baseline/{}/activate",
-            fixture.project_id, baseline.baseline_id
-        ),
-        &token,
-        activation_body.clone(),
-        &[StatusCode::OK],
-    )
-    .await;
-    assert_eq!(activation["baseline"]["lifecycle"], json!("active"));
-    let activation_replay = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/execution-baseline/{}/activate",
-            fixture.project_id, baseline.baseline_id
-        ),
-        &token,
-        activation_body.clone(),
-        &[StatusCode::OK],
-    )
-    .await;
-    assert_eq!(activation_replay, activation);
-    for (label, altered) in user_authorization_replay_variants(&activation_body, false) {
-        let conflict = request_json(
-            app,
-            Method::POST,
-            &format!(
-                "/api/v1/projects/{}/execution-baseline/{}/activate",
-                fixture.project_id, baseline.baseline_id
-            ),
-            &token,
-            altered,
-            &[StatusCode::CONFLICT],
-        )
-        .await;
-        assert_eq!(conflict["code"], json!("idempotency_conflict"), "{label}");
-    }
-    for (label, altered) in [
-        ("baseline activation revision", {
-            let mut value = activation_body.clone();
-            value["revision_id"] = json!("v076-different-activation-revision");
-            value
-        }),
-        ("baseline activation approval", {
-            let mut value = activation_body.clone();
-            value["approval_id"] = json!("v076-different-activation-approval");
-            value
-        }),
-        ("baseline activation content digest", {
-            let mut value = activation_body.clone();
-            value["content_digest"] = json!("v076-different-activation-digest");
-            value
-        }),
-    ] {
-        let conflict = request_json(
-            app,
-            Method::POST,
-            &format!(
-                "/api/v1/projects/{}/execution-baseline/{}/activate",
-                fixture.project_id, baseline.baseline_id
-            ),
-            &token,
-            altered,
-            &[StatusCode::CONFLICT],
-        )
-        .await;
-        assert_eq!(conflict["code"], json!("idempotency_conflict"), "{label}");
-    }
-    let activation_target_conflict = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/execution-baseline/v076-different-path-baseline/activate",
-            fixture.project_id
-        ),
-        &token,
-        activation_body.clone(),
-        &[StatusCode::CONFLICT],
-    )
-    .await;
-    assert_eq!(
-        activation_target_conflict["code"],
-        json!("idempotency_conflict")
-    );
-
-    record_passed_check(app, &harness, &token, &fixture, &baseline).await;
-    let check = sqlx::query(
-        "SELECT id, definition_revision_id, version
-         FROM project_milestone_check
-         WHERE project_id = ? AND milestone_id = ? ORDER BY id LIMIT 1",
-    )
-    .bind(&fixture.project_id)
-    .bind(&fixture.milestone_id)
-    .fetch_one(harness.state.db.pool())
-    .await
-    .expect("manual-check waiver target");
-    let check_id: String = check.get("id");
-    let definition_revision_id: String = check.get("definition_revision_id");
-    let check_version: i64 = check.get("version");
-    let waiver_body = json!({
-        "mutation": {
-            "expected_version": check_version,
-            "idempotency_key": "v076-check-waiver",
-            "authorization": user_authorization(
-                "project.milestone.check.waive",
-                "v076-check-waiver-event"
-            )
-        },
-        "check_id": check_id,
-        "definition_revision_id": definition_revision_id,
-        "reason": "An independent user records the bounded waiver decision.",
-        "input_digest": "v076-waiver-input",
-        "governing_revision_ids": [fixture.charter_revision_id, baseline.baseline_revision_id]
-    });
-    let waiver = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/milestones/{}/checks/{}/waive",
-            fixture.project_id, fixture.milestone_id, check_id
-        ),
-        &token,
-        waiver_body.clone(),
-        &[StatusCode::OK],
-    )
-    .await;
-    let waiver_replay = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/milestones/{}/checks/{}/waive",
-            fixture.project_id, fixture.milestone_id, check_id
-        ),
-        &token,
-        waiver_body.clone(),
-        &[StatusCode::OK],
-    )
-    .await;
-    assert_eq!(waiver_replay, waiver);
-    for (label, altered) in user_authorization_replay_variants(&waiver_body, false) {
-        let conflict = request_json(
-            app,
-            Method::POST,
-            &format!(
-                "/api/v1/projects/{}/milestones/{}/checks/{}/waive",
-                fixture.project_id, fixture.milestone_id, check_id
-            ),
-            &token,
-            altered,
-            &[StatusCode::CONFLICT],
-        )
-        .await;
-        assert_eq!(conflict["code"], json!("idempotency_conflict"), "{label}");
-    }
-    for (label, altered) in [
-        ("waiver definition revision", {
-            let mut value = waiver_body.clone();
-            value["definition_revision_id"] = json!("v076-different-check-revision");
-            value
-        }),
-        ("waiver input digest", {
-            let mut value = waiver_body.clone();
-            value["input_digest"] = json!("v076-different-waiver-input");
-            value
-        }),
-        ("waiver expected version", {
-            let mut value = waiver_body.clone();
-            value["mutation"]["expected_version"] = json!(check_version + 1);
-            value
-        }),
-        ("waiver governing Charter", {
-            let mut value = waiver_body.clone();
-            value["governing_revision_ids"][0] = json!("v076-different-charter-revision");
-            value
-        }),
-        ("waiver governing baseline", {
-            let mut value = waiver_body.clone();
-            value["governing_revision_ids"][1] = json!("v076-different-baseline-revision");
-            value
-        }),
-        ("waiver request target", {
-            let mut value = waiver_body.clone();
-            value["check_id"] = json!("v076-different-check-target");
-            value
-        }),
-    ] {
-        let conflict = request_json(
-            app,
-            Method::POST,
-            &format!(
-                "/api/v1/projects/{}/milestones/{}/checks/{}/waive",
-                fixture.project_id, fixture.milestone_id, check_id
-            ),
-            &token,
-            altered,
-            &[StatusCode::CONFLICT],
-        )
-        .await;
-        assert_eq!(conflict["code"], json!("idempotency_conflict"), "{label}");
-    }
-    let waiver_path_target_conflict = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/milestones/{}/checks/v076-different-path-check/waive",
-            fixture.project_id, fixture.milestone_id
-        ),
-        &token,
-        waiver_body.clone(),
-        &[StatusCode::CONFLICT],
-    )
-    .await;
-    assert_eq!(
-        waiver_path_target_conflict["code"],
-        json!("idempotency_conflict")
-    );
-
-    // Readiness and release each carry a complete user receipt plus immutable
-    // baseline/snapshot target pins. Replays must compare both dimensions.
-    let current_milestone = request_json(
-        app,
-        Method::GET,
-        &format!(
-            "/api/v1/projects/{}/milestones/{}",
-            fixture.project_id, fixture.milestone_id
-        ),
-        &token,
-        Value::Null,
-        &[StatusCode::OK],
-    )
-    .await;
-    let readiness_body = json!({
-        "mutation": {
-            "expected_version": current_milestone["version"],
-            "idempotency_key": "v076-authority-readiness",
-            "authorization": user_authorization(
-                "project.milestone.readiness",
-                "v076-authority-readiness-event"
-            )
-        },
-        "milestone_id": fixture.milestone_id,
-        "baseline_id": baseline.baseline_id,
-        "baseline_revision_id": baseline.baseline_revision_id,
-        "release_policy_revision": "v076-policy-r1"
-    });
-    let readiness = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/milestones/{}/readiness",
-            fixture.project_id, fixture.milestone_id
-        ),
-        &token,
-        readiness_body.clone(),
-        &[StatusCode::OK],
-    )
-    .await;
-    assert_eq!(readiness["result"], json!("ready"));
-    let readiness_replay = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/milestones/{}/readiness",
-            fixture.project_id, fixture.milestone_id
-        ),
-        &token,
-        readiness_body.clone(),
-        &[StatusCode::OK],
-    )
-    .await;
-    assert_eq!(readiness_replay, readiness);
-    for (label, altered) in user_authorization_replay_variants(&readiness_body, false) {
-        let conflict = request_json(
-            app,
-            Method::POST,
-            &format!(
-                "/api/v1/projects/{}/milestones/{}/readiness",
-                fixture.project_id, fixture.milestone_id
-            ),
-            &token,
-            altered,
-            &[StatusCode::CONFLICT],
-        )
-        .await;
-        assert_eq!(conflict["code"], json!("idempotency_conflict"), "{label}");
-    }
-    for (label, altered) in [
-        ("readiness baseline revision", {
-            let mut value = readiness_body.clone();
-            value["baseline_revision_id"] = json!("v076-different-readiness-revision");
-            value
-        }),
-        ("readiness policy revision", {
-            let mut value = readiness_body.clone();
-            value["release_policy_revision"] = json!("v076-different-policy-revision");
-            value
-        }),
-    ] {
-        let conflict = request_json(
-            app,
-            Method::POST,
-            &format!(
-                "/api/v1/projects/{}/milestones/{}/readiness",
-                fixture.project_id, fixture.milestone_id
-            ),
-            &token,
-            altered,
-            &[StatusCode::CONFLICT],
-        )
-        .await;
-        assert_eq!(conflict["code"], json!("idempotency_conflict"), "{label}");
-    }
-
-    let ready_milestone = request_json(
-        app,
-        Method::GET,
-        &format!(
-            "/api/v1/projects/{}/milestones/{}",
-            fixture.project_id, fixture.milestone_id
-        ),
-        &token,
-        Value::Null,
-        &[StatusCode::OK],
-    )
-    .await;
-    let release_body = json!({
-        "mutation": {
-            "expected_version": ready_milestone["version"],
-            "idempotency_key": "v076-authority-release",
-            "authorization": user_authorization(
-                "project.milestone.release",
-                "v076-authority-release-event"
-            )
-        },
-        "milestone_id": fixture.milestone_id,
-        "readiness_snapshot_id": readiness["id"],
-        "readiness_digest": readiness["readiness_digest"]
-    });
-    let release = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/milestones/{}/release",
-            fixture.project_id, fixture.milestone_id
-        ),
-        &token,
-        release_body.clone(),
-        &[StatusCode::OK],
-    )
-    .await;
-    let release_replay = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/milestones/{}/release",
-            fixture.project_id, fixture.milestone_id
-        ),
-        &token,
-        release_body.clone(),
-        &[StatusCode::OK],
-    )
-    .await;
-    assert_eq!(release_replay, release);
-    for (label, altered) in user_authorization_replay_variants(&release_body, false) {
-        let conflict = request_json(
-            app,
-            Method::POST,
-            &format!(
-                "/api/v1/projects/{}/milestones/{}/release",
-                fixture.project_id, fixture.milestone_id
-            ),
-            &token,
-            altered,
-            &[StatusCode::CONFLICT],
-        )
-        .await;
-        assert_eq!(conflict["code"], json!("idempotency_conflict"), "{label}");
-    }
-    for (label, altered) in [
-        ("release readiness snapshot", {
-            let mut value = release_body.clone();
-            value["readiness_snapshot_id"] = json!("v076-different-readiness-snapshot");
-            value
-        }),
-        ("release readiness digest", {
-            let mut value = release_body.clone();
-            value["readiness_digest"] = json!("v076-different-readiness-digest");
-            value
-        }),
-    ] {
-        let conflict = request_json(
-            app,
-            Method::POST,
-            &format!(
-                "/api/v1/projects/{}/milestones/{}/release",
-                fixture.project_id, fixture.milestone_id
-            ),
-            &token,
-            altered,
-            &[StatusCode::CONFLICT],
-        )
-        .await;
-        assert_eq!(conflict["code"], json!("idempotency_conflict"), "{label}");
-    }
-}
-
 async fn record_passed_check(
     app: &Router,
     harness: &common::Harness,
     token: &str,
     fixture: &GenesisFixture,
-    baseline: &BaselineFixture,
 ) {
     let db = harness.state.db.clone();
     let project_id = fixture.project_id.clone();
     let milestone_id = fixture.milestone_id.clone();
-    let baseline_revision_id = baseline.baseline_revision_id.clone();
     let check = sqlx::query(
         "SELECT id, definition_revision_id, version FROM project_milestone_check
          WHERE project_id = ? AND milestone_id = ? ORDER BY id LIMIT 1",
@@ -2554,7 +1839,7 @@ async fn record_passed_check(
         "status": "pass",
         "result": "passed",
         "input_digest": "v076-check-input",
-        "governing_revision_ids": [fixture.charter_revision_id, baseline_revision_id]
+        "governing_revision_ids": [fixture.charter_revision_id]
     });
     let result = request_json(
         app,
@@ -2604,11 +1889,6 @@ async fn record_passed_check(
         ("manual check governing Charter", {
             let mut value = result_body.clone();
             value["governing_revision_ids"][0] = json!("v076-different-charter-revision");
-            value
-        }),
-        ("manual check governing baseline", {
-            let mut value = result_body.clone();
-            value["governing_revision_ids"][1] = json!("v076-different-baseline-revision");
             value
         }),
         ("manual check request target", {
@@ -2673,7 +1953,7 @@ async fn record_passed_check(
             "status": "pass",
             "result": "agent must not attest",
             "input_digest": "v076-agent-check-input",
-            "governing_revision_ids": [fixture.charter_revision_id, baseline_revision_id]
+            "governing_revision_ids": [fixture.charter_revision_id]
         }),
         &[StatusCode::FORBIDDEN],
     )
@@ -2703,7 +1983,7 @@ async fn record_passed_check(
             "status": "pass",
             "result": "altered result",
             "input_digest": "v076-altered-check-input",
-            "governing_revision_ids": [fixture.charter_revision_id, baseline_revision_id]
+            "governing_revision_ids": [fixture.charter_revision_id]
         }),
         &[StatusCode::CONFLICT],
     )
@@ -2922,7 +2202,7 @@ async fn create_genesis_project(app: &Router, token: &str, prefix: &str) -> Gene
         "project_mode": "compact",
         "selected_project_agent_identity_id": project_identity,
         "selected_project_agent_profile_revision_id": project_profile,
-        "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@6",
+        "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@10",
         "selected_project_agent_policy_digest": policy_digest
     });
     let approval = request_json(
@@ -3083,311 +2363,6 @@ async fn create_genesis_project(app: &Router, token: &str, prefix: &str) -> Gene
         milestone_acceptance_check_id,
         milestone_acceptance_check_description,
     }
-}
-
-async fn create_active_baseline(
-    app: &Router,
-    token: &str,
-    fixture: &GenesisFixture,
-) -> BaselineFixture {
-    create_baseline(app, token, fixture, true).await
-}
-
-async fn create_baseline(
-    app: &Router,
-    token: &str,
-    fixture: &GenesisFixture,
-    activate: bool,
-) -> BaselineFixture {
-    let project = request_json(
-        app,
-        Method::GET,
-        &format!("/api/v1/projects/{}", fixture.project_id),
-        token,
-        Value::Null,
-        &[StatusCode::OK],
-    )
-    .await;
-    let project_version = project["version"]
-        .as_i64()
-        .expect("baseline project version");
-    let release_policy: api_types::ExecutionBaselineReleasePolicy = serde_json::from_value(json!({
-        "schema_version": services::EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA,
-        "revision": "v076-policy-r1",
-        "required_check_definition_revisions": [fixture.milestone_definition_revision_id],
-        "reviewer_independence_rules": ["independent-reviewer"],
-        "manual_attestation_rules": ["manual-attestation"],
-        "waiver_rules": ["user-waiver"],
-        "evidence_kinds": ["ci-log", "media"],
-        "evidence_contexts": ["milestone"],
-        "evidence_freshness_rules": ["current-milestone"],
-        "dependency_rules": ["dependencies-green"],
-        "stale_input_rules": ["stale-baseline-blocks"],
-        "forbidden_side_effects": ["cross-project-write"],
-        "known_issue_rules": ["known-issue-blocks"],
-        "correction_rules": ["correction-required"],
-        "purge_rules": ["purge-stale-evidence"]
-    }))
-    .expect("closed release policy parses");
-    let release_policy_digest = api_types::canonical_digest_with_schema(
-        services::EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA,
-        &release_policy,
-    )
-    .expect("closed release policy digest");
-    let content = json!({
-        "charter_revision": {
-            "artifact_id": fixture.charter_id,
-            "revision_id": fixture.charter_revision_id,
-            "content_digest": fixture.charter_content_digest,
-            "render_version": "forge.project-charter/v1",
-            "render_digest": fixture.charter_render_digest
-        },
-        "document_revisions": [],
-        "plan_item_ids": ["v076-plan-item-1", "v076-plan-item-2"],
-        "milestone_ids": [fixture.milestone_id],
-        "milestone_definition_revision_ids": [fixture.milestone_definition_revision_id],
-        "primary_milestone_id": fixture.milestone_id,
-        "release_policy_revision": "v076-policy-r1",
-        "release_policy_digest": release_policy_digest,
-        "release_policy": release_policy,
-        "acceptance_evidence_matrix": [{
-            "id": fixture.milestone_acceptance_check_id,
-            "description": fixture.milestone_acceptance_check_description,
-            "required": true,
-            "evidence_kind": null,
-            "check_definition_revision": fixture.milestone_definition_revision_id
-        }],
-        "capability_classes": ["repository_write"],
-        "risk_classes": ["low"],
-        "reviewer_independence_rules": ["independent-reviewer"],
-        "elevated_operations": [],
-        "adaptive_envelope": {
-            "allowed_task_operations": ["split"],
-            "fixed_outcomes": [],
-            "fixed_acceptance": [],
-            "fixed_risk_classes": ["low"],
-            "forbidden_side_effects": [],
-            "elevated_operations": []
-        },
-        "rollback_and_recovery": ["retry"],
-        "exclusions": []
-    });
-    let rendered = services::render_execution_baseline(
-        &serde_json::from_value(content.clone()).expect("baseline content type"),
-    )
-    .expect("baseline renderer");
-    let draft = request_json(
-        app,
-        Method::POST,
-        &format!("/api/v1/projects/{}/execution-baseline", fixture.project_id),
-        token,
-        json!({
-            "mutation": {
-                "expected_version": 0,
-                "idempotency_key": "v076-baseline-draft",
-                "authorization": user_authorization("project.execution_baseline.save_draft", "v076-baseline-draft-event")
-            },
-            "operation": "save_draft",
-            "base_revision_id": null,
-            "content": content.clone(),
-            "rendered_view": rendered.rendered_view.clone(),
-            "render_version": services::EXECUTION_BASELINE_RENDER_VERSION,
-            "content_digest": rendered.content_digest.clone(),
-            "render_digest": rendered.render_digest.clone(),
-            "provenance": user_provenance("V076 baseline draft")
-        }),
-        &[StatusCode::CREATED, StatusCode::OK],
-    )
-    .await;
-    assert_eq!(draft["baseline"]["lifecycle"], json!("draft"));
-    assert_eq!(draft["requires_user_authorization"], json!(false));
-    let baseline_id = required_string(&draft, &["baseline", "id"]);
-    let baseline_id = baseline_id.as_str();
-    let baseline_version = draft["baseline"]["version"]
-        .as_i64()
-        .expect("baseline version");
-    let draft_revision_id = required_string(&draft, &["current_revision", "id"]);
-    let saved = request_json(
-        app,
-        Method::POST,
-        &format!("/api/v1/projects/{}/execution-baseline/{baseline_id}/revisions", fixture.project_id),
-        token,
-        json!({
-            "mutation": {
-                "expected_version": baseline_version,
-                "idempotency_key": "v076-baseline-revision",
-                "authorization": user_authorization("project.execution_baseline.propose_for_approval", "v076-baseline-revision-event")
-            },
-            "operation": "propose_for_approval",
-            "base_revision_id": draft_revision_id,
-            "content": content.clone(),
-            "rendered_view": rendered.rendered_view.clone(),
-            "render_version": services::EXECUTION_BASELINE_RENDER_VERSION,
-            "content_digest": rendered.content_digest.clone(),
-            "render_digest": rendered.render_digest.clone(),
-            "provenance": user_provenance("V076 baseline revision")
-        }),
-        &[StatusCode::CREATED, StatusCode::OK],
-    )
-    .await;
-    assert_eq!(saved["requires_user_authorization"], json!(true));
-    assert_eq!(
-        saved["approval_target"]["requires_user_authorization"],
-        json!(true)
-    );
-    let revision_id = required_string(&saved, &["approval_target", "revision_id"]);
-    let revised_version = saved["baseline"]["version"]
-        .as_i64()
-        .expect("revised baseline version");
-    let approval_authorization = user_authorization(
-        "project.execution_baseline.approve",
-        "v076-baseline-approve-event",
-    );
-    let approved = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/execution-baseline/{baseline_id}/revisions/{revision_id}/approve",
-            fixture.project_id
-        ),
-        token,
-        json!({
-            "mutation": {
-                "expected_version": revised_version,
-                "idempotency_key": "v076-baseline-approve",
-                "authorization": approval_authorization.clone()
-            },
-            "revision_id": revision_id,
-            "content_digest": rendered.content_digest.clone(),
-            "render_digest": rendered.render_digest.clone(),
-            "expected_project_version": project_version
-        }),
-        &[StatusCode::CREATED, StatusCode::OK],
-    )
-    .await;
-    let approval_id = required_string(&approved, &["approval", "id"]);
-    let approved_version = approved["baseline"]["version"]
-        .as_i64()
-        .expect("approved baseline version");
-    if activate {
-        let activation_body = json!({
-            "mutation": {
-                "expected_version": project_version,
-                "idempotency_key": "v076-baseline-activate",
-                "authorization": user_authorization("project.execution_baseline.activate", "v076-baseline-activate-event")
-            },
-            "baseline_id": baseline_id,
-            "revision_id": revision_id,
-            "approval_id": approval_id,
-            "expected_baseline_version": approved_version,
-            "content_digest": rendered.content_digest.clone(),
-            "render_digest": rendered.render_digest.clone()
-        });
-        let activated = request_json(
-            app,
-            Method::POST,
-            &format!(
-                "/api/v1/projects/{}/execution-baseline/{baseline_id}/activate",
-                fixture.project_id
-            ),
-            token,
-            activation_body.clone(),
-            &[StatusCode::OK],
-        )
-        .await;
-        assert_eq!(activated["baseline"]["lifecycle"], json!("active"));
-        assert_eq!(
-            activated["baseline"]["version"],
-            json!(approved_version + 1)
-        );
-        let activation_replay = request_json(
-            app,
-            Method::POST,
-            &format!(
-                "/api/v1/projects/{}/execution-baseline/{baseline_id}/activate",
-                fixture.project_id
-            ),
-            token,
-            activation_body,
-            &[StatusCode::OK],
-        )
-        .await;
-        assert_eq!(activation_replay, activated);
-    }
-    BaselineFixture {
-        baseline_id: baseline_id.to_owned(),
-        baseline_revision_id: revision_id,
-        baseline_version: if activate {
-            approved_version + 1
-        } else {
-            approved_version
-        },
-        approval_expected_baseline_version: revised_version,
-        approval_expected_project_version: project_version,
-        content_digest: rendered.content_digest,
-        render_digest: rendered.render_digest,
-        approval_id,
-        approval_authorization,
-    }
-}
-
-async fn activate_baseline(
-    app: &Router,
-    token: &str,
-    fixture: &GenesisFixture,
-    baseline: &BaselineFixture,
-) {
-    let project = request_json(
-        app,
-        Method::GET,
-        &format!("/api/v1/projects/{}", fixture.project_id),
-        token,
-        Value::Null,
-        &[StatusCode::OK],
-    )
-    .await;
-    let project_version = project["version"]
-        .as_i64()
-        .expect("activation project version");
-    let activation_body = json!({
-        "mutation": {
-            "expected_version": project_version,
-            "idempotency_key": "v076-baseline-activate",
-            "authorization": user_authorization("project.execution_baseline.activate", "v076-baseline-activate-event")
-        },
-        "baseline_id": baseline.baseline_id,
-        "revision_id": baseline.baseline_revision_id,
-        "approval_id": baseline.approval_id,
-        "expected_baseline_version": baseline.baseline_version,
-        "content_digest": baseline.content_digest,
-        "render_digest": baseline.render_digest
-    });
-    let activated = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/execution-baseline/{}/activate",
-            fixture.project_id, baseline.baseline_id
-        ),
-        token,
-        activation_body.clone(),
-        &[StatusCode::OK],
-    )
-    .await;
-    assert_eq!(activated["baseline"]["lifecycle"], json!("active"));
-    let replay = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/execution-baseline/{}/activate",
-            fixture.project_id, baseline.baseline_id
-        ),
-        token,
-        activation_body,
-        &[StatusCode::OK],
-    )
-    .await;
-    assert_eq!(replay, activated);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3580,156 +2555,6 @@ fn charter_content(name: &str, acceptance: &str) -> ProjectCharterContent {
     .expect("V076 Charter content parses")
 }
 
-#[tokio::test]
-async fn v076_baseline_authority_replay_checks_identity_before_auth() {
-    let workspace = common::TestDir::new("v076-baseline-authority-replay-order");
-    let harness = common::test_app(workspace.path(), "v076-baseline-authority-replay-order").await;
-    let app = &harness.app;
-    let token = common::test_jwt();
-    let fixture = create_genesis_project(app, &token, "v076-replay-order").await;
-    let baseline = create_baseline(app, &token, &fixture, false).await;
-
-    let approval_body = json!({
-        "mutation": {
-            "expected_version": baseline.approval_expected_baseline_version,
-            "idempotency_key": "v076-baseline-approve",
-            "authorization": baseline.approval_authorization.clone()
-        },
-        "revision_id": baseline.baseline_revision_id,
-        "content_digest": baseline.content_digest,
-        "render_digest": baseline.render_digest,
-        "expected_project_version": baseline.approval_expected_project_version
-    });
-    let approval_replay = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/execution-baseline/{}/revisions/{}/approve",
-            fixture.project_id, baseline.baseline_id, baseline.baseline_revision_id
-        ),
-        &token,
-        approval_body.clone(),
-        &[StatusCode::OK],
-    )
-    .await;
-    assert_eq!(approval_replay["baseline"]["lifecycle"], json!("approved"));
-
-    let mut altered_authority = approval_body.clone();
-    altered_authority["mutation"]["authorization"]["action"] =
-        json!("project.execution_baseline.activate");
-    let approval_authority_conflict = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/execution-baseline/{}/revisions/{}/approve",
-            fixture.project_id, baseline.baseline_id, baseline.baseline_revision_id
-        ),
-        &token,
-        altered_authority,
-        &[StatusCode::CONFLICT],
-    )
-    .await;
-    assert_eq!(
-        approval_authority_conflict["code"],
-        json!("idempotency_conflict")
-    );
-
-    let mut altered_target = approval_body.clone();
-    altered_target["revision_id"] = json!("v076-different-revision");
-    let approval_target_conflict = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/execution-baseline/{}/revisions/{}/approve",
-            fixture.project_id, baseline.baseline_id, baseline.baseline_revision_id
-        ),
-        &token,
-        altered_target,
-        &[StatusCode::CONFLICT],
-    )
-    .await;
-    assert_eq!(
-        approval_target_conflict["code"],
-        json!("idempotency_conflict")
-    );
-
-    let project = request_json(
-        app,
-        Method::GET,
-        &format!("/api/v1/projects/{}", fixture.project_id),
-        &token,
-        Value::Null,
-        &[StatusCode::OK],
-    )
-    .await;
-    let activation_body = json!({
-        "mutation": {
-            "expected_version": project["version"],
-            "idempotency_key": "v076-baseline-activate",
-            "authorization": user_authorization(
-                "project.execution_baseline.activate",
-                "v076-baseline-activate-event"
-            )
-        },
-        "baseline_id": baseline.baseline_id,
-        "revision_id": baseline.baseline_revision_id,
-        "approval_id": baseline.approval_id,
-        "expected_baseline_version": baseline.baseline_version,
-        "content_digest": baseline.content_digest,
-        "render_digest": baseline.render_digest
-    });
-    let activation = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/execution-baseline/{}/activate",
-            fixture.project_id, baseline.baseline_id
-        ),
-        &token,
-        activation_body.clone(),
-        &[StatusCode::OK],
-    )
-    .await;
-    assert_eq!(activation["baseline"]["lifecycle"], json!("active"));
-
-    let mut altered_activation_authority = activation_body.clone();
-    altered_activation_authority["mutation"]["authorization"]["action"] =
-        json!("project.execution_baseline.approve");
-    let activation_authority_conflict = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/execution-baseline/{}/activate",
-            fixture.project_id, baseline.baseline_id
-        ),
-        &token,
-        altered_activation_authority,
-        &[StatusCode::CONFLICT],
-    )
-    .await;
-    assert_eq!(
-        activation_authority_conflict["code"],
-        json!("idempotency_conflict")
-    );
-
-    let activation_target_conflict = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/execution-baseline/different-path-baseline/activate",
-            fixture.project_id
-        ),
-        &token,
-        activation_body,
-        &[StatusCode::CONFLICT],
-    )
-    .await;
-    assert_eq!(
-        activation_target_conflict["code"],
-        json!("idempotency_conflict")
-    );
-}
-
 fn user_authorization(action: &str, event_id: impl Into<String>) -> Value {
     json!({
         "principal": {"kind": "user", "id": "test-user-id"},
@@ -3809,7 +2634,7 @@ fn user_authorization_replay_variants(
 fn user_provenance(summary: &str) -> Value {
     json!({
         "author": {"kind": "user", "id": "test-user-id"},
-        "operating_skill_revision": "forge.project.orchestration/v1@6",
+        "operating_skill_revision": "forge.project.orchestration/v1@10",
         "source_refs": [],
         "change_summary": summary
     })

@@ -51,9 +51,10 @@ pub use operation_catalog::{
     OperationInputContract, OperationOutputContract, OperationPermission, OperationSetupExposure,
     OperationSurface, PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
     PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION,
-    PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
+    PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION,
     PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION, SHARED_ORCHESTRATION_OUTCOME,
-    TASK_ADAPTIVE_OPERATION, TASK_PROPOSE_OPERATION, TASK_REVIEW_OPERATION, classify_operation,
+    TASK_ADAPTIVE_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PROPOSE_OPERATION,
+    TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION, classify_operation,
     contains_adaptive_authority_override, contains_authority_override,
     descriptor as operation_descriptor, is_allowed_project_direct_payload,
     is_approval_required_operation, is_denied_operation, is_project_orchestration_operation,
@@ -162,6 +163,14 @@ pub enum WorkspaceAccess {
     Deny,
     TaskRead,
     TaskWrite,
+    /// Read and run inside a disposable per-Project verification checkout.
+    ///
+    /// This exists so a Project Agent can exercise the delivered software
+    /// itself -- build it, run its tests, start it -- without becoming a second
+    /// implementation path. There is no write tool and no commit or push route,
+    /// and the checkout is not the Task worktree any delivery came from, so
+    /// nothing done here can reach the repository.
+    ProjectVerify,
 }
 
 impl CanonicalScope {
@@ -173,7 +182,8 @@ impl CanonicalScope {
                 | CanonicalScopeType::Project
                 | CanonicalScopeType::AgentChat,
                 WorkspaceAccess::Deny,
-            ) => Ok(()),
+            )
+            | (CanonicalScopeType::AgentChat, WorkspaceAccess::ProjectVerify) => Ok(()),
             _ => Err(AgentHostError::Authority(
                 "filesystem access is only valid for an admitted Task scope".to_owned(),
             )),

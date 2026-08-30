@@ -64,6 +64,7 @@ use crate::{
     project_runtime::{load_effective_project_state, ProjectEffectiveStateProjection},
     wake_turn_consumer::{
         DELIVERY_FOLLOWUP_POSTCONDITION_SCHEMA, DELIVERY_FOLLOWUP_READINESS_EVENT,
+        DELIVERY_FOLLOWUP_VALIDATION_EVENT,
     },
     EmbeddedAgentService, Result, ServiceError,
 };
@@ -80,8 +81,24 @@ const PROJECT_CONTEXT_DIGEST_SCHEMA_VERSION: &str = "forge.project-context-refer
 const MAX_HANDOFF_BOUNDED_CHARS: usize = 12_000;
 const DELIVERY_FOLLOWUP_POSTCONDITION_FAILED: &str = "delivery_followup_postcondition_failed";
 const DELIVERY_FOLLOWUP_POSTCONDITION_MESSAGE: &str =
-    "Delivery follow-up returned without committing a newer milestone readiness evaluation";
-const DELIVERY_FOLLOWUP_RETRY_INSTRUCTION: &str = r#"
+    "Delivery follow-up returned without committing the acceptance-check result or readiness evaluation it owed";
+const DELIVERY_FOLLOWUP_VALIDATION_RETRY_INSTRUCTION: &str = r#"
+
+## SERVER-OWNED DELIVERY FOLLOW-UP RETRY
+Your prior attempt returned text without recording the acceptance-check
+result this delivery owed. Narration cannot complete this turn. The work order
+in the wake message names the exact milestone_id, milestone_version,
+definition_revision_id, and check_id for every check you can settle yourself:
+exercise the delivered software against each check's expected result and
+record what you observed with `project.validation` (action `record`), one call
+per check. Record a `fail` you actually observed rather than skipping the
+check. Give each observation an `input_digest` that reflects what you actually
+exercised: repeating an earlier observation's exact digest replays the original
+record and commits nothing. Task completion or a passing review is live
+progress, not validation. Do not attest a manual check, waive a check, or
+release the milestone.
+"#;
+const DELIVERY_FOLLOWUP_READINESS_RETRY_INSTRUCTION: &str = r#"
 
 ## SERVER-OWNED DELIVERY FOLLOW-UP RETRY
 Your prior attempt returned text without committing the required milestone
@@ -1328,7 +1345,9 @@ impl FederatedAgentChatTurnRunner {
         };
         append_delivery_followup_retry_instruction(
             job.error_code.as_deref(),
-            delivery_followup_postcondition(&input)?.is_some(),
+            delivery_followup_postcondition(&input)?
+                .as_ref()
+                .map(|postcondition| postcondition.required_event_type.as_str()),
             &mut operating_instruction,
         )?;
         let owner_user_id = agent
@@ -2511,38 +2530,6 @@ impl FederatedAgentChatTurnRunner {
         }
         let effective_state = effective_state_context(&projection)?;
 
-        if let Some(baseline) = projection.active_execution_baseline.as_ref() {
-            context_references.push(OperatingContextReference::included(
-                format!(
-                    "baseline:{}@{}:content:{}:render:{}:policy:{}@{}",
-                    baseline.id,
-                    baseline.revision_id,
-                    baseline.content_digest,
-                    baseline.render_digest,
-                    baseline.release_policy_revision,
-                    baseline.release_policy_digest
-                ),
-                &baseline.id,
-                "execution_baseline",
-                &baseline.revision_id,
-                &baseline.content_digest,
-                "active_approved_execution_baseline",
-            ));
-        } else {
-            context_references.push(OperatingContextReference::omitted(
-                "baseline:unresolved",
-                project_id,
-                "execution_baseline",
-                "unresolved",
-                canonical_context_digest(&serde_json::json!({
-                    "project_id": project_id,
-                    "source_event_watermark": &projection.source_event_watermark,
-                    "execution_baseline": Value::Null,
-                }))?,
-                "no_active_approved_execution_baseline",
-            ));
-        }
-
         for document in &projection.approved_documents {
             context_references.push(OperatingContextReference::included(
                 format!(
@@ -2765,14 +2752,12 @@ impl FederatedAgentChatTurnRunner {
             let release_revision = release.release_revision.to_string();
             context_references.push(OperatingContextReference::included(
                 format!(
-                    "release:{}:{}@{}:readiness:{}:snapshot:{}:baseline:{}@{}",
+                    "release:{}:{}@{}:readiness:{}:snapshot:{}",
                     release.id,
                     release.release_identifier,
                     release.release_revision,
                     release.readiness_digest,
-                    release.snapshot_digest,
-                    release.baseline_id,
-                    release.baseline_revision_id
+                    release.snapshot_digest
                 ),
                 &release.id,
                 "immutable_project_release",
@@ -2793,11 +2778,6 @@ impl FederatedAgentChatTurnRunner {
                 "unreleased_decision_candidate",
                 &unreleased.decision_candidate_ids,
                 "decision_candidate_not_effective",
-            ),
-            (
-                "unreleased_baseline_revision",
-                &unreleased.baseline_revision_ids,
-                "baseline_revision_not_active",
             ),
             (
                 "unreleased_active_milestone",
@@ -2908,6 +2888,19 @@ impl FederatedAgentChatTurnRunner {
                 .await?
                 .as_ref()
                 .and_then(crate::embedded_agent_service::entry_provider_account_id);
+        // The Project Agent runs its turn inside its own workspace: `forge/`
+        // for what it writes, `checkout/` for the software it exercises.
+        let verification_checkout = match AgentChatRepo::get_agent_chat(&*self.db, &job.chat_id)
+            .await?
+            .and_then(|chat| chat.project_id)
+        {
+            Some(project_id) => {
+                self.embedded_agents
+                    .project_agent_workspace(&project_id)
+                    .await
+            }
+            None => None,
+        };
         let started = std::time::Instant::now();
         let output = self
             .embedded_agents
@@ -2919,9 +2912,13 @@ impl FederatedAgentChatTurnRunner {
                     scope: CanonicalScope {
                         scope_type: CanonicalScopeType::AgentChat,
                         scope_id: job.chat_id.clone(),
-                        workspace_access: WorkspaceAccess::Deny,
+                        workspace_access: verification_checkout
+                            .as_ref()
+                            .map_or(WorkspaceAccess::Deny, |_| WorkspaceAccess::ProjectVerify),
                     },
-                    workspace_path: None,
+                    workspace_path: verification_checkout
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned()),
                     provider: {
                         let (context_tokens, max_input_tokens, max_output_tokens) =
                             crate::embedded_agent_service::effective_native_limits(
@@ -3993,7 +3990,10 @@ fn delivery_followup_postcondition(
         })?;
     if postcondition.schema_version != DELIVERY_FOLLOWUP_POSTCONDITION_SCHEMA
         || postcondition.attention_id.trim().is_empty()
-        || postcondition.required_event_type != DELIVERY_FOLLOWUP_READINESS_EVENT
+        || !matches!(
+            postcondition.required_event_type.as_str(),
+            DELIVERY_FOLLOWUP_READINESS_EVENT | DELIVERY_FOLLOWUP_VALIDATION_EVENT
+        )
         || postcondition.required_scope_type != "project"
         || postcondition.required_scope_id.trim().is_empty()
         || postcondition.after_event_sequence < 1
@@ -4006,22 +4006,29 @@ fn delivery_followup_postcondition(
     Ok(Some(postcondition))
 }
 
+/// The corrective instruction has to name the same record the postcondition
+/// requires. Telling an Agent to evaluate readiness when what it actually owes
+/// is a validation result is how a delivery follow-up ends up looping on the
+/// blockers it was supposed to clear.
 fn append_delivery_followup_retry_instruction(
     error_code: Option<&str>,
-    has_delivery_followup_postcondition: bool,
+    required_event_type: Option<&str>,
     operating_instruction: &mut Option<String>,
 ) -> Result<()> {
-    if error_code != Some(DELIVERY_FOLLOWUP_POSTCONDITION_FAILED)
-        || !has_delivery_followup_postcondition
-    {
+    if error_code != Some(DELIVERY_FOLLOWUP_POSTCONDITION_FAILED) {
         return Ok(());
     }
+    let retry = match required_event_type {
+        Some(DELIVERY_FOLLOWUP_VALIDATION_EVENT) => DELIVERY_FOLLOWUP_VALIDATION_RETRY_INSTRUCTION,
+        Some(DELIVERY_FOLLOWUP_READINESS_EVENT) => DELIVERY_FOLLOWUP_READINESS_RETRY_INSTRUCTION,
+        _ => return Ok(()),
+    };
     let instruction = operating_instruction.as_mut().ok_or_else(|| {
         ServiceError::invalid_operation(
             "Delivery follow-up retry has no Project operating instruction",
         )
     })?;
-    instruction.push_str(DELIVERY_FOLLOWUP_RETRY_INSTRUCTION);
+    instruction.push_str(retry);
     Ok(())
 }
 
@@ -4710,15 +4717,13 @@ fn effective_state_context(
     let unreleased = &projection.unreleased_changes;
     if !unreleased.document_ids.is_empty()
         || !unreleased.decision_candidate_ids.is_empty()
-        || !unreleased.baseline_revision_ids.is_empty()
         || !unreleased.active_milestone_ids.is_empty()
         || !unreleased.reconciliation_ids.is_empty()
     {
         reconciliation_required.push(format!(
-            "unreleased changes: documents={:?}; decision_candidates={:?}; baseline_revisions={:?}; active_milestones={:?}; reconciliations={:?}",
+            "unreleased changes: documents={:?}; decision_candidates={:?}; active_milestones={:?}; reconciliations={:?}",
             unreleased.document_ids,
             unreleased.decision_candidate_ids,
-            unreleased.baseline_revision_ids,
             unreleased.active_milestone_ids,
             unreleased.reconciliation_ids,
         ));
@@ -4761,20 +4766,6 @@ fn effective_state_context(
                 charter.version
             )
         }),
-        active_execution_baseline: projection
-            .active_execution_baseline
-            .as_ref()
-            .map(|baseline| {
-                format!(
-                    "{}@{}:content:{}:render:{}:policy:{}@{}",
-                    baseline.id,
-                    baseline.revision_id,
-                    baseline.content_digest,
-                    baseline.render_digest,
-                    baseline.release_policy_revision,
-                    baseline.release_policy_digest
-                )
-            }),
         applicable_document_revisions: projection
             .approved_documents
             .iter()
@@ -4795,17 +4786,12 @@ fn effective_state_context(
             .map(|decision| {
                 let digest = canonical_context_digest(decision)?;
                 Ok::<_, ServiceError>(format!(
-                    "{} [{}] @{}: {}:digest:{}{}",
+                    "{} [{}] @{}: {}:digest:{}",
                     decision.id,
                     decision.decision_class,
                     decision.created_at,
                     decision.selected_outcome,
-                    digest,
-                    decision
-                        .baseline_revision_id
-                        .as_deref()
-                        .map(|revision| format!(":baseline:{revision}"))
-                        .unwrap_or_default()
+                    digest
                 ))
             })
             .collect::<Result<Vec<_>>>()?,
@@ -4876,16 +4862,11 @@ fn effective_state_context(
             .as_ref()
             .map(|readiness| {
                 format!(
-                    "{} ({}@{}):event:{}:baseline:{}@{}:content:{}:policy:{}@{}",
+                    "{} ({}@{}):event:{}",
                     readiness.outcome,
                     readiness.id,
                     readiness.readiness_digest,
-                    readiness.event_watermark,
-                    readiness.baseline_id,
-                    readiness.baseline_revision_id,
-                    readiness.baseline_digest,
-                    readiness.release_policy_revision,
-                    readiness.release_policy_digest
+                    readiness.event_watermark
                 )
             })
             .unwrap_or_else(|| "unresolved".to_owned()),
@@ -4894,14 +4875,11 @@ fn effective_state_context(
             .iter()
             .map(|release| {
                 format!(
-                    "{} ({}@{}):snapshot:{}:baseline:{}@{}:content:{}:created:{}",
+                    "{} ({}@{}):snapshot:{}:created:{}",
                     release.release_identifier,
                     release.id,
                     release.readiness_digest,
                     release.snapshot_digest,
-                    release.baseline_id,
-                    release.baseline_revision_id,
-                    release.baseline_digest,
                     release.created_at
                 )
             })
@@ -5226,23 +5204,50 @@ mod tests {
     }
 
     #[test]
-    fn delivery_followup_retry_adds_server_owned_corrective_instruction() {
-        let mut instruction = Some("Project operating instruction".to_owned());
+    fn delivery_followup_retry_corrects_toward_the_record_the_turn_owed() {
+        let mut readiness = Some("Project operating instruction".to_owned());
         append_delivery_followup_retry_instruction(
             Some(DELIVERY_FOLLOWUP_POSTCONDITION_FAILED),
-            true,
-            &mut instruction,
+            Some(DELIVERY_FOLLOWUP_READINESS_EVENT),
+            &mut readiness,
         )
         .expect("delivery follow-up retry instruction");
-        let instruction = instruction.expect("Project operating instruction remains available");
-        assert!(instruction.contains("SERVER-OWNED DELIVERY FOLLOW-UP RETRY"));
-        assert!(instruction.contains("invoke `project.readiness`"));
-        assert!(instruction.contains("Narration cannot complete this turn"));
+        let readiness = readiness.expect("Project operating instruction remains available");
+        assert!(readiness.contains("SERVER-OWNED DELIVERY FOLLOW-UP RETRY"));
+        assert!(readiness.contains("invoke `project.readiness`"));
+        assert!(readiness.contains("Narration cannot complete this turn"));
+
+        // A turn that owed a validation result must be corrected toward
+        // recording it, not toward evaluating readiness it cannot satisfy.
+        let mut validation = Some("Project operating instruction".to_owned());
+        append_delivery_followup_retry_instruction(
+            Some(DELIVERY_FOLLOWUP_POSTCONDITION_FAILED),
+            Some(DELIVERY_FOLLOWUP_VALIDATION_EVENT),
+            &mut validation,
+        )
+        .expect("delivery follow-up retry instruction");
+        let validation = validation.expect("Project operating instruction remains available");
+        assert!(validation.contains("`project.validation` (action `record`)"));
+        assert!(!validation.contains("invoke `project.readiness`"));
 
         let mut ordinary = Some("Project operating instruction".to_owned());
-        append_delivery_followup_retry_instruction(Some("backend_failed"), true, &mut ordinary)
-            .expect("ordinary retries are unchanged");
+        append_delivery_followup_retry_instruction(
+            Some("backend_failed"),
+            Some(DELIVERY_FOLLOWUP_READINESS_EVENT),
+            &mut ordinary,
+        )
+        .expect("ordinary retries are unchanged");
         assert_eq!(ordinary.as_deref(), Some("Project operating instruction"));
+
+        // No postcondition means no corrective overlay.
+        let mut none = Some("Project operating instruction".to_owned());
+        append_delivery_followup_retry_instruction(
+            Some(DELIVERY_FOLLOWUP_POSTCONDITION_FAILED),
+            None,
+            &mut none,
+        )
+        .expect("turns without a postcondition are unchanged");
+        assert_eq!(none.as_deref(), Some("Project operating instruction"));
     }
 
     #[test]
@@ -5432,12 +5437,6 @@ mod tests {
                 "id": "charter-1", "revision_id": "charter-revision-2", "revision": 2,
                 "version": 3, "content_digest": "charter-content", "render_digest": "charter-render"
             },
-            "active_execution_baseline": {
-                "id": "baseline-1", "revision_id": "baseline-revision-2", "revision": 2,
-                "version": 2, "lifecycle": "active", "charter_revision_id": "charter-revision-2",
-                "content_digest": "baseline-content", "render_digest": "baseline-render",
-                "release_policy_revision": "policy-2", "release_policy_digest": "policy-digest"
-            },
             "approved_documents": [{
                 "id": "document-1", "kind": "delivery_brief", "title": "Brief",
                 "revision_id": "document-revision-3", "revision": 3, "version": 2,
@@ -5450,8 +5449,7 @@ mod tests {
                 "authority_basis": "active_execution_baseline_adaptive_envelope",
                 "authorization_action": "project.decision.record_effective",
                 "explicit_event": "action-1", "authorization_occurred_at": "2026-08-13T00:00:02Z",
-                "charter_revision_id": "charter-revision-2",
-                "baseline_revision_id": "baseline-revision-2", "source_refs": [],
+                "charter_revision_id": "charter-revision-2", "source_refs": [],
                 "affected_records": {}, "created_at": "2026-08-13T00:00:02Z"
             }],
             "invalidated_decisions": [],
@@ -5492,9 +5490,7 @@ mod tests {
             "readiness": {
                 "latest": {
                     "id": "readiness-1", "milestone_id": "milestone-1", "definition_revision_id": "milestone-revision-2",
-                    "baseline_id": "baseline-1", "baseline_revision_id": "baseline-revision-2",
-                    "baseline_digest": "baseline-content", "release_policy_revision": "policy-2",
-                    "release_policy_digest": "policy-digest", "event_watermark": "event-8",
+                    "event_watermark": "event-8",
                     "outcome": "blocked", "blocking_reasons": ["stale"], "readiness_digest": "readiness-digest",
                     "created_at": "2026-08-13T00:00:04Z"
                 },
@@ -5503,14 +5499,13 @@ mod tests {
             "releases": [{
                 "id": "release-1", "milestone_id": "milestone-1", "release_sequence": 1,
                 "release_revision": 1, "release_identifier": "M001-r1", "readiness_snapshot_id": "readiness-0",
-                "readiness_digest": "readiness-0-digest", "baseline_id": "baseline-0",
-                "baseline_revision_id": "baseline-revision-1", "baseline_digest": "baseline-0-content",
+                "readiness_digest": "readiness-0-digest",
                 "snapshot_digest": "release-snapshot-0-digest",
                 "created_at": "2026-08-12T00:00:00Z"
             }],
             "unreleased_changes": {
                 "document_ids": ["document-2"], "decision_candidate_ids": ["candidate-1"],
-                "baseline_revision_ids": ["baseline-revision-3"], "active_milestone_ids": ["milestone-1"],
+                "active_milestone_ids": ["milestone-1"],
                 "reconciliation_ids": ["reconcile-1"]
             },
             "source_event_watermark": "event-8", "source_event_sequence": 8,
@@ -5521,10 +5516,6 @@ mod tests {
             .governing_charter
             .expect("Charter")
             .contains("charter-content"));
-        assert!(state
-            .active_execution_baseline
-            .expect("baseline")
-            .contains("policy-2@policy-digest"));
         assert!(state.active_decisions[0].contains("digest:"));
         assert!(state.reconciliation_required[0].contains("task-digest"));
         assert!(state
@@ -5536,7 +5527,7 @@ mod tests {
         assert!(state.validation_summary.contains("total=1"));
         assert!(state.active_milestones[0].contains("milestone-content"));
         assert!(state.readiness.contains("event:event-8"));
-        assert!(state.releases[0].contains("baseline-revision-1"));
+        assert!(state.releases[0].contains("release-snapshot-0-digest"));
         assert!(state
             .reconciliation_required
             .iter()

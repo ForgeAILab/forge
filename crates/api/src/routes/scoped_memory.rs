@@ -650,23 +650,6 @@ async fn load_project_context_pointers(
     }
 
     for row in sqlx::query(
-        "SELECT id, current_revision_id
-         FROM project_execution_baseline
-         WHERE project_id = ? AND lifecycle = 'active'
-           AND current_revision_id IS NOT NULL",
-    )
-    .bind(project_id)
-    .fetch_all(state.db.pool())
-    .await?
-    {
-        pointers.insert(
-            "execution_baseline",
-            row.try_get::<String, _>("id")?.as_str(),
-            row.try_get::<String, _>("current_revision_id")?.as_str(),
-        );
-    }
-
-    for row in sqlx::query(
         "SELECT id, current_definition_revision_id
          FROM project_milestone
          WHERE project_id = ?

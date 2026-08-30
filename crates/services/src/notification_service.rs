@@ -100,6 +100,21 @@ impl NotificationService {
                 )
                 .await?;
             }
+            EventContext::ProjectAutonomyStalled {
+                project_id,
+                open_incidents,
+                reason,
+            } => {
+                // No task id: the stall is the Project's, not any one Task's.
+                self.create_and_publish(
+                    project_id,
+                    None,
+                    "project.autonomy_stalled".to_owned(),
+                    format!("Project Agent stopped: {open_incidents} open incident(s) unanswered"),
+                    Some(reason),
+                )
+                .await?;
+            }
             EventContext::TaskFailed {
                 project_id, reason, ..
             } => {

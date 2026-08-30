@@ -153,51 +153,15 @@ async fn create_release(db: &SqliteDb, project_id: &str) {
     .await
     .expect("charter pointer");
     sqlx::query(
-        "INSERT INTO project_execution_baseline
-         (id, project_id, lifecycle, current_revision_id, created_at, updated_at)
-         VALUES ('baseline-media', ?, 'active', NULL, ?, ?)",
-    )
-    .bind(project_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("baseline");
-    sqlx::query(
-        "INSERT INTO project_execution_baseline_revision
-         (id, baseline_id, revision, lifecycle, charter_revision_id,
-          release_policy_revision, release_policy_digest, schema_version,
-          render_version, rendered_view, content_digest, rendered_digest, created_at)
-         VALUES ('baseline-media-r1', 'baseline-media', 1, 'approved',
-                 'charter-media-r1', 'policy-media-r1', 'policy-digest', 'test',
-                 'test', 'media baseline', 'baseline-digest',
-                 'baseline-rendered-digest', ?)",
-    )
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("baseline revision");
-    sqlx::query(
-        "UPDATE project_execution_baseline
-         SET current_revision_id = ?
-         WHERE id = 'baseline-media'",
-    )
-    .bind("baseline-media-r1")
-    .execute(db.pool())
-    .await
-    .expect("baseline pointer");
-    sqlx::query(
         "INSERT INTO project_readiness_snapshot
          (id, project_id, milestone_id, definition_revision_id,
-          baseline_id, baseline_revision_id, baseline_digest,
-          release_policy_revision, release_policy_digest, event_watermark, outcome,
+          event_watermark, outcome,
           computing_policy_revision, readiness_digest, principal_type, principal_id,
           authorization_basis, authorization_action, authorization_occurred_at,
           expected_milestone_version, explicit_event,
           idempotency_key, created_at)
          VALUES ('readiness-media', ?, 'milestone-media', 'milestone-media-r1',
-                 'baseline-media', 'baseline-media-r1', 'baseline-digest',
-                 'policy-media-r1', 'policy-digest', 'event-watermark-media', 'ready',
+                 'event-watermark-media', 'ready',
                  'test', 'readiness-digest', 'user', 'user-media', 'test',
                  'project.milestone.readiness.evaluate', '2026-08-13T00:00:00Z', 1,
                  'event-media', 'idem-readiness-media', ?)",
@@ -211,16 +175,13 @@ async fn create_release(db: &SqliteDb, project_id: &str) {
         "INSERT INTO project_release
          (id, project_id, milestone_id, release_sequence, release_revision,
           release_identifier, milestone_revision_id, readiness_snapshot_id,
-          readiness_digest, baseline_id, baseline_revision_id, baseline_digest,
-          release_policy_revision, release_policy_digest,
+          readiness_digest,
           releasing_principal_type, releasing_principal_id,
           authorization_basis, authorization_action, authorization_occurred_at,
           explicit_event, schema_version, snapshot_digest,
           idempotency_key, created_at)
          VALUES ('release-media', ?, 'milestone-media', 1, 1, 'M001-r1',
                  'milestone-media-r1', 'readiness-media', 'readiness-digest',
-                 'baseline-media', 'baseline-media-r1', 'baseline-digest',
-                 'policy-media-r1', 'policy-digest',
                  'user', 'user-media', 'test', 'project.release.create',
                  '2026-08-13T00:00:00Z', 'event-release-media', 'test',
                  'snapshot-digest', 'idem-release-media', ?)",

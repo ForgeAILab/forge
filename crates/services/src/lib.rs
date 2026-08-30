@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod adaptive_task_operations;
 pub(crate) mod agent_capacity;
 pub mod agent_chat_memory_consumer;
 pub mod agent_chat_policy;
@@ -26,7 +27,6 @@ pub mod domain_event_service;
 pub mod embedded_agent_service;
 pub mod embedded_daemon;
 pub mod embedded_task_executor;
-pub mod execution_baseline;
 pub mod execution_setup;
 pub mod external_api;
 pub mod external_sync;
@@ -92,6 +92,10 @@ pub(crate) mod test_support;
 #[cfg(test)]
 mod receipt_characterization_tests;
 
+pub use adaptive_task_operations::{
+    adaptive_task_operation_supported_values, parse_persisted_adaptive_envelope,
+    validate_adaptive_task_operations, ADAPTIVE_ALLOWED_TASK_OPERATIONS_FIELD,
+};
 pub use agent_chat_memory_consumer::{
     memory_consumer_lease_owner, memory_consumer_name, AgentChatMemoryConsumer,
 };
@@ -99,8 +103,8 @@ pub use agent_chat_policy::{AgentChatOperation, AgentChatPolicyError, AgentChatS
 pub use agent_chat_service::{
     append_system_chat_message, AdmittedAgentChatMessage, AgentChatHandoffOutcome,
     AgentChatService, CancelAgentChatTurnInput, CommittedAgentChatResponse,
-    CreateAgentHandoffInput, SendAgentChatMessageInput, SetMainAgentBindingInput,
-    SetProjectAgentBindingInput,
+    CreateAgentHandoffInput, RetryAgentChatTurnInput, SendAgentChatMessageInput,
+    SetMainAgentBindingInput, SetProjectAgentBindingInput,
 };
 pub use agent_chat_turn_policy::{
     bounded_error as bounded_agent_chat_error, claim as claim_agent_chat_turn,
@@ -159,21 +163,6 @@ pub use domain_event_service::DomainEventService;
 pub use embedded_agent_service::{EmbeddedAgentService, ProviderEntryTestOutcome};
 pub use embedded_daemon::EmbeddedDaemon;
 pub use embedded_task_executor::{EmbeddedTaskExecutor, TaskExecutorRouter};
-pub use execution_baseline::{
-    adaptive_task_operation_supported_values, audit_execution_baseline_integrity,
-    baseline_column_json, parse_persisted_adaptive_envelope, release_policy_digest,
-    render_execution_baseline, validate_adaptive_task_operations,
-    validate_execution_baseline_policy, ActivateExecutionBaselineCommand,
-    ApproveAndActivateExecutionBaselineCommand, ApproveExecutionBaselineCommand,
-    BaselineColumnJson, ExecutionBaselineApprovalTarget, ExecutionBaselineCommandOutcome,
-    ExecutionBaselineCommandService, ExecutionBaselineIntegrityAudit,
-    ExecutionBaselineQueryService, ExecutionBaselineRender,
-    ProposeExecutionBaselineForApprovalCommand, SaveExecutionBaselineDraftCommand,
-    EXECUTION_BASELINE_ACTIVATE_COMMAND, EXECUTION_BASELINE_APPROVE_AND_ACTIVATE_COMMAND,
-    EXECUTION_BASELINE_APPROVE_COMMAND, EXECUTION_BASELINE_PROPOSE_COMMAND,
-    EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA, EXECUTION_BASELINE_RENDER_VERSION,
-    EXECUTION_BASELINE_SAVE_DRAFT_COMMAND, EXECUTION_BASELINE_SCHEMA_VERSION,
-};
 pub use execution_setup::{
     canonical_task_capability, classify_task_execution, eligible_project_execution_agents,
     ensure_execution_role_principal, is_eligible_execution_identity, is_read_only_capability,
@@ -215,7 +204,7 @@ pub use milestone_orchestration::{
     ReadinessEvaluationInput, ReadinessTaskState, ReleaseCandidateVerification,
     MILESTONE_READINESS_DIGEST_SCHEMA_VERSION, MILESTONE_RELEASE_DIGEST_SCHEMA_VERSION,
 };
-pub use milestone_runtime::{validate_release_policy, MilestoneRuntime};
+pub use milestone_runtime::MilestoneRuntime;
 pub use native_tools::CoordinationToolProvider;
 pub use notification_service::NotificationService;
 pub use oauth_service::{OAuthError, OAuthService};

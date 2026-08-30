@@ -16,9 +16,10 @@ use crate::operation_catalog::{
     MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
     PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION,
-    PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
+    PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION,
     PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION,
-    TASK_PROPOSE_OPERATION, TASK_REVIEW_OPERATION,
+    TASK_EVIDENCE_OPERATION, TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION,
+    TASK_WORKLOG_OPERATION,
 };
 
 pub(crate) fn object_schema(properties: Value, required: &[&str]) -> Value {
@@ -82,38 +83,6 @@ pub(crate) fn artifact_ref_schema() -> Value {
             "render_digest": string_or_null_schema(),
         }),
         &["artifact_id", "revision_id", "content_digest"],
-    )
-}
-
-pub(crate) fn execution_baseline_artifact_ref_schema() -> Value {
-    object_schema(
-        json!({
-            "artifact_id": {"type":"string","minLength":1},
-            "revision_id": {"type":"string","minLength":1},
-            "content_digest": {"type":"string","minLength":1},
-            "render_version": {"type":"string","minLength":1},
-            "render_digest": {"type":"string","minLength":1},
-        }),
-        &[
-            "artifact_id",
-            "revision_id",
-            "content_digest",
-            "render_version",
-            "render_digest",
-        ],
-    )
-}
-
-fn execution_baseline_charter_ref_schema() -> Value {
-    object_schema(
-        json!({
-            "artifact_id": {"type":"string","minLength":1,"description":"Omit. The server resolves the Charter id from revision_id."},
-            "revision_id": {"type":"string","minLength":1,"description":"The exact Project Charter revision to authorize and reference."},
-            "content_digest": {"type":"string","minLength":1,"description":"Omit. The server loads this from the persisted Charter revision."},
-            "render_version": {"type":"string","minLength":1,"description":"Omit. The server loads this from the persisted Charter revision."},
-            "render_digest": {"type":"string","minLength":1,"description":"Omit. The server loads this from the persisted Charter revision."},
-        }),
-        &["revision_id"],
     )
 }
 
@@ -268,92 +237,6 @@ pub(crate) fn document_content_schema() -> Value {
     })
 }
 
-pub(crate) fn execution_baseline_release_policy_schema() -> Value {
-    object_schema(
-        json!({
-            "schema_version": {"type":"string","const":"forge.execution-baseline-release-policy/v1"},
-            "revision": {"type":"string","minLength":1},
-            "required_check_definition_revisions": string_array_schema(),
-            "reviewer_independence_rules": string_array_schema(),
-            "manual_attestation_rules": string_array_schema(),
-            "waiver_rules": string_array_schema(),
-            "evidence_kinds": string_array_schema(),
-            "evidence_contexts": string_array_schema(),
-            "evidence_freshness_rules": string_array_schema(),
-            "dependency_rules": string_array_schema(),
-            "stale_input_rules": string_array_schema(),
-            "forbidden_side_effects": string_array_schema(),
-            "known_issue_rules": string_array_schema(),
-            "correction_rules": string_array_schema(),
-            "purge_rules": string_array_schema()
-        }),
-        &[
-            "schema_version",
-            "revision",
-            "required_check_definition_revisions",
-            "reviewer_independence_rules",
-            "manual_attestation_rules",
-            "waiver_rules",
-            "evidence_kinds",
-            "evidence_contexts",
-            "evidence_freshness_rules",
-            "dependency_rules",
-            "stale_input_rules",
-            "forbidden_side_effects",
-            "known_issue_rules",
-            "correction_rules",
-            "purge_rules",
-        ],
-    )
-}
-
-pub(crate) fn execution_baseline_content_schema() -> Value {
-    object_schema(
-        json!({
-            "charter_revision": execution_baseline_charter_ref_schema(),
-            "document_revisions": {"type":"array","items":execution_baseline_artifact_ref_schema()},
-            "plan_item_ids": string_array_schema(),
-            "milestone_ids": string_array_schema(),
-            "milestone_definition_revision_ids": string_array_schema(),
-            "primary_milestone_id": string_or_null_schema(),
-            "release_policy_revision": {"type":"string","minLength":1},
-            "release_policy_digest": {"type":"string","minLength":1,"description":"Omit. The server computes this from release_policy."},
-            "release_policy": execution_baseline_release_policy_schema(),
-            "acceptance_evidence_matrix": {"type":"array","items":object_schema(json!({
-                "id":{"type":"string","minLength":1,"description":"Reuse the exact stable acceptance-check id exposed by project.current_state; never invent an alias such as ac-1."},
-                "description":{"type":"string","minLength":1},
-                "required":{"type":"boolean"},
-                "evidence_kind":{"type":["string","null"],"enum":["screenshot","walkthrough_video","log","report","other",null]},
-                "check_definition_revision":{"type":["string","null"],"minLength":1,"description":"Use the exact milestone definition_revision_id exposed with this check by project.current_state."}
-            }), &["id","description","required"])},
-            "capability_classes": string_array_schema(),
-            "risk_classes": string_array_schema(),
-            "reviewer_independence_rules": string_array_schema(),
-            "elevated_operations": string_array_schema(),
-            "adaptive_envelope": object_schema(json!({
-                "allowed_task_operations":string_array_schema(),
-                "fixed_outcomes":string_array_schema(),
-                "fixed_acceptance":string_array_schema(),
-                "fixed_risk_classes":string_array_schema(),
-                "forbidden_side_effects":string_array_schema(),
-                "elevated_operations":string_array_schema()
-            }), &[]),
-            "rollback_and_recovery": string_array_schema(),
-            "exclusions": string_array_schema()
-        }),
-        &[
-            "charter_revision",
-            "document_revisions",
-            "plan_item_ids",
-            "milestone_ids",
-            "milestone_definition_revision_ids",
-            "release_policy_revision",
-            "release_policy",
-            "adaptive_envelope",
-        ],
-    )
-}
-
 pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
     match operation {
         MAIN_GENESIS_START_OPERATION => object_schema(
@@ -501,8 +384,6 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
                     properties["content_digest"] = json!({"type":"string","minLength":1});
                     properties["render_digest"] = json!({"type":"string","minLength":1});
                     properties["expected_document_version"] = json!({"type":"integer","minimum":1});
-                    properties["baseline_id"] = string_or_null_schema();
-                    properties["baseline_revision_id"] = string_or_null_schema();
                     properties["envelope_digest"] = string_or_null_schema();
                     properties
                 },
@@ -535,8 +416,6 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
                     "content":document_content_schema(),
                     "content_digest":{"type":"string","minLength":1},
                     "render_digest":{"type":"string","minLength":1},
-                    "baseline_id":string_or_null_schema(),
-                    "baseline_revision_id":string_or_null_schema(),
                     "envelope_digest":string_or_null_schema()
                 },
                 "oneOf":[draft, approval],
@@ -544,36 +423,14 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
             })
         }
         PROJECT_DECISION_OPERATION => described_object_schema(
-            json!({"action":{"enum":["record_candidate","record_effective"]},"question":{"type":"string","minLength":1},"options":string_array_schema(),"selected_outcome":string_or_null_schema(),"rationale":string_or_null_schema(),"decision_class":{"const":"project_implementation"},"baseline_id":{"type":"string","minLength":1},"baseline_revision_id":{"type":"string","minLength":1},"expected_project_version":{"type":"integer","minimum":1},"decision_id":string_or_null_schema(),"affected_artifact_refs":{"type":"array","items":artifact_ref_schema()},"affected_task_ids":string_array_schema(),"affected_milestone_ids":string_array_schema()}),
+            json!({"action":{"enum":["record_candidate","record_effective"]},"question":{"type":"string","minLength":1},"options":string_array_schema(),"selected_outcome":string_or_null_schema(),"rationale":string_or_null_schema(),"decision_class":{"const":"project_implementation"},"expected_project_version":{"type":"integer","minimum":1},"decision_id":string_or_null_schema(),"affected_artifact_refs":{"type":"array","items":artifact_ref_schema()},"affected_task_ids":string_array_schema(),"affected_milestone_ids":string_array_schema()}),
             &[
                 "action",
                 "question",
                 "decision_class",
-                "baseline_id",
-                "baseline_revision_id",
                 "expected_project_version",
             ],
-            "Project Agent decisions are limited to implementation choices inside the current active execution baseline. User-scope decisions, policy decisions, waivers, and manual approvals are user-only actions outside this tool.",
-        ),
-        PROJECT_EXECUTION_BASELINE_OPERATION => described_object_schema(
-            json!({
-                "action":{"enum":["draft_revision","revise","propose_approval"]},
-                "baseline_id":{"type":["string","null"],"minLength":1,"description":"Omit when drafting a new execution baseline — the server mints the id and returns it. Required for revise/propose_approval: the id of an existing baseline from the Project current state."},
-                "base_revision_id":string_or_null_schema(),
-                "expected_baseline_version":{"type":"integer","minimum":0,"description":"The baseline's current version from the Project current state; use 0 for a first REST/native draft and the current positive version when revising or proposing an existing baseline."},
-                "content":execution_baseline_content_schema(),
-                "render_version":{"type":"string","minLength":1,"description":"Omit. The server stamps its own render version."},
-                "rendered_view":{"type":"string","minLength":1,"description":"Omit. The server renders the canonical review target from content."},
-                "content_digest":{"type":"string","minLength":1,"description":"Omit. The server computes this from content."},
-                "render_digest":{"type":"string","minLength":1,"description":"Omit. The server computes this from its own render."},
-                "provenance":revision_provenance_schema()
-            }),
-            // `rendered_view`/`render_version`/`content_digest`/`render_digest`
-            // stay optional for the same reason as the Charter draft: they are
-            // derived from `content`, and a model cannot reproduce the server
-            // renderer byte-for-byte or recompute its digests.
-            &["action", "content", "provenance"],
-            "Project Agent may save a draft (draft_revision or revise) or propose a complete execution baseline for user approval (propose_approval). The shared command service validates exact Project-owned ArtifactRefs, versions, digests, milestones, policy, and reconciliation state. Approval and activation are user-only and never exposed here.",
+            "Project Agent decisions are limited to implementation choices inside the approved Project Charter. User-scope decisions, policy decisions, waivers, and manual approvals are user-only actions outside this tool.",
         ),
         PROJECT_MILESTONE_OPERATION => object_schema(
             json!({"action":{"enum":["define","revise","set_primary"]},"milestone_id":string_or_null_schema(),"display_label":string_or_null_schema(),"expected_milestone_version":{"type":"integer","minimum":1},"primary_milestone_id":string_or_null_schema(),"content":{"type":"object","properties":{"name":{"type":"string","minLength":1},"outcome":{"type":"string","minLength":1},"included_scope":string_array_schema(),"excluded_scope":string_array_schema(),"charter_revision":{"oneOf":[artifact_ref_schema(),{"type":"null"}]},"document_revisions":{"type":"array","items":artifact_ref_schema()},"task_ids":string_array_schema(),"dependencies":string_array_schema(),"risks":{"type":"array","items":charter_risk_schema()},"acceptance_checks":{"type":"array","items":object_schema(json!({"id":{"type":"string","minLength":1,"description":"Stable canonical id; preserve it across milestone revisions."},"description":{"type":"string","minLength":1},"required":{"type":"boolean"},"source_kind":{"type":"string","enum":["manual","policy_waiver","task_validation"],"description":"Only source kinds with a current authoritative result path are admitted. Use manual for a genuinely human observation, and task_validation for an integrated check an agent can run and record through project.validation."},"expected_result":{"type":"string","minLength":1},"latest_result":string_or_null_schema(),"latest_result_id":string_or_null_schema(),"latest_result_digest":string_or_null_schema()}), &["id","description","required","source_kind","expected_result"])},"evidence_requirements":{"type":"array","items":object_schema(json!({"id":{"type":"string","minLength":1,"description":"Use the exact acceptance-check id this evidence proves."},"description":{"type":"string","minLength":1},"required":{"type":"boolean"},"evidence_kind":{"type":["string","null"],"enum":["screenshot","walkthrough_video","log","report","other",null]},"check_definition_revision":string_or_null_schema()}), &["id","description","required"])},"known_issues":string_array_schema(),"target_date":string_or_null_schema()},"additionalProperties":false}}),
@@ -592,7 +449,7 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
             ],
         ),
         PROJECT_VALIDATION_OPERATION => object_schema(
-            json!({"action":{"const":"record"},"milestone_id":{"type":"string","minLength":1},"milestone_version":{"type":"integer","minimum":1},"check_id":{"type":"string","minLength":1,"description":"Stable acceptance-check id on the milestone's current definition revision. The check's source_kind must not be manual."},"definition_revision_id":{"type":"string","minLength":1},"status":{"type":"string","enum":["pass","fail","blocked","stale","unavailable"]},"result":{"type":"string","minLength":1,"description":"What was actually observed, in the Agent's own words."},"input_digest":{"type":"string","minLength":1,"description":"Digest of the exact inputs observed, so a repeat of the same observation replays instead of appending."},"governing_revision_ids":string_array_schema()}),
+            json!({"action":{"const":"record"},"milestone_id":{"type":"string","minLength":1},"milestone_version":{"type":"integer","minimum":1},"check_id":{"type":"string","minLength":1,"description":"Stable acceptance-check id on the milestone's current definition revision. The check's source_kind must not be manual."},"definition_revision_id":{"type":"string","minLength":1},"status":{"type":"string","enum":["pass","fail","blocked","stale","unavailable"]},"result":{"type":"string","minLength":1,"description":"What was actually observed, in the Agent's own words."},"input_digest":{"type":"string","minLength":1,"description":"Digest of the exact inputs observed, so a repeat of the same observation replays instead of appending."},"observed_task_id":{"type":["string","null"],"minLength":1,"description":"The Task whose run produced this observation, when a Task produced it. Omit only when you exercised the software yourself in your Project workspace checkout. Never name a Task that did not actually run: the server verifies it belongs to this Project and reached a delivered state."},"evidence_asset_id":{"type":["string","null"],"minLength":1,"description":"Optional id of an artifact that Task captured through `task.evidence`, when one backs this observation."},"governing_revision_ids":string_array_schema()}),
             &[
                 "action",
                 "milestone_id",
@@ -605,15 +462,8 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
             ],
         ),
         PROJECT_READINESS_OPERATION => object_schema(
-            json!({"action":{"const":"evaluate"},"milestone_id":{"type":"string","minLength":1},"milestone_version":{"type":"integer","minimum":1},"baseline_id":{"type":"string","minLength":1},"baseline_revision_id":{"type":"string","minLength":1},"release_policy_revision":{"type":"string","minLength":1}}),
-            &[
-                "action",
-                "milestone_id",
-                "milestone_version",
-                "baseline_id",
-                "baseline_revision_id",
-                "release_policy_revision",
-            ],
+            json!({"action":{"const":"evaluate"},"milestone_id":{"type":"string","minLength":1},"milestone_version":{"type":"integer","minimum":1}}),
+            &["action", "milestone_id", "milestone_version"],
         ),
         PROJECT_RELEASE_OPERATION => described_object_schema(
             json!({
@@ -647,6 +497,36 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
             }),
             &["action", "title"],
             "Create one Task in the authenticated Project scope. The server binds the current approved Charter, optional traceability references, permissions, and Task workflow state.",
+        ),
+        TASK_RECOVER_OPERATION => described_object_schema(
+            json!({
+                "action":{"type":"string","enum":["resume_session","reexecute","reset_to_initial","reset_retry_window"]},
+                "task_id":{"type":"string","minLength":1},
+                "reason":{"type":"string","minLength":1,"description":"What stopped this Task, in your own words."}
+            }),
+            &["action", "task_id", "reason"],
+            "Recover a Task that stopped so it can run again, rather than creating a replacement. Use this when the Task definition is sound and the failure was operational -- an expired worker lease, a runtime that went away, a dispatch race, an exhausted retry window. `resume_session` continues the interrupted run; `reexecute` starts a fresh run of the same Task; `reset_to_initial` returns it to the queue for normal dispatch; `reset_retry_window` clears an exhausted retry budget. Replace a Task only when what it asks for is actually wrong: a duplicate leaves the original stranded and the work double-counted.",
+        ),
+        TASK_WORKLOG_OPERATION => described_object_schema(
+            json!({
+                "action":{"const":"append"},
+                "kind":{"type":"string","enum":["progress","decision","validation","blocker"],"description":"progress: a meaningful slice landed. decision: a choice you made and why. validation: what you ran and what it reported. blocker: what stopped you and what you need."},
+                "summary":{"type":"string","minLength":1,"maxLength":4000,"description":"One concise user-visible update in your own words."}
+            }),
+            &["action", "kind", "summary"],
+            "Append one entry to this Task's worklog, which the next role reads in its dispatch context. Write after a meaningful milestone -- initial approach, a completed slice, validation results, a deviation, a blocker -- not for every tool call or file edit. Forge derives the Task, execution, role, and identity from your session and posts the final completion summary itself, so no separate handoff entry is needed. A worklog entry never moves the Task and never satisfies an acceptance check: proof of behaviour is a captured artifact, not prose.",
+        ),
+        TASK_EVIDENCE_OPERATION => described_object_schema(
+            json!({
+                "action":{"const":"capture"},
+                "kind":{"type":"string","enum":["screenshot","walkthrough_video","log","report","other"]},
+                "caption":{"type":"string","minLength":1,"description":"What this artifact shows, in your own words."},
+                "path":{"type":["string","null"],"minLength":1,"description":"Workspace-relative path of a file this run produced (screenshot, recording, report). Omit when supplying inline content."},
+                "content":{"type":["string","null"],"minLength":1,"description":"Verbatim captured output for a log or report -- the exact stdout/stderr you observed, not a summary. Omit when supplying a path."},
+                "filename":{"type":["string","null"],"minLength":1,"description":"Display filename for inline content. Defaults to a name derived from the kind."}
+            }),
+            &["action", "kind", "caption"],
+            "Capture one artifact this Task run actually produced and register it as authoritative evidence bound to this Task. Supply exactly one of `path` (a file in the Task workspace) or `content` (verbatim captured output). The server stores the bytes, computes the checksum, and returns the asset id a milestone evidence attachment references. Never describe an observation you did not make: this records what the run produced, not what you expect it to produce.",
         ),
         TASK_REVIEW_OPERATION => described_object_schema(
             json!({
@@ -1102,6 +982,14 @@ pub(crate) fn orchestration_read_arguments_schema(operation: &str) -> Value {
             &[],
             "List the exact account-owned Project Agent identities eligible for explicit selection in the active Product Genesis session, plus the currently persisted preference and resolved approval selection.",
         ),
+        PROJECT_OBSERVATIONS_OPERATION => described_object_schema(
+            json!({
+                "task_id":string_or_null_schema(),
+                "limit":{"type":["integer","null"],"minimum":1,"maximum":50}
+            }),
+            &[],
+            "Read what Task runs in this Project actually reported: worklog entries with the execution and role that wrote them, and the artifacts those runs captured. Captured text (a log or report) is returned inline so you can read what was observed; binary artifacts return their metadata and asset id. Use this to check an observation before citing it in `project.validation`, and to decide whether an outcome needs a corrective Task.",
+        ),
         MAIN_CHARTER_READ_OPERATION => object_schema(
             json!({"charter_id":string_or_null_schema(),"revision_id":string_or_null_schema(),"genesis_session_id":string_or_null_schema()}),
             &[],
@@ -1313,16 +1201,7 @@ mod tests {
     }
 
     #[test]
-    fn baseline_contract_permits_zero_for_first_draft_version() {
-        let schema = orchestration_payload_schema(PROJECT_EXECUTION_BASELINE_OPERATION);
-        assert_eq!(
-            schema["properties"]["expected_baseline_version"]["minimum"],
-            0
-        );
-    }
-
-    #[test]
-    fn milestone_and_baseline_contracts_expose_exact_acceptance_evidence_shape() {
+    fn milestone_contract_exposes_exact_acceptance_evidence_shape() {
         let milestone = orchestration_payload_schema(PROJECT_MILESTONE_OPERATION);
         let check = &milestone["properties"]["content"]["properties"]["acceptance_checks"]["items"];
         assert_eq!(
@@ -1341,19 +1220,6 @@ mod tests {
                 "other",
                 null
             ])
-        );
-
-        let baseline = orchestration_payload_schema(PROJECT_EXECUTION_BASELINE_OPERATION);
-        let matrix =
-            &baseline["properties"]["content"]["properties"]["acceptance_evidence_matrix"]["items"];
-        assert!(
-            matrix["properties"]["id"]["description"]
-                .as_str()
-                .is_some_and(|description| description.contains("project.current_state"))
-        );
-        assert_eq!(
-            matrix["properties"]["evidence_kind"]["enum"],
-            evidence["properties"]["evidence_kind"]["enum"]
         );
     }
 
@@ -1402,6 +1268,40 @@ mod tests {
         let properties = select["properties"].as_object().expect("properties");
         assert!(!properties.contains_key("charter_content"));
         assert!(!properties.contains_key("charter_prose"));
+    }
+
+    /// An operation constant that is not imported becomes a binding pattern in
+    /// `match`, silently swallowing every arm after it -- the payload schema
+    /// for one operation is then served for all of them. Rust only warns. This
+    /// asserts distinct operations keep distinct schemas, which a wildcard
+    /// cannot satisfy.
+    #[test]
+    fn every_operation_resolves_its_own_payload_schema() {
+        let cases = [
+            (TASK_ADAPTIVE_OPERATION, "split"),
+            (TASK_RECOVER_OPERATION, "resume_session"),
+            (TASK_WORKLOG_OPERATION, "append"),
+            (TASK_EVIDENCE_OPERATION, "capture"),
+            (PROJECT_VALIDATION_OPERATION, "record"),
+        ];
+        for (operation, expected_action) in cases {
+            let schema = orchestration_payload_schema(operation);
+            let action = &schema["properties"]["action"];
+            let admits = action
+                .get("const")
+                .and_then(Value::as_str)
+                .map(|value| value == expected_action)
+                .unwrap_or_else(|| {
+                    action["enum"]
+                        .as_array()
+                        .is_some_and(|values| values.iter().any(|v| v == expected_action))
+                });
+            assert!(
+                admits,
+                "{operation} resolved a schema whose action does not admit \
+                 `{expected_action}` -- an unimported constant is matching everything"
+            );
+        }
     }
 
     #[test]

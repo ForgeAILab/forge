@@ -42,8 +42,8 @@ use crate::{
         MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION,
         MAIN_CHARTER_READINESS_OPERATION, MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
         OperationExposure, OperationSurface, PROJECT_CHARTER_ADOPTION_OPERATION,
-        PROJECT_CURRENT_STATE_OPERATION, PROJECT_EXECUTION_BASELINE_OPERATION,
-        operation_names_for_surface,
+        PROJECT_CURRENT_STATE_OPERATION, PROJECT_OBSERVATIONS_OPERATION, TASK_EVIDENCE_OPERATION,
+        TASK_WORKLOG_OPERATION, operation_names_for_surface,
     },
     operation_contract::{
         coordination_payload_guidance, coordination_payload_properties,
@@ -166,9 +166,11 @@ impl TaskToolRole {
             (_, None) => Err(AgentHostError::Authority(
                 "Task tool composition requires a server-issued Task role".to_owned(),
             )),
-            (WorkspaceAccess::Deny, _) => Err(AgentHostError::Authority(
-                "Task tool composition requires TaskRead or TaskWrite access".to_owned(),
-            )),
+            (WorkspaceAccess::Deny | WorkspaceAccess::ProjectVerify, _) => {
+                Err(AgentHostError::Authority(
+                    "Task tool composition requires TaskRead or TaskWrite access".to_owned(),
+                ))
+            }
         }
     }
 }
@@ -288,7 +290,24 @@ impl ScopeToolComposition {
                 "Task tool composition requires the host-issued workspace root".to_owned(),
             ));
         }
-        if !matches!(scope.scope_type, CanonicalScopeType::Task) && workspace_root.is_some() {
+        // A Project Agent Chat may hold one disposable verification checkout so
+        // it can exercise the delivered software itself. Every other non-Task
+        // scope still receives no workspace at all.
+        let project_verification = scope.scope_type == CanonicalScopeType::AgentChat
+            && scope.workspace_access == WorkspaceAccess::ProjectVerify;
+        if project_verification
+            && workspace_root
+                .filter(|root| !root.trim().is_empty())
+                .is_none()
+        {
+            return Err(AgentHostError::Authority(
+                "Project verification composition requires the host-issued checkout".to_owned(),
+            ));
+        }
+        if !matches!(scope.scope_type, CanonicalScopeType::Task)
+            && !project_verification
+            && workspace_root.is_some()
+        {
             return Err(AgentHostError::Authority(
                 "non-Task tool composition cannot receive a workspace root".to_owned(),
             ));
@@ -361,6 +380,20 @@ impl ScopeToolComposition {
             CanonicalScopeType::Account
             | CanonicalScopeType::Project
             | CanonicalScopeType::AgentChat => {
+                // Verification is read-and-run only. There is no write tool
+                // here on purpose: this Agent checks the delivered software, it
+                // does not author it, and nothing it does in this checkout can
+                // reach the repository.
+                if project_verification {
+                    let root = workspace_root.expect("validated verification checkout");
+                    tools.push(Arc::new(TaskReadTool));
+                    tools.push(Arc::new(TaskCommandTool));
+                    tools.push(Arc::new(TaskWriteTool));
+                    coverage_set.insert(Permission::FsRead);
+                    coverage_set.insert(Permission::ProcessSpawn);
+                    coverage_set.insert(Permission::FsWrite);
+                    let _ = root;
+                }
                 if let Some(provider) = provider {
                     let (read_operations, propose_operations) = non_task_operations(
                         scope.scope_type,
@@ -811,7 +844,16 @@ fn task_operations(_role: TaskToolRole) -> (Vec<String>, Vec<String>) {
     // review services.  Native Worker/reviewer tools never provide a second
     // Task mutation or workflow path; the reviewer receives read/validation
     // only, while Worker writes through the bounded worktree tools above.
-    let propose = Vec::new();
+    //
+    // Evidence capture is the one exception, and it is not a second mutation
+    // path: it records an artifact this run already produced. It belongs here
+    // because the Task session is the only scope with a workspace and a
+    // process, so it is the only place an observation can be made rather than
+    // described.
+    let propose = vec![
+        TASK_EVIDENCE_OPERATION.to_owned(),
+        TASK_WORKLOG_OPERATION.to_owned(),
+    ];
     (read, propose)
 }
 
@@ -1305,38 +1347,6 @@ impl Tool for ForgeScopeProposeTool {
                 payload.remove("render_version");
             }
         }
-        if operation == PROJECT_EXECUTION_BASELINE_OPERATION {
-            // Same reason as the Charter, plus the two digests: every one of
-            // these is derived from `content`, so a model-supplied copy only
-            // ever disagrees with the server's own render.
-            if let Some(payload) = arguments.get_mut("payload").and_then(Value::as_object_mut) {
-                payload.remove("rendered_view");
-                payload.remove("render_version");
-                payload.remove("content_digest");
-                payload.remove("render_digest");
-                // The policy digest is a hash of `content.release_policy`, which
-                // no model can compute; the server derives it.
-                if let Some(content) = payload.get_mut("content").and_then(Value::as_object_mut) {
-                    content.remove("release_policy_digest");
-                    // `revision_id` is the lookup key. The server reauthorizes
-                    // it in the bound Project and rehydrates every other
-                    // Charter ArtifactRef field from the persisted revision.
-                    if let Some(charter) = content
-                        .get_mut("charter_revision")
-                        .and_then(Value::as_object_mut)
-                    {
-                        for field in [
-                            "artifact_id",
-                            "content_digest",
-                            "render_version",
-                            "render_digest",
-                        ] {
-                            charter.remove(field);
-                        }
-                    }
-                }
-            }
-        }
         for field in ["dedupe_key", "correlation_id"] {
             if required_string(&arguments, field)?.trim().is_empty() {
                 return Err(RuntimeError::tool(format!("{field} cannot be empty")));
@@ -1752,6 +1762,7 @@ fn validate_orchestration_read_arguments(
                 "genesis_session_id",
             ],
             PROJECT_CURRENT_STATE_OPERATION => &["limit"],
+            PROJECT_OBSERVATIONS_OPERATION => &["task_id", "limit"],
             _ => &[],
         };
         if let Some(field) = nested
@@ -1975,9 +1986,8 @@ mod tests {
     use super::*;
     use crate::operation_catalog::{
         MAIN_PROJECT_CREATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
-        PROJECT_EVIDENCE_OPERATION, PROJECT_EXECUTION_BASELINE_OPERATION,
-        PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
-        PROJECT_VALIDATION_OPERATION,
+        PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
+        PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION,
     };
     use crate::operation_contract::{
         orchestration_payload_schema, orchestration_read_arguments_schema,
@@ -2413,7 +2423,6 @@ mod tests {
         for operation in [
             PROJECT_DOCUMENT_OPERATION,
             PROJECT_DECISION_OPERATION,
-            PROJECT_EXECUTION_BASELINE_OPERATION,
             PROJECT_MILESTONE_OPERATION,
             PROJECT_EVIDENCE_OPERATION,
             PROJECT_VALIDATION_OPERATION,
@@ -2436,21 +2445,6 @@ mod tests {
                     || payload["properties"]["action"].get("const").is_some()
             );
         }
-        let baseline = orchestration_payload_schema(PROJECT_EXECUTION_BASELINE_OPERATION);
-        let charter_ref = &baseline["properties"]["content"]["properties"]["charter_revision"];
-        assert_eq!(charter_ref["required"], json!(["revision_id"]));
-        let document_ref =
-            &baseline["properties"]["content"]["properties"]["document_revisions"]["items"];
-        assert_eq!(
-            document_ref["required"],
-            json!([
-                "artifact_id",
-                "revision_id",
-                "content_digest",
-                "render_version",
-                "render_digest"
-            ])
-        );
         let decision = orchestration_payload_schema(PROJECT_DECISION_OPERATION);
         assert_eq!(
             decision["properties"]["decision_class"]["const"],
@@ -2467,13 +2461,7 @@ mod tests {
                 .contains("waivers")
         );
         let readiness = orchestration_payload_schema(PROJECT_READINESS_OPERATION);
-        for field in [
-            "milestone_id",
-            "milestone_version",
-            "baseline_id",
-            "baseline_revision_id",
-            "release_policy_revision",
-        ] {
+        for field in ["milestone_id", "milestone_version"] {
             assert!(
                 readiness["required"]
                     .as_array()
@@ -2551,8 +2539,6 @@ mod tests {
             "content_digest",
             "render_digest",
             "expected_document_version",
-            "baseline_id",
-            "baseline_revision_id",
             "envelope_digest",
         ] {
             assert!(

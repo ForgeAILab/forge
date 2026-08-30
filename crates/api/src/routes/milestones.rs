@@ -7,8 +7,7 @@
 
 use api_types::{
     canonical_digest_with_schema, AuthorizationProvenance, CreateMilestoneRequest,
-    EvaluateMilestoneReadinessRequest, ExecutionBaselineReleasePolicy,
-    MilestoneDefinitionLifecycle, MilestoneDefinitionRevision,
+    EvaluateMilestoneReadinessRequest, MilestoneDefinitionLifecycle, MilestoneDefinitionRevision,
     MilestoneDefinitionRevisionListResponse, MilestoneLifecycle, PrincipalKind, PrincipalRef,
     ProjectMilestone, ProjectMilestoneListResponse, ProjectRelease, ProjectReleaseListResponse,
     ReadinessSnapshot, ReadinessSnapshotListResponse, RecordMilestoneCheckRequest,
@@ -727,16 +726,6 @@ async fn replay_milestone_check_result(
         .ok_or_else(|| {
             ApiError::internal("persisted manual check definition reference is missing")
         })?;
-    let existing_policy_revision = existing_manifest
-        .get("governing_policy_revision")
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| ApiError::internal("persisted manual check policy revision is missing"))?;
-    let existing_policy_digest = existing_manifest
-        .get("governing_policy_digest")
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| ApiError::internal("persisted manual check policy digest is missing"))?;
     let existing_governing_revision_ids = existing_manifest
         .get("governing_revision_ids")
         .cloned()
@@ -748,10 +737,7 @@ async fn replay_milestone_check_result(
         })?;
     let existing_charter_revision_id =
         existing.try_get::<Option<String>, _>("governing_charter_revision_id")?;
-    let existing_baseline_revision_id =
-        existing.try_get::<Option<String>, _>("governing_baseline_revision_id")?;
     let requested_charter_revision_id = request.governing_revision_ids.first().map(String::as_str);
-    let requested_baseline_revision_id = request.governing_revision_ids.get(1).map(String::as_str);
 
     let mismatch = request.check_id != check_id
         || request.mutation.authorization.principal.kind != PrincipalKind::User
@@ -777,11 +763,8 @@ async fn replay_milestone_check_result(
             != request.mutation.authorization.occurred_at
         || existing_result != request.result
         || existing_definition != request.definition_revision_id
-        || existing_policy_revision.is_empty()
-        || existing_policy_digest.is_empty()
         || existing_governing_revision_ids != request.governing_revision_ids
-        || existing_charter_revision_id.as_deref() != requested_charter_revision_id
-        || existing_baseline_revision_id.as_deref() != requested_baseline_revision_id;
+        || existing_charter_revision_id.as_deref() != requested_charter_revision_id;
     if mismatch {
         return Err(ApiError::conflict_with_code(
             "idempotency_conflict",
@@ -905,30 +888,12 @@ pub async fn record_milestone_check(
             "the acceptance check belongs to a superseded milestone definition revision",
         ));
     }
-    let governance = sqlx::query(
-        "SELECT p.current_charter_revision_id,
-                b.current_revision_id AS baseline_revision_id,
-                r.release_policy_revision, r.release_policy_digest,
-                r.release_policy_json
-         FROM project p
-         JOIN project_execution_baseline b
-           ON b.project_id = p.id AND b.lifecycle = 'active'
-         JOIN project_execution_baseline_revision r
-           ON r.id = b.current_revision_id AND r.baseline_id = b.id
-          AND r.lifecycle = 'approved'
-         WHERE p.id = ?
-         ORDER BY b.updated_at DESC, b.id DESC
-         LIMIT 1",
-    )
-    .bind(&project_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| {
-        ApiError::conflict_with_code(
-            "baseline_required",
-            "manual acceptance requires the current active approved execution baseline",
-        )
-    })?;
+    let governance =
+        sqlx::query("SELECT p.current_charter_revision_id FROM project p WHERE p.id = ? LIMIT 1")
+            .bind(&project_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| ApiError::not_found("project", &project_id))?;
     let governing_charter_revision_id: String = governance
         .try_get::<Option<String>, _>("current_charter_revision_id")?
         .filter(|value| !value.trim().is_empty())
@@ -938,24 +903,13 @@ pub async fn record_milestone_check(
                 "manual acceptance requires the current approved Project Charter",
             )
         })?;
-    let governing_baseline_revision_id: String = governance.try_get("baseline_revision_id")?;
-    let derived_governing_revision_ids = vec![
-        governing_charter_revision_id.clone(),
-        governing_baseline_revision_id.clone(),
-    ];
+    let derived_governing_revision_ids = vec![governing_charter_revision_id.clone()];
     if request.governing_revision_ids != derived_governing_revision_ids {
         return Err(ApiError::conflict_with_code(
             "governing_revision_conflict",
-            "manual acceptance governing revisions must match the current Charter and baseline",
+            "manual acceptance governing revisions must match the current approved Charter",
         ));
     }
-    let governing_policy_revision: String = governance.try_get("release_policy_revision")?;
-    let governing_policy_digest: String = governance.try_get("release_policy_digest")?;
-    require_release_policy_rule(
-        &governance,
-        "manual_attestation_rules",
-        "manual-attestation",
-    )?;
     if author_id == user.user_id {
         return Err(ApiError::forbidden_with_code(
             "self_attestation_denied",
@@ -970,18 +924,16 @@ pub async fn record_milestone_check(
         "result": request.result.clone(),
         "governing_revision_ids": request.governing_revision_ids.clone(),
         "check_definition_revision_id": check_definition_revision_id.clone(),
-        "governing_policy_revision": governing_policy_revision.clone(),
-        "governing_policy_digest": governing_policy_digest.clone(),
     });
     let inserted = sqlx::query(
         "INSERT INTO project_milestone_check_result (
             id, project_id, milestone_id, check_id, definition_revision_id,
             outcome, source_kind, source_manifest_json, input_digest,
-            governing_charter_revision_id, governing_baseline_revision_id,
+            governing_charter_revision_id,
             principal_type, principal_id, authorization_basis, authorization_action,
             expected_version, explicit_event, authorization_occurred_at,
             idempotency_key, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, 'user', ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, 'user', ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&result_id)
     .bind(&project_id)
@@ -992,7 +944,6 @@ pub async fn record_milestone_check(
     .bind(source_manifest.to_string())
     .bind(&input_digest)
     .bind(&governing_charter_revision_id)
-    .bind(&governing_baseline_revision_id)
     .bind(&user.user_id)
     .bind(&request.mutation.authorization.authorization_basis)
     .bind(&request.mutation.authorization.action)
@@ -1055,8 +1006,6 @@ pub async fn record_milestone_check(
                 "status": outcome,
                 "authorization": request.mutation.authorization.clone(),
                 "governing_revision_ids": request.governing_revision_ids.clone(),
-                "governing_policy_revision": governing_policy_revision,
-                "governing_policy_digest": governing_policy_digest,
             })
             .to_string(),
             created_at: created_at.clone(),
@@ -1149,7 +1098,7 @@ async fn replay_milestone_check_waiver(
                 principal_type, principal_id, authority_basis,
                 authorization_action, explicit_event,
                 authorization_occurred_at, charter_revision_id,
-                baseline_revision_id, affected_records_json
+                affected_records_json
          FROM project_decision WHERE id = ? AND project_id = ?",
     )
     .bind(waiver_id)
@@ -1181,12 +1130,6 @@ async fn replay_milestone_check_waiver(
                 == request
                     .governing_revision_ids
                     .first()
-                    .cloned()
-                    .unwrap_or_default()
-            && decision.try_get::<String, _>("baseline_revision_id")?
-                == request
-                    .governing_revision_ids
-                    .get(1)
                     .cloned()
                     .unwrap_or_default()
             && affected
@@ -1377,30 +1320,12 @@ pub async fn waive_milestone_check(
             "the definition author cannot waive its own acceptance check",
         ));
     }
-    let governance = sqlx::query(
-        "SELECT p.current_charter_revision_id,
-                b.current_revision_id AS baseline_revision_id,
-                r.release_policy_revision, r.release_policy_digest,
-                r.release_policy_json
-         FROM project p
-         JOIN project_execution_baseline b
-           ON b.project_id = p.id AND b.lifecycle = 'active'
-         JOIN project_execution_baseline_revision r
-           ON r.id = b.current_revision_id AND r.baseline_id = b.id
-          AND r.lifecycle = 'approved'
-         WHERE p.id = ?
-         ORDER BY b.updated_at DESC, b.id DESC
-         LIMIT 1",
-    )
-    .bind(&project_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| {
-        ApiError::conflict_with_code(
-            "baseline_required",
-            "waivers require the current active approved execution baseline",
-        )
-    })?;
+    let governance =
+        sqlx::query("SELECT p.current_charter_revision_id FROM project p WHERE p.id = ? LIMIT 1")
+            .bind(&project_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| ApiError::not_found("project", &project_id))?;
     let waiver_charter_revision_id: String = governance
         .try_get::<Option<String>, _>("current_charter_revision_id")?
         .filter(|value| !value.trim().is_empty())
@@ -1410,20 +1335,13 @@ pub async fn waive_milestone_check(
                 "waivers require the current approved Project Charter",
             )
         })?;
-    let waiver_baseline_revision_id: String = governance.try_get("baseline_revision_id")?;
-    let derived_governing_revision_ids = vec![
-        waiver_charter_revision_id.clone(),
-        waiver_baseline_revision_id.clone(),
-    ];
+    let derived_governing_revision_ids = vec![waiver_charter_revision_id.clone()];
     if request.governing_revision_ids != derived_governing_revision_ids {
         return Err(ApiError::conflict_with_code(
             "governing_revision_conflict",
-            "waiver governing revisions must match the current Charter and baseline",
+            "waiver governing revisions must match the current approved Charter",
         ));
     }
-    let waiver_policy_revision: String = governance.try_get("release_policy_revision")?;
-    let waiver_policy_digest: String = governance.try_get("release_policy_digest")?;
-    require_release_policy_rule(&governance, "waiver_rules", "user-waiver")?;
     let waiver_id = new_uuid_v4();
     let created_at = now_rfc3339();
     let event = DomainEventRepo::append_event_in_tx(
@@ -1457,8 +1375,6 @@ pub async fn waive_milestone_check(
                 "principal_id": user.user_id.clone(),
                 "authorization": request.mutation.authorization.clone(),
                 "governing_revision_ids": request.governing_revision_ids.clone(),
-                "governing_policy_revision": waiver_policy_revision.clone(),
-                "governing_policy_digest": waiver_policy_digest.clone(),
                 "created_at": created_at.clone(),
             })
             .to_string(),
@@ -1480,9 +1396,9 @@ pub async fn waive_milestone_check(
             id, project_id, state, decision_class, question, context_json,
             selected_outcome, rationale, principal_type, principal_id,
             authority_basis, authorization_action, explicit_event,
-            authorization_occurred_at, charter_revision_id, baseline_revision_id,
+            authorization_occurred_at, charter_revision_id,
             source_refs_json, affected_records_json, created_at
-         ) VALUES (?, ?, 'active', 'waiver', ?, '{}', 'waived', ?, 'user', ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?)",
+         ) VALUES (?, ?, 'active', 'waiver', ?, '{}', 'waived', ?, 'user', ?, ?, ?, ?, ?, ?, '[]', ?, ?)",
     )
     .bind(&waiver_id)
     .bind(&project_id)
@@ -1494,7 +1410,6 @@ pub async fn waive_milestone_check(
     .bind(&request.mutation.authorization.event_id)
     .bind(&request.mutation.authorization.occurred_at)
     .bind(&waiver_charter_revision_id)
-    .bind(&waiver_baseline_revision_id)
     .bind(
         serde_json::json!({
             "milestone_id": milestone_id,
@@ -1503,8 +1418,6 @@ pub async fn waive_milestone_check(
             "input_digest": request.input_digest.clone(),
             "expected_version": request.mutation.expected_version,
             "governing_revision_ids": request.governing_revision_ids.clone(),
-            "governing_policy_revision": waiver_policy_revision.clone(),
-            "governing_policy_digest": waiver_policy_digest.clone(),
         })
         .to_string(),
     )
@@ -1524,8 +1437,6 @@ pub async fn waive_milestone_check(
         "principal_id": user.user_id,
         "authorization": request.mutation.authorization,
         "governing_revision_ids": request.governing_revision_ids,
-        "governing_policy_revision": waiver_policy_revision,
-        "governing_policy_digest": waiver_policy_digest,
         "created_at": created_at,
     })))
 }
@@ -1549,9 +1460,6 @@ pub async fn evaluate_readiness(
                 project_id: project_id.clone(),
                 milestone_id: milestone_id.clone(),
                 expected_milestone_version: request.mutation.expected_version,
-                baseline_id: request.baseline_id,
-                baseline_revision_id: request.baseline_revision_id,
-                release_policy_revision: request.release_policy_revision,
                 idempotency_key: request.mutation.idempotency_key,
                 authenticated_user_id: Some(user.user_id.clone()),
                 authorization: readiness_authorization(
@@ -2076,12 +1984,8 @@ fn validation_result_from_row(
     }
     let persisted_charter_revision_id: Option<String> =
         row.try_get("governing_charter_revision_id")?;
-    let persisted_baseline_revision_id: Option<String> =
-        row.try_get("governing_baseline_revision_id")?;
     if governing_revision_ids.first().map(String::as_str)
         != persisted_charter_revision_id.as_deref()
-        || governing_revision_ids.get(1).map(String::as_str)
-            != persisted_baseline_revision_id.as_deref()
     {
         return Err(ApiError::internal(
             "persisted manual check governing columns disagree with its manifest",
@@ -2350,55 +2254,6 @@ fn well_formed_authorization_timestamp(value: &str) -> bool {
         return false;
     }
     DateTime::parse_from_rfc3339(value).is_ok()
-}
-
-fn require_release_policy_rule(
-    governance: &sqlx::sqlite::SqliteRow,
-    field: &str,
-    rule: &str,
-) -> ApiResult<()> {
-    let policy_json: String = governance
-        .try_get("release_policy_json")
-        .map_err(ApiError::from)?;
-    let envelope: serde_json::Value = serde_json::from_str(&policy_json)
-        .map_err(|_| ApiError::internal("persisted release policy is invalid"))?;
-    let policy_value = envelope
-        .get("policy")
-        .cloned()
-        .ok_or_else(|| ApiError::internal("persisted release policy payload is missing"))?;
-    let policy: ExecutionBaselineReleasePolicy = serde_json::from_value(policy_value)
-        .map_err(|_| ApiError::internal("persisted release policy payload is invalid"))?;
-    let policy_revision: String = governance.try_get("release_policy_revision")?;
-    let policy_digest: String = governance.try_get("release_policy_digest")?;
-    if policy.schema_version != services::EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA
-        || policy.revision != policy_revision
-        || services::execution_baseline::release_policy_digest(&policy)
-            .map_err(|_| ApiError::internal("persisted release policy digest is invalid"))?
-            != policy_digest
-    {
-        return Err(ApiError::internal(
-            "persisted release policy authority reference is invalid",
-        ));
-    }
-    services::validate_release_policy(&policy).map_err(|error| {
-        ApiError::internal(format!("persisted release policy is invalid: {error}"))
-    })?;
-    let enabled = match field {
-        "manual_attestation_rules" => policy.manual_attestation_rules,
-        "waiver_rules" => policy.waiver_rules,
-        _ => {
-            return Err(ApiError::internal(
-                "unsupported release policy rule requested",
-            ));
-        }
-    };
-    if !enabled.iter().any(|candidate| candidate == rule) {
-        return Err(ApiError::conflict_with_code(
-            "policy_rule_required",
-            format!("the active release policy does not permit {rule}"),
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

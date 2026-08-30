@@ -566,6 +566,7 @@ pub struct AgentContextScope {
     pub task_id: Option<String>,
     pub task_role: Option<String>,
     pub workspace_access: String,
+    pub workspace_path: Option<String>,
     pub authority_json: String,
     pub version: i64,
     pub created_at: String,
@@ -1928,6 +1929,10 @@ pub struct TaskComment {
     pub author_id: Option<String>,
     pub author_name: String,
     pub content: String,
+    pub execution_id: Option<String>,
+    pub role: Option<String>,
+    pub worklog_kind: Option<String>,
+    pub idempotency_key: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

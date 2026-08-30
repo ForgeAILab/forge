@@ -33,7 +33,6 @@ pub mod coordination;
 pub mod daemons;
 pub mod embedded_agents;
 pub mod events;
-pub mod execution_baseline;
 pub mod executions;
 pub mod executor_types;
 pub mod external_links;

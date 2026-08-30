@@ -208,11 +208,6 @@ pub fn api_router(state: AppState) -> Router {
             get(routes::project_overview::get_project_overview),
         )
         .route(
-            "/api/v1/projects/{id}/execution-baseline",
-            get(routes::execution_baseline::get_execution_baseline)
-                .post(routes::execution_baseline::create_execution_baseline),
-        )
-        .route(
             "/api/v1/projects/{id}/execution-setup",
             get(routes::project_execution_setup::get_execution_setup),
         )
@@ -243,22 +238,6 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/projects/{id}/reconciliations/{reconciliation_id}/resolve",
             post(routes::reconciliations::resolve_project_reconciliation),
-        )
-        .route(
-            "/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions",
-            post(routes::execution_baseline::save_execution_baseline_revision),
-        )
-        .route(
-            "/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions/{revision_id}/approve",
-            post(routes::execution_baseline::approve_execution_baseline),
-        )
-        .route(
-            "/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions/{revision_id}/approve-and-activate",
-            post(routes::execution_baseline::approve_and_activate_execution_baseline),
-        )
-        .route(
-            "/api/v1/projects/{id}/execution-baseline/{baseline_id}/activate",
-            post(routes::execution_baseline::activate_execution_baseline),
         )
         .route(
             "/api/v1/projects/{id}/charter",
@@ -455,6 +434,10 @@ pub fn api_router(state: AppState) -> Router {
         .route(
             "/api/v1/agent-chats/{chat_id}/turns/{turn_id}/cancel",
             post(routes::agent_chats::cancel_agent_chat_turn),
+        )
+        .route(
+            "/api/v1/agent-chats/{chat_id}/turns/{turn_id}/retry",
+            post(routes::agent_chats::retry_agent_chat_turn),
         )
         .route(
             "/api/v1/agent-chats/{chat_id}/topics",

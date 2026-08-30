@@ -83,9 +83,6 @@ pub struct ProjectReadinessRequestCommand {
     pub project_id: String,
     pub milestone_id: String,
     pub expected_milestone_version: i64,
-    pub baseline_id: String,
-    pub baseline_revision_id: String,
-    pub release_policy_revision: String,
     pub idempotency_key: String,
     /// REST binds this command to the authenticated user while native
     /// Project-Agent execution leaves the field unset.  The binding is
@@ -261,12 +258,6 @@ impl ProjectMilestoneCommandService {
                             project_id: project_id.to_owned(),
                             milestone_id: value_string(payload, "milestone_id")?,
                             expected_milestone_version: value_i64(payload, "milestone_version")?,
-                            baseline_id: value_string(payload, "baseline_id")?,
-                            baseline_revision_id: value_string(payload, "baseline_revision_id")?,
-                            release_policy_revision: value_string(
-                                payload,
-                                "release_policy_revision",
-                            )?,
                             idempotency_key: context.idempotency_key().to_owned(),
                             authenticated_user_id: None,
                             authorization: native_authorization(
@@ -537,6 +528,15 @@ impl ProjectMilestoneCommandService {
                 "milestone revision crosses Project scope",
             ));
         }
+        // A revision is a delta on an existing definition, and the Charter it
+        // is tied to is not something a revision silently drops. Persisting a
+        // NULL binding leaves the milestone impossible to evaluate readiness
+        // for, since the approved Charter is its governing authority. The
+        // inherited reference is validated below exactly like a supplied one.
+        if command.content.charter_revision.is_none() {
+            command.content.charter_revision =
+                inherited_charter_reference(&self.db, &command.project_id, &milestone_id).await?;
+        }
         validate_definition_references(&self.db, &command.project_id, &command.content).await?;
         if command.expected_milestone_version <= 0 {
             return Err(ServiceError::invalid_operation(
@@ -713,9 +713,6 @@ impl ProjectMilestoneCommandService {
                 &authorization,
                 &command.milestone_id,
                 command.expected_milestone_version,
-                &command.baseline_id,
-                &command.baseline_revision_id,
-                &command.release_policy_revision,
             )
             .await?;
         let result_json = json!({
@@ -1155,9 +1152,6 @@ fn validate_primary_command(command: &ProjectPrimaryMilestoneCommand) -> Result<
 fn validate_readiness_command(command: &ProjectReadinessRequestCommand) -> Result<()> {
     if command.project_id.trim().is_empty()
         || command.milestone_id.trim().is_empty()
-        || command.baseline_id.trim().is_empty()
-        || command.baseline_revision_id.trim().is_empty()
-        || command.release_policy_revision.trim().is_empty()
         || command.idempotency_key.trim().is_empty()
         || command.expected_milestone_version < 1
     {
@@ -1446,11 +1440,6 @@ fn readiness_input(
         project_id: snapshot.project_id.clone(),
         milestone_id: snapshot.milestone_id.clone(),
         definition_revision_id: snapshot.milestone_definition_revision_id.clone(),
-        baseline_id: snapshot.baseline_id.clone(),
-        baseline_revision_id: snapshot.baseline_revision_id.clone(),
-        baseline_digest: snapshot.baseline_digest.clone(),
-        release_policy_revision: snapshot.release_policy_revision.clone(),
-        release_policy_digest: snapshot.release_policy_digest.clone(),
         input_manifest_json: serde_json::to_string(&snapshot.input_manifest)
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
         event_watermark: snapshot.source_event_watermark.clone(),
@@ -1673,6 +1662,47 @@ async fn authorize_project_principal(
             message: "milestone commands accept only user or Project Agent principals".to_owned(),
         }),
     }
+}
+
+/// Rebuild the Charter reference the milestone's current definition already
+/// carries, so a revision that does not restate it keeps the binding instead of
+/// dropping it. Returns `None` when the current definition has no binding to
+/// inherit; the caller's own validation still applies.
+async fn inherited_charter_reference(
+    db: &SqliteDb,
+    project_id: &str,
+    milestone_id: &str,
+) -> Result<Option<api_types::ArtifactRef>> {
+    let row = sqlx::query(
+        "SELECT c.id AS artifact_id, r.id AS revision_id, r.content_digest,
+                r.render_version, r.rendered_digest
+         FROM project_milestone m
+         JOIN project_milestone_revision d
+           ON d.id = COALESCE(
+                m.current_definition_revision_id,
+                (SELECT id FROM project_milestone_revision
+                 WHERE milestone_id = m.id ORDER BY revision DESC LIMIT 1)
+              )
+          AND d.milestone_id = m.id
+         JOIN project_charter_revision r ON r.id = d.charter_revision_id
+         JOIN project_charter c ON c.id = r.charter_id AND c.project_id = m.project_id
+         WHERE m.id = ? AND m.project_id = ?
+         LIMIT 1",
+    )
+    .bind(milestone_id)
+    .bind(project_id)
+    .fetch_optional(db.pool())
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    Ok(Some(api_types::ArtifactRef {
+        artifact_id: row.try_get("artifact_id")?,
+        revision_id: row.try_get("revision_id")?,
+        content_digest: row.try_get("content_digest")?,
+        render_version: row.try_get("render_version")?,
+        render_digest: row.try_get("rendered_digest")?,
+    }))
 }
 
 async fn validate_definition_references(
@@ -2075,11 +2105,6 @@ fn map_readiness(row: sqlx::sqlite::SqliteRow) -> Result<ProjectReadinessSnapsho
         project_id: row.try_get("project_id")?,
         milestone_id: row.try_get("milestone_id")?,
         definition_revision_id: row.try_get("definition_revision_id")?,
-        baseline_id: row.try_get("baseline_id")?,
-        baseline_revision_id: row.try_get("baseline_revision_id")?,
-        baseline_digest: row.try_get("baseline_digest")?,
-        release_policy_revision: row.try_get("release_policy_revision")?,
-        release_policy_digest: row.try_get("release_policy_digest")?,
         input_manifest_json: row.try_get("input_manifest_json")?,
         event_watermark: row.try_get("event_watermark")?,
         outcome: row.try_get("outcome")?,

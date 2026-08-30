@@ -22,10 +22,13 @@ pub const MAIN_CHARTER_DIFF_OPERATION: &str = "charter.diff";
 pub const MAIN_CHARTER_APPROVAL_TARGET_OPERATION: &str = "charter.approval_target";
 pub const MAIN_PROJECT_CREATE_OPERATION: &str = "project.create";
 pub const PROJECT_CURRENT_STATE_OPERATION: &str = "project.current_state";
+/// Read what a Task run actually reported: its worklog entries and the
+/// artifacts it captured. This is how a Project Agent checks an observation
+/// before citing it, and how it decides whether the outcome needs a fix Task.
+pub const PROJECT_OBSERVATIONS_OPERATION: &str = "project.observations";
 pub const PROJECT_CHARTER_ADOPTION_OPERATION: &str = "project.charter.adoption";
 pub const PROJECT_DOCUMENT_OPERATION: &str = "project.document";
 pub const PROJECT_DECISION_OPERATION: &str = "project.decision";
-pub const PROJECT_EXECUTION_BASELINE_OPERATION: &str = "project.execution_baseline";
 pub const PROJECT_MILESTONE_OPERATION: &str = "project.milestone";
 pub const PROJECT_EVIDENCE_OPERATION: &str = "project.evidence";
 pub const PROJECT_VALIDATION_OPERATION: &str = "project.validation";
@@ -34,6 +37,20 @@ pub const PROJECT_RELEASE_OPERATION: &str = "project.release.request";
 pub const TASK_PROPOSE_OPERATION: &str = "task.propose";
 pub const TASK_ADAPTIVE_OPERATION: &str = "task.adaptive";
 pub const TASK_REVIEW_OPERATION: &str = "task.review";
+/// Repair a Task that stopped, instead of replacing it. A transient failure --
+/// an expired lease, a lost runtime, a dispatch race -- leaves a perfectly good
+/// Task stranded; recovering it is what the Project Agent's own protocol asks
+/// for, and without this the only reachable remedy is a duplicate Task.
+pub const TASK_RECOVER_OPERATION: &str = "task.recover";
+/// Capture one artifact a Task run actually produced as authoritative
+/// evidence. This lives in the Task scope on purpose: only a Task session has
+/// a workspace and a process to observe, so it is the only place an
+/// observation can be recorded rather than described.
+pub const TASK_EVIDENCE_OPERATION: &str = "task.evidence";
+/// Append one provenance-bearing entry to the Task worklog. This is narration
+/// the next role reads, never workflow truth: it moves no Task, satisfies no
+/// acceptance check, and is not milestone evidence.
+pub const TASK_WORKLOG_OPERATION: &str = "task.worklog";
 
 /// The typed native surface that owns an operation's public contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -88,6 +105,10 @@ pub enum OperationPermission {
     ProposeDiscovery,
     ProposeProject,
     ProposeTask,
+    /// Recording an artifact a Task run produced. Gated on the Task read
+    /// permission so both the Worker and the reviewer can capture what they
+    /// observed; it writes no repository content and mutates no Task state.
+    CaptureTaskEvidence,
 }
 
 impl OperationPermission {
@@ -118,6 +139,7 @@ impl OperationPermission {
             (Self::ProposeTask, CanonicalScopeType::Project | CanonicalScopeType::AgentChat) => {
                 Some("propose_task")
             }
+            (Self::CaptureTaskEvidence, CanonicalScopeType::Task) => Some("task_read"),
             _ => None,
         }
     }
@@ -159,6 +181,7 @@ const MAIN_SCOPES: &[CanonicalScopeType] =
     &[CanonicalScopeType::Account, CanonicalScopeType::AgentChat];
 const PROJECT_SCOPES: &[CanonicalScopeType] =
     &[CanonicalScopeType::Project, CanonicalScopeType::AgentChat];
+const TASK_SCOPES: &[CanonicalScopeType] = &[CanonicalScopeType::Task];
 
 pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
     OperationContract {
@@ -272,6 +295,17 @@ pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
         output: SHARED_ORCHESTRATION_OUTCOME,
     },
     OperationContract {
+        operation: PROJECT_OBSERVATIONS_OPERATION,
+        surface: OperationSurface::ProjectOrchestration,
+        exposure: OperationExposure::TypedRead,
+        input: OperationInputContract::ReadArguments,
+        setup: OperationSetupExposure::ReadyOnly,
+        supported_scopes: PROJECT_SCOPES,
+        classification: OperationClassification::Query,
+        permission: OperationPermission::ReadProjectOrAgentChat,
+        output: SHARED_ORCHESTRATION_OUTCOME,
+    },
+    OperationContract {
         operation: PROJECT_CHARTER_ADOPTION_OPERATION,
         surface: OperationSurface::ProjectOrchestration,
         exposure: OperationExposure::TypedProposal,
@@ -295,17 +329,6 @@ pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
     },
     OperationContract {
         operation: PROJECT_DECISION_OPERATION,
-        surface: OperationSurface::ProjectOrchestration,
-        exposure: OperationExposure::TypedProposal,
-        input: OperationInputContract::ProposalEnvelope,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::ApprovalRequiredAction,
-        permission: OperationPermission::ProposeProject,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: PROJECT_EXECUTION_BASELINE_OPERATION,
         surface: OperationSurface::ProjectOrchestration,
         exposure: OperationExposure::TypedProposal,
         input: OperationInputContract::ProposalEnvelope,
@@ -401,6 +424,42 @@ pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
         supported_scopes: PROJECT_SCOPES,
         classification: OperationClassification::DirectCommand,
         permission: OperationPermission::ProposeTask,
+        output: SHARED_ORCHESTRATION_OUTCOME,
+    },
+    OperationContract {
+        operation: TASK_RECOVER_OPERATION,
+        surface: OperationSurface::Coordination,
+        // Coordination composes GenericProposal operations into
+        // `forge_scope_propose`; a TypedProposal here would leave the
+        // operation dispatchable but invisible to the Agent.
+        exposure: OperationExposure::GenericProposal,
+        input: OperationInputContract::ProposalEnvelope,
+        setup: OperationSetupExposure::ReadyOnly,
+        supported_scopes: PROJECT_SCOPES,
+        classification: OperationClassification::DirectCommand,
+        permission: OperationPermission::ProposeTask,
+        output: SHARED_ORCHESTRATION_OUTCOME,
+    },
+    OperationContract {
+        operation: TASK_WORKLOG_OPERATION,
+        surface: OperationSurface::Coordination,
+        exposure: OperationExposure::TypedProposal,
+        input: OperationInputContract::ProposalEnvelope,
+        setup: OperationSetupExposure::ReadyOnly,
+        supported_scopes: TASK_SCOPES,
+        classification: OperationClassification::DirectCommand,
+        permission: OperationPermission::CaptureTaskEvidence,
+        output: SHARED_ORCHESTRATION_OUTCOME,
+    },
+    OperationContract {
+        operation: TASK_EVIDENCE_OPERATION,
+        surface: OperationSurface::Coordination,
+        exposure: OperationExposure::TypedProposal,
+        input: OperationInputContract::ProposalEnvelope,
+        setup: OperationSetupExposure::ReadyOnly,
+        supported_scopes: TASK_SCOPES,
+        classification: OperationClassification::DirectCommand,
+        permission: OperationPermission::CaptureTaskEvidence,
         output: SHARED_ORCHESTRATION_OUTCOME,
     },
 ];
@@ -665,10 +724,6 @@ pub fn is_allowed_project_direct_payload(operation: &str, payload: &Value) -> bo
                 && payload.get("decision_class").and_then(Value::as_str)
                     == Some("project_implementation")
         }
-        PROJECT_EXECUTION_BASELINE_OPERATION => matches!(
-            action,
-            Some("draft_revision") | Some("revise") | Some("propose_approval")
-        ),
         PROJECT_MILESTONE_OPERATION => {
             matches!(
                 action,
@@ -682,6 +737,17 @@ pub fn is_allowed_project_direct_payload(operation: &str, payload: &Value) -> bo
         // outside this path -- a user attestation is only ever a user's.
         PROJECT_VALIDATION_OPERATION => action == Some("record"),
         PROJECT_READINESS_OPERATION => action == Some("evaluate"),
+        // Capturing an artifact the run produced is append-only and carries no
+        // authority beyond the Task it is bound to.
+        TASK_EVIDENCE_OPERATION => action == Some("capture"),
+        TASK_WORKLOG_OPERATION => action == Some("append"),
+        TASK_RECOVER_OPERATION => matches!(
+            action,
+            Some("resume_session")
+                | Some("reexecute")
+                | Some("reset_to_initial")
+                | Some("reset_retry_window")
+        ),
         // A release candidate is a consequential approval/audit proposal even
         // though it does not perform the final immutable release itself.  It
         // must retain an AgentAction until the user-facing approval contract
@@ -733,8 +799,6 @@ pub fn contains_adaptive_authority_override(value: &Value) -> bool {
         "actor_id",
         "actor_identity_id",
         "authority",
-        "baseline_id",
-        "baseline_revision_id",
         "charter_revision_id",
         "credential",
         "elevated_operations",
@@ -751,8 +815,6 @@ pub fn contains_adaptive_authority_override(value: &Value) -> bool {
         "plan_item_id",
         "project_id",
         "provenance",
-        "release_policy_digest",
-        "release_policy_revision",
         "repository_path",
         "repository_url",
         "risk_class",
@@ -907,24 +969,6 @@ mod tests {
             MAIN_GENESIS_START_OPERATION,
             CanonicalScopeType::Task
         ));
-    }
-
-    #[test]
-    fn project_subaction_classification_is_payload_aware() {
-        let direct = serde_json::json!({"action":"draft_revision"});
-        let protected = serde_json::json!({"action":"activate"});
-        assert_eq!(
-            classify_operation(PROJECT_EXECUTION_BASELINE_OPERATION, Some(&direct)),
-            OperationClassification::DirectCommand
-        );
-        assert_eq!(
-            classify_operation(PROJECT_EXECUTION_BASELINE_OPERATION, Some(&protected)),
-            OperationClassification::ApprovalRequiredAction
-        );
-        assert_eq!(
-            classify_operation(PROJECT_EXECUTION_BASELINE_OPERATION, None),
-            OperationClassification::ApprovalRequiredAction
-        );
     }
 
     #[test]

@@ -387,14 +387,8 @@ fn export_typescript() {
     AcceptanceCheckSourceKind::export().expect("export AcceptanceCheckSourceKind");
     AcceptanceCheckSummary::export().expect("export AcceptanceCheckSummary");
     AcceptanceEvidenceRequirement::export().expect("export AcceptanceEvidenceRequirement");
-    ActivateExecutionBaselineRequest::export().expect("export ActivateExecutionBaselineRequest");
     AdaptiveEnvelope::export().expect("export AdaptiveEnvelope");
     AdaptiveTaskOperation::export().expect("export AdaptiveTaskOperation");
-    ApproveAndActivateExecutionBaselineRequest::export()
-        .expect("export ApproveAndActivateExecutionBaselineRequest");
-    ApproveAndActivateExecutionBaselineResponse::export()
-        .expect("export ApproveAndActivateExecutionBaselineResponse");
-    ApproveExecutionBaselineRequest::export().expect("export ApproveExecutionBaselineRequest");
     ApproveProjectCharterRequest::export().expect("export ApproveProjectCharterRequest");
     ApproveProjectDocumentRequest::export().expect("export ApproveProjectDocumentRequest");
     ApproveDecisionCandidateRequest::export().expect("export ApproveDecisionCandidateRequest");
@@ -426,7 +420,6 @@ fn export_typescript() {
     CharterSupersession::export().expect("export CharterSupersession");
     CreateProjectFromCharterApprovalRequest::export()
         .expect("export CreateProjectFromCharterApprovalRequest");
-    CreateExecutionBaselineRequest::export().expect("export CreateExecutionBaselineRequest");
     CreateProjectFromCharterApprovalResponse::export()
         .expect("export CreateProjectFromCharterApprovalResponse");
     DecisionCandidate::export().expect("export DecisionCandidate");
@@ -451,16 +444,6 @@ fn export_typescript() {
     ReleaseEvidenceAvailability::export().expect("export ReleaseEvidenceAvailability");
     EvidenceKind::export().expect("export EvidenceKind");
     EvidencePin::export().expect("export EvidencePin");
-    ExecutionBaseline::export().expect("export ExecutionBaseline");
-    ExecutionBaselineApproval::export().expect("export ExecutionBaselineApproval");
-    ExecutionBaselineApprovalTarget::export().expect("export ExecutionBaselineApprovalTarget");
-    ExecutionBaselineIntegrityIssue::export().expect("export ExecutionBaselineIntegrityIssue");
-    ExecutionBaselineContent::export().expect("export ExecutionBaselineContent");
-    ExecutionBaselineReleasePolicy::export().expect("export ExecutionBaselineReleasePolicy");
-    ExecutionBaselineLifecycle::export().expect("export ExecutionBaselineLifecycle");
-    ExecutionBaselineWriteOperation::export().expect("export ExecutionBaselineWriteOperation");
-    ExecutionBaselineRevision::export().expect("export ExecutionBaselineRevision");
-    ExecutionBaselineResponse::export().expect("export ExecutionBaselineResponse");
     ExecutionPlanContent::export().expect("export ExecutionPlanContent");
     MediaAsset::export().expect("export MediaAsset");
     ProjectMediaListResponse::export().expect("export ProjectMediaListResponse");
@@ -538,8 +521,6 @@ fn export_typescript() {
     ResearchSource::export().expect("export ResearchSource");
     RevisionProvenance::export().expect("export RevisionProvenance");
     SaveProjectCharterRevisionRequest::export().expect("export SaveProjectCharterRevisionRequest");
-    SaveExecutionBaselineRevisionRequest::export()
-        .expect("export SaveExecutionBaselineRevisionRequest");
     SaveProjectDocumentRevisionRequest::export()
         .expect("export SaveProjectDocumentRevisionRequest");
     CreateProjectDocumentRequest::export().expect("export CreateProjectDocumentRequest");

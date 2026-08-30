@@ -488,10 +488,6 @@ impl ProjectRepo for SqliteDb {
             "DELETE FROM project_milestone_check_result WHERE project_id = ?",
             "DELETE FROM project_milestone_revision WHERE milestone_id IN
                  (SELECT id FROM project_milestone WHERE project_id = ?)",
-            "DELETE FROM project_execution_baseline_approval WHERE baseline_id IN
-                 (SELECT id FROM project_execution_baseline WHERE project_id = ?)",
-            "DELETE FROM project_execution_baseline_revision WHERE baseline_id IN
-                 (SELECT id FROM project_execution_baseline WHERE project_id = ?)",
             "DELETE FROM project_document_approval WHERE document_id IN
                  (SELECT id FROM project_document WHERE project_id = ?)",
             "DELETE FROM project_document_revision WHERE document_id IN

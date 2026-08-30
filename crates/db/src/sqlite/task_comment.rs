@@ -3,13 +3,32 @@ use super::*;
 #[async_trait]
 impl TaskCommentRepo for SqliteDb {
     async fn create_comment(&self, input: CreateTaskComment) -> Result<TaskComment> {
-        sqlx::query("INSERT INTO task_comment (id, task_id, author_type, author_id, author_name, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        // A replayed worklog append must return the original entry rather than
+        // appending a second one into the reviewer's context.
+        if let Some(key) = input.idempotency_key.as_deref() {
+            if let Some(existing) =
+                sqlx::query("SELECT * FROM task_comment WHERE task_id = ? AND idempotency_key = ?")
+                    .bind(&input.task_id)
+                    .bind(key)
+                    .fetch_optional(&self.pool)
+                    .await?
+                    .map(map_task_comment)
+                    .transpose()?
+            {
+                return Ok(existing);
+            }
+        }
+        sqlx::query("INSERT INTO task_comment (id, task_id, author_type, author_id, author_name, content, execution_id, role, worklog_kind, idempotency_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&input.id)
             .bind(&input.task_id)
             .bind(input.author_type.to_string())
             .bind(input.author_id.as_deref())
             .bind(&input.author_name)
             .bind(&input.content)
+            .bind(input.execution_id.as_deref())
+            .bind(input.role.as_deref())
+            .bind(input.worklog_kind.as_deref())
+            .bind(input.idempotency_key.as_deref())
             .bind(&input.created_at)
             .bind(&input.updated_at)
             .execute(&self.pool)

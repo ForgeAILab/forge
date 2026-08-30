@@ -1192,6 +1192,7 @@ async fn test_agent_session_rotation_is_atomic_and_preserves_lineage() {
             task_id: None,
             task_role: None,
             workspace_access: "deny".to_owned(),
+            workspace_path: None,
             authority_json: "{}".to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -1287,6 +1288,7 @@ async fn task_context_scopes_are_distinct_per_role_for_the_same_identity() {
             task_id: Some(task_id.clone()),
             task_role: Some("worker".to_owned()),
             workspace_access: "task_write".to_owned(),
+            workspace_path: None,
             authority_json: r#"{"scope":{"kind":"task","role":"worker"}}"#.to_owned(),
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -1303,6 +1305,7 @@ async fn task_context_scopes_are_distinct_per_role_for_the_same_identity() {
         task_id: Some(task_id.clone()),
         task_role: Some("reviewer".to_owned()),
         workspace_access: "task_read".to_owned(),
+        workspace_path: None,
         authority_json: r#"{"scope":{"kind":"task","role":"reviewer"}}"#.to_owned(),
         created_at: now.clone(),
         updated_at: now,
@@ -6443,9 +6446,6 @@ async fn non_runnable_governance_cannot_mint_a_running_execution_after_read_gate
     let now = now_rfc3339();
     let charter_id = new_uuid_v4();
     let charter_revision_id = new_uuid_v4();
-    let baseline_id = new_uuid_v4();
-    let baseline_revision_id = new_uuid_v4();
-    let approval_id = new_uuid_v4();
     let user_id = new_uuid_v4();
 
     sqlx::query(
@@ -6520,66 +6520,14 @@ async fn non_runnable_governance_cannot_mint_a_running_execution_after_read_gate
     .await
     .expect("Project becomes Charter-backed");
     sqlx::query(
-        "INSERT INTO project_execution_baseline
-         (id, project_id, current_revision_id, lifecycle, version, created_at, updated_at)
-         VALUES (?, ?, ?, 'active', 1, ?, ?)",
-    )
-    .bind(&baseline_id)
-    .bind(&project_id)
-    .bind(&baseline_revision_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("active baseline creates");
-    sqlx::query(
-        "INSERT INTO project_execution_baseline_revision
-         (id, baseline_id, revision, base_revision, lifecycle, charter_revision_id,
-          release_policy_revision, release_policy_digest, schema_version, render_version,
-          rendered_view, content_digest, rendered_digest, created_at)
-         VALUES (?, ?, 1, 0, 'approved', ?, 'policy-1', 'policy-digest',
-                 'schema-1', 'render-1', 'approved baseline', 'content-digest',
-                 'render-digest', ?)",
-    )
-    .bind(&baseline_revision_id)
-    .bind(&baseline_id)
-    .bind(&charter_revision_id)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("approved baseline revision creates");
-    sqlx::query(
-        "INSERT INTO project_execution_baseline_approval
-         (id, baseline_id, revision_id, expected_project_version, principal_type,
-          principal_id, authorization_basis, authorization_action,
-          authorization_occurred_at, explicit_event, content_digest,
-          rendered_digest, lifecycle, idempotency_key, created_at, updated_at)
-         VALUES (?, ?, ?, 1, 'user', ?, 'test',
-                 'project.execution_baseline.approve', '2026-08-13T00:00:00Z',
-                 'approve exact baseline',
-                 'content-digest', 'render-digest', 'consumed', ?, ?, ?)",
-    )
-    .bind(&approval_id)
-    .bind(&baseline_id)
-    .bind(&baseline_revision_id)
-    .bind(&user_id)
-    .bind(format!("approval-{approval_id}"))
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("baseline approval creates");
-    sqlx::query(
         "INSERT INTO project_task_governance
-         (task_id, project_id, charter_revision_id, baseline_id, baseline_revision_id,
+         (task_id, project_id, charter_revision_id,
           runnable, provenance_json, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 1, '{}', ?, ?)",
+         VALUES (?, ?, ?, 1, '{}', ?, ?)",
     )
     .bind(&task_id)
     .bind(&project_id)
     .bind(&charter_revision_id)
-    .bind(&baseline_id)
-    .bind(&baseline_revision_id)
     .bind(&now)
     .bind(&now)
     .execute(db.pool())
@@ -6588,18 +6536,7 @@ async fn non_runnable_governance_cannot_mint_a_running_execution_after_read_gate
 
     // This represents a readiness race after the service's read-only admission
     // check: durable Task governance becomes non-runnable before the
-    // authoritative execution INSERT starts. Baseline supersession alone no
-    // longer performs this update.
-    sqlx::query(
-        "UPDATE project_execution_baseline
-         SET lifecycle = 'superseded', version = version + 1, updated_at = ?
-         WHERE id = ?",
-    )
-    .bind(&now)
-    .bind(&baseline_id)
-    .execute(db.pool())
-    .await
-    .expect("baseline supersedes");
+    // authoritative execution INSERT starts.
     sqlx::query(
         "UPDATE project_task_governance
          SET runnable = 0, version = version + 1, updated_at = ?
@@ -6741,7 +6678,7 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
             ),
             (
                 "forge.project.orchestration/v1".to_owned(),
-                "forge.project.orchestration/v1@6".to_owned(),
+                "forge.project.orchestration/v1@10".to_owned(),
             ),
         ],
         "a seeded operating-skill revision must be repointed in the same release (V081 regression)"
@@ -6749,7 +6686,7 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
     let (body, digest): (String, String) = sqlx::query_as(
         "SELECT canonical_body, content_digest
          FROM operating_skill_revision
-         WHERE id = 'forge.project.orchestration/v1@6'",
+         WHERE id = 'forge.project.orchestration/v1@10'",
     )
     .fetch_one(db.pool())
     .await
@@ -6757,8 +6694,17 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
     assert!(body.contains("Never invent aliases such as `ac-1`"));
     assert!(body.contains("Evidence is mandatory proof, not optional decoration"));
     assert!(body.contains("Never propose or narrate a release from a blocked"));
-    assert!(body.contains("A baseline is not an implementation gate"));
+    assert!(body.contains("The approved Charter is the only implementation gate"));
     assert!(body.contains("Any enabled configured Agent—including this Project Agent—may fill Worker or reviewer roles"));
+    // The completion trigger: finished Tasks are what makes the acceptance
+    // checks the remaining work, and settling them precedes readiness.
+    assert!(body.contains("On a delivery follow-up wake"));
+    assert!(body.contains("that milestone's acceptance checks are the remaining work"));
+    // The chain that makes a recorded observation mean something: a run
+    // observes, an artifact is captured, the Agent cites the run.
+    assert!(body.contains("You have your own Project workspace"));
+    assert!(body.contains("`checkout/` is not how software gets built"));
+    assert!(body.contains("Evidence is per acceptance check, not per Task"));
     assert_eq!(hex::encode(Sha256::digest(body.as_bytes())), digest);
 }
 

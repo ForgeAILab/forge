@@ -36,8 +36,8 @@ use crate::{
     AgentHostError, AgentSessionBackend, AgentTurnOutput, AgentTurnRequest, BackendCapabilities,
     CanonicalScope, CanonicalScopeType, DeterministicLcmSummaryModel, FORGE_LCM_STORE_REVISION,
     ForgeToolProvider, InteractionBrokerHandle, ProjectChatToolContext, RuntimeContextManifestLink,
-    ScopeToolComposition, TurnEventSink, protected_store::SqliteProtectedRuntimeStore,
-    transport::ReqwestTransport,
+    ScopeToolComposition, TurnEventSink, WorkspaceAccess,
+    protected_store::SqliteProtectedRuntimeStore, transport::ReqwestTransport,
 };
 
 #[derive(Clone)]
@@ -190,8 +190,15 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             ));
         }
         let workspace = workspace_for_scope(&binding.scope, binding.workspace_path.as_deref())?;
+        // A Task session and a Project Agent verification session both compose
+        // against a real root; every other scope composes against none.
         let composed_workspace_root = match binding.scope.scope_type {
             CanonicalScopeType::Task => Some(workspace.root().to_owned()),
+            CanonicalScopeType::AgentChat
+                if binding.scope.workspace_access == WorkspaceAccess::ProjectVerify =>
+            {
+                Some(workspace.root().to_owned())
+            }
             CanonicalScopeType::Account
             | CanonicalScopeType::Project
             | CanonicalScopeType::AgentChat => None,
@@ -497,6 +504,28 @@ fn workspace_for_scope(
             if !canonical.is_dir() {
                 return Err(AgentHostError::Authority(
                     "Task scope workspace path is not a directory".to_owned(),
+                ));
+            }
+            Ok(Arc::new(TaskWorkspace::new(canonical)))
+        }
+        CanonicalScopeType::AgentChat
+            if scope.workspace_access == WorkspaceAccess::ProjectVerify =>
+        {
+            let path = workspace_path
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    AgentHostError::Authority(
+                        "Project verification scope requires a host-issued checkout".to_owned(),
+                    )
+                })?;
+            let canonical = std::fs::canonicalize(path).map_err(|_| {
+                AgentHostError::Authority(
+                    "Project verification checkout is not an existing directory".to_owned(),
+                )
+            })?;
+            if !canonical.is_dir() {
+                return Err(AgentHostError::Authority(
+                    "Project verification checkout is not a directory".to_owned(),
                 ));
             }
             Ok(Arc::new(TaskWorkspace::new(canonical)))

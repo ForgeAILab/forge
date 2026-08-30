@@ -864,46 +864,36 @@ async fn charter_amendment_supersedes_execution_and_changed_replay_rolls_back() 
     .await
     .expect("amendment revision");
 
+    // A Charter amendment invalidates execution authorized by the superseded
+    // Charter revision. Seed a runnable governance row bound to revision one
+    // and assert the amendment revokes it.
     sqlx::query(
-        "INSERT INTO project_execution_baseline (
-            id, project_id, current_revision_id, lifecycle, version, created_at, updated_at
-         ) VALUES ('baseline-for-amendment', ?, NULL, 'draft', 1, ?, ?)",
+        "INSERT INTO task (id, project_id, title, description, status, task_type,
+                           priority, version, created_at, updated_at)
+         VALUES ('amendment-task', ?, 'Governed work', '', 'todo', 'task', 'medium',
+                 1, ?, ?)",
     )
     .bind(PROJECT_ID)
     .bind(NOW)
     .bind(NOW)
     .execute(db.pool())
     .await
-    .expect("baseline");
+    .expect("governed task");
     sqlx::query(
-        "INSERT INTO project_execution_baseline_revision (
-            id, baseline_id, revision, base_revision, base_revision_id, lifecycle,
-            charter_revision_id, document_revisions_json, plan_items_json,
-            milestone_id, milestone_ids_json, milestone_definition_revision_ids_json,
-            primary_milestone_id, release_policy_json, release_policy_revision,
-            release_policy_digest, acceptance_matrix_json, capability_classes_json,
-            risk_classes_json, adaptive_envelope_json, elevated_operations_json,
-            exclusions_json, rollback_recovery_json, schema_version, render_version,
-            rendered_view, content_digest, rendered_digest, source_refs_json, created_at
-         ) VALUES ('baseline-revision-for-amendment', 'baseline-for-amendment', 1, 0,
-                   NULL, 'approved', ?, '[]', '[]', NULL, '[]', '[]', NULL, '{}',
-                   'release-policy@1', 'release-policy-digest', '[]', '[]', '[]',
-                   '{}', '[]', '[]', '{}', 'baseline/v1', 'baseline-render/v1',
-                   '# Baseline', 'baseline-content', 'baseline-render', '[]', ?)",
+        "INSERT INTO project_task_governance
+            (task_id, project_id, charter_revision_id, plan_item_id, milestone_id,
+             document_revisions_json, capability_class, risk_class, runnable,
+             replacement_of_task_id, provenance_json, version, created_at, updated_at)
+         VALUES ('amendment-task', ?, ?, NULL, NULL, '[]', 'repository_write', 'low',
+                 1, NULL, '{}', 1, ?, ?)",
     )
+    .bind(PROJECT_ID)
     .bind(REVISION_ONE_ID)
+    .bind(NOW)
     .bind(NOW)
     .execute(db.pool())
     .await
-    .expect("baseline revision");
-    sqlx::query(
-        "UPDATE project_execution_baseline
-         SET current_revision_id = 'baseline-revision-for-amendment', lifecycle = 'active'
-         WHERE id = 'baseline-for-amendment'",
-    )
-    .execute(db.pool())
-    .await
-    .expect("activate baseline");
+    .expect("runnable governance");
 
     let amendment_outcome = serde_json::json!({
         "project_id": PROJECT_ID,
@@ -937,7 +927,7 @@ async fn charter_amendment_supersedes_execution_and_changed_replay_rolls_back() 
         amendment_rationale: Some("material scope change".to_owned()),
         amendment_material_diff_json: Some(r#"{"changed_sections":["success"]}"#.to_owned()),
         amendment_affected_records_json: Some(
-            r#"{"reconciliation_required":["baselines","tasks"]}"#.to_owned(),
+            r#"{"reconciliation_required":["tasks"]}"#.to_owned(),
         ),
         command_receipt: Some(receipt("amendment-command", amendment_outcome)),
         action_execution: None,
@@ -952,19 +942,22 @@ async fn charter_amendment_supersedes_execution_and_changed_replay_rolls_back() 
     );
     assert_eq!(amended.amendment_id.as_deref(), Some("amendment-record"));
     assert_eq!(amended.project_version, adopted.project_version + 1);
-    let baseline_lifecycle: String = sqlx::query_scalar(
-        "SELECT lifecycle FROM project_execution_baseline WHERE id = 'baseline-for-amendment'",
+    let runnable_after: i64 = sqlx::query_scalar(
+        "SELECT runnable FROM project_task_governance WHERE task_id = 'amendment-task'",
     )
     .fetch_one(db.pool())
     .await
-    .expect("baseline lifecycle");
+    .expect("governance runnable");
     let old_revision_lifecycle: String =
         sqlx::query_scalar("SELECT lifecycle FROM project_charter_revision WHERE id = ?")
             .bind(REVISION_ONE_ID)
             .fetch_one(db.pool())
             .await
             .expect("old revision lifecycle");
-    assert_eq!(baseline_lifecycle, "superseded");
+    assert_eq!(
+        runnable_after, 0,
+        "an amendment revokes execution authorized by the superseded Charter revision"
+    );
     assert_eq!(old_revision_lifecycle, "superseded");
 
     let replay =

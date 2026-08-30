@@ -30,8 +30,6 @@ struct ProjectAuthorityFixture {
 
 struct TaskGovernanceFixture {
     charter_revision_id: String,
-    baseline_id: String,
-    baseline_revision_id: String,
     milestone_id: String,
 }
 
@@ -217,7 +215,7 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
             "project_mode": "compact",
             "selected_project_agent_identity_id": project_identity,
             "selected_project_agent_profile_revision_id": project_profile,
-            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@6",
+            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@10",
             "selected_project_agent_policy_digest": project_policy_digest(
                 &project_agent["profile"]["tool_policy"]
             )
@@ -298,11 +296,11 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
         &[StatusCode::OK],
     )
     .await;
-    let milestone_acceptance_check_id = required_string(
+    let _milestone_acceptance_check_id = required_string(
         &milestone_definition["content"]["acceptance_checks"][0],
         &["id"],
     );
-    let milestone_acceptance_check_description = required_string(
+    let _milestone_acceptance_check_description = required_string(
         &milestone_definition["content"]["acceptance_checks"][0],
         &["description"],
     );
@@ -322,17 +320,22 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
         required_string(&project_agent, &["agent", "id"])
     );
 
-    // Core Main/Project chats are continuity scopes, not repository sessions.
-    for (identity_id, profile_id, chat_id) in [
+    // The Main chat is a continuity scope with no workspace at all. The
+    // Project chat gets its own verification workspace -- it may read and run,
+    // never author repository changes -- so its access is `project_verify`,
+    // not a Task-scoped write grant.
+    for (identity_id, profile_id, chat_id, expected_access) in [
         (
             main_identity.as_str(),
             main_profile.as_str(),
             main_chat_id.as_str(),
+            "deny",
         ),
         (
             project_identity.as_str(),
             project_profile.as_str(),
             project_chat_id.as_str(),
+            "project_verify",
         ),
     ] {
         let session = request_json(
@@ -352,7 +355,7 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
             .await
             .expect("core chat scope reads")
             .expect("core chat scope exists");
-        assert_eq!(scope_row.workspace_access, "deny");
+        assert_eq!(scope_row.workspace_access, expected_access);
     }
 
     // Genesis provisioning already registered a primary repository with an
@@ -396,22 +399,10 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
         &[StatusCode::OK],
     )
     .await;
-    let task_governance = create_active_execution_baseline(
-        app,
-        &token,
-        ProjectAuthorityFixture {
-            project_id: project_id.clone(),
-            charter_id: charter_id.to_owned(),
-            charter_revision_id: charter_revision_id.clone(),
-            charter_content_digest: rendered_charter.content_digest.clone(),
-            charter_render_digest: rendered_charter.render_digest.clone(),
-            milestone_id: milestone_id.clone(),
-            milestone_definition_revision_id,
-            milestone_acceptance_check_id,
-            milestone_acceptance_check_description,
-        },
-    )
-    .await;
+    let task_governance = TaskGovernanceFixture {
+        charter_revision_id: charter_revision_id.clone(),
+        milestone_id: milestone_id.clone(),
+    };
 
     let chats = request_json(
         app,
@@ -591,229 +582,6 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
     );
 }
 
-async fn create_active_execution_baseline(
-    app: &Router,
-    token: &str,
-    authority: ProjectAuthorityFixture,
-) -> TaskGovernanceFixture {
-    let project = request_json(
-        app,
-        Method::GET,
-        &format!("/api/v1/projects/{}", authority.project_id),
-        token,
-        Value::Null,
-        &[StatusCode::OK],
-    )
-    .await;
-    let project_version = project["version"]
-        .as_i64()
-        .expect("baseline Project version");
-    let release_policy: api_types::ExecutionBaselineReleasePolicy = serde_json::from_value(json!({
-        "schema_version": services::EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA,
-        "revision": "revised-acceptance-policy-r1",
-        "required_check_definition_revisions": [
-            authority.milestone_definition_revision_id
-        ],
-        "reviewer_independence_rules": ["independent-reviewer"],
-        "manual_attestation_rules": ["manual-attestation"],
-        "waiver_rules": ["user-waiver"],
-        "evidence_kinds": ["ci-log", "media"],
-        "evidence_contexts": ["milestone"],
-        "evidence_freshness_rules": ["current-milestone"],
-        "dependency_rules": ["dependencies-green"],
-        "stale_input_rules": ["stale-baseline-blocks"],
-        "forbidden_side_effects": ["cross-project-write"],
-        "known_issue_rules": ["known-issue-blocks"],
-        "correction_rules": ["correction-required"],
-        "purge_rules": ["purge-stale-evidence"]
-    }))
-    .expect("closed release policy parses");
-    let release_policy_digest = api_types::canonical_digest_with_schema(
-        services::EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA,
-        &release_policy,
-    )
-    .expect("release policy digest");
-    let content = json!({
-        "charter_revision": {
-            "artifact_id": authority.charter_id,
-            "revision_id": authority.charter_revision_id,
-            "content_digest": authority.charter_content_digest,
-            "render_version": "forge.project-charter/v1",
-            "render_digest": authority.charter_render_digest
-        },
-        "document_revisions": [],
-        "plan_item_ids": ["revised-acceptance-plan-item-1"],
-        "milestone_ids": [authority.milestone_id],
-        "milestone_definition_revision_ids": [
-            authority.milestone_definition_revision_id
-        ],
-        "primary_milestone_id": authority.milestone_id,
-        "release_policy_revision": "revised-acceptance-policy-r1",
-        "release_policy_digest": release_policy_digest,
-        "release_policy": release_policy,
-        "acceptance_evidence_matrix": [{
-            "id": authority.milestone_acceptance_check_id,
-            "description": authority.milestone_acceptance_check_description,
-            "required": true,
-            "evidence_kind": null,
-            "check_definition_revision": authority.milestone_definition_revision_id
-        }],
-        "capability_classes": ["repository_write"],
-        "risk_classes": ["low"],
-        "reviewer_independence_rules": ["independent-reviewer"],
-        "elevated_operations": [],
-        "adaptive_envelope": {
-            "allowed_task_operations": ["split"],
-            "fixed_outcomes": [],
-            "fixed_acceptance": [],
-            "fixed_risk_classes": ["low"],
-            "forbidden_side_effects": [],
-            "elevated_operations": []
-        },
-        "rollback_and_recovery": ["retry"],
-        "exclusions": []
-    });
-    let typed_content: api_types::ExecutionBaselineContent =
-        serde_json::from_value(content.clone()).expect("baseline content parses");
-    let rendered =
-        services::render_execution_baseline(&typed_content).expect("execution baseline renders");
-    let draft = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/execution-baseline",
-            authority.project_id
-        ),
-        token,
-        json!({
-            "mutation": {
-                "expected_version": 0,
-                "idempotency_key": "revised-acceptance-baseline-draft",
-                "authorization": user_authorization(
-                    "project.execution_baseline.save_draft",
-                    "revised-acceptance-baseline-draft-event"
-                )
-            },
-            "operation": "save_draft",
-            "base_revision_id": null,
-            "content": content.clone(),
-            "rendered_view": rendered.rendered_view.clone(),
-            "render_version": services::EXECUTION_BASELINE_RENDER_VERSION,
-            "content_digest": rendered.content_digest.clone(),
-            "render_digest": rendered.render_digest.clone(),
-            "provenance": user_provenance("Revised acceptance baseline draft")
-        }),
-        &[StatusCode::CREATED, StatusCode::OK],
-    )
-    .await;
-    assert_eq!(draft["baseline"]["lifecycle"], json!("draft"));
-    assert_eq!(draft["requires_user_authorization"], json!(false));
-    let baseline_id = required_string(&draft, &["baseline", "id"]);
-    let baseline_id = baseline_id.as_str();
-    let baseline_version = draft["baseline"]["version"]
-        .as_i64()
-        .expect("draft baseline version");
-    let draft_revision_id = required_string(&draft, &["current_revision", "id"]);
-    let saved = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/execution-baseline/{baseline_id}/revisions",
-            authority.project_id
-        ),
-        token,
-        json!({
-            "mutation": {
-                "expected_version": baseline_version,
-                "idempotency_key": "revised-acceptance-baseline-revision",
-                "authorization": user_authorization(
-                    "project.execution_baseline.propose_for_approval",
-                    "revised-acceptance-baseline-revision-event"
-                )
-            },
-            "operation": "propose_for_approval",
-            "base_revision_id": draft_revision_id,
-            "content": content.clone(),
-            "rendered_view": rendered.rendered_view.clone(),
-            "render_version": services::EXECUTION_BASELINE_RENDER_VERSION,
-            "content_digest": rendered.content_digest.clone(),
-            "render_digest": rendered.render_digest.clone(),
-            "provenance": user_provenance("Todo execution baseline")
-        }),
-        &[StatusCode::CREATED, StatusCode::OK],
-    )
-    .await;
-    assert_eq!(saved["requires_user_authorization"], json!(true));
-    assert_eq!(
-        saved["approval_target"]["requires_user_authorization"],
-        json!(true)
-    );
-    let baseline_revision_id = required_string(&saved, &["approval_target", "revision_id"]);
-    let revised_version = saved["baseline"]["version"]
-        .as_i64()
-        .expect("revised baseline version");
-    let approved = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/execution-baseline/{baseline_id}/revisions/{baseline_revision_id}/approve",
-            authority.project_id
-        ),
-        token,
-        json!({
-            "mutation": {
-                "expected_version": revised_version,
-                "idempotency_key": "revised-acceptance-baseline-approve",
-                "authorization": user_authorization(
-                    "project.execution_baseline.approve",
-                    "revised-acceptance-baseline-approve-event"
-                )
-            },
-            "revision_id": baseline_revision_id,
-            "content_digest": rendered.content_digest,
-            "render_digest": rendered.render_digest,
-            "expected_project_version": project_version
-        }),
-        &[StatusCode::CREATED, StatusCode::OK],
-    )
-    .await;
-    let approval_id = required_string(&approved, &["approval", "id"]);
-    let activated = request_json(
-        app,
-        Method::POST,
-        &format!(
-            "/api/v1/projects/{}/execution-baseline/{baseline_id}/activate",
-            authority.project_id
-        ),
-        token,
-        json!({
-            "mutation": {
-                "expected_version": project_version,
-                "idempotency_key": "revised-acceptance-baseline-activate",
-                "authorization": user_authorization(
-                    "project.execution_baseline.activate",
-                    "revised-acceptance-baseline-activate-event"
-                )
-            },
-            "baseline_id": baseline_id,
-            "revision_id": baseline_revision_id,
-            "approval_id": approval_id,
-            "expected_baseline_version": approved["baseline"]["version"],
-            "content_digest": rendered.content_digest.clone(),
-            "render_digest": rendered.render_digest.clone()
-        }),
-        &[StatusCode::OK],
-    )
-    .await;
-    assert_eq!(activated["baseline"]["lifecycle"], json!("active"));
-    TaskGovernanceFixture {
-        charter_revision_id: authority.charter_revision_id,
-        baseline_id: baseline_id.to_owned(),
-        baseline_revision_id,
-        milestone_id: authority.milestone_id,
-    }
-}
-
 async fn connect_embedded(app: &Router, token: &str, name: &str, permissions: &[&str]) -> Value {
     let entry = request_json(
         app,
@@ -865,8 +633,6 @@ fn task_proposal_body(
         }],
         "governance": {
             "charter_revision_id": governance.charter_revision_id,
-            "baseline_id": governance.baseline_id,
-            "baseline_revision_id": governance.baseline_revision_id,
             "plan_item_id": "revised-acceptance-plan-item-1",
             "milestone_id": governance.milestone_id,
             "document_revision_ids": [],
@@ -926,7 +692,7 @@ fn user_authorization(action: &str, event_id: &str) -> Value {
 fn user_provenance(summary: &str) -> Value {
     json!({
         "author": {"kind": "user", "id": "test-user-id"},
-        "operating_skill_revision": "forge.project.orchestration/v1@6",
+        "operating_skill_revision": "forge.project.orchestration/v1@10",
         "source_refs": [],
         "change_summary": summary
     })

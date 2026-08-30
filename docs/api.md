@@ -65,7 +65,7 @@ database for historical provenance.
 | POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/readiness` | Persist one principal-bound immutable `ReadinessSnapshot` candidate |
 | GET    | `/api/v1/projects/{id}/milestones/{milestone_id}/readiness/history` | List immutable readiness candidates with opaque keyset pagination |
 | GET    | `/api/v1/projects/{id}/milestones/{milestone_id}/readiness/{snapshot_id}` | Read one exact readiness candidate |
-| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/checks/{check_id}/result` | Record a user-bound manual Pass/Fail result against the current check version and governing Charter/baseline revisions; this does not attach evidence |
+| POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/checks/{check_id}/result` | Record a user-bound manual Pass/Fail result against the current check version and the governing Charter revision; this does not attach evidence |
 | POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/checks/{check_id}/waive` | Record a user-bound immutable acceptance waiver |
 | POST   | `/api/v1/projects/{id}/milestones/{milestone_id}/release` | User-only release of an exact readiness candidate into immutable `Mxxx-rN` |
 | GET    | `/api/v1/projects/{id}/releases/{release_id}` | Inspect an immutable release manifest and evidence pins |
@@ -80,20 +80,14 @@ database for historical provenance.
 | GET    | `/api/v1/projects/{id}/milestones/{milestone_id}/evidence/{evidence_id}` | Read one exact active evidence attachment |
 | DELETE | `/api/v1/projects/{id}/milestones/{milestone_id}/evidence/{evidence_id}` | Remove a milestone evidence attachment (release pins remain immutable) |
 | GET    | `/api/v1/projects/{id}/overview` | Read the derived Project Overview projection, including hydrated current acceptance-check results and check CAS versions |
-| GET    | `/api/v1/projects/{id}/execution-baseline` | Read the Project's current execution-baseline proposal/approval projection. If the preserved active revision fails the closed adaptive-operation audit, `current_revision` is null, `integrity_issue` names its exact immutable identity/values and reserved correction records, and `proposed_revision` is the valid successor draft |
-| GET    | `/api/v1/projects/{id}/execution-setup` | Read independent coordination and repository-setup state plus optional default Worker/reviewer identities; legacy baseline-gate fields remain projection-only and do not gate Tasks |
+| GET    | `/api/v1/projects/{id}/execution-setup` | Read independent coordination and repository-setup state plus optional default Worker/reviewer identities |
 | POST   | `/api/v1/projects/{id}/execution-setup/worker` | Project owner/admin selects an eligible Worker identity with `expected_project_version` and `idempotency_key` |
 | POST   | `/api/v1/projects/{id}/execution-setup/independent-reviewer` | Project owner/admin selects an optional reviewer default with `expected_project_version` and `idempotency_key`; it may be the same Agent as the Worker |
 | POST   | `/api/v1/projects/{id}/execution-setup/repository` | Project owner/admin attaches a repository with `expected_project_version` and `idempotency_key` |
 | POST   | `/api/v1/projects/{id}/execution-setup/provisioning/retry` | Project owner/admin retries the durable, finite provisioning operation with `expected_operation_version` and `idempotency_key` |
-| POST   | `/api/v1/projects/{id}/execution-baseline` | Save the first complete or incomplete execution-baseline candidate as a `draft`; the request must carry `operation: "save_draft"`, the candidate content, canonical rendered view/digests, provenance, and `mutation.expected_version: 0` (the baseline id is server-minted) |
-| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions` | Save an exact digest-bound revision with explicit `operation: "save_draft"` or `"propose_for_approval"`; proposal additionally requires its acceptance/evidence matrix to exactly match the stable IDs, evidence kinds, and revisions of the pinned milestone definitions, and only a valid proposal returns `requires_user_authorization: true` with a frozen `approval_target` |
-| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions/{revision_id}/approve` | Record the exact authenticated user's baseline approval receipt. For the designated successor of an invalid active revision this remains approval-only: it does not move the active pointer |
-| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/revisions/{revision_id}/approve-and-activate` | "Approve traceability plan": one atomic, replay-exact command that approves and activates the exact freshly proposed optional traceability revision in a single transaction/receipt. It emits `approved`/`activated` events but does not grant, revoke, start, or pause Task execution. The request supplies `mutation.expected_version` and `expected_baseline_version`; the receipt-first response preserves the exact committed IDs/digests and uses `refresh_required: true` when only the follow-up projection read fails |
-| POST   | `/api/v1/projects/{id}/execution-baseline/{baseline_id}/activate` | Activate an already-approved optional traceability plan. Activation may advance milestone/plan pointers but never changes Task runnable state |
 | GET    | `/api/v1/projects/{project_id}/reconciliations` | List Project reconciliations with opaque keyset pagination |
 | GET    | `/api/v1/projects/{project_id}/reconciliations/{reconciliation_id}` | Read one reconciliation's conflict, governing/affected records, allowed resolutions, and (once resolved) its resolution |
-| POST   | `/api/v1/projects/{project_id}/reconciliations/{reconciliation_id}/resolve` | User-only: resolve a reconciliation with one of the closed `retained`/`revised`/`cancelled`/`superseded`/`invalidated` actions. `invalid_active_baseline` allows only `revised` with its exact approved successor and activates that successor atomically with resolution |
+| POST   | `/api/v1/projects/{project_id}/reconciliations/{reconciliation_id}/resolve` | User-only: resolve a reconciliation with one of the closed `retained`/`revised`/`cancelled`/`superseded`/`invalidated` actions.  |
 | GET    | `/api/v1/projects/{id}/memory/search` | Search project memory |
 | GET    | `/api/v1/memory/{id}` | Get memory item |
 | POST   | `/api/v1/memory/{id}/publish` | Explicitly publish an owned private assertion into an authorized scope |
@@ -104,7 +98,7 @@ database for historical provenance.
 | GET    | `/api/v1/projects/{id}/project_hook_runs` | List project hook run history |
 | POST   | `/api/v1/projects/{id}/repos` | Create repo |
 | GET    | `/api/v1/projects/{id}/repos` | List repos |
-| POST   | `/api/v1/projects/{id}/tasks` | Create a Task; omitted governance is derived from the current approved Charter, and a repository-backed Task can run without a baseline |
+| POST   | `/api/v1/projects/{id}/tasks` | Create a Task; omitted governance is derived from the current approved Charter |
 | GET    | `/api/v1/projects/{id}/tasks` | List tasks (paginated, filterable) |
 | GET    | `/api/v1/tasks/{id}` | Get task |
 | GET    | `/api/v1/tasks/{id}/prompt-preview?role=&trigger=` | Preview effective prompt without dispatching |
@@ -442,7 +436,7 @@ account during pre-Project Genesis), and authenticated principal. Reusing the
 same client key in another Project or account is an independent mutation, while
 a replay in the same scope returns the original result. Project access is
 checked before replay lookup, so an idempotency key cannot be used to probe a
-foreign Charter, baseline, milestone check, or Document approval.
+foreign Charter, milestone check, or Document approval.
 
 ### Project Charters, Documents, Decisions, and effective state
 
@@ -458,7 +452,7 @@ states.
 
 Responses that summarize current Project state are derived by authority domain:
 the approved Charter governs identity, scope, and implementation authority;
-optional approved baselines and Documents govern traceability, effective Decisions govern recorded choices,
+approved Documents govern traceability, effective Decisions govern recorded choices,
 Task/validation services govern work/check truth, and immutable releases govern
 historic claims. Chat, memory, status cards, and dashboards are retrieval or
 navigation aids only. A cross-domain conflict returns a typed reconciliation
@@ -569,31 +563,6 @@ execution retry budget. Duplicate candidates and unknown executor types are
 rejected at dispatch time; an empty `{}` candidate config is valid. See
 [architecture.md](architecture.md#executor-fallback-chains).
 
-### Invalid execution-baseline integrity recovery
-
-Startup audits persisted execution-baseline adaptive envelopes against the
-closed `split`/`sequence`/`replace` vocabulary before dispatch begins. The
-audit never rewrites a historical revision or approval. `GET
-/api/v1/projects/{project_id}/execution-baseline` adds an optional
-`integrity_issue` with the invalid revision, exact field path and values,
-diagnostic, audit timestamp, and reserved successor/reconciliation/conflict
-identities. While that revision remains the physical active pointer,
-`current_revision` is deliberately `null` so no client can mistake malformed
-authority for a usable current baseline; `proposed_revision` exposes the valid
-correction draft when one was created.
-
-The user edits/proposes and explicitly approves that exact draft through the
-ordinary baseline routes. Approval is intentionally not activation. Once an
-exact active user approval exists, the associated reconciliation includes a
-read-only `suggested_replacement_ref` naming that revision. Resolving it as
-`revised` with the identical replacement performs successor activation and
-reconciliation resolution in one transaction. The database rechecks the
-current invalid pointer, integrity markers, replacement manifest, approval and
-digests, Charter and milestones, and Project/baseline versions. It preserves
-the invalid revision as `superseded`, consumes the approval, resolves only the
-named record, and commits one receipt/event. A changed or stale target returns
-`409` with no partial activation.
-
 ### Project reconciliations
 
 A `ProjectReconciliation` is the shared, scoped projection of one
@@ -622,8 +591,8 @@ resolve.
 `POST .../reconciliations/{reconciliation_id}/resolve` is interactive-user
 only: the shared service rejects any authorization whose principal is not
 `user`, so no chat agent is ever given a generic self-resolve tool — this
-covers execution-baseline, Charter, waiver, and release-governing
-reconciliations as well as every other record type. The request is a
+covers Charter, waiver, and release-governing reconciliations as well as
+every other record type. The request is a
 `MutationEnvelope` (`expected_version`, `idempotency_key`, `authorization`)
 plus the closed `action`, a non-empty `reason`, and an exact `replacement_ref`
 (`record_type`, `record_id`, optional `record_revision`) that is required for
@@ -637,16 +606,6 @@ event IDs. A version mismatch or an already-resolved record returns `409`;
 the web Reconciliation review card reuses TanStack Query invalidation so the
 Overview, execution-setup, and Project views resume without a manual phase
 toggle or a page reload.
-
-For `invalid_active_baseline`, the generic action vocabulary is narrowed to
-`revised`. The server prepares and suggests the exact correction revision; it
-may still be a draft. The interactive user's single resolve request is also
-the exact approval event, so the client does not need to propose and approve
-the repair first. Approval, activation, invalid revision
-supersession, approval consumption, conflict disposition, reconciliation
-transition, receipt, and event are one atomic database command.
-Unrelated Task-scoped reconciliations remain unresolved and cannot widen their
-scope. Task runnable state is unchanged by this traceability repair.
 
 Project Overview presents this repair as **Accept** or **Reject**, preceded by a
 one-sentence explanation that Accept replaces the named Agent/record. Replacement identifiers, digests, affected paths, and the
@@ -697,9 +656,12 @@ direct stream so one approved execution cannot appear twice.
 
 `AttentionCategory` includes `delivery_followup`. Forge projects it when a
 Task reaches `done` so the bound Project Agent can reconcile authoritative
-validation, evidence, and milestone readiness. It is an orchestration prompt,
-not a validation result, readiness decision, or release approval; a committed
-milestone readiness evaluation resolves the Project's open delivery follow-ups.
+validation, evidence, and milestone readiness. The wake the Agent receives names
+the affected milestones and their outstanding required acceptance checks, and
+the turn must commit the corresponding validation result before it owes a
+readiness evaluation. It is an orchestration prompt, not a validation result,
+readiness decision, or release approval; a committed milestone readiness
+evaluation resolves the Project's open delivery follow-ups.
 
 ## Commitments, inbox, and typed actions
 
@@ -751,8 +713,8 @@ The exact closed proposal payload is validated before the command runs. For a
 Charter-backed Project, an omitted governance object is derived from the
 current approved Charter and repository-backed Tasks are runnable immediately.
 `planning_task` and `discovery` use the read-only capability lane. A proposal that supplies
-`plan_item_id` or `milestone_id` binds those optional references to the active baseline
-even when `capability_class` is read-only. Optional
+`plan_item_id` or `milestone_id` binds those optional references to the
+Project's own records even when `capability_class` is read-only. Optional
 `depends_on_task_ids` must name accepted, non-cancelled Tasks in the same
 Project and every prerequisite must reach `done` before dispatch.
 `task_type`, when present, is the same closed enum as normal
@@ -773,9 +735,7 @@ includes `source_task_id`, `expected_task_version`,
 non-empty child `items` list, an ordered Task-id list, or replacement
 `title`/optional `description`. Project, scope, actor, permission,
 governance and fixed-boundary values are derived from the authenticated
-binding and Task traceability; unknown or override fields are rejected. All
-three verbs are available under the current Charter even when an optional
-baseline lists a narrower set. The
+binding and Task traceability; unknown or override fields are rejected. All three verbs are available under the current Charter. The
 adapter calls the shared Task command directly, creates no `AgentAction`, and
 returns bounded receipt/event, source Task, Task-id, board-revision, and
 `replayed` fields. Exact retries replay the frozen receipt result before
@@ -797,7 +757,7 @@ typed execution and the underlying Charter/Project mutation require the action
 version and idempotency key; replays return the committed execution/result.
 
 Native Project coordination uses the same catalog boundary. Closed safe
-Document, Decision, Charter-adoption, execution-baseline, Milestone, evidence,
+Document, Decision, Charter-adoption, Milestone, evidence,
 and readiness subactions execute through their shared command services and
 return a committed receipt/event without an Action id. Release requests and
 any other approval-required subaction remain pending `AgentAction` records
@@ -821,32 +781,49 @@ structured Project Agent candidates plus the persisted/resolved selection.
 requiring `propose_discovery`; it accepts the Genesis session/version and one
 identity id, mutates no Charter prose, and freezes no approval by itself.
 
-Project Agent execution-baseline proposals use the typed
-`project.execution_baseline` operation. Every payload supplies canonical
-`content`, `rendered_view`, `render_version`, `content_digest`,
-`render_digest`, and revision provenance. `draft_revision` creates a
-server-identified baseline when `baseline_id` is absent; `draft_revision` and
-`revise` both persist `draft`. `propose_approval` requires an existing baseline
-and exact positive `expected_baseline_version`, persists `proposed`, and returns
-the frozen approval target with `requires_user_authorization=true`. The native
-adapter never approves or activates a baseline and applies the same shared
-ArtifactRef, milestone-definition, Charter, policy, version, digest, and
-reconciliation checks as REST.
-
 Project Agent validation results use the typed `project.validation` operation.
 A `record` payload must include the current positive
 `expected_milestone_version` alongside `milestone_id`, `check_id`,
-`definition_revision_id`, `status`, `result`, and `input_digest`. It exists
+`definition_revision_id`, `status`, `result`, `input_digest`, and
+`observed_task_id`. `status` uses
+the same vocabulary as the user-facing manual attestation route (`pass`, `fail`,
+`blocked`, `stale`, `unavailable`) and is translated to the persisted outcome
+the same way. It exists
 because an acceptance check asserts *integrated* behaviour, which is wider than
 the single Task under review: a check can cover a feature delivered earlier
 that later work must keep working, and a Task review only looks at the code
-that Task changed. The command derives the governing Charter revision, the
-active approved baseline revision, and the check version itself rather than
-accepting them, and it refuses any check whose `source_kind` is `manual` —
+that Task changed. `observed_task_id` names the Task whose run produced the observation, and
+Forge verifies it belongs to the Project and reached a delivered state; an
+optional `evidence_asset_id` names the captured artifact backing it, and both
+are written into the validation manifest readiness reads back. A Project Agent
+session has no workspace and no process, so it cites the run that observed
+rather than reporting a first-hand observation of its own. The command derives
+the governing Charter revision and the
+check version itself rather than accepting them, and it refuses any check whose
+`source_kind` is `manual` —
 a human attestation stays the user-only `checks/{check_id}/result` route.
 Acceptance checks may therefore declare `task_validation` as a `source_kind`,
 and readiness treats a receipt-backed `task_validation` result as release
 authority exactly as it treats a user attestation.
+
+Task sessions capture evidence with the typed `task.evidence` operation. A
+`capture` payload names a `kind`, a `caption`, and exactly one of `path` (a
+workspace-relative file the run produced) or `content` (verbatim captured
+output). Forge stores the bytes in the media store, derives the SHA-256
+checksum a milestone evidence attachment compares against, and returns the
+`media_id`/`asset_id`. The operation is exposed only in a Task scope: a Project
+or Agent Chat session receives no workspace root by construction, so it could
+author an artifact but never capture one. Captured Task media is promoted to a
+project-scoped `media_asset`, so a single verification run's artifact can back
+every acceptance check it demonstrates.
+
+Task sessions record progress with the typed `task.worklog` operation. An
+`append` payload carries a `kind` (`progress`, `decision`, `validation`, or
+`blocker`) and a `summary`; Forge derives the Task, execution, role, and agent
+identity from the session and stores them on the comment along with an
+idempotency key, so a retried turn appends once. Worklog entries flow into the
+next role's dispatch context. They never move a Task and never satisfy an
+acceptance check.
 
 Project Agent evidence proposals use the typed `project.evidence` operation.
 An `attach` payload must include the current positive
@@ -955,7 +932,7 @@ Before the transaction, Forge stages only repositories managed as direct
 children of `<workspace_root>/repos`; it restores them on rollback and removes
 them after commit. Linked repositories elsewhere on disk are never deleted.
 Immutable-row guards are relaxed only for that exact teardown transaction;
-individual Charter, milestone, readiness, release, baseline, decision, lease,
+individual Charter, milestone, readiness, release, decision, lease,
 and evidence records remain non-deletable through ordinary writes.
 
 There is no later primary-agent election. Projects imported from before the
@@ -988,7 +965,7 @@ the authoritative rows were read; `unavailable` (with a `refresh_and_retry`
 action) means that dimension must not be inferred from the other two. A
 backfilled local repository may report `repository_initialized=skipped` with
 `filesystem_verified=false`: V087 verifies only persisted repository linkage,
-workflow/baseline role requirements, and effectively eligible identities. It
+workflow role requirements, and effectively eligible identities. It
 does not inspect the filesystem or fabricate a successful initialization.
 
 The Worker, independent-reviewer, and repository actions are owner/admin-only
@@ -1047,7 +1024,7 @@ preset. A Task may override the Project default. In `human-required`, either the
 interactive user or the bound Project Agent may accept or reject through the
 normal Task workflow; the Project Agent uses the native ReadyOnly `task.review`
 operation, which validates the exact binding, Project, Task version, CI, and
-evidence before transition. It is not an execution-baseline approval.
+evidence before transition.
 
 ## Execution status and liveness
 
@@ -1234,7 +1211,7 @@ Git cannot compute a merge base, Forge falls back to the commit recorded when
 the workspace was created (`workspace.before_sha`), then to the repo default
 branch for older rows without `before_sha`.
 
-`base_sha` is the exact baseline commit. `base_ref` is display-oriented: for
+`base_sha` is the exact branch-point commit. `base_ref` is display-oriented: for
 normal Forge-created workspaces it is formatted as
 `<default_branch>@<short_sha>`; fallback rows use the default branch name.
 
@@ -1298,7 +1275,7 @@ sensitivity, authority, lifecycle metadata, and retention fields only.
 bounded list of source ids, revisions, selection reasons, dispositions, and
 fragment fingerprints, never source fragments. Pointer-backed Project sources
 also expose `is_stale` and `current_revision`; these are read-time comparisons
-against the current Charter, approved Document, active execution baseline,
+against the current Charter, approved Document,
 active milestone definition, Project identity, or Project Agent binding. The
 stored source revision, disposition, and manifest fingerprint remain immutable.
 `GET /api/v1/agents/{id}/context-manifests` is the discoverability/listing
@@ -1853,7 +1830,7 @@ parse. Its fields identify the action `code`, `required_principal`,
 `target_type`, `target_id`, `title`, `explanation`, `action_kind`,
 `route_or_operation`, `blocking`, and optional `expected_version`. The server
 resolves one action using this order: Charter adoption/setup; conflicts and
-reconciliation; Worker/reviewer/repository execution setup; baseline draft or
+reconciliation; Worker/reviewer/repository execution setup; milestone draft or
 user approval; blocked/failed Task remediation; missing or stale validation;
 missing or stale evidence; readiness evaluation; exact user release; then
 definition of the next milestone. The client follows the typed route or
@@ -1862,7 +1839,7 @@ Task counts, a readiness badge, or free-form copy.
 
 Readiness shown inside the Overview is current only when the displayed
 snapshot's exact input manifest still matches the current milestone
-definition, baseline and policy, acceptance-check definitions/results,
+definition, acceptance-check definitions/results,
 approved Documents, waivers, evidence source context, and bounded
 build/commit references. An evidence attachment is release-gating evidence
 only when its provenance binds the source Task revision, execution/run (when
@@ -1913,10 +1890,6 @@ envelope when mirrored, with `event_type`, `entity_id`, and `timestamp`.
 | `project.decision.approved` | `{ "project_id": "...", "candidate_id": "...", "decision_id": "..." }` |
 | `project.decision.candidate_rejected` | `{ "project_id": "...", "candidate_id": "...", "reason": "..." }` |
 | `project.decision.created` | `{ "project_id": "...", "decision_id": "...", "state": "active", "decision_class": "..." }` |
-| `project.execution_baseline.draft_saved` | `{ "operation": "save_draft", "project_id": "...", "baseline_id": "...", "revision_id": "...", "revision": 1, "lifecycle": "draft", "result": { ... } }` |
-| `project.execution_baseline.proposed` | `{ "operation": "propose_for_approval", "project_id": "...", "baseline_id": "...", "revision_id": "...", "revision": 2, "lifecycle": "proposed", "result": { ... } }` |
-| `project.execution_baseline.approved` | `{ "project_id": "...", "baseline_id": "...", "revision_id": "...", "approval_id": "..." }` |
-| `project.execution_baseline.activated` | `{ "project_id": "...", "baseline_id": "...", "revision_id": "..." }` |
 | `task.media.uploaded` | `{ "task_id": "...", "media_id": "...", "content_type": "...", "byte_size": 12345, "filename": "evidence.png" }` |
 | `task.media.deleted` | `{ "task_id": "...", "media_id": "..." }` |
 | `project.media.uploaded` | `{ "project_id": "...", "asset_id": "...", "content_type": "...", "byte_size": 12345, "filename": "evidence.png", "checksum": "..." }` |

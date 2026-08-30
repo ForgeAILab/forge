@@ -899,11 +899,262 @@ async fn append_project_attention_wake(
     wake_event_id
 }
 
+/// One milestone whose acceptance matrix an Agent is expected to settle.
+/// Written as fixture rows rather than through the command services so the
+/// wake tests exercise delivery, not milestone authoring.
+struct DeliveryMilestoneFixture {
+    milestone_id: String,
+    milestone_revision_id: String,
+    agent_check_id: String,
+    manual_check_id: String,
+}
+
+async fn seed_delivery_milestone(db: &SqliteDb, project_id: &str) -> DeliveryMilestoneFixture {
+    let now = now_rfc3339();
+    let user_id = new_uuid_v4();
+    UserRepo::create_user(
+        db,
+        &User {
+            id: user_id.clone(),
+            email: format!("{user_id}@example.test"),
+            password_hash: "test".to_owned(),
+            display_name: Some("Delivery Fixture".to_owned()),
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    // The Charter's account and the Project's owner are the same principal;
+    // the schema enforces it.
+    sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
+        .bind(&user_id)
+        .bind(project_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let charter_id = new_uuid_v4();
+    let charter_revision_id = new_uuid_v4();
+    sqlx::query(
+        "INSERT INTO project_charter
+            (id, account_id, genesis_session_id, project_id,
+             current_draft_revision_id, current_approved_revision_id,
+             project_mode, maturity, lifecycle, version, created_at, updated_at)
+         VALUES (?, ?, NULL, ?, NULL, NULL, 'compact', 'mvp', 'attached', 1, ?, ?)",
+    )
+    .bind(&charter_id)
+    .bind(&user_id)
+    .bind(project_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO project_charter_revision
+            (id, charter_id, revision, base_revision, base_revision_id,
+             lifecycle, schema_version, render_version, content_json,
+             rendered_view, change_summary, author_type, author_id,
+             source_message_id, source_turn_job_id, source_refs_json,
+             content_digest, rendered_digest, created_at)
+         VALUES (?, ?, 1, 0, NULL, 'approved', 'charter@1', 'render@1', '{}',
+                 '# Charter', 'fixture', 'user', ?, NULL, NULL, '[]',
+                 'charter-content', 'charter-rendered', ?)",
+    )
+    .bind(&charter_revision_id)
+    .bind(&charter_id)
+    .bind(&user_id)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE project_charter SET current_approved_revision_id = ? WHERE id = ?")
+        .bind(&charter_revision_id)
+        .bind(&charter_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let milestone_id = new_uuid_v4();
+    let milestone_revision_id = new_uuid_v4();
+    sqlx::query(
+        "INSERT INTO project_milestone
+            (id, project_id, milestone_sequence, milestone_key, display_label,
+             lifecycle, blocker_reason_json, stale_reason_json,
+             reconciliation_reason_json, version, created_at, updated_at)
+         VALUES (?, ?, 1, 'M001', 'Delivery milestone', 'active', '[]', '[]',
+                 '[]', 3, ?, ?)",
+    )
+    .bind(&milestone_id)
+    .bind(project_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO project_milestone_revision
+            (id, milestone_id, revision, base_revision, base_revision_id,
+             lifecycle, display_label, outcome, included_scope_json,
+             excluded_scope_json, charter_revision_id, document_revisions_json,
+             task_selection_json, dependencies_json, risks_json,
+             acceptance_checks_json, evidence_requirements_json,
+             known_issues_json, change_summary, schema_version, render_version,
+             rendered_view, content_digest, rendered_digest, author_type,
+             author_id, source_refs_json, created_at)
+         VALUES (?, ?, 1, 0, NULL, 'approved', 'Delivery milestone',
+                 'The delivery outcome is exercised end to end', '[]', '[]',
+                 ?, '[]', '[]', '[]', '[]', '[]', '[]', '[]', 'fixture',
+                 'milestone@1', 'milestone-render@1', '# Milestone',
+                 'milestone-content', 'milestone-rendered', 'user', ?, '[]', ?)",
+    )
+    .bind(&milestone_revision_id)
+    .bind(&milestone_id)
+    .bind(&charter_revision_id)
+    .bind(&user_id)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE project_milestone SET current_definition_revision_id = ? WHERE id = ?")
+        .bind(&milestone_revision_id)
+        .bind(&milestone_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let agent_check_id = "ac-integrated-flow".to_owned();
+    let manual_check_id = "ac-user-judgment".to_owned();
+    for (check_id, source_kind) in [
+        (agent_check_id.as_str(), "task_validation"),
+        (manual_check_id.as_str(), "manual"),
+    ] {
+        sqlx::query(
+            "INSERT INTO project_milestone_check
+                (id, project_id, milestone_id, definition_revision_id, check_key,
+                 description, required, source_kind, expected_result,
+                 evidence_required, version, current_result_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 'fixture check', 1, ?, 'passes', 0, 1, NULL, ?, ?)",
+        )
+        .bind(check_id)
+        .bind(project_id)
+        .bind(&milestone_id)
+        .bind(&milestone_revision_id)
+        .bind(check_id)
+        .bind(source_kind)
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+
+    DeliveryMilestoneFixture {
+        milestone_id,
+        milestone_revision_id,
+        agent_check_id,
+        manual_check_id,
+    }
+}
+
+/// Bind one Task to the milestone in the state a delivery follow-up sees.
+async fn seed_governed_task(
+    db: &SqliteDb,
+    project_id: &str,
+    milestone_id: &str,
+    status: &str,
+) -> String {
+    let now = now_rfc3339();
+    let task_id = new_uuid_v4();
+    sqlx::query(
+        "INSERT INTO task (id, project_id, title, description, status, priority,
+                           created_at, updated_at)
+         VALUES (?, ?, 'Delivery task', 'fixture', ?, 0, ?, ?)",
+    )
+    .bind(&task_id)
+    .bind(project_id)
+    .bind(status)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO project_task_governance
+            (task_id, project_id, charter_revision_id, plan_item_id, milestone_id,
+             document_revisions_json, capability_class, risk_class, runnable,
+             replacement_of_task_id, provenance_json, version, created_at, updated_at)
+         VALUES (?, ?, NULL, NULL, ?, '[]', NULL, NULL, 0, NULL,
+                 '{}', 1, ?, ?)",
+    )
+    .bind(&task_id)
+    .bind(project_id)
+    .bind(milestone_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    task_id
+}
+
+/// Give one acceptance check a current authoritative result.
+async fn settle_check(
+    db: &SqliteDb,
+    project_id: &str,
+    fixture: &DeliveryMilestoneFixture,
+    check_id: &str,
+    outcome: &str,
+) {
+    let source_kind: String =
+        sqlx::query_scalar("SELECT source_kind FROM project_milestone_check WHERE id = ?")
+            .bind(check_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let now = now_rfc3339();
+    let result_id = new_uuid_v4();
+    sqlx::query(
+        "INSERT INTO project_milestone_check_result
+            (id, project_id, milestone_id, check_id, definition_revision_id,
+             outcome, source_kind, source_manifest_json, input_digest,
+             governing_charter_revision_id,
+             principal_type, principal_id, authorization_basis,
+             authorization_action, authorization_occurred_at, expected_version,
+             explicit_event, idempotency_key, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 'digest', NULL,
+                 'agent', 'fixture-agent', 'project_agent_binding_policy',
+                 'project.validation.record', ?, 1, ?, ?, ?)",
+    )
+    .bind(&result_id)
+    .bind(project_id)
+    .bind(&fixture.milestone_id)
+    .bind(check_id)
+    .bind(&fixture.milestone_revision_id)
+    .bind(outcome)
+    .bind(&source_kind)
+    .bind(&now)
+    .bind(new_uuid_v4())
+    .bind(new_uuid_v4())
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE project_milestone_check SET current_result_id = ? WHERE id = ?")
+        .bind(&result_id)
+        .bind(check_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+}
+
 async fn append_project_delivery_attention_wake(
     db: &SqliteDb,
     identity_id: &str,
     project_id: &str,
     incident_key: &str,
+    task_id: &str,
 ) -> String {
     let source_event = new_uuid_v4();
     append_event(
@@ -912,7 +1163,7 @@ async fn append_project_delivery_attention_wake(
             id: source_event.clone(),
             event_type: "task.completed".to_owned(),
             entity_type: "task".to_owned(),
-            entity_id: new_uuid_v4(),
+            entity_id: task_id.to_owned(),
             actor_type: "system".to_owned(),
             actor_id: None,
             scope_type: "project".to_owned(),
@@ -944,6 +1195,8 @@ async fn append_project_delivery_attention_wake(
         serde_json::json!({
             "scope_type": "project",
             "scope_id": project_id,
+            "entity_type": "task",
+            "entity_id": task_id,
         })
         .to_string(),
     )
@@ -1114,18 +1367,189 @@ async fn admitted_wake_becomes_a_project_agent_turn() {
     assert_eq!(turn_count, 1, "replay must reuse the deduped turn");
 }
 
+/// The wake that fires when the last Task finishes is the moment validation is
+/// owed. It has to hand the Agent the exact ids to record against and require
+/// the record itself -- readiness evaluated first can only re-report the same
+/// missing results, which is what a delivery follow-up used to do forever.
+#[tokio::test]
+async fn delivery_followup_with_all_tasks_done_orders_validation_before_readiness() {
+    let db = database().await;
+    let identity_id = new_uuid_v4();
+    let profile_id = identity_with_profile(&db, &identity_id).await;
+    let (project_id, chat_id) = bound_project(&db, &identity_id, &profile_id).await;
+    let fixture = seed_delivery_milestone(&db, &project_id).await;
+    let task_id = seed_governed_task(&db, &project_id, &fixture.milestone_id, "done").await;
+    let consumer = WakeTurnConsumer::new(Arc::clone(&db), "delivery-validation-consumer");
+    consumer.run_once(100).await.unwrap();
+
+    let incident_key = format!("attention:delivery_followup:project:{project_id}:task:done");
+    let wake_event_id = append_project_delivery_attention_wake(
+        &db,
+        &identity_id,
+        &project_id,
+        &incident_key,
+        &task_id,
+    )
+    .await;
+    assert_eq!(consumer.run_once(100).await.unwrap().delivered_turns, 1);
+
+    let (content, source_metadata_json): (String, String) = sqlx::query_as(
+        "SELECT message.content, message.source_metadata_json
+         FROM agent_chat_turn_job AS job
+         JOIN agent_chat_message AS message ON message.id = job.triggering_message_id
+         WHERE job.chat_id = ? AND job.dedupe_key = ?",
+    )
+    .bind(&chat_id)
+    .bind(format!("wake-turn:{wake_event_id}"))
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+
+    assert!(content.contains("every Task bound to it is done"));
+    assert!(content.contains(&format!("milestone_id={}", fixture.milestone_id)));
+    assert!(content.contains("milestone_version=3"));
+    assert!(content.contains(&format!(
+        "definition_revision_id={}",
+        fixture.milestone_revision_id
+    )));
+    assert!(content.contains("`project.validation` (action `record`)"));
+    assert!(
+        content.contains(&fixture.agent_check_id),
+        "the Agent-settleable check must be named"
+    );
+    assert!(
+        content.contains(&fixture.manual_check_id),
+        "the user-attested check must be named as the user's"
+    );
+    assert!(content.contains("you may never record one yourself"));
+
+    let source_metadata: serde_json::Value = serde_json::from_str(&source_metadata_json).unwrap();
+    assert_eq!(
+        source_metadata["turn_postcondition"]["required_event_type"],
+        "project.milestone.check.recorded",
+        "the turn owes the validation record, not a readiness evaluation"
+    );
+
+    // Once the Agent-settleable check has an authoritative result, the same
+    // wake shape asks for readiness instead.
+    settle_check(
+        &db,
+        &project_id,
+        &fixture,
+        &fixture.agent_check_id,
+        "passed",
+    )
+    .await;
+    let second_incident = format!("attention:delivery_followup:project:{project_id}:task:done:2");
+    let second_wake = append_project_delivery_attention_wake(
+        &db,
+        &identity_id,
+        &project_id,
+        &second_incident,
+        &task_id,
+    )
+    .await;
+    assert_eq!(consumer.run_once(100).await.unwrap().delivered_turns, 1);
+    let (second_content, second_metadata): (String, String) = sqlx::query_as(
+        "SELECT message.content, message.source_metadata_json
+         FROM agent_chat_turn_job AS job
+         JOIN agent_chat_message AS message ON message.id = job.triggering_message_id
+         WHERE job.chat_id = ? AND job.dedupe_key = ?",
+    )
+    .bind(&chat_id)
+    .bind(format!("wake-turn:{second_wake}"))
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(!second_content.contains(&format!(
+        "Settle yourself, in this turn: {}",
+        fixture.agent_check_id
+    )));
+    assert!(second_content.contains(&fixture.manual_check_id));
+    let second_metadata: serde_json::Value = serde_json::from_str(&second_metadata).unwrap();
+    assert_eq!(
+        second_metadata["turn_postcondition"]["required_event_type"],
+        "milestone.readiness.evaluated",
+        "with nothing left to record, readiness is what the turn owes"
+    );
+}
+
+/// A milestone with open Tasks still names its outstanding checks, but says so
+/// honestly instead of claiming the delivery is finished.
+#[tokio::test]
+async fn delivery_followup_reports_open_tasks_without_claiming_completion() {
+    let db = database().await;
+    let identity_id = new_uuid_v4();
+    let profile_id = identity_with_profile(&db, &identity_id).await;
+    let (project_id, chat_id) = bound_project(&db, &identity_id, &profile_id).await;
+    let fixture = seed_delivery_milestone(&db, &project_id).await;
+    let done_task = seed_governed_task(&db, &project_id, &fixture.milestone_id, "done").await;
+    seed_governed_task(&db, &project_id, &fixture.milestone_id, "in_progress").await;
+    let consumer = WakeTurnConsumer::new(Arc::clone(&db), "delivery-open-task-consumer");
+    consumer.run_once(100).await.unwrap();
+
+    let incident_key = format!("attention:delivery_followup:project:{project_id}:task:done");
+    let wake_event_id = append_project_delivery_attention_wake(
+        &db,
+        &identity_id,
+        &project_id,
+        &incident_key,
+        &done_task,
+    )
+    .await;
+    assert_eq!(consumer.run_once(100).await.unwrap().delivered_turns, 1);
+    let content: String = sqlx::query_scalar(
+        "SELECT message.content
+         FROM agent_chat_turn_job AS job
+         JOIN agent_chat_message AS message ON message.id = job.triggering_message_id
+         WHERE job.chat_id = ? AND job.dedupe_key = ?",
+    )
+    .bind(&chat_id)
+    .bind(format!("wake-turn:{wake_event_id}"))
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(content.contains("1 Task(s) still open"));
+    assert!(!content.contains("every Task bound to it is done"));
+}
 #[tokio::test]
 async fn delivery_followup_requires_newer_readiness_before_turn_success() {
     let db = database().await;
     let identity_id = new_uuid_v4();
     let profile_id = identity_with_profile(&db, &identity_id).await;
     let (project_id, chat_id) = bound_project(&db, &identity_id, &profile_id).await;
+    // Every acceptance check already settled, so readiness is what this
+    // delivery still owes.
+    let fixture = seed_delivery_milestone(&db, &project_id).await;
+    settle_check(
+        &db,
+        &project_id,
+        &fixture,
+        &fixture.agent_check_id,
+        "passed",
+    )
+    .await;
+    settle_check(
+        &db,
+        &project_id,
+        &fixture,
+        &fixture.manual_check_id,
+        "passed",
+    )
+    .await;
+    let task_id = seed_governed_task(&db, &project_id, &fixture.milestone_id, "done").await;
     let consumer = WakeTurnConsumer::new(Arc::clone(&db), "delivery-postcondition-consumer");
     consumer.run_once(100).await.unwrap();
 
     let incident_key = format!("attention:delivery_followup:project:{project_id}:task:done");
-    let wake_event_id =
-        append_project_delivery_attention_wake(&db, &identity_id, &project_id, &incident_key).await;
+    let wake_event_id = append_project_delivery_attention_wake(
+        &db,
+        &identity_id,
+        &project_id,
+        &incident_key,
+        &task_id,
+    )
+    .await;
     let wake_event_sequence: i64 =
         sqlx::query_scalar("SELECT sequence FROM domain_event WHERE id = ?")
             .bind(&wake_event_id)
@@ -1146,7 +1570,8 @@ async fn delivery_followup_requires_newer_readiness_before_turn_success() {
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert!(content.contains("cannot complete from narration"));
+    assert!(content
+        .contains("Every required acceptance check already has a current authoritative result"));
     assert!(content.contains("project.readiness"));
     let source_metadata: serde_json::Value = serde_json::from_str(&source_metadata_json).unwrap();
     assert_eq!(
@@ -1592,58 +2017,6 @@ async fn setup_required_wake_reconsiders_after_binding_change() {
     .await
     .unwrap();
     assert_eq!(turn_count, 1);
-}
-
-#[tokio::test]
-async fn baseline_activation_delivers_traceability_update_turn() {
-    let db = database().await;
-    let identity_id = new_uuid_v4();
-    let profile_id = identity_with_profile(&db, &identity_id).await;
-    let (project_id, chat_id) = bound_project(&db, &identity_id, &profile_id).await;
-    let consumer = WakeTurnConsumer::new(Arc::clone(&db), "test-lease-owner");
-    consumer.run_once(100).await.unwrap();
-
-    let event_id = new_uuid_v4();
-    append_event(
-        &db,
-        CreateDomainEvent {
-            id: event_id.clone(),
-            event_type: "project.execution_baseline.activated".to_owned(),
-            entity_type: "execution_baseline".to_owned(),
-            entity_id: "baseline-1".to_owned(),
-            actor_type: "user".to_owned(),
-            actor_id: Some("user-1".to_owned()),
-            scope_type: "project".to_owned(),
-            scope_id: project_id.clone(),
-            correlation_id: event_id.clone(),
-            causation_id: None,
-            causation_depth: 0,
-            dedupe_key: Some("baseline-activation-1".to_owned()),
-            payload_json: serde_json::json!({
-                "result": {"baseline_id": "baseline-1", "revision_id": "revision-1"},
-            })
-            .to_string(),
-            created_at: now_rfc3339(),
-        },
-    )
-    .await;
-
-    let run = consumer.run_once(100).await.unwrap();
-    assert!(run.delivered_turns >= 1);
-
-    let (status, content): (String, String) = sqlx::query_as(
-        "SELECT job.status, message.content
-         FROM agent_chat_turn_job AS job
-         JOIN agent_chat_message AS message ON message.id = job.triggering_message_id
-         WHERE job.chat_id = ? AND job.dedupe_key LIKE 'baseline-turn:%'",
-    )
-    .bind(&chat_id)
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
-    assert_eq!(status, "queued");
-    assert!(content.contains("baseline-1"));
-    assert!(content.contains("approved Charter already authorizes implementation"));
 }
 
 /// The whole autonomy loop, end to end: a Task execution fails → the durable

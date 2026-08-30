@@ -37,8 +37,6 @@ const CHARTER_ID: &str = "task-command-charter";
 const CHARTER_REVISION_ID: &str = "task-command-charter-revision";
 const MILESTONE_ID: &str = "task-command-milestone";
 const MILESTONE_REVISION_ID: &str = "task-command-milestone-revision";
-const BASELINE_ID: &str = "task-command-baseline";
-const BASELINE_REVISION_ID: &str = "task-command-baseline-revision";
 const PREBASELINE_CHARTER_ID: &str = "task-command-prebaseline-charter";
 const PREBASELINE_CHARTER_REVISION_ID: &str = "task-command-prebaseline-charter-revision";
 const PREBASELINE_MILESTONE_ID: &str = "task-command-prebaseline-milestone";
@@ -53,8 +51,6 @@ struct Fixture {
 }
 
 type GovernanceTraceabilityRow = (
-    Option<String>,
-    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -272,69 +268,6 @@ async fn seed_charter_and_milestone(
         .expect("milestone pointer");
 }
 
-async fn seed_active_baseline(db: &SqliteDb, project_id: &str) {
-    sqlx::query(
-        "INSERT INTO project_execution_baseline
-         (id, project_id, current_revision_id, lifecycle, version, created_at, updated_at)
-         VALUES (?, ?, ?, 'active', 1, ?, ?)",
-    )
-    .bind(BASELINE_ID)
-    .bind(project_id)
-    .bind(BASELINE_REVISION_ID)
-    .bind(NOW)
-    .bind(NOW)
-    .execute(db.pool())
-    .await
-    .expect("active baseline");
-    let revision_sql = format!(
-        "INSERT INTO project_execution_baseline_revision
-         (id, baseline_id, revision, base_revision, base_revision_id, lifecycle,
-          charter_revision_id, document_revisions_json, plan_items_json,
-          milestone_id, milestone_ids_json, milestone_definition_revision_ids_json,
-          primary_milestone_id, release_policy_json, release_policy_revision,
-          release_policy_digest, acceptance_matrix_json, capability_classes_json,
-          risk_classes_json, adaptive_envelope_json, elevated_operations_json,
-          exclusions_json, rollback_recovery_json, schema_version, render_version,
-          rendered_view, content_digest, rendered_digest, source_refs_json, created_at)
-        VALUES (?, ?, 1, 0, NULL, 'approved', ?, '[]', '[\"plan-1\",\"plan-2\"]',
-                 ?, '[\"{}\"]', '[\"{}\"]', ?, '{{}}', 'policy-1',
-                 'policy-digest', '[]', '[\"repository_write\",\"repository_read\"]', '[\"low\"]',
-                 '{{\"allowed_task_operations\":[\"split\",\"sequence\",\"replace\"],\"fixed_outcomes\":[],\"fixed_acceptance\":[],\"fixed_risk_classes\":[\"low\"],\"forbidden_side_effects\":[],\"elevated_operations\":[]}}', '[]', '[]', '{{}}', 'baseline@1', 'baseline-render@1',
-                 '# Baseline', 'baseline-content', 'baseline-rendered', '[]', ?)",
-        MILESTONE_ID, MILESTONE_REVISION_ID,
-    );
-    sqlx::query(&revision_sql)
-        .bind(BASELINE_REVISION_ID)
-        .bind(BASELINE_ID)
-        .bind(CHARTER_REVISION_ID)
-        .bind(MILESTONE_ID)
-        .bind(MILESTONE_ID)
-        .bind(NOW)
-        .execute(db.pool())
-        .await
-        .expect("baseline revision");
-    sqlx::query(
-        "INSERT INTO project_execution_baseline_approval
-         (id, baseline_id, revision_id, expected_project_version, principal_type,
-          principal_id, authorization_basis, authorization_action, explicit_event,
-          authorization_occurred_at, content_digest, rendered_digest, lifecycle,
-          idempotency_key, created_at, updated_at)
-         VALUES ('task-command-approval', ?, ?, 1, 'user', ?,
-                 'explicit baseline approval', 'project.execution_baseline.approve',
-                 'task-command-approval-event', ?, 'baseline-content',
-                 'baseline-rendered', 'active', 'task-command-approval-key', ?, ?)",
-    )
-    .bind(BASELINE_ID)
-    .bind(BASELINE_REVISION_ID)
-    .bind(USER_ID)
-    .bind(NOW)
-    .bind(NOW)
-    .bind(NOW)
-    .execute(db.pool())
-    .await
-    .expect("baseline approval");
-}
-
 async fn fixture() -> Fixture {
     let db = database().await;
     sqlx::query(
@@ -375,7 +308,6 @@ async fn fixture() -> Fixture {
         MILESTONE_REVISION_ID,
     )
     .await;
-    seed_active_baseline(&db, BASELINE_PROJECT_ID).await;
     seed_charter_and_milestone(
         &db,
         PREBASELINE_PROJECT_ID,
@@ -549,27 +481,19 @@ async fn task_proposal_commits_one_atomic_bundle_and_replays_frozen_task() {
         .await,
         1
     );
-    let governance: (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        i64,
-    ) = sqlx::query_as(
-        "SELECT baseline_id, baseline_revision_id, plan_item_id, milestone_id, runnable
+    let governance: (Option<String>, Option<String>, i64) = sqlx::query_as(
+        "SELECT plan_item_id, milestone_id, runnable
              FROM project_task_governance WHERE task_id = ?",
     )
     .bind(&task_id)
     .fetch_one(fixture.db.pool())
     .await
     .expect("governance row");
-    assert_eq!(governance.0.as_deref(), Some(BASELINE_ID));
-    assert_eq!(governance.1.as_deref(), Some(BASELINE_REVISION_ID));
-    assert_eq!(governance.2.as_deref(), Some("plan-1"));
-    assert_eq!(governance.3.as_deref(), Some(MILESTONE_ID));
+    assert_eq!(governance.0.as_deref(), Some("plan-1"));
+    assert_eq!(governance.1.as_deref(), Some(MILESTONE_ID));
     assert_eq!(
-        governance.4, 1,
-        "active approved baseline makes implementation runnable"
+        governance.2, 1,
+        "the approved Charter makes implementation runnable"
     );
 
     let bundle: (i64, i64, i64, i64) = sqlx::query_as(
@@ -712,7 +636,7 @@ async fn active_baseline_read_only_task_retains_traceability_and_dependencies() 
     .expect("read-only verification proposal");
 
     let governance: GovernanceTraceabilityRow = sqlx::query_as(
-        "SELECT baseline_id, baseline_revision_id, plan_item_id, milestone_id,
+        "SELECT plan_item_id, milestone_id,
                 capability_class, risk_class, runnable
          FROM project_task_governance WHERE task_id = ?",
     )
@@ -720,15 +644,13 @@ async fn active_baseline_read_only_task_retains_traceability_and_dependencies() 
     .fetch_one(fixture.db.pool())
     .await
     .expect("read-only verification governance");
-    assert_eq!(governance.0.as_deref(), Some(BASELINE_ID));
-    assert_eq!(governance.1.as_deref(), Some(BASELINE_REVISION_ID));
-    assert_eq!(governance.2.as_deref(), Some("plan-2"));
-    assert_eq!(governance.3.as_deref(), Some(MILESTONE_ID));
-    assert_eq!(governance.4.as_deref(), Some("repository_read"));
-    assert_eq!(governance.5.as_deref(), Some("low"));
+    assert_eq!(governance.0.as_deref(), Some("plan-2"));
+    assert_eq!(governance.1.as_deref(), Some(MILESTONE_ID));
+    assert_eq!(governance.2.as_deref(), Some("repository_read"));
+    assert_eq!(governance.3.as_deref(), Some("low"));
     assert_eq!(
-        governance.6, 1,
-        "an active approved baseline makes governed read-only verification runnable"
+        governance.4, 1,
+        "the approved Charter makes governed read-only verification runnable"
     );
 
     let dependencies: Vec<String> = sqlx::query_scalar(
@@ -1307,27 +1229,19 @@ async fn charter_backed_planning_and_discovery_are_read_only_and_runnable() {
             &format!("task-command-prebaseline-{suffix}-key"),
         )
         .await
-        .expect("pre-baseline planning/discovery proposal");
-        let governance: (
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            i64,
-        ) = sqlx::query_as(
-            "SELECT baseline_id, baseline_revision_id, capability_class,
+        .expect("charter-backed planning/discovery proposal");
+        let governance: (Option<String>, Option<String>, i64) = sqlx::query_as(
+            "SELECT capability_class,
                     risk_class, runnable
              FROM project_task_governance WHERE task_id = ?",
         )
         .bind(&proposal.task.id)
         .fetch_one(fixture.db.pool())
         .await
-        .expect("pre-baseline governance");
-        assert!(governance.0.is_none());
-        assert!(governance.1.is_none());
-        assert_eq!(governance.2.as_deref(), Some("repository_read"));
-        assert_eq!(governance.3.as_deref(), Some("low"));
-        assert_eq!(governance.4, 1);
+        .expect("charter-backed planning governance");
+        assert_eq!(governance.0.as_deref(), Some("repository_read"));
+        assert_eq!(governance.1.as_deref(), Some("low"));
+        assert_eq!(governance.2, 1);
     }
     assert_eq!(
         count(

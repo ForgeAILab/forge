@@ -384,12 +384,7 @@ export function ProjectReleasePage({ projectId, releaseId }: { projectId: string
               <DigestRow label="Snapshot digest" value={snapshot.snapshot_digest} />
               <DigestRow label="Readiness digest" value={snapshot.readiness_digest} />
               <DigestRow label="Source watermark" value={snapshot.source_event_watermark} />
-              <DigestRow label="Baseline" value={snapshot.baseline_id} />
-              <DigestRow label="Baseline revision" value={snapshot.baseline_revision_id} />
-              <DigestRow label="Baseline digest" value={snapshot.baseline_digest} />
               <DigestRow label="Schema version" value={snapshot.schema_version} />
-              <DigestRow label="Release policy" value={snapshot.release_policy_revision} />
-              <DigestRow label="Release policy digest" value={snapshot.release_policy_digest} />
               <DigestRow label="Readiness snapshot" value={snapshot.readiness_snapshot_id} />
             </dl>
             {snapshot.changelog.length > 0 ? (

@@ -23,8 +23,6 @@ const PROJECT_ID: &str = "plan04-project";
 const REPO_ID: &str = "plan04-repo";
 const CHARTER_ID: &str = "plan04-charter";
 const CHARTER_REVISION_ID: &str = "plan04-charter-revision";
-const BASELINE_ID: &str = "plan04-baseline";
-const BASELINE_REVISION_ID: &str = "plan04-baseline-revision";
 const MILESTONE_ID: &str = "plan04-milestone";
 const MILESTONE_REVISION_ID: &str = "plan04-milestone-revision";
 const ROOT_TASK_ID: &str = "plan04-root-task";
@@ -190,7 +188,7 @@ async fn fixture_with_allowed_operations(
     .await
     .expect("milestone revision");
 
-    let envelope = json!({
+    let _envelope = json!({
         "allowed_task_operations": allowed_task_operations,
         "fixed_outcomes": ["ship-the-approved-outcome"],
         "fixed_acceptance": ["acceptance-r1"],
@@ -198,67 +196,6 @@ async fn fixture_with_allowed_operations(
         "forbidden_side_effects": ["publish", "deploy"],
         "elevated_operations": ["none"],
     });
-    sqlx::query(
-        "INSERT INTO project_execution_baseline
-         (id, project_id, current_revision_id, lifecycle, version, created_at, updated_at)
-         VALUES (?, ?, ?, 'active', 1, ?, ?)",
-    )
-    .bind(BASELINE_ID)
-    .bind(PROJECT_ID)
-    .bind(BASELINE_REVISION_ID)
-    .bind(NOW)
-    .bind(NOW)
-    .execute(db.pool())
-    .await
-    .expect("baseline");
-    sqlx::query(
-        "INSERT INTO project_execution_baseline_revision
-         (id, baseline_id, revision, base_revision, lifecycle,
-          charter_revision_id, document_revisions_json, plan_items_json,
-          milestone_id, milestone_ids_json, milestone_definition_revision_ids_json,
-          primary_milestone_id, release_policy_json, release_policy_revision,
-          release_policy_digest, acceptance_matrix_json, capability_classes_json,
-          risk_classes_json, adaptive_envelope_json, elevated_operations_json,
-          exclusions_json, rollback_recovery_json, schema_version, render_version,
-          rendered_view, content_digest, rendered_digest, source_refs_json, created_at)
-         VALUES (?, ?, 1, 0, 'approved', ?, '[]', '[\"plan-1\"]', ?,
-                 '[\"plan04-milestone\"]', '[\"plan04-milestone-revision\"]', ?, '{}', 'release-r1', 'release-digest',
-                 '[{\"id\":\"acceptance-r1\",\"description\":\"acceptance\",\"required\":true}]',
-                 '[\"repository_write\"]', '[\"low\"]', ?, '[\"none\"]',
-                 '[\"publish\",\"deploy\"]', '{}', 'baseline@1',
-                 'baseline-render@1', '# PLAN-04 baseline', 'baseline-content',
-                 'baseline-rendered', '[]', ?)",
-    )
-    .bind(BASELINE_REVISION_ID)
-    .bind(BASELINE_ID)
-    .bind(CHARTER_REVISION_ID)
-    .bind(MILESTONE_ID)
-    .bind(MILESTONE_ID)
-    .bind(envelope.to_string())
-    .bind(NOW)
-    .execute(db.pool())
-    .await
-    .expect("baseline revision");
-    sqlx::query(
-        "INSERT INTO project_execution_baseline_approval
-         (id, baseline_id, revision_id, expected_project_version,
-          principal_type, principal_id, authorization_basis,
-          authorization_action, explicit_event, authorization_occurred_at,
-          content_digest, rendered_digest, lifecycle, idempotency_key,
-          created_at, updated_at)
-         VALUES ('plan04-approval', ?, ?, 3, 'user', 'plan04-user',
-                 'explicit approval', 'project.execution_baseline.approve',
-                 'plan04-approval-event', ?, 'baseline-content',
-                 'baseline-rendered', 'active', 'plan04-approval-key', ?, ?)",
-    )
-    .bind(BASELINE_ID)
-    .bind(BASELINE_REVISION_ID)
-    .bind(NOW)
-    .bind(NOW)
-    .bind(NOW)
-    .execute(db.pool())
-    .await
-    .expect("baseline approval");
 
     TaskRepo::create(
         &*db,
@@ -287,27 +224,21 @@ async fn fixture_with_allowed_operations(
     .expect("root Task");
     sqlx::query(
         "INSERT INTO project_task_governance
-         (task_id, project_id, charter_revision_id, baseline_id,
-          baseline_revision_id, plan_item_id, milestone_id,
+         (task_id, project_id, charter_revision_id, plan_item_id, milestone_id,
           document_revisions_json, capability_class, risk_class, runnable,
           replacement_of_task_id, provenance_json, version, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'plan-1', ?, '[]', 'repository_write', 'low',
+         VALUES (?, ?, ?, 'plan-1', ?, '[]', 'repository_write', 'low',
                  1, NULL, ?, 1, ?, ?)",
     )
     .bind(ROOT_TASK_ID)
     .bind(PROJECT_ID)
     .bind(CHARTER_REVISION_ID)
-    .bind(BASELINE_ID)
-    .bind(BASELINE_REVISION_ID)
     .bind(MILESTONE_ID)
     .bind(
         json!({
             "schema": "forge.task-governance/v1",
             "origin_plan_item_id": "plan-1",
-            "governing_baseline_id": BASELINE_ID,
-            "governing_baseline_revision_id": BASELINE_REVISION_ID,
-            "governing_baseline_content_digest": "baseline-content",
-            "governing_baseline_rendered_digest": "baseline-rendered",
+            "charter_authority": true,
             "fixed_outcomes": ["ship-the-approved-outcome"],
             "fixed_acceptance": ["acceptance-r1"],
             "fixed_risk_classes": ["low"],
@@ -453,10 +384,9 @@ fn assert_native_success(outcome: &Value, operation: &str) {
     assert!(outcome["event_id"].as_str().is_some(), "outcome: {outcome}");
 }
 
-async fn governance_row(db: &SqliteDb, task_id: &str) -> (String, String, String, String, String) {
+async fn governance_row(db: &SqliteDb, task_id: &str) -> (String, String, String) {
     sqlx::query_as(
-        "SELECT baseline_id, baseline_revision_id, plan_item_id,
-                risk_class, provenance_json
+        "SELECT plan_item_id, risk_class, provenance_json
          FROM project_task_governance WHERE task_id = ?",
     )
     .bind(task_id)
@@ -488,10 +418,7 @@ async fn plan04_split_sequence_replace_preserve_the_approved_boundaries() {
         .expect("split is inside the adaptive envelope");
     assert_eq!(children.len(), 2);
     for child in &children {
-        let (baseline, revision, plan_item, risk, provenance) =
-            governance_row(&db, &child.id).await;
-        assert_eq!(baseline, BASELINE_ID);
-        assert_eq!(revision, BASELINE_REVISION_ID);
+        let (plan_item, risk, provenance) = governance_row(&db, &child.id).await;
         assert_eq!(plan_item, "plan-1");
         assert_eq!(risk, "low");
         let provenance: Value = serde_json::from_str(&provenance).expect("provenance JSON");
@@ -527,17 +454,8 @@ async fn plan04_split_sequence_replace_preserve_the_approved_boundaries() {
         )
         .await
         .expect("replace is inside the adaptive envelope");
-    let (baseline, revision, plan_item, risk, provenance) =
-        governance_row(&db, &replacement.id).await;
-    assert_eq!(
-        (baseline, revision, plan_item, risk),
-        (
-            BASELINE_ID.to_owned(),
-            BASELINE_REVISION_ID.to_owned(),
-            "plan-1".to_owned(),
-            "low".to_owned(),
-        )
-    );
+    let (plan_item, risk, provenance) = governance_row(&db, &replacement.id).await;
+    assert_eq!((plan_item, risk), ("plan-1".to_owned(), "low".to_owned()));
     let provenance: Value = serde_json::from_str(&provenance).expect("replacement provenance");
     assert_eq!(provenance["origin_task_id"], ROOT_TASK_ID);
     assert_eq!(provenance["replacement_of_task_id"], ROOT_TASK_ID);
@@ -557,8 +475,6 @@ async fn plan04_crossing_a_fixed_boundary_records_reconciliation_without_freezin
     let (db, service) = fixture().await;
     let governance = api_types::TaskGovernanceRequest {
         charter_revision_id: Some(CHARTER_REVISION_ID.to_owned()),
-        baseline_id: Some(BASELINE_ID.to_owned()),
-        baseline_revision_id: Some(BASELINE_REVISION_ID.to_owned()),
         plan_item_id: Some("plan-1".to_owned()),
         milestone_id: Some(MILESTONE_ID.to_owned()),
         document_revision_ids: Vec::new(),
@@ -841,11 +757,6 @@ async fn plan04_adaptive_adapter_replay_is_frozen_before_mutable_gate_recheck() 
     // stale live gate, not a stale command input: the exact command already
     // committed and must replay its frozen snapshots without a new child or
     // reconciliation record.
-    sqlx::query("UPDATE project_execution_baseline SET lifecycle = 'superseded' WHERE id = ?")
-        .bind(BASELINE_ID)
-        .execute(fixture.db.pool())
-        .await
-        .expect("mutate live baseline gate");
     let replay = adapter_propose(
         &fixture,
         TASK_ADAPTIVE_OPERATION,
@@ -979,65 +890,13 @@ async fn adaptive_children_count(db: &SqliteDb) -> i64 {
 }
 
 #[tokio::test]
-async fn plan04_adaptive_adapter_uses_charter_authority_not_baseline_approval() {
-    // A superseded optional traceability plan does not revoke Charter-backed
-    // Task operations.
-    let stale_baseline = adapter_fixture().await;
-    sqlx::query("UPDATE project_execution_baseline SET lifecycle = 'superseded' WHERE id = ?")
-        .bind(BASELINE_ID)
-        .execute(stale_baseline.db.pool())
-        .await
-        .expect("supersede baseline");
-    adapter_propose(
-        &stale_baseline,
-        TASK_ADAPTIVE_OPERATION,
-        adaptive_split_payload(board_revision(&stale_baseline.db).await),
-        "plan04-stale-baseline",
-    )
-    .await
-    .expect("superseded traceability plan must not reject adaptive split");
-    assert_eq!(adaptive_children_count(&stale_baseline.db).await, 2);
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM project_reconciliation_record
-             WHERE project_id = ? AND state = 'required'",
-        )
-        .bind(PROJECT_ID)
-        .fetch_one(stale_baseline.db.pool())
-        .await
-        .expect("superseded plan reconciliation count"),
-        0
-    );
-
-    // Revoking optional plan approval likewise does not revoke Charter-backed
-    // Task operations.
-    let stale_approval = adapter_fixture().await;
-    sqlx::query(
-        "UPDATE project_execution_baseline_approval
-         SET lifecycle = 'revoked', updated_at = '2026-08-21T00:01:00.000Z'
-         WHERE id = 'plan04-approval'",
-    )
-    .execute(stale_approval.db.pool())
-    .await
-    .expect("revoke approval receipt");
-    adapter_propose(
-        &stale_approval,
-        TASK_ADAPTIVE_OPERATION,
-        adaptive_split_payload(board_revision(&stale_approval.db).await),
-        "plan04-stale-approval",
-    )
-    .await
-    .expect("revoked traceability approval must not reject adaptive split");
-    assert_eq!(adaptive_children_count(&stale_approval.db).await, 2);
-
+async fn plan04_adaptive_adapter_scopes_a_boundary_divergence_to_the_rejected_change() {
     // A real fixed-boundary divergence remains recorded, but it is scoped to
     // that rejected change and does not become a second Project-wide Task
     // workflow.
     let reconciled = adapter_fixture().await;
     let changed_governance = api_types::TaskGovernanceRequest {
         charter_revision_id: Some(CHARTER_REVISION_ID.to_owned()),
-        baseline_id: Some(BASELINE_ID.to_owned()),
-        baseline_revision_id: Some(BASELINE_REVISION_ID.to_owned()),
         plan_item_id: Some("plan-1".to_owned()),
         milestone_id: Some(MILESTONE_ID.to_owned()),
         document_revision_ids: Vec::new(),

@@ -531,6 +531,10 @@ fn map_task_comment(row: SqliteRow) -> Result<TaskComment> {
         author_id: row.try_get("author_id")?,
         author_name: row.try_get("author_name")?,
         content: row.try_get("content")?,
+        execution_id: row.try_get("execution_id")?,
+        role: row.try_get("role")?,
+        worklog_kind: row.try_get("worklog_kind")?,
+        idempotency_key: row.try_get("idempotency_key")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })

@@ -8,11 +8,9 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
-#[cfg(test)]
-use api_types::canonical_digest_with_schema;
 use api_types::{
-    ArtifactRef, CurrentVersionOrRevision, ExecutionBaselineContent, PrincipalKind,
-    ProjectCharterContent, ProjectDocumentContent, ProjectDocumentKind, RevisionProvenance,
+    CurrentVersionOrRevision, PrincipalKind, ProjectCharterContent, ProjectDocumentContent,
+    ProjectDocumentKind, RevisionProvenance,
 };
 use db::{
     new_uuid_v4, now_rfc3339, AgentAction, AgentActionExecution, AgentActionExecutionStatus,
@@ -23,8 +21,8 @@ use db::{
 use forge_agent_host::{
     is_allowed_project_direct_payload, is_project_orchestration_operation,
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
-    PROJECT_EVIDENCE_OPERATION, PROJECT_EXECUTION_BASELINE_OPERATION, PROJECT_MILESTONE_OPERATION,
-    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION,
+    PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
+    PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -34,19 +32,12 @@ use sqlx::Row;
 use crate::{
     parse_document_kind, AgentActionProvenance, AgentActionService,
     AuthorizationProvenance as CommandAuthorizationProvenance, CommandContext, CommandPrincipal,
-    CommandScope, CommandScopeType, ExecutionBaselineCommandService, ExpectedCommandState,
-    NewCommandContext, ProjectArtifactCommandService, ProjectCharterCommandService,
-    ProjectCharterRevisionCommand, ProjectCommandAuthorization, ProjectDocumentApprovalCommand,
-    ProjectDocumentRevisionCommand, ProjectEvidenceCommand, ProjectMilestoneCommandService,
-    ProjectValidationCommand, ProposeExecutionBaselineForApprovalCommand, Result,
-    SaveExecutionBaselineDraftCommand, ServiceError, EXECUTION_BASELINE_PROPOSE_COMMAND,
-    EXECUTION_BASELINE_SAVE_DRAFT_COMMAND,
+    CommandScope, CommandScopeType, ExpectedCommandState, NewCommandContext,
+    ProjectArtifactCommandService, ProjectCharterCommandService, ProjectCharterRevisionCommand,
+    ProjectCommandAuthorization, ProjectDocumentApprovalCommand, ProjectDocumentRevisionCommand,
+    ProjectEvidenceCommand, ProjectMilestoneCommandService, ProjectValidationCommand, Result,
+    ServiceError,
 };
-
-#[cfg(test)]
-const MILESTONE_DEFINITION_SCHEMA: &str = "forge.milestone-definition/v1";
-#[cfg(test)]
-const MILESTONE_RENDER_SCHEMA: &str = "forge.milestone-definition-render/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecuteProjectOrchestrationActionInput {
@@ -154,46 +145,6 @@ impl ProjectOrchestrationActionService {
                             return Ok(None);
                         }
                         current.revision_id = Some(revision.id);
-                        current.revision = Some(revision.revision);
-                        current.content_digest = Some(revision.content_digest);
-                        current.rendered_digest = Some(revision.rendered_digest);
-                    }
-                }
-                Ok(Some(current))
-            }
-            PROJECT_EXECUTION_BASELINE_OPERATION => {
-                let Some(baseline_id) = payload.get("baseline_id").and_then(Value::as_str) else {
-                    return Ok(None);
-                };
-                let Some(baseline) = ProjectOrchestrationRepo::get_project_execution_baseline(
-                    &*self.db,
-                    baseline_id,
-                )
-                .await?
-                else {
-                    return Ok(None);
-                };
-                if baseline.project_id != project.id {
-                    return Ok(None);
-                }
-
-                let mut current = CurrentVersionOrRevision::new(
-                    "project_execution_baseline",
-                    baseline.id.clone(),
-                );
-                current.version = Some(baseline.version);
-                if let Some(revision_id) = baseline.current_revision_id {
-                    current.revision_id = Some(revision_id.clone());
-                    if let Some(revision) =
-                        ProjectOrchestrationRepo::get_project_execution_baseline_revision(
-                            &*self.db,
-                            &revision_id,
-                        )
-                        .await?
-                    {
-                        if revision.baseline_id != baseline.id {
-                            return Ok(None);
-                        }
                         current.revision = Some(revision.revision);
                         current.content_digest = Some(revision.content_digest);
                         current.rendered_digest = Some(revision.rendered_digest);
@@ -407,15 +358,6 @@ impl ProjectOrchestrationActionService {
                 )
                 .await?
             }
-            PROJECT_EXECUTION_BASELINE_OPERATION => {
-                self.materialize_direct_execution_baseline(
-                    &action,
-                    &input.project_id,
-                    &payload,
-                    &context,
-                )
-                .await?
-            }
             PROJECT_MILESTONE_OPERATION => {
                 self.materialize_milestone(&action, &input.project_id, &payload, Some(&context))
                     .await?
@@ -565,15 +507,6 @@ impl ProjectOrchestrationActionService {
             }
             PROJECT_DECISION_OPERATION => {
                 self.materialize_decision_checked_with_command(
-                    &action,
-                    &project_id,
-                    &payload,
-                    command_context.as_ref(),
-                )
-                .await?
-            }
-            PROJECT_EXECUTION_BASELINE_OPERATION => {
-                self.materialize_execution_baseline(
                     &action,
                     &project_id,
                     &payload,
@@ -792,11 +725,6 @@ impl ProjectOrchestrationActionService {
         action: &AgentAction,
         context: &CommandContext,
     ) -> Result<Option<AgentActionExecution>> {
-        if action.operation == PROJECT_EXECUTION_BASELINE_OPERATION {
-            return self
-                .resolve_execution_baseline_replay(action, context)
-                .await;
-        }
         let receipt = CommandReceiptRepo::get_command_receipt(
             &*self.db,
             context.principal().principal_type(),
@@ -838,53 +766,6 @@ impl ProjectOrchestrationActionService {
         // the new command is allowed to fail atomically rather than silently
         // treating an unbound legacy row as a frozen command result.
         Ok(None)
-    }
-
-    /// Baseline commands have lifecycle-specific receipt operations below the
-    /// coarse native action operation.  Replay therefore follows the frozen
-    /// action-execution link rather than asking the generic Project command
-    /// lookup to guess a digest/operation that the adapter never owns.
-    async fn resolve_execution_baseline_replay(
-        &self,
-        action: &AgentAction,
-        context: &CommandContext,
-    ) -> Result<Option<AgentActionExecution>> {
-        let Some(execution) =
-            AgentActionRepo::get_successful_action_execution(&*self.db, &action.id).await?
-        else {
-            return Ok(None);
-        };
-        if execution.idempotency_key != context.idempotency_key()
-            || execution.executed_by_type != context.principal().principal_type()
-            || execution.executed_by_id != context.principal().principal_id()
-        {
-            return Err(ServiceError::Db(db::DbError::IdempotencyConflict));
-        }
-        let receipt = CommandReceiptRepo::get_command_receipt_by_agent_action_execution(
-            &*self.db,
-            &execution.id,
-        )
-        .await?;
-        let Some(receipt) = receipt else {
-            return Err(ServiceError::Conflict(
-                "execution baseline action execution has no linked command receipt".to_owned(),
-            ));
-        };
-        if receipt.scope_type != CommandScopeType::Project.as_str()
-            || receipt.scope_id != context.canonical_scope().scope_id()
-            || !matches!(
-                receipt.operation.as_str(),
-                EXECUTION_BASELINE_SAVE_DRAFT_COMMAND | EXECUTION_BASELINE_PROPOSE_COMMAND
-            )
-            || receipt.agent_action_execution_id.as_deref() != Some(execution.id.as_str())
-            || receipt.idempotency_key != execution.idempotency_key
-            || receipt.principal_type != execution.executed_by_type
-            || receipt.principal_id != execution.executed_by_id
-            || receipt.outcome_json != execution.result_json.clone().unwrap_or_default()
-        {
-            return Err(ServiceError::Db(db::DbError::IdempotencyConflict));
-        }
-        Ok(Some(execution))
     }
 
     async fn project_id_for_action(&self, action: &AgentAction) -> Result<String> {
@@ -1203,317 +1084,6 @@ impl ProjectOrchestrationActionService {
             .await
     }
 
-    async fn materialize_execution_baseline(
-        &self,
-        action: &AgentAction,
-        project_id: &str,
-        payload: &Value,
-        command_context: Option<&CommandContext>,
-    ) -> Result<Value> {
-        let context = command_context.ok_or_else(|| {
-            ServiceError::invalid_operation(
-                "Project execution-baseline execution requires a canonical command context",
-            )
-        })?;
-        let action_name = string(payload, "action")?;
-        let content = self
-            .native_execution_baseline_content(project_id, payload)
-            .await?;
-        let provenance: RevisionProvenance = from_value(payload, "provenance")?;
-        // The review target is derived from `content`, never echoed by the
-        // agent. Requiring the model to reproduce the server renderer
-        // byte-for-byte and recompute both digests is a contract it cannot
-        // satisfy, and it failed every baseline the Project Agent authored.
-        // The REST route keeps its strict round-trip contract; here the
-        // server renders and stamps its own canonical values.
-        let render =
-            crate::execution_baseline::render_execution_baseline(&content).map_err(|error| {
-                ServiceError::invalid_operation(format!("render baseline: {error}"))
-            })?;
-        let rendered_view = render.rendered_view;
-        let render_version =
-            crate::execution_baseline::EXECUTION_BASELINE_RENDER_VERSION.to_owned();
-        let content_digest = render.content_digest;
-        let render_digest = render.render_digest;
-        let authorization_action = match action_name.as_str() {
-            "draft_revision" | "revise" => EXECUTION_BASELINE_SAVE_DRAFT_COMMAND,
-            "propose_approval" => EXECUTION_BASELINE_PROPOSE_COMMAND,
-            _ => {
-                return Err(ServiceError::invalid_operation(
-                    "Project Agent may draft or propose a baseline; approval and activation are user-only",
-                ));
-            }
-        };
-        let authorization = document_command_authorization(action, context, authorization_action);
-        let baseline_id = optional_nonempty_string(payload, "baseline_id")?;
-        let base_revision_id = optional_nonempty_string(payload, "base_revision_id")?;
-        let expected_baseline_version = payload
-            .get("expected_baseline_version")
-            .map(|_| nonnegative_integer(payload, "expected_baseline_version"))
-            .transpose()?;
-        let service = ExecutionBaselineCommandService::new(Arc::clone(&self.db));
-        let _outcome = match authorization_action {
-            EXECUTION_BASELINE_SAVE_DRAFT_COMMAND => {
-                service
-                    .save_draft(SaveExecutionBaselineDraftCommand {
-                        project_id: project_id.to_owned(),
-                        baseline_id,
-                        base_revision_id,
-                        expected_baseline_version,
-                        content,
-                        rendered_view,
-                        render_version,
-                        content_digest,
-                        render_digest,
-                        provenance,
-                        idempotency_key: context.idempotency_key().to_owned(),
-                        authorization,
-                        action: context.action_provenance.clone(),
-                    })
-                    .await?
-            }
-            EXECUTION_BASELINE_PROPOSE_COMMAND => {
-                let baseline_id = baseline_id.ok_or_else(|| {
-                    ServiceError::invalid_operation(
-                        "baseline_id is required when proposing an execution baseline for approval",
-                    )
-                })?;
-                let expected_baseline_version = expected_baseline_version.ok_or_else(|| {
-                    ServiceError::invalid_operation(
-                        "expected_baseline_version is required when proposing an execution baseline for approval",
-                    )
-                })?;
-                service
-                    .propose_for_approval(ProposeExecutionBaselineForApprovalCommand {
-                        project_id: project_id.to_owned(),
-                        baseline_id,
-                        base_revision_id,
-                        expected_baseline_version,
-                        content,
-                        rendered_view,
-                        render_version,
-                        content_digest,
-                        render_digest,
-                        provenance,
-                        idempotency_key: context.idempotency_key().to_owned(),
-                        authorization,
-                        action: context.action_provenance.clone(),
-                    })
-                    .await?
-            }
-            _ => unreachable!(),
-        };
-        let execution = AgentActionRepo::get_successful_action_execution(&*self.db, &action.id)
-            .await?
-            .ok_or_else(|| {
-                ServiceError::Conflict(
-                    "execution baseline command committed without its AgentAction execution"
-                        .to_owned(),
-                )
-            })?;
-        let frozen = execution.result_json.ok_or_else(|| {
-            ServiceError::Conflict(
-                "execution baseline command AgentAction execution has no frozen outcome".to_owned(),
-            )
-        })?;
-        serde_json::from_str(&frozen).map_err(|error| {
-            ServiceError::invalid_operation(format!(
-                "deserialize frozen execution baseline outcome: {error}"
-            ))
-        })
-    }
-
-    async fn materialize_direct_execution_baseline(
-        &self,
-        action: &AgentAction,
-        project_id: &str,
-        payload: &Value,
-        context: &CommandContext,
-    ) -> Result<Value> {
-        let action_name = string(payload, "action")?;
-        let content = self
-            .native_execution_baseline_content(project_id, payload)
-            .await?;
-        let provenance: RevisionProvenance = from_value(payload, "provenance")?;
-        // The review target is derived from `content`, never echoed by the
-        // agent. Requiring the model to reproduce the server renderer
-        // byte-for-byte and recompute both digests is a contract it cannot
-        // satisfy, and it failed every baseline the Project Agent authored.
-        // The REST route keeps its strict round-trip contract; here the
-        // server renders and stamps its own canonical values.
-        let render =
-            crate::execution_baseline::render_execution_baseline(&content).map_err(|error| {
-                ServiceError::invalid_operation(format!("render baseline: {error}"))
-            })?;
-        let rendered_view = render.rendered_view;
-        let render_version =
-            crate::execution_baseline::EXECUTION_BASELINE_RENDER_VERSION.to_owned();
-        let content_digest = render.content_digest;
-        let render_digest = render.render_digest;
-        let authorization_action = match action_name.as_str() {
-            "draft_revision" | "revise" => EXECUTION_BASELINE_SAVE_DRAFT_COMMAND,
-            "propose_approval" => EXECUTION_BASELINE_PROPOSE_COMMAND,
-            _ => {
-                return Err(ServiceError::invalid_operation(
-                    "Project Agent may draft or propose a baseline; approval and activation are user-only",
-                ));
-            }
-        };
-        let authorization = document_command_authorization(action, context, authorization_action);
-        let baseline_id = optional_nonempty_string(payload, "baseline_id")?;
-        let base_revision_id = optional_nonempty_string(payload, "base_revision_id")?;
-        let expected_baseline_version = payload
-            .get("expected_baseline_version")
-            .map(|_| nonnegative_integer(payload, "expected_baseline_version"))
-            .transpose()?;
-        let service = ExecutionBaselineCommandService::new(Arc::clone(&self.db));
-        let outcome = match authorization_action {
-            EXECUTION_BASELINE_SAVE_DRAFT_COMMAND => {
-                service
-                    .save_draft_with_context(
-                        SaveExecutionBaselineDraftCommand {
-                            project_id: project_id.to_owned(),
-                            baseline_id,
-                            base_revision_id,
-                            expected_baseline_version,
-                            content,
-                            rendered_view,
-                            render_version,
-                            content_digest,
-                            render_digest,
-                            provenance,
-                            idempotency_key: context.idempotency_key().to_owned(),
-                            authorization,
-                            action: None,
-                        },
-                        context.clone(),
-                    )
-                    .await?
-            }
-            EXECUTION_BASELINE_PROPOSE_COMMAND => {
-                let baseline_id = baseline_id.ok_or_else(|| {
-                    ServiceError::invalid_operation(
-                        "baseline_id is required when proposing an execution baseline for approval",
-                    )
-                })?;
-                let expected_baseline_version = expected_baseline_version.ok_or_else(|| {
-                    ServiceError::invalid_operation(
-                        "expected_baseline_version is required when proposing an execution baseline for approval",
-                    )
-                })?;
-                service
-                    .propose_for_approval_with_context(
-                        ProposeExecutionBaselineForApprovalCommand {
-                            project_id: project_id.to_owned(),
-                            baseline_id,
-                            base_revision_id,
-                            expected_baseline_version,
-                            content,
-                            rendered_view,
-                            render_version,
-                            content_digest,
-                            render_digest,
-                            provenance,
-                            idempotency_key: context.idempotency_key().to_owned(),
-                            authorization,
-                            action: None,
-                        },
-                        context.clone(),
-                    )
-                    .await?
-            }
-            _ => unreachable!(),
-        };
-        serde_json::to_value(outcome).map_err(|error| {
-            ServiceError::invalid_operation(format!(
-                "serialize direct execution baseline outcome: {error}"
-            ))
-        })
-    }
-
-    /// Build the native baseline content from authoritative Project state.
-    /// The model selects a Charter revision by id; Forge authorizes that id in
-    /// the bound Project and supplies every digest/render echo from persistence
-    /// before the baseline itself is rendered. REST callers retain the strict
-    /// round-trip validation in `ExecutionBaselineCommandService`.
-    async fn native_execution_baseline_content(
-        &self,
-        project_id: &str,
-        payload: &Value,
-    ) -> Result<ExecutionBaselineContent> {
-        let mut content_value = payload
-            .get("content")
-            .cloned()
-            .ok_or_else(|| ServiceError::invalid_operation("content is required"))?;
-        let content_object = content_value.as_object_mut().ok_or_else(|| {
-            ServiceError::invalid_operation("execution baseline content must be an object")
-        })?;
-        let charter_revision_id = content_object
-            .get("charter_revision")
-            .and_then(Value::as_object)
-            .and_then(|reference| reference.get("revision_id"))
-            .and_then(Value::as_str)
-            .filter(|revision_id| !revision_id.trim().is_empty())
-            .ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "content.charter_revision.revision_id must be non-empty",
-                )
-            })?;
-        let charter_revision =
-            ProjectOrchestrationRepo::get_project_charter_revision(&*self.db, charter_revision_id)
-                .await?
-                .ok_or_else(|| {
-                    ServiceError::conflict("Charter revision is not owned by this Project")
-                })?;
-        let charter =
-            ProjectOrchestrationRepo::get_project_charter(&*self.db, &charter_revision.charter_id)
-                .await?
-                .filter(|charter| charter.project_id.as_deref() == Some(project_id))
-                .ok_or_else(|| {
-                    ServiceError::conflict("Charter revision is not owned by this Project")
-                })?;
-        content_object.insert(
-            "charter_revision".to_owned(),
-            serde_json::to_value(ArtifactRef {
-                artifact_id: charter.id,
-                revision_id: charter_revision.id,
-                content_digest: charter_revision.content_digest,
-                render_version: Some(charter_revision.render_version),
-                render_digest: Some(charter_revision.rendered_digest),
-            })
-            .map_err(|error| {
-                ServiceError::invalid_operation(format!(
-                    "serialize canonical Charter ArtifactRef: {error}"
-                ))
-            })?,
-        );
-
-        // The policy digest is a hash over the frozen release policy the caller
-        // just supplied. A model cannot compute a digest, so demanding it echo
-        // one made the baseline unauthorable. A placeholder keeps the typed
-        // shape intact through deserialization; the real value is derived below
-        // from the policy payload the server is about to validate.
-        content_object.insert(
-            "release_policy_digest".to_owned(),
-            Value::String("pending-server-derived".to_owned()),
-        );
-        let mut content: ExecutionBaselineContent =
-            serde_json::from_value(content_value).map_err(|error| {
-                ServiceError::invalid_operation(format!("invalid content: {error}"))
-            })?;
-        // Project Agents start with the complete safe adaptive vocabulary.
-        // Fine-grained reductions belong to an explicit user setting; until
-        // that surface exists, a model-authored baseline must not accidentally
-        // remove its own ability to split, sequence, or replace in-scope Tasks.
-        content.adaptive_envelope.allowed_task_operations =
-            api_types::AdaptiveTaskOperation::ALL.to_vec();
-        content.release_policy_digest =
-            crate::execution_baseline::release_policy_digest(&content.release_policy).map_err(
-                |error| ServiceError::invalid_operation(format!("release policy digest: {error}")),
-            )?;
-        Ok(content)
-    }
-
     async fn materialize_milestone(
         &self,
         action: &AgentAction,
@@ -1697,6 +1267,8 @@ impl ProjectOrchestrationActionService {
                     status: string(payload, "status")?,
                     result: string(payload, "result")?,
                     input_digest: string(payload, "input_digest")?,
+                    observed_task_id: optional_string(payload, "observed_task_id"),
+                    evidence_asset_id: optional_string(payload, "evidence_asset_id"),
                     expected_milestone_version,
                     idempotency_key: context.idempotency_key().to_owned(),
                     authorization,
@@ -1801,17 +1373,6 @@ fn direct_receipt_operation(operation: &str, payload: &Value) -> Result<String> 
             "Project operation is not an automatically allowed coordination subaction",
         ));
     }
-    if operation == PROJECT_EXECUTION_BASELINE_OPERATION {
-        return match payload.get("action").and_then(Value::as_str) {
-            Some("draft_revision") | Some("revise") => {
-                Ok(EXECUTION_BASELINE_SAVE_DRAFT_COMMAND.to_owned())
-            }
-            Some("propose_approval") => Ok(EXECUTION_BASELINE_PROPOSE_COMMAND.to_owned()),
-            _ => Err(ServiceError::invalid_operation(
-                "Project Agent may draft or propose a baseline; approval and activation are user-only",
-            )),
-        };
-    }
     Ok(operation.to_owned())
 }
 
@@ -1833,17 +1394,6 @@ fn direct_command_context(
         if let Some(value) = payload.get(key).and_then(Value::as_i64) {
             versions.insert(key.to_owned(), value);
         }
-    }
-    if operation == EXECUTION_BASELINE_SAVE_DRAFT_COMMAND
-        || operation == EXECUTION_BASELINE_PROPOSE_COMMAND
-    {
-        versions.insert(
-            "baseline_version".to_owned(),
-            payload
-                .get("expected_baseline_version")
-                .and_then(Value::as_i64)
-                .unwrap_or(1),
-        );
     }
     let digests = BTreeMap::from([
         ("action_scope_type".to_owned(), input.scope_type.clone()),
@@ -1998,16 +1548,6 @@ fn optional_string(payload: &Value, field: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn optional_nonempty_string(payload: &Value, field: &str) -> Result<Option<String>> {
-    match payload.get(field) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
-        Some(_) => Err(ServiceError::invalid_operation(format!(
-            "{field} must be a non-empty string when supplied"
-        ))),
-    }
-}
-
 fn integer(payload: &Value, field: &str) -> Result<i64> {
     payload
         .get(field)
@@ -2020,16 +1560,6 @@ fn positive_integer(payload: &Value, field: &str) -> Result<i64> {
     if value < 1 {
         return Err(ServiceError::invalid_operation(format!(
             "{field} must be a positive integer"
-        )));
-    }
-    Ok(value)
-}
-
-fn nonnegative_integer(payload: &Value, field: &str) -> Result<i64> {
-    let value = integer(payload, field)?;
-    if value < 0 {
-        return Err(ServiceError::invalid_operation(format!(
-            "{field} must be a non-negative integer"
         )));
     }
     Ok(value)
@@ -2110,389 +1640,6 @@ fn document_command_authorization(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use api_types::{
-        AdaptiveEnvelope, ArtifactRef, ExecutionBaselineContent, ExecutionBaselineReleasePolicy,
-        PrincipalKind, PrincipalRef,
-    };
-    use db::{create_sqlite_pool, run_migrations, CreateProject, ProjectRepo};
-    use std::sync::Arc;
-
-    fn baseline_test_content(
-        charter_id: &str,
-        charter_revision_id: &str,
-        charter_digest: &str,
-        milestone_id: &str,
-        milestone_definition_revision_id: &str,
-    ) -> ExecutionBaselineContent {
-        let release_policy = ExecutionBaselineReleasePolicy {
-            schema_version: crate::EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA.to_owned(),
-            revision: "policy-r1".to_owned(),
-            required_check_definition_revisions: vec!["check-r1".to_owned()],
-            reviewer_independence_rules: vec!["independent-reviewer".to_owned()],
-            manual_attestation_rules: vec!["manual-attestation".to_owned()],
-            waiver_rules: vec!["user-waiver".to_owned()],
-            evidence_kinds: vec!["test-report".to_owned()],
-            evidence_contexts: vec!["repository".to_owned()],
-            evidence_freshness_rules: vec!["current-commit".to_owned()],
-            dependency_rules: vec!["dependencies-green".to_owned()],
-            stale_input_rules: vec!["stale-baseline-blocks".to_owned()],
-            forbidden_side_effects: vec!["publish".to_owned()],
-            known_issue_rules: vec!["record-known-issue".to_owned()],
-            correction_rules: vec!["correct-before-release".to_owned()],
-            purge_rules: vec!["purge-invalid-evidence".to_owned()],
-        };
-        let release_policy_digest = canonical_digest_with_schema(
-            crate::EXECUTION_BASELINE_RELEASE_POLICY_SCHEMA,
-            &release_policy,
-        )
-        .expect("release policy digest");
-        ExecutionBaselineContent {
-            charter_revision: ArtifactRef {
-                artifact_id: charter_id.to_owned(),
-                revision_id: charter_revision_id.to_owned(),
-                content_digest: charter_digest.to_owned(),
-                render_version: Some("charter-render-v1".to_owned()),
-                render_digest: Some("charter-render-digest".to_owned()),
-            },
-            document_revisions: Vec::new(),
-            plan_item_ids: vec!["plan-1".to_owned()],
-            milestone_ids: vec![milestone_id.to_owned()],
-            milestone_definition_revision_ids: vec![milestone_definition_revision_id.to_owned()],
-            primary_milestone_id: Some(milestone_id.to_owned()),
-            release_policy_revision: release_policy.revision.clone(),
-            release_policy_digest,
-            release_policy,
-            acceptance_evidence_matrix: Vec::new(),
-            capability_classes: vec!["repository_write".to_owned()],
-            risk_classes: vec!["low".to_owned()],
-            reviewer_independence_rules: Vec::new(),
-            elevated_operations: Vec::new(),
-            adaptive_envelope: AdaptiveEnvelope {
-                allowed_task_operations: vec![api_types::AdaptiveTaskOperation::Split],
-                fixed_outcomes: Vec::new(),
-                fixed_acceptance: Vec::new(),
-                fixed_risk_classes: vec!["low".to_owned()],
-                forbidden_side_effects: Vec::new(),
-                elevated_operations: Vec::new(),
-            },
-            rollback_and_recovery: Vec::new(),
-            exclusions: Vec::new(),
-        }
-    }
-
-    #[tokio::test]
-    async fn action_baseline_materializer_rehydrates_charter_ref_and_persists_manifest_v076() {
-        let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
-        run_migrations(&pool).await.expect("fresh V076 schema");
-        let db = SqliteDb::new(pool);
-        let now = now_rfc3339();
-        let user_id = new_uuid_v4();
-        let project_id = new_uuid_v4();
-        let charter_id = new_uuid_v4();
-        let charter_revision_id = new_uuid_v4();
-        let milestone_id = new_uuid_v4();
-        let milestone_definition_revision_id = new_uuid_v4();
-
-        sqlx::query(
-            "INSERT INTO user (id, email, password_hash, display_name, created_at, updated_at)
-             VALUES (?, ?, 'test', 'Baseline Action User', ?, ?)",
-        )
-        .bind(&user_id)
-        .bind(format!("{user_id}@example.test"))
-        .bind(&now)
-        .bind(&now)
-        .execute(db.pool())
-        .await
-        .expect("user");
-        ProjectRepo::create(
-            &db,
-            CreateProject {
-                id: project_id.clone(),
-                name: "Baseline Action Project".to_owned(),
-                settings: "{}".to_owned(),
-                workflow_definition: "{}".to_owned(),
-                primary_repo_id: None,
-                owner_id: Some(user_id.clone()),
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-        )
-        .await
-        .expect("project");
-        sqlx::query(
-            "INSERT INTO project_charter (
-                 id, account_id, project_id, project_mode, maturity, lifecycle,
-                 version, created_at, updated_at
-             ) VALUES (?, ?, ?, 'compact', 'prototype', 'attached', 1, ?, ?)",
-        )
-        .bind(&charter_id)
-        .bind(&user_id)
-        .bind(&project_id)
-        .bind(&now)
-        .bind(&now)
-        .execute(db.pool())
-        .await
-        .expect("charter");
-        sqlx::query(
-            "INSERT INTO project_charter_revision (
-                 id, charter_id, revision, base_revision, lifecycle, schema_version,
-                 render_version, content_json, rendered_view, change_summary,
-                 author_type, author_id, source_refs_json, content_digest,
-                 rendered_digest, created_at
-             ) VALUES (?, ?, 1, 0, 'approved', 'charter-v1', 'charter-render-v1',
-                       '{}', '{}', 'test', 'user', ?, '[]', ?, ?, ?)",
-        )
-        .bind(&charter_revision_id)
-        .bind(&charter_id)
-        .bind(&user_id)
-        .bind("charter-content-digest")
-        .bind("charter-render-digest")
-        .bind(&now)
-        .execute(db.pool())
-        .await
-        .expect("charter revision");
-        sqlx::query(
-            "UPDATE project_charter
-             SET current_approved_revision_id = ?, current_draft_revision_id = ?, version = 2
-             WHERE id = ?",
-        )
-        .bind(&charter_revision_id)
-        .bind(&charter_revision_id)
-        .bind(&charter_id)
-        .execute(db.pool())
-        .await
-        .expect("approve charter fixture");
-        sqlx::query(
-            "UPDATE project
-             SET current_charter_id = ?, current_charter_revision_id = ?,
-                 current_charter_version = 1, charter_status = 'charter_backed',
-                 charter_setup_required = 0
-             WHERE id = ?",
-        )
-        .bind(&charter_id)
-        .bind(&charter_revision_id)
-        .bind(&project_id)
-        .execute(db.pool())
-        .await
-        .expect("attach charter fixture");
-        sqlx::query(
-            "INSERT INTO project_milestone (
-                 id, project_id, milestone_sequence, milestone_key, display_label,
-                 lifecycle, blocker_reason_json, stale_reason_json,
-                 reconciliation_reason_json, version, created_at, updated_at
-             ) VALUES (?, ?, 1, 'M001', 'Deliver outcome', 'planned', '[]', '[]', '[]', 1, ?, ?)",
-        )
-        .bind(&milestone_id)
-        .bind(&project_id)
-        .bind(&now)
-        .bind(&now)
-        .execute(db.pool())
-        .await
-        .expect("milestone");
-        sqlx::query(
-            "INSERT INTO project_milestone_revision (
-                 id, milestone_id, revision, base_revision, lifecycle,
-                 display_label, outcome, included_scope_json, excluded_scope_json,
-                 charter_revision_id, document_revisions_json, task_selection_json,
-                 dependencies_json, risks_json, acceptance_checks_json,
-                 evidence_requirements_json, known_issues_json, change_summary,
-                 schema_version, render_version, rendered_view, content_digest,
-                 rendered_digest, author_type, author_id, source_refs_json, created_at
-             ) VALUES (?, ?, 1, 0, 'proposed', 'Deliver outcome', 'Deliver outcome',
-                       '[]', '[]', ?, '[]', '[]', '[]', '[]', '[]', '[]', '[]',
-                       'test', ?, ?, '{}', ?, ?, 'agent', NULL, '[]', ?)",
-        )
-        .bind(&milestone_definition_revision_id)
-        .bind(&milestone_id)
-        .bind(&charter_revision_id)
-        .bind(MILESTONE_DEFINITION_SCHEMA)
-        .bind(MILESTONE_RENDER_SCHEMA)
-        .bind("milestone-content-digest")
-        .bind("milestone-render-digest")
-        .bind(&now)
-        .execute(db.pool())
-        .await
-        .expect("milestone definition");
-        sqlx::query(
-            "UPDATE project_milestone
-             SET current_definition_revision_id = ?
-             WHERE id = ?",
-        )
-        .bind(&milestone_definition_revision_id)
-        .bind(&milestone_id)
-        .execute(db.pool())
-        .await
-        .expect("milestone definition pointer");
-
-        let mut content = baseline_test_content(
-            &charter_id,
-            &charter_revision_id,
-            "charter-content-digest",
-            &milestone_id,
-            &milestone_definition_revision_id,
-        );
-        content.charter_revision.artifact_id = "invented-charter".to_owned();
-        content.charter_revision.content_digest = "invented-content-digest".to_owned();
-        content.charter_revision.render_version = Some("forge.charter-render/v1".to_owned());
-        content.charter_revision.render_digest = Some("invented-render-digest".to_owned());
-        let mut native_payload = json!({"content": content});
-        let action_service = ProjectOrchestrationActionService::new(Arc::new(db.clone()));
-        let content = action_service
-            .native_execution_baseline_content(&project_id, &native_payload)
-            .await
-            .expect("native content rehydrates the persisted Charter revision");
-        assert_eq!(
-            content.adaptive_envelope.allowed_task_operations,
-            api_types::AdaptiveTaskOperation::ALL
-        );
-        assert_eq!(content.charter_revision.artifact_id, charter_id);
-        assert_eq!(
-            content.charter_revision.content_digest,
-            "charter-content-digest"
-        );
-        assert_eq!(
-            content.charter_revision.render_version.as_deref(),
-            Some("charter-render-v1")
-        );
-        assert_eq!(
-            content.charter_revision.render_digest.as_deref(),
-            Some("charter-render-digest")
-        );
-        // The native provider adapter removes these redundant echoes entirely;
-        // the service accepts that exact shape as long as revision_id remains.
-        for field in [
-            "artifact_id",
-            "content_digest",
-            "render_version",
-            "render_digest",
-        ] {
-            native_payload["content"]["charter_revision"]
-                .as_object_mut()
-                .expect("Charter ref object")
-                .remove(field);
-        }
-        let content_without_echoes = action_service
-            .native_execution_baseline_content(&project_id, &native_payload)
-            .await
-            .expect("revision_id alone resolves the canonical Charter ref");
-        assert_eq!(
-            content_without_echoes.charter_revision,
-            content.charter_revision
-        );
-        let expected_release_policy_digest = content.release_policy_digest.clone();
-        let expected_release_policy =
-            serde_json::to_value(&content.release_policy).expect("release policy JSON");
-        let expected_adaptive_envelope =
-            serde_json::to_value(&content.adaptive_envelope).expect("adaptive envelope JSON");
-        // No baseline_id: drafting a new baseline must server-mint the shell
-        // id. The native adapter uses this same command service below.
-        let rendered = crate::render_execution_baseline(&content).expect("render baseline");
-        let service = crate::ExecutionBaselineCommandService::new(Arc::new(db.clone()));
-        let result = service
-            .save_draft(crate::SaveExecutionBaselineDraftCommand {
-                project_id: project_id.clone(),
-                baseline_id: None,
-                base_revision_id: None,
-                expected_baseline_version: None,
-                content,
-                rendered_view: rendered.rendered_view,
-                render_version: crate::EXECUTION_BASELINE_RENDER_VERSION.to_owned(),
-                content_digest: rendered.content_digest,
-                render_digest: rendered.render_digest,
-                provenance: RevisionProvenance {
-                    author: PrincipalRef {
-                        kind: PrincipalKind::User,
-                        id: user_id.clone(),
-                        display_name: None,
-                    },
-                    profile_revision: None,
-                    operating_skill_revision: None,
-                    source_refs: Vec::new(),
-                    change_summary: "test baseline draft".to_owned(),
-                    material_diff: None,
-                },
-                idempotency_key: "baseline-action-dedupe".to_owned(),
-                authorization: ProjectCommandAuthorization {
-                    principal_type: "user".to_owned(),
-                    principal_id: user_id,
-                    policy_result: "allowed".to_owned(),
-                    policy_revision: None,
-                    policy_digest: None,
-                    requested_permission: Some("propose_project".to_owned()),
-                    correlation_id: "baseline-action-correlation".to_owned(),
-                    causation_id: None,
-                    causation_depth: 0,
-                    authorization_event_id: "baseline-action-authorization".to_owned(),
-                    authorization_basis: "test".to_owned(),
-                    authorization_action: crate::EXECUTION_BASELINE_SAVE_DRAFT_COMMAND.to_owned(),
-                    authorization_occurred_at: now,
-                    authorization_json: "{}".to_owned(),
-                },
-                action: None,
-            })
-            .await
-            .expect("baseline command materializes on fresh V076 schema");
-        let minted_baseline_id = result.baseline_id.as_str();
-        uuid::Uuid::parse_str(minted_baseline_id).expect("baseline id is a server-minted UUID");
-        let revision_id = result
-            .revision_id
-            .as_deref()
-            .expect("revision id")
-            .to_owned();
-        let row = sqlx::query(
-            "SELECT milestone_ids_json, milestone_definition_revision_ids_json,
-                    primary_milestone_id, release_policy_revision, release_policy_digest,
-                    release_policy_json, adaptive_envelope_json
-             FROM project_execution_baseline_revision WHERE id = ?",
-        )
-        .bind(revision_id)
-        .fetch_one(db.pool())
-        .await
-        .expect("persisted baseline revision");
-        assert_eq!(
-            row.try_get::<String, _>("milestone_ids_json")
-                .expect("milestone ids"),
-            format!(r#"["{milestone_id}"]"#)
-        );
-        assert_eq!(
-            row.try_get::<String, _>("milestone_definition_revision_ids_json")
-                .expect("definition ids"),
-            format!(r#"["{milestone_definition_revision_id}"]"#)
-        );
-        assert_eq!(
-            row.try_get::<Option<String>, _>("primary_milestone_id")
-                .expect("primary milestone"),
-            Some(milestone_id)
-        );
-        assert_eq!(
-            row.try_get::<String, _>("release_policy_revision")
-                .expect("policy revision"),
-            "policy-r1"
-        );
-        assert_eq!(
-            row.try_get::<String, _>("release_policy_digest")
-                .expect("policy digest"),
-            expected_release_policy_digest
-        );
-        let release_policy_json: Value = serde_json::from_str(
-            &row.try_get::<String, _>("release_policy_json")
-                .expect("policy json"),
-        )
-        .expect("release policy projection");
-        assert_eq!(
-            release_policy_json.get("policy"),
-            Some(&expected_release_policy)
-        );
-        assert_eq!(
-            serde_json::from_str::<Value>(
-                &row.try_get::<String, _>("adaptive_envelope_json")
-                    .expect("adaptive envelope"),
-            )
-            .expect("adaptive envelope projection"),
-            expected_adaptive_envelope
-        );
-    }
-
     #[test]
     fn direct_project_allowlist_excludes_approval_and_release_operations() {
         assert!(is_allowed_project_direct_payload(

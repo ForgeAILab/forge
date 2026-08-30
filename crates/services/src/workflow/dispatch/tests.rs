@@ -88,8 +88,6 @@ fn fake_context(role: &str) -> AgentDispatchContext {
 }
 
 const FAILURE_TAXONOMY_LINE: &str = "Failure taxonomy: classify any blocker using exactly this taxonomy: transient | input_missing | environment | code_bug | design_gap | review_failed | systemic.";
-const HANDOFF_SECTIONS_LINE: &str =
-    "Summary | Deliverables | Verification | Deviations | Next Step";
 
 #[test]
 fn default_prompt_builders_include_managed_contract_and_role_boundaries() {
@@ -224,8 +222,11 @@ fn worker_prompt_builders_cover_autonomous_handoff_and_use_coder_tools() {
     assert!(merge_fix.user.contains("Merge repair is required"));
 }
 
+/// The coder reports through the worklog the reviewer reads, and proves
+/// behaviour with a captured artifact rather than prose. Forge posts the final
+/// completion summary itself, so the prompt must not ask for a handoff block.
 #[test]
-fn coder_family_prompts_require_structured_completion_handoff() {
+fn coder_family_prompts_require_a_worklog_and_captured_proof() {
     for builder_id in [
         BUILDER_ID_CODER_IMPLEMENTATION_V2,
         BUILDER_ID_CODER_REVIEW_FIX_V2,
@@ -234,20 +235,30 @@ fn coder_family_prompts_require_structured_completion_handoff() {
         let prompt = resolve_prompt_builder(builder_id).build(&fake_context(default_roles::CODER));
 
         assert!(
-            prompt.system.contains(HANDOFF_SECTIONS_LINE),
-            "{builder_id} missing handoff sections"
+            prompt.system.contains("`task.worklog`"),
+            "{builder_id} missing the worklog contract"
         );
         assert!(
             prompt
                 .system
-                .contains("List any verification not run with the reason."),
-            "{builder_id} missing skipped verification rule"
+                .contains("not for every tool call or file edit"),
+            "{builder_id} missing the worklog cadence rule"
+        );
+        assert!(
+            prompt.system.contains("`task.evidence`"),
+            "{builder_id} missing the captured-proof rule"
         );
         assert!(
             prompt
                 .system
-                .contains("For UI/runtime behavior changes, include proof media"),
-            "{builder_id} missing proof media rule"
+                .contains("Proof of behaviour is a captured artifact, not prose"),
+            "{builder_id} missing the proof-is-an-artifact rule"
+        );
+        assert!(
+            !prompt
+                .system
+                .contains("Summary | Deliverables | Verification | Deviations | Next Step"),
+            "{builder_id} still asks for a handoff block Forge now writes itself"
         );
     }
 }

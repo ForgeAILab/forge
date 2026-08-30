@@ -74,7 +74,6 @@ import type {
   Project,
   ProjectOverview,
   ProjectRelease,
-  ExecutionBaselineResponse,
   ValidationResult,
   Repo,
   Review,
@@ -303,13 +302,6 @@ export function useRecordManualMilestoneCheck() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: async (input: RecordManualMilestoneCheckInput) => {
-      const baseline = await apiFetch<ExecutionBaselineResponse>(
-        `/projects/${input.projectId}/execution-baseline`,
-      )
-      const baselineRevisionId = baseline.current_revision?.id
-      if (baseline.baseline.lifecycle !== 'active' || !baselineRevisionId) {
-        throw new Error('A current active execution baseline is required before attestation.')
-      }
       return apiFetch<ValidationResult>(
         `/projects/${input.projectId}/milestones/${input.milestoneId}/checks/${input.checkId}/result`,
         {
@@ -327,7 +319,7 @@ export function useRecordManualMilestoneCheck() {
             status: input.status,
             result: input.result,
             input_digest: input.inputDigest,
-            governing_revision_ids: [input.charterRevisionId, baselineRevisionId],
+            governing_revision_ids: [input.charterRevisionId],
           }),
         },
       )

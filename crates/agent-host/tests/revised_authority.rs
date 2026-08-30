@@ -88,6 +88,156 @@ fn advertised_operations(composition: &ScopeToolComposition, tool_name: &str) ->
         .unwrap_or_default()
 }
 
+/// Evidence capture must reach the Worker and the reviewer -- the two roles
+/// that actually run something -- and must never appear in a Project Agent
+/// session, which has no workspace and no process and could therefore only
+/// author an artifact rather than capture one.
+/// The Agent that cites a run must be able to inspect it. Reading what a run
+/// reported is the step between "a Task ran" and "this outcome is acceptable",
+/// and it is what lets the Project Agent decide a corrective Task is needed.
+/// A Project Agent holding its own workspace can read the delivered software,
+/// run it, and keep its own documents and memory beside it.
+#[test]
+fn project_agent_workspace_grants_read_run_and_its_own_documents() {
+    let composition = ScopeToolComposition::for_scope_with_permissions_and_project_chat(
+        "identity-project",
+        CanonicalScope {
+            scope_type: CanonicalScopeType::AgentChat,
+            scope_id: "chat-1".to_owned(),
+            workspace_access: WorkspaceAccess::ProjectVerify,
+        },
+        None,
+        Some("/tmp/forge-verify-checkout"),
+        &broad_permissions(),
+        true,
+        Some(Arc::new(NoopProvider)),
+    )
+    .expect("Project verification composition is valid");
+    let names = composition.tool_names();
+    assert!(
+        names.iter().any(|name| name.contains("command")),
+        "verification must be able to run the delivered software"
+    );
+    assert!(
+        names.iter().any(|name| name.contains("read")),
+        "verification must be able to read the checkout"
+    );
+    // It writes in its own workspace -- memory, notes, helper scripts. Where
+    // that write belongs is a matter of instruction, not of tooling: the
+    // checkout is disposable and detached, so an edit there goes nowhere.
+    assert!(
+        names.iter().any(|name| name == "forge_task_write"),
+        "the Project Agent must be able to keep documents and memory"
+    );
+
+    // Without a checkout the scope is rejected rather than silently degraded.
+    assert!(
+        ScopeToolComposition::for_scope_with_permissions_and_project_chat(
+            "identity-project",
+            CanonicalScope {
+                scope_type: CanonicalScopeType::AgentChat,
+                scope_id: "chat-1".to_owned(),
+                workspace_access: WorkspaceAccess::ProjectVerify,
+            },
+            None,
+            None,
+            &broad_permissions(),
+            true,
+            Some(Arc::new(NoopProvider)),
+        )
+        .is_err(),
+        "a verification scope without a checkout must fail closed"
+    );
+}
+
+#[test]
+fn project_agent_can_read_what_task_runs_reported() {
+    let provider = Arc::new(NoopProvider);
+    let composition = ScopeToolComposition::for_scope_with_permissions_and_project_chat(
+        "identity-project",
+        CanonicalScope {
+            scope_type: CanonicalScopeType::AgentChat,
+            scope_id: "chat-1".to_owned(),
+            workspace_access: WorkspaceAccess::Deny,
+        },
+        None,
+        None,
+        &broad_permissions(),
+        true,
+        Some(provider),
+    )
+    .expect("Project Agent Chat composition is valid");
+    assert!(
+        advertised_operations(&composition, "forge_project_orchestration_read")
+            .iter()
+            .any(|operation| operation == "project.observations"),
+        "a Project Agent must be able to read the worklog and artifacts it cites"
+    );
+}
+
+#[test]
+fn evidence_capture_is_exposed_to_task_roles_and_withheld_from_project_scope() {
+    let provider = Arc::new(NoopProvider);
+    for (role, access) in [
+        ("coder", WorkspaceAccess::TaskWrite),
+        ("reviewer", WorkspaceAccess::TaskRead),
+    ] {
+        let composition = ScopeToolComposition::for_scope_with_permissions(
+            "identity-task",
+            CanonicalScope {
+                scope_type: CanonicalScopeType::Task,
+                scope_id: "task-1".to_owned(),
+                workspace_access: access,
+            },
+            Some(role),
+            Some("/tmp/forge-capture-workspace"),
+            &broad_permissions(),
+            Some(provider.clone()),
+        )
+        .expect("Task tool composition is valid");
+        let operations = advertised_operations(&composition, "forge_scope_propose");
+        assert!(
+            operations
+                .iter()
+                .any(|operation| operation == "task.evidence"),
+            "{role} must be able to capture what its own run produced"
+        );
+        assert!(
+            operations
+                .iter()
+                .any(|operation| operation == "task.worklog"),
+            "{role} must be able to record what it did for the next role to read"
+        );
+    }
+
+    let project = ScopeToolComposition::for_scope_with_permissions(
+        "identity-project",
+        CanonicalScope {
+            scope_type: CanonicalScopeType::AgentChat,
+            scope_id: "chat-1".to_owned(),
+            workspace_access: WorkspaceAccess::Deny,
+        },
+        None,
+        None,
+        &broad_permissions(),
+        Some(provider),
+    )
+    .expect("Project Agent Chat composition is valid");
+    let project_operations = advertised_operations(&project, "forge_scope_propose");
+    assert!(
+        !project_operations
+            .iter()
+            .any(|operation| operation == "task.evidence"),
+        "a session with no workspace must never capture evidence: it could only author it"
+    );
+    assert!(
+        !project_operations
+            .iter()
+            .any(|operation| operation == "task.worklog"),
+        "the Task worklog belongs to the run that did the work"
+    );
+}
+
 #[test]
 fn main_scope_catalog_has_no_task_mutation_or_filesystem() {
     let provider = Arc::new(NoopProvider);

@@ -591,7 +591,7 @@ async fn load_task_counts(
 ) -> ApiResult<Value> {
     let rows = if let Some(milestone_id) = milestone_id {
         sqlx::query(
-            "SELECT t.status
+            "SELECT t.status, t.blocked_json
              FROM task t
              JOIN project_task_governance g ON g.task_id = t.id
              WHERE t.project_id = ? AND g.project_id = ? AND g.milestone_id = ?
@@ -604,22 +604,33 @@ async fn load_task_counts(
         .await
         .map_err(sql_error)?
     } else {
-        sqlx::query("SELECT status FROM task WHERE project_id = ? AND deleted_at IS NULL")
-            .bind(project_id)
-            .fetch_all(state.db.pool())
-            .await
-            .map_err(sql_error)?
+        sqlx::query(
+            "SELECT status, blocked_json FROM task
+             WHERE project_id = ? AND deleted_at IS NULL",
+        )
+        .bind(project_id)
+        .fetch_all(state.db.pool())
+        .await
+        .map_err(sql_error)?
     };
 
     let mut counts = Counts::default();
     for row in rows {
         counts.total += 1;
         let status = row.try_get::<String, _>("status").map_err(sql_error)?;
+        // A Task keeps its workflow status when an execution fails, so status
+        // alone reports stalled work as active. The blocked record is what the
+        // user is actually waiting on, and a terminal Task has moved past it.
+        let blocked = row
+            .try_get::<Option<String>, _>("blocked_json")
+            .unwrap_or_default()
+            .is_some_and(|value| !value.trim().is_empty());
         match classify_status(&status) {
+            TaskBucket::Terminal => counts.terminal += 1,
+            _ if blocked => counts.blocked += 1,
             TaskBucket::Backlog => counts.backlog += 1,
             TaskBucket::Active => counts.active += 1,
             TaskBucket::Review => counts.review += 1,
-            TaskBucket::Terminal => counts.terminal += 1,
             TaskBucket::Blocked => counts.blocked += 1,
         }
     }
@@ -1196,8 +1207,6 @@ async fn load_latest_readiness(
 ) -> ApiResult<(Option<Value>, bool)> {
     let row = sqlx::query(
         "SELECT id, project_id, milestone_id, definition_revision_id,
-                baseline_id, baseline_revision_id, baseline_digest,
-                release_policy_revision, release_policy_digest,
                 input_manifest_json, event_watermark, outcome,
                 blocking_reasons_json, check_results_json, waiver_manifest_json,
                 evidence_manifest_json, commit_context_json,
@@ -1218,18 +1227,8 @@ async fn load_latest_readiness(
         return Ok((None, false));
     };
     let definition_revision_id = try_get!(row, String, "definition_revision_id");
-    let baseline_id = try_get!(row, String, "baseline_id");
-    let baseline_revision_id = try_get!(row, String, "baseline_revision_id");
-    let baseline_digest = try_get!(row, String, "baseline_digest");
-    let release_policy_revision = try_get!(row, String, "release_policy_revision");
-    let release_policy_digest = try_get!(row, String, "release_policy_digest");
     let source_event_watermark = try_get!(row, String, "event_watermark");
     let stale = definition_revision_id != current_definition_revision_id
-        || baseline_id.trim().is_empty()
-        || baseline_revision_id.trim().is_empty()
-        || baseline_digest.trim().is_empty()
-        || release_policy_revision.trim().is_empty()
-        || release_policy_digest.trim().is_empty()
         || source_event_watermark.trim().is_empty();
     let input_manifest =
         typed_json_array::<api_types::ReadinessInput>(&row, "input_manifest_json")?;
@@ -1321,11 +1320,6 @@ async fn load_latest_readiness(
             "milestone_id": try_get!(row, String, "milestone_id"),
             "expected_milestone_version": expected_milestone_version,
             "milestone_definition_revision_id": definition_revision_id,
-            "baseline_id": baseline_id,
-            "baseline_revision_id": baseline_revision_id,
-            "baseline_digest": baseline_digest,
-            "release_policy_revision": release_policy_revision,
-            "release_policy_digest": release_policy_digest,
             "input_manifest": input_manifest,
             "source_event_watermark": source_event_watermark,
             "result": result,
@@ -1357,9 +1351,7 @@ async fn load_releases(state: &AppState, project_id: &str) -> ApiResult<(Vec<Val
         "SELECT r.id, r.project_id, r.milestone_id, r.release_sequence,
                 r.release_revision, r.release_identifier,
                 r.milestone_revision_id, r.readiness_snapshot_id,
-                r.readiness_digest, r.baseline_id, r.baseline_revision_id,
-                r.baseline_digest, r.release_policy_revision,
-                r.release_policy_digest,
+                r.readiness_digest,
                 r.summary, r.changelog, r.known_issues_json,
                 r.charter_revision_id, r.document_revisions_json,
                 r.decision_ids_json, r.task_references_json,
@@ -1470,11 +1462,6 @@ async fn load_releases(state: &AppState, project_id: &str) -> ApiResult<(Vec<Val
             stale = true;
             continue;
         };
-        let release_policy_revision = try_get!(row, String, "release_policy_revision");
-        let baseline_id = try_get!(row, String, "baseline_id");
-        let baseline_revision_id = try_get!(row, String, "baseline_revision_id");
-        let baseline_digest = try_get!(row, String, "baseline_digest");
-        let release_policy_digest = try_get!(row, String, "release_policy_digest");
         let milestone_definition_revision_id = try_get!(row, String, "milestone_revision_id");
         let milestone_definition_digest = try_get!(row, String, "milestone_definition_digest");
         let readiness_snapshot_id = try_get!(row, String, "readiness_snapshot_id");
@@ -1487,12 +1474,7 @@ async fn load_releases(state: &AppState, project_id: &str) -> ApiResult<(Vec<Val
         let authorization_action = try_get!(row, String, "authorization_action");
         let authorization_event = try_get!(row, String, "explicit_event");
         let authorization_occurred_at = try_get!(row, String, "authorization_occurred_at");
-        if baseline_id.trim().is_empty()
-            || baseline_revision_id.trim().is_empty()
-            || baseline_digest.trim().is_empty()
-            || release_policy_revision.trim().is_empty()
-            || release_policy_digest.trim().is_empty()
-            || milestone_definition_revision_id.trim().is_empty()
+        if milestone_definition_revision_id.trim().is_empty()
             || milestone_definition_digest.trim().is_empty()
             || readiness_snapshot_id.trim().is_empty()
             || readiness_digest.trim().is_empty()
@@ -1525,9 +1507,6 @@ async fn load_releases(state: &AppState, project_id: &str) -> ApiResult<(Vec<Val
             "readiness_snapshot_id": readiness_snapshot_id,
             "readiness_digest": readiness_digest,
             "source_event_watermark": source_event_watermark,
-            "baseline_id": baseline_id,
-            "baseline_revision_id": baseline_revision_id,
-            "baseline_digest": baseline_digest,
             "charter_revision": charter_ref,
             "document_revisions": row_json_array_from(&row, "document_revisions_json")?,
             "included_decisions": decision_refs,
@@ -1536,8 +1515,6 @@ async fn load_releases(state: &AppState, project_id: &str) -> ApiResult<(Vec<Val
             "repository_references": string_array_from(&row, "git_references_json")?,
             "evidence_pins": evidence_pins,
             "waived_check_ids": string_array_from(&row, "waivers_json")?,
-            "release_policy_revision": release_policy_revision,
-            "release_policy_digest": release_policy_digest,
             "released_by": released_by,
             "authorization": {
                 "principal": released_by,
@@ -2483,7 +2460,6 @@ mod next_action_parity_tests {
         let _ = crate::routes::project_execution_setup::retry_provisioning;
         let _ = crate::routes::project_execution_setup::select_worker;
         let _ = crate::routes::project_execution_setup::attach_primary_repository;
-        let _ = crate::routes::execution_baseline::approve_execution_baseline;
         let _ = crate::routes::milestones::record_milestone_check;
         let _ = crate::routes::project_media::attach_evidence;
         let _ = crate::routes::milestones::evaluate_readiness;

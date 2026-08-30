@@ -1880,6 +1880,7 @@ mod tests {
                 task_id: None,
                 task_role: None,
                 workspace_access: "deny".to_owned(),
+                workspace_path: None,
                 authority_json: "{}".to_owned(),
                 created_at: now.clone(),
                 updated_at: now.clone(),

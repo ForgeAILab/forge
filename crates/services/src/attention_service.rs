@@ -140,11 +140,56 @@ enum WakeDecisionEvent {
 #[derive(Clone)]
 pub struct AttentionService {
     db: Arc<SqliteDb>,
+    event_bus: Option<Arc<events::EventBus>>,
 }
 
 impl AttentionService {
     pub fn new(db: Arc<SqliteDb>) -> Self {
-        Self { db }
+        Self {
+            db,
+            event_bus: None,
+        }
+    }
+
+    /// Attach the event bus so an autonomy stall reaches the user. Without it
+    /// the suppression is still recorded in the wake ledger; it just stays
+    /// invisible, which is the failure this exists to prevent.
+    #[must_use]
+    pub fn with_event_bus(mut self, event_bus: Arc<events::EventBus>) -> Self {
+        self.event_bus = Some(event_bus);
+        self
+    }
+
+    /// Announce that autonomy has halted while incidents remain unanswered.
+    async fn publish_autonomy_stall(&self, scope_type: &str, scope_id: &str, reason: &str) {
+        if scope_type != "project" {
+            return;
+        }
+        let Some(event_bus) = self.event_bus.as_ref() else {
+            return;
+        };
+        // Only a stall with outstanding work is worth interrupting a user for.
+        let open_incidents: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM attention_projection
+             WHERE scope_type = 'project' AND scope_id = ? AND status = 'open'",
+        )
+        .bind(scope_id)
+        .fetch_one(self.db.pool())
+        .await
+        .unwrap_or(0);
+        if open_incidents == 0 {
+            return;
+        }
+        event_bus.publish(events::ForgeEvent {
+            event_type: "project.autonomy_stalled".to_owned(),
+            entity_id: scope_id.to_owned(),
+            timestamp: events::event_timestamp(),
+            context: events::EventContext::ProjectAutonomyStalled {
+                project_id: scope_id.to_owned(),
+                open_incidents,
+                reason: reason.to_owned(),
+            },
+        });
     }
 
     /// Start the durable Attention projection consumer.  The worker owns no
@@ -592,6 +637,12 @@ impl AttentionService {
             )
             .await?;
             transaction.commit().await?;
+            self.publish_autonomy_stall(
+                &budget_scope_type,
+                &budget_scope_id,
+                "the Project Agent's hourly wake budget is exhausted",
+            )
+            .await;
             return Ok(WakeAdmissionResult::Suppressed {
                 reason: WakeSuppressionReason::BudgetExhausted,
             });

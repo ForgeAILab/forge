@@ -6,7 +6,7 @@
 //! admitted wake into one system-authored Agent Chat message plus a queued
 //! turn job for the woken identity's chat, so the agent actually runs a turn
 //! and can act on the incident.  It also delivers the user-driven
-//! continuation `project.execution_baseline.activated` straight to the
+//! continuation straight to the
 //! Project Agent chat — a user approval is its own deterministic admission
 //! and consumes no wake budget.
 //!
@@ -20,8 +20,7 @@ use db::{
     AgentChatMessageStatus, AgentChatRepo, AgentWakeDisposition, AgentWakeDispositionKind,
     AgentWakeDispositionRepo, AttentionRepo, ClaimDomainEvents, CompleteClaimedWake,
     CompleteDomainEvent, CreateAgentChatMessage, CreateAgentChatTurnJob,
-    CreateAgentWakeDisposition, CreateAttentionProjection, DomainEvent, DomainEventRepo,
-    RetryAgentWakeDisposition, SqliteDb,
+    CreateAgentWakeDisposition, DomainEvent, DomainEventRepo, RetryAgentWakeDisposition, SqliteDb,
 };
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -45,6 +44,131 @@ const MAX_DETAIL_CHARS: usize = 2_000;
 pub(crate) const DELIVERY_FOLLOWUP_POSTCONDITION_SCHEMA: &str =
     "forge.delivery-followup-postcondition/v1";
 pub(crate) const DELIVERY_FOLLOWUP_READINESS_EVENT: &str = "milestone.readiness.evaluated";
+pub(crate) const DELIVERY_FOLLOWUP_VALIDATION_EVENT: &str = "project.milestone.check.recorded";
+/// A wake message is a work order, not a report; keep the named work bounded
+/// so a milestone with a long check matrix cannot crowd out the instruction.
+const MAX_DELIVERY_FOLLOWUP_MILESTONES: usize = 3;
+const MAX_DELIVERY_FOLLOWUP_CHECKS: usize = 8;
+
+/// What a delivery follow-up wake actually has to settle, resolved from server
+/// state at admission time.
+///
+/// The wake fires when a Task reaches `done`, and the work it implies is not
+/// "describe the completion" — it is "settle the acceptance checks this
+/// delivery was supposed to satisfy". Resolving that here means the work order
+/// can name the exact milestone, version, definition revision, and check ids
+/// the Agent must pass to `project.validation`, instead of asking it to
+/// rediscover them and hope it decides to act.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct DeliveryFollowupState {
+    pub(crate) milestones: Vec<DeliveryFollowupMilestone>,
+    /// Open milestones the work order could not carry. Reported rather than
+    /// dropped, so a bounded message never reads as full coverage.
+    pub(crate) skipped_milestones: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeliveryFollowupMilestone {
+    pub(crate) milestone_id: String,
+    pub(crate) milestone_key: String,
+    pub(crate) version: i64,
+    pub(crate) definition_revision_id: String,
+    pub(crate) open_task_count: i64,
+    /// Required checks the Agent may settle itself, in stable check order.
+    pub(crate) agent_check_ids: Vec<String>,
+    /// Required checks only an authorized user can attest.
+    pub(crate) manual_check_ids: Vec<String>,
+}
+
+impl DeliveryFollowupState {
+    fn agent_settleable(&self) -> bool {
+        self.milestones
+            .iter()
+            .any(|milestone| !milestone.agent_check_ids.is_empty())
+    }
+
+    /// The event the turn must actually commit. Outstanding validation comes
+    /// first: readiness computed before the results exist can only re-report
+    /// the same missing checks, which is exactly the loop this wake used to
+    /// produce.
+    pub(crate) fn required_event_type(&self) -> Option<&'static str> {
+        if self.agent_settleable() {
+            Some(DELIVERY_FOLLOWUP_VALIDATION_EVENT)
+        } else if self.milestones.is_empty() {
+            // Nothing to settle and nothing to evaluate.
+            None
+        } else {
+            Some(DELIVERY_FOLLOWUP_READINESS_EVENT)
+        }
+    }
+}
+
+/// Name the checks the work order can carry. A milestone with more required
+/// checks than fit says so rather than presenting a truncated list as complete.
+fn named_checks(check_ids: &[String]) -> String {
+    if check_ids.len() <= MAX_DELIVERY_FOLLOWUP_CHECKS {
+        return check_ids.join(", ");
+    }
+    format!(
+        "{}, and {} more (read `project.current_state` for the rest)",
+        check_ids[..MAX_DELIVERY_FOLLOWUP_CHECKS].join(", "),
+        check_ids.len() - MAX_DELIVERY_FOLLOWUP_CHECKS,
+    )
+}
+
+/// Render the ordered work order for a delivery follow-up wake.
+pub(crate) fn delivery_followup_directive(state: &DeliveryFollowupState) -> String {
+    let mut lines = String::from("\nDELIVERY FOLLOW-UP WORK ORDER\n");
+    let mut has_work = false;
+    for milestone in &state.milestones {
+        if milestone.agent_check_ids.is_empty() && milestone.manual_check_ids.is_empty() {
+            continue;
+        }
+        has_work = true;
+        let progress = if milestone.open_task_count == 0 {
+            "every Task bound to it is done".to_owned()
+        } else {
+            format!("{} Task(s) still open", milestone.open_task_count)
+        };
+        lines.push_str(&format!(
+            "\nMilestone {} ({}): {}.\n  milestone_id={} milestone_version={} definition_revision_id={}\n",
+            milestone.milestone_key,
+            milestone.milestone_id,
+            progress,
+            milestone.milestone_id,
+            milestone.version,
+            milestone.definition_revision_id,
+        ));
+        if !milestone.agent_check_ids.is_empty() {
+            lines.push_str(&format!(
+                "  Settle yourself, in this turn: {}. Exercise the delivered software against each check's expected result, then record what you observed with `project.validation` (action `record`) using the exact milestone_id, milestone_version, definition_revision_id, and check_id above. One call per check.\n",
+                named_checks(&milestone.agent_check_ids),
+            ));
+        }
+        if !milestone.manual_check_ids.is_empty() {
+            lines.push_str(&format!(
+                "  User-attested only: {}. Ask the user for the observation; you may never record one yourself.\n",
+                named_checks(&milestone.manual_check_ids),
+            ));
+        }
+    }
+    if !has_work {
+        lines.push_str(
+            "\nEvery required acceptance check already has a current authoritative result. Evaluate readiness for the applicable milestone with `project.readiness` and report the committed canonical result, even when it is blocked, failed, or stale.\n",
+        );
+        return lines;
+    }
+    lines.push_str(
+        "\nRecord every check you can settle before evaluating readiness: readiness computed first can only re-report the same missing results. Narration does not complete this turn, and Task completion or a passing review is not validation.\n",
+    );
+    if state.skipped_milestones > 0 {
+        lines.push_str(&format!(
+            "{} further open milestone(s) are not named here; read `project.current_state` for them.\n",
+            state.skipped_milestones,
+        ));
+    }
+    lines
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeTurnRun {
@@ -521,10 +645,6 @@ impl WakeTurnConsumer {
                     }),
                 )
             }
-            "project.execution_baseline.activated" => {
-                self.plan_baseline(event, attempt, max_attempts, parent_id)
-                    .await?
-            }
             _ => WakeDeliveryPlan::Suppressed(self.disposition(DispositionSpec {
                 event,
                 attempt,
@@ -837,7 +957,36 @@ impl WakeTurnConsumer {
             }
             AgentTurnReadiness::Ready => {}
         }
-        let content = wake_content(&attention);
+        // A delivery follow-up's work order is resolved from server state, not
+        // from the incident text: the Agent is told which milestone, which
+        // checks, and which exact ids to record against.
+        let delivery = if attention.attention_type == "delivery_followup" {
+            match self
+                .delivery_followup_state(
+                    &attention.scope_id,
+                    delivery_followup_task_id(&attention).as_deref(),
+                )
+                .await
+            {
+                Ok(state) => Some(state),
+                Err(_) => {
+                    return Ok(self.deferred_plan(DeferredPlanSpec {
+                        event,
+                        attempt,
+                        max_attempts,
+                        parent_id,
+                        reason: "delivery_state_unavailable",
+                        incident_key: Some(fields.incident_key),
+                        incident_digest: Some(incident_digest),
+                        responder: None,
+                        attention_id: Some(attention.id),
+                    }));
+                }
+            }
+        } else {
+            None
+        };
+        let content = wake_content(&attention, delivery.as_ref());
         let digest = content_digest(&content)
             .map_err(|_| ServiceError::invalid_operation("wake content digest failed"))?;
         let dedupe_key = format!("wake-turn:{}", event.id);
@@ -871,8 +1020,14 @@ impl WakeTurnConsumer {
                 }));
             }
         };
-        let admission =
-            self.build_turn_admission(event, chat, content, prepared.clone(), Some(&attention))?;
+        let admission = self.build_turn_admission(
+            event,
+            chat,
+            content,
+            prepared.clone(),
+            Some(&attention),
+            delivery.as_ref(),
+        )?;
         let mut disposition = self.disposition(DispositionSpec {
             event,
             attempt,
@@ -898,184 +1053,131 @@ impl WakeTurnConsumer {
         })
     }
 
-    async fn plan_baseline(
+    /// Resolve the delivery follow-up work order from server state.
+    ///
+    /// The milestone set is the one the completed Task is governed by; a Task
+    /// bound to no milestone falls back to the Project's open milestones, so a
+    /// delivery still reaches the outcome it was meant to satisfy.
+    async fn delivery_followup_state(
         &self,
-        event: &DomainEvent,
-        attempt: i64,
-        max_attempts: i64,
-        parent_id: Option<String>,
-    ) -> Result<WakeDeliveryPlan> {
-        if event.scope_type != "project" {
-            return Ok(WakeDeliveryPlan::Suppressed(self.disposition(
-                DispositionSpec {
-                    event,
-                    attempt,
-                    max_attempts,
-                    kind: AgentWakeDispositionKind::DeterministicallySuppressed,
-                    reason: "ineligible_scope",
-                    incident_key: None,
-                    incident_digest: None,
-                    attention_id: None,
-                    responder: None,
-                    parent_disposition_id: parent_id,
-                },
-            )));
-        }
-        let payload = serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
-        let Some(baseline_id) = payload
-            .pointer("/result/baseline_id")
-            .and_then(Value::as_str)
-        else {
-            return Ok(WakeDeliveryPlan::Suppressed(self.disposition(
-                DispositionSpec {
-                    event,
-                    attempt,
-                    max_attempts,
-                    kind: AgentWakeDispositionKind::DeterministicallySuppressed,
-                    reason: "malformed_baseline_activation",
-                    incident_key: None,
-                    incident_digest: None,
-                    attention_id: None,
-                    responder: None,
-                    parent_disposition_id: parent_id,
-                },
-            )));
-        };
-        let revision_id = payload
-            .pointer("/result/revision_id")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let Some(chat) = self.chat_for_scope("project", &event.scope_id).await? else {
-            let attention = self
-                .ensure_setup_attention(event, None, "project_chat_missing")
-                .await?;
-            return Ok(WakeDeliveryPlan::SetupRequired(self.disposition(
-                DispositionSpec {
-                    event,
-                    attempt,
-                    max_attempts,
-                    kind: AgentWakeDispositionKind::SetupRequired,
-                    reason: "project_chat_setup_required",
-                    incident_key: Some(format!("baseline_activation:{}", event.id)),
-                    incident_digest: None,
-                    attention_id: Some(attention.id),
-                    responder: None,
-                    parent_disposition_id: parent_id,
-                },
-            )));
-        };
-        let content = format!(
-            "Traceability plan {baseline_id} (revision {revision_id}) is now active. The approved Charter already authorizes implementation. Refresh optional plan-item links, confirm Task assignments and workflows, then continue the highest-priority runnable Task."
-        );
-        let digest = content_digest(&content)
-            .map_err(|_| ServiceError::invalid_operation("baseline content digest failed"))?;
-        let service = AgentTurnAdmissionService::new(Arc::clone(&self.db));
-        let responder = match service.resolve(&chat).await {
-            Ok(responder) => responder,
-            Err(_) => {
-                return Ok(self.deferred_plan(DeferredPlanSpec {
-                    event,
-                    attempt,
-                    max_attempts,
-                    parent_id,
-                    reason: "responder_resolution_unavailable",
-                    incident_key: Some(format!("baseline_activation:{}", event.id)),
-                    incident_digest: None,
-                    responder: None,
-                    attention_id: None,
-                }))
-            }
-        };
-        if responder.readiness == AgentTurnReadiness::SetupRequired {
-            let attention = self
-                .ensure_setup_attention(
-                    event,
-                    responder.identity_id.clone(),
-                    "project_responder_setup_required",
+        project_id: &str,
+        task_id: Option<&str>,
+    ) -> Result<DeliveryFollowupState> {
+        let governed_milestone_ids: Vec<String> = match task_id {
+            Some(task_id) => {
+                sqlx::query_scalar(
+                    "SELECT DISTINCT g.milestone_id FROM project_task_governance g
+                 WHERE g.task_id = ? AND g.project_id = ? AND g.milestone_id IS NOT NULL",
                 )
-                .await?;
-            return Ok(WakeDeliveryPlan::SetupRequired(self.disposition(
-                DispositionSpec {
-                    event,
-                    attempt,
-                    max_attempts,
-                    kind: AgentWakeDispositionKind::SetupRequired,
-                    reason: "responder_setup_required",
-                    incident_key: Some(format!("baseline_activation:{}", event.id)),
-                    incident_digest: None,
-                    attention_id: Some(attention.id),
-                    responder: Some(&responder),
-                    parent_disposition_id: parent_id,
-                },
-            )));
-        }
-        if responder.readiness == AgentTurnReadiness::Unavailable {
-            return Ok(self.deferred_plan(DeferredPlanSpec {
-                event,
-                attempt,
-                max_attempts,
-                parent_id,
-                reason: "responder_unavailable",
-                incident_key: Some(format!("baseline_activation:{}", event.id)),
-                incident_digest: None,
-                responder: Some(&responder),
-                attention_id: None,
-            }));
-        }
-        let dedupe_key = format!("baseline-turn:{}", event.id);
-        let prepared = match service
-            .prepare(AgentTurnPrepareInput {
-                chat: &chat,
-                trigger: AgentTurnTrigger::BaselineActivation,
-                dedupe_key: &dedupe_key,
-                content_digest: &digest,
-                causation_id: Some(&event.id),
-                causation_depth: event
-                    .causation_depth
-                    .saturating_add(1)
-                    .min(MAX_WAKE_REACTION_DEPTH),
-                source_responder: None,
-            })
-            .await
-        {
-            Ok(prepared) => prepared,
-            Err(_) => {
-                return Ok(self.deferred_plan(DeferredPlanSpec {
-                    event,
-                    attempt,
-                    max_attempts,
-                    parent_id,
-                    reason: "turn_admission_unavailable",
-                    incident_key: Some(format!("baseline_activation:{}", event.id)),
-                    incident_digest: None,
-                    responder: Some(&responder),
-                    attention_id: None,
-                }))
+                .bind(task_id)
+                .bind(project_id)
+                .fetch_all(self.db.pool())
+                .await?
             }
+            None => Vec::new(),
         };
-        let admission = self.build_turn_admission(event, chat, content, prepared.clone(), None)?;
-        let mut disposition = self.disposition(DispositionSpec {
-            event,
-            attempt,
-            max_attempts,
-            kind: AgentWakeDispositionKind::TurnAdmitted,
-            reason: "turn_admitted",
-            incident_key: Some(format!("baseline_activation:{}", event.id)),
-            incident_digest: None,
-            attention_id: None,
-            responder: None,
-            parent_disposition_id: parent_id,
-        });
-        disposition.turn_job_id = Some(admission.turn.id.clone());
-        disposition.binding_id = admission.turn.responder_binding_id.clone();
-        disposition.binding_version = admission.turn.responder_binding_version;
-        disposition.profile_id = Some(admission.turn.profile_id.clone());
-        disposition.profile_version = admission.turn.profile_version;
-        disposition.provenance_json = Some(prepared.canonical_scope_provenance_json);
-        Ok(WakeDeliveryPlan::Admitted {
-            disposition,
-            admission: Box::new(admission),
-            expected_attention: None,
+
+        let candidates = sqlx::query(
+            "SELECT m.id, m.milestone_key, m.version,
+                    m.current_definition_revision_id AS definition_revision_id,
+                    r.task_selection_json
+             FROM project_milestone m
+             JOIN project_milestone_revision r
+               ON r.id = m.current_definition_revision_id AND r.milestone_id = m.id
+             WHERE m.project_id = ?
+               AND m.lifecycle IN ('planned', 'active', 'ready_for_release')
+             ORDER BY m.milestone_sequence ASC, m.id ASC",
+        )
+        .bind(project_id)
+        .fetch_all(self.db.pool())
+        .await?;
+
+        let mut milestones = Vec::new();
+        let mut skipped_milestones = 0usize;
+        for row in candidates {
+            let milestone_id: String = row.try_get("id")?;
+            if !governed_milestone_ids.is_empty() && !governed_milestone_ids.contains(&milestone_id)
+            {
+                continue;
+            }
+            if milestones.len() >= MAX_DELIVERY_FOLLOWUP_MILESTONES {
+                skipped_milestones += 1;
+                continue;
+            }
+            let definition_revision_id: String = row.try_get("definition_revision_id")?;
+            let task_selection_json: String = row.try_get("task_selection_json")?;
+            // Mirror readiness: a milestone gates on every governed Task plus
+            // every Task its definition selected, so the wake never claims the
+            // work is finished while readiness still sees an open Task.
+            let open_task_count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM task t
+                 WHERE t.project_id = ?
+                   AND t.deleted_at IS NULL AND t.archived_at IS NULL
+                   AND t.status NOT IN ('done', 'cancelled')
+                   AND (
+                        t.id IN (SELECT g.task_id FROM project_task_governance g
+                                 WHERE g.milestone_id = ? AND g.project_id = ?)
+                     OR t.id IN (SELECT value FROM json_each(?))
+                   )",
+            )
+            .bind(project_id)
+            .bind(&milestone_id)
+            .bind(project_id)
+            .bind(&task_selection_json)
+            .fetch_optional(self.db.pool())
+            .await?
+            .unwrap_or_default();
+
+            let check_rows = sqlx::query(
+                "SELECT c.id, c.source_kind, COALESCE(r.outcome, 'missing') AS outcome
+                 FROM project_milestone_check c
+                 LEFT JOIN project_milestone_check_result r
+                   ON r.id = c.current_result_id
+                  AND r.definition_revision_id = c.definition_revision_id
+                 WHERE c.project_id = ? AND c.milestone_id = ?
+                   AND c.definition_revision_id = ? AND c.required = 1
+                   AND COALESCE(r.outcome, 'missing') NOT IN ('passed', 'waived')
+                 ORDER BY c.check_key ASC
+                 LIMIT 64",
+            )
+            .bind(project_id)
+            .bind(&milestone_id)
+            .bind(&definition_revision_id)
+            .fetch_all(self.db.pool())
+            .await?;
+            let mut agent_check_ids = Vec::new();
+            let mut manual_check_ids = Vec::new();
+            for check in check_rows {
+                let check_id: String = check.try_get("id")?;
+                let source_kind: String = check.try_get("source_kind")?;
+                let outcome: String = check.try_get("outcome")?;
+                // A check that already failed or went stale is still
+                // outstanding, but it is not unobserved: say which it is so the
+                // Agent re-runs it rather than reporting it as never attempted.
+                let named = if outcome == "missing" {
+                    check_id
+                } else {
+                    format!("{check_id} (currently {outcome})")
+                };
+                if source_kind == "manual" {
+                    manual_check_ids.push(named);
+                } else {
+                    agent_check_ids.push(named);
+                }
+            }
+            milestones.push(DeliveryFollowupMilestone {
+                milestone_id,
+                milestone_key: row.try_get("milestone_key")?,
+                version: row.try_get("version")?,
+                definition_revision_id,
+                open_task_count,
+                agent_check_ids,
+                manual_check_ids,
+            });
+        }
+        Ok(DeliveryFollowupState {
+            milestones,
+            skipped_milestones,
         })
     }
 
@@ -1086,6 +1188,7 @@ impl WakeTurnConsumer {
         content: String,
         prepared: PreparedAgentTurnAdmission,
         attention: Option<&db::AttentionProjection>,
+        delivery: Option<&DeliveryFollowupState>,
     ) -> Result<AdmitAgentChatTurn> {
         let message_id = deterministic_uuid(&format!("{}:message", prepared.dedupe_key));
         let turn_id = deterministic_uuid(&format!("{}:turn", prepared.dedupe_key));
@@ -1118,25 +1221,33 @@ impl WakeTurnConsumer {
             updated_at: now.clone(),
         };
         let turn = prepared.apply_to_turn(base_turn)?;
-        let source_metadata_json =
-            match attention.filter(|attention| attention.attention_type == "delivery_followup") {
-                Some(attention) => json!({
-                    "wake_event_id": event.id,
-                    "wake_event_type": event.event_type,
-                    "turn_postcondition": {
-                        "schema_version": DELIVERY_FOLLOWUP_POSTCONDITION_SCHEMA,
-                        "attention_id": attention.id,
-                        "required_event_type": DELIVERY_FOLLOWUP_READINESS_EVENT,
-                        "required_scope_type": attention.scope_type,
-                        "required_scope_id": attention.scope_id,
-                        "after_event_sequence": event.sequence,
-                    }
-                }),
-                None => json!({
-                    "wake_event_id": event.id,
-                    "wake_event_type": event.event_type
-                }),
-            };
+        // The postcondition names the one server record this turn must
+        // produce. Outstanding validation asks for the validation record;
+        // only once the checks are settled does readiness become the thing
+        // the turn owes. When no approved baseline exists neither is
+        // possible, and the turn must be free to say so.
+        let required_event_type = attention
+            .filter(|attention| attention.attention_type == "delivery_followup")
+            .and_then(|attention| Some((attention, delivery?)))
+            .and_then(|(attention, delivery)| Some((attention, delivery.required_event_type()?)));
+        let source_metadata_json = match required_event_type {
+            Some((attention, required_event_type)) => json!({
+                "wake_event_id": event.id,
+                "wake_event_type": event.event_type,
+                "turn_postcondition": {
+                    "schema_version": DELIVERY_FOLLOWUP_POSTCONDITION_SCHEMA,
+                    "attention_id": attention.id,
+                    "required_event_type": required_event_type,
+                    "required_scope_type": attention.scope_type,
+                    "required_scope_id": attention.scope_id,
+                    "after_event_sequence": event.sequence,
+                }
+            }),
+            None => json!({
+                "wake_event_id": event.id,
+                "wake_event_type": event.event_type
+            }),
+        };
         let message = CreateAgentChatMessage {
             id: message_id,
             chat_id: chat.id,
@@ -1293,52 +1404,6 @@ impl WakeTurnConsumer {
         Ok(chat)
     }
 
-    async fn ensure_setup_attention(
-        &self,
-        event: &DomainEvent,
-        identity_id: Option<String>,
-        reason: &str,
-    ) -> Result<db::AttentionProjection> {
-        let dedupe_key = format!(
-            "attention:agent_setup:project:{}:baseline_activation:{}",
-            event.scope_id, event.id
-        );
-        AttentionRepo::insert_attention(
-            &*self.db,
-            CreateAttentionProjection {
-                id: deterministic_uuid(&dedupe_key),
-                attention_type: "agent_setup_required".to_owned(),
-                scope_type: "project".to_owned(),
-                scope_id: event.scope_id.clone(),
-                identity_id,
-                source_event_id: event.id.clone(),
-                priority: 100,
-                status: "open".to_owned(),
-                summary: "Project Agent setup is required before execution can start".to_owned(),
-                details_json: json!({
-                    "source_event_id": event.id,
-                    "source_sequence": event.sequence,
-                    "scope_type": "project",
-                    "scope_id": event.scope_id,
-                    "reason": reason,
-                })
-                .to_string(),
-                dedupe_key,
-                occurred_at: event.created_at.clone(),
-                updated_at: now_rfc3339(),
-                acknowledged_at: None,
-                snoozed_until: None,
-                resolved_at: None,
-                updated_by_user_id: None,
-                recommended_action: "Configure the active Project Agent binding and Profile."
-                    .to_owned(),
-                source_sequence: Some(event.sequence),
-            },
-        )
-        .await
-        .map_err(ServiceError::from)
-    }
-
     fn deferred_plan(&self, spec: DeferredPlanSpec<'_>) -> WakeDeliveryPlan {
         let DeferredPlanSpec {
             event,
@@ -1384,7 +1449,6 @@ struct WakeFields {
 
 fn is_delivery_event(event: &DomainEvent) -> bool {
     event.event_type.starts_with("agent.wake.")
-        || event.event_type == "project.execution_baseline.activated"
 }
 
 fn completion_for(
@@ -1473,7 +1537,23 @@ fn is_self_event(event: &DomainEvent, payload: &Value, identity_id: Option<&str>
         || event.causation_id.as_deref() == Some(event.id.as_str())
 }
 
-fn wake_content(attention: &db::AttentionProjection) -> String {
+/// The completed Task behind a delivery follow-up, when the incident has one.
+fn delivery_followup_task_id(attention: &db::AttentionProjection) -> Option<String> {
+    let details = serde_json::from_str::<Value>(&attention.details_json).ok()?;
+    if details.get("entity_type").and_then(Value::as_str) != Some("task") {
+        return None;
+    }
+    details
+        .get("entity_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+}
+
+fn wake_content(
+    attention: &db::AttentionProjection,
+    delivery: Option<&DeliveryFollowupState>,
+) -> String {
     let details = if attention.details_json.trim().is_empty()
         || attention.details_json.trim() == "{}"
         || attention.details_json.chars().count() > MAX_DETAIL_CHARS
@@ -1482,11 +1562,11 @@ fn wake_content(attention: &db::AttentionProjection) -> String {
     } else {
         format!("\nDetails: {}\n", attention.details_json)
     };
-    let delivery_requirement = if attention.attention_type == "delivery_followup" {
-        "\nThis delivery follow-up cannot complete from narration. Before replying, invoke `project.readiness` for the applicable milestone even when the canonical result will be blocked, failed, or stale. Do not infer validation, evidence, readiness, or release from Task completion alone.\n"
-    } else {
-        ""
-    };
+    let delivery_requirement =
+        match delivery.filter(|_| attention.attention_type == "delivery_followup") {
+            Some(state) => delivery_followup_directive(state),
+            None => String::new(),
+        };
     format!(
         "### Attention wake: {}\n\nCategory: {} — recommended action: {}.\nIncident: {}{}\nAssess the current state with your tools and take the action this incident requires. If a decision genuinely belongs to the user, ask for it; otherwise proceed.",
         attention.summary,

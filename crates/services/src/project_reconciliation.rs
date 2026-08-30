@@ -36,11 +36,10 @@ use chrono::{DateTime, Utc};
 use db::{
     CommandReceiptRepo, CreateCommandReceipt, CreateDomainEvent, DomainEventRepo,
     ProjectMemberRepo, ProjectOrchestrationRepo, ProjectReconciliationRecord, ProjectRepo,
-    ResolveInvalidActiveBaseline, ResolveProjectReconciliation, SqliteDb, TaskRepo,
+    ResolveProjectReconciliation, SqliteDb,
 };
 use events::EventBus;
 use serde_json::json;
-use sqlx::Row;
 
 use crate::{DomainEventService, Result, ServiceError};
 
@@ -190,17 +189,6 @@ impl ProjectReconciliationService {
             ));
         }
 
-        let invalid_active_baseline = conflict.conflict_code == "invalid_active_baseline";
-        if invalid_active_baseline
-            && !matches!(
-                request.action,
-                ReconciliationResolutionAction::Revised | ReconciliationResolutionAction::Retained
-            )
-        {
-            return Err(ServiceError::invalid_operation(
-                "invalid_active_baseline may only accept the recommended correction or retain the historical record",
-            ));
-        }
         let replacement_required = matches!(
             request.action,
             ReconciliationResolutionAction::Revised | ReconciliationResolutionAction::Superseded
@@ -219,7 +207,6 @@ impl ProjectReconciliationService {
             }
             _ => {}
         }
-        let mut invalid_baseline_replacement = None;
         if let Some(replacement_ref) = &request.replacement_ref {
             if replacement_ref.record_type.trim().is_empty()
                 || replacement_ref.record_id.trim().is_empty()
@@ -227,174 +214,6 @@ impl ProjectReconciliationService {
                 return Err(ServiceError::invalid_operation(
                     "replacement_ref requires a non-empty record_type and record_id",
                 ));
-            }
-            if invalid_active_baseline {
-                if replacement_ref.record_type != "execution_baseline_revision" {
-                    return Err(ServiceError::invalid_operation(
-                        "invalid_active_baseline replacement_ref must name an execution_baseline_revision",
-                    ));
-                }
-                let baseline = ProjectOrchestrationRepo::get_project_execution_baseline(
-                    &*self.db,
-                    &record.governing_record_id,
-                )
-                .await?
-                .filter(|baseline| {
-                    baseline.project_id == project_id
-                        && baseline.lifecycle == "active"
-                        && baseline.current_revision_id.as_deref()
-                            == Some(record.record_id.as_str())
-                })
-                .ok_or_else(|| {
-                    ServiceError::conflict(
-                        "invalid active baseline changed while the reconciliation was open",
-                    )
-                })?;
-                let successor =
-                    ProjectOrchestrationRepo::get_project_execution_baseline_revision(
-                        &*self.db,
-                        &replacement_ref.record_id,
-                    )
-                    .await?
-                    .filter(|revision| {
-                        revision.baseline_id == baseline.id
-                            && revision.id != record.record_id
-                            && matches!(
-                                revision.lifecycle.as_str(),
-                                "draft" | "proposed" | "approved"
-                            )
-                    })
-                    .ok_or_else(|| {
-                        ServiceError::invalid_operation(
-                            "replacement_ref must name the server-recommended correction revision on the affected baseline",
-                        )
-                    })?;
-                let successor_revision = successor.revision.to_string();
-                if replacement_ref.record_revision.as_deref() != Some(successor_revision.as_str()) {
-                    return Err(ServiceError::invalid_operation(
-                        "replacement_ref record_revision does not match the approved successor revision",
-                    ));
-                }
-                let marked_invalid: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM execution_baseline_revision_integrity
-                     WHERE revision_id = ?",
-                )
-                .bind(&successor.id)
-                .fetch_one(self.db.pool())
-                .await?;
-                if marked_invalid != 0 {
-                    return Err(ServiceError::invalid_operation(
-                        "replacement_ref names a baseline revision rejected by the integrity audit",
-                    ));
-                }
-                let approval = ProjectOrchestrationRepo::list_project_execution_baseline_approvals(
-                    &*self.db,
-                    &baseline.id,
-                )
-                .await?
-                .into_iter()
-                .find(|approval| {
-                    approval.revision_id == successor.id
-                        && approval.lifecycle == "active"
-                        && approval.principal_type == "user"
-                        && matches!(
-                            approval.authorization_action.as_str(),
-                            "project.execution_baseline.approve"
-                                | RESOLVE_PROJECT_RECONCILIATION_OPERATION
-                        )
-                        && approval.content_digest == successor.content_digest
-                        && approval.rendered_digest == successor.rendered_digest
-                });
-                let create_approval = approval.is_none();
-                if create_approval {
-                    let recommended: i64 = sqlx::query_scalar(
-                        "SELECT COUNT(*) FROM execution_baseline_revision_integrity
-                         WHERE revision_id = ? AND baseline_id = ? AND project_id = ?
-                           AND successor_revision_id = ?",
-                    )
-                    .bind(&record.record_id)
-                    .bind(&baseline.id)
-                    .bind(project_id)
-                    .bind(&successor.id)
-                    .fetch_one(self.db.pool())
-                    .await?;
-                    if recommended != 1 {
-                        return Err(ServiceError::invalid_operation(
-                            "replacement_ref requires the exact server-recommended correction revision",
-                        ));
-                    }
-                }
-                let target = crate::execution_baseline::validated_baseline_activation_target(
-                    &self.db,
-                    project_id,
-                    &baseline.id,
-                    &successor,
-                )
-                .await?;
-                let project = ProjectRepo::get_by_id(&*self.db, project_id)
-                    .await?
-                    .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
-                invalid_baseline_replacement = Some(ResolveInvalidActiveBaseline {
-                    project_id: project_id.to_owned(),
-                    baseline_id: baseline.id,
-                    invalid_revision_id: record.record_id.clone(),
-                    successor_revision_id: successor.id,
-                    approval_id: approval
-                        .as_ref()
-                        .map_or_else(db::new_uuid_v4, |approval| approval.id.clone()),
-                    create_approval,
-                    approval_principal_id: approval.as_ref().map_or_else(
-                        || request.mutation.authorization.principal.id.clone(),
-                        |approval| approval.principal_id.clone(),
-                    ),
-                    approval_authorization_basis: approval.as_ref().map_or_else(
-                        || request.mutation.authorization.authorization_basis.clone(),
-                        |approval| approval.authorization_basis.clone(),
-                    ),
-                    approval_authorization_action: approval.as_ref().map_or_else(
-                        || "project.execution_baseline.approve".to_owned(),
-                        |approval| approval.authorization_action.clone(),
-                    ),
-                    approval_authorization_occurred_at: approval.as_ref().map_or_else(
-                        || request.mutation.authorization.occurred_at.clone(),
-                        |approval| approval.authorization_occurred_at.clone(),
-                    ),
-                    approval_explicit_event: approval.as_ref().map_or_else(
-                        || request.mutation.authorization.event_id.clone(),
-                        |approval| approval.explicit_event.clone(),
-                    ),
-                    approval_idempotency_key: approval.as_ref().map_or_else(
-                        || {
-                            format!(
-                                "{}:baseline-correction-approval",
-                                request.mutation.idempotency_key
-                            )
-                        },
-                        |approval| approval.idempotency_key.clone(),
-                    ),
-                    expected_baseline_version: baseline.version,
-                    expected_project_version: project.version,
-                    charter_revision_id: target.charter_revision_id,
-                    milestone_ids: target.milestone_ids,
-                    milestone_definition_revision_ids: target.milestone_definition_revision_ids,
-                    primary_milestone_id: target.primary_milestone_id,
-                    content_digest: successor.content_digest,
-                    rendered_digest: successor.rendered_digest,
-                });
-            } else if replacement_ref.record_type == "task" {
-                let replacement_task =
-                    TaskRepo::get_by_id(&*self.db, &replacement_ref.record_id, false)
-                        .await?
-                        .ok_or_else(|| {
-                            ServiceError::invalid_operation(
-                                "replacement_ref names a Task that does not exist",
-                            )
-                        })?;
-                if replacement_task.project_id != project_id {
-                    return Err(ServiceError::invalid_operation(
-                        "replacement_ref names a Task outside this Project",
-                    ));
-                }
             }
         }
 
@@ -507,7 +326,6 @@ impl ProjectReconciliationService {
                     .replacement_ref
                     .as_ref()
                     .and_then(|replacement_ref| replacement_ref.record_revision.clone()),
-                invalid_baseline_replacement,
                 // The client-authorized timestamp, not a fresh server clock
                 // read: an identical retry must compare equal to the first
                 // attempt's stored resolution row for the idempotency replay
@@ -651,23 +469,10 @@ impl ProjectReconciliationService {
         let affected_paths: Vec<String> =
             serde_json::from_str(&conflict.affected_paths_json).unwrap_or_default();
         let state = reconciliation_state_from_wire(&record.state)?;
-        let invalid_active_baseline = conflict.conflict_code == "invalid_active_baseline";
         let adaptive_boundary = conflict.conflict_code == "adaptive_task_boundary_crossed";
-        let suggested_replacement_ref = if state != ReconciliationState::Required {
-            None
-        } else if invalid_active_baseline {
-            self.suggested_invalid_baseline_replacement(record).await?
-        } else if adaptive_boundary {
-            self.suggested_repaired_adaptive_boundary(record).await?
-        } else {
-            None
-        };
-        let allowed_actions = if state == ReconciliationState::Required && invalid_active_baseline {
-            vec![
-                ReconciliationResolutionAction::Revised,
-                ReconciliationResolutionAction::Retained,
-            ]
-        } else if state == ReconciliationState::Required {
+        let _ = adaptive_boundary;
+        let suggested_replacement_ref = None;
+        let allowed_actions = if state == ReconciliationState::Required {
             RESOLUTION_ACTIONS.to_vec()
         } else {
             Vec::new()
@@ -722,100 +527,6 @@ impl ProjectReconciliationService {
             created_at: record.created_at.clone(),
             updated_at: record.updated_at.clone(),
         })
-    }
-
-    async fn suggested_invalid_baseline_replacement(
-        &self,
-        record: &ProjectReconciliationRecord,
-    ) -> Result<Option<ReconciliationReplacementRef>> {
-        let row = sqlx::query(
-            "SELECT revision.id, revision.revision,
-                    CASE WHEN approval.id IS NULL THEN 1 ELSE 0 END AS recommendation_rank
-             FROM project_execution_baseline_revision revision
-             LEFT JOIN project_execution_baseline_approval approval
-               ON approval.baseline_id = revision.baseline_id
-              AND approval.revision_id = revision.id
-              AND approval.lifecycle = 'active'
-              AND approval.principal_type = 'user'
-              AND approval.authorization_action IN (
-                  'project.execution_baseline.approve',
-                  'project.reconciliation.resolve'
-              )
-              AND approval.content_digest = revision.content_digest
-              AND approval.rendered_digest = revision.rendered_digest
-             LEFT JOIN execution_baseline_revision_integrity source_integrity
-               ON source_integrity.revision_id = ?
-              AND source_integrity.baseline_id = revision.baseline_id
-              AND source_integrity.project_id = ?
-              AND source_integrity.successor_revision_id = revision.id
-             WHERE revision.baseline_id = ?
-               AND revision.id != ?
-               AND revision.lifecycle IN ('draft', 'proposed', 'approved')
-               AND (approval.id IS NOT NULL OR source_integrity.revision_id IS NOT NULL)
-               AND NOT EXISTS (
-                   SELECT 1 FROM execution_baseline_revision_integrity integrity
-                   WHERE integrity.revision_id = revision.id
-               )
-             ORDER BY recommendation_rank, revision.revision DESC, revision.id DESC
-             LIMIT 1",
-        )
-        .bind(&record.record_id)
-        .bind(&record.project_id)
-        .bind(&record.governing_record_id)
-        .bind(&record.record_id)
-        .fetch_optional(self.db.pool())
-        .await?;
-        row.map(|row| {
-            Ok(ReconciliationReplacementRef {
-                record_type: "execution_baseline_revision".to_owned(),
-                record_id: row.try_get("id")?,
-                record_revision: Some(row.try_get::<i64, _>("revision")?.to_string()),
-            })
-        })
-        .transpose()
-    }
-
-    /// An adaptive attempt blocked only by a historically invalid governing
-    /// baseline becomes actionable after that exact baseline is corrected.
-    /// The user can then revise the conflict to the now-active successor and
-    /// wake the Task so the Project Agent can retry the original operation.
-    async fn suggested_repaired_adaptive_boundary(
-        &self,
-        record: &ProjectReconciliationRecord,
-    ) -> Result<Option<ReconciliationReplacementRef>> {
-        let row = sqlx::query(
-            "SELECT successor.id, successor.revision
-             FROM execution_baseline_revision_integrity integrity
-             JOIN project_execution_baseline baseline
-               ON baseline.id = integrity.baseline_id
-              AND baseline.project_id = integrity.project_id
-             JOIN project_execution_baseline_revision successor
-              ON successor.id = integrity.successor_revision_id
-              AND successor.baseline_id = baseline.id
-              AND successor.lifecycle = 'approved'
-              AND baseline.current_revision_id = successor.id
-             WHERE integrity.project_id = ?
-               AND integrity.baseline_id = ?
-               AND integrity.revision_id = ?
-               AND NOT EXISTS (
-                   SELECT 1 FROM execution_baseline_revision_integrity successor_integrity
-                   WHERE successor_integrity.revision_id = successor.id
-               )
-             LIMIT 1",
-        )
-        .bind(&record.project_id)
-        .bind(&record.governing_record_id)
-        .bind(&record.governing_record_revision)
-        .fetch_optional(self.db.pool())
-        .await?;
-        row.map(|row| {
-            Ok(ReconciliationReplacementRef {
-                record_type: "execution_baseline_revision".to_owned(),
-                record_id: row.try_get("id")?,
-                record_revision: Some(row.try_get::<i64, _>("revision")?.to_string()),
-            })
-        })
-        .transpose()
     }
 }
 
