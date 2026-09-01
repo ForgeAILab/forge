@@ -46,6 +46,7 @@ pub struct NativeAgentRuntimeBackend {
     interaction_broker: InteractionBrokerHandle,
     active: Arc<Mutex<HashMap<String, SessionHandle>>>,
     forge_tool_provider: Option<Arc<dyn ForgeToolProvider>>,
+    provider_override: Option<Arc<dyn Provider>>,
 }
 
 impl NativeAgentRuntimeBackend {
@@ -55,7 +56,19 @@ impl NativeAgentRuntimeBackend {
             protected_store,
             active: Arc::new(Mutex::new(HashMap::new())),
             forge_tool_provider: None,
+            provider_override: None,
         }
+    }
+
+    /// Replaces outbound provider construction with an in-process runtime
+    /// provider. The transport's SSRF policy correctly rejects loopback
+    /// endpoints, so integration tests that exercise the full native turn
+    /// path (scope binding, LCM wiring, manifest linkage) inject a scripted
+    /// provider here instead of a mock HTTP server.
+    #[doc(hidden)]
+    pub fn with_provider_override(mut self, provider: Arc<dyn Provider>) -> Self {
+        self.provider_override = Some(provider);
+        self
     }
 
     /// Installs the Forge domain provider used by scope-derived read/proposal
@@ -74,6 +87,9 @@ impl NativeAgentRuntimeBackend {
     }
 
     fn provider(&self, request: &AgentTurnRequest) -> Result<Arc<dyn Provider>, AgentHostError> {
+        if let Some(provider) = &self.provider_override {
+            return Ok(Arc::clone(provider));
+        }
         let transport = ReqwestTransport::new()
             .map_err(|error| AgentHostError::Configuration(error.message))?;
         let target = ProviderCredentialTarget::new(request.provider.credential_handle_id.clone())

@@ -85,6 +85,24 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   configuration. Main/Project Chat turns no longer consume Task execution
   concurrency, and stopped executions notify the configured Project Agent.
 
+### Fixed
+
+- Embedded (native) agent sessions past their context budget could never
+  compact and failed every subsequent turn. LCM was wired for all embedded
+  scopes — Main and Project Agent chats included — but the host's
+  deterministic summary model treated the coordinator's 2048-token leaf
+  target as an output allowance and returned near-full concatenations
+  (~1830-token blocks "summarized" to ~1800 tokens), so each bounded
+  hard-compaction round reclaimed almost nothing and any session that crossed
+  ~95% of `max_input_tokens` wedged with "LCM context cannot fit after
+  bounded hard compaction". The model (revision `forge-lcm-summary-2`) now
+  compresses for real: output is capped at 512 tokens, the excerpt budget is
+  spread across every message in the condensed range, and a small block still
+  strictly shrinks. A new integration test drives a real native Main-chat
+  turn over hard pressure through `NativeAgentRuntimeBackend` with a scripted
+  runtime provider and proves the chat-scoped timeline, entry admission,
+  condensation nodes, manifest summary linkage, and a healthy follow-up turn.
+
 ### Added
 
 - Agents can now produce the evidence they are asked for. `task.evidence`

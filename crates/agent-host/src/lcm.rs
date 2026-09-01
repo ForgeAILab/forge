@@ -147,6 +147,15 @@ impl TaskLcmProjectionPolicy {
     }
 }
 
+/// The deterministic summary model's own output ceiling, mirroring the
+/// coordinator's `deterministic_token_cap`. The coordinator's leaf target
+/// (2048 source tokens) is a *source* sizing goal; a summary model that
+/// treats it as an output allowance returns near-full concatenations, each
+/// hard-compaction round then reclaims almost nothing, and any session past
+/// hard pressure fails every turn with "LCM context cannot fit after bounded
+/// hard compaction".
+const DETERMINISTIC_SUMMARY_TOKEN_CAP: u64 = 512;
+
 /// A bounded host-owned summary adapter used by the embedded runtime until a
 /// provider-specific summary route is selected. It deliberately preserves
 /// source provenance while never receiving secret-class sources (the runtime
@@ -159,7 +168,7 @@ pub struct DeterministicLcmSummaryModel {
 impl Default for DeterministicLcmSummaryModel {
     fn default() -> Self {
         Self {
-            revision: RegistryRevision::new("forge-lcm-summary-1"),
+            revision: RegistryRevision::new("forge-lcm-summary-2"),
         }
     }
 }
@@ -184,22 +193,39 @@ impl LcmSummaryModel for DeterministicLcmSummaryModel {
         &self,
         request: &LcmSummaryModelRequest,
     ) -> Result<LcmSummaryModelResponse, LcmSummaryError> {
+        let bodies = request
+            .messages
+            .iter()
+            .map(|message| message.joined_text())
+            .filter(|body| !body.is_empty())
+            .collect::<Vec<_>>();
+        if bodies.is_empty() {
+            return Err(LcmSummaryError::EmptySource);
+        }
+        let source_chars: usize = bodies.iter().map(|body| body.chars().count()).sum();
+        // Compression is the contract: bound the excerpt by the caller's
+        // target AND this model's own cap, and never return more than half
+        // the source so a small block still strictly shrinks.
+        let target_tokens = request
+            .target_tokens
+            .clamp(1, DETERMINISTIC_SUMMARY_TOKEN_CAP);
+        let max_chars = (target_tokens.saturating_mul(4) as usize).min((source_chars / 2).max(1));
+        // Spread the budget across every source message so the excerpt covers
+        // the whole condensed range instead of only its first message.
+        let per_message = (max_chars / bodies.len()).max(24);
         let mut text = String::new();
-        for message in &request.messages {
-            let body = message.joined_text();
-            if body.is_empty() {
-                continue;
-            }
+        for body in &bodies {
             if !text.is_empty() {
                 text.push('\n');
             }
-            text.push_str(body.as_str());
+            if body.chars().count() > per_message {
+                text.extend(body.chars().take(per_message));
+                text.push('…');
+            } else {
+                text.push_str(body);
+            }
         }
-        if text.is_empty() {
-            return Err(LcmSummaryError::EmptySource);
-        }
-        let max_chars = request.target_tokens.saturating_mul(4) as usize;
-        if max_chars > 0 && text.chars().count() > max_chars {
+        if text.chars().count() > max_chars {
             let mut bounded = text.chars().take(max_chars).collect::<String>();
             bounded.push_str(" …");
             text = bounded;
