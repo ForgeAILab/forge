@@ -103,6 +103,22 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   runtime provider and proves the chat-scoped timeline, entry admission,
   condensation nodes, manifest summary linkage, and a healthy follow-up turn.
 
+- Live embedded chats still could not compact after the summary-model fix,
+  for three stacked reasons found in a live multi-project run. LCM pressure
+  was measured against the full provider window while the planner also had to
+  fit the system prompt, tool schemas, and the new user input, so a session
+  failed planner-side (`budget_exceeded`) before LCM ever reached hard
+  pressure — the native host now hands the coordinator the conversation's
+  remaining share of the window. Bounded hard compaction's three rounds
+  (~6k source tokens) could not walk a deeply over-budget chat back under its
+  budget, and a single `[user, assistant]` turn larger than the 2048-token
+  leaf target wedged the condensation frontier permanently — Forge's pressure
+  policy (`forge-lcm-pressure-2`) now runs up to sixteen rounds and scales
+  the leaf target with the profile's `max_output_tokens`. Verified live: a
+  Main chat and a Project chat that both failed every turn with "LCM context
+  cannot fit after bounded hard compaction" now condense (one leaf absorbed a
+  13.8k-token span) and keep answering.
+
 ### Added
 
 - Agents can now produce the evidence they are asked for. `task.evidence`

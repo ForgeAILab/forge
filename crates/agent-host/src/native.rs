@@ -155,6 +155,71 @@ impl NativeAgentRuntimeBackend {
     }
 }
 
+/// Sizing constants mirroring the LCM `CharRatioSizer` default so the
+/// host-side overhead estimate and the coordinator's timeline accounting
+/// stay on one scale.
+const LCM_CHARS_PER_TOKEN: u64 = 4;
+/// Absorbs framing, cache-control, and estimator drift the host cannot
+/// measure exactly at composition time.
+const LCM_PLANNER_MARGIN_TOKENS: u64 = 1024;
+/// Keeps the pressure policy valid (a zero budget is rejected) when the
+/// non-conversation content alone exceeds the provider window; the turn then
+/// fails with the planner's precise required-content diagnostic instead of a
+/// policy configuration error.
+const LCM_MIN_CONVERSATION_BUDGET_TOKENS: u64 = 1024;
+
+/// The LCM pressure model counts only timeline (conversation) tokens, while
+/// the context planner must fit the system prompt, activated tool schemas,
+/// and the new user input inside the same provider window. Handing the
+/// coordinator the full `max_input_tokens` leaves a dead zone: history alone
+/// stays below hard pressure while the planned total already exceeds the
+/// budget, so the turn fails planner-side (`budget_exceeded`) without LCM
+/// ever compacting. Deduct the measurable non-conversation content so
+/// pressure trips while compaction can still help.
+fn conversation_budget_tokens(
+    request: &AgentTurnRequest,
+    composition: &ScopeToolComposition,
+) -> u64 {
+    let mut chars = request.system_prompt.as_deref().map_or(0, str::len) as u64;
+    chars += request.input.len() as u64;
+    for tool in composition.tools() {
+        let spec = tool.spec();
+        chars += (spec.name.len() + spec.description.len()) as u64;
+        chars += serde_json::to_string(&spec.input_schema).map_or(0, |schema| schema.len() as u64);
+    }
+    let overhead = chars.div_ceil(LCM_CHARS_PER_TOKEN) + LCM_PLANNER_MARGIN_TOKENS;
+    u64::from(request.provider.max_input_tokens)
+        .saturating_sub(overhead)
+        .max(LCM_MIN_CONVERSATION_BUDGET_TOKENS)
+}
+
+/// Forge's pressure policy, adjusted on two axes the stock defaults get
+/// wrong for real chats:
+///
+/// - `leaf_target_tokens` must exceed one full canonical turn. Leaf planning
+///   only commits a span ending at a user boundary; when a single
+///   `[user, assistant]` pair outgrows the target (assistant replies are
+///   bounded by `max_output_tokens`, far above the stock 2048), selection
+///   stops mid-turn, the planner backs up to the previous user boundary —
+///   eventually index zero — and returns no plan, so every attempt ends in
+///   "LCM context cannot fit after bounded hard compaction" with the
+///   frontier permanently stuck in front of the oversized turn. Scale the
+///   target with the profile's output cap so one leaf can always swallow a
+///   full turn pair.
+/// - `max_rounds`: 3 rounds cannot walk a chat back under budget once it has
+///   drifted deep past hard pressure. Sixteen rounds cover a full
+///   provider-window overrun in one attempt; each round is a cheap local
+///   deterministic summary, so the widened bound costs nothing when pressure
+///   is caught early.
+fn forge_lcm_pressure_policy(request: &AgentTurnRequest) -> agent_runtime::lcm::LcmPressurePolicy {
+    agent_runtime::lcm::LcmPressurePolicy {
+        revision: agent_runtime::registry::RegistryRevision::from_content("forge-lcm-pressure-2"),
+        leaf_target_tokens: u64::from(request.provider.max_output_tokens).saturating_add(4096),
+        max_rounds: 16,
+        ..agent_runtime::lcm::LcmPressurePolicy::default()
+    }
+}
+
 impl fmt::Debug for NativeAgentRuntimeBackend {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -265,7 +330,8 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             Arc::new(DeterministicLcmSummaryModel::default()),
             Arc::new(StaticLcmTimelineResolver::new(lcm_binding)),
             LcmCoordinatorPolicy {
-                input_budget_tokens: u64::from(request.provider.max_input_tokens),
+                input_budget_tokens: conversation_budget_tokens(&request, &composition),
+                pressure: forge_lcm_pressure_policy(&request),
                 ..LcmCoordinatorPolicy::default()
             },
         )

@@ -149,6 +149,157 @@ async fn lcm_counts(db: &SqliteDb, timeline_id: &str) -> (i64, i64, i64) {
     (entries, leaf_nodes, condensed_nodes)
 }
 
+/// The planner must fit the system prompt, tool schemas, and the new user
+/// input alongside conversation history, while LCM pressure counts only the
+/// timeline. This case sits in the former dead zone: history alone is far
+/// below the hard threshold of the full window, but the planned total
+/// overflows it. Before the host deducted non-conversation overhead from the
+/// coordinator's budget, this failed planner-side (`budget_exceeded`) without
+/// LCM ever compacting; now pressure trips early and the turn completes.
+#[tokio::test]
+async fn native_chat_compacts_when_system_prompt_crowds_the_window() {
+    let db = sqlite_db().await;
+    let service = EmbeddedAgentService::new(Arc::clone(&db), b"lcm-compaction-test-key");
+    let credential_id = new_uuid_v4();
+    service
+        .protected_store()
+        .create_credential(
+            &credential_id,
+            "user-1",
+            "openai",
+            "scripted provider",
+            Secret::new("unused-test-key"),
+            &now_rfc3339(),
+        )
+        .await
+        .expect("credential creates");
+    let (identity_id, profile_id) = native_identity(&db, &credential_id).await;
+    let chats = AgentChatService::new(Arc::clone(&db));
+    chats
+        .set_main_binding(SetMainAgentBindingInput {
+            actor_user_id: "user-1".to_owned(),
+            account_id: "user-1".to_owned(),
+            identity_id: identity_id.clone(),
+            autonomy_policy_json: "{}".to_owned(),
+            tool_policy_revision: "test".to_owned(),
+            expected_version: None,
+            replacement_reason: None,
+        })
+        .await
+        .expect("Main binding");
+    let chat = db::AgentChatRepo::get_main_chat(&*db, "user-1")
+        .await
+        .expect("Main chat lookup")
+        .expect("Main chat");
+    let session = service
+        .create_or_resume_session(CreateScopedSession {
+            actor_user_id: "user-1".to_owned(),
+            identity_id: identity_id.clone(),
+            profile_id: Some(profile_id.clone()),
+            scope: RequestedCanonicalScope::AgentChat {
+                chat_id: chat.id.clone(),
+            },
+        })
+        .await
+        .expect("session creates");
+    let runtime_session_id = session
+        .runtime_session_id
+        .clone()
+        .expect("native session has a runtime id");
+    let backend = NativeAgentRuntimeBackend::new(service.protected_store())
+        .with_provider_override(Arc::new(scripted_reply_provider(4)));
+
+    // ~28k chars ≈ 7k tokens of operating-skill-style instructions: the shape
+    // of a Project Agent scope where fixed content claims most of the window.
+    let system_prompt = format!(
+        "You are the Project Agent. {}",
+        "Follow the operating skill exactly as written here. ".repeat(560)
+    );
+    // ~25k chars ≈ 6.2k tokens of history: far below 95% of the 12,288-token
+    // window on its own, but the planned total (with the system prompt) is
+    // well over it.
+    let mut seed_history = Vec::new();
+    for index in 0..14 {
+        seed_history.push(Message::user(format!(
+            "user message {index}: {}",
+            "considered planning detail. ".repeat(32)
+        )));
+        seed_history.push(Message::text(
+            Role::Assistant,
+            format!(
+                "assistant reply {index}: {}",
+                "prior assistant reasoning. ".repeat(32)
+            ),
+        ));
+    }
+
+    let provider_config = NativeProviderConfig {
+        provider: "openai".to_owned(),
+        base_url: "https://unused.invalid/v1".to_owned(),
+        model: "fake".to_owned(),
+        credential_handle_id: credential_id.clone(),
+        owner_user_id: "user-1".to_owned(),
+        provider_account_id: None,
+        context_tokens: 24_576,
+        max_input_tokens: 12_288,
+        max_output_tokens: 1_024,
+    };
+    let scope = CanonicalScope {
+        scope_type: CanonicalScopeType::AgentChat,
+        scope_id: chat.id.clone(),
+        workspace_access: WorkspaceAccess::Deny,
+    };
+
+    let mut timeline_id = None;
+    for turn in 0..3 {
+        let output = backend
+            .run_turn(
+                AgentTurnRequest {
+                    forge_session_id: session.id.clone(),
+                    runtime_session_id: runtime_session_id.clone(),
+                    scope: scope.clone(),
+                    workspace_path: None,
+                    provider: provider_config.clone(),
+                    system_prompt: Some(system_prompt.clone()),
+                    history: if turn == 0 {
+                        seed_history.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    input: format!("turn {turn}: continue the plan"),
+                    cancellation: CancellationToken::new(),
+                },
+                Arc::new(NoopSink),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("turn {turn} must compact instead of failing planner-side: {error}")
+            });
+        assert!(
+            !output.text.trim().is_empty(),
+            "turn {turn} returns assistant text"
+        );
+        let manifest = output
+            .context_manifest
+            .expect("native turn links a runtime context manifest");
+        timeline_id = Some(
+            manifest
+                .lcm_timeline_id
+                .clone()
+                .expect("manifest links the chat LCM timeline"),
+        );
+    }
+
+    let timeline_id = timeline_id.expect("at least one turn ran");
+    let (entries, leaf_nodes, condensed_nodes) = lcm_counts(&db, &timeline_id).await;
+    assert!(entries > 0, "canonical history is admitted as LCM entries");
+    assert!(
+        leaf_nodes + condensed_nodes > 0,
+        "the crowded window must condense history into LCM nodes \
+         (leaf: {leaf_nodes}, condensed: {condensed_nodes})"
+    );
+}
+
 #[tokio::test]
 async fn native_main_chat_compacts_over_budget_history_through_lcm() {
     let db = sqlite_db().await;
@@ -226,6 +377,21 @@ async fn native_main_chat_compacts_over_budget_history_through_lcm() {
             ),
         ));
     }
+    // One canonical turn far larger than the stock 2048-token leaf target
+    // (~12k chars ≈ 3k tokens): leaf planning must swallow the whole
+    // `[user, assistant]` pair in one span instead of backing up to the
+    // previous user boundary forever, which wedged the condensation frontier
+    // in front of any long assistant reply.
+    seed_history.push(Message::user(
+        "please write the full portfolio review".to_owned(),
+    ));
+    seed_history.push(Message::text(
+        Role::Assistant,
+        format!(
+            "the full review: {}",
+            "an exhaustive portfolio finding. ".repeat(380)
+        ),
+    ));
 
     let provider_config = NativeProviderConfig {
         provider: "openai".to_owned(),
