@@ -6,6 +6,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-02
+
 ### Breaking
 
 - **A `task_validation` result must cite the Agent's own command

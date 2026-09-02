@@ -21,7 +21,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.8.0"
+version = "0.9.0"
 license = "MIT"
 description = "AI coding agent workflow engine — orchestrate agents through structured task lifecycles"
 homepage = "https://github.com/ForgeAILab/forge"
