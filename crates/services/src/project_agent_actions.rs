@@ -1665,6 +1665,14 @@ mod tests {
             PROJECT_RELEASE_OPERATION,
             &json!({"action": "propose_candidate"}),
         ));
+        assert!(is_allowed_project_direct_payload(
+            forge_agent_host::PROJECT_EVIDENCE_OPERATION,
+            &json!({"action": "attach"}),
+        ));
+        assert!(is_allowed_project_direct_payload(
+            forge_agent_host::PROJECT_EVIDENCE_OPERATION,
+            &json!({"action": "capture"}),
+        ));
     }
 
     #[test]

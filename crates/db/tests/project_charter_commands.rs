@@ -338,6 +338,23 @@ async fn charter_adoption_is_atomic_replay_exact_and_scope_bound() {
         Some(bootstrap_message_id)
     );
     assert_eq!(created.approval.lifecycle, "consumed");
+    let admission: (String, String, Option<String>, String) = sqlx::query_as(
+        "SELECT receipt.id, receipt.source_kind, receipt.handoff_id,
+                binding.charter_approval_id
+         FROM project_admission_receipt receipt
+         JOIN project_agent_binding binding
+           ON binding.admission_receipt_id = receipt.id
+          AND binding.project_id = receipt.project_id
+          AND binding.state = 'active'
+         WHERE receipt.project_id = ?",
+    )
+    .bind(PROJECT_ID)
+    .fetch_one(db.pool())
+    .await
+    .expect("adoption admission and current binding authority");
+    assert_eq!(admission.1, "charter_adoption");
+    assert_eq!(admission.2, None);
+    assert_eq!(admission.3, "adoption-approval");
 
     let event_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM domain_event
@@ -832,6 +849,12 @@ async fn charter_amendment_supersedes_execution_and_changed_replay_rolls_back() 
     let adopted = ProjectOrchestrationRepo::apply_project_charter_approval_command(&db, adoption)
         .await
         .expect("adoption");
+    let admission_before: String =
+        sqlx::query_scalar("SELECT id FROM project_admission_receipt WHERE project_id = ?")
+            .bind(PROJECT_ID)
+            .fetch_one(db.pool())
+            .await
+            .expect("stable admission before amendment");
 
     ProjectOrchestrationRepo::create_project_charter_revision(
         &db,
@@ -942,6 +965,30 @@ async fn charter_amendment_supersedes_execution_and_changed_replay_rolls_back() 
     );
     assert_eq!(amended.amendment_id.as_deref(), Some("amendment-record"));
     assert_eq!(amended.project_version, adopted.project_version + 1);
+    let amended_binding: (String, String, String, String) = sqlx::query_as(
+        "SELECT admission_receipt_id, charter_approval_id, charter_id,
+                charter_revision_id
+         FROM project_agent_binding
+         WHERE project_id = ? AND state = 'active'",
+    )
+    .bind(PROJECT_ID)
+    .fetch_one(db.pool())
+    .await
+    .expect("amendment binding authority");
+    assert_eq!(amended_binding.0, admission_before);
+    assert_eq!(amended_binding.1, "amendment-approval");
+    assert_eq!(amended_binding.2, CHARTER_ID);
+    assert_eq!(amended_binding.3, "charter-command-revision-2");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM project_admission_receipt WHERE project_id = ?",
+        )
+        .bind(PROJECT_ID)
+        .fetch_one(db.pool())
+        .await
+        .expect("one stable admission after amendment"),
+        1
+    );
     let runnable_after: i64 = sqlx::query_scalar(
         "SELECT runnable FROM project_task_governance WHERE task_id = 'amendment-task'",
     )

@@ -12,11 +12,11 @@ use async_trait::async_trait;
 use db::{
     AccountMainAgentBindingRepo, AdmitAgentChatTurn, AdmittedAgentChatTurn, AgentChat,
     AgentChatTransactionRepo, AgentProfileRepo, AgentRepo, CreateAgentChatMessage,
-    CreateAgentChatTurnJob, CredentialHandleRepo, ProjectAgentBindingRepo, SqliteDb,
+    CreateAgentChatTurnJob, CredentialHandleRepo, ProjectAdmissionReceiptRepo,
+    ProjectAgentBindingRepo, ProjectRepo, SqliteDb,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::Row;
 
 use crate::{
     agent_service::cli_runtime_source_enabled,
@@ -495,22 +495,52 @@ impl AgentResponderStore for SqliteDb {
             let Some(identity_id) = binding.identity_id else {
                 return Ok(ResolvedAgentResponder::setup(chat));
             };
-            // These fields are part of the binding's server-owned provenance,
-            // but intentionally are not exposed by the legacy DB model.
-            let row = sqlx::query(
-                "SELECT operating_skill_revision_id, policy_revision, policy_digest
-                 FROM project_agent_binding WHERE id = ? AND project_id = ?",
-            )
-            .bind(&binding.id)
-            .bind(project_id)
-            .fetch_optional(self.pool())
-            .await?;
-            let Some(row) = row else {
+            let Some(project) = ProjectRepo::get_by_id(self, project_id).await? else {
                 return Ok(ResolvedAgentResponder::unavailable(chat));
             };
-            let skill_revision: Option<String> = row.try_get("operating_skill_revision_id")?;
-            let policy_revision: String = row.try_get("policy_revision")?;
-            let stored_policy_digest: String = row.try_get("policy_digest")?;
+            let current_skill =
+                ProjectAdmissionReceiptRepo::get_current_project_operating_skill_revision(self)
+                    .await?;
+            if project.charter_status == "charter_backed" && !project.charter_setup_required {
+                let Some(authority) =
+                    ProjectAdmissionReceiptRepo::resolve_current_project_binding_authority(
+                        self, project_id,
+                    )
+                    .await?
+                else {
+                    return Ok(ResolvedAgentResponder::setup(chat));
+                };
+                if binding.charter_setup_required
+                    || binding.admission_receipt_id.as_deref()
+                        != Some(authority.admission_receipt_id.as_str())
+                    || binding.charter_approval_id.as_deref()
+                        != Some(authority.charter_approval_id.as_str())
+                    || binding.charter_id.as_deref() != Some(authority.charter_id.as_str())
+                    || binding.charter_revision_id.as_deref()
+                        != Some(authority.charter_revision_id.as_str())
+                    || binding.operating_skill_revision_id.as_deref()
+                        != Some(authority.operating_skill_revision_id.as_str())
+                {
+                    return Ok(ResolvedAgentResponder::setup(chat));
+                }
+            } else if project.charter_status == "legacy_unverified"
+                && project.charter_setup_required
+            {
+                if !binding.charter_setup_required
+                    || binding.admission_receipt_id.is_some()
+                    || binding.charter_approval_id.is_some()
+                    || binding.charter_id.is_some()
+                    || binding.charter_revision_id.is_some()
+                    || binding.operating_skill_revision_id.as_deref() != current_skill.as_deref()
+                {
+                    return Ok(ResolvedAgentResponder::setup(chat));
+                }
+            } else {
+                return Ok(ResolvedAgentResponder::setup(chat));
+            }
+            let skill_revision = binding.operating_skill_revision_id;
+            let policy_revision = binding.policy_revision;
+            let stored_policy_digest = binding.policy_digest;
             let Some(skill_revision) = skill_revision.filter(|value| !value.trim().is_empty())
             else {
                 return Ok(ResolvedAgentResponder::setup(chat));

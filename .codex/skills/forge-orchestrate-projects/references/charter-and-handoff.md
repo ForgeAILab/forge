@@ -7,6 +7,7 @@
 - Readiness
 - Approval receipt
 - Atomic Project creation
+- Project admission receipt
 - Handoff projections
 - Handoff invariants and exclusions
 - Post-handoff amendments
@@ -175,13 +176,40 @@ In one SQLite transaction:
 5. Attach the Charter to the Project and transfer mutation authority.
 6. Create compact default primary milestone `M1 — Deliver outcome` when `project_mode=compact`; standard mode may create planned milestone definitions from the approved Charter only when present.
 7. Create server-signed handoff record, project-visible payload, target handoff message, and one queued Project Agent turn.
-8. Append domain events/outbox records.
-9. Transition Genesis to `handed_off` and mark receipt `consumed` with Project ID.
-10. Commit.
+8. Freeze one immutable Project admission receipt that names the handoff, consumed approval, initial Charter/revision, and canonical packet digest.
+9. Link the active binding to that admission receipt and to the exact current consumed Charter approval.
+10. Append domain events/outbox records.
+11. Transition Genesis to `handed_off` and mark the Charter approval receipt `consumed` with Project ID.
+12. Commit.
 
 Any error rolls back every item. Runtime execution of the queued Project Agent turn happens after commit and follows the normal finite retry/failure lifecycle; a failed model response does not undo the delivered handoff.
 
 Enforce uniqueness on approval ID and idempotency key. A retry after a lost response returns the same IDs.
+
+## Project Admission Receipt
+
+Admission is established once, at the transaction that first makes the
+Project Charter-backed:
+
+- Genesis creation validates the complete bounded handoff and freezes its ID
+  and canonical request fingerprint.
+- Legacy adoption has no Main handoff; it freezes the exact consumed adoption
+  approval and content digest.
+- The receipt is immutable, unique per Project, and never supplied by an
+  adapter or model.
+
+An active Charter-backed binding must reference that stable receipt, the exact
+current consumed Charter approval and Charter/revision pointers, current
+Project operating-skill revision, policy digest, Profile snapshot, and
+permission ceiling. Rebinding reuses the admission receipt and creates no
+handoff. A Charter amendment rotates the binding's current approval/Charter
+authority and also reuses the receipt.
+
+Fresh turns check receipt integrity plus current binding/Charter authority.
+They must not re-derive admission by scanning Main messages/turns, source
+Profiles, Genesis instruction revisions, or Project-creation events. Queued,
+leased, and retrying turns retain the responder provenance frozen when they
+were admitted.
 
 ## Handoff Projections
 
@@ -259,8 +287,8 @@ The same interactive user may inspect authorized provenance through a dedicated 
 - Every visible statement exists inside the approved Charter or an explicitly included immutable research record.
 - Unresolved summary has at most two non-blocking/non-normative items; the full queue remains in the Charter.
 - Publication is idempotent on the consumed approval.
-- A correction is a new handoff referencing an approved Project-local amendment and `supersedes_handoff_id`; it never mutates the old handoff.
-- Project Agent startup fails closed on any hash/binding/approval mismatch.
+- A supplemental/correction publication is an explicit new handoff; ordinary rebinding and Charter amendment are not handoff publications.
+- Issue-time admission fails closed on any packet/hash/approval mismatch. Later turns fail closed on a missing/cross-Project receipt or stale current binding/Charter authority without re-walking Main provenance.
 
 ## Never Cross the Model Boundary
 
@@ -296,3 +324,7 @@ CharterAmendmentDraft {
 ```
 
 User approval must compare expected current Charter revision plus candidate content/render digests. A mismatch fails. Successful approval advances the pointer and marks affected records `reconciliation_required` until explicitly resolved.
+
+The same amendment transaction updates the active binding to the new consumed
+approval and current Charter revision while retaining the Project admission
+receipt. It never requires or creates a replacement Main handoff.

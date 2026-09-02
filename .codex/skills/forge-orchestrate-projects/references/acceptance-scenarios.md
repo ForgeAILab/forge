@@ -38,7 +38,7 @@ authenticated and all referenced records belong to the named account.
 
 - **Given** an active receipt binds the exact ready Charter content/render digests, selected Agent identity/Profile/skill/policy revisions, and approved metadata
 - **When** `CreateProjectFromCharterApproval` succeeds with an idempotency key
-- **Then** one transaction creates the Project, one binding, one Project Chat, Charter attachment, immutable bounded handoff, target message/turn, domain events, and `Genesis=handed_off`, consumes the receipt, and uses one Project ID throughout (including compact `M1 — Deliver outcome` when applicable)
+- **Then** one transaction creates the Project, one binding, one Project Chat, Charter attachment, immutable bounded handoff, immutable Project admission receipt, target message/turn, domain events, and `Genesis=handed_off`, consumes the Charter approval receipt, and uses one Project ID throughout (including compact `M1 — Deliver outcome` when applicable)
 
 ### HAND-02 — Creation failure leaves no partial handoff
 
@@ -50,13 +50,19 @@ authenticated and all referenced records belong to the named account.
 
 - **Given** create-and-handoff committed but the client lost its response
 - **When** the client retries with the same receipt and idempotency key
-- **Then** Forge returns the original Project, binding, Chat, handoff, message, and turn IDs and creates no duplicate Project, handoff, turn, or event
+- **Then** Forge returns the original Project, binding, Chat, handoff, message, and turn IDs even if that binding was later replaced, and creates no duplicate Project, admission receipt, handoff, turn, or event
 
-### HAND-04 — Handoff admission is exact and bounded
+### HAND-04 — Issue-time handoff admission is exact and bounded
 
 - **Given** a handoff contains an approved Charter revision/digests and safe unresolved/research references
-- **When** the target Project Agent starts with a matching handoff, or with a missing, inaccessible, superseded, cross-Project, or digest-mismatched reference
-- **Then** the matching case admits only authorized Project context and no raw Main history, hidden memory, secrets, browser state, paths, or capabilities; the mismatch case fails closed with a typed conflict and admits no mutation
+- **When** atomic Project creation validates and freezes the handoff into the Project admission receipt
+- **Then** the matching case admits only authorized Project context and no raw Main history, hidden memory, secrets, browser state, paths, or capabilities; a missing, inaccessible, cross-Project, or digest-mismatched reference rolls back with a typed conflict and admits no mutation
+
+### HAND-05 — Later turns use stable admission plus current authority
+
+- **Given** a Charter-backed Project has one valid admission receipt and its original binding is later replaced, its Profile edited, its same-key operating skill revised, or its Charter amended
+- **When** Forge admits a fresh Project turn
+- **Then** Forge uses the same admission receipt plus the current binding/current Charter authority, creates no replacement Main handoff, and does not query historical Main messages/turns/Profiles/instructions or creation-event provenance; queued/leased/retry turns retain their already frozen responder provenance
 
 ## Approval digests, replay, and races
 

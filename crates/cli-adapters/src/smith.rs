@@ -263,13 +263,20 @@ impl CodingExecutorAdapter for SmithAdapter {
                 .await?;
         }
 
-        if let Some(summary) = &stream.summary {
+        // The assistant log entry is the transcript, and a reviewer's verdict
+        // marker sits at the end of its final message -- so this writes the
+        // complete text, never the bounded `summary` preview.
+        if let Some(text) = stream
+            .assistant_output
+            .as_deref()
+            .or(stream.summary.as_deref())
+        {
             writer
                 .write(
                     LogKind::Assistant,
                     LogStream::Main,
                     serde_json::json!({
-                        "text": summary,
+                        "text": text,
                         "source": "smith_cli",
                         "session_id": stream.agent_session_id.as_deref(),
                     }),

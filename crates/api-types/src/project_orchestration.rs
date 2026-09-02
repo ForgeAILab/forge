@@ -1117,8 +1117,6 @@ pub struct AcceptanceEvidenceRequirement {
     pub required: bool,
     #[serde(default)]
     pub evidence_kind: Option<String>,
-    #[serde(default)]
-    pub check_definition_revision: Option<String>,
 }
 
 /// The closed set of adaptive Task authority verbs a baseline's adaptive

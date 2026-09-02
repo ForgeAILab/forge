@@ -80,25 +80,37 @@ pub async fn get_project_overview(
     stale |= releases_stale;
     let watermark = load_watermark(&state, &project.id, project.project_work_epoch).await?;
 
-    if project.charter_setup_required {
-        stale = true;
-    }
-    let charter_state = if project.charter_setup_required
-        || (project.charter_status == "charter_backed" && current_charter.is_none())
-    {
-        stale = true;
+    // Charter setup is a starting state, not a projection fault.  A Project
+    // that has simply never adopted a Charter reports that through
+    // `charter_state` and the `charter_adoption` next action; raising the
+    // generic stale banner on top of those would say the Overview cannot be
+    // trusted when in fact it is exactly current -- there is nothing yet to
+    // govern.  A missing Charter only makes the projection unprovable in the
+    // two cases below.
+    //
+    // 1. The Project record claims a Charter that cannot be loaded.
+    let charter_pointer_broken =
+        project.charter_status == "charter_backed" && current_charter.is_none();
+    let charter_state = if project.charter_setup_required || charter_pointer_broken {
+        stale |= charter_pointer_broken;
         "charter_setup_required"
     } else {
         match project.charter_status.as_str() {
             "charter_backed" => "approved",
             "legacy_unverified" => "legacy_unverified",
             _ => {
+                // An uninterpretable Charter status is a real record fault.
                 stale = true;
                 "charter_setup_required"
             }
         }
     };
-    if project.charter_status == "legacy_unverified" && !project.charter_setup_required {
+    // 2. The Project already carries governed records -- milestones, evidence,
+    //    or releases -- that only an approved Charter could have authorized.
+    //    Those cannot be shown as current release truth without it.
+    if current_charter.is_none()
+        && (!active_milestones.is_empty() || !milestone_evidence.is_empty() || !releases.is_empty())
+    {
         stale = true;
     }
 

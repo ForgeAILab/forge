@@ -203,13 +203,16 @@ impl CodingExecutorAdapter for OpencodeAdapter {
                 .await?;
         }
 
-        if let Some(summary) = &stream.summary {
+        let assistant_output = stream.assistant_output;
+        let summary = assistant_output.as_deref().map(truncate_summary);
+
+        if let Some(text) = &assistant_output {
             writer
                 .write(
                     LogKind::Assistant,
                     LogStream::Main,
                     serde_json::json!({
-                        "text": summary,
+                        "text": text,
                         "source": "opencode_cli",
                         "session_id": stream.agent_session_id.as_deref(),
                     }),
@@ -222,7 +225,8 @@ impl CodingExecutorAdapter for OpencodeAdapter {
                 status: ExecutionOutcome::Cancelled,
                 after_sha: None,
                 agent_session_id: stream.agent_session_id,
-                summary: stream.summary,
+                assistant_output,
+                summary,
                 error: None,
                 usage: None,
                 ..Default::default()
@@ -234,7 +238,8 @@ impl CodingExecutorAdapter for OpencodeAdapter {
                 status: ExecutionOutcome::Failed,
                 after_sha: None,
                 agent_session_id: stream.agent_session_id,
-                summary: stream.summary,
+                assistant_output,
+                summary,
                 error: Some(error),
                 usage: None,
                 ..Default::default()
@@ -246,18 +251,20 @@ impl CodingExecutorAdapter for OpencodeAdapter {
                 status: ExecutionOutcome::Failed,
                 after_sha: None,
                 agent_session_id: stream.agent_session_id,
-                summary: stream.summary,
+                assistant_output,
+                summary,
                 error: Some(opencode_run_error(status, &stream.stderr_tail)),
                 usage: None,
                 ..Default::default()
             });
         }
 
-        if stream.summary.is_none() {
+        if assistant_output.is_none() {
             return Ok(ExecutionResult {
                 status: ExecutionOutcome::Failed,
                 after_sha: None,
                 agent_session_id: stream.agent_session_id,
+                assistant_output: None,
                 summary: None,
                 error: Some("opencode run completed without assistant text".to_owned()),
                 usage: None,
@@ -286,7 +293,8 @@ impl CodingExecutorAdapter for OpencodeAdapter {
             status: ExecutionOutcome::Completed,
             after_sha,
             agent_session_id: stream.agent_session_id,
-            summary: stream.summary,
+            assistant_output,
+            summary,
             error: None,
             usage: None,
             ..Default::default()
@@ -314,7 +322,11 @@ impl CodingExecutorAdapter for OpencodeAdapter {
 
 struct RunStreamResult {
     agent_session_id: Option<String>,
-    summary: Option<String>,
+    /// Complete final assistant text.  The bounded `summary` preview is
+    /// derived from this at the end of the run; nothing truncates on the way
+    /// in, because the assistant log entry is the transcript a reviewer's
+    /// verdict is read back from.
+    assistant_output: Option<String>,
     error: Option<String>,
     stderr_tail: String,
 }
@@ -329,7 +341,7 @@ async fn stream_run_output(
     let mut stdout_done = false;
     let mut stderr_done = false;
     let mut agent_session_id = None;
-    let mut summary = None;
+    let mut assistant_output = None;
     let mut error = None;
     let mut stderr_tail = String::new();
 
@@ -340,11 +352,11 @@ async fn stream_run_output(
                     Some(line) => {
                         let cleaned = strip_ansi_codes(&line);
                         if let Ok(event) = serde_json::from_str::<serde_json::Value>(&cleaned) {
-                            capture_run_event(&event, &mut agent_session_id, &mut summary, &mut error);
+                            capture_run_event(&event, &mut agent_session_id, &mut assistant_output, &mut error);
                             writer.write(classify_run_event(&event), LogStream::Main, event).await?;
                         } else {
                             if !cleaned.trim().is_empty() {
-                                summary = Some(truncate_summary(&cleaned));
+                                assistant_output = Some(cleaned.clone());
                             }
                             writer
                                 .write(
@@ -379,7 +391,7 @@ async fn stream_run_output(
 
     Ok(RunStreamResult {
         agent_session_id,
-        summary,
+        assistant_output,
         error,
         stderr_tail,
     })
@@ -440,7 +452,7 @@ fn classify_run_event(event: &serde_json::Value) -> LogKind {
 fn capture_run_event(
     event: &serde_json::Value,
     agent_session_id: &mut Option<String>,
-    summary: &mut Option<String>,
+    assistant_output: &mut Option<String>,
     error: &mut Option<String>,
 ) {
     if agent_session_id.is_none() {
@@ -458,7 +470,7 @@ fn capture_run_event(
     if let Some(text) = extract_text(event)
         && !text.trim().is_empty()
     {
-        *summary = Some(truncate_summary(&text));
+        *assistant_output = Some(text);
     }
 }
 
@@ -943,6 +955,84 @@ printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step
         assert_eq!(result.status, ExecutionOutcome::Completed);
         assert_eq!(result.agent_session_id, Some("ses_test".to_owned()));
         assert_eq!(result.summary, Some("forge fake ok".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn assistant_log_entry_keeps_the_whole_final_message() {
+        // A reviewer's verdict marker sits at the END of its final message, and
+        // the review runner reads the verdict back out of the assistant log
+        // entry. Truncating that entry to the bounded `summary` preview silently
+        // discarded the marker and every long review failed as "verdict marker
+        // missing", so the log entry must carry the complete text while
+        // `summary` stays bounded for the Task projection.
+        let dir = tempfile::tempdir().unwrap();
+        let fake_opencode = dir.path().join("fake-opencode-long");
+        let body = "x".repeat(2_000);
+        std::fs::write(
+            &fake_opencode,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' '{{"type":"text","sessionID":"ses_test","part":{{"type":"text","text":"{body}\n===REVIEW: PASS==="}}}}'
+"#
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&fake_opencode).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&fake_opencode, permissions).unwrap();
+        }
+
+        let logs_path = dir.path().join("opencode-long.jsonl");
+        let adapter = OpencodeAdapter::new();
+        let result = adapter
+            .execute(ExecutionContext {
+                task_id: "task".to_owned(),
+                execution_id: "execution".to_owned(),
+                worktree_path: dir.path().to_string_lossy().to_string(),
+                description: "hello".to_owned(),
+                agent_config: serde_json::json!({
+                    "base_command_override": fake_opencode.to_string_lossy(),
+                }),
+                logs_path: logs_path.to_string_lossy().to_string(),
+                heartbeat_interval_seconds: 1,
+                max_turns: None,
+                log_sender: None,
+            })
+            .await
+            .unwrap();
+
+        let full = result.assistant_output.expect("full assistant output");
+        assert!(
+            full.ends_with("===REVIEW: PASS==="),
+            "verdict marker survives"
+        );
+        assert!(full.chars().count() > 500);
+        assert_eq!(
+            result.summary.as_ref().map(|s| s.chars().count()),
+            Some(500)
+        );
+
+        let logged = std::fs::read_to_string(&logs_path).unwrap();
+        let assistant_text = logged
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|entry| entry.get("kind").and_then(|k| k.as_str()) == Some("assistant"))
+            .and_then(|entry| {
+                entry
+                    .get("payload")
+                    .and_then(|payload| payload.get("text"))
+                    .and_then(|text| text.as_str())
+                    .map(str::to_owned)
+            })
+            .expect("assistant log entry");
+        assert!(
+            assistant_text.ends_with("===REVIEW: PASS==="),
+            "the assistant log entry must keep the verdict marker, got {} chars",
+            assistant_text.chars().count()
+        );
     }
 
     #[tokio::test]

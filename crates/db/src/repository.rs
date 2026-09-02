@@ -867,6 +867,35 @@ pub trait ProjectAgentBindingRepo: Send + Sync {
 }
 
 #[async_trait]
+pub trait ProjectBindingCommandRepo: Send + Sync {
+    async fn set_project_binding_command(
+        &self,
+        input: SetProjectAgentBindingCommand,
+    ) -> Result<ProjectAgentBinding>;
+}
+
+#[async_trait]
+pub trait ProjectAdmissionReceiptRepo: Send + Sync {
+    async fn get_project_admission_receipt(
+        &self,
+        id: &str,
+    ) -> Result<Option<ProjectAdmissionReceipt>>;
+    async fn get_project_admission_receipt_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<ProjectAdmissionReceipt>>;
+    async fn create_project_admission_receipt(
+        &self,
+        input: CreateProjectAdmissionReceipt,
+    ) -> Result<ProjectAdmissionReceipt>;
+    async fn resolve_current_project_binding_authority(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<CurrentProjectBindingAuthority>>;
+    async fn get_current_project_operating_skill_revision(&self) -> Result<Option<String>>;
+}
+
+#[async_trait]
 pub trait AgentChatRepo: Send + Sync {
     async fn get_agent_chat(&self, id: &str) -> Result<Option<AgentChat>>;
     async fn get_main_chat(&self, account_id: &str) -> Result<Option<AgentChat>>;
@@ -2022,8 +2051,41 @@ pub struct CreateProjectAgentBinding {
     pub permission_ceiling_json: String,
     pub subscriptions_json: String,
     pub wake_budget: i64,
+    pub operating_skill_revision_id: Option<String>,
+    pub policy_revision: String,
+    pub policy_digest: String,
+    pub charter_id: Option<String>,
+    pub charter_revision_id: Option<String>,
+    pub charter_setup_required: bool,
+    pub admission_receipt_id: Option<String>,
+    pub charter_approval_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateProjectAdmissionReceipt {
+    pub id: String,
+    pub project_id: String,
+    pub source_kind: String,
+    pub handoff_id: Option<String>,
+    pub initial_charter_approval_id: String,
+    pub initial_charter_id: String,
+    pub initial_charter_revision_id: String,
+    pub payload_digest: String,
+    pub validation_schema_version: String,
+    pub validated_at: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentProjectBindingAuthority {
+    pub project_id: String,
+    pub admission_receipt_id: String,
+    pub charter_approval_id: String,
+    pub charter_id: String,
+    pub charter_revision_id: String,
+    pub operating_skill_revision_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2032,6 +2094,16 @@ pub struct ReplaceProjectAgentBinding {
     pub expected_version: i64,
     pub replacement: CreateProjectAgentBinding,
     pub replacement_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetProjectAgentBindingCommand {
+    pub actor_user_id: String,
+    pub expected_version: Option<i64>,
+    pub replacement: CreateProjectAgentBinding,
+    pub replacement_reason: Option<String>,
+    pub event_id: String,
+    pub correlation_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

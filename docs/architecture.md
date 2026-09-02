@@ -205,6 +205,17 @@ approved adoption Charter resolves that setup binding, the same transaction
 installs the canonical Project-Agent permission ceiling before activating the
 binding; setup's empty ceiling never survives into an admitted Project Agent.
 
+V117 separates one-time Project admission from current Project-Agent
+authority. Genesis creation validates the complete Main-to-Project packet and
+freezes one immutable `project_admission_receipt`; explicit legacy adoption
+freezes the consumed adoption approval instead. The active binding references
+that stable receipt plus the exact current consumed Charter approval, current
+Charter/revision pointers, current Project operating-skill revision, and policy
+digest. REST, MCP, and native callers all use one transactional binding command
+that derives those fields, replaces the old binding, updates Chat readiness,
+and appends the binding event atomically. A binding without complete
+Charter-backed authority cannot be written.
+
 User-message or handoff admission atomically appends the guarded immutable
 message, its durable domain event, and one queued turn job. A turn exposes the
 finite states `queued`, `leased`, `awaiting_input`, `retry_wait`, `succeeded`, `failed`, or
@@ -229,6 +240,29 @@ all admitted turns. An explicit retry reclaims the same turn job and frozen
 provenance; it is not a second responder resolution or a new model admission.
 A Profile edit or binding replacement therefore affects the next admitted turn
 only, never an already queued/leased turn.
+
+For a Charter-backed Project, fresh turn admission checks the active binding
+against the Project's current Charter pointers and its stable admission
+receipt. A Genesis receipt performs one lookup of its recorded immutable
+handoff and compares the canonical fingerprint; an adoption receipt compares
+its recorded consumed approval digest. It never re-walks historical Main
+messages, Main turns, source Profiles, Genesis instructions, or Project-create
+event provenance. Rebinding reuses the receipt and creates no handoff; a
+Charter amendment rotates current binding/approval pointers while retaining the
+same receipt. Already admitted retrying turns continue to use their frozen
+binding/Profile/skill provenance.
+
+The Project operating skill (`forge.project.orchestration/v1@12`) is a
+doctrine index, not a doctrine dump: the resident prompt carries the mission,
+authority boundaries, standing invariants, and autonomous-drive rules, plus an
+index of server-owned doctrine sections (`research`, `documents`,
+`scope_change`, `tasks`, `milestones`, `release`) that the Agent reads on
+demand through the `skill.section` native read. The approved Charter likewise
+stays out of resident context: the handoff packet delivers only the Charter's
+identity and digests, and the Agent reads the full rendered text with the
+`project.charter` native read whenever its details matter. This keeps a
+Project Chat turn's fixed prompt cost small enough that LCM compaction has a
+real conversation budget to work with on small provider profiles.
 
 An autonomous `delivery_followup` admission also freezes a typed postcondition
 on its server-authored trigger: one Project-scoped event must commit at a
@@ -793,10 +827,12 @@ artifact or server state always outranks chat, summaries, memory, or model
 output; cross-Project sources are rejected before retrieval and counting.
 
 Genesis Project creation, binding, Project Chat, Charter attachment, handoff
-message/turn, events, `handed_off` transition, and receipt consumption are one
-database transaction. A failure leaves Genesis `ready_for_project`, the exact
-approval receipt `active`, and no partial Project or handoff; retry with the
-same idempotency key returns the original committed result if one exists.
+message/turn, immutable Project admission receipt, events, `handed_off`
+transition, and Charter-approval receipt consumption are one database
+transaction. A failure leaves Genesis `ready_for_project`, the exact approval
+receipt `active`, and no partial Project or handoff; retry with the same
+idempotency key returns the original committed result if one exists, even when
+the original Project binding has since been replaced.
 
 Native operations are classified by one host-owned catalog before descriptor
 exposure and again at the service boundary. Queries use read services;
@@ -1063,16 +1099,24 @@ committed together. The Attention projection can derive an
 `execution.progress_warning` remain separate semantic-progress signals.
 Project-scoped incidents with no more specific responder wake the active
 Project Agent binding, whose default wake budget is 10 admissions per hour.
-Observation is Task-scoped by construction. `ScopeToolComposition` refuses to
-give a non-Task scope a workspace root, so only a Task session holds a worktree
-and a process; Account/Project/Agent Chat sessions receive the Forge read and
-propose tools alone. That is why evidence capture (`task.evidence`) and the
-worklog (`task.worklog`) exist only in the Task scope, and why
-`project.validation` requires an `observed_task_id`: the Project Agent decides
-and cites, while a Task run observes. An acceptance check that asserts the whole
-outcome is settled by an acceptance-verification Task scoped to that outcome
-rather than to one change; the artifact it captures is promoted to a
-project-scoped media asset and may back every check it demonstrates.
+Observation belongs to the run that made it. A Task session holds a worktree
+and a process and captures what its own run did (`task.evidence`,
+`task.worklog`). The Project Agent holds its own verification workspace — a
+durable `forge/` plus a disposable `checkout/` of the repository — and every
+Project Agent Chat turn composes against it (`WorkspaceAccess::ProjectVerify`).
+An acceptance check that asserts the whole delivered outcome is settled by the
+Project Agent itself: it exercises the software in `checkout/` (its command
+tool runs there, never at the workspace root, so a build tool's upward
+manifest search cannot escape into the host's own repository), records the
+result with `project.validation` (naming `observed_task_id` only when a Task
+run made the observation), and captures its proof with `project.evidence`
+(`capture`), which stores the artifact as a project-scoped media asset and
+attaches it in one call. Verification is never delegated to a Task: an
+implementation Task's completion contract demands a commit on the Task branch,
+so a read-only verification Task fails by construction — the operating skill
+directs the Agent to cancel such a Task and settle its checks itself, and to
+respond to a failed check by dispatching the implementation Task that fixes
+the defect.
 
 Every terminal `done` Task transition also creates a `delivery_followup`
 Attention incident for that Project Agent. The follow-up asks it to reconcile
@@ -1590,8 +1634,9 @@ Connection pool sets `PRAGMA foreign_keys=ON`, `journal_mode=WAL`,
 `busy_timeout=5000` per connection.
 
 The revised schema adds `account_main_agent_binding`,
-`project_agent_binding`, `agent_chat`, immutable `agent_chat_message`, bounded
-`agent_chat_turn_job`, and immutable `agent_handoff` records to the existing
+`project_agent_binding`, immutable `project_admission_receipt`, `agent_chat`,
+immutable `agent_chat_message`, bounded `agent_chat_turn_job`, and immutable
+`agent_handoff` records to the existing
 identity/profile, session, LCM, memory, commitment, event, Attention, Task,
 execution, review, and terminal tables. It enforces one active Main binding per
 account, one active Project binding per operational Project, one global chat per
@@ -1614,6 +1659,14 @@ Project-agent-membership tables under `legacy_*`, remaps Room-scoped semantic
 memory to the owning Agent Chat, and adds database guards that reject new Room
 context, LCM, memory-binding, or manifest authority. Historical source IDs and
 sequences remain available only as provenance.
+
+V117 backfills one Project-owned admission receipt from the immutable Genesis
+handoff or consumed adoption approval, links safely inferable bindings to it,
+and enforces immutable/same-Project/current-Charter guards. Startup
+reconciliation replaces the known inferable incomplete binding shape while
+preserving its selected identity/settings and frozen turns. Ambiguous records
+are moved to `agent_setup_required` with a durable repair-required event rather
+than fabricating authority.
 
 The Charter, Project artifact, milestone, release, and shared-media metadata
 for this change are added by the forward-only

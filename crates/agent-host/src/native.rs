@@ -193,7 +193,7 @@ fn conversation_budget_tokens(
         .max(LCM_MIN_CONVERSATION_BUDGET_TOKENS)
 }
 
-/// Forge's pressure policy, adjusted on two axes the stock defaults get
+/// Forge's pressure policy, adjusted on three axes the stock defaults get
 /// wrong for real chats:
 ///
 /// - `leaf_target_tokens` must exceed one full canonical turn. Leaf planning
@@ -211,11 +211,23 @@ fn conversation_budget_tokens(
 ///   provider-window overrun in one attempt; each round is a cheap local
 ///   deterministic summary, so the widened bound costs nothing when pressure
 ///   is caught early.
+/// - `hard_threshold_percent`: the stock 95% assumes the pressure estimate
+///   tracks the planner's accounting. It does not: the `CharRatioSizer`
+///   counts only each entry's joined text, so assistant reasoning payloads
+///   and per-message JSON framing are invisible to it — on a real chat the
+///   estimate runs 10–15% under what the planner charges for the same
+///   history. Five percent of headroom is smaller than that error, so a chat
+///   sails past the planner budget (`budget_exceeded`, no turn possible)
+///   while pressure still reads Soft — and Soft never compacts, because the
+///   host does not drive the idle admission phase. Hard at 85% trips
+///   before the estimator error can eat the whole margin.
 fn forge_lcm_pressure_policy(request: &AgentTurnRequest) -> agent_runtime::lcm::LcmPressurePolicy {
     agent_runtime::lcm::LcmPressurePolicy {
-        revision: agent_runtime::registry::RegistryRevision::from_content("forge-lcm-pressure-2"),
+        revision: agent_runtime::registry::RegistryRevision::from_content("forge-lcm-pressure-3"),
         leaf_target_tokens: u64::from(request.provider.max_output_tokens).saturating_add(4096),
         max_rounds: 16,
+        soft_threshold_percent: 70,
+        hard_threshold_percent: 85,
         ..agent_runtime::lcm::LcmPressurePolicy::default()
     }
 }

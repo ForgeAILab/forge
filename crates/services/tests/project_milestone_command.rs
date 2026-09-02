@@ -360,7 +360,6 @@ fn definition_content(name: &str, check_id: Option<&str>) -> MilestoneDefinition
                     description: format!("Evidence for {name}"),
                     required: true,
                     evidence_kind: None,
-                    check_definition_revision: None,
                 }]
             })
             .unwrap_or_default(),
@@ -2089,4 +2088,121 @@ fn release_input_for_conflict(
             )),
         },
     }
+}
+
+#[tokio::test]
+async fn verbatim_revise_returns_current_revision_and_keeps_approval_standing() {
+    let db = fixture().await;
+    let service = ProjectMilestoneCommandService::new(Arc::clone(&db));
+    let defined = service
+        .define_milestone(
+            definition_command(DefinitionCommandInput {
+                project_version: 1,
+                milestone_id: None,
+                milestone_version: 1,
+                base_revision_id: None,
+                lifecycle: MilestoneDefinitionLifecycle::Proposed,
+                key: "verbatim-define",
+                name: "Verbatim milestone",
+                check_id: Some("verbatim-check"),
+            }),
+            None,
+        )
+        .await
+        .expect("define milestone");
+    sqlx::query("UPDATE project_milestone_revision SET lifecycle = 'approved' WHERE id = ?")
+        .bind(&defined.id)
+        .execute(db.pool())
+        .await
+        .expect("mark revision approved");
+
+    // Identical content re-authored as a new proposal must not mint a
+    // revision that revokes the standing approval.
+    let noop = service
+        .revise_milestone(
+            definition_command(DefinitionCommandInput {
+                project_version: 0,
+                milestone_id: Some(&defined.milestone_id),
+                milestone_version: 1,
+                base_revision_id: Some(&defined.id),
+                lifecycle: MilestoneDefinitionLifecycle::Proposed,
+                key: "verbatim-noop",
+                name: "Verbatim milestone",
+                check_id: Some("verbatim-check"),
+            }),
+            None,
+        )
+        .await
+        .expect("verbatim revise no-ops");
+    assert_eq!(noop.id, defined.id);
+    assert_eq!(noop.lifecycle, "approved");
+    let revision_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM project_milestone_revision WHERE milestone_id = ?",
+    )
+    .bind(&defined.milestone_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("revision count after verbatim revise");
+    assert_eq!(revision_count, 1);
+    let current_pointer: Option<String> = sqlx::query_scalar(
+        "SELECT current_definition_revision_id FROM project_milestone WHERE id = ?",
+    )
+    .bind(&defined.milestone_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("current pointer after verbatim revise");
+    assert_eq!(current_pointer.as_deref(), Some(defined.id.as_str()));
+
+    // An actual content change still appends a new proposed revision.
+    let milestone_version: i64 =
+        sqlx::query_scalar("SELECT version FROM project_milestone WHERE id = ?")
+            .bind(&defined.milestone_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("milestone version before changed revise");
+    let changed = service
+        .revise_milestone(
+            definition_command(DefinitionCommandInput {
+                project_version: 0,
+                milestone_id: Some(&defined.milestone_id),
+                milestone_version,
+                base_revision_id: Some(&defined.id),
+                lifecycle: MilestoneDefinitionLifecycle::Proposed,
+                key: "verbatim-changed",
+                name: "Verbatim milestone changed",
+                check_id: Some("verbatim-check"),
+            }),
+            None,
+        )
+        .await
+        .expect("changed revise appends");
+    assert_ne!(changed.id, defined.id);
+    assert_eq!(changed.lifecycle, "proposed");
+
+    // Re-proposing the now-current proposal verbatim is also a no-op.
+    let duplicate_proposal = service
+        .revise_milestone(
+            definition_command(DefinitionCommandInput {
+                project_version: 0,
+                milestone_id: Some(&defined.milestone_id),
+                milestone_version: milestone_version + 1,
+                base_revision_id: Some(&changed.id),
+                lifecycle: MilestoneDefinitionLifecycle::Proposed,
+                key: "verbatim-duplicate-proposal",
+                name: "Verbatim milestone changed",
+                check_id: Some("verbatim-check"),
+            }),
+            None,
+        )
+        .await
+        .expect("duplicate proposal no-ops");
+    assert_eq!(duplicate_proposal.id, changed.id);
+    let final_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM project_milestone_revision WHERE milestone_id = ?",
+    )
+    .bind(&defined.milestone_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("final revision count");
+    assert_eq!(final_count, 2);
 }

@@ -1306,11 +1306,37 @@ pub struct ProjectAgentBinding {
     pub permission_ceiling_json: String,
     pub subscriptions_json: String,
     pub wake_budget: i64,
+    pub operating_skill_revision_id: Option<String>,
+    pub policy_revision: String,
+    pub policy_digest: String,
+    pub charter_id: Option<String>,
+    pub charter_revision_id: Option<String>,
+    pub charter_setup_required: bool,
+    pub admission_receipt_id: Option<String>,
+    pub charter_approval_id: Option<String>,
     pub version: i64,
     pub replaced_by_binding_id: Option<String>,
     pub replacement_reason: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Immutable proof that Forge admitted a Project through one exact Genesis
+/// handoff or legacy-Charter adoption. Current Charter and binding authority
+/// deliberately live elsewhere and may advance without replacing this row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectAdmissionReceipt {
+    pub id: String,
+    pub project_id: String,
+    pub source_kind: String,
+    pub handoff_id: Option<String>,
+    pub initial_charter_approval_id: String,
+    pub initial_charter_id: String,
+    pub initial_charter_revision_id: String,
+    pub payload_digest: String,
+    pub validation_schema_version: String,
+    pub validated_at: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

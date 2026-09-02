@@ -32,8 +32,8 @@ Maintain continuity through Forge artifacts, Decisions, Tasks/events, validation
 
 STARTUP
 1. Accept canonical Project ID, Project Agent binding, identity/Profile/operating-skill revisions, permission ceiling, and policy digest only from the authenticated runtime.
-2. Verify the project-visible handoff payload hash plus Charter ID/revision/content digest/render digest/approval receipt against current server state. Compare target identity/Profile/operating-skill revisions to the binding.
-3. If any reference is missing, mismatched, unapproved, inaccessible, revoked, or belongs to another Project, fail closed. Do not reconstruct a Charter or authority from prose.
+2. Accept the immutable Project admission receipt from the authenticated runtime. Verify its Project scope/integrity, then verify the current binding against the current consumed Charter approval and Charter/revision pointers, identity/current Profile, operating-skill revision, policy digest, and permission ceiling.
+3. If the admission receipt is missing, malformed, cross-Project, or current authority is stale, fail closed. The initial handoff was fully validated when admission was issued; on later turns do not scan Main messages/turns, source Profiles, Genesis instructions, or creation events to reconstruct it, and never reconstruct authority from prose.
 4. Load Effective Project State from authorized current Charter, active execution baseline, applicable Documents, active Decisions, reconciliation conflicts, Tasks/validation, milestones/releases, commitments, and context-manifest provenance.
 5. Acknowledge compactly: approved outcome, fixed boundaries, current mode, unresolved assumptions/research, active baseline/milestone state, and next recommended setup action. Do not re-interview settled decisions.
 
@@ -170,7 +170,7 @@ The runtime should derive rather than accept:
 - Project ID and Project Agent binding;
 - identity/Profile/operating-skill/policy revisions;
 - permission ceiling;
-- verified project-visible handoff and audit hash;
+- immutable Project admission receipt and optional historical handoff context;
 - current Charter and approval;
 - active execution baseline and applicable artifact pointers;
 - Effective Project State/canonical conflicts;

@@ -971,6 +971,9 @@ function EvidenceTile({ projectId, item }: { projectId: string; item: EvidenceAt
   const [previewError, setPreviewError] = useState(false)
   const [previewAttempt, setPreviewAttempt] = useState(0)
   const [duration, setDuration] = useState<number | null>(null)
+  const [previewOpen, setPreviewOpen] = useState(false)
+  const [textPreview, setTextPreview] = useState<string | null>(null)
+  const [blobType, setBlobType] = useState<string | null>(null)
   const isVideo = item.kind === 'walkthrough_video'
   const hasVisualPreview = item.kind === 'screenshot' || isVideo
   const mediaPath = `/projects/${projectId}/media/${encodeURIComponent(item.asset_id)}`
@@ -1000,6 +1003,8 @@ function EvidenceTile({ projectId, item }: { projectId: string; item: EvidenceAt
     setPreviewError(false)
     setPreviewLoading(shouldLoad)
     setDuration(null)
+    setTextPreview(null)
+    setBlobType(null)
     if (!shouldLoad) return
 
     void apiFetchBlob(mediaPath)
@@ -1011,6 +1016,19 @@ function EvidenceTile({ projectId, item }: { projectId: string; item: EvidenceAt
         }
         objectUrl = URL.createObjectURL(blob)
         setMediaUrl(objectUrl)
+        setBlobType(blob.type || null)
+        // Text-like evidence (logs, reports) previews inline in the modal; the
+        // bytes are already authorized and in hand, so read a bounded slice.
+        const isTextLike =
+          !hasVisualPreview && (blob.type.startsWith('text/') || blob.type === 'application/json')
+        if (isTextLike && typeof blob.text === 'function') {
+          void blob
+            .text()
+            .then((text) => {
+              if (!cancelled) setTextPreview(text.slice(0, 20_000))
+            })
+            .catch(() => {})
+        }
       })
       .catch(() => {
         if (!cancelled) setPreviewError(true)
@@ -1138,16 +1156,14 @@ function EvidenceTile({ projectId, item }: { projectId: string; item: EvidenceAt
             <>
               {mediaUrl ? (
                 <>
-                  <a
-                    href={mediaUrl}
-                    target="_blank"
-                    rel="noreferrer"
+                  <button
+                    type="button"
+                    onClick={() => setPreviewOpen(true)}
                     className="inline-flex items-center gap-1 rounded-md border border-input px-2 py-1 text-xs font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
-                    Open{' '}
-                    {isVideo ? 'video' : item.kind === 'screenshot' ? 'image' : 'evidence file'}{' '}
-                    <ArrowUpRight size={13} aria-hidden />
-                  </a>
+                    Preview{' '}
+                    {isVideo ? 'video' : item.kind === 'screenshot' ? 'image' : 'evidence file'}
+                  </button>
                   <a
                     href={mediaUrl}
                     download
@@ -1169,6 +1185,75 @@ function EvidenceTile({ projectId, item }: { projectId: string; item: EvidenceAt
           )}
         </div>
       </div>
+      <Dialog
+        open={previewOpen}
+        onOpenChange={setPreviewOpen}
+        ariaLabel={`Evidence preview: ${item.caption}`}
+      >
+        <DialogContent className="max-w-4xl">
+          <DialogHeader>
+            <DialogTitle>{item.caption}</DialogTitle>
+            <DialogDescription>
+              {humanize(item.kind)} · captured {formatDate(item.captured_at)} · asset{' '}
+              {shortId(item.asset_id)}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="mt-3 max-h-[70vh] overflow-auto rounded-md border border-border-subtle bg-muted/20">
+            {!mediaUrl ? (
+              <p className="p-4 text-sm text-muted-foreground">Authorized asset unavailable.</p>
+            ) : isVideo ? (
+              <video
+                src={mediaUrl}
+                controls
+                preload="metadata"
+                playsInline
+                aria-label={`${item.caption} preview`}
+                className="mx-auto max-h-[70vh] w-full"
+              />
+            ) : item.kind === 'screenshot' ? (
+              <img
+                src={mediaUrl}
+                alt={`${item.caption} preview`}
+                className="mx-auto max-h-[70vh] w-auto"
+              />
+            ) : textPreview !== null ? (
+              <pre className="whitespace-pre-wrap p-3 font-mono text-xs leading-5 text-foreground">
+                {textPreview}
+              </pre>
+            ) : blobType === 'application/pdf' ? (
+              <iframe src={mediaUrl} title={`${item.caption} preview`} className="h-[70vh] w-full" />
+            ) : (
+              <p className="p-4 text-sm text-muted-foreground">
+                No inline preview for this file type. Open it in a new tab or download it.
+              </p>
+            )}
+          </div>
+          <DialogFooter className="mt-4 gap-2">
+            {mediaUrl ? (
+              <>
+                <a
+                  href={mediaUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 rounded-md border border-input px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  Open in new tab <ArrowUpRight size={13} aria-hidden />
+                </a>
+                <a
+                  href={mediaUrl}
+                  download
+                  className="inline-flex items-center rounded-md px-3 py-1.5 text-xs font-medium text-primary transition-colors hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  Download
+                </a>
+              </>
+            ) : null}
+            <Button type="button" onClick={() => setPreviewOpen(false)}>
+              Close
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </article>
   )
 }
@@ -1727,6 +1812,25 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
   const primary = activeMilestones.find(
     (item) => item.milestone.id === overview.primary_milestone_id,
   )
+  // Before a Charter is adopted the Charter-derived panels have no source.
+  // Hide each one that is also empty so the Overview shows what actually
+  // exists -- Task progress, and the setup the Project still needs -- instead
+  // of a column of "none recorded" placeholders. A Project that carries real
+  // milestone, document, decision, evidence, or release records keeps
+  // rendering them: this hides empty panels, never existing truth.
+  const hideOutcome = setupRequired && activeMilestones.length === 0
+  const hideValidation = hideOutcome && count(overview.check_summary.required_total) === 0
+  const hideDocuments = setupRequired && overview.document_freshness.length === 0
+  const hideDecisions =
+    setupRequired &&
+    overview.decisions.length === 0 &&
+    overview.pending_decisions.length === 0 &&
+    overview.risks.length === 0
+  const hideEvidence = setupRequired && overview.evidence.length === 0
+  const hideReleases = setupRequired && overview.releases.length === 0
+  // The adoption banner already renders `charter_adoption` as a real control;
+  // a second card restating it is noise.
+  const hideNextAction = setupRequired && overview.next_action?.code === 'charter_adoption'
   const effectiveReleaseError =
     releaseError ??
     (releaseMutation.error
@@ -1760,9 +1864,11 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
               ) : (
                 <span className="text-xs text-muted-foreground">No approved Charter revision</span>
               )}
-              <span className="break-all font-mono text-micro text-muted-foreground">
-                Primary milestone ID {overview.primary_milestone_id ?? 'not set'}
-              </span>
+              {overview.primary_milestone_id ? (
+                <span className="break-all font-mono text-micro text-muted-foreground">
+                  Primary milestone ID {overview.primary_milestone_id}
+                </span>
+              ) : null}
               {activeMilestones.map((item) => (
                 <span
                   key={item.milestone.id}
@@ -1826,74 +1932,93 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
           className="order-3 min-w-0 space-y-5 xl:order-1 xl:col-start-1"
           aria-label="Project progress"
         >
-          <div id="milestones" className="scroll-mt-24">
+          {hideOutcome ? null : (
+            <div id="milestones" className="scroll-mt-24">
+              <SectionCard
+                title={primary ? 'Current outcome' : 'Current outcome setup'}
+                eyebrow="Live Project progress"
+                action={
+                  <Link
+                    to="/projects/$projectId/tasks"
+                    params={{ projectId }}
+                    search={{ sort_by: 'updated_at', sort_order: 'desc' }}
+                    className="inline-flex items-center gap-1 text-xs font-medium text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    View Tasks <ArrowUpRight size={13} aria-hidden />
+                  </Link>
+                }
+              >
+                {activeMilestones.length === 0 ? (
+                  <div className="rounded-md border border-dashed border-border bg-muted/30 p-4">
+                    <p className="text-sm font-medium text-foreground">
+                      No active milestone is defined yet.
+                    </p>
+                    <p className="mt-1 break-words text-xs leading-5 text-muted-foreground">
+                      {overview.next_action?.title ??
+                        'Continue in Project Agent Chat to define the first bounded outcome and acceptance checks.'}
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    {activeMilestones.map((item) => (
+                      <OutcomeCard
+                        key={item.milestone.id}
+                        item={item}
+                        primary={item === primary}
+                        projectionState={overview.projection_state}
+                        hasUser={hasUser}
+                        releasePending={releaseMutation.isPending}
+                        releaseError={effectiveReleaseError}
+                        onReviewRelease={reviewRelease}
+                      />
+                    ))}
+                  </div>
+                )}
+              </SectionCard>
+            </div>
+          )}
+
+          <div className={`grid min-w-0 gap-5 ${hideValidation ? '' : 'lg:grid-cols-2'}`}>
             <SectionCard
-              title={primary ? 'Current outcome' : 'Current outcome setup'}
-              eyebrow="Live Project progress"
+              title="Task progress"
+              eyebrow="Authoritative workflow counts"
               action={
-                <Link
-                  to="/projects/$projectId/tasks"
-                  params={{ projectId }}
-                  search={{ sort_by: 'updated_at', sort_order: 'desc' }}
-                  className="inline-flex items-center gap-1 text-xs font-medium text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  View Tasks <ArrowUpRight size={13} aria-hidden />
-                </Link>
+                hideOutcome ? (
+                  <Link
+                    to="/projects/$projectId/tasks"
+                    params={{ projectId }}
+                    search={{ sort_by: 'updated_at', sort_order: 'desc' }}
+                    className="inline-flex items-center gap-1 text-xs font-medium text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    View Tasks <ArrowUpRight size={13} aria-hidden />
+                  </Link>
+                ) : undefined
               }
             >
-              {activeMilestones.length === 0 ? (
-                <div className="rounded-md border border-dashed border-border bg-muted/30 p-4">
-                  <p className="text-sm font-medium text-foreground">
-                    No active milestone is defined yet.
-                  </p>
-                  <p className="mt-1 break-words text-xs leading-5 text-muted-foreground">
-                    {overview.next_action?.title ??
-                      'Continue in Project Agent Chat to define the first bounded outcome and acceptance checks.'}
-                  </p>
-                </div>
-              ) : (
-                <div className="space-y-4">
-                  {activeMilestones.map((item) => (
-                    <OutcomeCard
-                      key={item.milestone.id}
-                      item={item}
-                      primary={item === primary}
-                      projectionState={overview.projection_state}
-                      hasUser={hasUser}
-                      releasePending={releaseMutation.isPending}
-                      releaseError={effectiveReleaseError}
-                      onReviewRelease={reviewRelease}
-                    />
-                  ))}
-                </div>
-              )}
-            </SectionCard>
-          </div>
-
-          <div className="grid min-w-0 gap-5 lg:grid-cols-2">
-            <SectionCard title="Task progress" eyebrow="Authoritative workflow counts">
               <MetricGrid counts={overview.task_counts} />
               <p className="mt-3 text-xs leading-5 text-muted-foreground">
                 Counts come from linked Tasks. Forge does not infer a completion percentage from
                 terminal work.
               </p>
             </SectionCard>
-            <div id="readiness" className="scroll-mt-24">
-              <SectionCard title="Validation" eyebrow="Acceptance contract">
-                <CheckSummary summary={overview.check_summary} />
-                <AcceptanceChecksPanel
-                  milestones={activeMilestones}
-                  hasUser={hasUser}
-                  pending={attestationMutation.isPending}
-                  onReview={(candidate) => {
-                    setAttestationError(null)
-                    setAttestationNotice(null)
-                    attestationMutation.reset?.()
-                    setAttestationCandidate(candidate)
-                  }}
-                />
-              </SectionCard>
-            </div>
+            {hideValidation ? null : (
+              <div id="readiness" className="scroll-mt-24">
+                <SectionCard title="Validation" eyebrow="Acceptance contract">
+                  <CheckSummary summary={overview.check_summary} />
+                  <AcceptanceChecksPanel
+                    milestones={activeMilestones}
+                    hasUser={hasUser}
+                    pending={attestationMutation.isPending}
+                    onReview={(candidate) => {
+                      setAttestationError(null)
+                      setAttestationNotice(null)
+                      attestationMutation.reset?.()
+                      setAttestationCandidate(candidate)
+                    }}
+                  />
+                </SectionCard>
+              </div>
+            )}
           </div>
         </section>
 
@@ -1904,21 +2029,31 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
           <div className="order-1 min-w-0 xl:order-none">
             <ProjectExecutionSetupPanel projectId={projectId} compact />
           </div>
-          <div className="order-2 min-w-0 xl:order-none">
-            <NextActionCard projectId={projectId} nextAction={overview.next_action} />
-          </div>
-          <div id="documents" className="order-4 min-w-0 scroll-mt-24 xl:order-none">
-            <DocumentFreshnessPanel documents={overview.document_freshness} />
-          </div>
-          <div id="decisions" className="order-5 min-w-0 scroll-mt-24 xl:order-none">
-            <DecisionsAndRisks projectId={projectId} overview={overview} />
-          </div>
-          <div id="evidence" className="order-6 min-w-0 scroll-mt-24 xl:order-none">
-            <EvidenceGallery projectId={projectId} evidence={overview.evidence} />
-          </div>
-          <div id="releases" className="order-7 min-w-0 scroll-mt-24 xl:order-none">
-            <ReleaseHistory projectId={projectId} releases={overview.releases} />
-          </div>
+          {hideNextAction ? null : (
+            <div className="order-2 min-w-0 xl:order-none">
+              <NextActionCard projectId={projectId} nextAction={overview.next_action} />
+            </div>
+          )}
+          {hideDocuments ? null : (
+            <div id="documents" className="order-4 min-w-0 scroll-mt-24 xl:order-none">
+              <DocumentFreshnessPanel documents={overview.document_freshness} />
+            </div>
+          )}
+          {hideDecisions ? null : (
+            <div id="decisions" className="order-5 min-w-0 scroll-mt-24 xl:order-none">
+              <DecisionsAndRisks projectId={projectId} overview={overview} />
+            </div>
+          )}
+          {hideEvidence ? null : (
+            <div id="evidence" className="order-6 min-w-0 scroll-mt-24 xl:order-none">
+              <EvidenceGallery projectId={projectId} evidence={overview.evidence} />
+            </div>
+          )}
+          {hideReleases ? null : (
+            <div id="releases" className="order-7 min-w-0 scroll-mt-24 xl:order-none">
+              <ReleaseHistory projectId={projectId} releases={overview.releases} />
+            </div>
+          )}
         </aside>
       </div>
 

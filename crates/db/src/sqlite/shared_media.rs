@@ -1590,7 +1590,18 @@ impl SharedMediaRepo for SqliteDb {
             .bind(source_validation_id)
             .fetch_optional(&mut *transaction)
             .await?
-            .ok_or(DbError::NotFound)?;
+            // A bare NotFound is redacted at the model boundary into "resource
+            // unavailable", which hides the one mistake callers actually make
+            // here: citing the acceptance-check id instead of the recorded
+            // result's own id.
+            .ok_or_else(|| {
+                DbError::Check(
+                    "evidence source_validation_id must name a recorded validation result \
+                     (the result id returned by recording the validation), not an \
+                     acceptance-check id"
+                        .to_owned(),
+                )
+            })?;
             let validation_project: String = validation.try_get("project_id")?;
             let validation_milestone: String = validation.try_get("milestone_id")?;
             let validation_check: String = validation.try_get("check_id")?;

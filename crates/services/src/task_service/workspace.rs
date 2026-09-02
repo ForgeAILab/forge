@@ -416,7 +416,18 @@ pub async fn ensure_project_agent_workspace(
     let Some(repo) = RepoRepo::get_by_id(db, &repo_id).await? else {
         return Ok(Some(workspace));
     };
-    if !workspace.join(PROJECT_AGENT_CHECKOUT_DIR).is_dir() {
+    let checkout = workspace.join(PROJECT_AGENT_CHECKOUT_DIR);
+    if checkout.is_dir() {
+        // The checkout is a disposable read-and-run copy: re-point it at the
+        // current default-branch tip every time it is handed out, so the
+        // Agent verifies what Tasks actually delivered rather than the tree
+        // as of Project creation.
+        let manager = WorkspaceManager::new(workspaces_root.to_path_buf());
+        manager
+            .refresh_detached_worktree(&checkout, &repo.default_branch)
+            .await
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+    } else {
         let source = resolve_repo_source(&repo, workspaces_root).await?;
         let manager = WorkspaceManager::new(workspaces_root.to_path_buf());
         manager
@@ -434,8 +445,9 @@ pub async fn ensure_project_agent_workspace(
 
 /// The one directory a Project Agent may write to, inside its workspace.
 pub const PROJECT_AGENT_DOCS_DIR: &str = "forge";
-/// The read-and-run copy of the repository inside that workspace.
-pub const PROJECT_AGENT_CHECKOUT_DIR: &str = "checkout";
+/// The read-and-run copy of the repository inside that workspace. The
+/// runtime runs the Agent's verification commands inside this directory.
+pub const PROJECT_AGENT_CHECKOUT_DIR: &str = forge_agent_host::PROJECT_VERIFICATION_CHECKOUT_DIR;
 
 async fn resolve_repo_source(repo: &db::Repo, workspace_root: &std::path::Path) -> Result<String> {
     if let Some(local_path) = repo

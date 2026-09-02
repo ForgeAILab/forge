@@ -162,9 +162,11 @@ impl ProjectCharterCommandService {
             command.authorization.principal_id.clone()
         };
 
-        let charter =
-            ProjectOrchestrationRepo::get_project_adoption_charter(&*self.db, &command.project_id)
-                .await?;
+        let charter = ProjectOrchestrationRepo::get_project_charter_by_project_id(
+            &*self.db,
+            &command.project_id,
+        )
+        .await?;
         let charter_id = charter.as_ref().map_or_else(
             || {
                 if command.charter_id.trim().is_empty() {

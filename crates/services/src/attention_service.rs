@@ -1587,8 +1587,36 @@ impl AttentionService {
         }))
     }
 
+    /// A Task entering `review` is only attention when a person must decide
+    /// the gate. A review run by the workflow's reviewer Agent settles itself;
+    /// waking the Project Agent for it sends the Agent to a `task.review`
+    /// action the gate rejects, which wastes the turn and reports a blocker
+    /// that does not exist. A Task that no longer exists is nobody's review.
+    async fn review_needs_a_person(&self, event: &DomainEvent) -> Result<bool> {
+        if event.entity_type != "task" {
+            return Ok(true);
+        }
+        let Some(task) = db::TaskRepo::get_by_id(&*self.db, &event.entity_id, false).await? else {
+            return Ok(false);
+        };
+        let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
+            return Ok(false);
+        };
+        let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
+        );
+        Ok(crate::task_service::task_review_requires_user_decision(
+            &task, &workflow,
+        ))
+    }
+
     async fn project_event(&self, event: &DomainEvent) -> Result<()> {
         if let Some(category) = classify_event(event) {
+            if category == "review_ready" && !self.review_needs_a_person(event).await? {
+                return Ok(());
+            }
             let (scope_type, scope_id) = self.event_scope(event).await?;
             // Attention's historical materialization table accepts the
             // account/project scope vocabulary, while Agent Chat events use

@@ -14,16 +14,16 @@ use db::{
     AgentChatMessageRepo, AgentChatMessageStatus as DbMessageStatus, AgentChatRepo,
     AgentChatTurnJob, AgentChatTurnState, AgentHandoff, AgentHandoffRepo,
     AgentHandoffStatus as DbHandoffStatus, AgentListQuery, AgentProfileRepo, AgentRepo,
-    AgentSessionRepo, CreateAccountMainAgentBinding, CreateProject, CreateProjectAgentBinding,
-    ExecutionRepo, MemoryScopeGrant, PageRequest, ProjectAgentBinding, ProjectAgentBindingRepo,
-    ProjectMemberRepo, ProjectRepo, ReplaceAccountMainAgentBinding, ReplaceProjectAgentBinding,
-    SortBy, SortOrder, TaskDependencyRepo, TaskListQuery, TaskRepo, UpdateProject, UpdateTask,
+    AgentSessionRepo, CreateAccountMainAgentBinding, CreateProject, ExecutionRepo,
+    MemoryScopeGrant, PageRequest, ProjectAgentBinding, ProjectAgentBindingRepo, ProjectMemberRepo,
+    ProjectRepo, ReplaceAccountMainAgentBinding, SortBy, SortOrder, TaskDependencyRepo,
+    TaskListQuery, TaskRepo, UpdateProject, UpdateTask,
 };
 use executors::ExecutionOverrides;
 use serde_json::{json, Map, Value};
 use services::{
     workflow::engine::WorkflowEngine, Assignee, DiffService, MemoryAccessContext,
-    MemorySearchResult,
+    MemorySearchResult, SetProjectAgentBindingInput,
 };
 use uuid::Uuid;
 
@@ -1161,7 +1161,6 @@ pub(super) async fn forge_set_project_agent(
     let user_id = authenticated_user(context)?;
     let params: BindProjectAgentParams = parse_params(params)?;
     require_project_admin(state, &params.project_id, user_id).await?;
-    let identity = require_owned_identity_for_user(state, user_id, &params.identity_id).await?;
     if params.wake_budget < 0 {
         return Err(invalid_field_error(
             "wake_budget",
@@ -1169,45 +1168,22 @@ pub(super) async fn forge_set_project_agent(
             Some(json!({ "type": "integer", "minimum": 0 })),
         ));
     }
-    let now = now_rfc3339();
-    let replacement = CreateProjectAgentBinding {
-        id: new_uuid_v4(),
-        project_id: params.project_id.clone(),
-        identity_id: Some(params.identity_id),
-        // Bind-time snapshot; turns re-resolve the agent's current profile.
-        profile_id: Some(identity.profile_id),
-        state: "active".to_owned(),
-        autonomy_policy_json: policy_json(params.autonomy_policy),
-        permission_ceiling_json: policy_json(params.permission_ceiling),
-        subscriptions_json: serde_json::to_string(&params.subscriptions)
-            .map_err(|error| McpToolError::new(-32603, error.to_string()))?,
-        wake_budget: params.wake_budget,
-        created_at: now.clone(),
-        updated_at: now,
-    };
-    let history =
-        ProjectAgentBindingRepo::list_project_binding_history(&*state.db, &params.project_id)
-            .await?;
-    let binding = if history.is_empty() {
-        if params.expected_version != 0 {
-            return Err(McpToolError::new(
-                -32009,
-                "Project Agent binding does not exist; expected_version must be 0",
-            ));
-        }
-        ProjectAgentBindingRepo::create_project_binding(&*state.db, replacement).await?
-    } else {
-        ProjectAgentBindingRepo::replace_project_binding(
-            &*state.db,
-            ReplaceProjectAgentBinding {
-                project_id: params.project_id.clone(),
-                expected_version: params.expected_version,
-                replacement,
-                replacement_reason: Some("mcp_replace".to_owned()),
-            },
-        )
-        .await?
-    };
+    let binding = state
+        .agent_chat_service
+        .set_project_binding(SetProjectAgentBindingInput {
+            actor_user_id: user_id.to_owned(),
+            project_id: params.project_id.clone(),
+            identity_id: Some(params.identity_id),
+            state: "active".to_owned(),
+            autonomy_policy_json: policy_json(params.autonomy_policy),
+            permission_ceiling_json: policy_json(params.permission_ceiling),
+            subscriptions_json: serde_json::to_string(&params.subscriptions)
+                .map_err(|error| McpToolError::new(-32603, error.to_string()))?,
+            wake_budget: params.wake_budget,
+            expected_version: (params.expected_version > 0).then_some(params.expected_version),
+            replacement_reason: Some("mcp_replace".to_owned()),
+        })
+        .await?;
     let chat_id = AgentChatRepo::get_project_chat(&*state.db, &params.project_id)
         .await?
         .map(|chat| chat.id)

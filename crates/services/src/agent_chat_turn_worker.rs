@@ -10,13 +10,15 @@ use std::{collections::BTreeSet, fmt, path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
+#[cfg(test)]
+use db::canonicalize_project_handoff_json;
 use db::{
-    canonicalize_project_handoff_json, now_rfc3339, project_handoff_request_fingerprint,
-    AccountMainAgentBindingRepo, Agent, AgentChatMessage, AgentChatMessageAuthorType,
-    AgentChatMessageListQuery, AgentChatMessageRepo, AgentChatMessageStatus, AgentChatRepo,
-    AgentChatTransactionRepo, AgentChatTurnJob, AgentChatTurnJobRepo, AgentProfile,
-    AgentProfileRepo, AgentRepo, AgentSession, CompleteAgentChatControlTransfer,
-    CredentialHandleRepo, PageRequest, ProjectAgentBindingRepo, ProjectRepo, SqliteDb,
+    now_rfc3339, project_handoff_request_fingerprint, AccountMainAgentBindingRepo, Agent,
+    AgentChatMessage, AgentChatMessageAuthorType, AgentChatMessageListQuery, AgentChatMessageRepo,
+    AgentChatMessageStatus, AgentChatRepo, AgentChatTransactionRepo, AgentChatTurnJob,
+    AgentChatTurnJobRepo, AgentProfile, AgentProfileRepo, AgentRepo, AgentSession,
+    CompleteAgentChatControlTransfer, CredentialHandleRepo, PageRequest, ProjectAgentBindingRepo,
+    ProjectRepo, SqliteDb,
 };
 use executors::{
     merge_overrides, ExecutionContext, ExecutionOutcome, ExecutionOverrides, ExecutionResult,
@@ -78,6 +80,7 @@ const MAX_ERROR_CHARS: usize = 512;
 const MAX_CLI_ASSISTANT_CHARS: usize = 500;
 const PROJECT_HANDOFF_SCHEMA_VERSION: &str = "forge.project-charter-handoff/v1";
 const PROJECT_CONTEXT_DIGEST_SCHEMA_VERSION: &str = "forge.project-context-reference/v1";
+#[cfg(test)]
 const MAX_HANDOFF_BOUNDED_CHARS: usize = 12_000;
 const DELIVERY_FOLLOWUP_POSTCONDITION_FAILED: &str = "delivery_followup_postcondition_failed";
 const DELIVERY_FOLLOWUP_POSTCONDITION_MESSAGE: &str =
@@ -138,6 +141,7 @@ fn ceiling_grants_nothing(ceiling: &str) -> bool {
     };
     entries.is_none_or(|values| !values.iter().any(serde_json::Value::is_string))
 }
+#[cfg(test)]
 const REQUIRED_HANDOFF_REDACTION_CATEGORIES: [&str; 6] = [
     "full_main_chat_history",
     "hidden_memory_bodies",
@@ -425,6 +429,7 @@ struct ProjectCharterHandoffDelivery {
     delivered_at: String,
 }
 
+#[cfg(test)]
 struct ProjectHandoffExpectation<'a> {
     handoff_id: &'a str,
     deduplication_key: &'a str,
@@ -1541,7 +1546,8 @@ impl FederatedAgentChatTurnRunner {
         let binding_row = sqlx::query(
             "SELECT id, project_id, state, version, identity_id,
                     operating_skill_revision_id, policy_revision, policy_digest,
-                    charter_id, charter_revision_id, charter_setup_required
+                    charter_id, charter_revision_id, charter_setup_required,
+                    admission_receipt_id, charter_approval_id
              FROM project_agent_binding
              WHERE id = ? AND project_id = ?",
         )
@@ -1566,6 +1572,10 @@ impl FederatedAgentChatTurnRunner {
         let binding_charter_revision_id: Option<String> =
             binding_row.try_get("charter_revision_id")?;
         let binding_charter_setup_required: i64 = binding_row.try_get("charter_setup_required")?;
+        let binding_admission_receipt_id: Option<String> =
+            binding_row.try_get("admission_receipt_id")?;
+        let binding_charter_approval_id: Option<String> =
+            binding_row.try_get("charter_approval_id")?;
         if let Some(frozen) = frozen {
             let historical_binding_version_matches = binding_version == frozen.binding_version
                 || (binding_state == "replaced" && binding_version == frozen.binding_version + 1);
@@ -1736,6 +1746,8 @@ impl FederatedAgentChatTurnRunner {
             || binding_charter_setup_required != 0
             || binding_policy_revision.trim().is_empty()
             || binding_policy_digest.trim().is_empty()
+            || binding_admission_receipt_id.is_none()
+            || binding_charter_approval_id.is_none()
         {
             return Err(ServiceError::invalid_operation(
                 "Project Agent binding is not an active Charter-backed authority",
@@ -1772,28 +1784,20 @@ impl FederatedAgentChatTurnRunner {
 
         let charter_row = sqlx::query(
             "SELECT c.id AS charter_id, c.account_id AS charter_account_id,
-                    c.genesis_session_id,
                     c.current_approved_revision_id,
                     c.project_mode, c.version AS charter_version,
                     r.id AS charter_revision_id, r.lifecycle AS charter_revision_lifecycle,
-                    r.revision AS charter_revision_number,
-                    r.schema_version AS charter_schema_version,
-                    r.render_version AS charter_render_version,
                     r.content_digest AS charter_content_digest,
                     r.rendered_digest AS charter_render_digest,
                     a.id AS approval_id, a.lifecycle AS approval_lifecycle,
-                    a.approval_type,
                     a.content_digest AS approval_content_digest,
                     a.rendered_digest AS approval_render_digest,
                     a.expected_charter_version,
-                    a.approved_project_mode,
-                    a.approved_name,
                     a.selected_identity_id, a.selected_profile_id,
                     a.selected_operating_skill_revision_id,
                     a.selected_policy_revision, a.selected_policy_digest,
                     a.approval_event_id,
                     a.consumed_project_id,
-                    a.approved_slug,
                     a.approving_principal_type,
                     a.approving_principal_id,
                     a.authorization_basis AS approval_authorization_basis,
@@ -1808,13 +1812,14 @@ impl FederatedAgentChatTurnRunner {
              JOIN project_charter_approval AS a
                ON a.charter_id = c.id AND a.revision_id = r.id
               AND a.lifecycle IN ('active', 'consumed')
-             WHERE c.project_id = ? AND c.id = ? AND r.id = ?
+             WHERE c.project_id = ? AND c.id = ? AND r.id = ? AND a.id = ?
              ORDER BY a.created_at DESC, a.id DESC
              LIMIT 1",
         )
         .bind(project_id)
         .bind(project_charter_id)
         .bind(project_charter_revision_id)
+        .bind(binding_charter_approval_id.as_deref())
         .fetch_optional(self.db.pool())
         .await?
         .ok_or_else(|| {
@@ -1829,31 +1834,18 @@ impl FederatedAgentChatTurnRunner {
             charter_row.try_get("current_approved_revision_id")?;
         let charter_revision_lifecycle: String =
             charter_row.try_get("charter_revision_lifecycle")?;
-        let charter_revision_number: i64 = charter_row.try_get("charter_revision_number")?;
-        let charter_schema_version: String = charter_row.try_get("charter_schema_version")?;
-        let charter_render_version: String = charter_row.try_get("charter_render_version")?;
         let charter_version: i64 = charter_row.try_get("charter_version")?;
         let expected_charter_version: i64 = charter_row.try_get("expected_charter_version")?;
         let approval_lifecycle: String = charter_row.try_get("approval_lifecycle")?;
         let approval_id: String = charter_row.try_get("approval_id")?;
-        let approval_type: String = charter_row.try_get("approval_type")?;
         let approval_content_digest: String = charter_row.try_get("approval_content_digest")?;
         let approval_render_digest: String = charter_row.try_get("approval_render_digest")?;
-        let approved_project_mode: String = charter_row.try_get("approved_project_mode")?;
-        let approved_name: Option<String> = charter_row.try_get("approved_name")?;
         let charter_content_digest: String = charter_row.try_get("charter_content_digest")?;
         let charter_render_digest: String = charter_row.try_get("charter_render_digest")?;
         let consumed_project_id: Option<String> = charter_row.try_get("consumed_project_id")?;
-        let selected_identity_id: Option<String> = charter_row.try_get("selected_identity_id")?;
-        let selected_profile_id: Option<String> = charter_row.try_get("selected_profile_id")?;
         let selected_skill_revision_id: Option<String> =
             charter_row.try_get("selected_operating_skill_revision_id")?;
-        let selected_policy_revision: Option<String> =
-            charter_row.try_get("selected_policy_revision")?;
-        let selected_policy_digest: Option<String> =
-            charter_row.try_get("selected_policy_digest")?;
         let approval_event_id: Option<String> = charter_row.try_get("approval_event_id")?;
-        let approval_approved_slug: Option<String> = charter_row.try_get("approved_slug")?;
         let approval_principal_kind: String = charter_row.try_get("approving_principal_type")?;
         let approval_principal_id: String = charter_row.try_get("approving_principal_id")?;
         let approval_authorization_basis: String =
@@ -1865,20 +1857,9 @@ impl FederatedAgentChatTurnRunner {
         let approval_authorization_occurred_at: String =
             charter_row.try_get("approval_authorization_occurred_at")?;
         let approval_created_at: String = charter_row.try_get("approval_created_at")?;
-        let genesis_session_id: Option<String> = charter_row.try_get("genesis_session_id")?;
         let expected_approval_event_id = approval_event_id.as_deref().ok_or_else(|| {
             ServiceError::invalid_operation(
                 "Project Agent Charter approval has no immutable authorization event",
-            )
-        })?;
-        let expected_identity_id = selected_identity_id.as_deref().ok_or_else(|| {
-            ServiceError::invalid_operation(
-                "Project Agent Charter approval has no selected identity",
-            )
-        })?;
-        let expected_profile_revision_id = selected_profile_id.as_deref().ok_or_else(|| {
-            ServiceError::invalid_operation(
-                "Project Agent Charter approval has no selected profile revision",
             )
         })?;
         let expected_skill_revision_id =
@@ -1887,17 +1868,6 @@ impl FederatedAgentChatTurnRunner {
                     "Project Agent Charter approval has no selected operating skill revision",
                 )
             })?;
-        let expected_policy_revision = selected_policy_revision.as_deref().ok_or_else(|| {
-            ServiceError::invalid_operation(
-                "Project Agent Charter approval has no selected policy revision",
-            )
-        })?;
-        let expected_policy_digest = selected_policy_digest.as_deref().ok_or_else(|| {
-            ServiceError::invalid_operation(
-                "Project Agent Charter approval has no selected policy digest",
-            )
-        })?;
-        let recomputed_policy_digest = project_agent_policy_digest(&profile.tool_policy_json);
         if charter_id != project_charter_id
             || charter_revision_id != project_charter_revision_id
             || current_approved_revision_id.as_deref() != Some(project_charter_revision_id)
@@ -1909,8 +1879,6 @@ impl FederatedAgentChatTurnRunner {
             || approval_render_digest != charter_render_digest
             || charter_content_digest.trim().is_empty()
             || charter_render_digest.trim().is_empty()
-            || (frozen.is_none() && selected_identity_id.as_deref() != Some(agent.id.as_str()))
-            || (frozen.is_none() && selected_profile_id.as_deref() != Some(profile.id.as_str()))
             // The approval receipt immutably records the skill revision that
             // was current at approval time. The skill body is server-owned —
             // the user approved the agent and policy, not the instruction
@@ -1919,15 +1887,6 @@ impl FederatedAgentChatTurnRunner {
             // carry the exact current server contract.
             || !expected_skill_revision_id
                 .starts_with(&format!("{PROJECT_OPERATING_SKILL_KEY}@"))
-            || (frozen.is_none()
-                && selected_policy_revision.as_deref() != Some(binding_policy_revision.as_str()))
-            || (frozen.is_none()
-                && selected_policy_digest.as_deref() != Some(binding_policy_digest.as_str()))
-            || (frozen.is_none() && expected_identity_id != agent.id)
-            || (frozen.is_none() && expected_profile_revision_id != profile.id)
-            || (frozen.is_none() && expected_policy_revision != binding_policy_revision)
-            || (frozen.is_none() && expected_policy_digest != binding_policy_digest)
-            || (frozen.is_none() && expected_policy_digest != recomputed_policy_digest)
             || consumed_project_id.as_deref() != Some(project_id)
         {
             return Err(ServiceError::invalid_operation(
@@ -2041,360 +2000,171 @@ impl FederatedAgentChatTurnRunner {
                 "Project Charter approval event is not an exact user authorization",
             ));
         }
-        let (handoff_id, handoff_payload_hash) = if genesis_session_id.is_none()
-            && matches!(approval_type.as_str(), "adoption" | "charter_amendment")
-        {
-            let is_adoption = approval_type == "adoption";
-            if project.charter_status != "charter_backed"
-                || project.charter_setup_required
-                || approval_principal_kind != "user"
-                || approval_principal_id != project_owner_id
-                || approved_name.as_deref() != Some(project.name.as_str())
-                || approval_lifecycle != "consumed"
-                || consumed_project_id.as_deref() != Some(project_id)
-            {
-                return Err(ServiceError::invalid_operation(
-                    "Project adoption approval is stale or not authenticated",
-                ));
-            }
-            let charter_revision_for_hash = project_charter_revision_id.to_owned();
-            let adoption_hash = hash_parts(
-                if is_adoption {
-                    b"forge-project-adoption-bootstrap-v1\0"
-                } else {
-                    b"forge-project-charter-amendment-bootstrap-v1\0"
-                },
-                [&approval_id, &charter_revision_for_hash, &binding.id],
-            );
-            (None, adoption_hash)
-        } else {
-            let genesis_session_id = genesis_session_id.ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "Project Charter has no Product Genesis source for Main provenance",
-                )
-            })?;
-            let genesis_row = sqlx::query(
-                "SELECT account_id, main_chat_id, lifecycle, source_message_ids_json
-                 FROM product_genesis_session
-                 WHERE id = ?",
+        let admission_receipt_id = binding_admission_receipt_id.as_deref().ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "Project Agent binding has no immutable Project admission receipt",
             )
-            .bind(&genesis_session_id)
-            .fetch_optional(self.db.pool())
-            .await?
-            .ok_or_else(|| {
-                ServiceError::invalid_operation(
-                    "Project handoff has no Product Genesis source record",
+        })?;
+        let has_stable_admission_receipt = !admission_receipt_id.trim().is_empty();
+        let (handoff_id, handoff_payload_hash, admission_source_kind) =
+            if has_stable_admission_receipt {
+                let receipt = sqlx::query(
+                    "SELECT id, project_id, source_kind, handoff_id,
+                        initial_charter_approval_id, initial_charter_id,
+                        initial_charter_revision_id, payload_digest,
+                        validation_schema_version
+                 FROM project_admission_receipt
+                 WHERE id = ? AND project_id = ?",
                 )
-            })?;
-            let genesis_account_id: String = genesis_row.try_get("account_id")?;
-            let genesis_main_chat_id: String = genesis_row.try_get("main_chat_id")?;
-            let genesis_lifecycle: String = genesis_row.try_get("lifecycle")?;
-            let genesis_source_message_ids_json: String =
-                genesis_row.try_get("source_message_ids_json")?;
-            let genesis_source_message_ids: Vec<String> =
-                serde_json::from_str(&genesis_source_message_ids_json).map_err(|_| {
-                    ServiceError::invalid_operation(
-                        "Project handoff Product Genesis source references are invalid",
-                    )
-                })?;
-            if genesis_account_id != project_owner_id
-                || genesis_lifecycle != "handed_off"
-                || genesis_main_chat_id.trim().is_empty()
-            {
-                return Err(ServiceError::invalid_operation(
-                    "Project handoff Product Genesis/Main provenance is stale or mismatched",
-                ));
-            }
-            let source_turn_id = match genesis_source_message_ids.last() {
-                Some(source_message_id) => {
-                    sqlx::query_scalar::<_, String>(
-                        "SELECT id FROM agent_chat_turn_job
-                     WHERE chat_id = ? AND triggering_message_id = ?
-                     ORDER BY created_at DESC, id DESC LIMIT 1",
-                    )
-                    .bind(&genesis_main_chat_id)
-                    .bind(source_message_id)
-                    .fetch_optional(self.db.pool())
-                    .await?
-                }
-                None => None,
-            };
-            let handoff_rows = sqlx::query(
-                "SELECT handoff.id, handoff.source_chat_id, handoff.target_chat_id,
-                        handoff.author_identity_id, handoff.content,
-                        handoff.source_revisions_json, handoff.status,
-                        handoff.correlation_id, handoff.causation_id,
-                        handoff.dedupe_key, handoff.created_at, handoff.updated_at,
-                        handoff.target_message_id, handoff.target_turn_job_id,
-                        source_chat.kind AS source_kind,
-                        source_chat.account_id AS source_account_id,
-                        target_chat.kind AS target_kind,
-                        target_chat.project_id AS target_project_id
-                 FROM agent_handoff AS handoff
-                 JOIN agent_chat AS source_chat ON source_chat.id = handoff.source_chat_id
-                  AND source_chat.kind = 'account_main'
-                  AND source_chat.account_id = ?
-                 JOIN agent_chat AS target_chat ON target_chat.id = handoff.target_chat_id
-                  AND target_chat.kind = 'project'
-                  AND target_chat.project_id = ?
-                 JOIN agent_identity AS author ON author.id = handoff.author_identity_id
-                  AND author.owner_id = source_chat.account_id
-                 WHERE handoff.target_chat_id = ?
-                   AND handoff.status = 'delivered'
-                   AND json_valid(handoff.source_revisions_json) = 1
-                   AND json_extract(handoff.source_revisions_json, '$.schema_version') = ?
-                   AND json_extract(handoff.source_revisions_json, '$.approval.id') = ?
-                 ORDER BY handoff.created_at DESC, handoff.id DESC",
-            )
-            .bind(project_owner_id)
-            .bind(project_id)
-            .bind(project_chat_id)
-            .bind(PROJECT_HANDOFF_SCHEMA_VERSION)
-            .bind(&approval_id)
-            .fetch_all(self.db.pool())
-            .await?;
-            let mut matching_handoff: Option<(String, String, String)> = None;
-            for handoff_row in handoff_rows {
-                let source_chat_id: String = handoff_row.try_get("source_chat_id")?;
-                let target_chat_id: String = handoff_row.try_get("target_chat_id")?;
-                let author_identity_id: Option<String> =
-                    handoff_row.try_get("author_identity_id")?;
-                let source_kind: String = handoff_row.try_get("source_kind")?;
-                let source_account_id: Option<String> = handoff_row.try_get("source_account_id")?;
-                let target_kind: String = handoff_row.try_get("target_kind")?;
-                let target_project_id: Option<String> = handoff_row.try_get("target_project_id")?;
-                let status: String = handoff_row.try_get("status")?;
-                if source_kind != "account_main"
-                    || source_account_id.as_deref() != Some(project_owner_id)
-                    || target_kind != "project"
-                    || target_project_id.as_deref() != Some(project_id)
-                    || target_chat_id != project_chat_id
-                    || source_chat_id == project_chat_id
-                    || source_chat_id != genesis_main_chat_id
-                    || status != "delivered"
-                {
-                    continue;
-                }
-                let handoff_id: String = handoff_row.try_get("id")?;
-                let handoff_content: String = handoff_row.try_get("content")?;
-                let handoff_source_revisions: String =
-                    handoff_row.try_get("source_revisions_json")?;
-                let Some(author_identity_id) = author_identity_id.as_deref() else {
-                    continue;
-                };
-                let packet = match parse_project_handoff_packet(&handoff_source_revisions) {
-                    Ok(packet) => packet,
-                    Err(_) => continue,
-                };
-                let source_profile_exists: Option<String> = sqlx::query_scalar(
-                    "SELECT profile.id
-                     FROM agent_profile AS profile
-                     JOIN agent_identity AS identity ON identity.id = profile.identity_id
-                     WHERE profile.id = ? AND profile.identity_id = ?
-                       AND identity.owner_id = ?
-                     LIMIT 1",
-                )
-                .bind(&packet.source.profile_revision_id)
-                .bind(author_identity_id)
-                .bind(project_owner_id)
-                .fetch_optional(self.db.pool())
-                .await?;
-                if source_profile_exists.is_none() {
-                    continue;
-                }
-                let source_instruction_revision: Option<i64> = sqlx::query_scalar(
-                    "SELECT revision FROM agent_chat_instruction_revision
-                     WHERE id = ? AND chat_id = ? AND source_type = 'native' AND source_id = ?
-                     LIMIT 1",
-                )
-                .bind(&packet.source.instruction_revision_id)
-                .bind(&genesis_main_chat_id)
-                .bind(&genesis_session_id)
-                .fetch_optional(self.db.pool())
-                .await?;
-                if source_instruction_revision != Some(packet.source.instruction_revision) {
-                    continue;
-                }
-                if let Some(source_turn_id) = packet.source.turn_id.as_deref() {
-                    let source_turn: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-                        "SELECT responder_identity_id, profile_id
-                             FROM agent_chat_turn_job
-                             WHERE id = ? AND chat_id = ? LIMIT 1",
-                    )
-                    .bind(source_turn_id)
-                    .bind(&genesis_main_chat_id)
-                    .fetch_optional(self.db.pool())
-                    .await?;
-                    if source_turn.as_ref().and_then(|turn| turn.0.as_deref())
-                        != Some(author_identity_id)
-                        || source_turn.as_ref().and_then(|turn| turn.1.as_deref())
-                            != Some(packet.source.profile_revision_id.as_str())
-                    {
-                        continue;
-                    }
-                }
-                let handoff_correlation_id: String = handoff_row.try_get("correlation_id")?;
-                let handoff_causation_id: Option<String> = handoff_row.try_get("causation_id")?;
-                let handoff_deduplication_key: String = handoff_row.try_get("dedupe_key")?;
-                let handoff_created_at: String = handoff_row.try_get("created_at")?;
-                let handoff_updated_at: String = handoff_row.try_get("updated_at")?;
-                let create_event_payload: String = sqlx::query_scalar(
-                    "SELECT payload_json
-                     FROM domain_event
-                     WHERE dedupe_key = ?
-                       AND event_type = 'project.created_from_charter_approval'
-                       AND entity_type = 'project'
-                       AND entity_id = ?
-                     ORDER BY created_at DESC, id DESC LIMIT 1",
-                )
-                .bind(format!(
-                    "project-charter-create:{handoff_deduplication_key}"
-                ))
+                .bind(admission_receipt_id)
                 .bind(project_id)
                 .fetch_optional(self.db.pool())
                 .await?
                 .ok_or_else(|| {
                     ServiceError::invalid_operation(
-                        "Project handoff has no durable Project-creation authorization event",
+                        "Project Agent admission receipt is missing or cross-Project",
                     )
                 })?;
-                let create_event: Value =
-                    serde_json::from_str(&create_event_payload).map_err(|_| {
-                        ServiceError::invalid_operation(
-                            "Project handoff creation authorization event is invalid",
-                        )
-                    })?;
-                let create_authorization = create_event
-                    .get("authorization")
-                    .and_then(Value::as_object)
-                    .ok_or_else(|| {
-                        ServiceError::invalid_operation(
-                            "Project handoff creation authorization event is incomplete",
-                        )
-                    })?;
-                let create_authorization_field = |field: &str| -> Result<String> {
-                    create_authorization
-                        .get(field)
-                        .and_then(Value::as_str)
-                        .filter(|value| !value.trim().is_empty())
-                        .map(str::to_owned)
-                        .ok_or_else(|| {
-                            ServiceError::invalid_operation(format!(
-                                "Project handoff creation authorization is missing {field}"
-                            ))
-                        })
-                };
-                let create_authorization_principal_type =
-                    create_authorization_field("principal_type")?;
-                let create_authorization_principal_id = create_authorization_field("principal_id")?;
-                let create_authorization_basis = create_authorization_field("authorization_basis")?;
-                let create_authorization_action = create_authorization_field("action")?;
-                let create_authorization_event_id = create_authorization_field("event_id")?;
-                let create_authorization_occurred_at = create_authorization_field("occurred_at")?;
-                let handoff_target_message_id: Option<String> =
-                    handoff_row.try_get("target_message_id")?;
-                let handoff_target_turn_id: Option<String> =
-                    handoff_row.try_get("target_turn_job_id")?;
-                let handoff_causation_id = handoff_causation_id.as_deref().ok_or_else(|| {
-                    ServiceError::invalid_operation(
-                        "Project handoff has no immutable causation event",
-                    )
-                })?;
-                let handoff_target_message_id =
-                    handoff_target_message_id.as_deref().ok_or_else(|| {
-                        ServiceError::invalid_operation(
-                            "Project handoff has no target message provenance",
-                        )
-                    })?;
-                let handoff_target_turn_id =
-                    handoff_target_turn_id.as_deref().ok_or_else(|| {
-                        ServiceError::invalid_operation(
-                            "Project handoff has no target turn provenance",
-                        )
-                    })?;
-                // The handoff records the turn that first consumed it; every
-                // later turn in this Project chat re-verifies the same packet
-                // against that recorded delivery rather than expecting the
-                // handoff to point at itself.
-                let handoff_expectation = ProjectHandoffExpectation {
-                    handoff_id: &handoff_id,
-                    deduplication_key: &handoff_deduplication_key,
-                    correlation_id: &handoff_correlation_id,
-                    causation_id: handoff_causation_id,
-                    source_chat_id: &genesis_main_chat_id,
-                    source_identity_id: author_identity_id,
-                    source_profile_revision_id: &packet.source.profile_revision_id,
-                    source_instruction_revision_id: &packet.source.instruction_revision_id,
-                    source_instruction_revision: packet.source.instruction_revision,
-                    source_message_ids: genesis_source_message_ids.clone(),
-                    source_turn_id: source_turn_id.as_deref(),
-                    project_id,
-                    project_name: &project.name,
-                    project_mode: &approved_project_mode,
-                    approved_slug: approval_approved_slug.as_deref(),
-                    target_chat_id: project_chat_id,
-                    target_binding_id: &binding.id,
-                    target_message_id: handoff_target_message_id,
-                    target_turn_id: handoff_target_turn_id,
-                    charter_id: project_charter_id,
-                    charter_revision_id: project_charter_revision_id,
-                    charter_revision_number,
-                    charter_schema_version: &charter_schema_version,
-                    charter_content_digest: &charter_content_digest,
-                    charter_render_version: &charter_render_version,
-                    charter_render_digest: &charter_render_digest,
-                    approval_id: &approval_id,
-                    approval_event_id: expected_approval_event_id,
-                    approval_authorization_basis: &approval_authorization_basis,
-                    approval_authorization_action: &approval_authorization_action,
-                    approval_authorization_event_id: &approval_authorization_event_id,
-                    approval_authorization_occurred_at: &approval_authorization_occurred_at,
-                    approval_principal_kind: &approval_principal_kind,
-                    approval_principal_id: project_owner_id,
-                    approval_created_at: &approval_created_at,
-                    create_authorization_principal_type: &create_authorization_principal_type,
-                    create_authorization_principal_id: &create_authorization_principal_id,
-                    create_authorization_basis: &create_authorization_basis,
-                    create_authorization_action: &create_authorization_action,
-                    create_authorization_event_id: &create_authorization_event_id,
-                    create_authorization_occurred_at: &create_authorization_occurred_at,
-                    identity_id: &agent.id,
-                    profile_revision_id: &profile.id,
-                    policy_revision: &binding_policy_revision,
-                    policy_digest: &recomputed_policy_digest,
-                    created_at: &handoff_created_at,
-                    delivered_at: &handoff_updated_at,
-                };
-                if validate_project_handoff_packet(
-                    &handoff_source_revisions,
-                    &handoff_expectation,
-                    &approval_lifecycle,
-                    consumed_project_id.as_deref(),
-                    project_id,
-                )
-                .is_err()
+                let receipt_project_id: String = receipt.try_get("project_id")?;
+                let receipt_source_kind: String = receipt.try_get("source_kind")?;
+                let receipt_handoff_id: Option<String> = receipt.try_get("handoff_id")?;
+                let receipt_initial_approval_id: String =
+                    receipt.try_get("initial_charter_approval_id")?;
+                let receipt_initial_charter_id: String = receipt.try_get("initial_charter_id")?;
+                let receipt_initial_revision_id: String =
+                    receipt.try_get("initial_charter_revision_id")?;
+                let receipt_payload_digest: String = receipt.try_get("payload_digest")?;
+                let receipt_schema: String = receipt.try_get("validation_schema_version")?;
+                if receipt_project_id != project_id
+                    || receipt_initial_charter_id != charter_id
+                    || receipt_payload_digest.trim().is_empty()
+                    || receipt_schema != "forge.project-admission/v1"
                 {
-                    continue;
-                }
-                if matching_handoff.is_some() {
                     return Err(ServiceError::invalid_operation(
-                        "Project Agent turn has multiple handoffs for the exact Charter approval",
+                        "Project Agent admission receipt is stale or malformed",
                     ));
                 }
-                matching_handoff = Some((handoff_id, handoff_content, handoff_source_revisions));
-            }
-            let (handoff_id, handoff_content, handoff_source_revisions) = matching_handoff
-                .ok_or_else(|| {
-                    ServiceError::invalid_operation(
-                        "Project Agent turn has no exact consumed Charter handoff",
-                    )
-                })?;
-            let handoff_payload_hash = hash_parts(
-                b"forge-project-handoff-payload-v1\0",
-                [&handoff_id, &handoff_content, &handoff_source_revisions],
-            );
-            (Some(handoff_id), handoff_payload_hash)
-        };
+
+                match receipt_source_kind.as_str() {
+                    "genesis_handoff" => {
+                        let receipt_handoff_id =
+                            receipt_handoff_id.as_deref().ok_or_else(|| {
+                                ServiceError::invalid_operation(
+                                    "Genesis Project admission receipt has no handoff",
+                                )
+                            })?;
+                        let handoff = sqlx::query(
+                            "SELECT h.content, h.source_revisions_json, h.status,
+                                h.target_chat_id, target.project_id AS target_project_id
+                         FROM agent_handoff h
+                         JOIN agent_chat target ON target.id = h.target_chat_id
+                         WHERE h.id = ? AND target.kind = 'project'",
+                        )
+                        .bind(receipt_handoff_id)
+                        .fetch_optional(self.db.pool())
+                        .await?
+                        .ok_or_else(|| {
+                            ServiceError::invalid_operation(
+                                "Genesis Project admission handoff is missing",
+                            )
+                        })?;
+                        let handoff_content: String = handoff.try_get("content")?;
+                        let handoff_source_revisions: String =
+                            handoff.try_get("source_revisions_json")?;
+                        let handoff_status: String = handoff.try_get("status")?;
+                        let handoff_target_chat_id: String = handoff.try_get("target_chat_id")?;
+                        let handoff_target_project_id: Option<String> =
+                            handoff.try_get("target_project_id")?;
+                        let packet = parse_project_handoff_packet(&handoff_source_revisions)?;
+                        let packet_value: Value = serde_json::from_str(&handoff_source_revisions)
+                            .map_err(|_| {
+                            ServiceError::invalid_operation(
+                                "Genesis Project admission handoff packet is invalid",
+                            )
+                        })?;
+                        let authorization = serde_json::to_value(&packet.request.authorization)
+                            .map_err(|_| {
+                                ServiceError::invalid_operation(
+                                    "Genesis Project admission authorization is invalid",
+                                )
+                            })?;
+                        let recomputed_digest = project_handoff_request_fingerprint(
+                            &packet_value,
+                            &packet.request.source_revisions_json,
+                            &authorization,
+                        )
+                        .map_err(ServiceError::invalid_operation)?;
+                        if handoff_status != "delivered"
+                            || handoff_target_chat_id != project_chat_id
+                            || handoff_target_project_id.as_deref() != Some(project_id)
+                            || packet.schema_version != PROJECT_HANDOFF_SCHEMA_VERSION
+                            || packet.handoff_id != receipt_handoff_id
+                            || packet.project.id != project_id
+                            || packet.target.chat_id != project_chat_id
+                            || packet.approval_id != receipt_initial_approval_id
+                            || packet.approval.id != receipt_initial_approval_id
+                            || packet.charter.id != receipt_initial_charter_id
+                            || packet.charter.revision_id != receipt_initial_revision_id
+                            || packet.request.source_revisions_digest != receipt_payload_digest
+                            || recomputed_digest != receipt_payload_digest
+                        {
+                            return Err(ServiceError::invalid_operation(
+                            "Genesis Project admission receipt does not match its immutable handoff",
+                        ));
+                        }
+                        let receipt_handoff_id = receipt_handoff_id.to_owned();
+                        let historical_payload_hash = hash_parts(
+                            b"forge-project-handoff-payload-v1\0",
+                            [
+                                &receipt_handoff_id,
+                                &handoff_content,
+                                &handoff_source_revisions,
+                            ],
+                        );
+                        (
+                            Some(receipt_handoff_id),
+                            historical_payload_hash,
+                            receipt_source_kind,
+                        )
+                    }
+                    "charter_adoption" => {
+                        if receipt_handoff_id.is_some() {
+                            return Err(ServiceError::invalid_operation(
+                                "Charter-adoption admission receipt unexpectedly names a handoff",
+                            ));
+                        }
+                        let initial_content_digest: Option<String> = sqlx::query_scalar(
+                            "SELECT content_digest FROM project_charter_approval
+                         WHERE id = ? AND charter_id = ? AND revision_id = ?
+                           AND approval_type = 'adoption' AND lifecycle = 'consumed'
+                           AND consumed_project_id = ?",
+                        )
+                        .bind(&receipt_initial_approval_id)
+                        .bind(&receipt_initial_charter_id)
+                        .bind(&receipt_initial_revision_id)
+                        .bind(project_id)
+                        .fetch_optional(self.db.pool())
+                        .await?;
+                        if initial_content_digest.as_deref()
+                            != Some(receipt_payload_digest.as_str())
+                        {
+                            return Err(ServiceError::invalid_operation(
+                            "Charter-adoption admission receipt does not match its consumed approval",
+                        ));
+                        }
+                        (None, receipt_payload_digest, receipt_source_kind)
+                    }
+                    _ => {
+                        return Err(ServiceError::invalid_operation(
+                            "Project Agent admission receipt has an unsupported source kind",
+                        ));
+                    }
+                }
+            } else {
+                return Err(ServiceError::invalid_operation(
+                    "Project Agent binding has no immutable Project admission receipt",
+                ));
+            };
 
         let project_mode = match charter_row.try_get::<String, _>("project_mode")?.as_str() {
             "compact" => api_types::ProjectMode::Compact,
@@ -2496,14 +2266,14 @@ impl FederatedAgentChatTurnRunner {
                 &handoff_payload_hash,
                 "opaque_handoff_provenance_only",
             ));
-        } else if approval_type == "adoption" {
+        } else if admission_source_kind == "charter_adoption" {
             context_references.push(OperatingContextReference::included(
                 format!("adoption_bootstrap:{approval_id}:receipt:{handoff_payload_hash}"),
-                &approval_id,
+                admission_receipt_id,
                 "project_adoption_bootstrap",
-                charter_revision_id.clone(),
+                "forge.project-admission/v1",
                 &handoff_payload_hash,
-                "consumed_user_adoption_approval",
+                "immutable_project_admission_provenance",
             ));
         } else {
             context_references.push(OperatingContextReference::included(
@@ -4403,6 +4173,7 @@ fn canonical_context_digest<T: Serialize>(value: &T) -> Result<String> {
     )
 }
 
+#[cfg(test)]
 fn validate_project_handoff_packet(
     source_revisions_json: &str,
     expected: &ProjectHandoffExpectation<'_>,
@@ -4615,6 +4386,7 @@ fn parse_project_handoff_packet(
     })
 }
 
+#[cfg(test)]
 fn handoff_source_manifest_matches_packet(
     source_manifest: &Value,
     packet: &ProjectCharterHandoffPacket,
@@ -4644,6 +4416,7 @@ fn handoff_source_manifest_matches_packet(
 /// removing values allocated by that transaction.  The fingerprint therefore
 /// proves the complete bounded packet shape and the exact authorization
 /// envelope without treating a caller-controlled digest as authority.
+#[cfg(test)]
 fn handoff_request_fingerprint(
     value: &Value,
     authorization: &ProjectCharterHandoffAuthorization,
@@ -4666,10 +4439,12 @@ fn handoff_request_fingerprint(
         .map_err(ServiceError::invalid_operation)
 }
 
+#[cfg(test)]
 fn non_empty(value: &str) -> bool {
     !value.trim().is_empty()
 }
 
+#[cfg(test)]
 fn handoff_text_is_safe(value: &str) -> bool {
     if value.chars().count() > MAX_HANDOFF_BOUNDED_CHARS {
         return false;
@@ -4680,18 +4455,12 @@ fn handoff_text_is_safe(value: &str) -> bool {
     guard_agent_chat_content(value).is_ok()
 }
 
+#[cfg(test)]
 fn handoff_value_is_bounded(value: &Value) -> bool {
     let Ok(serialized) = serde_json::to_string(value) else {
         return false;
     };
     serialized.chars().count() <= MAX_HANDOFF_BOUNDED_CHARS && handoff_text_is_safe(&serialized)
-}
-
-fn project_agent_policy_digest(tool_policy_json: &str) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"forge.project-agent-policy/v1\0");
-    digest.update(tool_policy_json.as_bytes());
-    hex::encode(digest.finalize())
 }
 
 fn effective_state_context(
@@ -4989,8 +4758,20 @@ fn cli_result_content(result: ExecutionResult) -> Result<String> {
         ExecutionOutcome::Cancelled => Err(ServiceError::invalid_operation(
             "Agent Chat CLI turn was cancelled",
         )),
+        // The adapter already knows why it failed. Reporting only "turn
+        // failed" left the real reason -- a missing binary, an unauthenticated
+        // CLI, a bad model id -- in a dropped field, so the chat surfaced an
+        // error nobody could act on and the server log carried nothing either.
         ExecutionOutcome::Failed => Err(ServiceError::invalid_operation(
-            "Agent Chat CLI turn failed",
+            match result
+                .error
+                .as_deref()
+                .map(str::trim)
+                .filter(|error| !error.is_empty())
+            {
+                Some(error) => format!("Agent Chat CLI turn failed: {error}"),
+                None => "Agent Chat CLI turn failed without a reported reason".to_owned(),
+            },
         )),
     }?;
     Ok(if content.chars().count() <= MAX_CLI_ASSISTANT_CHARS {
@@ -5107,6 +4888,39 @@ mod tests {
             main_skill_key_for_frozen_revision("forge.main.project-discovery/v2@7"),
             MAIN_OPERATING_SKILL_KEY
         );
+    }
+
+    #[test]
+    fn project_turn_query_boundary_does_not_rewalk_main_provenance() {
+        // This is an intentional source-boundary regression. Project context
+        // loading may read the immutable admission receipt and its recorded
+        // handoff, but must never grow queries back to mutable/historical Main
+        // provenance after admission has already been validated at issuance.
+        let source = include_str!("agent_chat_turn_worker.rs");
+        let start = source
+            .find("    async fn load_project_operating_skill(")
+            .expect("Project operating-context loader remains present");
+        let end = source[start..]
+            .find("\n    async fn run_native(")
+            .map(|offset| start + offset)
+            .expect("Project operating-context loader remains bounded");
+        let loader = &source[start..end];
+
+        assert!(loader.contains("FROM project_admission_receipt"));
+        assert!(loader.contains("FROM agent_handoff h"));
+        for historical_source in [
+            "product_genesis_session",
+            "agent_chat_message",
+            "agent_chat_turn_job",
+            "agent_chat_instruction_revision",
+            "agent_profile",
+            "domain_event",
+        ] {
+            assert!(
+                !loader.contains(historical_source),
+                "Project turn loader must not query historical Main source `{historical_source}`"
+            );
+        }
     }
 
     #[test]

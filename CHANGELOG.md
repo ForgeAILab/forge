@@ -8,6 +8,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **`AcceptanceEvidenceRequirement` loses `check_definition_revision`.**
+  Evidence freshness is defined against the milestone's current definition
+  revision, full stop. The per-requirement pin was stamped by genesis with the
+  baseline's own revision id, echoed verbatim by the Project Agent through
+  every later `revise`, and compared for equality with the revision an
+  attachment is actually captured under — so every attachment captured after
+  the first definition change was reported `evidence_context_stale` forever
+  and the milestone could never become ready again. Migration V122 strips the
+  pin from persisted definition content (the revision immutability trigger is
+  lifted for that one rewrite and restored verbatim). Callers that still send
+  the field are rejected. An attachment captured under an earlier definition
+  revision is stale after any definition change and must be re-captured; that
+  is the intended "exact source context" rule, now applied consistently.
+
 - **The execution baseline is removed.** Forge pinned approved intent three
   times: the Project Charter revision, the milestone definition revision, and
   an execution baseline revision that mostly stored pointers back to the first
@@ -85,7 +99,129 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   configuration. Main/Project Chat turns no longer consume Task execution
   concurrency, and stopped executions notify the configured Project Agent.
 
+### Changed
+
+- The Project Agent's resident prompt shrank by more than half. The operating
+  skill (revision `forge.project.orchestration/v1@11`, migration `V119`) now
+  carries only the authority boundaries, standing invariants, and
+  autonomous-drive rules plus a doctrine index; the detailed doctrine
+  (research, documents, scope_change, tasks, milestones, release) moved behind
+  a new `skill.section` native read the Agent calls on demand. The Charter
+  handoff packet likewise stops inlining the full rendered Charter — it now
+  carries the Charter's identity, digests, and a pointer to the new
+  `project.charter` native read, which returns the current approved Charter's
+  rendered Markdown at any time (previously the packet message was the only
+  place a Project Agent could see the Charter text, and compaction could
+  erase it). Together this cuts a Project Chat turn's fixed prompt cost from
+  ~20KB of skill text plus up to 12KB of packet text to ~9KB resident, so
+  small provider profiles can actually serve Project chats and LCM compaction
+  has a real conversation budget. Replaying a `project.create` command from
+  before this change with its original idempotency key now reports a packet
+  mismatch; new creations are unaffected.
+
 ### Fixed
+
+- Releases approved through the web client load again. The immutable release
+  snapshot digests the releasing principal as the authorization receipt
+  carried it — display name included, which the signed-in web client always
+  sends — but the release row never persisted that name, so reading the
+  release back rebuilt the principal without it and failed with "immutable
+  release snapshot digest does not match its contents" although the release
+  had committed and the milestone was already `released`. Migration V123 adds
+  `releasing_principal_display_name`; the release transaction binds
+  `released_by` to the receipt's label and persists it, and every read
+  restores it. A release recorded before this fix through the web client
+  cannot be loaded at all: its digest covered a principal state (a nameless
+  actor beside a named receipt) that no row can reproduce. Remove that
+  release and its pins, return the milestone to `ready_for_release`, and
+  release again.
+
+- The review-ready attention wake now fires only when a person must decide
+  the review gate. Every transition into `review` woke the Project Agent with
+  "Work is ready for review — recommended action: review", including the
+  common case where the workflow's reviewer Agent runs the review itself. The
+  Project Agent then spent the turn on a `task.review` action the gate
+  rejects, and reported "the typed review operation is unavailable" as a
+  blocker while the reviewer was already at work. An agent-run review now
+  raises no attention row and no wake; the delivery follow-up wake on `done`
+  and the review-risk wake on rejection are unchanged.
+
+- A Project Agent's verification commands now run inside its repository
+  `checkout/`. The command tool ran at the verification workspace root — the
+  parent directory holding `forge/` beside `checkout/` — which has no
+  manifest of its own, so `cargo test` there walked up the tree and ran
+  whatever repository the data directory sits in: for a `--data-dir ./test`
+  development server, Forge's own entire test suite, pinning every core for
+  twelve minutes while the Agent waited on the wrong project's tests. The
+  tool now runs with the checkout as its current directory, refuses to run
+  when the Project has no checkout, and says so in its description.
+
+- Native operation argument rejections now reach the agent as correctable
+  validation outcomes. The `task.recover`, `task.worklog`, and evidence
+  `capture` handlers raised their own input checks — an unknown `action`, a
+  missing `reason` or `task_id`, an empty caption, both `path` and `content`
+  supplied — as bare runtime errors, which the operation boundary renders as
+  "the Forge operation could not complete" with no retry hint. A Project Agent
+  told by its doctrine to cancel a wedged verification Task therefore saw two
+  opaque internal failures and gave up, leaving the milestone blocked on a
+  Task the user then had to cancel by hand. Those checks now return the same
+  structured `validation_error` with a `correct_input` retry that
+  service-level validation already used, naming the offending field.
+
+- The Project Agent now authors acceptance checks the way it will settle
+  them. A fresh genesis project's baseline milestone records every Charter
+  acceptance statement as a `manual` (user-attested) check, and the "prefer
+  `task_validation`" rule lived only in the on-demand `milestones` section a
+  Charter-handoff turn never reads — so a clean bootstrap parked readiness on
+  user attestation for behaviors the Agent is supposed to verify itself,
+  inverting the verification doctrine at the very first definition. Operating
+  skill revision `forge.project.orchestration/v1@13` (migration V121) pulls
+  the rule into the resident core: a behavior settled by exercising the
+  delivered software is a `task_validation` check the Agent verifies and
+  records itself, `manual` is reserved for judgment only a person can make,
+  and on the handoff turn the Agent revises the genesis baseline's checks
+  accordingly and asks for that revision's approval in its startup note.
+
+- Re-authoring a milestone definition verbatim no longer revokes a standing
+  approval. The `project.milestone` `revise` command appended a new revision
+  unconditionally, so an agent re-submitting the current definition with
+  identical content minted a duplicate `proposed` revision, moved the current
+  pointer onto it, and flipped readiness back to `definition_not_approved` —
+  silently discarding the user's approval of the byte-identical predecessor.
+  A revise whose content digest, display label, and lifecycle match the
+  current revision (or whose current revision is `approved` with identical
+  content) now returns that revision unchanged; only an actual content change
+  or a draft promotion appends.
+- The Project Agent could not execute the `cancel_task` recovery its own
+  blocked-Task annotation advertised: the native `task.recover` operation
+  only mapped `resume_session`, `reexecute`, `reset_to_initial`, and
+  `reset_retry_window`. `cancel_task` is now admitted as a bounded direct
+  action, and the Project Agent's evidence capture promotes its stored asset
+  to `available` before attaching (creation quarantines an asset until its
+  bytes are in place, and the attach command rightly refuses a quarantined
+  asset). Attaching evidence with a `source_validation_id` that names an
+  acceptance-check id instead of the recorded result id now fails with a
+  message that says exactly that, instead of a redacted `not_found`.
+
+- The Project Agent's verification `checkout/` was created once at Project
+  setup and never updated, so the Agent exercised the tree as of Project
+  creation — typically just the genesis README — no matter what Tasks had
+  since delivered, and honest verification could only record `unavailable`.
+  The checkout is now re-pointed at the current default-branch tip every time
+  the workspace is handed to a turn (local edits and untracked files are
+  dropped; ignored build caches survive).
+
+- Embedded chats could still overflow the provider input budget without LCM
+  ever compacting, failing every turn with `budget_exceeded`. The pressure
+  estimate (`CharRatioSizer`) counts only each entry's joined text — assistant
+  reasoning payloads and JSON framing are invisible to it — so on a real chat
+  it runs 10–15% under what the context planner charges for the same history,
+  and the stock 95% hard threshold left less headroom than that error. A chat
+  could sit at ~91% measured pressure (Soft — which never compacts, since the
+  host does not drive idle compaction) while the planner already refused the
+  turn. The Forge pressure policy (`forge-lcm-pressure-3`) now trips hard
+  compaction at 85% (soft at 70%) so compaction runs before the estimator
+  error can consume the margin.
 
 - Embedded (native) agent sessions past their context budget could never
   compact and failed every subsequent turn. LCM was wired for all embedded
@@ -119,7 +255,67 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   cannot fit after bounded hard compaction" now condense (one leaf absorbed a
   13.8k-token span) and keep answering.
 
+- Project Agent rebinding and Charter amendment no longer invalidate the
+  original Main-to-Project handoff or block later turns. Forge now validates
+  admission once when Genesis creation or legacy Charter adoption commits,
+  freezes one immutable Project admission receipt, and derives current binding
+  authority through a shared REST/MCP/native command. Fresh turns check that
+  receipt plus current Charter pointers without re-walking historical Main
+  messages, turns, Profiles, instructions, or creation events; startup safely
+  repairs the known incomplete replacement shape and fails ambiguous rows into
+  explicit setup-required recovery.
+
+- Charter-backed Projects can be deleted again. Admission authority remains
+  mandatory for active Project-Agent bindings during ordinary writes, while
+  the existing Project-scoped deletion guard now permits Charter cascades to
+  clear binding authority as part of the same bounded teardown transaction.
+
+- The assistant log entry now carries the agent's complete final message. The
+  `opencode` and `smith` adapters wrote the bounded 500-character `summary`
+  preview into it instead, so any final message longer than that was stored
+  cut off mid-word — the execution transcript ended mid-sentence with no
+  conclusion. This also silently erased review verdicts: the auditor is told to
+  "End your response with `===REVIEW: PASS===`", and the verdict is parsed back
+  out of that same log entry, so a first-500-characters cut removed the marker
+  from every auditor response long enough to have one and reported
+  `verdict marker missing`. The log entry is the transcript; `summary` stays
+  bounded for the Task projection, and `assistant_output` carries the full text
+  on the result.
+
+- A Project that has not adopted a Charter no longer reports itself as a stale
+  Overview. `projection_state` says whether the assembled records prove a
+  current projection; Charter setup is a starting state, not a projection
+  fault, and `charter_state` plus the `charter_adoption` next action already
+  report it. A missing Charter still makes the projection `stale` when the
+  Project record claims a Charter revision that cannot be loaded, or when the
+  Project already carries milestone, evidence, or release records that only an
+  approved Charter could have authorized. The Project Overview page follows:
+  before adoption it hides the Charter-derived panels that are also empty —
+  outcome, validation, documents, decisions, evidence, releases, and the Next
+  action card the adoption banner already renders — leaving Task progress and
+  the Project Agent execution setup where the Project actually needs work. A
+  Project that carries real records of any of those kinds keeps showing them.
+
 ### Added
+
+- The Project Agent captures its own verification proof. `project.evidence`
+  (`capture`) stores an artifact the Agent's verification run produced — a
+  report or log from its Project workspace by `path`, or inline as `content` —
+  as a Project media asset and attaches it to the named acceptance checks in
+  the same call, citing the validation result it backs via
+  `source_validation_id`. Readiness treats validation-sourced evidence with no
+  Task provenance as fresh exactly while the cited validation result is
+  current. This closes the loop that previously forced the Agent to create a
+  "verification Task" just to produce an artifact: only Task runs could
+  capture evidence, and a read-only verification Task wedges in the coder
+  pipeline — its completion contract demands a commit, and a dispatched
+  executor has no channel to advance the workflow. Operating skill revision
+  `forge.project.orchestration/v1@12` (migration V120) makes the flow
+  explicit: when a milestone's Tasks are done, the Project Agent verifies the
+  delivered software itself in its `checkout/`, records validation, captures
+  the proof, and dispatches fix Tasks for what fails — it never delegates
+  verification to a Task, and it absorbs a wedged verification-shaped Task by
+  cancelling it and settling its checks itself.
 
 - Agents can now produce the evidence they are asked for. `task.evidence`
   (`capture`) registers an artifact a Task run actually produced — a screenshot,

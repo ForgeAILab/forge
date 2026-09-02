@@ -165,25 +165,6 @@ async fn seed_chat_project(state: &AppState, identity_id: &str) -> String {
         })
         .await
         .expect("project binding creates");
-    // A handoff admits a real Project Agent turn, so the fixture must carry
-    // the same frozen skill/policy provenance as a production binding.  The
-    // binding service intentionally leaves these Charter-era fields unset;
-    // the test supplies the canonical seeded Project skill explicitly rather
-    // than weakening the admission boundary.
-    sqlx::query(
-        "UPDATE project_agent_binding
-         SET operating_skill_revision_id = (
-                 SELECT id FROM operating_skill_revision
-                 WHERE skill_key = 'forge.project.orchestration/v1'
-                 ORDER BY revision DESC LIMIT 1
-             ),
-             policy_revision = 'test-policy', policy_digest = 'test-policy-digest'
-         WHERE project_id = ? AND state = 'active'",
-    )
-    .bind(&project_id)
-    .execute(state.db.pool())
-    .await
-    .expect("project binding provenance updates");
     project_id
 }
 

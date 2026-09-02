@@ -43,6 +43,7 @@ use uuid::Uuid;
 
 pub mod action_resolver;
 mod actions;
+pub use actions::task_review_requires_user_decision;
 mod adaptive;
 mod claim;
 mod common;

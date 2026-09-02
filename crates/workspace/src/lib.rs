@@ -179,6 +179,47 @@ impl WorkspaceManager {
         Ok(worktree_path)
     }
 
+    /// Re-point an existing detached worktree at the current tip of
+    /// `base_branch` and drop any local edits and untracked files. The
+    /// worktree shares its source repository's object database, so no fetch
+    /// is involved — the branch ref is re-resolved as of now. Ignored files
+    /// (build caches) survive so a refresh does not force a full rebuild.
+    pub async fn refresh_detached_worktree(
+        &self,
+        worktree_path: &Path,
+        base_branch: &str,
+    ) -> Result<()> {
+        let mut steps: Vec<Vec<String>> = vec![vec![
+            "reset".to_string(),
+            "--hard".to_string(),
+            "HEAD".to_string(),
+        ]];
+        if !base_branch.is_empty() {
+            steps.push(vec![
+                "checkout".to_string(),
+                "--detach".to_string(),
+                base_branch.to_string(),
+            ]);
+        }
+        steps.push(vec!["clean".to_string(), "-fd".to_string()]);
+        for args in steps {
+            let output = git_command()
+                .args(&args)
+                .current_dir(worktree_path)
+                .output()
+                .await?;
+            if !output.status.success() {
+                return Err(git::GitError::CommandFailed {
+                    command: format!("git {}", args.join(" ")),
+                    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                    stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     pub async fn recover_worktree(
         &self,
         repo_url: &str,

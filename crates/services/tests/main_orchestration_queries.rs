@@ -166,7 +166,7 @@ async fn insert_identity(db: &SqliteDb, identity_id: &str, permissions: &str) {
             backend_kind: "native".to_owned(),
             executor_type: "native".to_owned(),
             provider: None,
-            model: None,
+            model: Some("test-model".to_owned()),
             reasoning_effort: None,
             permission_policy: None,
             prompt_template: None,

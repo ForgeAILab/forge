@@ -2122,17 +2122,29 @@ fn is_protected_runtime_field(key: &str) -> bool {
         || compact.ends_with("token")
 }
 
+/// Input budget a context window leaves once its reserved output is set
+/// aside.  A model's input budget is not an independent quantity -- it is
+/// whatever the window holds minus the response it must still fit -- so
+/// deriving it keeps the two from drifting apart as either is tuned.
+fn input_budget_for(context_tokens: u32, max_output_tokens: u32) -> u32 {
+    context_tokens.saturating_sub(max_output_tokens)
+}
+
 /// Provider-aware native model limits `(context, max_input, max_output)`.
-/// The generic defaults are conservative; every current Gemini API model
-/// serves a 1M-token context window, and the generic 96k input budget made
-/// large Task context manifests fail with `budget_exceeded` before the model
-/// was even called.
+/// Every current Gemini API model serves a 1M-token context window.
+///
+/// The generic arm previously carried a flat 96k input budget that was
+/// unrelated to its own 128k context window, stranding 32k of the window and
+/// failing `budget_exceeded` before the model was called -- a Project Agent
+/// turn died at 97,747 of 96,000 once accumulated `tool_result` context
+/// crossed the line, with 128k actually available. The budget is derived from
+/// the window now, so only Gemini still needs a bespoke arm.
 fn native_model_limits(provider: &str) -> (u32, u32, u32) {
     match provider {
         "gemini" => (1_048_576, 800_000, 64_000),
         _ => (
             DEFAULT_CONTEXT_TOKENS,
-            DEFAULT_MAX_INPUT_TOKENS,
+            input_budget_for(DEFAULT_CONTEXT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS),
             DEFAULT_MAX_OUTPUT_TOKENS,
         ),
     }
@@ -2476,6 +2488,48 @@ fn task_role_admitted_by_workflow(active_role: Option<&str>, requested_role: &st
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn generic_input_budget_uses_the_whole_context_window() {
+        // A Project Agent turn failed `budget_exceeded` at 97,747 of 96,000
+        // while its own profile advertised a 128k context window, because the
+        // input budget was a flat constant unrelated to that window. The
+        // budget must follow the window, so the turn that failed now fits.
+        let (context, max_input, max_output) = native_model_limits("openai");
+        assert_eq!(context, DEFAULT_CONTEXT_TOKENS);
+        assert_eq!(max_output, DEFAULT_MAX_OUTPUT_TOKENS);
+        assert_eq!(max_input, context - max_output);
+        assert!(
+            max_input > 97_747,
+            "the turn that failed at 97,747 tokens must now fit, got {max_input}"
+        );
+
+        // Gemini keeps its bespoke arm.
+        assert_eq!(native_model_limits("gemini"), (1_048_576, 800_000, 64_000));
+    }
+
+    #[test]
+    fn a_profile_carrying_the_baked_default_triple_is_relifted() {
+        // Profiles are immutable, so agents created before this carry the old
+        // triple verbatim. That exact triple can only be a baked default, and
+        // must resolve to the provider limits rather than cap the model.
+        let stored = (
+            DEFAULT_CONTEXT_TOKENS,
+            DEFAULT_MAX_INPUT_TOKENS,
+            DEFAULT_MAX_OUTPUT_TOKENS,
+        );
+        let (_, max_input, _) = effective_native_limits("openai", stored.0, stored.1, stored.2);
+        assert_eq!(
+            max_input,
+            DEFAULT_CONTEXT_TOKENS - DEFAULT_MAX_OUTPUT_TOKENS
+        );
+
+        // A deliberate user choice is still honoured verbatim.
+        assert_eq!(
+            effective_native_limits("openai", 200_000, 50_000, 8_000),
+            (200_000, 50_000, 8_000)
+        );
+    }
     use super::*;
 
     #[tokio::test]

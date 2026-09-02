@@ -231,7 +231,7 @@ async fn product_genesis_requires_main_binding_and_hides_cross_account_sessions(
 }
 
 #[tokio::test]
-async fn product_genesis_approval_creates_one_exact_project_and_handoff() {
+async fn product_genesis_approval_creates_one_exact_project_and_handoff_and_can_delete_it() {
     let workspace = common::TestDir::new("product-genesis-charter-create");
     let harness = common::test_app(workspace.path(), "product-genesis-charter-create").await;
     let app = &harness.app;
@@ -286,7 +286,7 @@ async fn product_genesis_approval_creates_one_exact_project_and_handoff() {
     assert_eq!(selected_agent.profile_revision_id, connected.profile.id);
     assert_eq!(
         selected_agent.operating_skill_revision,
-        "forge.project.orchestration/v1@10"
+        "forge.project.orchestration/v1@13"
     );
 
     let content = exact_charter_content();
@@ -835,6 +835,35 @@ async fn product_genesis_approval_creates_one_exact_project_and_handoff() {
         .await
         .expect("project count remains queryable");
     assert_eq!(project_count_after, 1);
+
+    let deleted = common::raw_empty_request(
+        app,
+        Method::DELETE,
+        &format!("/api/v1/projects/{}", created.project_id),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    for (table, project_column) in [
+        ("project", "id"),
+        ("project_agent_binding", "project_id"),
+        ("project_admission_receipt", "project_id"),
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE {project_column} = ?"
+        ))
+        .bind(&created.project_id)
+        .fetch_one(harness.state.db.pool())
+        .await
+        .unwrap_or_else(|error| panic!("{table} teardown count: {error}"));
+        assert_eq!(count, 0, "{table} survives guarded Project teardown");
+    }
+    let guard_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM project_deletion_guard WHERE project_id = ?")
+            .bind(&created.project_id)
+            .fetch_one(harness.state.db.pool())
+            .await
+            .expect("Project teardown clears its guard");
+    assert_eq!(guard_count, 0);
 }
 
 async fn connect_genesis_agent(

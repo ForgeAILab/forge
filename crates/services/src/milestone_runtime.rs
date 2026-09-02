@@ -666,6 +666,16 @@ impl MilestoneRuntime {
                 message: "release idempotency key is required".to_owned(),
             });
         }
+        // The immutable snapshot digests the releasing principal twice — as
+        // `released_by` and inside the authorization receipt — and the row
+        // persists one display name for both. Bind the actor to the label the
+        // receipt carries so the write and every later read agree byte for
+        // byte; the route already proved both name the same authenticated user.
+        let actor = &PrincipalRef {
+            kind: actor.kind,
+            id: actor.id.clone(),
+            display_name: authorization.principal.display_name.clone(),
+        };
         if let Some(existing) = self
             .release_by_idempotency(project_id, idempotency_key)
             .await?
@@ -675,6 +685,7 @@ impl MilestoneRuntime {
                 || existing.readiness_digest != readiness_digest
                 || existing.releasing_principal_id != actor.id
                 || existing.releasing_principal_type != principal_kind_name(actor.kind)
+                || existing.releasing_principal_display_name != actor.display_name
                 || existing.releasing_principal_id != authorization.principal.id
                 || existing.releasing_principal_type
                     != principal_kind_name(authorization.principal.kind)
@@ -829,6 +840,7 @@ impl MilestoneRuntime {
                 || existing.readiness_digest != readiness_digest
                 || existing.releasing_principal_id != actor.id
                 || existing.releasing_principal_type != principal_kind_name(actor.kind)
+                || existing.releasing_principal_display_name != actor.display_name
                 || existing.authorization_basis != authorization.authorization_basis
                 || existing.authorization_action != authorization.action
                 || existing.explicit_event != authorization.event_id
@@ -877,10 +889,11 @@ impl MilestoneRuntime {
                 known_issues_json, charter_revision_id, document_revisions_json, decision_ids_json,
                 task_references_json, validation_references_json, git_references_json,
                 evidence_references_json, waivers_json, releasing_principal_type,
-                releasing_principal_id, authorization_basis, authorization_action,
+                releasing_principal_id, releasing_principal_display_name,
+                authorization_basis, authorization_action,
                 explicit_event, authorization_occurred_at, schema_version,
                 snapshot_digest, idempotency_key, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&release_id)
         .bind(project_id)
@@ -905,6 +918,7 @@ impl MilestoneRuntime {
         .bind(serde_json::to_string(&snapshot.waived_check_ids).map_err(json_error)?)
         .bind("user")
         .bind(&actor.id)
+        .bind(actor.display_name.as_deref())
         .bind(&authorization.authorization_basis)
         .bind(&authorization.action)
         .bind(&authorization.event_id)
@@ -2753,7 +2767,7 @@ impl MilestoneRuntime {
         let releasing_principal = PrincipalRef {
             kind: principal_kind(&record.releasing_principal_type)?,
             id: record.releasing_principal_id.clone(),
-            display_name: None,
+            display_name: record.releasing_principal_display_name.clone(),
         };
         let release_authorization = AuthorizationProvenance {
             principal: releasing_principal.clone(),
@@ -4319,6 +4333,7 @@ fn release_record_from_row(row: sqlx::sqlite::SqliteRow) -> db::Result<ProjectRe
         waivers_json: row.try_get("waivers_json")?,
         releasing_principal_type: row.try_get("releasing_principal_type")?,
         releasing_principal_id: row.try_get("releasing_principal_id")?,
+        releasing_principal_display_name: row.try_get("releasing_principal_display_name")?,
         authorization_basis: row.try_get("authorization_basis")?,
         authorization_action: row.try_get("authorization_action")?,
         explicit_event: row.try_get("explicit_event")?,

@@ -376,6 +376,14 @@ async fn identity_with_project_permission(
                 permission_ceiling_json: json!({"permissions":["propose_task"]}).to_string(),
                 subscriptions_json: "[]".to_owned(),
                 wake_budget: 1,
+                operating_skill_revision_id: None,
+                policy_revision: "default".to_owned(),
+                policy_digest: String::new(),
+                charter_id: None,
+                charter_revision_id: None,
+                charter_setup_required: true,
+                admission_receipt_id: None,
+                charter_approval_id: None,
                 created_at: now.clone(),
                 updated_at: now,
             },
@@ -978,6 +986,14 @@ async fn hostile_project_identity(db: &SqliteDb, identity_id: &str, project_id: 
                 permission_ceiling_json: json!({"permissions":["propose_task"]}).to_string(),
                 subscriptions_json: "[]".to_owned(),
                 wake_budget: 1,
+                operating_skill_revision_id: None,
+                policy_revision: "default".to_owned(),
+                policy_digest: String::new(),
+                charter_id: None,
+                charter_revision_id: None,
+                charter_setup_required: true,
+                admission_receipt_id: None,
+                charter_approval_id: None,
                 created_at: now.clone(),
                 updated_at: now,
             },
@@ -1231,13 +1247,71 @@ async fn untrusted_text_from_every_source_cannot_raise_the_server_ceiling() {
     .fetch_one(db.pool())
     .await
     .expect("Project operating skill revision exists");
+    let approval_id = "project-a-adoption-approval";
+    let admission_receipt_id = "project-a-admission-receipt";
+    let authority_at = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO project_charter_approval (
+             id, approval_type, charter_id, revision_id, content_digest,
+             rendered_digest, expected_charter_version, selected_identity_id,
+             selected_profile_id, selected_operating_skill_revision_id,
+             selected_policy_revision, selected_policy_digest,
+             approving_principal_type, approving_principal_id,
+             authorization_basis, authorization_action, explicit_event,
+             authorization_occurred_at, source_action, lifecycle,
+             idempotency_key, consumed_project_id, consumed_at, version,
+             created_at, updated_at, approved_project_mode
+         ) VALUES (?, 'adoption', 'project-a-charter',
+                   'project-a-charter-revision-1', 'charter-content-digest',
+                   'charter-render-digest', 1, 'project-agent-a',
+                   (SELECT id FROM agent_profile
+                    WHERE identity_id = 'project-agent-a'
+                    ORDER BY created_at DESC, id DESC LIMIT 1),
+                   ?, 'project-policy@1', 'project-policy-digest',
+                   'user', 'user-1', 'authenticated_project_owner',
+                   'adopt_project_charter', 'test_fixture_adoption', ?,
+                   'test_fixture', 'consumed', 'auth04-adoption', 'project-a',
+                   ?, 2, ?, ?, 'compact')",
+    )
+    .bind(approval_id)
+    .bind(&skill_revision)
+    .bind(&authority_at)
+    .bind(&authority_at)
+    .bind(&authority_at)
+    .bind(&authority_at)
+    .execute(db.pool())
+    .await
+    .expect("consumed adoption approval creates");
+    sqlx::query(
+        "INSERT INTO project_admission_receipt (
+             id, project_id, source_kind, handoff_id,
+             initial_charter_approval_id, initial_charter_id,
+             initial_charter_revision_id, payload_digest,
+             validation_schema_version, validated_at, created_at
+         ) VALUES (?, 'project-a', 'charter_adoption', NULL, ?,
+                   'project-a-charter', 'project-a-charter-revision-1',
+                   'charter-content-digest', 'forge.project-admission/v1', ?, ?)",
+    )
+    .bind(admission_receipt_id)
+    .bind(approval_id)
+    .bind(&authority_at)
+    .bind(&authority_at)
+    .execute(db.pool())
+    .await
+    .expect("Project admission receipt creates");
     sqlx::query(
         "UPDATE project_agent_binding
          SET operating_skill_revision_id = ?, policy_revision = 'project-policy@1',
-             policy_digest = 'project-policy-digest'
+             policy_digest = 'project-policy-digest',
+             charter_id = 'project-a-charter',
+             charter_revision_id = 'project-a-charter-revision-1',
+             charter_setup_required = 0, admission_receipt_id = ?,
+             charter_approval_id = ?
          WHERE project_id = 'project-a' AND state = 'active'",
     )
     .bind(&skill_revision)
+    .bind(admission_receipt_id)
+    .bind(approval_id)
     .execute(db.pool())
     .await
     .expect("binding provenance completes");

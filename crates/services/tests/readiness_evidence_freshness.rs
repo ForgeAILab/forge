@@ -88,7 +88,6 @@ fn definition() -> MilestoneDefinitionRevision {
                 description: "current proof".to_owned(),
                 required: true,
                 evidence_kind: Some("screenshot".to_owned()),
-                check_definition_revision: Some("definition-1".to_owned()),
             }],
             known_issues: Vec::new(),
             target_date: None,

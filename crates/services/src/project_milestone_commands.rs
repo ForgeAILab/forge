@@ -572,6 +572,17 @@ impl ProjectMilestoneCommandService {
             command.base_revision_id.clone(),
             milestone_definition_lifecycle_name(command.lifecycle),
         )?;
+        // Re-authoring the current definition verbatim is a no-op: appending
+        // a duplicate row would move the current pointer onto an unapproved
+        // copy and silently revoke a standing approval with zero semantic
+        // change. Only an actual content change, or a draft being promoted,
+        // may append a new revision.
+        if revision.content_digest == current.content_digest
+            && revision.display_label == current.display_label
+            && (revision.lifecycle == current.lifecycle || current.lifecycle == "approved")
+        {
+            return Ok(current.clone());
+        }
         let check_definitions =
             build_check_definitions(&command, &milestone_id, &revision_id, &revision.created_at);
         let lifecycle = milestone_definition_lifecycle_name(command.lifecycle);
@@ -1033,15 +1044,6 @@ fn validate_checks(content: &MilestoneDefinitionContent, materialize: bool) -> R
         }) {
             return Err(ServiceError::invalid_operation(
                 "milestone evidence_kind must be one of: screenshot, walkthrough_video, log, report, other",
-            ));
-        }
-        if requirement
-            .check_definition_revision
-            .as_deref()
-            .is_some_and(|revision| revision.trim().is_empty())
-        {
-            return Err(ServiceError::invalid_operation(
-                "milestone evidence check_definition_revision cannot be empty",
             ));
         }
         if requirement.required

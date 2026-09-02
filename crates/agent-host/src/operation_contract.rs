@@ -14,10 +14,11 @@ use crate::operation_catalog::{
     MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION, MAIN_CHARTER_READINESS_OPERATION,
     MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION, MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
     MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
-    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
-    PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION,
-    PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION,
-    PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION,
+    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CHARTER_READ_OPERATION,
+    PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
+    PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
+    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_SKILL_SECTION_NAMES,
+    PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION,
     TASK_EVIDENCE_OPERATION, TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION,
     TASK_WORKLOG_OPERATION,
 };
@@ -433,23 +434,22 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
             "Project Agent decisions are limited to implementation choices inside the approved Project Charter. User-scope decisions, policy decisions, waivers, and manual approvals are user-only actions outside this tool.",
         ),
         PROJECT_MILESTONE_OPERATION => object_schema(
-            json!({"action":{"enum":["define","revise","set_primary"]},"milestone_id":string_or_null_schema(),"display_label":string_or_null_schema(),"expected_milestone_version":{"type":"integer","minimum":1},"primary_milestone_id":string_or_null_schema(),"content":{"type":"object","properties":{"name":{"type":"string","minLength":1},"outcome":{"type":"string","minLength":1},"included_scope":string_array_schema(),"excluded_scope":string_array_schema(),"charter_revision":{"oneOf":[artifact_ref_schema(),{"type":"null"}]},"document_revisions":{"type":"array","items":artifact_ref_schema()},"task_ids":string_array_schema(),"dependencies":string_array_schema(),"risks":{"type":"array","items":charter_risk_schema()},"acceptance_checks":{"type":"array","items":object_schema(json!({"id":{"type":"string","minLength":1,"description":"Stable canonical id; preserve it across milestone revisions."},"description":{"type":"string","minLength":1},"required":{"type":"boolean"},"source_kind":{"type":"string","enum":["manual","policy_waiver","task_validation"],"description":"Only source kinds with a current authoritative result path are admitted. Use manual for a genuinely human observation, and task_validation for an integrated check an agent can run and record through project.validation."},"expected_result":{"type":"string","minLength":1},"latest_result":string_or_null_schema(),"latest_result_id":string_or_null_schema(),"latest_result_digest":string_or_null_schema()}), &["id","description","required","source_kind","expected_result"])},"evidence_requirements":{"type":"array","items":object_schema(json!({"id":{"type":"string","minLength":1,"description":"Use the exact acceptance-check id this evidence proves."},"description":{"type":"string","minLength":1},"required":{"type":"boolean"},"evidence_kind":{"type":["string","null"],"enum":["screenshot","walkthrough_video","log","report","other",null]},"check_definition_revision":string_or_null_schema()}), &["id","description","required"])},"known_issues":string_array_schema(),"target_date":string_or_null_schema()},"additionalProperties":false}}),
+            json!({"action":{"enum":["define","revise","set_primary"]},"milestone_id":string_or_null_schema(),"display_label":string_or_null_schema(),"expected_milestone_version":{"type":"integer","minimum":1},"primary_milestone_id":string_or_null_schema(),"content":{"type":"object","properties":{"name":{"type":"string","minLength":1},"outcome":{"type":"string","minLength":1},"included_scope":string_array_schema(),"excluded_scope":string_array_schema(),"charter_revision":{"oneOf":[artifact_ref_schema(),{"type":"null"}]},"document_revisions":{"type":"array","items":artifact_ref_schema()},"task_ids":string_array_schema(),"dependencies":string_array_schema(),"risks":{"type":"array","items":charter_risk_schema()},"acceptance_checks":{"type":"array","items":object_schema(json!({"id":{"type":"string","minLength":1,"description":"Stable canonical id; preserve it across milestone revisions."},"description":{"type":"string","minLength":1},"required":{"type":"boolean"},"source_kind":{"type":"string","enum":["manual","policy_waiver","task_validation"],"description":"Only source kinds with a current authoritative result path are admitted. Use manual for a genuinely human observation, and task_validation for an integrated check an agent can run and record through project.validation."},"expected_result":{"type":"string","minLength":1},"latest_result":string_or_null_schema(),"latest_result_id":string_or_null_schema(),"latest_result_digest":string_or_null_schema()}), &["id","description","required","source_kind","expected_result"])},"evidence_requirements":{"type":"array","items":object_schema(json!({"id":{"type":"string","minLength":1,"description":"Use the exact acceptance-check id this evidence proves."},"description":{"type":"string","minLength":1},"required":{"type":"boolean"},"evidence_kind":{"type":["string","null"],"enum":["screenshot","walkthrough_video","log","report","other",null]}}), &["id","description","required"])},"known_issues":string_array_schema(),"target_date":string_or_null_schema()},"additionalProperties":false}}),
             &["action", "expected_milestone_version"],
         ),
-        PROJECT_EVIDENCE_OPERATION => object_schema(
-            json!({"action":{"const":"attach"},"milestone_id":{"type":"string","minLength":1},"expected_milestone_version":{"type":"integer","minimum":1},"asset_id":{"type":"string","minLength":1},"task_id":string_or_null_schema(),"acceptance_check_ids":string_array_schema(),"caption":{"type":"string","minLength":1},"kind":{"type":"string","enum":["screenshot","walkthrough_video","log","report","other"]},"checksum":{"type":"string","minLength":1}}),
+        PROJECT_EVIDENCE_OPERATION => described_object_schema(
+            json!({"action":{"enum":["attach","capture"],"description":"attach binds an existing Project media asset (asset_id + checksum required). capture stores an artifact your own verification run produced and attaches it in the same call: supply exactly one of content or path, never asset_id/checksum."},"milestone_id":{"type":"string","minLength":1},"expected_milestone_version":{"type":"integer","minimum":1},"asset_id":{"type":["string","null"],"minLength":1,"description":"attach only: the existing Project media asset to bind."},"task_id":string_or_null_schema(),"source_validation_id":{"type":["string","null"],"minLength":1,"description":"The id of the recorded validation RESULT this artifact backs — the `validation_id`/result id returned by `project.validation` (`record`), never the acceptance-check id. Record the check result first, then capture its proof citing that returned id."},"acceptance_check_ids":string_array_schema(),"caption":{"type":"string","minLength":1},"kind":{"type":"string","enum":["screenshot","walkthrough_video","log","report","other"]},"checksum":{"type":["string","null"],"minLength":1,"description":"attach only: SHA-256 of the named asset's bytes."},"content":{"type":["string","null"],"minLength":1,"description":"capture only: inline text artifact (for example a verification report)."},"path":{"type":["string","null"],"minLength":1,"description":"capture only: a file path under your Project workspace root (forge/ or checkout/)."},"filename":{"type":["string","null"],"minLength":1,"description":"capture only: display filename override, no path separators."}}),
             &[
                 "action",
                 "milestone_id",
                 "expected_milestone_version",
-                "asset_id",
                 "caption",
                 "kind",
-                "checksum",
             ],
+            "Evidence for a milestone acceptance check. attach an existing asset, or capture the proof your own verification run produced — the server creates the Project media asset and attaches it atomically. Never create a Task just to produce evidence.",
         ),
         PROJECT_VALIDATION_OPERATION => object_schema(
-            json!({"action":{"const":"record"},"milestone_id":{"type":"string","minLength":1},"milestone_version":{"type":"integer","minimum":1},"check_id":{"type":"string","minLength":1,"description":"Stable acceptance-check id on the milestone's current definition revision. The check's source_kind must not be manual."},"definition_revision_id":{"type":"string","minLength":1},"status":{"type":"string","enum":["pass","fail","blocked","stale","unavailable"]},"result":{"type":"string","minLength":1,"description":"What was actually observed, in the Agent's own words."},"input_digest":{"type":"string","minLength":1,"description":"Digest of the exact inputs observed, so a repeat of the same observation replays instead of appending."},"observed_task_id":{"type":["string","null"],"minLength":1,"description":"The Task whose run produced this observation, when a Task produced it. Omit only when you exercised the software yourself in your Project workspace checkout. Never name a Task that did not actually run: the server verifies it belongs to this Project and reached a delivered state."},"evidence_asset_id":{"type":["string","null"],"minLength":1,"description":"Optional id of an artifact that Task captured through `task.evidence`, when one backs this observation."},"governing_revision_ids":string_array_schema()}),
+            json!({"action":{"const":"record"},"milestone_id":{"type":"string","minLength":1},"milestone_version":{"type":"integer","minimum":1},"check_id":{"type":"string","minLength":1,"description":"Stable acceptance-check id on the milestone's current definition revision. The check's source_kind must not be manual."},"definition_revision_id":{"type":"string","minLength":1},"status":{"type":"string","enum":["pass","fail","blocked","stale","unavailable"]},"result":{"type":"string","minLength":1,"description":"What was actually observed, in the Agent's own words."},"input_digest":{"type":"string","minLength":1,"description":"Digest of the exact inputs observed, so a repeat of the same observation replays instead of appending."},"observed_task_id":{"type":["string","null"],"minLength":1,"description":"The Task whose run produced this observation, when a Task produced it. Omit only when you exercised the software yourself in your Project workspace checkout. Never name a Task that did not actually run: the server verifies it belongs to this Project and reached a delivered state."},"evidence_asset_id":{"type":["string","null"],"minLength":1,"description":"Optional id of an artifact backing this observation: one the observed Task captured through `task.evidence`, or one you captured yourself through `project.evidence` (`capture`)."},"governing_revision_ids":string_array_schema()}),
             &[
                 "action",
                 "milestone_id",
@@ -500,12 +500,12 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
         ),
         TASK_RECOVER_OPERATION => described_object_schema(
             json!({
-                "action":{"type":"string","enum":["resume_session","reexecute","reset_to_initial","reset_retry_window"]},
+                "action":{"type":"string","enum":["resume_session","reexecute","reset_to_initial","reset_retry_window","cancel_task"]},
                 "task_id":{"type":"string","minLength":1},
                 "reason":{"type":"string","minLength":1,"description":"What stopped this Task, in your own words."}
             }),
             &["action", "task_id", "reason"],
-            "Recover a Task that stopped so it can run again, rather than creating a replacement. Use this when the Task definition is sound and the failure was operational -- an expired worker lease, a runtime that went away, a dispatch race, an exhausted retry window. `resume_session` continues the interrupted run; `reexecute` starts a fresh run of the same Task; `reset_to_initial` returns it to the queue for normal dispatch; `reset_retry_window` clears an exhausted retry budget. Replace a Task only when what it asks for is actually wrong: a duplicate leaves the original stranded and the work double-counted.",
+            "Recover a Task that stopped so it can run again, rather than creating a replacement. Use this when the Task definition is sound and the failure was operational -- an expired worker lease, a runtime that went away, a dispatch race, an exhausted retry window. `resume_session` continues the interrupted run; `reexecute` starts a fresh run of the same Task; `reset_to_initial` returns it to the queue for normal dispatch; `reset_retry_window` clears an exhausted retry budget; `cancel_task` ends a Task whose outcome no longer needs a run at all -- a verification-shaped Task you absorbed by settling its checks yourself. Replace a Task only when what it asks for is actually wrong: a duplicate leaves the original stranded and the work double-counted.",
         ),
         TASK_WORKLOG_OPERATION => described_object_schema(
             json!({
@@ -1044,6 +1044,18 @@ pub(crate) fn orchestration_read_arguments_schema(operation: &str) -> Value {
             &[],
             "Returns the server-derived closed EffectiveProjectState projection for the bound Project, including Charter/baseline references, approved Documents, Decisions, reconciliation/conflict records, Task/validation summaries, milestones/readiness, releases, unreleased changes, and source watermark/version. The response is scope-bound and never accepts a Project or authority selector.",
         ),
+        PROJECT_CHARTER_READ_OPERATION => described_object_schema(
+            json!({}),
+            &[],
+            "Returns the bound Project's current approved Charter as rendered Markdown plus its charter/revision identifiers and content/render digests. The Charter is Project data, not resident context: read it whenever its details matter to a decision. The response is scope-bound and never accepts a Project selector.",
+        ),
+        PROJECT_SKILL_SECTION_OPERATION => described_object_schema(
+            json!({
+                "section":{"type":"string","enum":PROJECT_SKILL_SECTION_NAMES}
+            }),
+            &["section"],
+            "Returns one server-owned Project operating-doctrine section by name. Read the matching section before the first work of that kind in a conversation and re-read it when unsure: research, documents, scope_change, tasks, milestones, release.",
+        ),
         _ => object_schema(json!({}), &[]),
     }
 }
@@ -1180,11 +1192,20 @@ mod tests {
                 "{} must remain a closed input contract",
                 contract.operation
             );
+            // Every contract must resolve past the unhandled-operation
+            // fallthrough: either operation-specific properties or an
+            // explicit root description marking a deliberate zero-argument
+            // read (the fallthrough produces neither).
+            let has_properties = schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .is_some_and(|properties| !properties.is_empty());
+            let has_description = schema
+                .get("description")
+                .and_then(Value::as_str)
+                .is_some_and(|description| !description.trim().is_empty());
             assert!(
-                schema
-                    .get("properties")
-                    .and_then(Value::as_object)
-                    .is_some_and(|properties| !properties.is_empty()),
+                has_properties || has_description,
                 "{} must resolve to operation-specific input metadata",
                 contract.operation
             );

@@ -7,6 +7,29 @@ use db::{
     TaskRoleAssignmentRepo,
 };
 
+/// Whether `task` is parked at a review gate only a user may decide.
+///
+/// The Project Agent's `task.review` action and the review-ready attention
+/// wake both hinge on this: a review run by the workflow's reviewer Agent
+/// settles itself, so neither a decision nor a wake is anyone's business.
+#[must_use]
+pub fn task_review_requires_user_decision(
+    task: &Task,
+    workflow: &api_types::WorkflowDefinition,
+) -> bool {
+    workflow
+        .states
+        .iter()
+        .find(|state| state.name == task.status)
+        .is_some_and(|state| {
+            state.canonical_phase == Some(api_types::CanonicalPhase::Review)
+                && state
+                    .gate_config
+                    .as_ref()
+                    .is_some_and(|gate| gate.requires_user_approval())
+        })
+}
+
 #[derive(Debug)]
 pub struct TaskActionResult {
     pub task: Task,
@@ -52,18 +75,7 @@ impl TaskService {
         let actor = Actor::agent(project_agent_identity_id);
         let workflow =
             WorkflowEngine::resolve_workflow_for_task(&task, &project.workflow_definition, &actor);
-        let review_gate = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status);
-        let human_review = review_gate.is_some_and(|state| {
-            state.canonical_phase == Some(api_types::CanonicalPhase::Review)
-                && state
-                    .gate_config
-                    .as_ref()
-                    .is_some_and(|gate| gate.requires_user_approval())
-        });
-        if !human_review {
+        if !task_review_requires_user_decision(&task, &workflow) {
             return Err(ServiceError::invalid_operation(
                 "Task is not waiting for a human-required review decision",
             ));

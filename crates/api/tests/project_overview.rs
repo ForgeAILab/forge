@@ -45,9 +45,12 @@ async fn project_overview_returns_truthful_setup_projection() {
         overview.charter_state,
         api_types::ProjectCharterState::CharterSetupRequired
     );
+    // Charter setup is a starting state, not a projection fault: a Project
+    // with nothing yet to govern reports Current and lets `charter_state`
+    // plus the `charter_adoption` next action carry the setup message.
     assert_eq!(
         overview.projection_state,
-        api_types::OverviewProjectionState::Stale
+        api_types::OverviewProjectionState::Current
     );
     assert!(overview.current_charter.is_none());
     assert!(overview.active_milestones.is_empty());

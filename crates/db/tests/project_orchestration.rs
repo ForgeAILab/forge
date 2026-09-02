@@ -397,6 +397,108 @@ async fn charter_approval_create_is_atomic_and_replay_safe() {
     assert_eq!(created.charter_revision_id, revision_id);
     assert_eq!(created.project.id, "project-1");
     assert!(created.project.primary_milestone_id.is_some());
+    let admission = sqlx::query(
+        "SELECT id, source_kind, handoff_id, initial_charter_approval_id,
+                initial_charter_id, initial_charter_revision_id, payload_digest
+         FROM project_admission_receipt WHERE project_id = ?",
+    )
+    .bind(&created.project.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("stable Project admission receipt");
+    let admission_id: String = admission.try_get("id").expect("admission id");
+    assert_eq!(
+        admission.try_get::<String, _>("source_kind").unwrap(),
+        "genesis_handoff"
+    );
+    assert_eq!(
+        admission
+            .try_get::<Option<String>, _>("handoff_id")
+            .unwrap(),
+        Some(created.handoff_id.clone())
+    );
+    assert_eq!(
+        admission
+            .try_get::<String, _>("initial_charter_approval_id")
+            .unwrap(),
+        "orchestration-approval"
+    );
+    assert_eq!(
+        admission
+            .try_get::<String, _>("initial_charter_id")
+            .unwrap(),
+        charter_id
+    );
+    assert_eq!(
+        admission
+            .try_get::<String, _>("initial_charter_revision_id")
+            .unwrap(),
+        revision_id
+    );
+    assert_eq!(
+        admission
+            .try_get::<String, _>("payload_digest")
+            .unwrap()
+            .len(),
+        64
+    );
+    let binding_authority = sqlx::query(
+        "SELECT admission_receipt_id, charter_approval_id, charter_id,
+                charter_revision_id, charter_setup_required
+         FROM project_agent_binding WHERE id = ?",
+    )
+    .bind(&created.project_agent_binding_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("complete Project binding authority");
+    assert_eq!(
+        binding_authority
+            .try_get::<String, _>("admission_receipt_id")
+            .unwrap(),
+        admission_id
+    );
+    assert_eq!(
+        binding_authority
+            .try_get::<String, _>("charter_approval_id")
+            .unwrap(),
+        "orchestration-approval"
+    );
+    assert_eq!(
+        binding_authority
+            .try_get::<i64, _>("charter_setup_required")
+            .unwrap(),
+        0
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE project_agent_binding
+             SET admission_receipt_id = 'cross-project-or-missing-receipt'
+             WHERE id = ?",
+        )
+        .bind(&created.project_agent_binding_id)
+        .execute(db.pool())
+        .await
+        .is_err(),
+        "active bindings must retain a same-Project admission receipt"
+    );
+    assert!(
+        sqlx::query("UPDATE project_agent_binding SET charter_approval_id = NULL WHERE id = ?",)
+            .bind(&created.project_agent_binding_id)
+            .execute(db.pool())
+            .await
+            .is_err(),
+        "active bindings must retain complete current Charter authority"
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE project_admission_receipt SET payload_digest = 'tampered' WHERE id = ?",
+        )
+        .bind(&admission_id)
+        .execute(db.pool())
+        .await
+        .is_err(),
+        "admission receipts must remain immutable"
+    );
     let frozen_turn = sqlx::query(
         "SELECT responder_binding_id, responder_binding_version,
                 responder_identity_version, profile_version,
@@ -485,6 +587,16 @@ async fn charter_approval_create_is_atomic_and_replay_safe() {
     assert_eq!(replay.handoff_id, created.handoff_id);
     assert_eq!(replay.target_message_id, created.target_message_id);
     assert_eq!(replay.target_turn_id, created.target_turn_id);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM project_admission_receipt WHERE project_id = ?",
+        )
+        .bind(&created.project.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("one replay-stable admission receipt"),
+        1
+    );
     assert!(sqlx::query(
         "UPDATE project_charter_approval
          SET consumed_project_id = 'tampered-project'
@@ -1139,4 +1251,175 @@ async fn charter_create_rechecks_selected_agent_availability_inside_transaction(
         ProjectOrchestrationRepo::create_project_from_charter_approval(&db, input).await,
         Err(DbError::VersionConflict)
     ));
+}
+
+#[tokio::test]
+async fn startup_reconciliation_repairs_inferable_incomplete_project_binding_once() {
+    let (db, genesis_id, _main_chat_id, now) = fixture().await;
+    approval_fixture(&db, &genesis_id, &now).await;
+    let created = ProjectOrchestrationRepo::create_project_from_charter_approval(
+        &db,
+        create_input(
+            "orchestration-approval",
+            "repairable-project",
+            "repairable-handoff",
+            "repairable-message",
+            "repairable-turn",
+            &now,
+            r#"{"schema_version":"forge.project-charter-handoff/v1","project":{"id":"repairable-project","name":"Compact Orchestration Project","mode":"compact"},"target":{},"source":{"identity_id":"orchestration-main-identity","profile_revision_id":"orchestration-main-profile"}}"#,
+        ),
+    )
+    .await
+    .expect("repair fixture Project");
+    let original_binding_id = created.project_agent_binding_id.clone();
+    let frozen_before: (String, i64, String) = sqlx::query_as(
+        "SELECT responder_binding_id, responder_binding_version, admission_digest
+         FROM agent_chat_turn_job WHERE id = ?",
+    )
+    .bind(&created.target_turn_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("frozen turn before repair");
+
+    sqlx::query(
+        "UPDATE project_agent_binding
+         SET operating_skill_revision_id = NULL,
+             policy_revision = '', policy_digest = '', charter_id = NULL,
+             charter_revision_id = NULL, charter_setup_required = 1,
+             admission_receipt_id = NULL, charter_approval_id = NULL
+         WHERE id = ? AND state = 'active'",
+    )
+    .bind(&original_binding_id)
+    .execute(db.pool())
+    .await
+    .expect("simulate historical incomplete replacement");
+
+    run_migrations(db.pool())
+        .await
+        .expect("bounded startup reconciliation");
+    let repaired: (String, String, String, String, String, String, i64) = sqlx::query_as(
+        "SELECT id, admission_receipt_id, charter_approval_id, charter_id,
+                charter_revision_id, operating_skill_revision_id,
+                charter_setup_required
+         FROM project_agent_binding
+         WHERE project_id = ? AND state = 'active'",
+    )
+    .bind(&created.project.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("repaired active binding");
+    assert_ne!(repaired.0, original_binding_id);
+    assert_eq!(repaired.2, "orchestration-approval");
+    assert_eq!(repaired.3, created.charter_id);
+    assert_eq!(repaired.4, created.charter_revision_id);
+    assert_eq!(repaired.6, 0);
+    assert!(repaired.1.len() > 20);
+    assert!(repaired.5.len() > 20);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM project_agent_binding WHERE id = ?",)
+            .bind(&original_binding_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("historical binding state"),
+        "replaced"
+    );
+    let frozen_after: (String, i64, String) = sqlx::query_as(
+        "SELECT responder_binding_id, responder_binding_version, admission_digest
+         FROM agent_chat_turn_job WHERE id = ?",
+    )
+    .bind(&created.target_turn_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("frozen turn after repair");
+    assert_eq!(frozen_after, frozen_before);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'project.agent_binding.repaired'
+               AND scope_id = ?",
+        )
+        .bind(&created.project.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("repair event"),
+        1
+    );
+
+    run_migrations(db.pool())
+        .await
+        .expect("idempotent recovery replay");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'project.agent_binding.repaired'
+               AND scope_id = ?",
+        )
+        .bind(&created.project.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("one repair event after replay"),
+        1
+    );
+}
+
+#[tokio::test]
+async fn startup_reconciliation_fails_ambiguous_binding_closed() {
+    let (db, genesis_id, _main_chat_id, now) = fixture().await;
+    approval_fixture(&db, &genesis_id, &now).await;
+    let created = ProjectOrchestrationRepo::create_project_from_charter_approval(
+        &db,
+        create_input(
+            "orchestration-approval",
+            "ambiguous-project",
+            "ambiguous-handoff",
+            "ambiguous-message",
+            "ambiguous-turn",
+            &now,
+            r#"{"schema_version":"forge.project-charter-handoff/v1","project":{"id":"ambiguous-project","name":"Compact Orchestration Project","mode":"compact"},"target":{},"source":{"identity_id":"orchestration-main-identity","profile_revision_id":"orchestration-main-profile"}}"#,
+        ),
+    )
+    .await
+    .expect("ambiguous repair fixture Project");
+    sqlx::query(
+        "UPDATE project_agent_binding
+         SET charter_setup_required = 1, admission_receipt_id = NULL,
+             charter_approval_id = NULL
+         WHERE id = ? AND state = 'active'",
+    )
+    .bind(&created.project_agent_binding_id)
+    .execute(db.pool())
+    .await
+    .expect("simulate ambiguous historical binding");
+    sqlx::query("UPDATE agent_identity SET paused = 1 WHERE id = ?")
+        .bind(PROJECT_AGENT_IDENTITY_ID)
+        .execute(db.pool())
+        .await
+        .expect("make binding identity unavailable");
+
+    run_migrations(db.pool())
+        .await
+        .expect("fail-closed startup reconciliation");
+    let state: (i64, String) = sqlx::query_as(
+        "SELECT binding.charter_setup_required, chat.status
+         FROM project_agent_binding binding
+         JOIN agent_chat chat ON chat.project_id = binding.project_id AND chat.kind = 'project'
+         WHERE binding.id = ?",
+    )
+    .bind(&created.project_agent_binding_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("typed recovery state");
+    assert_eq!(state, (1, "agent_setup_required".to_owned()));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'project.agent_binding.repair_required'
+               AND scope_id = ?",
+        )
+        .bind(&created.project.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("repair-required event"),
+        1
+    );
 }

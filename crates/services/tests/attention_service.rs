@@ -7,6 +7,7 @@ use db::{
     UpdateAttentionLifecycle,
 };
 use services::{
+    workflow::{default_autonomous_workflow, default_workflow},
     AttentionService, WakeAdmissionRequest, WakeAdmissionResult, WakeSuppressionReason,
 };
 use tokio::sync::watch;
@@ -1116,4 +1117,125 @@ async fn cancelled_execution_notifies_the_configured_project_agent_with_recovery
     .await
     .unwrap();
     assert_eq!(admitted_identity, identity_id);
+}
+
+/// Seed a Project with `workflow_definition` and one Task parked in `review`,
+/// then project its `task.transitioned` event. Returns the attention rows
+/// materialized for the Project.
+async fn review_attention_rows(db: &Arc<SqliteDb>, workflow_definition: &str) -> Vec<String> {
+    let identity_id = new_uuid_v4();
+    identity(db, &identity_id).await;
+    let profile_id: String =
+        sqlx::query_scalar("SELECT selected_profile_id FROM agent_identity WHERE id = ?")
+            .bind(&identity_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let project_id = new_uuid_v4();
+    let now = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO project (
+            id, name, settings, workflow_definition, owner_id, created_at, updated_at
+         ) VALUES (?, 'review-wake-project', '{}', ?, NULL, ?, ?)",
+    )
+    .bind(&project_id)
+    .bind(workflow_definition)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE project_agent_binding
+         SET identity_id = ?, profile_id = ?, state = 'active', wake_budget = 10,
+             version = version + 1, updated_at = ?
+         WHERE project_id = ? AND state = 'agent_setup_required'",
+    )
+    .bind(&identity_id)
+    .bind(&profile_id)
+    .bind(&now)
+    .bind(&project_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let task = TaskRepo::create(
+        &**db,
+        CreateTask {
+            id: new_uuid_v4(),
+            project_id: project_id.clone(),
+            repo_id: None,
+            parent_task_id: None,
+            subtask_order: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "Deliver the reviewed slice".to_owned(),
+            description: None,
+            task_type: "task".to_owned(),
+            status: "review".to_owned(),
+            is_automation: false,
+            priority: 0,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    DomainEventRepo::append_event(
+        &**db,
+        CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "task.transitioned".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: task.id.clone(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "project".to_owned(),
+            scope_id: project_id.clone(),
+            correlation_id: new_uuid_v4(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(new_uuid_v4()),
+            payload_json: r#"{"to_state":"review"}"#.to_owned(),
+            created_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    AttentionService::new(Arc::clone(db))
+        .project_once(100)
+        .await
+        .unwrap();
+    sqlx::query_scalar(
+        "SELECT attention_type FROM attention_projection
+         WHERE scope_type = 'project' AND scope_id = ? ORDER BY updated_at",
+    )
+    .bind(&project_id)
+    .fetch_all(db.pool())
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn review_ready_wakes_only_for_a_human_required_review_gate() {
+    let db = database().await;
+    // The default workflow's review gate is run by the reviewer Agent: the
+    // Project Agent has nothing to decide, so no attention and no wake.
+    let agent_reviewed =
+        serde_json::to_string(&default_workflow::default_workflow()).expect("serialize workflow");
+    assert!(
+        review_attention_rows(&db, &agent_reviewed).await.is_empty(),
+        "an agent-run review gate must not raise review_ready attention"
+    );
+    // The autonomous workflow's review gate is a user decision.
+    let human_reviewed =
+        serde_json::to_string(&default_autonomous_workflow::default_autonomous_workflow())
+            .expect("serialize workflow");
+    assert_eq!(
+        review_attention_rows(&db, &human_reviewed).await,
+        vec!["review_ready".to_owned()],
+        "a human-required review gate must raise exactly one review_ready attention"
+    );
 }

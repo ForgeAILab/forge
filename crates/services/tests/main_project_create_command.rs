@@ -1460,9 +1460,6 @@ impl executors::TaskExecutor for UnreachableExecutor {
     }
 }
 
-/// The exact message the runner returns when the Project turn's handoff
-/// cannot be authenticated against current server truth.
-const HANDOFF_REJECTED: &str = "Project Agent turn has no exact consumed Charter handoff";
 /// The message that proves the turn got all the way past handoff
 /// authentication and reached backend dispatch. The Project Agent Profile in
 /// this test pairs the `cli` backend with the `embedded` executor, which the
@@ -1470,15 +1467,15 @@ const HANDOFF_REJECTED: &str = "Project Agent turn has no exact consumed Charter
 /// deterministic outcome and never needs a live provider.
 const HANDOFF_ACCEPTED: &str = "selected executor cannot run a legacy CLI Agent Chat turn";
 
-/// `HAND-04` — one end-to-end Project-Agent turn per mismatch case.
+/// `HAND-04` / `HAND-05` — one end-to-end Project-Agent turn per historical
+/// source drift case.
 ///
 /// Every case below runs the real `FederatedAgentChatTurnRunner` against a
 /// real server-issued handoff produced by the atomic Project-create command,
-/// so the whole consumption path is exercised: the authenticated candidate
-/// query, the Genesis/Main provenance checks, the durable creation
-/// authorization event, and the packet validator. The control case proves the
-/// exact packet is accepted; each drift case proves the same packet stops
-/// being consumable the moment current server truth no longer matches it.
+/// so the receipt/current-authority consumption path is exercised. The
+/// control case proves the exact packet is accepted; the other cases prove a
+/// later turn does not re-walk mutable Main identity, Project display name, or
+/// Genesis lifecycle after that packet was admitted atomically.
 ///
 /// Forged-packet cases (a tampered digest, a cross-Project id, a rewritten
 /// authorization envelope) are deliberately *not* reproduced here by editing a
@@ -1489,17 +1486,16 @@ const HANDOFF_ACCEPTED: &str = "selected executor cannot run a legacy CLI Agent 
 /// are covered field-by-field by the validator matrix in
 /// `services::agent_chat_turn_worker`.
 #[tokio::test]
-async fn project_turn_consumes_only_the_exact_handoff_for_every_mismatch_case() {
+async fn project_turn_uses_issued_handoff_without_rewalking_mutable_main_history() {
     #[derive(Clone, Copy)]
     enum Case {
         /// The exact server-issued packet against unchanged server truth.
         Matching,
-        /// The Main author identity is no longer owned by the Project account,
-        /// so no authenticated handoff candidate remains.
+        /// Main ownership changed after the immutable Project admission.
         UnauthenticatedSourceAuthor,
-        /// The Project was renamed after the packet froze its identity.
+        /// The Project display name changed after admission.
         ProjectIdentityDrift,
-        /// The Genesis session is no longer the handed-off source of record.
+        /// The historical Genesis lifecycle changed after admission.
         StaleGenesisProvenance,
     }
 
@@ -1508,17 +1504,17 @@ async fn project_turn_consumes_only_the_exact_handoff_for_every_mismatch_case() 
         (
             Case::UnauthenticatedSourceAuthor,
             "unauthenticated source author",
-            HANDOFF_REJECTED,
+            HANDOFF_ACCEPTED,
         ),
         (
             Case::ProjectIdentityDrift,
             "project identity drift",
-            HANDOFF_REJECTED,
+            HANDOFF_ACCEPTED,
         ),
         (
             Case::StaleGenesisProvenance,
             "stale Genesis provenance",
-            "Project handoff Product Genesis/Main provenance is stale or mismatched",
+            HANDOFF_ACCEPTED,
         ),
     ] {
         let db = database().await;
@@ -1579,11 +1575,5 @@ async fn project_turn_consumes_only_the_exact_handoff_for_every_mismatch_case() 
             message.contains(expected),
             "{label}: expected {expected:?}, got {message:?}"
         );
-        if !matches!(case, Case::Matching) {
-            assert!(
-                !message.contains(HANDOFF_ACCEPTED),
-                "{label}: a drifted handoff must never reach backend dispatch, got {message:?}"
-            );
-        }
     }
 }

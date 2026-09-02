@@ -37,12 +37,12 @@ use forge_agent_host::{
     MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READINESS_OPERATION, MAIN_CHARTER_READ_OPERATION,
     MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION, MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
     MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
-    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
-    PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION,
-    PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION,
-    PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION,
-    TASK_EVIDENCE_OPERATION, TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION,
-    TASK_WORKLOG_OPERATION,
+    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CHARTER_READ_OPERATION,
+    PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
+    PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
+    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_SKILL_SECTION_OPERATION,
+    PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_EVIDENCE_OPERATION,
+    TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION,
 };
 use reqwest::header::ACCEPT;
 use serde::Deserialize;
@@ -554,7 +554,7 @@ impl CoordinationToolProvider {
             .and_then(Value::as_str)
             .filter(|value| matches!(*value, "progress" | "decision" | "validation" | "blocker"))
             .ok_or_else(|| {
-                AgentHostError::Runtime(
+                invalid_arguments(
                     "kind must be progress, decision, validation, or blocker".to_owned(),
                 )
             })?
@@ -564,9 +564,9 @@ impl CoordinationToolProvider {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| AgentHostError::Runtime("summary is required".to_owned()))?;
+            .ok_or_else(|| invalid_arguments("summary is required".to_owned()))?;
         if summary.chars().count() > MAX_WORKLOG_SUMMARY_CHARS {
-            return Err(AgentHostError::Runtime(format!(
+            return Err(invalid_arguments(format!(
                 "summary exceeds the {MAX_WORKLOG_SUMMARY_CHARS} character worklog limit"
             )));
         }
@@ -642,7 +642,7 @@ impl CoordinationToolProvider {
                 )
             })
             .ok_or_else(|| {
-                AgentHostError::Runtime(
+                invalid_arguments(
                     "kind must be screenshot, walkthrough_video, log, report, or other".to_owned(),
                 )
             })?
@@ -653,7 +653,7 @@ impl CoordinationToolProvider {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
-                AgentHostError::Runtime("caption describing the artifact is required".to_owned())
+                invalid_arguments("caption describing the artifact is required".to_owned())
             })?
             .to_owned();
         let path = payload
@@ -688,24 +688,22 @@ impl CoordinationToolProvider {
                 "text/plain".to_owned(),
             ),
             (Some(_), Some(_)) => {
-                return Err(AgentHostError::Runtime(
+                return Err(invalid_arguments(
                     "supply either path or content, not both".to_owned(),
                 ));
             }
             (None, None) => {
-                return Err(AgentHostError::Runtime(
+                return Err(invalid_arguments(
                     "evidence capture requires either a workspace path or inline content"
                         .to_owned(),
                 ));
             }
         };
         if bytes.is_empty() {
-            return Err(AgentHostError::Runtime(
-                "captured artifact is empty".to_owned(),
-            ));
+            return Err(invalid_arguments("captured artifact is empty".to_owned()));
         }
         if bytes.len() as i64 > MAX_CAPTURED_EVIDENCE_BYTES {
-            return Err(AgentHostError::Runtime(format!(
+            return Err(invalid_arguments(format!(
                 "captured artifact exceeds the {MAX_CAPTURED_EVIDENCE_BYTES} byte capture limit"
             )));
         }
@@ -799,6 +797,239 @@ impl CoordinationToolProvider {
                     "this Task has no active workspace to capture an artifact from".to_owned(),
                 )
             })
+    }
+
+    /// The Project Agent's own verification workspace root (`forge/` plus the
+    /// disposable `checkout/`), as persisted on its `project_verify` scope.
+    async fn project_verify_workspace_root(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+    ) -> Result<PathBuf, AgentHostError> {
+        let path: Option<String> = sqlx::query_scalar(
+            "SELECT workspace_path FROM agent_context_scope
+             WHERE identity_id = ? AND scope_type = ? AND scope_id = ?
+               AND workspace_access = 'project_verify'
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(actor_identity_id)
+        .bind(scope_type_name(scope.scope_type))
+        .bind(&scope.scope_id)
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+        path.filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                AgentHostError::Runtime(
+                    "this session has no Project verification workspace to capture an artifact \
+                     from; pass the artifact text inline as `content` instead"
+                        .to_owned(),
+                )
+            })
+    }
+
+    /// Store an artifact the Project Agent's own verification run produced as
+    /// a Project media asset, and rewrite the `capture` payload into the
+    /// equivalent bounded `attach`. This is the Project-scope sibling of
+    /// `task.evidence`: a Task run captures what its own execution did, while
+    /// this path captures what the Agent itself observed in its workspace.
+    async fn capture_project_evidence_asset(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        payload: Value,
+        arguments: &Value,
+    ) -> Result<Value, AgentHostError> {
+        let project_id = self
+            .authorization
+            .project_orchestration_target(actor_identity_id, scope)
+            .await
+            .map_err(native_scope_error)?;
+        let kind = payload
+            .get("kind")
+            .and_then(Value::as_str)
+            .filter(|value| {
+                matches!(
+                    *value,
+                    "screenshot" | "walkthrough_video" | "log" | "report" | "other"
+                )
+            })
+            .ok_or_else(|| {
+                invalid_arguments(
+                    "kind must be screenshot, walkthrough_video, log, report, or other".to_owned(),
+                )
+            })?
+            .to_owned();
+        if payload
+            .get("asset_id")
+            .is_some_and(|value| !value.is_null())
+            || payload
+                .get("checksum")
+                .is_some_and(|value| !value.is_null())
+        {
+            return Err(invalid_arguments(
+                "capture creates the asset itself; asset_id and checksum belong to attach"
+                    .to_owned(),
+            ));
+        }
+        let path = payload
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let content = payload
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty());
+        // One source of bytes, never both: a caller supplying each would leave
+        // the stored artifact ambiguous about what was actually observed.
+        let (bytes, default_name, content_type) = match (path, content) {
+            (Some(path), None) => {
+                let root = self
+                    .project_verify_workspace_root(actor_identity_id, scope)
+                    .await?;
+                let resolved = resolve_workspace_artifact(&root, path)?;
+                let bytes = std::fs::read(&resolved).map_err(|error| {
+                    AgentHostError::Runtime(format!("captured artifact is unreadable: {error}"))
+                })?;
+                let name = resolved
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("artifact")
+                    .to_owned();
+                // The Project media store accepts a closed content-type set;
+                // structured-text and unknown captures are stored as plain
+                // text rather than refused after the bytes were read.
+                let content_type = match content_type_for(&name, &kind).as_str() {
+                    "application/json" | "application/octet-stream" => "text/plain".to_owned(),
+                    other => other.to_owned(),
+                };
+                (bytes, name, content_type)
+            }
+            (None, Some(content)) => (
+                content.as_bytes().to_vec(),
+                format!("{kind}.txt"),
+                "text/plain".to_owned(),
+            ),
+            (Some(_), Some(_)) => {
+                return Err(invalid_arguments(
+                    "supply either path or content, not both".to_owned(),
+                ));
+            }
+            (None, None) => {
+                return Err(invalid_arguments(
+                    "evidence capture requires either a workspace path or inline content"
+                        .to_owned(),
+                ));
+            }
+        };
+        if bytes.is_empty() {
+            return Err(invalid_arguments("captured artifact is empty".to_owned()));
+        }
+        if bytes.len() as i64 > MAX_CAPTURED_EVIDENCE_BYTES {
+            return Err(invalid_arguments(format!(
+                "captured artifact exceeds the {MAX_CAPTURED_EVIDENCE_BYTES} byte capture limit"
+            )));
+        }
+        let filename = payload
+            .get("filename")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && !value.contains('/') && !value.contains('\\'))
+            .map_or(default_name, str::to_owned);
+        let media_root = self.media_root_handle().ok_or_else(|| {
+            AgentHostError::Configuration("media storage is not configured".to_owned())
+        })?;
+        let project_version: Option<i64> =
+            sqlx::query_scalar("SELECT version FROM project WHERE id = ?")
+                .bind(&project_id)
+                .fetch_optional(self.db.pool())
+                .await
+                .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+        let project_version = project_version.ok_or_else(|| {
+            AgentHostError::Runtime("the bound Project no longer exists".to_owned())
+        })?;
+        let dedupe_key = required_argument(arguments, "dedupe_key")?;
+        let correlation_id = required_argument(arguments, "correlation_id")?;
+        let byte_size = bytes.len() as i64;
+        let checksum = hex::encode(Sha256::digest(&bytes));
+        let asset_id = db::new_uuid_v4();
+        // The storage key matches the user upload route so one GC/tombstone
+        // path covers every Project media asset.
+        let storage_key = format!("projects/{project_id}/{asset_id}__{filename}");
+        let destination = safe_media_destination(&media_root, &storage_key)?;
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                AgentHostError::Runtime(format!("media storage is unavailable: {error}"))
+            })?;
+        }
+        std::fs::write(&destination, &bytes).map_err(|error| {
+            AgentHostError::Runtime(format!("captured artifact could not be stored: {error}"))
+        })?;
+        let mutation_fingerprint = hex::encode(Sha256::digest(
+            json!({
+                "operation": "project.evidence.capture",
+                "project_id": project_id,
+                "filename": filename,
+                "byte_size": byte_size,
+                "checksum": checksum,
+            })
+            .to_string()
+            .as_bytes(),
+        ));
+        let created = db::SharedMediaRepo::create_project_media_asset(
+            &*self.db,
+            db::CreateProjectMediaAsset {
+                id: asset_id.clone(),
+                project_id: project_id.clone(),
+                display_filename: filename,
+                content_type,
+                byte_size,
+                storage_key,
+                checksum: checksum.clone(),
+                idempotency_key: format!("agent-evidence-capture:{dedupe_key}"),
+                mutation_fingerprint,
+                expected_project_version: project_version,
+                actor_type: "agent".to_owned(),
+                actor_id: Some(actor_identity_id.to_owned()),
+                authorization_event_id: correlation_id,
+                created_at: db::now_rfc3339(),
+            },
+        )
+        .await;
+        let created = match created {
+            Ok(asset) => asset,
+            Err(error) => {
+                let _ = std::fs::remove_file(&destination);
+                return Err(AgentHostError::Runtime(error.to_string()));
+            }
+        };
+        if created.id != asset_id {
+            // Idempotent replay returned the already-stored asset; the bytes
+            // written above belong to no row.
+            let _ = std::fs::remove_file(&destination);
+        }
+        // Creation leaves the asset quarantined until its bytes are in place
+        // (the user upload flow stages first). Capture wrote the final bytes
+        // above, so promote to available now — the attach command refuses a
+        // quarantined asset. Finalize is idempotent on replay.
+        db::SharedMediaRepo::finalize_project_media_upload(
+            &*self.db,
+            &project_id,
+            &created.id,
+            &db::now_rfc3339(),
+        )
+        .await
+        .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+        let mut object = payload.as_object().cloned().unwrap_or_default();
+        object.insert("action".to_owned(), json!("attach"));
+        object.insert("asset_id".to_owned(), json!(created.id));
+        object.insert("checksum".to_owned(), json!(checksum));
+        object.remove("content");
+        object.remove("path");
+        object.remove("filename");
+        Ok(Value::Object(object))
     }
 
     /// Return what Task runs actually reported: worklog entries with the
@@ -911,6 +1142,80 @@ impl CoordinationToolProvider {
                 }))
                 .collect::<Vec<_>>(),
             "artifacts": artifacts,
+        }))
+    }
+
+    async fn project_charter_read(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+    ) -> Result<Value, AgentHostError> {
+        let project_id = self
+            .authorization
+            .project_orchestration_target(actor_identity_id, scope)
+            .await
+            .map_err(native_scope_error)?;
+        let row = sqlx::query(
+            "SELECT c.id AS charter_id, c.project_mode, c.version AS charter_version,
+                    r.id AS revision_id, r.revision, r.content_digest, r.rendered_digest,
+                    r.rendered_view
+             FROM project_charter AS c
+             JOIN project_charter_revision AS r
+               ON r.id = c.current_approved_revision_id AND r.lifecycle = 'approved'
+             WHERE c.project_id = ?",
+        )
+        .bind(&project_id)
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(|_| AgentHostError::ProtectedPersistence)?
+        .ok_or_else(|| {
+            AgentHostError::Authority("the bound Project has no approved Charter".to_owned())
+        })?;
+        Ok(json!({
+            "scope": {"type": "project", "id": project_id},
+            "charter_id": row.try_get::<String, _>("charter_id").unwrap_or_default(),
+            "revision_id": row.try_get::<String, _>("revision_id").unwrap_or_default(),
+            "revision": row.try_get::<i64, _>("revision").unwrap_or_default(),
+            "charter_version": row.try_get::<i64, _>("charter_version").unwrap_or_default(),
+            "project_mode": row.try_get::<String, _>("project_mode").unwrap_or_default(),
+            "content_digest": row.try_get::<String, _>("content_digest").unwrap_or_default(),
+            "render_digest": row.try_get::<String, _>("rendered_digest").unwrap_or_default(),
+            "rendered_markdown": row.try_get::<String, _>("rendered_view").unwrap_or_default(),
+        }))
+    }
+
+    async fn project_skill_section_read(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        arguments: Value,
+    ) -> Result<Value, AgentHostError> {
+        // Doctrine text is static server-owned content, but the read still
+        // authenticates the Project binding so the operation cannot become an
+        // unauthorized liveness probe for foreign scopes.
+        let _project_id = self
+            .authorization
+            .project_orchestration_target(actor_identity_id, scope)
+            .await
+            .map_err(native_scope_error)?;
+        let section = arguments
+            .get("section")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let body = crate::operating_skills::project_skill_section(section).ok_or_else(|| {
+            AgentHostError::Unsupported(format!(
+                "unknown doctrine section `{section}`; sections: {}",
+                crate::operating_skills::PROJECT_SKILL_SECTIONS
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+        Ok(json!({
+            "skill_key": crate::operating_skills::PROJECT_OPERATING_SKILL_KEY,
+            "section": section,
+            "content": body,
         }))
     }
 
@@ -1245,6 +1550,19 @@ impl CoordinationToolProvider {
                 .execute_task_evidence_capture(actor_identity_id, scope, &payload)
                 .await;
         }
+        // `project.evidence` capture stores the artifact the Project Agent's
+        // own verification run produced as a Project media asset, then
+        // continues as the bounded attach it now is. The asset exists before
+        // the attach command runs; an attach failure leaves an unreferenced
+        // Project asset for media GC, never a dangling attachment.
+        let payload = if operation == PROJECT_EVIDENCE_OPERATION
+            && payload.get("action").and_then(Value::as_str) == Some("capture")
+        {
+            self.capture_project_evidence_asset(actor_identity_id, scope, payload, &arguments)
+                .await?
+        } else {
+            payload
+        };
         if classification == OperationClassification::DirectCommand {
             let requested_permission = descriptor.required_permission.ok_or_else(|| {
                 AgentHostError::Authority(
@@ -1567,14 +1885,14 @@ impl CoordinationToolProvider {
                 .get("task_id")
                 .and_then(Value::as_str)
                 .map(str::to_owned)
-                .ok_or_else(|| AgentHostError::Runtime("task_id is required".to_owned()))?;
+                .ok_or_else(|| invalid_arguments("task_id is required".to_owned()))?;
             let reason = payload
                 .get("reason")
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| {
-                    AgentHostError::Runtime(
+                    invalid_arguments(
                         "state what stopped this Task before recovering it".to_owned(),
                     )
                 })?
@@ -1584,10 +1902,11 @@ impl CoordinationToolProvider {
                 Some("reexecute") => api_types::RecoveryAction::Reexecute,
                 Some("reset_to_initial") => api_types::RecoveryAction::ResetToInitial,
                 Some("reset_retry_window") => api_types::RecoveryAction::ResetRetryWindow,
+                Some("cancel_task") => api_types::RecoveryAction::CancelTask,
                 _ => {
-                    return Err(AgentHostError::Runtime(
-                        "action must be resume_session, reexecute, reset_to_initial, or \
-                         reset_retry_window"
+                    return Err(invalid_arguments(
+                        "action must be resume_session, reexecute, reset_to_initial, \
+                         reset_retry_window, or cancel_task"
                             .to_owned(),
                     ));
                 }
@@ -2612,6 +2931,13 @@ impl ForgeToolProvider for CoordinationToolProvider {
                 self.project_observations_read(actor_identity_id, scope, arguments)
                     .await
             }
+            PROJECT_CHARTER_READ_OPERATION => {
+                self.project_charter_read(actor_identity_id, scope).await
+            }
+            PROJECT_SKILL_SECTION_OPERATION => {
+                self.project_skill_section_read(actor_identity_id, scope, arguments)
+                    .await
+            }
             "memory.read" => {
                 self.memory_read(actor_identity_id, scope, arguments, false)
                     .await
@@ -3247,6 +3573,25 @@ fn native_scope_error(error: crate::ServiceError) -> AgentHostError {
     }
 }
 
+/// An argument-shape rejection is the model's only path to a corrected call,
+/// so it travels back verbatim as a structured validation outcome with a
+/// `correct_input` retry. Raising it as a bare `Runtime` error renders as
+/// "the Forge operation could not complete" — an internal failure the model
+/// cannot act on, so it retries the same rejected shape or gives up on a
+/// repair its doctrine requires. Only server-authored messages naming the
+/// offending field belong here; never echo caller-supplied values.
+fn invalid_arguments(message: String) -> AgentHostError {
+    let mut outcome = OrchestrationOutcome::failed(
+        OutcomeCode::ValidationError,
+        "unknown",
+        OutcomeScopeRef::new(OutcomeScopeType::Account, ""),
+        "",
+        format!("the operation or arguments are not valid for this Forge surface ({message})"),
+    );
+    outcome.retry = Some(RetryInstruction::new(RetryAction::CorrectInput, false));
+    AgentHostError::StructuredOutcome(Box::new(outcome))
+}
+
 fn service_error(error: crate::ServiceError) -> AgentHostError {
     // A validation reason from the command boundary names the offending
     // input, so it returns to the model verbatim. Collapsing it to a bare
@@ -3255,15 +3600,7 @@ fn service_error(error: crate::ServiceError) -> AgentHostError {
     if let crate::ServiceError::InvalidOperation { message }
     | crate::ServiceError::TerminalInvalidInput { message } = &error
     {
-        let mut outcome = OrchestrationOutcome::failed(
-            OutcomeCode::ValidationError,
-            "unknown",
-            OutcomeScopeRef::new(OutcomeScopeType::Account, ""),
-            "",
-            format!("the operation or arguments are not valid for this Forge surface ({message})"),
-        );
-        outcome.retry = Some(RetryInstruction::new(RetryAction::CorrectInput, false));
-        return AgentHostError::StructuredOutcome(Box::new(outcome));
+        return invalid_arguments(message.clone());
     }
     // A conflict's prose is the only account of what the caller got wrong, so
     // it is shown. It stays unstructured on purpose: read it, never parse it
@@ -3556,6 +3893,32 @@ fn content_type_for(filename: &str, kind: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn argument_shape_rejections_are_correctable_validation_outcomes() {
+        // A Project Agent that sends `task.recover` with an unknown action
+        // must learn which field to fix; an opaque internal failure leaves it
+        // retrying the same shape or abandoning a repair its doctrine requires.
+        let error = invalid_arguments(
+            "action must be resume_session, reexecute, reset_to_initial, reset_retry_window, \
+             or cancel_task"
+                .to_owned(),
+        );
+        match error {
+            AgentHostError::StructuredOutcome(outcome) => {
+                assert_eq!(outcome.code, OutcomeCode::ValidationError);
+                assert_eq!(outcome.status, OutcomeStatus::Failed);
+                assert!(outcome
+                    .safe_message
+                    .contains("action must be resume_session"));
+                assert_eq!(
+                    outcome.retry.as_ref().map(|retry| retry.action),
+                    Some(RetryAction::CorrectInput)
+                );
+            }
+            other => panic!("argument rejections must be structured, got {other:?}"),
+        }
+    }
 
     #[test]
     fn generic_conflicts_are_typed_and_keep_the_actionable_reason() {

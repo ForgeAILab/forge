@@ -386,37 +386,81 @@ describe('ProjectOverviewPage', () => {
     )
   })
 
-  it('keeps Tasks and Project Agent Chat usable when Charter adoption is required', () => {
+  const charterAdoptionAction = {
+    code: 'charter_adoption',
+    required_principal: 'user',
+    target_type: 'project',
+    target_id: 'project-1',
+    title: 'Ask the Project Agent to prepare an adoption Charter.',
+    explanation: 'An approved Charter is required before Project work can be governed.',
+    action_kind: 'approval',
+    route_or_operation: 'project.charter.adoption',
+    blocking: true,
+    expected_version: 1n,
+  } as const
+
+  it('tracks Tasks and Project Agent setup, and hides empty Charter panels, before adoption', () => {
     mockQuery({
       data: {
         ...overview,
         charter_state: 'charter_setup_required',
         active_milestones: [],
-        next_action: {
-          code: 'charter_adoption',
-          required_principal: 'user',
-          target_type: 'project',
-          target_id: 'project-1',
-          title: 'Ask the Project Agent to prepare an adoption Charter.',
-          explanation: 'An approved Charter is required before Project work can be governed.',
-          action_kind: 'approval',
-          route_or_operation: 'project.charter.adoption',
-          blocking: true,
-          expected_version: 1n,
+        primary_milestone_id: null,
+        check_summary: {
+          required_total: 0n,
+          passed: 0n,
+          failed: 0n,
+          missing: 0n,
+          stale: 0n,
+          waived: 0n,
+          unavailable: 0n,
         },
+        pending_decisions: [],
+        risks: [],
+        document_freshness: [],
+        next_action: charterAdoptionAction,
       },
     })
 
     render(<ProjectOverviewPage projectId="project-1" />)
 
+    // Charter setup is the whole message; the empty panels that only an
+    // approved Charter could fill are gone rather than shown as placeholders.
     expect(screen.getByText('Charter adoption is required before release')).toBeTruthy()
-    expect(screen.getByText('No active milestone is defined yet.')).toBeTruthy()
+    expect(screen.queryByText('No active milestone is defined yet.')).toBeNull()
+    expect(screen.queryByText('Validation')).toBeNull()
+    expect(screen.queryByText('Document freshness')).toBeNull()
+    expect(screen.queryByText('Release history')).toBeNull()
+    // The adoption banner already renders the action; the Next action card
+    // must not restate it.
+    expect(screen.queryByText('Next action')).toBeNull()
+    expect(screen.queryByText(/Primary milestone ID/)).toBeNull()
+
+    // What remains is Task progress and the setup the Project still needs.
+    expect(screen.getByText('Task progress')).toBeTruthy()
     expect(screen.getByRole('link', { name: /View Tasks/ }).getAttribute('href')).toContain(
       '/projects/project-1/tasks',
     )
-    expect(
-      screen.getAllByRole('link', { name: /Continue with Project Agent/ }).length,
-    ).toBeGreaterThan(0)
+    expect(screen.getAllByRole('link', { name: /Project Agent Chat/ }).length).toBeGreaterThan(0)
+  })
+
+  it('keeps real records visible before adoption instead of hiding them as Charter panels', () => {
+    mockQuery({
+      data: {
+        ...overview,
+        charter_state: 'charter_setup_required',
+        active_milestones: [],
+        next_action: charterAdoptionAction,
+      },
+    })
+
+    render(<ProjectOverviewPage projectId="project-1" />)
+
+    // `overview` carries a real risk, pending decision, and Document row: a
+    // Project without a Charter still has to show the records it does have.
+    expect(screen.getByText('Evidence may become stale.')).toBeTruthy()
+    expect(screen.getByText('Document freshness')).toBeTruthy()
+    expect(screen.getByText('Validation')).toBeTruthy()
   })
 
   it('routes release history to the authenticated immutable snapshot view', () => {
@@ -458,7 +502,10 @@ describe('ProjectOverviewPage', () => {
       'overflow-x-auto',
     )
     expect(mediaFetch).toHaveBeenCalledWith('/projects/project-1/media/asset-1')
-    expect(screen.getByRole('link', { name: /Open video/ }).getAttribute('href')).toBe(
+    fireEvent.click(screen.getByRole('button', { name: /Preview video/ }))
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByLabelText('Project walkthrough preview').tagName).toBe('VIDEO')
+    expect(within(dialog).getByRole('link', { name: /Open in new tab/ }).getAttribute('href')).toBe(
       'blob:evidence-preview',
     )
     rendered.unmount()
@@ -479,12 +526,18 @@ describe('ProjectOverviewPage', () => {
 
     render(<ProjectOverviewPage projectId="project-1" />)
 
-    expect(await screen.findByRole('link', { name: /Open evidence file/ })).toBeTruthy()
+    fireEvent.click(await screen.findByRole('button', { name: /Preview evidence file/ }))
     expect(mediaFetch).toHaveBeenCalledWith('/projects/project-1/media/asset-report')
     expect(
       screen.getByText(/Task task-1 · validation validation-1 · uploaded by Test User/),
     ).toBeTruthy()
-    expect(screen.getByRole('link', { name: 'Download' }).getAttribute('href')).toBe(
+    // The modal comes first; opening in a new tab and downloading live inside it.
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText(/No inline preview for this file type/)).toBeTruthy()
+    expect(within(dialog).getByRole('link', { name: /Open in new tab/ }).getAttribute('href')).toBe(
+      'blob:evidence-preview',
+    )
+    expect(within(dialog).getByRole('link', { name: 'Download' }).getAttribute('href')).toBe(
       'blob:evidence-preview',
     )
   })

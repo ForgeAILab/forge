@@ -304,20 +304,6 @@ async fn chat_turn_fixture() -> ChatTurnFixture {
         })
         .await
         .unwrap();
-    sqlx::query(
-        "UPDATE project_agent_binding
-         SET operating_skill_revision_id = (
-                 SELECT id FROM operating_skill_revision
-                 WHERE skill_key = 'forge.project.orchestration/v1'
-                 ORDER BY revision DESC LIMIT 1
-             ),
-             policy_revision = 'test-policy', policy_digest = 'test-policy-digest'
-         WHERE project_id = ? AND state = 'active'",
-    )
-    .bind(&project_id)
-    .execute(db.pool())
-    .await
-    .unwrap();
     let chat_id = AgentChatRepo::get_project_chat(&*db, &project_id)
         .await
         .unwrap()

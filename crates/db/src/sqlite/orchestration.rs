@@ -1085,6 +1085,10 @@ fn map_release(row: SqliteRow) -> Result<ProjectReleaseRecord> {
         waivers_json: required_string(&row, "waivers_json")?,
         releasing_principal_type: required_string(&row, "releasing_principal_type")?,
         releasing_principal_id: required_string(&row, "releasing_principal_id")?,
+        releasing_principal_display_name: optional_string(
+            &row,
+            "releasing_principal_display_name",
+        )?,
         authorization_basis: required_string(&row, "authorization_basis")?,
         authorization_action: required_string(&row, "authorization_action")?,
         authorization_occurred_at: required_string(&row, "authorization_occurred_at")?,
@@ -1714,13 +1718,13 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .await
     }
 
-    async fn get_project_adoption_charter(
+    async fn get_project_charter_by_project_id(
         &self,
         project_id: &str,
     ) -> Result<Option<ProjectCharterRecord>> {
         select_one(
             "SELECT * FROM project_charter
-             WHERE project_id = ? AND genesis_session_id IS NULL",
+             WHERE project_id = ?",
             self.pool(),
             project_id,
             map_charter,
@@ -3618,7 +3622,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
                  SET identity_id = ?, profile_id = ?, state = 'active',
                      permission_ceiling_json = ?,
                      operating_skill_revision_id = ?, policy_revision = ?, policy_digest = ?,
-                     charter_id = ?, charter_revision_id = ?, charter_setup_required = 0,
+                     charter_id = ?, charter_revision_id = ?, charter_setup_required = 1,
                      version = version + 1, updated_at = ?
                  WHERE id = ? AND project_id = ?
                    AND state = 'agent_setup_required' AND version = ?",
@@ -3680,7 +3684,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
                     charter_id, charter_revision_id, charter_setup_required,
                     created_at, updated_at
                  ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, NULL, NULL,
-                           ?, ?, ?, ?, ?, 0, ?, ?)",
+                           ?, ?, ?, ?, ?, 1, ?, ?)",
             )
             .bind(&replacement_id)
             .bind(&input.project_id)
@@ -3967,6 +3971,57 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .execute(&mut *tx)
         .await
         .map_err(orchestration_write_error)?;
+
+        let admission_receipt_id = if expected_approval_type == "adoption" {
+            let receipt_id = new_uuid_v4();
+            sqlx::query(
+                "INSERT INTO project_admission_receipt (
+                    id, project_id, source_kind, handoff_id,
+                    initial_charter_approval_id, initial_charter_id,
+                    initial_charter_revision_id, payload_digest,
+                    validation_schema_version, validated_at, created_at
+                 ) VALUES (?, ?, 'charter_adoption', NULL, ?, ?, ?, ?,
+                           'forge.project-admission/v1', ?, ?)",
+            )
+            .bind(&receipt_id)
+            .bind(&input.project_id)
+            .bind(&approval.id)
+            .bind(&approval.charter_id)
+            .bind(&approval.revision_id)
+            .bind(&approval.content_digest)
+            .bind(&approval.updated_at)
+            .bind(&approval.updated_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(orchestration_write_error)?;
+            receipt_id
+        } else {
+            sqlx::query_scalar::<_, String>(
+                "SELECT id FROM project_admission_receipt
+                 WHERE project_id = ? LIMIT 1",
+            )
+            .bind(&input.project_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(DbError::VersionConflict)?
+        };
+        let completed_binding = sqlx::query(
+            "UPDATE project_agent_binding
+             SET admission_receipt_id = ?, charter_approval_id = ?,
+                 charter_setup_required = 0
+             WHERE id = ? AND project_id = ? AND state = 'active'
+               AND charter_setup_required = 1",
+        )
+        .bind(&admission_receipt_id)
+        .bind(&approval.id)
+        .bind(&project_agent_binding_id)
+        .bind(&input.project_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(orchestration_write_error)?;
+        if completed_binding.rows_affected() != 1 {
+            return Err(DbError::VersionConflict);
+        }
 
         finalize_command_in_tx(
             self,
@@ -7766,6 +7821,8 @@ impl ProjectOrchestrationRepo for SqliteDb {
                 || existing.waivers_json != input.waivers_json
                 || existing.releasing_principal_type != input.releasing_principal_type
                 || existing.releasing_principal_id != input.releasing_principal_id
+                || existing.releasing_principal_display_name
+                    != input.releasing_principal_display_name
                 || existing.authorization_basis != input.authorization_basis
                 || existing.authorization_action != input.authorization_action
                 || existing.authorization_occurred_at != input.authorization_occurred_at
@@ -7866,13 +7923,14 @@ impl ProjectOrchestrationRepo for SqliteDb {
                 charter_revision_id, document_revisions_json, decision_ids_json,
                 task_references_json, validation_references_json, git_references_json,
                 evidence_references_json, waivers_json, releasing_principal_type,
-                releasing_principal_id, authorization_basis, authorization_action,
+                releasing_principal_id, releasing_principal_display_name,
+                authorization_basis, authorization_action,
                 authorization_occurred_at, explicit_event, schema_version,
                 snapshot_digest, idempotency_key, created_at
              ) VALUES (
                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
              )",
         )
         .bind(&input.id)
@@ -7897,6 +7955,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .bind(&input.waivers_json)
         .bind(&input.releasing_principal_type)
         .bind(&input.releasing_principal_id)
+        .bind(input.releasing_principal_display_name.as_deref())
         .bind(&input.authorization_basis)
         .bind(&input.authorization_action)
         .bind(&input.authorization_occurred_at)
@@ -8071,12 +8130,13 @@ impl ProjectOrchestrationRepo for SqliteDb {
                 known_issues_json, charter_revision_id, document_revisions_json,
                 decision_ids_json, task_references_json, validation_references_json,
                 git_references_json, evidence_references_json, waivers_json,
-                releasing_principal_type, releasing_principal_id, authorization_basis,
+                releasing_principal_type, releasing_principal_id,
+                releasing_principal_display_name, authorization_basis,
                 authorization_action, authorization_occurred_at, explicit_event,
                 schema_version, snapshot_digest, idempotency_key, created_at
              ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
              )",
         )
         .bind(&input.id)
@@ -8101,6 +8161,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .bind(&input.waivers_json)
         .bind(&input.releasing_principal_type)
         .bind(&input.releasing_principal_id)
+        .bind(input.releasing_principal_display_name.as_deref())
         .bind(&input.authorization_basis)
         .bind(&input.authorization_action)
         .bind(&input.authorization_occurred_at)
@@ -8617,7 +8678,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
                         b.charter_id, b.charter_revision_id, c.status, b.state
                  FROM agent_chat c
                  JOIN project_agent_binding b ON b.project_id = c.project_id
-                   AND b.state = 'active'
+                   AND b.state IN ('active', 'replaced')
                  WHERE c.project_id = ? AND c.kind = 'project'
                    AND (? IS NULL OR c.id = ?) AND b.id = ?
                  LIMIT 1",
@@ -8637,7 +8698,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
                 .as_ref()
                 .is_some_and(|ids| project_chat_id != ids.2 || binding_id != ids.1)
                 || chat_status != "ready"
-                || binding_state != "active"
+                || !matches!(binding_state.as_str(), "active" | "replaced")
                 || binding_identity_id
                     != approval
                         .selected_identity_id
@@ -9122,7 +9183,10 @@ impl ProjectOrchestrationRepo for SqliteDb {
         )
         .bind(&input.project.id)
         .fetch_one(&mut *tx)
-        .await?;
+        .await
+        .map_err(|error| {
+            DbError::Check(format!("Project setup binding is unavailable: {error}"))
+        })?;
 
         let replaced_setup = sqlx::query(
             "UPDATE project_agent_binding
@@ -9146,7 +9210,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
                 charter_id, charter_revision_id, charter_setup_required,
                 created_at, updated_at
              ) VALUES (?, ?, ?, ?, 'active', '{}', ?, '[]', ?, 1, NULL,
-                       ?, ?, ?, ?, ?, 0, ?, ?)",
+                       ?, ?, ?, ?, ?, 1, ?, ?)",
         )
         .bind(&input.project_agent_binding_id)
         .bind(&input.project.id)
@@ -9208,7 +9272,10 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .bind(&input.project_agent_binding_id)
         .bind(&input.project.id)
         .fetch_one(&mut *tx)
-        .await?;
+        .await
+        .map_err(|error| {
+            DbError::Check(format!("Project target binding is unavailable: {error}"))
+        })?;
         let target_binding_version: i64 = target_binding.try_get("version")?;
         let target_binding_identity_id: Option<String> = target_binding.try_get("identity_id")?;
         let target_binding_profile_id: Option<String> = target_binding.try_get("profile_id")?;
@@ -9233,7 +9300,10 @@ impl ProjectOrchestrationRepo for SqliteDb {
         )
         .bind(&identity_id)
         .fetch_one(&mut *tx)
-        .await?;
+        .await
+        .map_err(|error| {
+            DbError::Check(format!("Project target identity is unavailable: {error}"))
+        })?;
         let target_identity_version: i64 = target_identity.try_get("version")?;
         let target_selected_profile_id: Option<String> =
             target_identity.try_get("selected_profile_id")?;
@@ -9248,7 +9318,10 @@ impl ProjectOrchestrationRepo for SqliteDb {
         )
         .bind(&profile_id)
         .fetch_one(&mut *tx)
-        .await?;
+        .await
+        .map_err(|error| {
+            DbError::Check(format!("Project target Profile is unavailable: {error}"))
+        })?;
         let target_profile_identity_id: String = target_profile.try_get("identity_id")?;
         let target_profile_version: i64 = target_profile.try_get("version")?;
         let target_tool_policy_json: String = target_profile.try_get("tool_policy_json")?;
@@ -9283,7 +9356,8 @@ impl ProjectOrchestrationRepo for SqliteDb {
             )
             .bind(source_turn_id)
             .fetch_one(&mut *tx)
-            .await?
+            .await
+            .map_err(|error| DbError::Check(format!("Main source turn is unavailable: {error}")))?
             .map(|json| {
                 serde_json::from_str::<serde_json::Value>(&json)
                     .map_err(|_| DbError::VersionConflict)
@@ -9404,7 +9478,6 @@ impl ProjectOrchestrationRepo for SqliteDb {
                     "description": format!("Authoritative evidence for: {description}"),
                     "required": true,
                     "evidence_kind": null,
-                    "check_definition_revision": milestone_revision_id.clone(),
                 }));
                 acceptance_check_rows.push((
                     check_id,
@@ -9558,7 +9631,10 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .bind(&input.project.updated_at)
         .bind(&project_chat_id)
         .fetch_one(&mut *tx)
-        .await?;
+        .await
+        .map_err(|error| {
+            DbError::Check(format!("Project Chat sequence is unavailable: {error}"))
+        })?;
         let source_value = serde_json::from_str::<serde_json::Value>(&input.source_revisions_json)
             .map_err(|_| {
                 DbError::Check("handoff source_revisions_json must be valid JSON".to_owned())
@@ -9568,6 +9644,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
                 "handoff source_revisions_json must be a JSON object".to_owned(),
             ));
         }
+        let handoff_payload_digest = handoff_request_fingerprint(&source_value, &input)?;
         let source_revisions_json: String = sqlx::query_scalar(
             "SELECT json_set(
                 ?,
@@ -9613,7 +9690,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .bind(input.source_turn_id.as_deref())
         .bind(&input.policy_revision)
         .bind(&input.policy_digest)
-        .bind(handoff_request_fingerprint(&source_value, &input)?)
+        .bind(&handoff_payload_digest)
         .bind(&input.source_revisions_json)
         .bind(&input.create_principal_type)
         .bind(&input.create_principal_id)
@@ -9623,7 +9700,10 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .bind(&input.create_occurred_at)
         .bind(&input.project.updated_at)
         .fetch_one(&mut *tx)
-        .await?;
+        .await
+        .map_err(|error| {
+            DbError::Check(format!("Project handoff packet cannot be frozen: {error}"))
+        })?;
         sqlx::query(
             "INSERT INTO agent_handoff (
                 id, source_chat_id, target_chat_id, source_message_id,
@@ -9879,6 +9959,46 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .execute(&mut *tx)
         .await
         .map_err(check_error)?;
+
+        let admission_receipt_id = new_uuid_v4();
+        sqlx::query(
+            "INSERT INTO project_admission_receipt (
+                id, project_id, source_kind, handoff_id,
+                initial_charter_approval_id, initial_charter_id,
+                initial_charter_revision_id, payload_digest,
+                validation_schema_version, validated_at, created_at
+             ) VALUES (?, ?, 'genesis_handoff', ?, ?, ?, ?, ?,
+                       'forge.project-admission/v1', ?, ?)",
+        )
+        .bind(&admission_receipt_id)
+        .bind(&input.project.id)
+        .bind(&input.handoff_id)
+        .bind(&approval.id)
+        .bind(&approval.charter_id)
+        .bind(&approval.revision_id)
+        .bind(&handoff_payload_digest)
+        .bind(&input.project.updated_at)
+        .bind(&input.project.updated_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(orchestration_write_error)?;
+        let completed_binding = sqlx::query(
+            "UPDATE project_agent_binding
+             SET admission_receipt_id = ?, charter_approval_id = ?,
+                 charter_setup_required = 0
+             WHERE id = ? AND project_id = ? AND state = 'active'
+               AND charter_setup_required = 1",
+        )
+        .bind(&admission_receipt_id)
+        .bind(&approval.id)
+        .bind(&input.project_agent_binding_id)
+        .bind(&input.project.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(orchestration_write_error)?;
+        if completed_binding.rows_affected() != 1 {
+            return Err(DbError::VersionConflict);
+        }
 
         let project_row = sqlx::query(&format!(
             "SELECT {PROJECT_COLUMNS} FROM project WHERE id = ?"

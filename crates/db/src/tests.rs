@@ -1408,6 +1408,14 @@ async fn test_list_agents_usable_in_project() {
                 permission_ceiling_json: "{}".to_owned(),
                 subscriptions_json: "[]".to_owned(),
                 wake_budget: 0,
+                operating_skill_revision_id: None,
+                policy_revision: "default".to_owned(),
+                policy_digest: String::new(),
+                charter_id: None,
+                charter_revision_id: None,
+                charter_setup_required: true,
+                admission_receipt_id: None,
+                charter_approval_id: None,
                 created_at: now.clone(),
                 updated_at: now,
             },
@@ -6678,7 +6686,7 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
             ),
             (
                 "forge.project.orchestration/v1".to_owned(),
-                "forge.project.orchestration/v1@10".to_owned(),
+                "forge.project.orchestration/v1@13".to_owned(),
             ),
         ],
         "a seeded operating-skill revision must be repointed in the same release (V081 regression)"
@@ -6686,25 +6694,22 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
     let (body, digest): (String, String) = sqlx::query_as(
         "SELECT canonical_body, content_digest
          FROM operating_skill_revision
-         WHERE id = 'forge.project.orchestration/v1@10'",
+         WHERE id = 'forge.project.orchestration/v1@13'",
     )
     .fetch_one(db.pool())
     .await
     .expect("latest Project operating skill reads");
+    // @11 keeps only the authority core and standing invariants resident; the
+    // detailed doctrine (documents, milestones, evidence, release) moved
+    // behind the `skill.section` read and is pinned by services-side tests.
     assert!(body.contains("Never invent aliases such as `ac-1`"));
-    assert!(body.contains("Evidence is mandatory proof, not optional decoration"));
-    assert!(body.contains("Never propose or narrate a release from a blocked"));
     assert!(body.contains("The approved Charter is the only implementation gate"));
-    assert!(body.contains("Any enabled configured Agent—including this Project Agent—may fill Worker or reviewer roles"));
-    // The completion trigger: finished Tasks are what makes the acceptance
-    // checks the remaining work, and settling them precedes readiness.
     assert!(body.contains("On a delivery follow-up wake"));
-    assert!(body.contains("that milestone's acceptance checks are the remaining work"));
-    // The chain that makes a recorded observation mean something: a run
-    // observes, an artifact is captured, the Agent cites the run.
-    assert!(body.contains("You have your own Project workspace"));
-    assert!(body.contains("`checkout/` is not how software gets built"));
-    assert!(body.contains("Evidence is per acceptance check, not per Task"));
+    assert!(body.contains("OPERATING DOCTRINE (on-demand skill sections)"));
+    assert!(body.contains("skill.section"));
+    assert!(body.contains("read `project.charter` and `project.current_state`"));
+    assert!(!body.contains("Evidence is mandatory proof, not optional decoration"));
+    assert!(!body.contains("MILESTONES AND EVIDENCE"));
     assert_eq!(hex::encode(Sha256::digest(body.as_bytes())), digest);
 }
 

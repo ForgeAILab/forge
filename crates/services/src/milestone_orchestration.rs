@@ -791,10 +791,7 @@ fn evaluate_evidence_requirements(
             continue;
         }
 
-        let expected_definition_revision_id = requirement
-            .check_definition_revision
-            .as_deref()
-            .unwrap_or(freshness.current_definition_revision_id);
+        let expected_definition_revision_id = freshness.current_definition_revision_id;
         let (fresh, stale): (Vec<_>, Vec<_>) = supporting.into_iter().partition(|attachment| {
             evidence_context_state(
                 attachment,
@@ -915,6 +912,17 @@ fn evidence_context_state(
         .as_deref()
         .or(attachment.task_id.as_deref());
     let Some(source_task_id) = source_task_id else {
+        // Validation-sourced evidence with no Task provenance is the Project
+        // Agent's own verification artifact. Its freshness IS the cited
+        // validation result: the guard above already returned Stale when that
+        // result is no longer among the current check results.
+        if attachment.source_validation_id.is_some()
+            && attachment.source_task_version.is_none()
+            && attachment.source_context_digest.is_none()
+            && attachment.source_run_id.is_none()
+        {
+            return EvidenceContextState::Fresh;
+        }
         return if attachment.source_task_version.is_none()
             && attachment.source_context_digest.is_none()
             && attachment.source_run_id.is_none()
@@ -1399,7 +1407,6 @@ mod tests {
                         description: "proof".to_owned(),
                         required: true,
                         evidence_kind: Some("screenshot".to_owned()),
-                        check_definition_revision: None,
                     }]
                 },
             ),
@@ -1860,6 +1867,35 @@ mod tests {
         assert_eq!(
             milestone_identity(0),
             Err(MilestoneOrchestrationError::InvalidMilestoneSequence { sequence: 0 })
+        );
+    }
+
+    #[test]
+    fn validation_sourced_evidence_without_task_provenance_is_fresh() {
+        // The Project Agent's own verification artifact: no Task refs, only
+        // the validation result it backs. Freshness follows that result.
+        let mut attachment = evidence("evidence-1", EvidenceAvailability::Available);
+        attachment.task_id = None;
+        attachment.source_task_id = None;
+        attachment.source_task_version = None;
+        attachment.source_context_digest = None;
+        attachment.source_run_id = None;
+        attachment.source_validation_id = Some("validation-1".to_owned());
+        let current = validation(
+            "validation-1",
+            "evidence-1",
+            AcceptanceCheckResultStatus::Pass,
+            "2026-08-13T00:00:00Z",
+        );
+        assert_eq!(
+            evidence_context_state(&attachment, "definition-1", &[], &[current], &[]),
+            EvidenceContextState::Fresh
+        );
+        // A cited validation that is no longer among the current check
+        // results stays stale exactly as before.
+        assert_eq!(
+            evidence_context_state(&attachment, "definition-1", &[], &[], &[]),
+            EvidenceContextState::Stale
         );
     }
 }

@@ -42,7 +42,8 @@ use crate::{
         MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION,
         MAIN_CHARTER_READINESS_OPERATION, MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
         OperationExposure, OperationSurface, PROJECT_CHARTER_ADOPTION_OPERATION,
-        PROJECT_CURRENT_STATE_OPERATION, PROJECT_OBSERVATIONS_OPERATION, TASK_EVIDENCE_OPERATION,
+        PROJECT_CURRENT_STATE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
+        PROJECT_SKILL_SECTION_NAMES, PROJECT_SKILL_SECTION_OPERATION, TASK_EVIDENCE_OPERATION,
         TASK_WORKLOG_OPERATION, operation_names_for_surface,
     },
     operation_contract::{
@@ -331,7 +332,7 @@ impl ScopeToolComposition {
                     TaskToolRole::Worker => {
                         if task_write_allowed {
                             tools.push(Arc::new(TaskWriteTool));
-                            tools.push(Arc::new(TaskCommandTool));
+                            tools.push(Arc::new(TaskCommandTool { command_dir: None }));
                             coverage_set.insert(Permission::FsWrite);
                             coverage_set.insert(Permission::ProcessSpawn);
                         }
@@ -387,7 +388,9 @@ impl ScopeToolComposition {
                 if project_verification {
                     let root = workspace_root.expect("validated verification checkout");
                     tools.push(Arc::new(TaskReadTool));
-                    tools.push(Arc::new(TaskCommandTool));
+                    tools.push(Arc::new(TaskCommandTool {
+                        command_dir: Some(PROJECT_VERIFICATION_CHECKOUT_DIR),
+                    }));
                     tools.push(Arc::new(TaskWriteTool));
                     coverage_set.insert(Permission::FsRead);
                     coverage_set.insert(Permission::ProcessSpawn);
@@ -1521,15 +1524,37 @@ impl Tool for TaskWriteTool {
     }
 }
 
+/// The subdirectory of a Project Agent verification workspace that holds the
+/// repository checkout. The workspace root itself is the *parent* of the
+/// checkout (durable `forge/` docs beside a disposable `checkout/`), so the
+/// checkout is where verification commands must run — see `TaskCommandTool`.
+pub const PROJECT_VERIFICATION_CHECKOUT_DIR: &str = "checkout";
+
 #[derive(Debug)]
-struct TaskCommandTool;
+struct TaskCommandTool {
+    /// Directory the command runs in, relative to the workspace root.
+    ///
+    /// `None` runs at the root: a Task worktree is the repository. A Project
+    /// Agent verification workspace is the parent of its checkout, and build
+    /// tools walk *up* from the current directory for a manifest, so a
+    /// `cargo test` at that parent would run whatever repository the data
+    /// directory happens to sit in — for a `--data-dir ./test` server, Forge
+    /// itself. Verification commands therefore run inside the checkout.
+    command_dir: Option<&'static str>,
+}
 
 #[async_trait]
 impl Tool for TaskCommandTool {
     fn spec(&self) -> ToolSpec {
+        let description = if self.command_dir.is_some() {
+            "Run one allowlisted command inside the Project's repository checkout, which is \
+             its current directory."
+        } else {
+            "Run one allowlisted command with the Task Workspace as its current directory."
+        };
         ToolSpec::new(
             "forge_task_command",
-            "Run one allowlisted command with the Task Workspace as its current directory.",
+            description,
             json!({
                 "type":"object",
                 "required":["program"],
@@ -1555,6 +1580,13 @@ impl Tool for TaskCommandTool {
         if ctx.workspace.root() == "<none>" {
             return Err(RuntimeError::workspace("Task command requires a workspace"));
         }
+        if let Some(command_dir) = self.command_dir {
+            if !Path::new(ctx.workspace.root()).join(command_dir).is_dir() {
+                return Err(RuntimeError::workspace(
+                    "this Project has no repository checkout to run commands in",
+                ));
+            }
+        }
         let arguments = json!({"program": program, "args": args});
         Ok(PreparedToolCall::new(
             ctx.call_id.clone(),
@@ -1574,7 +1606,7 @@ impl Tool for TaskCommandTool {
     ) -> Result<ToolOutcome, RuntimeError> {
         let program = required_string(prepared.arguments(), "program")?;
         let args = string_array(prepared.arguments(), "args")?;
-        run_workspace_command(program, &args, ctx).await
+        run_workspace_command(program, &args, self.command_dir, ctx).await
     }
 }
 
@@ -1621,22 +1653,28 @@ impl Tool for TaskValidateTool {
         _prepared: PreparedToolCall,
         ctx: &InvocationContext,
     ) -> Result<ToolOutcome, RuntimeError> {
-        run_workspace_command("git", &["diff".to_owned(), "--check".to_owned()], ctx).await
+        run_workspace_command("git", &["diff".to_owned(), "--check".to_owned()], None, ctx).await
     }
 }
 
 async fn run_workspace_command(
     program: &str,
     args: &[String],
+    command_dir: Option<&str>,
     ctx: &InvocationContext,
 ) -> Result<ToolOutcome, RuntimeError> {
     if ctx.should_stop() {
         return Err(RuntimeError::cancelled("Task command cancelled"));
     }
+    let root = Path::new(ctx.workspace.root());
+    let current_dir = match command_dir {
+        Some(command_dir) => root.join(command_dir),
+        None => root.to_path_buf(),
+    };
     let mut command = Command::new(program);
     command
         .args(args)
-        .current_dir(ctx.workspace.root())
+        .current_dir(&current_dir)
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .stdin(Stdio::null())
@@ -1763,6 +1801,7 @@ fn validate_orchestration_read_arguments(
             ],
             PROJECT_CURRENT_STATE_OPERATION => &["limit"],
             PROJECT_OBSERVATIONS_OPERATION => &["task_id", "limit"],
+            PROJECT_SKILL_SECTION_OPERATION => &["section"],
             _ => &[],
         };
         if let Some(field) = nested
@@ -1784,6 +1823,17 @@ fn validate_orchestration_read_arguments(
                 return Err(RuntimeError::tool(
                     "Project state read limit must be an integer",
                 ));
+            }
+        }
+        if operation == PROJECT_SKILL_SECTION_OPERATION {
+            match nested.get("section").and_then(Value::as_str) {
+                Some(section) if PROJECT_SKILL_SECTION_NAMES.contains(&section) => {}
+                _ => {
+                    return Err(RuntimeError::tool(format!(
+                        "skill.section requires `section` from: {}",
+                        PROJECT_SKILL_SECTION_NAMES.join(", ")
+                    )));
+                }
             }
         }
     }
@@ -1992,8 +2042,91 @@ mod tests {
     use crate::operation_contract::{
         orchestration_payload_schema, orchestration_read_arguments_schema,
     };
-    use agent_runtime::core::{ids::ToolCallId, tool::Tool};
+    use agent_runtime::core::{
+        clock::SystemClock,
+        ids::{RequestId, SessionId, ToolCallId},
+        tool::Tool,
+    };
     use api_types::{CanonicalScopeRef, OrchestrationOutcome, OutcomeCode, OutcomeScopeType};
+
+    fn command_preparation_context(workspace: Arc<dyn Workspace>) -> PreparationContext {
+        PreparationContext {
+            session: SessionId::new("command-session"),
+            turn: None,
+            call_id: ToolCallId::new("command-call"),
+            request: RequestId::new("command-request"),
+            workspace,
+            clock: Arc::new(SystemClock),
+            cancel: Cancellation::new(),
+            deadline: Deadline::never(),
+        }
+    }
+
+    fn command_invocation_context(workspace: Arc<dyn Workspace>) -> InvocationContext {
+        InvocationContext {
+            session: SessionId::new("command-session"),
+            turn: None,
+            call_id: ToolCallId::new("command-call"),
+            request: RequestId::new("command-request"),
+            workspace,
+            clock: Arc::new(SystemClock),
+            cancel: Cancellation::new(),
+            deadline: Deadline::never(),
+            output_limit: 16_384,
+        }
+    }
+
+    #[tokio::test]
+    async fn verification_commands_run_inside_the_checkout_never_at_the_workspace_root() {
+        // The verification workspace root is the parent of the checkout. A
+        // command run there would let a build tool's upward manifest search
+        // escape into whatever repository holds the data directory.
+        let root = std::env::temp_dir().join(format!(
+            "forge-verify-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        ));
+        let checkout = root.join(PROJECT_VERIFICATION_CHECKOUT_DIR);
+        std::fs::create_dir_all(&checkout).expect("create checkout");
+        std::fs::write(root.join("marker.txt"), "at the workspace root\n").expect("root marker");
+        std::fs::write(checkout.join("marker.txt"), "inside the checkout\n")
+            .expect("checkout marker");
+        let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
+            root: root.to_string_lossy().into_owned(),
+        });
+        let tool = TaskCommandTool {
+            command_dir: Some(PROJECT_VERIFICATION_CHECKOUT_DIR),
+        };
+        let arguments = json!({"program": "cat", "args": ["marker.txt"]});
+
+        let prepared = tool
+            .prepare(
+                arguments.clone(),
+                &command_preparation_context(workspace.clone()),
+            )
+            .await
+            .expect("prepare inside checkout");
+        let outcome = tool
+            .invoke(prepared, &command_invocation_context(workspace.clone()))
+            .await
+            .expect("invoke inside checkout");
+        assert_eq!(outcome.value["success"], true);
+        assert_eq!(outcome.value["stdout"], "inside the checkout\n");
+
+        std::fs::remove_dir_all(&checkout).expect("remove checkout");
+        let refused = tool
+            .prepare(arguments, &command_preparation_context(workspace))
+            .await
+            .expect_err("a Project without a checkout has nowhere to run commands");
+        assert!(
+            refused.to_string().contains("no repository checkout"),
+            "unexpected refusal: {refused}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn portable_const_schema_adds_type_and_enum_for_provider_compatibility() {
@@ -2475,10 +2608,8 @@ mod tests {
             "action",
             "milestone_id",
             "expected_milestone_version",
-            "asset_id",
             "caption",
             "kind",
-            "checksum",
         ] {
             assert!(
                 evidence["required"]
@@ -2487,6 +2618,32 @@ mod tests {
                     .iter()
                     .any(|value| value == field),
                 "evidence schema must require {field}"
+            );
+        }
+        // The action decides which of the remaining fields apply: attach
+        // names an existing asset, capture supplies the bytes itself.
+        assert_eq!(
+            evidence["properties"]["action"]["enum"],
+            json!(["attach", "capture"])
+        );
+        for field in [
+            "asset_id",
+            "checksum",
+            "content",
+            "path",
+            "source_validation_id",
+        ] {
+            assert!(
+                evidence["properties"].get(field).is_some(),
+                "evidence schema must describe {field}"
+            );
+            assert!(
+                !evidence["required"]
+                    .as_array()
+                    .expect("evidence required fields")
+                    .iter()
+                    .any(|value| value == field),
+                "evidence schema must not require action-specific field {field}"
             );
         }
         assert_eq!(

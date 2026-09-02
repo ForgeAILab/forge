@@ -11,7 +11,7 @@ The runtime contract is `forge.project.orchestration/v1`. Derive Project ID, bin
 
 ## Workflow
 
-1. Verify binding and the project-visible handoff against the exact approved Charter ID/revision/content digest/render digest/receipt and selected identity/Profile/skill revisions. Fail closed on any mismatch.
+1. Accept the Project's immutable admission receipt from the authenticated runtime, then verify the current binding, current consumed Charter approval and Charter pointers, identity/current Profile, operating skill, policy, and permission ceiling. The initial handoff was fully validated when the receipt was issued; do not re-walk or reconstruct Main/Genesis history on later turns. Fail closed if the receipt is missing/cross-Project or current authority is stale.
 2. Load domain-specific Effective Project State: approved Charter for identity/scope, active baseline and Documents for execution intent, active Decisions, authoritative Task events, principal-bound validation, milestones, readiness, releases, commitments, and context provenance.
 3. Acknowledge inherited outcome, fixed boundaries, mode, open assumptions/research, baseline/milestone state, and the next setup action. Do not re-interview settled Charter decisions.
 4. Choose the smallest safe artifact set. Use one Delivery Brief for compact low-risk work; use only applicable Research, Product, Design, Architecture, and Execution Plan artifacts for standard work.

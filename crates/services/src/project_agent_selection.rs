@@ -171,6 +171,12 @@ pub async fn list_genesis_project_agents(
 /// Deterministic fallback: the oldest enabled account-owned Agent with a
 /// current usable profile/source. Existing bindings are a tie-breaker only;
 /// they are not an eligibility restriction.
+///
+/// A profile with no model is not a candidate.  The credential clauses pass
+/// when `credential_ref` is NULL -- legitimate for a CLI agent that carries
+/// its own login -- so without the model check an entirely unconfigured
+/// daemon-discovered agent sorted first and was bound as Project Agent, where
+/// its first turn could only fail.
 async fn auto_pick_candidate(db: &SqliteDb, account_id: &str) -> Result<Option<String>> {
     Ok(sqlx::query_scalar::<_, String>(
         "SELECT identity.id
@@ -188,6 +194,8 @@ async fn auto_pick_candidate(db: &SqliteDb, account_id: &str) -> Result<Option<S
                  AND credential.status = 'configured'
                  AND credential.enabled = 1
            ))
+           AND profile.model IS NOT NULL
+           AND trim(profile.model) <> ''
          ORDER BY EXISTS (
                SELECT 1 FROM project_agent_binding AS project_binding
                WHERE project_binding.identity_id = identity.id
@@ -220,6 +228,18 @@ async fn eligible_selection(
     else {
         return Ok(None);
     };
+    // An agent with no model cannot run a turn.  This check is deliberately
+    // separate from the credential check below: a NULL `credential_ref` is
+    // legitimate for a CLI agent that authenticates itself, so the credential
+    // gate is skipped for those and cannot stand in for "is configured".
+    if profile
+        .model
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        return Ok(None);
+    }
     if let Some(credential_ref) = profile.credential_ref.as_deref() {
         let source_usable = CredentialHandleRepo::get_credential_handle(db, credential_ref)
             .await?
@@ -273,6 +293,17 @@ mod tests {
     }
 
     async fn create_agent(db: &SqliteDb, id: &str, created_at: &str) {
+        create_agent_with_model(db, id, created_at, Some("test-model")).await;
+    }
+
+    // Agent profiles are immutable, so an unconfigured agent has to be built
+    // that way rather than updated after the fact.
+    async fn create_agent_with_model(
+        db: &SqliteDb,
+        id: &str,
+        created_at: &str,
+        model: Option<&str>,
+    ) {
         AgentRepo::create_identity_with_profile(
             db,
             CreateAgentIdentity {
@@ -298,7 +329,7 @@ mod tests {
                 backend_kind: "native".to_owned(),
                 executor_type: "native".to_owned(),
                 provider: None,
-                model: None,
+                model: model.map(str::to_owned),
                 reasoning_effort: None,
                 permission_policy: None,
                 prompt_template: None,
@@ -376,6 +407,36 @@ mod tests {
             .await
             .expect("resolve");
         assert!(selection.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_agent_without_a_model_is_never_a_project_agent_candidate() {
+        // A daemon-discovered CLI agent is `is_default = 0` with a NULL
+        // `credential_ref`, so both credential clauses pass it -- and being
+        // discovered early, it sorted ahead of the configured agents and was
+        // bound as Project Agent, where its first turn could only fail. A
+        // profile with no model is not runnable and must not be selectable,
+        // by auto-pick or by a stored preference.
+        let db = fixture().await;
+        create_agent_with_model(&db, "unconfigured", "2026-01-01T00:00:00Z", None).await;
+        create_agent(&db, "configured", "2026-02-01T00:00:00Z").await;
+
+        let auto = resolve_genesis_project_agent(&db, &session(None))
+            .await
+            .expect("auto selection");
+        assert_eq!(
+            auto.map(|selection| selection.identity_id),
+            Some("configured".to_owned()),
+            "the older unconfigured agent must not win auto-pick"
+        );
+
+        let preferred = resolve_genesis_project_agent(&db, &session(Some("unconfigured")))
+            .await
+            .expect("preferred selection");
+        assert!(
+            preferred.is_none(),
+            "an explicit preference for an agent with no model is not eligible"
+        );
     }
 
     #[tokio::test]

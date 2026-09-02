@@ -407,8 +407,9 @@ and the appends are best-effort — they never fail the committed mutation.
 
 On success, one transaction creates the Project, Project Agent binding, Project
 Chat, Charter attachment, bounded immutable handoff, target message/turn job,
-the durable Genesis provisioning operation with its five pending checkpoints,
-domain events, Genesis `handed_off` state, and consumed receipt. There is no
+one immutable Project admission receipt, the durable Genesis provisioning
+operation with its five pending checkpoints, domain events, Genesis
+`handed_off` state, and consumed Charter-approval receipt. There is no
 `handoff_pending` state. Any failure rolls back every record, leaves Genesis
 `ready_for_project` and the receipt `active`, and can be retried with the same
 receipt/idempotency key. The response includes the committed Project/handoff
@@ -529,7 +530,9 @@ the required pins is reported as `evidence_context_missing`, while a pinned
 attachment whose Task, run, validation, definition, or build/commit context
 changed is reported as `evidence_context_stale`. Neither can make a candidate
 ready. The attachment remains inspectable so users can capture a replacement
-without rewriting evidence history.
+without rewriting evidence history. The definition context is the milestone's
+current definition revision: an attachment captured under an earlier revision
+is stale after any definition change and must be re-captured.
 
 The JSON body is `ProjectMediaTombstoneRequest`:
 
@@ -628,6 +631,15 @@ Project Agent binding. Only an authorized account or Project administrator may
 create or replace a binding. The invariant is unconditional: Task Worker and
 reviewer assignments never satisfy it, and there is no role/`is_primary`
 combination or primary-agent election.
+
+All REST, MCP, and native binding writes use the same server command. For a
+Charter-backed Project it derives and stores the stable Project admission
+receipt, exact current consumed Charter approval and Charter/revision pointers,
+current operating-skill revision, current Profile snapshot, policy digest, and
+permission ceiling in the same transaction that replaces the old binding,
+updates Chat readiness, and appends the binding event. Clients cannot supply or
+override these authority fields. Rebinding reuses the Project admission receipt
+and does not publish another Main handoff.
 
 Binding replacement uses optimistic concurrency and preserves the identity,
 profile revisions, sessions, Agent Chat messages, handoffs, commitments, Task
@@ -811,11 +823,10 @@ Task sessions capture evidence with the typed `task.evidence` operation. A
 workspace-relative file the run produced) or `content` (verbatim captured
 output). Forge stores the bytes in the media store, derives the SHA-256
 checksum a milestone evidence attachment compares against, and returns the
-`media_id`/`asset_id`. The operation is exposed only in a Task scope: a Project
-or Agent Chat session receives no workspace root by construction, so it could
-author an artifact but never capture one. Captured Task media is promoted to a
-project-scoped `media_asset`, so a single verification run's artifact can back
-every acceptance check it demonstrates.
+`media_id`/`asset_id`. The operation is exposed only in a Task scope — it
+captures what that Task's own run did. Captured Task media is promoted to a
+project-scoped `media_asset`, so a single run's artifact can back every
+acceptance check it demonstrates.
 
 Task sessions record progress with the typed `task.worklog` operation. An
 `append` payload carries a `kind` (`progress`, `decision`, `validation`, or
@@ -825,12 +836,19 @@ idempotency key, so a retried turn appends once. Worklog entries flow into the
 next role's dispatch context. They never move a Task and never satisfy an
 acceptance check.
 
-Project Agent evidence proposals use the typed `project.evidence` operation.
-An `attach` payload must include the current positive
+Project Agent evidence uses the typed `project.evidence` operation with two
+actions. An `attach` payload must include the current positive
 `expected_milestone_version` alongside `milestone_id`, `asset_id`, `caption`,
 `kind`, and `checksum`. Forge preserves receipt-first replay for an identical
 retry, but a new proposal with a stale milestone version fails the same
-compare-and-swap check as the REST evidence route.
+compare-and-swap check as the REST evidence route. A `capture` payload
+supplies the artifact the Project Agent's own verification run produced —
+exactly one of `path` (a file under its Project workspace) or `content`
+(inline text) — plus an optional `source_validation_id` naming the validation
+result it backs; Forge stores the bytes as a Project `media_asset` and
+performs the same attach in one call. Readiness treats validation-sourced
+evidence with no Task provenance as fresh exactly while the cited validation
+result is current.
 
 ## Agent Chats
 
@@ -856,6 +874,14 @@ the admitted frozen snapshot; only a newly admitted turn observes later
 binding, Profile, skill, or policy changes. A worker retry of a `retry_wait`
 job reuses that same admitted job and frozen provenance; it does not resolve
 the current binding or Profile again.
+
+For fresh Charter-backed Project turns, admission verifies the binding against
+the Project's current Charter pointers and stable admission receipt. Genesis
+receipts check the one recorded immutable handoff; adoption receipts check the
+recorded consumed approval digest. Ordinary later turns never reconstruct
+authority by querying historical Main messages/turns/Profiles/instructions or
+the Project-creation event chain. A Charter amendment updates current binding
+authority while retaining the same one-time admission receipt.
 
 The turn executes outside that transaction and exposes only the finite states
 `queued`, `leased`, `awaiting_input`, `retry_wait`, `succeeded`, `failed`, and
@@ -906,6 +932,13 @@ history, or Main Agent authority. Admission creates one visible delivery
 receipt and at most one target turn; replay with the same idempotency key is
 safe. A Project Agent response is not recursively fed back into the Main Agent;
 any later handoff is another explicit publication.
+
+The initial Genesis handoff is fully validated when Project creation consumes
+the user approval and is represented thereafter by one immutable
+Project-owned admission receipt. Binding replacement and Charter amendment are
+not handoff publications: they reuse that receipt and update only current
+authority. Exact creation replay continues to return the original frozen IDs
+even if the original binding is now historical.
 
 The V071+ request/response types and nested message/turn resources are the live
 contract. Clients should use the singular routes and types listed above; no
@@ -1790,6 +1823,15 @@ immutable release history. The response's
 `projection_state` distinguishes `current`, `loading`, `stale`, `error`, and
 `permission_denied`; clients must not turn a stale or error projection into a
 green release state.
+
+`projection_state` reports only whether the assembled records prove a current
+projection. Charter setup is not a projection fault: a Project that has never
+adopted a Charter and carries no governed records is `current`, and reports
+its setup through `charter_state` (`charter_setup_required`) and the
+`charter_adoption` next action instead. A missing Charter turns the projection
+`stale` in exactly two cases — the Project record claims a Charter revision
+that cannot be loaded, or the Project already carries milestone, evidence, or
+release records that only an approved Charter could have authorized.
 
 `document_freshness` includes every Project Document. Each entry identifies
 the approved revision/digest that remains the governing Project truth and,

@@ -26,6 +26,26 @@ pub const PROJECT_CURRENT_STATE_OPERATION: &str = "project.current_state";
 /// artifacts it captured. This is how a Project Agent checks an observation
 /// before citing it, and how it decides whether the outcome needs a fix Task.
 pub const PROJECT_OBSERVATIONS_OPERATION: &str = "project.observations";
+/// Read the current approved Charter's full rendered text on demand. The
+/// Charter is Project data, not resident prompt content: the handoff packet
+/// and the operating skill carry only its identity and digests, so this read
+/// is how the Agent gets the actual words whenever a decision needs them.
+pub const PROJECT_CHARTER_READ_OPERATION: &str = "project.charter";
+/// Read one server-owned Project doctrine section by name. The resident
+/// operating skill keeps only an index of these sections so the detailed
+/// doctrine stops occupying every turn's fixed prompt budget.
+pub const PROJECT_SKILL_SECTION_OPERATION: &str = "skill.section";
+/// The canonical doctrine section names. The read schema exposes this enum
+/// and the services provider must serve exactly these names; a drift between
+/// the two is caught by a services-side test.
+pub const PROJECT_SKILL_SECTION_NAMES: &[&str] = &[
+    "research",
+    "documents",
+    "scope_change",
+    "tasks",
+    "milestones",
+    "release",
+];
 pub const PROJECT_CHARTER_ADOPTION_OPERATION: &str = "project.charter.adoption";
 pub const PROJECT_DOCUMENT_OPERATION: &str = "project.document";
 pub const PROJECT_DECISION_OPERATION: &str = "project.decision";
@@ -296,6 +316,28 @@ pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
     },
     OperationContract {
         operation: PROJECT_OBSERVATIONS_OPERATION,
+        surface: OperationSurface::ProjectOrchestration,
+        exposure: OperationExposure::TypedRead,
+        input: OperationInputContract::ReadArguments,
+        setup: OperationSetupExposure::ReadyOnly,
+        supported_scopes: PROJECT_SCOPES,
+        classification: OperationClassification::Query,
+        permission: OperationPermission::ReadProjectOrAgentChat,
+        output: SHARED_ORCHESTRATION_OUTCOME,
+    },
+    OperationContract {
+        operation: PROJECT_CHARTER_READ_OPERATION,
+        surface: OperationSurface::ProjectOrchestration,
+        exposure: OperationExposure::TypedRead,
+        input: OperationInputContract::ReadArguments,
+        setup: OperationSetupExposure::ReadyOnly,
+        supported_scopes: PROJECT_SCOPES,
+        classification: OperationClassification::Query,
+        permission: OperationPermission::ReadProjectOrAgentChat,
+        output: SHARED_ORCHESTRATION_OUTCOME,
+    },
+    OperationContract {
+        operation: PROJECT_SKILL_SECTION_OPERATION,
         surface: OperationSurface::ProjectOrchestration,
         exposure: OperationExposure::TypedRead,
         input: OperationInputContract::ReadArguments,
@@ -730,7 +772,11 @@ pub fn is_allowed_project_direct_payload(operation: &str, payload: &Value) -> bo
                 Some("define") | Some("revise") | Some("set_primary")
             )
         }
-        PROJECT_EVIDENCE_OPERATION => action == Some("attach"),
+        // `capture` is the Project Agent's own verification artifact: the
+        // provider stores the bytes as a Project media asset and the call
+        // continues as the same bounded attach. Both forms are append-only
+        // and carry no authority beyond the milestone they bind to.
+        PROJECT_EVIDENCE_OPERATION => matches!(action, Some("attach") | Some("capture")),
         // Recording an agent-observed validation result is bounded and
         // append-only: it names one immutable check on the current definition
         // revision and carries its own receipt. The `manual` source kind stays
@@ -741,12 +787,17 @@ pub fn is_allowed_project_direct_payload(operation: &str, payload: &Value) -> bo
         // authority beyond the Task it is bound to.
         TASK_EVIDENCE_OPERATION => action == Some("capture"),
         TASK_WORKLOG_OPERATION => action == Some("append"),
+        // `cancel_task` is bounded repair authority within the adaptive
+        // envelope: the doctrine directs the Agent to absorb a
+        // verification-shaped Task by cancelling it and settling its checks
+        // itself.
         TASK_RECOVER_OPERATION => matches!(
             action,
             Some("resume_session")
                 | Some("reexecute")
                 | Some("reset_to_initial")
                 | Some("reset_retry_window")
+                | Some("cancel_task")
         ),
         // A release candidate is a consequential approval/audit proposal even
         // though it does not perform the final immutable release itself.  It

@@ -1146,6 +1146,7 @@ pub struct ProjectReleaseRecord {
     pub waivers_json: String,
     pub releasing_principal_type: String,
     pub releasing_principal_id: String,
+    pub releasing_principal_display_name: Option<String>,
     pub authorization_basis: String,
     pub authorization_action: String,
     pub authorization_occurred_at: String,
@@ -1181,6 +1182,7 @@ pub struct CreateProjectRelease {
     pub waivers_json: String,
     pub releasing_principal_type: String,
     pub releasing_principal_id: String,
+    pub releasing_principal_display_name: Option<String>,
     pub authorization_basis: String,
     pub authorization_action: String,
     pub authorization_occurred_at: String,
@@ -1502,7 +1504,7 @@ pub trait ProjectOrchestrationRepo: Send + Sync {
     /// The adoption Charter a Project already owns, if any. A Project holds at
     /// most one Charter (`idx_project_charter_project`), so this resolves the
     /// real primary key without trusting an id an agent proposed.
-    async fn get_project_adoption_charter(
+    async fn get_project_charter_by_project_id(
         &self,
         project_id: &str,
     ) -> Result<Option<ProjectCharterRecord>>;

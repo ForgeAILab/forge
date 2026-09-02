@@ -1,0 +1,11 @@
+-- An immutable release digests the releasing principal exactly as the
+-- release request carried it — including its display name — but the row
+-- never persisted that name, so reading the release back rebuilt the
+-- principal without it and the recomputed digest could not match. Every
+-- release approved through the web client (which sends the signed-in user's
+-- display name) failed to load with "immutable release snapshot digest does
+-- not match its contents" even though the release had committed. Persist it.
+-- Existing rows keep NULL: a release recorded without a display name digests
+-- correctly as-is, and one recorded with a name needs that exact name
+-- restored by the operator before it loads again.
+ALTER TABLE project_release ADD COLUMN releasing_principal_display_name TEXT;
