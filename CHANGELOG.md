@@ -139,6 +139,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- A native Agent Chat turn on the ChatGPT Codex backend no longer dies with
+  "Responses stream emitted conflicting terminal events". The backend keeps
+  the SSE connection open after `response.completed` / `response.failed`
+  and sends further frames before `[DONE]`; the pinned agent-runtime treated
+  any of them as a conflicting terminal, so a Main Agent genesis turn failed
+  three attempts in a row after it had already created the Project. The
+  runtime pin moves from `04a772d` to `f369b9e`, whose Responses adapter ends
+  an attempt at its first terminal frame and drops the rest. The bump also
+  brings the runtime's interrupted-turn admission fix (`e3bad15`) and its
+  model-host / external-tool authority hardening (`8c07d58`).
+
 - A released milestone's Overview no longer reports its own release snapshot
   as stale. `release()` only accepts the snapshot whose readiness transition
   produced the milestone's current version and then records its own
