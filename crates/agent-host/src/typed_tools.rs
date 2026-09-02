@@ -90,6 +90,26 @@ pub enum PublicSearchScope {
 /// Forge session before it constructs the tools.  Implementations therefore
 /// receive server-derived values and must not accept replacement identity or
 /// scope values from the model arguments.
+/// One command a Project Agent ran in its verification checkout, as Forge
+/// observed it: what ran, how it ended, and a digest of everything it printed.
+/// The provider persists it and returns the observation id the Agent must cite
+/// when it records a `task_validation` result, so a settled check always
+/// points at something the Agent actually executed rather than something a
+/// Task reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandObservation {
+    pub session_id: String,
+    pub turn_id: Option<String>,
+    pub program: String,
+    pub args: Vec<String>,
+    pub exit_code: Option<i32>,
+    pub success: bool,
+    /// SHA-256 over the complete stdout, a separator, and the complete stderr.
+    pub output_digest: String,
+    pub stdout_excerpt: String,
+    pub stderr_excerpt: String,
+}
+
 #[async_trait]
 pub trait ForgeToolProvider: Send + Sync + fmt::Debug {
     /// Performs one already-scope-bound, read-only domain operation.
@@ -111,6 +131,21 @@ pub trait ForgeToolProvider: Send + Sync + fmt::Debug {
         operation: &str,
         arguments: Value,
     ) -> Result<Value, AgentHostError>;
+
+    /// Records one command a Project Agent verification session ran and
+    /// returns `{"observation_id": ...}`. Surfaces without a verification
+    /// workspace never compose the tool that calls this.
+    async fn observe_command(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        observation: CommandObservation,
+    ) -> Result<Value, AgentHostError> {
+        let _ = (actor_identity_id, scope, observation);
+        Err(AgentHostError::Unsupported(
+            "this Forge surface records no command observations".to_owned(),
+        ))
+    }
 
     /// Returns whether a configured, unauthenticated public search endpoint
     /// is available.  The host uses this synchronous check to omit the tool
@@ -332,7 +367,10 @@ impl ScopeToolComposition {
                     TaskToolRole::Worker => {
                         if task_write_allowed {
                             tools.push(Arc::new(TaskWriteTool));
-                            tools.push(Arc::new(TaskCommandTool { command_dir: None }));
+                            tools.push(Arc::new(TaskCommandTool {
+                                observer: None,
+                                command_dir: None,
+                            }));
                             coverage_set.insert(Permission::FsWrite);
                             coverage_set.insert(Permission::ProcessSpawn);
                         }
@@ -389,6 +427,11 @@ impl ScopeToolComposition {
                     let root = workspace_root.expect("validated verification checkout");
                     tools.push(Arc::new(TaskReadTool));
                     tools.push(Arc::new(TaskCommandTool {
+                        observer: provider.clone().map(|provider| CommandObserver {
+                            actor_identity_id: actor_identity_id.clone(),
+                            scope: scope.clone(),
+                            provider,
+                        }),
                         command_dir: Some(PROJECT_VERIFICATION_CHECKOUT_DIR),
                     }));
                     tools.push(Arc::new(TaskWriteTool));
@@ -1530,8 +1573,21 @@ impl Tool for TaskWriteTool {
 /// checkout is where verification commands must run — see `TaskCommandTool`.
 pub const PROJECT_VERIFICATION_CHECKOUT_DIR: &str = "checkout";
 
+/// Where a verification command's observation is recorded: the provider that
+/// persists it for the Project this session is bound to.
+#[derive(Debug)]
+struct CommandObserver {
+    actor_identity_id: String,
+    scope: CanonicalScope,
+    provider: Arc<dyn ForgeToolProvider>,
+}
+
 #[derive(Debug)]
 struct TaskCommandTool {
+    /// Present only for a Project Agent verification session: every command
+    /// it runs is recorded as an observation the Agent cites in
+    /// `project.validation`. A Task worker's commands are its own business.
+    observer: Option<CommandObserver>,
     /// Directory the command runs in, relative to the workspace root.
     ///
     /// `None` runs at the root: a Task worktree is the repository. A Project
@@ -1606,7 +1662,46 @@ impl Tool for TaskCommandTool {
     ) -> Result<ToolOutcome, RuntimeError> {
         let program = required_string(prepared.arguments(), "program")?;
         let args = string_array(prepared.arguments(), "args")?;
-        run_workspace_command(program, &args, self.command_dir, ctx).await
+        let run = execute_workspace_command(program, &args, self.command_dir, ctx).await?;
+        let Some(observer) = &self.observer else {
+            return Ok(command_outcome(&run, None));
+        };
+        // A verification command that ran but left no observation would let
+        // the Agent settle a check on nothing; the run is read-and-run, so
+        // failing the call is the safe way to surface a recording fault.
+        let recorded = observer
+            .provider
+            .observe_command(
+                &observer.actor_identity_id,
+                &observer.scope,
+                CommandObservation {
+                    session_id: ctx.session.to_string(),
+                    turn_id: ctx.turn.as_ref().map(ToString::to_string),
+                    program: run.program.clone(),
+                    args: run.args.clone(),
+                    exit_code: run.status_code,
+                    success: run.success,
+                    output_digest: run.output_digest(),
+                    stdout_excerpt: bounded_text(&run.stdout, MAX_OBSERVATION_EXCERPT_BYTES).0,
+                    stderr_excerpt: bounded_text(&run.stderr, MAX_OBSERVATION_EXCERPT_BYTES).0,
+                },
+            )
+            .await
+            .map_err(|error| match error {
+                AgentHostError::StructuredOutcome(outcome) => RuntimeError::tool(format!(
+                    "the command ran but Forge could not record the observation: {}",
+                    outcome.safe_message
+                )),
+                other => host_error_to_runtime(other),
+            })?;
+        let observation_id = recorded
+            .get("observation_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                RuntimeError::tool("Forge recorded the observation without an observation id")
+            })?;
+        Ok(command_outcome(&run, Some(observation_id)))
     }
 }
 
@@ -1653,16 +1748,44 @@ impl Tool for TaskValidateTool {
         _prepared: PreparedToolCall,
         ctx: &InvocationContext,
     ) -> Result<ToolOutcome, RuntimeError> {
-        run_workspace_command("git", &["diff".to_owned(), "--check".to_owned()], None, ctx).await
+        let run =
+            execute_workspace_command("git", &["diff".to_owned(), "--check".to_owned()], None, ctx)
+                .await?;
+        Ok(command_outcome(&run, None))
     }
 }
 
-async fn run_workspace_command(
+/// Bytes of stdout/stderr kept verbatim in a recorded observation.
+const MAX_OBSERVATION_EXCERPT_BYTES: usize = 4_000;
+
+/// A workspace command after it ran: the exact bytes it produced, kept whole
+/// until the outcome is rendered so an observation digest covers all of it.
+struct ExecutedCommand {
+    program: String,
+    args: Vec<String>,
+    status_code: Option<i32>,
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl ExecutedCommand {
+    fn output_digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&self.stdout);
+        hasher.update(b"\n--stderr--\n");
+        hasher.update(&self.stderr);
+        hex::encode(hasher.finalize())
+    }
+}
+
+async fn execute_workspace_command(
     program: &str,
     args: &[String],
     command_dir: Option<&str>,
     ctx: &InvocationContext,
-) -> Result<ToolOutcome, RuntimeError> {
+) -> Result<ExecutedCommand, RuntimeError> {
     if ctx.should_stop() {
         return Err(RuntimeError::cancelled("Task command cancelled"));
     }
@@ -1684,17 +1807,32 @@ async fn run_workspace_command(
         .output()
         .await
         .map_err(|error| RuntimeError::tool(format!("Task command failed: {error}")))?;
-    let stdout = bounded_text(&output.stdout, MAX_COMMAND_OUTPUT_BYTES);
-    let stderr = bounded_text(&output.stderr, MAX_COMMAND_OUTPUT_BYTES);
-    Ok(ToolOutcome::json(json!({
-        "program": program,
-        "args": args,
-        "status": output.status.code(),
-        "success": output.status.success(),
+    Ok(ExecutedCommand {
+        program: program.to_owned(),
+        args: args.to_vec(),
+        status_code: output.status.code(),
+        success: output.status.success(),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
+fn command_outcome(run: &ExecutedCommand, observation_id: Option<&str>) -> ToolOutcome {
+    let stdout = bounded_text(&run.stdout, MAX_COMMAND_OUTPUT_BYTES);
+    let stderr = bounded_text(&run.stderr, MAX_COMMAND_OUTPUT_BYTES);
+    let mut value = json!({
+        "program": run.program,
+        "args": run.args,
+        "status": run.status_code,
+        "success": run.success,
         "stdout": stdout.0,
         "stderr": stderr.0,
         "truncated": stdout.1 || stderr.1
-    })))
+    });
+    if let Some(observation_id) = observation_id {
+        value["observation_id"] = json!(observation_id);
+    }
+    ToolOutcome::json(value)
 }
 
 fn bounded_text(bytes: &[u8], limit: usize) -> (String, bool) {
@@ -2098,6 +2236,7 @@ mod tests {
             root: root.to_string_lossy().into_owned(),
         });
         let tool = TaskCommandTool {
+            observer: None,
             command_dir: Some(PROJECT_VERIFICATION_CHECKOUT_DIR),
         };
         let arguments = json!({"program": "cat", "args": ["marker.txt"]});
@@ -2125,6 +2264,67 @@ mod tests {
             refused.to_string().contains("no repository checkout"),
             "unexpected refusal: {refused}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn verification_commands_are_recorded_as_observations_the_agent_can_cite() {
+        let root = std::env::temp_dir().join(format!(
+            "forge-verify-observe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        ));
+        let checkout = root.join(PROJECT_VERIFICATION_CHECKOUT_DIR);
+        std::fs::create_dir_all(&checkout).expect("create checkout");
+        std::fs::write(checkout.join("marker.txt"), "observed output\n").expect("marker");
+        let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
+            root: root.to_string_lossy().into_owned(),
+        });
+        let provider = Arc::new(TestProvider::default());
+        let tool = TaskCommandTool {
+            observer: Some(CommandObserver {
+                actor_identity_id: "agent-1".to_owned(),
+                scope: CanonicalScope {
+                    scope_type: CanonicalScopeType::AgentChat,
+                    scope_id: "chat-1".to_owned(),
+                    workspace_access: WorkspaceAccess::ProjectVerify,
+                },
+                provider: provider.clone(),
+            }),
+            command_dir: Some(PROJECT_VERIFICATION_CHECKOUT_DIR),
+        };
+        let arguments = json!({"program": "cat", "args": ["marker.txt"]});
+        let prepared = tool
+            .prepare(arguments, &command_preparation_context(workspace.clone()))
+            .await
+            .expect("prepare");
+        let outcome = tool
+            .invoke(prepared, &command_invocation_context(workspace))
+            .await
+            .expect("invoke");
+        assert_eq!(outcome.value["observation_id"], "observation-1");
+        assert_eq!(outcome.value["stdout"], "observed output\n");
+
+        let observations = provider.observations.lock().expect("observation log");
+        let observation = observations.first().expect("one observation recorded");
+        assert_eq!(observation.program, "cat");
+        assert_eq!(observation.args, vec!["marker.txt".to_owned()]);
+        assert_eq!(observation.exit_code, Some(0));
+        assert!(observation.success);
+        assert_eq!(observation.stdout_excerpt, "observed output\n");
+        // The digest covers the complete stdout and stderr, so a later
+        // inline evidence claim can be checked against what really printed.
+        let expected = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(b"observed output\n");
+            hasher.update(b"\n--stderr--\n");
+            hex::encode(hasher.finalize())
+        };
+        assert_eq!(observation.output_digest, expected);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2198,7 +2398,7 @@ mod tests {
             None,
             None,
             &allowed,
-            Some(Arc::new(TestProvider)),
+            Some(Arc::new(TestProvider::default())),
         )
         .expect("Main composition");
         assert!(
@@ -2262,7 +2462,7 @@ mod tests {
 
     #[test]
     fn project_service_tools_are_proposals_not_task_workspace_authority() {
-        let provider = Arc::new(TestProvider);
+        let provider = Arc::new(TestProvider::default());
         let composition = ScopeToolComposition::for_scope_with_permissions(
             "identity-1",
             scope(CanonicalScopeType::Project, WorkspaceAccess::Deny),
@@ -2283,7 +2483,7 @@ mod tests {
 
     #[test]
     fn persisted_permission_ceiling_filters_domain_operations() {
-        let provider = Arc::new(TestProvider);
+        let provider = Arc::new(TestProvider::default());
         let allowed = BTreeSet::from(["read_project".to_owned()]);
         let composition = ScopeToolComposition::for_scope_with_permissions(
             "identity-1",
@@ -2316,7 +2516,7 @@ mod tests {
             None,
             None,
             &allowed,
-            Some(Arc::new(TestProvider)),
+            Some(Arc::new(TestProvider::default())),
         )
         .expect("Main composition");
         let names = composition.tool_names();
@@ -2365,7 +2565,7 @@ mod tests {
             None,
             None,
             &allowed,
-            Some(Arc::new(TestProvider)),
+            Some(Arc::new(TestProvider::default())),
         )
         .expect("Project composition");
         let names = composition.tool_names();
@@ -2435,7 +2635,7 @@ mod tests {
             None,
             None,
             &allowed,
-            Some(Arc::new(TestProvider)),
+            Some(Arc::new(TestProvider::default())),
         )
         .expect("Main composition");
         let tool = composition
@@ -2537,7 +2737,7 @@ mod tests {
             None,
             None,
             &allowed,
-            Some(Arc::new(TestProvider)),
+            Some(Arc::new(TestProvider::default())),
         )
         .expect("Project composition");
         let tool = composition
@@ -2725,7 +2925,7 @@ mod tests {
                 is_project_agent_chat: true,
                 charter_setup_required: true,
             },
-            Some(Arc::new(TestProvider)),
+            Some(Arc::new(TestProvider::default())),
         )
         .expect("setup Project composition");
         let proposal = composition
@@ -2785,7 +2985,7 @@ mod tests {
             None,
             &allowed,
             false,
-            Some(Arc::new(TestProvider)),
+            Some(Arc::new(TestProvider::default())),
         )
         .expect("Main Chat composition");
         assert!(
@@ -2810,7 +3010,7 @@ mod tests {
             None,
             None,
             &allowed,
-            Some(Arc::new(TestProvider)),
+            Some(Arc::new(TestProvider::default())),
         )
         .expect("Main composition");
         let tool = composition
@@ -3226,11 +3426,26 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
-    struct TestProvider;
+    #[derive(Debug, Default)]
+    struct TestProvider {
+        observations: std::sync::Mutex<Vec<CommandObservation>>,
+    }
 
     #[async_trait]
     impl ForgeToolProvider for TestProvider {
+        async fn observe_command(
+            &self,
+            _actor_identity_id: &str,
+            _scope: &CanonicalScope,
+            observation: CommandObservation,
+        ) -> Result<Value, AgentHostError> {
+            self.observations
+                .lock()
+                .expect("observation log")
+                .push(observation);
+            Ok(json!({"observation_id": "observation-1"}))
+        }
+
         async fn read(
             &self,
             _actor_identity_id: &str,

@@ -141,7 +141,7 @@ pub(crate) fn delivery_followup_directive(state: &DeliveryFollowupState) -> Stri
         ));
         if !milestone.agent_check_ids.is_empty() {
             lines.push_str(&format!(
-                "  Settle yourself, in this turn: {}. Exercise the delivered software against each check's expected result, then record what you observed with `project.validation` (action `record`) using the exact milestone_id, milestone_version, definition_revision_id, and check_id above. One call per check.\n",
+                "  Settle yourself, in this turn: {}. Run the delivered software in your checkout with forge_task_command against each check's expected result, then record what you observed with `project.validation` (action `record`) using the exact milestone_id, milestone_version, definition_revision_id, and check_id above, citing the observation_id values those commands returned in observed_command_ids. One call per check. A Task's or reviewer's report settles nothing.\n",
                 named_checks(&milestone.agent_check_ids),
             ));
         }

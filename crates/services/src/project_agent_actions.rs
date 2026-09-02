@@ -1268,6 +1268,7 @@ impl ProjectOrchestrationActionService {
                     result: string(payload, "result")?,
                     input_digest: string(payload, "input_digest")?,
                     observed_task_id: optional_string(payload, "observed_task_id"),
+                    observed_command_ids: observed_command_ids(payload)?,
                     evidence_asset_id: optional_string(payload, "evidence_asset_id"),
                     expected_milestone_version,
                     idempotency_key: context.idempotency_key().to_owned(),
@@ -1538,6 +1539,32 @@ fn string(payload: &Value, field: &str) -> Result<String> {
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
         .ok_or_else(|| ServiceError::invalid_operation(format!("{field} is required")))
+}
+
+/// `observed_command_ids` is the Agent's citation of its own verification
+/// runs. Absent means none claimed; anything but strings is a malformed call.
+fn observed_command_ids(payload: &Value) -> Result<Vec<String>> {
+    match payload.get("observed_command_ids") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        ServiceError::invalid_operation(
+                            "observed_command_ids must be an array of observation ids",
+                        )
+                    })
+            })
+            .collect(),
+        Some(_) => Err(ServiceError::invalid_operation(
+            "observed_command_ids must be an array of observation ids",
+        )),
+    }
 }
 
 fn optional_string(payload: &Value, field: &str) -> Option<String> {

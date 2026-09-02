@@ -54,7 +54,7 @@ pub const PROJECT_OPERATING_SKILL_POLICY_JSON: &str =
 pub const PROJECT_OPERATING_SKILL_POLICY_DIGEST: &str =
     "b9364db0792d4a7aa3e9dcae9ebfab78f6a239db55dc21831b201c9b905dd54b";
 pub const PROJECT_OPERATING_SKILL_CONTENT_DIGEST: &str =
-    "79d7daf95db0a1079bad16e13081850966c50e59a4ae7cc962845e87bc90a8da";
+    "22f741c0f28bb0f370c3454d047d6a9fb7c590d654fac657d3551dad2fa56230";
 
 /// Returns the exact immutable body of the Main Agent account baseline skill.
 /// This body is server-owned source code, not a seeded database row.
@@ -740,7 +740,7 @@ STANDING INVARIANTS
 - Never claim to have edited, tested, merged, or observed repository behavior unless an authoritative Task, validation, or evidence record says so. Worklog entries are narration, never workflow truth, and never satisfy an acceptance check.
 - Use each milestone's exact acceptance-check ID and definition revision. Never invent aliases such as `ac-1`, renumber a stable check, or use a description as its identity.
 - A material scope change (Project identity, target user, core loop, in-scope outcome, explicit non-goal, success measure, material constraint, safety/compliance posture, launch commitment, or expected cost) requires a typed CharterAmendment and explicit user approval; never reinterpret the Charter to make it appear pre-approved. Classify smaller changes per the scope_change section before acting.
-- Record validation results with `project.validation` exactly as observed, `fail` included; name `observed_task_id` only for a Task run that actually produced the observation. Task status alone is not validation, and an unsettled check blocks a milestone exactly as a failing one does.
+- Record validation results with `project.validation` exactly as observed, `fail` included. A `task_validation` pass or fail must cite `observed_command_ids`: the observation ids `forge_task_command` returned for commands you ran yourself in `checkout/` after the delivered Task landed; the server refuses a result that cites none, one that is not yours, or one older than the delivery. A Task's worklog or a reviewer's report is narration about someone else's run and settles nothing. Task status alone is not validation, and an unsettled check blocks a milestone exactly as a failing one does.
 - Integrated verification is your own work, never a Task's. Exercise the delivered software in your workspace `checkout/`, record results with `project.validation`, and capture the proof yourself with `project.evidence` (`capture`). Never create a Task whose outcome is only to verify, validate, or collect evidence: an implementation Task's completion contract demands repository changes, so a read-only Task wedges its worker. When verification fails, create the Task that fixes the defect.
 - Author acceptance checks the way you will settle them: a behavior settled by exercising the delivered software is a `task_validation` check you verify and record yourself; reserve `manual` for judgment only a person can make. Never author a machine-verifiable behavior as a user-attested check. The genesis baseline records every Charter acceptance statement as a `manual` check, so on the Charter handoff turn revise the baseline milestone definition to give each check the source you will settle it by, and ask the user to approve that revision in the same startup note.
 - Only the user may approve a Charter, material amendment, release-gating document, manual check, waiver, validation attestation, or release. You may decide a Task workflow's human-required review only through the typed `task.review` action.
@@ -855,7 +855,7 @@ const PROJECT_SKILL_SECTION_MILESTONES: &str = r#"MILESTONES AND EVIDENCE
 - You have your own Project workspace, and your turn runs inside it. `forge/` is yours to keep: memory, notes, decisions, checklists, helper scripts — anything you or a later run needs to pick up, written with the workspace write tool. `checkout/` is a disposable detached copy of the repository. Read it and run it — build the software, run its tests, start it, exercise the behaviour an acceptance check asserts — so that what you record is something you observed rather than something you expect.
 - `checkout/` is not how software gets built. It carries no branch anything merges and no push path, so an edit you make there reaches nobody; implementation belongs to Tasks. Use it to find out whether the delivered outcome actually behaves, and when it does not, say so and create the Task that fixes it.
 - Read what Task runs reported with `project.observations` before you judge them: it returns worklog entries with the execution and role that wrote them, and the artifacts those runs captured, with captured text inline. Check the observation, then decide — accept it, record a failing result, or dispatch a corrective Task.
-- When you record a result with `project.validation`, name the Task in `observed_task_id` if a Task run produced the observation. Omit it only when you exercised the software yourself in your workspace. Never name a Task that did not run: a cited Task is verified. Cite the artifact backing the observation with `evidence_asset_id` — one the Task captured, or one you captured yourself.
+- When you record a result with `project.validation`, cite the commands you ran in `observed_command_ids`; name the delivered Task in `observed_task_id` for traceability only. Never name a Task that did not run: a cited Task is verified. Cite the artifact backing the observation with `evidence_asset_id` — one the Task captured, or one you captured yourself.
 - Multiple milestones may be active; primary_milestone_id identifies the single outcome emphasized in the Overview.
 - Live progress is derived from current Tasks and validation. Report concrete counts/states and failed or missing checks; do not imply that completion equals release.
 - Reuse authorized existing media assets when possible. Give every image/video a caption, evidence kind, source Task/run when applicable, and acceptance check it supports. Media is evidence only when provenance and relevance are clear.
@@ -1124,8 +1124,9 @@ mod tests {
         const V120_MIGRATION: &str = include_str!(
             "../../db/migrations/V120__verification_is_the_project_agents_own_work.sql"
         );
-        const V121_MIGRATION: &str =
-            include_str!("../../db/migrations/V121__author_checks_the_way_you_settle_them.sql");
+        const V125_MIGRATION: &str = include_str!(
+            "../../db/migrations/V125__validation_cites_the_agents_own_observations.sql"
+        );
         const V106_MIGRATION: &str =
             include_str!("../../db/migrations/V106__charter_execution_and_agent_availability.sql");
 
@@ -1178,10 +1179,10 @@ mod tests {
         assert!(V116_MIGRATION.contains("forge.project.orchestration/v1@10"));
         assert!(V119_MIGRATION.contains("forge.project.orchestration/v1@11"));
         assert!(V120_MIGRATION.contains("forge.project.orchestration/v1@12"));
-        assert!(V121_MIGRATION.contains("forge.project.orchestration/v1@13"));
-        let seeded_project = seeded_body(V121_MIGRATION, "Forge Project Agent");
+        assert!(V125_MIGRATION.contains("forge.project.orchestration/v1@14"));
+        let seeded_project = seeded_body(V125_MIGRATION, "Forge Project Agent");
         assert_eq!(seeded_project, canonical_project_operating_skill_body());
-        assert!(V121_MIGRATION.contains(PROJECT_OPERATING_SKILL_CONTENT_DIGEST));
+        assert!(V125_MIGRATION.contains(PROJECT_OPERATING_SKILL_CONTENT_DIGEST));
         assert_eq!(
             sha256_hex(canonical_project_operating_skill_body()),
             PROJECT_OPERATING_SKILL_CONTENT_DIGEST

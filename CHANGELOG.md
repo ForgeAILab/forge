@@ -8,6 +8,24 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **A `task_validation` result must cite the Agent's own command
+  observations.** Every command a Project Agent runs in its verification
+  `checkout/` through `forge_task_command` is now recorded as an observation
+  (migration V124, `project_command_observation`: program, arguments, exit
+  status, a digest of the complete output, the session that ran it) and the
+  tool returns its `observation_id`. `project.validation` (`record`) gains
+  `observed_command_ids`; a `pass` or `fail` recorded by an Agent on a
+  `task_validation` check is refused unless it cites at least one observation
+  that is the Agent's own, in this Project, and newer than the delivered work
+  (the newest `done` Task bound to the milestone, or the definition when none
+  has landed). `observed_task_id` is traceability only and settles nothing.
+  This closes the loop the doctrine only described: on a delivery wake the
+  Agent had recorded five passes in fifty seconds from the reviewer's report,
+  with no build in its checkout, and readiness accepted them. Operating skill
+  revision `forge.project.orchestration/v1@14` (migration V125) states the
+  mechanism, and the delivery work order names it. Blocked, stale, and
+  unavailable results carry no observation because they claim none.
+
 - **`AcceptanceEvidenceRequirement` loses `check_definition_revision`.**
   Evidence freshness is defined against the milestone's current definition
   revision, full stop. The per-requirement pin was stamped by genesis with the

@@ -66,7 +66,7 @@ pub use protected_store::{
     CreateOAuthCredential, CredentialRevocationOutcome, OAuthCredentialBundle,
     SqliteProtectedRuntimeStore,
 };
-pub use typed_tools::PROJECT_VERIFICATION_CHECKOUT_DIR;
+pub use typed_tools::{CommandObservation, PROJECT_VERIFICATION_CHECKOUT_DIR};
 pub use typed_tools::{
     FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL, FORGE_MAIN_ORCHESTRATION_READ_TOOL,
     FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL, FORGE_PROJECT_ORCHESTRATION_READ_TOOL,

@@ -1107,7 +1107,10 @@ Project Agent Chat turn composes against it (`WorkspaceAccess::ProjectVerify`).
 An acceptance check that asserts the whole delivered outcome is settled by the
 Project Agent itself: it exercises the software in `checkout/` (its command
 tool runs there, never at the workspace root, so a build tool's upward
-manifest search cannot escape into the host's own repository), records the
+manifest search cannot escape into the host's own repository; every command
+is recorded as a `project_command_observation` whose id the Agent must cite
+in `observed_command_ids` for a `task_validation` pass or fail, newer than
+the delivered Task, or the record is refused), records the
 result with `project.validation` (naming `observed_task_id` only when a Task
 run made the observation), and captures its proof with `project.evidence`
 (`capture`), which stores the artifact as a project-scoped media asset and

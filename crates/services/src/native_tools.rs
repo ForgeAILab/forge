@@ -32,8 +32,8 @@ use db::{
 use forge_agent_host::{
     contains_adaptive_authority_override, contains_authority_override, operation_contract,
     operation_descriptor, operation_permission, AgentHostError, CanonicalScope, CanonicalScopeType,
-    ForgeToolProvider, OperationClassification, PublicSearchScope, WorkspaceAccess,
-    MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
+    CommandObservation, ForgeToolProvider, OperationClassification, PublicSearchScope,
+    WorkspaceAccess, MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
     MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READINESS_OPERATION, MAIN_CHARTER_READ_OPERATION,
     MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION, MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
     MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
@@ -2870,6 +2870,49 @@ impl CoordinationToolProvider {
 
 #[async_trait]
 impl ForgeToolProvider for CoordinationToolProvider {
+    async fn observe_command(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        observation: CommandObservation,
+    ) -> Result<Value, AgentHostError> {
+        // The observation belongs to the Project this session is bound to;
+        // the binding, not the payload, says which Project that is.
+        let project_id = self
+            .authorization
+            .project_orchestration_target(actor_identity_id, scope)
+            .await
+            .map_err(service_error)?;
+        let id = db::new_uuid_v4();
+        let now = db::now_rfc3339();
+        sqlx::query(
+            "INSERT INTO project_command_observation (
+                id, project_id, actor_identity_id, scope_type, scope_id, session_id, turn_id,
+                program, args_json, exit_code, success, output_digest, stdout_excerpt,
+                stderr_excerpt, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(&project_id)
+        .bind(actor_identity_id)
+        .bind(scope_type_name(scope.scope_type))
+        .bind(&scope.scope_id)
+        .bind(&observation.session_id)
+        .bind(observation.turn_id.as_deref())
+        .bind(&observation.program)
+        .bind(serde_json::to_string(&observation.args).unwrap_or_else(|_| "[]".to_owned()))
+        .bind(observation.exit_code)
+        .bind(i64::from(observation.success))
+        .bind(&observation.output_digest)
+        .bind(&observation.stdout_excerpt)
+        .bind(&observation.stderr_excerpt)
+        .bind(&now)
+        .execute(self.db.pool())
+        .await
+        .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+        Ok(json!({"observation_id": id, "recorded_at": now}))
+    }
+
     fn public_search_configured(&self) -> bool {
         self.public_search_config()
             .is_some_and(|config| config.endpoint.is_some() && config.validate().is_ok())
