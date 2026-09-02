@@ -1404,6 +1404,12 @@ defined states.
 6. If an `after_enter` hook returns `HookResult::Cascade`, recursively
    transition with `triggered_by = "system"`; cascade depth is limited to 3.
 
+A state with blocking `before_enter` hooks is persisted with a running entry
+barrier until those hooks settle. Task responses derive `awaiting_human` from
+the same Task snapshot as the returned optimistic `version`; a running barrier
+therefore cannot expose a gate decision using a version that the barrier-clear
+write is about to invalidate.
+
 **Dispatch failure entering an active state:** when a dispatch hook
 (`dispatch_role_agent` / `dispatch_fix_agent` / `dispatch_executor`) fails
 `on_enter` of an `active` state and the task has no running execution, the

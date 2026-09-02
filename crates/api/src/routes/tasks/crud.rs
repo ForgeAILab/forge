@@ -157,10 +157,10 @@ pub async fn get_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<TaskResponse>> {
-    let awaiting_human = state.task_service.is_awaiting_human(id.clone()).await?;
     let task = TaskRepo::get_by_id(&*state.db, &id, false)
         .await?
         .ok_or_else(|| ApiError::not_found("task", id))?;
+    let awaiting_human = state.task_service.is_task_awaiting_human(&task).await?;
     let response = task_response_with_awaiting_human(&state.db, task, awaiting_human).await?;
     Ok(Json(response))
 }
