@@ -1348,6 +1348,20 @@ impl MilestoneRuntime {
         let candidate = readiness_from_record(record.clone())?;
         let snapshot_watermark = Some(candidate.source_event_watermark.clone());
         let current_watermark = Some(self.source_watermark_in_tx(&mut tx, project_id).await?);
+        // A release consumes exactly one readiness snapshot. `release()` only
+        // accepts the snapshot whose readiness transition produced the
+        // milestone's current version, then records its own one-step CAS, so
+        // a released milestone sits two versions past the snapshot it pinned.
+        let pinned_by_release = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM project_release
+             WHERE project_id = ? AND milestone_id = ? AND readiness_snapshot_id = ?",
+        )
+        .bind(project_id)
+        .bind(milestone_id)
+        .bind(snapshot_id)
+        .fetch_one(&mut *tx)
+        .await?
+            > 0;
         let recheck = self
             .recheck_readiness_in_tx(&mut tx, project_id, milestone_id, record)
             .await;
@@ -1355,13 +1369,21 @@ impl MilestoneRuntime {
         let (status, reason) = match recheck {
             Ok(recheck) => {
                 let expected_current_version = candidate.expected_milestone_version.checked_add(1);
-                // The direct runtime evaluator records a released correction
-                // with its normal one-step CAS, while the command composite
-                // intentionally leaves a terminal released milestone version
-                // unchanged for an observational correction. Accept exactly
-                // those two representations; active/ready candidates still
-                // require the one readiness transition.
-                let version_matches = if recheck.milestone.lifecycle == "released" {
+                // The snapshot a release pinned is current at exactly the
+                // readiness transition plus the release transition. A later
+                // correction on the released milestone (the direct runtime
+                // evaluator's one-step CAS, or the command composite that
+                // leaves a terminal version unchanged) is a different
+                // snapshot with its own expected version; active/ready
+                // candidates still require the one readiness transition.
+                let version_matches = if recheck.milestone.lifecycle == "released"
+                    && pinned_by_release
+                {
+                    candidate
+                        .expected_milestone_version
+                        .checked_add(2)
+                        .is_some_and(|version| recheck.milestone.version == version)
+                } else if recheck.milestone.lifecycle == "released" {
                     recheck.milestone.version == candidate.expected_milestone_version
                         || expected_current_version
                             .is_some_and(|version| recheck.milestone.version == version)

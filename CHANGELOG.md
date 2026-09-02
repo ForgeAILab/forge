@@ -139,6 +139,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- A released milestone's Overview no longer reports its own release snapshot
+  as stale. `release()` only accepts the snapshot whose readiness transition
+  produced the milestone's current version and then records its own
+  compare-and-swap, so the pinned snapshot sits two versions behind the
+  released milestone; readiness freshness accepted one. Every release made
+  from the web (ShelfList `M001-r1`) came back with "Overview is stale" and a
+  Refresh button that re-fetched the same verdict. Freshness now recognizes a
+  release-pinned snapshot and counts both transitions; corrections recorded
+  on a released milestone keep their existing one-step or unchanged forms.
+
 - A Project Agent turn no longer dies when its model wraps a Forge tool call
   in a `parameters` object. OpenAI gpt-5.x models intermittently emit
   `{"parameters": {...}}` for the orchestration read and propose tools; the

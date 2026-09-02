@@ -10,9 +10,9 @@
 use std::sync::Arc;
 
 use api_types::{
-    AcceptanceCheckSourceKind, AcceptanceEvidenceRequirement, MilestoneAcceptanceCheck,
-    MilestoneDefinitionContent, MilestoneDefinitionLifecycle, PrincipalKind, PrincipalRef,
-    RevisionProvenance,
+    AcceptanceCheckSourceKind, AcceptanceEvidenceRequirement, AuthorizationProvenance,
+    MilestoneAcceptanceCheck, MilestoneDefinitionContent, MilestoneDefinitionLifecycle,
+    PrincipalKind, PrincipalRef, RevisionProvenance,
 };
 use db::{
     create_sqlite_pool, run_migrations, AgentActionExecutionStatus, AgentActionPolicyResult,
@@ -1728,6 +1728,68 @@ async fn released_correction_freshness_accepts_terminal_version_without_incremen
     assert_eq!(
         freshness.status,
         api_types::ReadinessFreshnessStatus::Current
+    );
+}
+
+#[tokio::test]
+async fn released_pinned_snapshot_stays_current_across_the_release_transition() {
+    // The snapshot a release pins is two milestone versions old by the time
+    // anyone reads it: readiness moved the milestone to `ready_for_release`
+    // and `release()` moved it to `released`. The Overview must not call that
+    // snapshot stale forever -- every UI release did until this was counted.
+    let db = fixture().await;
+    let mut readiness_request = readiness_command("release-pinned-readiness");
+    readiness_request.authorization.authorization_occurred_at = db::now_rfc3339();
+    let readiness = ProjectMilestoneCommandService::new(Arc::clone(&db))
+        .request_readiness(readiness_request, None)
+        .await
+        .expect("readiness candidate persists");
+    assert_eq!(readiness.outcome, "ready");
+    assert_eq!(readiness.expected_milestone_version, 1);
+
+    let releasing_user = PrincipalRef {
+        kind: PrincipalKind::User,
+        id: USER_ID.to_owned(),
+        display_name: Some("Release approver".to_owned()),
+    };
+    let runtime = MilestoneRuntime::new(Arc::clone(&db));
+    let release = runtime
+        .release(
+            PROJECT_ID,
+            &releasing_user,
+            &AuthorizationProvenance {
+                principal: releasing_user.clone(),
+                authorization_basis: "interactive_user_release".to_owned(),
+                action: "project.milestone.release".to_owned(),
+                event_id: "release-pinned-event".to_owned(),
+                occurred_at: db::now_rfc3339(),
+            },
+            MILESTONE_ID,
+            2,
+            &readiness.id,
+            &readiness.readiness_digest,
+            "release-pinned-key",
+        )
+        .await
+        .expect("the ready milestone releases");
+    assert_eq!(release.snapshot.readiness_snapshot_id, readiness.id);
+    let state: (i64, String) =
+        sqlx::query_as("SELECT version, lifecycle FROM project_milestone WHERE id = ?")
+            .bind(MILESTONE_ID)
+            .fetch_one(db.pool())
+            .await
+            .expect("released milestone state");
+    assert_eq!(state, (3, "released".to_owned()));
+
+    let freshness = runtime
+        .readiness_freshness(PROJECT_ID, MILESTONE_ID, &readiness.id)
+        .await
+        .expect("pinned snapshot freshness");
+    assert_eq!(
+        freshness.status,
+        api_types::ReadinessFreshnessStatus::Current,
+        "{:?}",
+        freshness.reason
     );
 }
 
