@@ -139,6 +139,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- A Project Agent turn no longer dies when its model wraps a Forge tool call
+  in a `parameters` object *and* omits `dedupe_key`. The envelope admitted
+  in the previous fix copied the tool schema verbatim, so the copy still
+  carried `required`; a wrapped call missing the key failed the runtime's
+  provider validator and ended the attempt (PantryPal's handoff turn lost its
+  first attempt that way). The envelope copy is now as lenient as the root,
+  and `prepare` refuses the missing field in-turn for both shapes.
+
 - A native Agent Chat turn on the ChatGPT Codex backend no longer dies with
   "Responses stream emitted conflicting terminal events". The backend keeps
   the SSE connection open after `response.completed` / `response.failed`

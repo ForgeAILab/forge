@@ -1002,7 +1002,14 @@ fn tolerate_parameters_envelope(schema: Value) -> Value {
     let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
         return schema;
     };
-    let inner = schema.clone();
+    // Neither shape keeps a `required` list: the envelope copy must be as
+    // lenient as the root, or a wrapped call that omits `dedupe_key` still
+    // ends the turn at the provider validator instead of in `prepare`
+    // (PantryPal's handoff turn lost its first attempt exactly that way).
+    let mut inner = schema.clone();
+    inner
+        .as_object_mut()
+        .map(|object| object.remove("required"));
     let mut properties = properties.clone();
     properties.insert("parameters".to_owned(), inner);
     let mut envelope = schema;
@@ -2340,6 +2347,21 @@ mod tests {
                 .is_err(),
             "the envelope carries the same shape, not a looser one"
         );
+        // A missing required field is `prepare`'s to refuse in-turn, in both
+        // shapes: the provider validator must admit the call so the model
+        // sees a correctable error instead of a dead turn.
+        let mut missing_dedupe = plain.clone();
+        missing_dedupe.as_object_mut().unwrap().remove("dedupe_key");
+        assert!(
+            validator.validate(&missing_dedupe).is_ok(),
+            "plain call without dedupe_key passes the schema"
+        );
+        assert!(
+            validator
+                .validate(&json!({"parameters": missing_dedupe.clone()}))
+                .is_ok(),
+            "enveloped call without dedupe_key passes the schema"
+        );
         // `prepare` unwraps the envelope and enforces the required fields.
         let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
             root: "<none>".to_owned(),
@@ -2355,11 +2377,19 @@ mod tests {
         let refused = tool
             .prepare(
                 json!({"parameters": {"payload": {}}}),
-                &command_preparation_context(workspace),
+                &command_preparation_context(workspace.clone()),
             )
             .await
             .expect_err("a call missing its operation is refused in prepare");
         assert!(refused.to_string().contains("operation"), "{refused}");
+        let refused = tool
+            .prepare(
+                json!({"parameters": missing_dedupe}),
+                &command_preparation_context(workspace),
+            )
+            .await
+            .expect_err("an enveloped call missing dedupe_key is refused in prepare");
+        assert!(refused.to_string().contains("dedupe_key"), "{refused}");
     }
 
     #[tokio::test]
