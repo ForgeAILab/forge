@@ -988,6 +988,44 @@ struct ForgeScopeReadTool {
     reject_authority_overrides: bool,
 }
 
+/// Let a provider-emitted call wrap its arguments in a `parameters` object.
+///
+/// OpenAI gpt-5.x models intermittently emit `{"parameters": {...}}` for a
+/// tool whose schema names no such property. The runtime validates the
+/// provider's call against the tool schema before Forge sees it, and a
+/// mismatch fails the whole turn — three attempts in a row on a delivery
+/// wake, leaving a milestone unverified. As with the null-tolerant payload
+/// below, the provider-facing schema admits the envelope and `prepare`
+/// unwraps it; every required field stays enforced there, where a rejection
+/// returns to the model in-turn instead of ending the turn.
+fn tolerate_parameters_envelope(schema: Value) -> Value {
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return schema;
+    };
+    let inner = schema.clone();
+    let mut properties = properties.clone();
+    properties.insert("parameters".to_owned(), inner);
+    let mut envelope = schema;
+    envelope["properties"] = Value::Object(properties);
+    envelope
+        .as_object_mut()
+        .map(|object| object.remove("required"));
+    envelope
+}
+
+/// Undo the envelope `tolerate_parameters_envelope` admits: a call that carries
+/// only `parameters` is the call inside it.
+fn unwrap_parameters_envelope(arguments: Value) -> Value {
+    let is_envelope = arguments.as_object().is_some_and(|object| {
+        object.len() == 1 && object.get("parameters").is_some_and(Value::is_object)
+    });
+    if is_envelope {
+        arguments["parameters"].clone()
+    } else {
+        arguments
+    }
+}
+
 impl ForgeScopeReadTool {
     fn new(
         actor_identity_id: String,
@@ -1053,7 +1091,7 @@ impl ForgeScopeReadTool {
         ToolSpec::new(
             self.tool_name,
             description,
-            schema,
+            tolerate_parameters_envelope(schema),
             ToolEffects::new(Vec::new()),
         )
         .with_permission_upper_bound(PermissionSet::single(Permission::other(
@@ -1073,6 +1111,7 @@ impl Tool for ForgeScopeReadTool {
         arguments: Value,
         ctx: &PreparationContext,
     ) -> Result<PreparedToolCall, RuntimeError> {
+        let arguments = unwrap_parameters_envelope(arguments);
         let object = arguments
             .as_object()
             .ok_or_else(|| RuntimeError::tool("Forge read arguments must be an object"))?;
@@ -1354,7 +1393,7 @@ impl ForgeScopeProposeTool {
         ToolSpec::new(
             self.tool_name,
             description,
-            schema,
+            tolerate_parameters_envelope(schema),
             ToolEffects::new(Vec::new()),
         )
         .with_permission_upper_bound(PermissionSet::single(Permission::other(
@@ -1374,7 +1413,7 @@ impl Tool for ForgeScopeProposeTool {
         arguments: Value,
         ctx: &PreparationContext,
     ) -> Result<PreparedToolCall, RuntimeError> {
-        let mut arguments = arguments;
+        let mut arguments = unwrap_parameters_envelope(arguments);
         let operation = required_string(&arguments, "operation")?.to_owned();
         let operation = operation.as_str();
         if !self.operations.contains(operation) {
@@ -2265,6 +2304,62 @@ mod tests {
             "unexpected refusal: {refused}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn orchestration_tools_admit_and_unwrap_a_parameters_envelope() {
+        let scope = CanonicalScope {
+            scope_type: CanonicalScopeType::Project,
+            scope_id: "project-1".to_owned(),
+            workspace_access: WorkspaceAccess::Deny,
+        };
+        let tool = ForgeScopeProposeTool::new(
+            "agent-1".to_owned(),
+            scope,
+            vec![PROJECT_READINESS_OPERATION.to_owned()],
+            Arc::new(TestProvider::default()),
+        );
+        let plain = json!({
+            "operation": PROJECT_READINESS_OPERATION,
+            "payload": {"action": "evaluate", "milestone_id": "m-1", "milestone_version": 1},
+            "dedupe_key": "readiness-1",
+            "correlation_id": "readiness-1"
+        });
+        let enveloped = json!({"parameters": plain.clone()});
+        // The provider-facing schema, which the runtime validates the model's
+        // call against before Forge sees it, admits both shapes.
+        let validator = jsonschema::validator_for(&tool.spec().input_schema).expect("schema");
+        assert!(validator.validate(&plain).is_ok(), "plain call validates");
+        assert!(
+            validator.validate(&enveloped).is_ok(),
+            "enveloped call validates"
+        );
+        assert!(
+            validator
+                .validate(&json!({"parameters": {"operation": 7}}))
+                .is_err(),
+            "the envelope carries the same shape, not a looser one"
+        );
+        // `prepare` unwraps the envelope and enforces the required fields.
+        let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
+            root: "<none>".to_owned(),
+        });
+        let prepared = tool
+            .prepare(enveloped, &command_preparation_context(workspace.clone()))
+            .await
+            .expect("enveloped call prepares");
+        assert_eq!(
+            prepared.arguments()["operation"],
+            PROJECT_READINESS_OPERATION
+        );
+        let refused = tool
+            .prepare(
+                json!({"parameters": {"payload": {}}}),
+                &command_preparation_context(workspace),
+            )
+            .await
+            .expect_err("a call missing its operation is refused in prepare");
+        assert!(refused.to_string().contains("operation"), "{refused}");
     }
 
     #[tokio::test]

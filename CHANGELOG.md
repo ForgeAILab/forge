@@ -139,6 +139,28 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- A Project Agent turn no longer dies when its model wraps a Forge tool call
+  in a `parameters` object. OpenAI gpt-5.x models intermittently emit
+  `{"parameters": {...}}` for the orchestration read and propose tools; the
+  runtime validates the provider's call against the tool schema before Forge
+  sees it, and the mismatch failed the whole turn — three attempts in a row
+  on a NoteStash delivery wake, leaving the milestone unverified after the
+  Agent had already run thirteen verification commands. The provider-facing
+  schema of both tools now admits the envelope and `prepare` unwraps it; every
+  required field is still enforced there, where a rejection returns to the
+  model in-turn.
+
+- A Project Agent can build the delivered software in its checkout when the
+  Forge data directory sits inside another Cargo workspace. Cargo climbs from
+  `checkout/Cargo.toml` to the nearest parent `[workspace]` manifest, and a
+  `--data-dir ./test` development server keeps the checkout inside Forge's own
+  repository, so every `cargo build`, `cargo test`, and `cargo clippy` the
+  Agent ran was refused as an unlisted workspace member and the Agent
+  dispatched a fix Task for a defect the software did not have. The
+  verification workspace root now carries a boundary manifest — a workspace
+  whose only member is `checkout` — written once when the workspace is
+  prepared and never overwritten.
+
 - Releases approved through the web client load again. The immutable release
   snapshot digests the releasing principal as the authorization receipt
   carried it — display name included, which the signed-in web client always

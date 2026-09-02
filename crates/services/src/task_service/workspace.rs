@@ -406,6 +406,7 @@ pub async fn ensure_project_agent_workspace(
     std::fs::create_dir_all(workspace.join(PROJECT_AGENT_DOCS_DIR)).map_err(|error| {
         ServiceError::invalid_operation(format!("Project Agent workspace is unavailable: {error}"))
     })?;
+    write_verification_workspace_boundary(&workspace)?;
     let Some(repo_id) = ProjectRepo::get_by_id(db, project_id)
         .await?
         .and_then(|project| project.primary_repo_id)
@@ -441,6 +442,41 @@ pub async fn ensure_project_agent_workspace(
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
     }
     Ok(Some(workspace))
+}
+
+/// The manifest that stops cargo's upward workspace search at the
+/// verification workspace root.
+///
+/// Cargo resolves a package's workspace by climbing from its manifest to the
+/// nearest parent `Cargo.toml` that declares `[workspace]`. A Project Agent's
+/// checkout lives inside the Forge data directory, and a development server
+/// keeps that directory inside Forge's own repository — so a build in
+/// `checkout/` climbed into Forge's workspace and was refused as an unlisted
+/// member ("current package believes it's in a workspace when it's not").
+/// This root manifest is the nearest workspace instead, with the checkout as
+/// its only member. A checkout that declares its own `[workspace]` never
+/// reaches it; a checkout without a `Cargo.toml` never consults it.
+pub const VERIFICATION_WORKSPACE_BOUNDARY_MANIFEST: &str =
+    "# Forge verification workspace boundary.
+# Cargo searches upward from checkout/ for a workspace root; this manifest is
+# that root, so a build there never resolves against whatever repository
+# holds this data directory. Do not add packages here.
+[workspace]
+members = [\"checkout\"]
+resolver = \"2\"
+";
+
+/// Write the workspace-boundary manifest at `workspace` unless one exists.
+pub(crate) fn write_verification_workspace_boundary(workspace: &Path) -> Result<()> {
+    let manifest = workspace.join("Cargo.toml");
+    if manifest.exists() {
+        return Ok(());
+    }
+    std::fs::write(&manifest, VERIFICATION_WORKSPACE_BOUNDARY_MANIFEST).map_err(|error| {
+        ServiceError::invalid_operation(format!(
+            "Project Agent workspace boundary could not be written: {error}"
+        ))
+    })
 }
 
 /// The one directory a Project Agent may write to, inside its workspace.
@@ -568,6 +604,31 @@ pub(crate) fn default_workspace_root() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn verification_workspace_boundary_is_written_once_and_names_the_checkout() {
+        let root = std::env::temp_dir().join(format!(
+            "forge-verify-boundary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&root).expect("workspace root");
+        super::write_verification_workspace_boundary(&root).expect("boundary written");
+        let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("manifest");
+        assert!(manifest.contains("[workspace]"));
+        assert!(manifest.contains("members = [\"checkout\"]"));
+        // An existing manifest is the operator's; it is never overwritten.
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n").expect("rewrite");
+        super::write_verification_workspace_boundary(&root).expect("idempotent");
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.toml")).expect("manifest"),
+            "[workspace]\nmembers = []\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     use super::*;
     use db::{create_sqlite_pool, run_migrations, CreateProject, CreateRepo, UpdateProject};
     use tempfile::TempDir;

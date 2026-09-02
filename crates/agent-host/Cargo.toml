@@ -28,4 +28,5 @@ url = "2"
 workspace = true
 
 [dev-dependencies]
+jsonschema = { version = "0.28", default-features = false }
 tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread"] }
