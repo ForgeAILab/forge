@@ -1138,6 +1138,14 @@ state, the server auto-escalates to the user-routing-override path. MCP
 `forge_transition_task` is unchanged — it still emits `triggered_by="system"`
 and does not support user override (REST-only for now).
 
+`POST /api/v1/tasks/{id}/gates/{state_name}/approve` and `/reject` accept the
+current Task `version`. A gate with blocking entry checks is not decision-ready
+until its entry barrier settles: Task responses keep `awaiting_human = false`
+for that Task snapshot, and an early decision returns HTTP 409 with
+`code: "validation_error"`. The response's `awaiting_human` value and `version`
+are derived from the same Task snapshot so a barrier-clear write cannot expose
+readiness paired with the version it just invalidated.
+
 ## Task intent actions
 
 Intent endpoints accept an optional `TaskActionRequest` body:

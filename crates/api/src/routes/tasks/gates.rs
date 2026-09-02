@@ -71,6 +71,11 @@ async fn transition_gate(
             task.status
         )));
     }
+    if task.entry_barrier_is_running() {
+        return Err(ApiError::invalid_operation_conflict(format!(
+            "gate '{state_name}' is still running its entry checks; wait for them to finish before approving or rejecting"
+        )));
+    }
     ensure_gate_decision_ready(state, &task_id, gate_state).await?;
 
     if decision == GateDecision::Approve && state_name == default_states::REVIEW {
@@ -83,11 +88,9 @@ async fn transition_gate(
             .is_some_and(|review| review.status == ReviewStatus::AwaitingHuman)
         {
             let (task, _) = state.task_service.approve_review(task_id).await?;
-            let mut response = task_response(&state.db, task).await?;
-            response.awaiting_human = state
-                .task_service
-                .is_awaiting_human(response.id.clone())
-                .await?;
+            let awaiting_human = state.task_service.is_task_awaiting_human(&task).await?;
+            let response =
+                task_response_with_awaiting_human(&state.db, task, awaiting_human).await?;
             return Ok(response);
         }
     }
@@ -107,11 +110,12 @@ async fn transition_gate(
         )
         .await?;
 
-    let mut response = task_response(&state.db, result.task).await?;
-    response.awaiting_human = state
+    let awaiting_human = state
         .task_service
-        .is_awaiting_human(response.id.clone())
+        .is_task_awaiting_human(&result.task)
         .await?;
+    let response =
+        task_response_with_awaiting_human(&state.db, result.task, awaiting_human).await?;
     Ok(response)
 }
 

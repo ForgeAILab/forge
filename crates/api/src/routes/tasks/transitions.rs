@@ -15,11 +15,12 @@ pub async fn transition_task(
         .task_service
         .transition(id, request.status, options)
         .await?;
-    let mut response = task_response(&state.db, result.task).await?;
-    response.awaiting_human = state
+    let awaiting_human = state
         .task_service
-        .is_awaiting_human(response.id.clone())
+        .is_task_awaiting_human(&result.task)
         .await?;
+    let response =
+        task_response_with_awaiting_human(&state.db, result.task, awaiting_human).await?;
     Ok(Json(TransitionTaskResponse {
         task: response,
         review: result.review.map(review_response),

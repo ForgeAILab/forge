@@ -6,6 +6,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Review gate no longer reports `awaiting_human` before its entry has
+  settled.** Entering a state with blocking `before_enter` hooks persists the
+  transition behind a running entry barrier, and the engine clears that barrier
+  (bumping the Task version) once the hooks finish. `awaiting_human` could
+  already read true in between, so a client that read the Task and then
+  approved or rejected with that version hit a spurious `version_conflict`.
+  `awaiting_human` is now derived from the same Task snapshot as the returned
+  `version`, staying false while that snapshot's barrier is running. The
+  `POST /api/v1/tasks/{id}/gates/{state}/approve` and `/reject` endpoints also
+  refuse with 409 `validation_error` until it clears.
+
 ## [0.9.0] - 2026-09-02
 
 ### Breaking
