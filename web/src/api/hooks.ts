@@ -100,6 +100,7 @@ import type {
   Workspace,
 } from '@/types/generated'
 import type { AuthorizationProvenance } from '@/types/generated/bindings/AuthorizationProvenance'
+import type { MilestoneDefinitionRevision } from '@/types/generated/bindings/MilestoneDefinitionRevision'
 import { recordUserInitiatedTransition } from '@/lib/notification-toast-suppression'
 
 type TaskSearch = {
@@ -252,6 +253,46 @@ export type ProjectMilestoneReleaseInput = {
   readinessDigest: string
   idempotencyKey: string
   authorization: AuthorizationProvenance
+}
+
+export type ApproveMilestoneRevisionInput = {
+  projectId: string
+  milestoneId: string
+  revisionId: string
+  expectedMilestoneVersion: number
+  idempotencyKey: string
+  authorization: AuthorizationProvenance
+}
+
+/**
+ * Approve a `draft` / `proposed` milestone definition revision as the
+ * signed-in user. The compare-and-swap version is the milestone's, not the
+ * revision's: the transition moves the milestone's current definition.
+ */
+export function useApproveMilestoneRevision() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async (input: ApproveMilestoneRevisionInput) =>
+      apiFetch<MilestoneDefinitionRevision>(
+        `/projects/${input.projectId}/milestones/${input.milestoneId}/revisions/${input.revisionId}/transition`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            mutation: {
+              expected_version: input.expectedMilestoneVersion,
+              expected_digest: null,
+              idempotency_key: input.idempotencyKey,
+              deduplication_key: null,
+              authorization: input.authorization,
+            },
+            lifecycle: 'approved',
+          }),
+        },
+      ),
+    onSuccess: (_, input) => {
+      void queryClient.invalidateQueries({ queryKey: qk.projectOverview(input.projectId) })
+    },
+  })
 }
 
 export function useReleaseProjectMilestone() {

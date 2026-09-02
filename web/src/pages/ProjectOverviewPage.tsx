@@ -19,6 +19,7 @@ import {
 } from '@phosphor-icons/react'
 import { apiFetchBlob } from '@/api/client'
 import {
+  useApproveMilestoneRevision,
   useProjectOverviewQuery,
   useRecordManualMilestoneCheck,
   useReleaseProjectMilestone,
@@ -1527,12 +1528,18 @@ function ErrorState({
 function NextActionCard({
   projectId,
   nextAction,
+  milestones,
 }: {
   projectId: string
   nextAction: ProjectNextAction | null
+  milestones: ProjectMilestoneOverview[]
 }) {
   const action = nextAction
   const isReleaseAction = action?.action_kind === 'release'
+  const approvalTarget =
+    action?.code === 'milestone_definition_approval'
+      ? (milestones.find((entry) => entry.definition.id === action.target_id) ?? null)
+      : null
   return (
     <SectionCard title="Next action" eyebrow="User decision / action">
       <div className="flex min-w-0 items-start gap-3 rounded-md border border-ember-border bg-ember-surface p-3">
@@ -1569,7 +1576,13 @@ function NextActionCard({
               {action.blocking ? 'Blocking action' : 'Recommended next action'}
             </p>
           ) : null}
-          {isReleaseAction ? (
+          {approvalTarget && action ? (
+            <MilestoneRevisionApprovalControl
+              projectId={projectId}
+              target={approvalTarget}
+              expectedVersion={numberValue(action.expected_version)}
+            />
+          ) : isReleaseAction ? (
             <a
               href="#readiness"
               className="mt-3 inline-flex items-center gap-1 text-xs font-semibold text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -1588,6 +1601,77 @@ function NextActionCard({
         </div>
       </div>
     </SectionCard>
+  )
+}
+
+/**
+ * The one user action behind `milestone_definition_approval`: approve the
+ * milestone's current `proposed` definition revision in place. Until it is
+ * approved every downstream action is measured against an unapproved
+ * contract, and the stale banner's Refresh only re-fetches the same state.
+ */
+function MilestoneRevisionApprovalControl({
+  projectId,
+  target,
+  expectedVersion,
+}: {
+  projectId: string
+  target: ProjectMilestoneOverview
+  expectedVersion: number | null
+}) {
+  const approval = useApproveMilestoneRevision()
+  const [error, setError] = useState<string | null>(null)
+  const revisionNumber = numberValue(target.definition.revision_number)
+  const milestoneVersion = expectedVersion ?? numberValue(target.milestone.version)
+
+  async function approve() {
+    setError(null)
+    approval.reset?.()
+    if (milestoneVersion === null) {
+      setError('The milestone version is unavailable; refresh the Overview and try again.')
+      return
+    }
+    try {
+      await approval.mutateAsync({
+        projectId,
+        milestoneId: target.milestone.id,
+        revisionId: target.definition.id,
+        expectedMilestoneVersion: milestoneVersion,
+        idempotencyKey: newIdempotencyKey('milestone-revision-approve'),
+        authorization: createUserAuthorization(
+          'project.milestone.revision.transition',
+          'interactive_user_approval',
+        ),
+      })
+    } catch (caught) {
+      setError(
+        getApiErrorMessage(
+          caught,
+          'The definition revision could not be approved. Refresh the Overview and try again.',
+        ),
+      )
+    }
+  }
+
+  return (
+    <div className="mt-3 flex flex-col gap-2">
+      <p className="text-xs leading-5 text-muted-foreground">
+        {target.milestone.display_label}: definition revision{' '}
+        {revisionNumber ?? '—'} is {humanize(target.definition.lifecycle)}.
+      </p>
+      <div>
+        <Button size="sm" disabled={approval.isPending} onClick={() => void approve()}>
+          {approval.isPending
+            ? 'Approving…'
+            : `Approve definition revision ${revisionNumber ?? ''}`.trim()}
+        </Button>
+      </div>
+      {error ? (
+        <p role="alert" className="break-words text-xs leading-5 text-destructive">
+          {error}
+        </p>
+      ) : null}
+    </div>
   )
 }
 
@@ -2031,7 +2115,11 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
           </div>
           {hideNextAction ? null : (
             <div className="order-2 min-w-0 xl:order-none">
-              <NextActionCard projectId={projectId} nextAction={overview.next_action} />
+              <NextActionCard
+                projectId={projectId}
+                nextAction={overview.next_action}
+                milestones={overview.active_milestones}
+              />
             </div>
           )}
           {hideDocuments ? null : (

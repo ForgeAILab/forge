@@ -4,6 +4,7 @@ import type { ReactNode } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '@/api/client'
 import { useProjectOverviewQuery } from '@/api/hooks'
+import { useAuthStore } from '@/stores/auth'
 import { ProjectOverviewPage } from '@/pages/ProjectOverviewPage'
 import type { ProjectOverview, ProjectRelease } from '@/types/generated'
 
@@ -32,6 +33,7 @@ vi.mock('@tanstack/react-router', () => ({
 }))
 
 const releaseMutation = vi.hoisted(() => vi.fn())
+const approveRevision = vi.hoisted(() => vi.fn())
 vi.mock('@/api/hooks', () => ({
   useProjectOverviewQuery: vi.fn(),
   useRecordManualMilestoneCheck: vi.fn(() => ({
@@ -41,6 +43,12 @@ vi.mock('@/api/hooks', () => ({
     reset: vi.fn(),
   })),
   useReleaseProjectMilestone: releaseMutation,
+  useApproveMilestoneRevision: () => ({
+    mutateAsync: approveRevision,
+    isPending: false,
+    error: null,
+    reset: vi.fn(),
+  }),
   useProjectQuery: vi.fn(() => ({ data: undefined, isLoading: false })),
 }))
 
@@ -461,6 +469,65 @@ describe('ProjectOverviewPage', () => {
     expect(screen.getByText('Evidence may become stale.')).toBeTruthy()
     expect(screen.getByText('Document freshness')).toBeTruthy()
     expect(screen.getByText('Validation')).toBeTruthy()
+  })
+
+  it('lets the user approve a proposed milestone definition revision from the next action', async () => {
+    useAuthStore.setState({ user: { id: 'user-1', display_name: 'Test User' } as never })
+    approveRevision.mockResolvedValue({})
+    vi.mocked(useProjectOverviewQuery).mockReturnValue({
+      data: {
+        ...overview,
+        projection_state: 'stale',
+        active_milestones: [
+          {
+            ...activeMilestone,
+            milestone: { ...activeMilestone.milestone, version: 5n },
+            definition: {
+              ...activeMilestone.definition,
+              id: 'milestone-revision-2',
+              revision_number: 2n,
+              lifecycle: 'proposed' as const,
+            },
+          },
+        ],
+        next_action: {
+          code: 'milestone_definition_approval',
+          required_principal: 'user',
+          target_type: 'milestone_revision',
+          target_id: 'milestone-revision-2',
+          title: 'Approve the milestone definition revision',
+          explanation: 'The milestone definition revision is not approved.',
+          action_kind: 'approval',
+          route_or_operation: 'project.milestone.revision.transition',
+          blocking: true,
+          expected_version: 5n,
+        },
+      },
+      isLoading: false,
+      isFetching: false,
+      error: null,
+      refetch: vi.fn(),
+    } as never)
+
+    render(<ProjectOverviewPage projectId="project-1" />)
+
+    expect(screen.getByText('First release: definition revision 2 is Proposed.')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Approve definition revision 2' }))
+
+    await waitFor(() => expect(approveRevision).toHaveBeenCalledTimes(1))
+    const input = approveRevision.mock.calls[0][0]
+    expect(input).toMatchObject({
+      projectId: 'project-1',
+      milestoneId: 'milestone-1',
+      revisionId: 'milestone-revision-2',
+      expectedMilestoneVersion: 5,
+    })
+    expect(input.authorization).toMatchObject({
+      principal: { kind: 'user', id: 'user-1' },
+      action: 'project.milestone.revision.transition',
+      authorization_basis: 'interactive_user_approval',
+    })
+    expect(input.idempotencyKey).toBeTruthy()
   })
 
   it('routes release history to the authenticated immutable snapshot view', () => {

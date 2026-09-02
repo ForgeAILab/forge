@@ -1872,8 +1872,11 @@ parse. Its fields identify the action `code`, `required_principal`,
 `target_type`, `target_id`, `title`, `explanation`, `action_kind`,
 `route_or_operation`, `blocking`, and optional `expected_version`. The server
 resolves one action using this order: Charter adoption/setup; conflicts and
-reconciliation; Worker/reviewer/repository execution setup; milestone draft or
-user approval; blocked/failed Task remediation; missing or stale validation;
+reconciliation; Worker/reviewer/repository execution setup; user approval of a
+`draft`/`proposed` current milestone definition revision
+(`milestone_definition_approval`, `target_type: milestone_revision`, operation
+`project.milestone.revision.transition`, `expected_version` = the milestone's
+version); blocked/failed Task remediation; missing or stale validation;
 missing or stale evidence; readiness evaluation; exact user release; then
 definition of the next milestone. The client follows the typed route or
 operation and sends the expected version; it must not infer a mutation from

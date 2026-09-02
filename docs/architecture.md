@@ -798,8 +798,9 @@ It identifies an action `code`, the required principal, target type and id,
 human title/explanation, `action_kind`, canonical route or operation,
 whether it blocks the Project, and the expected version when a compare-and-swap
 mutation is required. The resolver gives conflicts/reconciliation and
-repository setup precedence over downstream work, then Task/validation/evidence
-remediation, readiness, user release, and finally
+repository setup precedence over downstream work, then user approval of an
+unapproved current milestone definition revision, then
+Task/validation/evidence remediation, readiness, user release, and finally
 milestone definition. Clients must render the action's target and operation;
 they must not infer an executable action from a stale badge, Task counts, or a
 free-form message.

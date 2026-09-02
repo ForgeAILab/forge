@@ -149,6 +149,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   release-pinned snapshot and counts both transitions; corrections recorded
   on a released milestone keep their existing one-step or unchanged forms.
 
+- A milestone whose current definition revision was never approved now gets
+  a real next action instead of a stale banner. When a Project Agent's
+  proposed revision stays `proposed` (InkDrop revision 2), the Overview
+  reported "Attach required evidence" for the Worker while every downstream
+  input was measured against an unapproved contract, and no client surface
+  offered the approval. `next_action` now resolves
+  `milestone_definition_approval` (`target_type: milestone_revision`,
+  operation `project.milestone.revision.transition`, `expected_version` = the
+  milestone's version) ahead of Task, validation, and evidence remediation,
+  and the Overview's Next action card carries the user's Approve button,
+  wired to the existing revision transition route.
+
 - A Project Agent turn no longer dies when its model wraps a Forge tool call
   in a `parameters` object. OpenAI gpt-5.x models intermittently emit
   `{"parameters": {...}}` for the orchestration read and propose tools; the

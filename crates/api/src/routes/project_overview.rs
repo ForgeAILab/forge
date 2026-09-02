@@ -1810,6 +1810,37 @@ fn next_action(context: NextActionContext<'_>) -> Option<ProjectNextAction> {
         }
     }
 
+    // A milestone whose current definition revision is still `draft` or
+    // `proposed` has no approved contract; validation, evidence, and
+    // readiness would all be measured against a definition nobody approved.
+    // The user's approval is the blocker there, not the Worker's evidence, and
+    // the stale banner alone gave the user nothing to act on.
+    if let Some(milestone) = milestones.iter().find(|milestone| {
+        milestone
+            .get("definition")
+            .and_then(|definition| definition.get("lifecycle"))
+            .and_then(Value::as_str)
+            .is_some_and(|lifecycle| lifecycle != "approved")
+    }) {
+        let revision_id = milestone.get("definition")?.get("id")?.as_str()?;
+        let version = milestone
+            .get("milestone")?
+            .get("version")
+            .and_then(Value::as_i64);
+        return Some(project_action!(
+            "milestone_definition_approval",
+            "user",
+            "milestone_revision",
+            revision_id,
+            "Approve the milestone definition revision",
+            "The milestone's current definition revision is not approved. Validation, evidence, and readiness are measured against an unapproved contract until a user approves or supersedes it.",
+            "approval",
+            "project.milestone.revision.transition",
+            true,
+            version,
+        ));
+    }
+
     if let Some(milestone) = milestones
         .iter()
         .find(|milestone| readiness_requires_contract_reconciliation(milestone))
@@ -2430,6 +2461,10 @@ mod next_action_parity_tests {
             "task.remediate",
             NextActionTarget::AutomatedByResponsiblePrincipal,
         ),
+        (
+            "project.milestone.revision.transition",
+            NextActionTarget::Rest,
+        ),
         ("project.milestone.check.record", NextActionTarget::Rest),
         (
             "project.milestone.check.evaluate",
@@ -2658,6 +2693,13 @@ mod next_action_parity_tests {
         scenarios.push(("acceptance_contract_reconciliation", fixture));
 
         let mut fixture = Fixture::base();
+        let mut milestone = default_milestone("milestone-8", 4);
+        milestone["definition"]["id"] = json!("revision-8");
+        milestone["definition"]["lifecycle"] = json!("proposed");
+        fixture.milestones = vec![milestone];
+        scenarios.push(("milestone_definition_approval", fixture));
+
+        let mut fixture = Fixture::base();
         fixture.task_counts = json!({"blocked": 1});
         scenarios.push(("task_blocked_remediation", fixture));
 
@@ -2761,6 +2803,43 @@ mod next_action_parity_tests {
             registered_target(&reconciliation_action.route_or_operation),
             NextActionTarget::Rest
         ));
+    }
+
+    #[test]
+    fn unapproved_definition_revision_asks_the_user_before_worker_evidence() {
+        // InkDrop: the Agent proposed definition revision 2, nobody approved
+        // it, and the Overview answered with "Attach required evidence" for
+        // the Worker plus a stale banner whose only button re-fetched the
+        // same projection.
+        let mut fixture = Fixture::base();
+        let mut milestone = default_milestone("milestone-1", 5);
+        milestone["definition"]["id"] = json!("revision-2");
+        milestone["definition"]["lifecycle"] = json!("proposed");
+        milestone["definition"]["content"]["evidence_requirements"] =
+            json!([{"id": "req-1", "required": true}]);
+        fixture.milestones = vec![milestone];
+        fixture.checks = json!({"missing": 1});
+        fixture.stale = true;
+
+        let action = fixture.action();
+        assert_eq!(action.code, "milestone_definition_approval");
+        assert_eq!(action.required_principal, "user");
+        assert_eq!(action.target_type, "milestone_revision");
+        assert_eq!(action.target_id, "revision-2");
+        assert_eq!(
+            action.route_or_operation,
+            "project.milestone.revision.transition"
+        );
+        assert_eq!(action.expected_version, Some(5));
+        assert!(action.blocking);
+
+        let mut approved = Fixture::base();
+        let mut milestone = default_milestone("milestone-1", 5);
+        milestone["definition"]["id"] = json!("revision-2");
+        milestone["definition"]["lifecycle"] = json!("approved");
+        approved.milestones = vec![milestone];
+        approved.checks = json!({"missing": 1});
+        assert_eq!(approved.action().code, "validation_required");
     }
 
     #[test]
