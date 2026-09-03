@@ -6682,7 +6682,7 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
         vec![
             (
                 "forge.main.project-discovery/v2".to_owned(),
-                "forge.main.project-discovery/v2@4".to_owned(),
+                "forge.main.project-discovery/v2@5".to_owned(),
             ),
             (
                 "forge.project.orchestration/v1".to_owned(),
@@ -7112,4 +7112,95 @@ async fn project_delete_tears_down_genesis_chat_and_handoff_rows() {
             .await
             .is_err()
     );
+}
+
+// `memory_item.task_id`, `agent_chat_message.profile_id`/`handoff_id`, and
+// `agent_chat_topic.starting_message_id` were `ON DELETE SET NULL` -- a
+// physical UPDATE -- on tables whose own `BEFORE UPDATE` trigger aborts
+// unconditionally. The moment a Project's teardown reached the task (or
+// profile, or message) one of these immutable rows pointed at, SQLite's own
+// cascade collided with the immutability guard and aborted the whole
+// delete. `agent_chat_topic`'s `BEFORE DELETE` trigger had the same shape
+// one level up: unconditional, on a table that also cascades in from
+// `agent_chat`. V129 drops the FK enforcement on those columns (they become
+// plain, unenforced historical references) and scopes the topic's delete
+// guard to `project_deletion_guard`, matching `agent_chat_message` and
+// `agent_handoff`.
+#[tokio::test]
+async fn project_delete_survives_immutable_rows_that_reference_a_sibling() {
+    let db = sqlite_db().await;
+    let now = now_rfc3339();
+    let (project_id, repo_id, _agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        None,
+        "todo".to_owned(),
+        "Task with an attached memory",
+    )
+    .await;
+
+    let mut item = memory_item(
+        &project_id,
+        "Observed during the task",
+        "The task revealed a durable fact worth keeping after it's gone.",
+    );
+    item.task_id = Some(task_id.clone());
+    MemoryRepository::insert_memory_item(&db, &item)
+        .await
+        .expect("memory item inserts");
+
+    let project_chat_id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM agent_chat WHERE project_id = ? AND kind = 'project'",
+    )
+    .bind(&project_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("project chat");
+
+    sqlx::query(
+        "INSERT INTO agent_chat_message
+         (id, chat_id, sequence, author_type, author_id, content, status,
+          correlation_id, created_at)
+         VALUES ('topic-message', ?, 0, 'user', 'nobody', 'hello', 'complete', 'corr', ?)",
+    )
+    .bind(&project_chat_id)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("message fixture");
+
+    sqlx::query(
+        "INSERT INTO agent_chat_topic
+         (id, chat_id, sequence, label, starting_message_id, starting_message_sequence,
+          principal_type, created_at)
+         VALUES ('project-topic', ?, 0, 'Kickoff', 'topic-message', 0, 'user', ?)",
+    )
+    .bind(&project_chat_id)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("topic fixture");
+
+    ProjectRepo::delete(&db, &project_id)
+        .await
+        .expect("Project with immutable cross-references tears down");
+
+    for (table, predicate) in [
+        ("project", "id = 'PROJECT'".to_owned()),
+        ("memory_item", format!("id = '{}'", item.id)),
+        ("agent_chat_topic", "id = 'project-topic'".to_owned()),
+        ("agent_chat_message", "id = 'topic-message'".to_owned()),
+    ] {
+        let sql = format!(
+            "SELECT COUNT(*) FROM {table} WHERE {}",
+            predicate.replace("PROJECT", &project_id)
+        );
+        let count = sqlx::query_scalar::<_, i64>(&sql)
+            .fetch_one(db.pool())
+            .await
+            .unwrap_or_else(|error| panic!("{table} count: {error}"));
+        assert_eq!(count, 0, "{table} row survived Project teardown");
+    }
 }

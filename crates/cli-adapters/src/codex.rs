@@ -283,7 +283,7 @@ impl CodingExecutorAdapter for CodexAdapter {
     async fn execute(&self, ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
         let config = Self::resolve_config(&ctx);
         let mut command = Self::build_command(&config);
-        command.current_dir(&ctx.worktree_path);
+        crate::command::run_in_worktree(&mut command, &ctx.worktree_path);
         let mut child = command.group_spawn()?;
 
         let stdout = match child.inner().stdout.take() {
@@ -562,27 +562,23 @@ impl CodexAdapter {
                 ..Default::default()
             });
         }
-        let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
-        let after_sha =
-            match crate::commit::commit_worktree_changes(Path::new(&ctx.worktree_path), &subject)
+        let after_sha = match crate::commit::commit_execution_changes(&ctx).await {
+            Ok(Some(sha)) => Some(sha),
+            Ok(None) => git::get_current_sha(Path::new(&ctx.worktree_path))
                 .await
-            {
-                Ok(Some(sha)) => Some(sha),
-                Ok(None) => git::get_current_sha(Path::new(&ctx.worktree_path))
-                    .await
-                    .ok(),
-                Err(error) => {
-                    return Ok(ExecutionResult {
-                        status: ExecutionOutcome::Failed,
-                        after_sha: None,
-                        agent_session_id,
-                        summary,
-                        error: Some(error.to_string()),
-                        usage: usage.map(|usage| usage_with_model(usage, &config)),
-                        ..Default::default()
-                    });
-                }
-            };
+                .ok(),
+            Err(error) => {
+                return Ok(ExecutionResult {
+                    status: ExecutionOutcome::Failed,
+                    after_sha: None,
+                    agent_session_id,
+                    summary,
+                    error: Some(error.to_string()),
+                    usage: usage.map(|usage| usage_with_model(usage, &config)),
+                    ..Default::default()
+                });
+            }
+        };
 
         Ok(ExecutionResult {
             status: ExecutionOutcome::Completed,

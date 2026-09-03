@@ -184,6 +184,7 @@ pub fn project_response(project: Project) -> ApiResult<ProjectResponse> {
         updated_at: project.updated_at,
         workflow_template_name: project.workflow_template_name,
         paused_at: project.paused_at.clone(),
+        system_pause_reason: project.system_pause_reason,
         paused: project.paused_at.is_some(),
         charter_status: project.charter_status,
         charter_setup_required: project.charter_setup_required,

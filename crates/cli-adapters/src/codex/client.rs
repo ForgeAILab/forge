@@ -241,7 +241,11 @@ impl CodexClient {
         result: &mut TurnRunResult,
     ) -> Result<(), ExecutorError> {
         if let Some(usage) = extract_token_usage(&raw) {
-            result.usage = Some(usage);
+            // Codex emits one `thread/tokenUsage/updated` per turn carrying that
+            // turn's delta in `last`. Overwriting kept only the final turn and
+            // discarded every earlier one — a whole session's work recorded as
+            // its last exchange. The deltas sum to the `total` Codex reports.
+            result.usage = super::merge_usage(result.usage.take(), Some(usage));
         }
         let normalized = normalize_event(raw);
         if let Some(thread_id) = normalized.thread_id {
@@ -501,14 +505,26 @@ fn extract_token_usage(raw: &Value) -> Option<TokenUsage> {
         .get("params")
         .and_then(|params| params.get("tokenUsage"))
         .or_else(|| raw.get("tokenUsage"))?;
-    let usage = token_usage
-        .get("last")
-        .or_else(|| token_usage.get("total"))?;
+    // `last` is this turn's delta and the caller accumulates it. `total` is
+    // Codex's running thread total, which must not be added to anything.
+    let usage = token_usage.get("last")?;
+    // Codex reports `inputTokens` inclusive of `cachedInputTokens` — its own
+    // `totalTokens` equals `inputTokens + outputTokens`. `TokenUsage` keeps the
+    // three input counters disjoint, so the cached prefix comes back out.
+    let cache_read_tokens = i64_field(usage, &["cachedInputTokens", "cached_input_tokens"]);
     Some(TokenUsage {
-        input_tokens: i64_field(usage, &["inputTokens", "input_tokens"]),
-        output_tokens: i64_field(usage, &["outputTokens", "output_tokens"]),
-        cache_read_tokens: i64_field(usage, &["cachedInputTokens", "cached_input_tokens"]),
-        cache_write_tokens: 0,
+        input_tokens: i64_field(usage, &["inputTokens", "input_tokens"])
+            .saturating_sub(cache_read_tokens)
+            .max(0),
+        // Reasoning output is billed output; the embedded host already folds it in.
+        output_tokens: i64_field(usage, &["outputTokens", "output_tokens"]).saturating_add(
+            i64_field(usage, &["reasoningOutputTokens", "reasoning_output_tokens"]),
+        ),
+        cache_read_tokens,
+        cache_write_tokens: i64_field(
+            usage,
+            &["cacheWriteInputTokens", "cache_write_input_tokens"],
+        ),
         cost_usd: None,
         model: string_field(usage, &["model"]).map(str::to_owned),
     })
@@ -629,11 +645,82 @@ mod tests {
 
         let usage = extract_token_usage(&raw).expect("usage extracted");
 
-        assert_eq!(usage.input_tokens, 49052);
+        // 49052 reported inclusive of the 48512-token cached prefix.
+        assert_eq!(usage.input_tokens, 540);
         assert_eq!(usage.output_tokens, 25);
         assert_eq!(usage.cache_read_tokens, 48512);
         assert_eq!(usage.cache_write_tokens, 0);
         assert_eq!(usage.cost_usd, None);
+    }
+
+    #[test]
+    fn codex_thread_token_usage_reads_the_turn_delta_not_the_running_total() {
+        // A mid-session notification: `last` is one turn, `total` is every turn
+        // so far. Reading `total` and accumulating it would compound.
+        let raw = json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "tokenUsage": {
+                    "last": {
+                        "cachedInputTokens": 100,
+                        "inputTokens": 150,
+                        "outputTokens": 10,
+                        "reasoningOutputTokens": 4,
+                        "totalTokens": 160
+                    },
+                    "total": {
+                        "cachedInputTokens": 9000,
+                        "inputTokens": 10000,
+                        "outputTokens": 700,
+                        "reasoningOutputTokens": 300,
+                        "totalTokens": 10700
+                    }
+                }
+            }
+        });
+
+        let usage = extract_token_usage(&raw).expect("usage extracted");
+
+        assert_eq!(
+            usage.input_tokens, 50,
+            "fresh input excludes the cached prefix"
+        );
+        assert_eq!(usage.cache_read_tokens, 100);
+        assert_eq!(usage.output_tokens, 14, "reasoning output is billed output");
+    }
+
+    #[test]
+    fn codex_turn_deltas_accumulate_to_the_session_total() {
+        // Three turns of a real session: Codex's own running `total` is the sum
+        // of the deltas, so accumulating the deltas reproduces it.
+        let deltas = [
+            (41290_i64, 40960_i64, 247_i64, 65_i64),
+            (12000, 9000, 300, 40),
+            (5000, 1000, 90, 10),
+        ];
+        let mut acc: Option<TokenUsage> = None;
+        for (input, cached, output, reasoning) in deltas {
+            let raw = json!({
+                "method": "thread/tokenUsage/updated",
+                "params": {"tokenUsage": {"last": {
+                    "inputTokens": input, "cachedInputTokens": cached,
+                    "outputTokens": output, "reasoningOutputTokens": reasoning
+                }}}
+            });
+            acc = super::super::merge_usage(acc, extract_token_usage(&raw));
+        }
+        let usage = acc.expect("accumulated");
+        let expected_input: i64 = deltas.iter().map(|d| d.0 - d.1).sum();
+        let expected_cached: i64 = deltas.iter().map(|d| d.1).sum();
+        let expected_output: i64 = deltas.iter().map(|d| d.2 + d.3).sum();
+        assert_eq!(usage.input_tokens, expected_input);
+        assert_eq!(usage.cache_read_tokens, expected_cached);
+        assert_eq!(usage.output_tokens, expected_output);
+        // Context consumed equals what Codex reports as its cumulative input.
+        assert_eq!(
+            usage.input_tokens + usage.cache_read_tokens,
+            deltas.iter().map(|d| d.0).sum::<i64>()
+        );
     }
 
     #[tokio::test]

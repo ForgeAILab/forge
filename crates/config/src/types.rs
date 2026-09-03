@@ -2,7 +2,8 @@ use crate::{
     default_data_dir, default_workspace_root, error::ConfigError,
     DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_AGENT_MAX_CONCURRENT_TASKS,
     DEFAULT_AGENT_MAX_MISSED_HEARTBEATS, DEFAULT_BCRYPT_COST, DEFAULT_CORS_ORIGIN,
-    DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES, DEFAULT_SERVER_BIND, DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
+    DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES, DEFAULT_SCAFFOLD_COMMAND, DEFAULT_SERVER_BIND,
+    DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -22,6 +23,8 @@ pub struct ForgeConfig {
     pub public_search: PublicSearchConfig,
     #[serde(default)]
     pub terminal: TerminalConfig,
+    #[serde(default)]
+    pub scaffold: ScaffoldConfig,
     pub project: ProjectSettings,
 }
 
@@ -66,6 +69,23 @@ pub struct ServerConfig {
 pub struct WorkspaceConfig {
     pub root: PathBuf,
     pub cleanup_delay_seconds: u64,
+}
+
+/// Repository scaffolding run by Genesis provisioning when the approved
+/// Charter carries a `scaffold` block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScaffoldConfig {
+    /// Whitespace-separated create-spark invocation; provisioning appends the
+    /// target directory name, `--template`, `--yes`, and `--packs`/`--no-packs`.
+    pub command: String,
+}
+
+impl Default for ScaffoldConfig {
+    fn default() -> Self {
+        Self {
+            command: DEFAULT_SCAFFOLD_COMMAND.to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,6 +252,7 @@ impl Default for ForgeConfig {
             },
             public_search: PublicSearchConfig::default(),
             terminal: TerminalConfig::default(),
+            scaffold: ScaffoldConfig::default(),
             project: ProjectSettings::default(),
         }
     }

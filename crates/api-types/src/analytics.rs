@@ -32,8 +32,29 @@ pub struct TokenUsageAnalytics {
     pub total_cache_write_tokens: i64,
     pub total_cost_usd: Option<f64>,
     pub execution_count: i64,
+    /// Agent Chat turns counted in the totals, across both chat surfaces.
+    pub chat_turn_count: i64,
     pub by_model: Vec<ModelTokenBreakdown>,
     pub by_agent: Vec<AgentTokenBreakdown>,
+    pub by_surface: Vec<SurfaceTokenBreakdown>,
+}
+
+/// Where a Project's tokens were spent. Task executions are only part of the
+/// bill: the Genesis discovery that produced the Project and the Project
+/// Agent's own orchestration turns are recorded on chat messages, and for a
+/// small Project they routinely outweigh the code work.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
+#[ts(export)]
+pub struct SurfaceTokenBreakdown {
+    /// `task_execution`, `project_chat`, or `genesis_chat`.
+    pub surface: String,
+    /// Task executions for `task_execution`, Agent Chat turns otherwise.
+    pub run_count: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

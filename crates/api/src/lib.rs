@@ -432,6 +432,10 @@ pub fn api_router(state: AppState) -> Router {
             get(routes::agent_chats::list_agent_chat_turns),
         )
         .route(
+            "/api/v1/agent-chats/{chat_id}/turns/{turn_id}/logs",
+            get(routes::agent_chats::get_agent_chat_turn_logs),
+        )
+        .route(
             "/api/v1/agent-chats/{chat_id}/turns/{turn_id}/cancel",
             post(routes::agent_chats::cancel_agent_chat_turn),
         )

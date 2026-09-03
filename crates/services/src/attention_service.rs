@@ -1646,6 +1646,25 @@ impl AttentionService {
             };
             let event_payload =
                 serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
+            // What the user decided, so the wake prompt can say it back to
+            // the Agent instead of making it rediscover the decision.
+            let decision_context = user_decision_outcome(event).map(|outcome| {
+                let payload_text = |key: &str| {
+                    event_payload
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .map(|value| bounded_text(value.to_owned()))
+                };
+                json!({
+                    "outcome": outcome,
+                    "target_type": event.entity_type,
+                    "target_id": event.entity_id,
+                    "revision_id": payload_text("revision_id"),
+                    "lifecycle": payload_text("lifecycle"),
+                    "event_type": event.event_type,
+                    "decided_by": "user",
+                })
+            });
             let details_json = serde_json::to_string(&json!({
                 "source_event_id": event.id,
                 "source_sequence": event.sequence,
@@ -1654,6 +1673,7 @@ impl AttentionService {
                 "scope_type": scope_type,
                 "scope_id": scope_id,
                 "task": task_context,
+                "decision": decision_context,
                 "role": event_payload.get("role").and_then(Value::as_str).map(|value| bounded_text(value.to_owned())),
                 "stop_reason": event_payload.get("stop_reason").and_then(Value::as_str).map(|value| bounded_text(value.to_owned())),
                 "error": event_payload.get("error").and_then(Value::as_str).map(|value| bounded_text(value.to_owned())),
@@ -2867,8 +2887,53 @@ fn is_execution_semantic_progress_event(event_type: &str) -> bool {
     event_type == "execution.progressed"
 }
 
+/// Attention category for a decision the user recorded on something the
+/// Project Agent was waiting for. The wake consumer resolves the incident
+/// once the wake turn is admitted; it is a hand-off, not a lasting incident.
+pub const DECISION_RECORDED_CATEGORY: &str = "decision_recorded";
+
+/// The category an incident key was minted for (`attention:<category>:…`).
+pub fn incident_key_category(incident_key: &str) -> Option<&str> {
+    incident_key
+        .strip_prefix("attention:")
+        .and_then(|rest| rest.split(':').next())
+        .filter(|category| !category.is_empty())
+}
+
+/// `approved` / `rejected` when `event` is a decision the *user* recorded on
+/// a pending Agent proposal. Only user-authored events qualify: an Agent's
+/// own approval must never wake the Agent that made it.
+fn user_decision_outcome(event: &DomainEvent) -> Option<&'static str> {
+    if event.actor_type != "user" {
+        return None;
+    }
+    match event.event_type.to_ascii_lowercase().as_str() {
+        "milestone.definition.transitioned" => {
+            let lifecycle = serde_json::from_str::<Value>(&event.payload_json)
+                .ok()
+                .and_then(|payload| {
+                    payload
+                        .get("lifecycle")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                });
+            match lifecycle.as_deref() {
+                Some("approved") => Some("approved"),
+                Some("rejected") => Some("rejected"),
+                _ => None,
+            }
+        }
+        "project.decision.approved" | "project.document.approved" => Some("approved"),
+        "project.decision.candidate_rejected" => Some("rejected"),
+        _ => None,
+    }
+}
+
 fn classify_event(event: &DomainEvent) -> Option<&'static str> {
     let event_type = event.event_type.to_ascii_lowercase();
+    if user_decision_outcome(event).is_some() {
+        return Some(DECISION_RECORDED_CATEGORY);
+    }
     if event_type == "project_release.candidate_requested" {
         return Some("human_input_required");
     }
@@ -3069,6 +3134,11 @@ fn category_metadata(category: &str) -> (i64, &'static str, &'static str) {
             "Task completed; reconcile validation, evidence, and readiness",
             "reconcile_delivery",
         ),
+        "decision_recorded" => (
+            65,
+            "The user recorded a decision; continue from it",
+            "continue_from_decision",
+        ),
         "runtime_offline" => (95, "Agent runtime is unavailable", "restore_runtime"),
         "budget_threshold" => (60, "Agent budget threshold reached", "review_budget"),
         "commitment_overdue" => (75, "Commitment is overdue", "review_commitment"),
@@ -3087,6 +3157,7 @@ pub fn attention_item(item: AttentionProjection) -> Result<AttentionItem> {
         "review_risk" => AttentionCategory::ReviewRisk,
         "execution_failed" => AttentionCategory::ExecutionFailed,
         "delivery_followup" => AttentionCategory::DeliveryFollowup,
+        "decision_recorded" => AttentionCategory::DecisionRecorded,
         "runtime_offline" => AttentionCategory::RuntimeOffline,
         "budget_threshold" => AttentionCategory::BudgetThreshold,
         "commitment_overdue" => AttentionCategory::CommitmentOverdue,
@@ -3366,6 +3437,101 @@ mod tests {
             payload_json: payload_json.to_owned(),
             created_at: "2026-01-01T00:00:00Z".to_owned(),
         }
+    }
+
+    fn user_event(event_type: &str, entity_type: &str, payload_json: &str) -> DomainEvent {
+        DomainEvent {
+            entity_type: entity_type.to_owned(),
+            entity_id: "entity-1".to_owned(),
+            actor_type: "user".to_owned(),
+            actor_id: Some("user-1".to_owned()),
+            ..event(event_type, payload_json)
+        }
+    }
+
+    #[test]
+    fn user_decisions_wake_the_agent_as_decision_recorded() {
+        assert_eq!(
+            classify_event(&user_event(
+                "milestone.definition.transitioned",
+                "milestone",
+                r#"{"revision_id":"rev-1","lifecycle":"approved"}"#
+            )),
+            Some("decision_recorded")
+        );
+        assert_eq!(
+            classify_event(&user_event(
+                "milestone.definition.transitioned",
+                "milestone",
+                r#"{"revision_id":"rev-1","lifecycle":"rejected"}"#
+            )),
+            Some("decision_recorded")
+        );
+        // Proposing is the Agent asking, not the user deciding.
+        assert_eq!(
+            classify_event(&user_event(
+                "milestone.definition.transitioned",
+                "milestone",
+                r#"{"revision_id":"rev-1","lifecycle":"proposed"}"#
+            )),
+            None
+        );
+        assert_eq!(
+            classify_event(&user_event(
+                "project.decision.approved",
+                "project_decision",
+                "{}"
+            )),
+            Some("decision_recorded")
+        );
+        assert_eq!(
+            classify_event(&user_event(
+                "project.decision.candidate_rejected",
+                "project_decision_candidate",
+                "{}"
+            )),
+            Some("decision_recorded")
+        );
+        assert_eq!(
+            classify_event(&user_event(
+                "project.document.approved",
+                "project_document_approval",
+                "{}"
+            )),
+            Some("decision_recorded")
+        );
+        assert_eq!(
+            category_metadata("decision_recorded").2,
+            "continue_from_decision"
+        );
+    }
+
+    #[test]
+    fn an_agents_own_approval_is_not_a_user_decision() {
+        let agent_event = DomainEvent {
+            actor_type: "agent".to_owned(),
+            actor_id: Some("identity-1".to_owned()),
+            ..user_event(
+                "milestone.definition.transitioned",
+                "milestone",
+                r#"{"revision_id":"rev-1","lifecycle":"approved"}"#,
+            )
+        };
+        assert_eq!(classify_event(&agent_event), None);
+        assert_eq!(
+            classify_event(&event("project.decision.approved", "{}")),
+            None
+        );
+    }
+
+    #[test]
+    fn incident_keys_name_their_category() {
+        assert_eq!(
+            incident_key_category("attention:decision_recorded:project:p1:milestone:m1"),
+            Some("decision_recorded")
+        );
+        assert_eq!(incident_key_category("attention::project:p1"), None);
+        assert_eq!(incident_key_category("wake:decision_recorded"), None);
     }
 
     #[test]

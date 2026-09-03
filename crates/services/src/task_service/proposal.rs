@@ -428,21 +428,15 @@ impl TaskService {
         } else {
             crate::workflow::engine::WorkflowEngine::resolve_workflow(&project.workflow_definition)
         };
-        let initial_status = if repo_id.is_none() {
-            workflow
-                .states
-                .iter()
-                .find(|state| state.kind == api_types::StateKind::Backlog)
-                .map(|state| state.name.clone())
-                .ok_or_else(|| ServiceError::invalid_operation("workflow has no backlog state"))?
-        } else {
-            workflow
-                .states
-                .iter()
-                .find(|state| state.kind == api_types::StateKind::Initial)
-                .map(|state| state.name.clone())
-                .ok_or_else(|| ServiceError::invalid_operation("workflow has no initial state"))?
-        };
+        // A repository-less Task (the Project has none yet) still starts in
+        // the workflow's initial state; the dispatcher pauses the Project
+        // instead. `backlog` is reserved for a deliberate later move.
+        let initial_status = workflow
+            .states
+            .iter()
+            .find(|state| state.kind == api_types::StateKind::Initial)
+            .map(|state| state.name.clone())
+            .ok_or_else(|| ServiceError::invalid_operation("workflow has no initial state"))?;
         let now = now_rfc3339();
         let task_id = db::new_uuid_v4();
         // Preserve the existing Task workflow semantics: an omitted

@@ -155,6 +155,7 @@ export type { CharterReadinessGapKind } from './bindings/CharterReadinessGapKind
 export type { CharterReadinessStatus } from './bindings/CharterReadinessStatus'
 export type { CharterRevisionLifecycle } from './bindings/CharterRevisionLifecycle'
 export type { CharterRisk } from './bindings/CharterRisk'
+export type { CharterScaffold } from './bindings/CharterScaffold'
 export type { CharterScope } from './bindings/CharterScope'
 export type { CharterSuccessBoundary } from './bindings/CharterSuccessBoundary'
 export type { CharterSupersession } from './bindings/CharterSupersession'

@@ -318,6 +318,7 @@ export function ProjectSettingsPage({
               isSaving={updateProject.isPending}
               paused={project?.paused ?? false}
               pausedAt={project?.paused_at}
+              systemPauseReason={project?.system_pause_reason}
               pausePending={pauseProject.isPending || resumeProject.isPending}
               name={name}
               ciSteps={ciSteps}

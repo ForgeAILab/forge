@@ -69,6 +69,41 @@ describe('logsToChatEntries', () => {
     })
   })
 
+  it('2b. tool_call input preview takes priority over params when present', () => {
+    const payload = {
+      call_id: 'call-1',
+      name: 'forge_task_command',
+      argument_keys: ['command', 'timeout_secs'],
+      input: { command: 'cargo test -p db', timeout_secs: '120' },
+    }
+    const entries = logsToChatEntries([log('tool_call', payload, 1)])
+
+    expect(entries).toHaveLength(1)
+    expect(entries[0]).toMatchObject({
+      kind: 'tool_call',
+      toolName: 'forge_task_command',
+      callId: 'call-1',
+      input: { command: 'cargo test -p db', timeout_secs: '120' },
+      status: 'pending',
+    })
+  })
+
+  it('2c. tool_call falls back to argument_keys when input did not survive filtering', () => {
+    const payload = {
+      call_id: 'call-1',
+      name: 'forge_task_command',
+      argument_keys: ['command'],
+    }
+    const entries = logsToChatEntries([log('tool_call', payload, 1)])
+
+    expect(entries).toHaveLength(1)
+    expect(entries[0]).toMatchObject({
+      kind: 'tool_call',
+      toolName: 'forge_task_command',
+      input: payload,
+    })
+  })
+
   it('3. tool_call + tool_result pairing by proximity (no call_id)', () => {
     const result = { success: false, error: 'nope' }
     const entries = logsToChatEntries([

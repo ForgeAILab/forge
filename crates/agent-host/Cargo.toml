@@ -12,6 +12,7 @@ chacha20poly1305 = "0.10"
 db = { path = "../db" }
 api-types = { path = "../api-types" }
 futures-util = "0.3"
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

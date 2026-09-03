@@ -6,8 +6,9 @@ use api_types::{
     CreateProjectRequest, ModelTokenBreakdown as ApiModelTokenBreakdown, PaginatedResponse,
     ProjectAnalyticsResponse, ProjectHookRunResponse, ProjectHookRunStatus,
     ProjectHookRunsResponse, ProjectResponse, ProjectSettings, ReviewConfig,
-    ReviewSummaryAnalytics, StateKind, TestLifecycleHookRequest, TokenUsageAnalytics,
-    UpdateProjectRequest, UpdateProjectWorkflowRequest, WorkflowDefinition,
+    ReviewSummaryAnalytics, StateKind, SurfaceTokenBreakdown as ApiSurfaceTokenBreakdown,
+    TestLifecycleHookRequest, TokenUsageAnalytics, UpdateProjectRequest,
+    UpdateProjectWorkflowRequest, WorkflowDefinition,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -19,7 +20,7 @@ use db::{
     new_uuid_v4, now_rfc3339, AgentProfileRepo, AgentRepo, AgentTokenBreakdown, CiStepStats,
     CreateProject, ModelTokenBreakdown, PageRequest, ProjectAnalyticsRepo, ProjectHookRun,
     ProjectHookRunRepo, ProjectRepo, ProjectReviewSummary, ProjectTokenStats, RepoRepo, SortBy,
-    SortOrder, UpdateProject,
+    SortOrder, SurfaceTokenBreakdown, UpdateProject,
 };
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde::Deserialize;
@@ -317,8 +318,10 @@ pub async fn get_project_analytics(
         total_cache_write_tokens,
         total_cost_usd,
         execution_count,
+        chat_turn_count,
         by_model,
         by_agent,
+        by_surface,
     } = token_usage;
     let token_usage = TokenUsageAnalytics {
         total_input_tokens,
@@ -327,6 +330,29 @@ pub async fn get_project_analytics(
         total_cache_write_tokens,
         total_cost_usd,
         execution_count,
+        chat_turn_count,
+        by_surface: by_surface
+            .into_iter()
+            .map(
+                |SurfaceTokenBreakdown {
+                     surface,
+                     run_count,
+                     input_tokens,
+                     output_tokens,
+                     cache_read_tokens,
+                     cache_write_tokens,
+                     cost_usd,
+                 }| ApiSurfaceTokenBreakdown {
+                    surface,
+                    run_count,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    cost_usd,
+                },
+            )
+            .collect(),
         by_model: by_model
             .into_iter()
             .map(

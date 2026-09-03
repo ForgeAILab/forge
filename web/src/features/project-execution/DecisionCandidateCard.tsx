@@ -5,8 +5,6 @@ import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { ConflictDetails } from '@/components/conflict-details'
-import { useAuthStore } from '@/stores/auth'
-import type { AuthorizationProvenance } from '@/types/generated/bindings/AuthorizationProvenance'
 import type { PendingDecisionSummary } from '@/types/generated'
 
 import type { ApproveDecisionCandidateWire, RejectDecisionCandidateWire } from './decision-api'
@@ -14,6 +12,7 @@ import {
   useApproveDecisionCandidateMutation,
   useRejectDecisionCandidateMutation,
 } from './decision-hooks'
+import { createUserAuthorization, newIdempotencyKey } from './user-authorization'
 
 const APPROVE_ACTION = 'project.decision.candidate.approve'
 const REJECT_ACTION = 'project.decision.candidate.reject'
@@ -28,28 +27,6 @@ function shortId(value: string): string {
 
 function humanize(value: string): string {
   return value.replaceAll('_', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase())
-}
-
-function newIdempotencyKey(prefix: string): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID()
-  }
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`
-}
-
-function createUserAuthorization(
-  action: string,
-  authorizationBasis: string,
-): AuthorizationProvenance {
-  const user = useAuthStore.getState().user
-  if (!user) throw new Error('Sign in again before acting on this decision.')
-  return {
-    principal: { kind: 'user', id: user.id, display_name: user.display_name ?? null },
-    authorization_basis: authorizationBasis,
-    action,
-    event_id: newIdempotencyKey(action),
-    occurred_at: new Date().toISOString(),
-  }
 }
 
 /**

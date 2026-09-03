@@ -194,6 +194,10 @@ pub(crate) fn charter_content_schema() -> Value {
             "knowledge_ledger": object_schema(json!({
                 "items": {"type":"array","items":charter_knowledge_item_schema()},
             }), &[]),
+            "scaffold": {"oneOf":[object_schema(json!({
+                "template":{"type":"string","minLength":1,"description":"spark template id: nextjs or vite-react"},
+                "packs":string_array_schema(),
+            }), &["template"]), {"type":"null"}], "description":"Repository scaffold for a web product: a spark template plus feature packs. Omit for a non-web product or a repository the user brings."},
             "handoff_note": {"oneOf":[object_schema(json!({
                 "recommended_first_action": string_or_null_schema(),
                 "bounded_summary": string_or_null_schema(),

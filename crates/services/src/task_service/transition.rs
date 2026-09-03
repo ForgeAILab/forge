@@ -69,6 +69,7 @@ impl TaskService {
         let defer_dispatch_until = options
             .defer_dispatch_seconds
             .map(|seconds| (chrono::Utc::now() + chrono::Duration::seconds(seconds)).to_rfc3339());
+        let preserve_deferred_dispatch = defer_dispatch_until.is_some();
         let result = engine
             .transition_with_deferred_dispatch(
                 &task_id,
@@ -81,7 +82,13 @@ impl TaskService {
                 defer_dispatch_until,
             )
             .await?;
-        let mut task = result.task;
+        // Entry/after-enter hooks can update metadata without changing the
+        // Task version (for example, a manual review marker). Reload the
+        // committed row so the returned Task snapshot and its version carry
+        // the same state used by API readiness calculations.
+        let mut task = TaskRepo::get_by_id(&*self.db, &task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
         if was_blocked {
             self.publish(ForgeEvent {
                 event_type: "task.unblocked".to_owned(),
@@ -156,7 +163,14 @@ impl TaskService {
             }
         }
         if previous_status != task.status {
-            super::execution::clear_execution_retry_metadata(&self.db, &task).await?;
+            if preserve_deferred_dispatch {
+                super::execution::clear_execution_retry_metadata_preserving_dispatch(
+                    &self.db, &task,
+                )
+                .await?;
+            } else {
+                super::execution::clear_execution_retry_metadata(&self.db, &task).await?;
+            }
         }
 
         Ok(TransitionResult {
@@ -240,8 +254,21 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        self.is_task_awaiting_human(&task).await
+    }
+
+    /// Resolve human-readiness from the same Task snapshot whose version will
+    /// be returned to the caller.
+    pub async fn is_task_awaiting_human(&self, task: &Task) -> Result<bool> {
         if task.blocked_json.is_some() {
             return Ok(true);
+        }
+        if task.entry_barrier_is_running() {
+            // The state's blocking before_enter hooks are still running. The
+            // status change is visible but the transition has not settled: the
+            // engine clears the barrier (bumping the task version) once they
+            // finish, so a gate decision taken now would race that write.
+            return Ok(false);
         }
         let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
             ServiceError::invalid_operation(format!("invalid task metadata: {error}"))
@@ -255,7 +282,7 @@ impl TaskService {
             return Ok(true);
         }
         if task.status == crate::workflow::default_states::REVIEW {
-            let latest_review = ReviewRepo::list_by_task(&*self.db, &task_id)
+            let latest_review = ReviewRepo::list_by_task(&*self.db, &task.id)
                 .await?
                 .into_iter()
                 .max_by_key(|review| review.attempt_number);
@@ -270,7 +297,7 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
         let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
+            task,
             &project.workflow_definition,
             &Actor::system(SystemComponent::General),
         );
@@ -286,7 +313,7 @@ impl TaskService {
                 return Ok(false);
             };
             let assignment =
-                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task_id, role_name)
+                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
                     .await?;
             return Ok(assignment.as_ref().is_some_and(|assignment| {
                 assignment.assignee_type == Some(AssigneeKind::User)
@@ -296,7 +323,7 @@ impl TaskService {
         if state.kind != api_types::StateKind::Gate {
             return Ok(false);
         }
-        let transition_log = TransitionLogRepo::list_by_task(&*self.db, &task_id).await?;
+        let transition_log = TransitionLogRepo::list_by_task(&*self.db, &task.id).await?;
         let entered_at = transition_log
             .iter()
             .rev()
@@ -319,7 +346,7 @@ impl TaskService {
                     return Ok(false);
                 };
                 let assignment =
-                    TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task_id, role_name)
+                    TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
                         .await?;
                 let assigned = assignment.as_ref().is_some_and(|assignment| {
                     assignment.assignee_type.is_some() && assignment.assignee_id.is_some()
@@ -335,7 +362,7 @@ impl TaskService {
             return Ok(false);
         };
 
-        let role_assignments = TaskRoleAssignmentRepo::list_by_task(&*self.db, &task_id).await?;
+        let role_assignments = TaskRoleAssignmentRepo::list_by_task(&*self.db, &task.id).await?;
         let Some(assignment) = role_assignments
             .iter()
             .find(|assignment| assignment.role_name == role_name)

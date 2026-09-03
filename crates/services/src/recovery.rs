@@ -191,6 +191,41 @@ pub struct HeartbeatMonitor {
     stop_notify: tokio::sync::Notify,
 }
 
+/// How long a freshly created `dispatch-pending:` lease marker is left alone
+/// before recovery may reclaim it. The local runner claims its lease within
+/// milliseconds; this only has to outlast that handoff.
+const DISPATCH_PENDING_GRACE_SECONDS: i64 = 30;
+
+/// Prefix of the placeholder lease owner installed with a locally dispatched
+/// execution, before its runner takes ownership.
+const DISPATCH_PENDING_OWNER_PREFIX: &str = "dispatch-pending:";
+
+/// Whether this expired-lease row is a dispatch marker still inside its grace
+/// window, and so not yet evidence of a dead owner. A row past its hard
+/// deadline is always eligible, marker or not.
+fn is_unclaimed_dispatch_marker(execution: &Execution, now: &str) -> bool {
+    let Some(owner) = execution.lease_owner.as_deref() else {
+        return false;
+    };
+    if !owner.starts_with(DISPATCH_PENDING_OWNER_PREFIX) {
+        return false;
+    }
+    if execution
+        .hard_deadline_at
+        .as_deref()
+        .is_some_and(|deadline| deadline <= now)
+    {
+        return false;
+    }
+    let (Ok(created_at), Ok(now)) = (
+        DateTime::parse_from_rfc3339(&execution.created_at),
+        DateTime::parse_from_rfc3339(now),
+    ) else {
+        return false;
+    };
+    now.signed_duration_since(created_at) < ChronoDuration::seconds(DISPATCH_PENDING_GRACE_SECONDS)
+}
+
 impl HeartbeatMonitor {
     const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(10);
     const DEFAULT_EXECUTION_STALL_TIMEOUT: Duration = Duration::from_secs(300);
@@ -416,6 +451,18 @@ impl HeartbeatMonitor {
         let mut expired = 0;
 
         for execution in executions {
+            // A locally dispatched execution is created carrying an
+            // already-expired `dispatch-pending:` marker, on purpose, so that
+            // a crash between the row write and the runner's first claim
+            // leaves something reclaimable. It is not orphaned yet: the runner
+            // claims it milliseconds later. Terminalizing inside that window
+            // kills a run that never started — observed as a reviewer
+            // execution failed 8ms after creation with "lease expired".
+            // Give the marker a grace period; a genuinely orphaned one is
+            // still reclaimed once the grace elapses.
+            if is_unclaimed_dispatch_marker(&execution, &now) {
+                continue;
+            }
             let deadline = execution
                 .hard_deadline_at
                 .as_deref()
@@ -3743,5 +3790,96 @@ mod tests {
             .expect("task loads")
             .expect("task exists");
         assert_eq!(updated.error_annotation, None);
+    }
+
+    fn dispatch_marker_execution(
+        lease_owner: Option<&str>,
+        created_at: &str,
+        hard_deadline_at: Option<&str>,
+    ) -> Execution {
+        Execution {
+            id: "execution-1".to_owned(),
+            task_id: "task-1".to_owned(),
+            agent_id: None,
+            role: "reviewer".to_owned(),
+            status: ExecutionStatus::Running,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: created_at.to_owned(),
+            updated_at: created_at.to_owned(),
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            prompt: None,
+            last_activity_at: None,
+            execution_version: 1,
+            lease_owner: lease_owner.map(str::to_owned),
+            lease_expires_at: Some(created_at.to_owned()),
+            hard_deadline_at: hard_deadline_at.map(str::to_owned),
+            last_heartbeat_at: None,
+            last_progress_at: None,
+        }
+    }
+
+    #[test]
+    fn a_fresh_dispatch_marker_is_not_treated_as_a_dead_owner() {
+        // The reviewer execution that regressed was killed 8ms after creation.
+        let execution = dispatch_marker_execution(
+            Some("dispatch-pending:execution-1"),
+            "2026-09-03T08:33:22.584249+00:00",
+            Some("2026-09-03T09:03:22.584249+00:00"),
+        );
+        assert!(is_unclaimed_dispatch_marker(
+            &execution,
+            "2026-09-03T08:33:22.592175+00:00"
+        ));
+    }
+
+    #[test]
+    fn a_stale_dispatch_marker_is_reclaimed_once_the_grace_elapses() {
+        let execution = dispatch_marker_execution(
+            Some("dispatch-pending:execution-1"),
+            "2026-09-03T08:33:22.584249+00:00",
+            Some("2026-09-03T09:03:22.584249+00:00"),
+        );
+        assert!(!is_unclaimed_dispatch_marker(
+            &execution,
+            "2026-09-03T08:34:22.584249+00:00"
+        ));
+    }
+
+    #[test]
+    fn a_real_owner_lease_is_never_given_the_dispatch_grace() {
+        let execution = dispatch_marker_execution(
+            Some("daemon-7"),
+            "2026-09-03T08:33:22.584249+00:00",
+            Some("2026-09-03T09:03:22.584249+00:00"),
+        );
+        assert!(!is_unclaimed_dispatch_marker(
+            &execution,
+            "2026-09-03T08:33:22.592175+00:00"
+        ));
+    }
+
+    #[test]
+    fn a_dispatch_marker_past_its_hard_deadline_is_still_eligible() {
+        let execution = dispatch_marker_execution(
+            Some("dispatch-pending:execution-1"),
+            "2026-09-03T08:33:22.584249+00:00",
+            Some("2026-09-03T08:33:22.584249+00:00"),
+        );
+        assert!(!is_unclaimed_dispatch_marker(
+            &execution,
+            "2026-09-03T08:33:22.592175+00:00"
+        ));
     }
 }

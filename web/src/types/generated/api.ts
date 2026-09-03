@@ -698,6 +698,7 @@ export interface Project {
   default_review_config?: ReviewConfig | null
   workflow_template_name?: string | null
   paused_at: string | null
+  system_pause_reason?: string | null
   paused: boolean
   charter_status: string
   charter_setup_required: boolean
@@ -1502,8 +1503,29 @@ export interface TokenUsageAnalytics {
   total_cache_write_tokens: number
   total_cost_usd: number | null
   execution_count: number
+  /** Agent Chat turns counted in the totals, across both chat surfaces. */
+  chat_turn_count: number
   by_model: ModelTokenBreakdown[]
   by_agent: AgentTokenBreakdown[]
+  by_surface: SurfaceTokenBreakdown[]
+}
+
+/**
+ * Where a Project's tokens were spent. Task executions are only part of the
+ * bill: the Genesis discovery that produced the Project and the Project
+ * Agent's own orchestration turns are recorded on chat messages, and for a
+ * small Project they routinely outweigh the code work.
+ */
+export interface SurfaceTokenBreakdown {
+  /** `task_execution`, `project_chat`, or `genesis_chat`. */
+  surface: string
+  /** Task executions for `task_execution`, Agent Chat turns otherwise. */
+  run_count: number
+  input_tokens: number
+  output_tokens: number
+  cache_read_tokens: number
+  cache_write_tokens: number
+  cost_usd: number | null
 }
 
 export interface ModelTokenBreakdown {

@@ -45,16 +45,17 @@ use crate::{
     RepoRepo, Result, RetryAgentWakeDisposition, Review, ReviewRepo, ReviewStatus, Runtime,
     RuntimeListQuery, RuntimeRepo, SelectAgentProfile, SetProjectAgentBindingCommand,
     SharedMediaRepo, Skill, SkillRepo, SoftDeleteProjectMediaAttachmentMutation, SortBy, SortOrder,
-    Task, TaskComment, TaskCommentRepo, TaskDependencyRepo, TaskExternalLink, TaskListQuery,
-    TaskMedia, TaskMediaRepo, TaskRepo, TaskUsageSummary, TerminalSession, TerminalSessionRepo,
-    TerminalSessionStatus, TerminalizeExecution, TransferAgentCommitment, UpdateAgent,
-    UpdateAgentAction, UpdateAgentChat, UpdateAgentChatTurnJob, UpdateAgentCommitment,
-    UpdateAgentInboxItem, UpdateAttentionLifecycle, UpdateDaemonReport, UpdateExecution,
-    UpdatePrMetadata, UpdatePrProviderConfig, UpdateProject, UpdateProjectHookRun,
-    UpdateProjectIntegration, UpdateProjectProvisioningOperation, UpdateRepo, UpdateSkill,
-    UpdateTask, UpdateTaskStatus, UpdateTerminalSessionStatus, UpsertAttentionConsumerHealth,
-    UpsertDaemon, UpsertExecutionUsage, UpsertProjectProvisioningCheckpoint, Workspace,
-    WorkspaceLease, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
+    SurfaceTokenBreakdown, Task, TaskComment, TaskCommentRepo, TaskDependencyRepo,
+    TaskExternalLink, TaskListQuery, TaskMedia, TaskMediaRepo, TaskRepo, TaskUsageSummary,
+    TerminalSession, TerminalSessionRepo, TerminalSessionStatus, TerminalizeExecution,
+    TransferAgentCommitment, UpdateAgent, UpdateAgentAction, UpdateAgentChat,
+    UpdateAgentChatTurnJob, UpdateAgentCommitment, UpdateAgentInboxItem, UpdateAttentionLifecycle,
+    UpdateDaemonReport, UpdateExecution, UpdatePrMetadata, UpdatePrProviderConfig, UpdateProject,
+    UpdateProjectHookRun, UpdateProjectIntegration, UpdateProjectProvisioningOperation, UpdateRepo,
+    UpdateSkill, UpdateTask, UpdateTaskStatus, UpdateTerminalSessionStatus,
+    UpsertAttentionConsumerHealth, UpsertDaemon, UpsertExecutionUsage,
+    UpsertProjectProvisioningCheckpoint, Workspace, WorkspaceLease, WorkspaceLeaseRepo,
+    WorkspaceRepo, WorkspaceStatus,
 };
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -191,7 +192,7 @@ fn order_clause_for(page: &PageRequest, supports_priority: bool) -> &'static str
 }
 
 const TASK_COLUMNS: &str = "id, project_id, repo_id, parent_task_id, assignee_type, assignee_id, title, description, task_type, status, is_automation, priority, board_position, subtask_order, task_state_config, merge_config, metadata_json, plan, error_annotation, blocked_json, failed_json, entry_barrier_json, review_passed_at, archived_at, deleted_at, version, created_at, updated_at";
-const PROJECT_COLUMNS: &str = "id, name, settings, workflow_definition, workflow_template_name, primary_repo_id, paused_at, owner_id, project_hooks_json, project_work_epoch, charter_status, charter_setup_required, current_charter_id, current_charter_revision_id, current_charter_version, primary_milestone_id, version, created_at, updated_at";
+const PROJECT_COLUMNS: &str = "id, name, settings, workflow_definition, workflow_template_name, primary_repo_id, paused_at, system_pause_reason, owner_id, project_hooks_json, project_work_epoch, charter_status, charter_setup_required, current_charter_id, current_charter_revision_id, current_charter_version, primary_milestone_id, version, created_at, updated_at";
 
 fn limit(page: &PageRequest) -> i64 {
     page.limit.clamp(1, 500)
@@ -246,6 +247,7 @@ fn map_project(row: SqliteRow) -> Result<Project> {
         workflow_template_name: row.try_get("workflow_template_name")?,
         primary_repo_id: row.try_get("primary_repo_id")?,
         paused_at: row.try_get("paused_at")?,
+        system_pause_reason: row.try_get("system_pause_reason")?,
         owner_id: row.try_get("owner_id")?,
         project_hooks_json: row.try_get("project_hooks_json")?,
         project_work_epoch: row.try_get("project_work_epoch")?,

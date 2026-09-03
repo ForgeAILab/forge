@@ -35,6 +35,21 @@ pub async fn commit_worktree_changes(
     Ok(Some(sha.trim().to_owned()))
 }
 
+/// Commit whatever an execution left in its worktree — unless the execution
+/// runs under the read-only worktree policy (reviewer and planner roles,
+/// planning/discovery Tasks). A read-only run never authors work; what it
+/// leaves behind is build output from the checks it ran, and committing that
+/// would move HEAD and make the runner discard the run as a policy breach.
+pub async fn commit_execution_changes(
+    ctx: &executors::ExecutionContext,
+) -> Result<Option<String>, ExecutorError> {
+    if executors::is_worktree_read_only(&ctx.agent_config) {
+        return Ok(None);
+    }
+    let subject = build_commit_subject(Some(&ctx.description), &ctx.task_id);
+    commit_worktree_changes(Path::new(&ctx.worktree_path), &subject).await
+}
+
 pub fn build_commit_subject(task_description: Option<&str>, fallback_title: &str) -> String {
     let subject_text = task_description
         .and_then(first_non_empty_line)
@@ -177,5 +192,80 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+}
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    fn git(worktree: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(worktree)
+            .output()
+            .expect("git runs");
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn context(worktree: &Path, agent_config: serde_json::Value) -> executors::ExecutionContext {
+        executors::ExecutionContext {
+            task_id: "task-1".to_owned(),
+            execution_id: "exec-1".to_owned(),
+            worktree_path: worktree.to_string_lossy().into_owned(),
+            description: "Review task: keep the worktree intact".to_owned(),
+            agent_config,
+            logs_path: worktree.join("logs").to_string_lossy().into_owned(),
+            heartbeat_interval_seconds: 30,
+            max_turns: None,
+            log_sender: None,
+        }
+    }
+
+    fn init_repo(worktree: &Path) {
+        git(worktree, &["init", "-q", "-b", "main"]);
+        git(worktree, &["config", "user.email", "test@forge.local"]);
+        git(worktree, &["config", "user.name", "Forge Test"]);
+        fs::write(worktree.join("README.md"), "hello\n").expect("file writes");
+        git(worktree, &["add", "-A"]);
+        git(worktree, &["commit", "-q", "-m", "init"]);
+    }
+
+    #[tokio::test]
+    async fn read_only_executions_never_commit_what_their_checks_leave_behind() {
+        let tempdir = tempfile::tempdir().expect("tempdir creates");
+        init_repo(tempdir.path());
+        let head = git(tempdir.path(), &["rev-parse", "HEAD"]);
+        fs::write(tempdir.path().join("next-env.d.ts"), "// build output\n").expect("file writes");
+
+        let mut config = serde_json::json!({ "executor_type": "opencode" });
+        executors::mark_worktree_read_only(&mut config);
+        let sha = commit_execution_changes(&context(tempdir.path(), config))
+            .await
+            .expect("read-only path never fails");
+
+        assert_eq!(sha, None);
+        assert_eq!(git(tempdir.path(), &["rev-parse", "HEAD"]), head);
+        assert!(git(tempdir.path(), &["status", "--porcelain"]).contains("next-env.d.ts"));
+    }
+
+    #[tokio::test]
+    async fn writable_executions_still_commit_their_work() {
+        let tempdir = tempfile::tempdir().expect("tempdir creates");
+        init_repo(tempdir.path());
+        let head = git(tempdir.path(), &["rev-parse", "HEAD"]);
+        fs::write(tempdir.path().join("lib.rs"), "fn main() {}\n").expect("file writes");
+
+        let config = serde_json::json!({ "executor_type": "opencode" });
+        let sha = commit_execution_changes(&context(tempdir.path(), config))
+            .await
+            .expect("commit succeeds");
+
+        assert!(sha.is_some());
+        assert_ne!(git(tempdir.path(), &["rev-parse", "HEAD"]), head);
+        assert!(git(tempdir.path(), &["status", "--porcelain"]).is_empty());
     }
 }

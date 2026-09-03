@@ -9152,6 +9152,7 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .map_err(orchestration_write_error)?;
         for checkpoint in [
             "preflight",
+            "repository_scaffolded",
             "repository_initialized",
             "repository_registered",
             "repository_linked",

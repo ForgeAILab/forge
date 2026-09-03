@@ -75,6 +75,96 @@ async fn list_review_step_results_json(
         .collect()
 }
 
+/// SQL selecting the four disjoint token counters out of an Agent Chat
+/// message's `token_usage_json`. `input` excludes the cached prefix, so a
+/// context total is the three input counters summed. See `docs/api.md`.
+const CHAT_TOKEN_COLUMNS: &str = "\
+    COUNT(*) AS run_count, \
+    COALESCE(SUM(CAST(COALESCE(json_extract(m.token_usage_json, '$.input'), 0) AS INTEGER)), 0) AS input_tokens, \
+    COALESCE(SUM(CAST(COALESCE(json_extract(m.token_usage_json, '$.output'), 0) AS INTEGER)), 0) AS output_tokens, \
+    COALESCE(SUM(CAST(COALESCE(json_extract(m.token_usage_json, '$.cache_read'), 0) AS INTEGER)), 0) AS cache_read_tokens, \
+    COALESCE(SUM(CAST(COALESCE(json_extract(m.token_usage_json, '$.cache_write'), 0) AS INTEGER)), 0) AS cache_write_tokens ";
+
+/// One grouped row of Agent Chat usage: an agent, on a model, on one surface.
+struct ChatUsageRow {
+    surface: &'static str,
+    agent_id: String,
+    provider: String,
+    model: String,
+    run_count: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+}
+
+/// Agent Chat usage for one Project, grouped by agent, provider and model,
+/// across both chat surfaces. `project_chat` is every Agent turn in the
+/// Project's own chat. `genesis_chat` is the Main-chat discovery that produced
+/// this Project, bounded by its Genesis session's own lifetime, so a shared
+/// Main chat does not bill one Project for another's discovery.
+async fn fetch_chat_usage(
+    pool: &sqlx::SqlitePool,
+    project_id: &str,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<Vec<ChatUsageRow>> {
+    let mut rows = Vec::new();
+    for (surface, source) in [
+        (
+            "project_chat",
+            "FROM agent_chat_message m \
+             JOIN agent_chat ch ON ch.id = m.chat_id \
+             LEFT JOIN agent_profile pr ON pr.id = m.profile_id \
+             WHERE ch.project_id = ",
+        ),
+        (
+            "genesis_chat",
+            "FROM product_genesis_session s \
+             JOIN agent_chat_message m ON m.chat_id = s.main_chat_id \
+                 AND m.created_at >= s.created_at AND m.created_at <= s.updated_at \
+             LEFT JOIN agent_profile pr ON pr.id = m.profile_id \
+             WHERE s.project_id = ",
+        ),
+    ] {
+        let mut query = sqlx::QueryBuilder::<Sqlite>::new("SELECT ");
+        query.push(CHAT_TOKEN_COLUMNS);
+        query.push(
+            ", COALESCE(m.author_id, '') AS agent_id, \
+               COALESCE(pr.provider, '') AS provider, \
+               COALESCE(m.model, '') AS model ",
+        );
+        query.push(source);
+        query.push_bind(project_id);
+        query.push(" AND m.author_type = 'agent' AND m.token_usage_json IS NOT NULL");
+        if let Some(from) = from {
+            query.push(" AND m.created_at >= ").push_bind(from);
+        }
+        if let Some(to) = to {
+            query.push(" AND m.created_at <= ").push_bind(to);
+        }
+        query.push(" GROUP BY m.author_id, pr.provider, m.model");
+        for row in query.build().fetch_all(pool).await? {
+            let run_count: i64 = row.try_get("run_count")?;
+            if run_count == 0 {
+                continue;
+            }
+            rows.push(ChatUsageRow {
+                surface,
+                agent_id: row.try_get("agent_id")?,
+                provider: row.try_get("provider")?,
+                model: row.try_get("model")?,
+                run_count,
+                input_tokens: row.try_get("input_tokens")?,
+                output_tokens: row.try_get("output_tokens")?,
+                cache_read_tokens: row.try_get("cache_read_tokens")?,
+                cache_write_tokens: row.try_get("cache_write_tokens")?,
+            });
+        }
+    }
+    Ok(rows)
+}
+
 #[async_trait]
 impl ProjectAnalyticsRepo for SqliteDb {
     async fn get_project_ci_analytics(
@@ -386,6 +476,142 @@ impl ProjectAnalyticsRepo for SqliteDb {
             });
         }
 
+        // Task executions are only part of a Project's bill. Fold in the
+        // Agent Chat surfaces so a Project total means what a reader expects:
+        // everything spent on this Project, discovery included.
+        let mut by_surface = vec![SurfaceTokenBreakdown {
+            surface: "task_execution".to_owned(),
+            run_count: execution_count,
+            input_tokens: total_input_tokens,
+            output_tokens: total_output_tokens,
+            cache_read_tokens: total_cache_read_tokens,
+            cache_write_tokens: total_cache_write_tokens,
+            cost_usd: total_cost_usd,
+        }];
+
+        let chat_rows = fetch_chat_usage(self.pool(), project_id, from, to).await?;
+        let mut chat_turn_count = 0_i64;
+        let mut surface_totals: std::collections::BTreeMap<&'static str, SurfaceTokenBreakdown> =
+            std::collections::BTreeMap::new();
+        let mut model_index: std::collections::HashMap<(String, String), usize> = by_model
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| ((entry.provider.clone(), entry.model.clone()), index))
+            .collect();
+        let mut agent_index: std::collections::HashMap<String, usize> = by_agent
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.agent_id.clone(), index))
+            .collect();
+
+        for row in chat_rows {
+            chat_turn_count += row.run_count;
+            total_input_tokens += row.input_tokens;
+            total_output_tokens += row.output_tokens;
+            total_cache_read_tokens += row.cache_read_tokens;
+            total_cache_write_tokens += row.cache_write_tokens;
+
+            let surface = surface_totals.entry(row.surface).or_insert_with(|| {
+                SurfaceTokenBreakdown {
+                    surface: row.surface.to_owned(),
+                    run_count: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    // A chat turn carries no cost figure: the embedded runtime
+                    // reports token counters only.
+                    cost_usd: None,
+                }
+            });
+            surface.run_count += row.run_count;
+            surface.input_tokens += row.input_tokens;
+            surface.output_tokens += row.output_tokens;
+            surface.cache_read_tokens += row.cache_read_tokens;
+            surface.cache_write_tokens += row.cache_write_tokens;
+
+            match model_index.get(&(row.provider.clone(), row.model.clone())) {
+                Some(&index) => {
+                    let entry = &mut by_model[index];
+                    entry.input_tokens += row.input_tokens;
+                    entry.output_tokens += row.output_tokens;
+                    entry.cache_read_tokens += row.cache_read_tokens;
+                    entry.cache_write_tokens += row.cache_write_tokens;
+                    entry.execution_count += row.run_count;
+                }
+                None => {
+                    model_index.insert((row.provider.clone(), row.model.clone()), by_model.len());
+                    by_model.push(ModelTokenBreakdown {
+                        provider: row.provider.clone(),
+                        model: row.model.clone(),
+                        input_tokens: row.input_tokens,
+                        output_tokens: row.output_tokens,
+                        cache_read_tokens: row.cache_read_tokens,
+                        cache_write_tokens: row.cache_write_tokens,
+                        cost_usd: None,
+                        execution_count: row.run_count,
+                    });
+                }
+            }
+
+            if row.agent_id.is_empty() {
+                continue;
+            }
+            match agent_index.get(&row.agent_id) {
+                Some(&index) => {
+                    let entry = &mut by_agent[index];
+                    entry.input_tokens += row.input_tokens;
+                    entry.output_tokens += row.output_tokens;
+                    entry.cache_read_tokens += row.cache_read_tokens;
+                    entry.cache_write_tokens += row.cache_write_tokens;
+                    entry.execution_count += row.run_count;
+                }
+                None => {
+                    // A Main or Project Agent that only ever spoke in chat has
+                    // no execution row to hang its usage on.
+                    let identity = sqlx::query(
+                        "SELECT name, executor_type, model FROM agent_current WHERE id = ?",
+                    )
+                    .bind(&row.agent_id)
+                    .fetch_optional(self.pool())
+                    .await?;
+                    let (agent_name, executor_type, model) = match identity {
+                        Some(identity) => (
+                            identity.try_get::<String, _>("name")?,
+                            identity.try_get::<String, _>("executor_type")?,
+                            identity.try_get::<Option<String>, _>("model")?,
+                        ),
+                        None => (row.agent_id.clone(), String::new(), None),
+                    };
+                    agent_index.insert(row.agent_id.clone(), by_agent.len());
+                    by_agent.push(AgentTokenBreakdown {
+                        agent_id: row.agent_id.clone(),
+                        agent_name,
+                        executor_type,
+                        model: model.or_else(|| (!row.model.is_empty()).then(|| row.model.clone())),
+                        input_tokens: row.input_tokens,
+                        output_tokens: row.output_tokens,
+                        cache_read_tokens: row.cache_read_tokens,
+                        cache_write_tokens: row.cache_write_tokens,
+                        cost_usd: None,
+                        execution_count: row.run_count,
+                        // Success rate and duration are execution concepts; a
+                        // chat-only agent has neither.
+                        success_rate: None,
+                        avg_duration_ms: None,
+                    });
+                }
+            }
+        }
+        by_surface.extend(surface_totals.into_values());
+        by_surface.retain(|entry| entry.run_count > 0);
+        by_model.sort_by(|left, right| {
+            left.provider
+                .cmp(&right.provider)
+                .then_with(|| left.model.cmp(&right.model))
+        });
+        by_agent.sort_by(|left, right| left.agent_name.cmp(&right.agent_name));
+
         Ok(ProjectTokenStats {
             total_input_tokens,
             total_output_tokens,
@@ -393,8 +619,10 @@ impl ProjectAnalyticsRepo for SqliteDb {
             total_cache_write_tokens,
             total_cost_usd,
             execution_count,
+            chat_turn_count,
             by_model,
             by_agent,
+            by_surface,
         })
     }
 

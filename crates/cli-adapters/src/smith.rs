@@ -195,7 +195,7 @@ impl CodingExecutorAdapter for SmithAdapter {
         };
 
         let mut cmd = Self::build_command(&config, &prompt);
-        cmd.current_dir(&ctx.worktree_path);
+        crate::command::run_in_worktree(&mut cmd, &ctx.worktree_path);
 
         let mut child = cmd.spawn()?;
 
@@ -327,18 +327,16 @@ impl CodingExecutorAdapter for SmithAdapter {
             });
         }
 
-        let after_sha = if let Ok(false) =
-            git::is_worktree_clean(Path::new(&ctx.worktree_path)).await
-        {
-            let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
-            crate::commit::commit_worktree_changes(Path::new(&ctx.worktree_path), &subject)
-                .await
-                .map_err(|err| {
-                    ExecutorError::Other(format!("failed to commit worktree changes: {err}"))
-                })?
-        } else {
-            None
-        };
+        let after_sha =
+            if let Ok(false) = git::is_worktree_clean(Path::new(&ctx.worktree_path)).await {
+                crate::commit::commit_execution_changes(&ctx)
+                    .await
+                    .map_err(|err| {
+                        ExecutorError::Other(format!("failed to commit worktree changes: {err}"))
+                    })?
+            } else {
+                None
+            };
 
         Ok(ExecutionResult {
             status: ExecutionOutcome::Completed,

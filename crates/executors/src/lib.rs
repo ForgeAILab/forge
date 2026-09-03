@@ -80,11 +80,21 @@ mod worktree_policy_tests {
 }
 
 /// Accumulated token usage from an executor run.
+///
+/// The three input counters are **disjoint**, whatever the upstream provider's
+/// own convention: `input_tokens` excludes both cache reads and cache writes,
+/// so context size is their sum and a total never double-counts a cached
+/// prefix. Adapters normalize to this on the way in — Anthropic already
+/// reports it, Codex and the embedded runtime report input inclusive of the
+/// cached prefix and have it subtracted back out.
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
+    /// Input tokens read fresh, excluding cache reads and cache writes.
     pub input_tokens: i64,
     pub output_tokens: i64,
+    /// Input tokens served from the provider's prompt cache.
     pub cache_read_tokens: i64,
+    /// Input tokens written to the provider's prompt cache.
     pub cache_write_tokens: i64,
     pub cost_usd: Option<f64>,
     pub model: Option<String>,

@@ -30,7 +30,7 @@ database for historical provenance.
 | GET    | `/api/v1/projects/{id}` | Get project |
 | PATCH  | `/api/v1/projects/{id}` | Update project |
 | DELETE | `/api/v1/projects/{id}` | Delete a Project through the guarded, transactional teardown of its Project-owned records |
-| GET    | `/api/v1/projects/{id}/analytics` | Read Project analytics (CI steps, review summary, token and cost breakdown by model and by agent) |
+| GET    | `/api/v1/projects/{id}/analytics` | Read Project analytics (CI steps, review summary, token and cost breakdown by surface, model and agent) |
 | GET    | `/api/v1/mission-control` | Read authorized attention, work, health, and bounded coordination activity projections; optional `project_id` restricts the feed to that Project |
 | GET    | `/api/v1/account/main-agent/product-genesis/{session_id}/charter` | Read the active Genesis Charter and revision/approval state |
 | POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/charter/revisions` | Append an immutable Genesis Charter draft revision |
@@ -189,6 +189,7 @@ database for historical provenance.
 | GET    | `/api/v1/agent-chats/{chat_id}/messages` | `V071+` — List immutable authorized Agent Chat messages |
 | POST   | `/api/v1/agent-chats/{chat_id}/messages` | `V071+` — Admit one guarded user message and exactly one queued turn |
 | GET    | `/api/v1/agent-chats/{chat_id}/turns` | `V071+` — List finite turn state (`queued`, `leased`, `awaiting_input`, `retry_wait`, `succeeded`, `failed`, `cancelled`) |
+| GET    | `/api/v1/agent-chats/{chat_id}/turns/{turn_id}/logs` | One keyset page of the turn's durable activity log (reasoning, tool calls with bounded results, reply deltas) in the `/executions/{id}/logs` shape; a turn that has not started reads as an empty page |
 | POST   | `/api/v1/agent-chats/{chat_id}/turns/{turn_id}/cancel` | `V071+` — Cancel an owned non-terminal turn with `expected_version` and an idempotency key |
 | GET    | `/api/v1/agent-chats/{chat_id}/topics` | `V103+` — List the chat's immutable topic epochs, newest first, with the current one marked |
 | POST   | `/api/v1/agent-chats/{chat_id}/topics` | `V103+` — Start a new topic epoch in the same chat; denied while a turn is live or a Genesis session/approval needs an explicit decision |
@@ -442,7 +443,12 @@ foreign Charter, milestone check, or Document approval.
 ### Project Charters, Documents, Decisions, and effective state
 
 The Project Charter route exposes immutable revisions, exact content/render
-digests, approval/supersession history, and the current-approved pointer. The
+digests, approval/supersession history, and the current-approved pointer.
+Charter content carries an optional `scaffold` block (`template`, `packs`)
+naming the spark template and packs Genesis provisioning stands the repository
+up from; it is omitted from canonical JSON when absent, so Charters that
+predate it keep their digests, and readiness rejects a template or pack that
+is not a slug or a pack listed twice. The
 Document routes expose only the typed kinds `research`, `delivery_brief`,
 `product_spec`, `design`, `architecture`, and `execution_plan`; they are
 Forge-owned artifacts with revision/diff/export views, not repository files.
@@ -675,6 +681,18 @@ readiness evaluation. It is an orchestration prompt, not a validation result,
 readiness decision, or release approval; a committed milestone readiness
 evaluation resolves the Project's open delivery follow-ups.
 
+`AttentionCategory` also includes `decision_recorded` (recommended action
+`continue_from_decision`). Forge projects it when the *user* records a
+decision the Project Agent was waiting on: a milestone definition revision
+transitioned to `approved` or `rejected`, a Decision approved or a candidate
+rejected, or a Document revision approved. Only user-authored events qualify,
+so an Agent's own approval never wakes the Agent that made it. The wake the
+Agent receives states what was decided (`details.decision`: outcome, target
+type and id, revision) and directs it to continue from the decision without
+asking again. The incident is a hand-off, not a lasting condition: the wake
+consumer resolves it as soon as the wake turn is admitted, so a settled
+decision never lingers in Mission Control.
+
 ## Commitments, inbox, and typed actions
 
 Coordination endpoints are authenticated and least-authority scoped. An
@@ -898,12 +916,43 @@ REST resource or generated API type; no wake-disposition endpoint is exposed.
 REST callers observe an admitted wake through the normal
 `AgentChatTurnJobResponse` and its finite turn status, while setup blockers use
 the Project execution-setup projection and documented REST error details.
+The trigger message an admitted wake appends is a `system` message whose
+`outcome` is `attention_wake` (migration `V127` backfills prompts admitted
+before that outcome existed); its content opens with a
+`### Attention wake: <summary>` line, and the web timeline shows that summary
+with the full work order behind a toggle rather than the whole prompt inline.
 Cancellation is allowed only for an authorized non-terminal turn and requires
 its current optimistic version plus an idempotency key; stale or terminal
 requests return a conflict instead of rewriting the durable outcome.
 CLI-backed assistant output is bounded to 500 Unicode characters before it is
 admitted to the immutable message, semantic-memory, FTS, and subsequent prompt
-history surfaces.
+history surfaces. An Agent reply's `token_usage_json` carries `input`,
+`output`, `cache_read`, and `cache_write`. The three input counters are
+disjoint: `input` counts only tokens read fresh, and the context a turn
+consumed is `input + cache_read + cache_write`. The same convention holds for
+`execution_usage` and every usage figure derived from it, whichever executor
+produced the row — adapters normalize on the way in, so a total never
+double-counts a cached prefix. Cache counters read zero on a session's first
+turn, which has no cache to read.
+
+Chat-turn usage carries no cost figure: the embedded runtime reports token
+counters only. `cost_usd` is populated for task executions whose executor
+reports it (the Claude Code adapter does; Codex, Smith, and the embedded
+runtime do not).
+
+`GET /api/v1/projects/{id}/analytics` counts **both** recording surfaces, so a
+Project total means everything spent on that Project. `token_usage.by_surface`
+splits it into `task_execution`, `project_chat`, and `genesis_chat`, each with
+its own `run_count` (task executions for the first, Agent Chat turns for the
+other two). `genesis_chat` is the Main-chat discovery that produced this
+Project, bounded by its Genesis session's own lifetime, so a shared Main chat
+never bills one Project for another's discovery. `execution_count` still counts
+task executions alone and `chat_turn_count` counts the chat turns beside it;
+`by_model` and `by_agent` include both surfaces, which is how an Agent that
+only ever spoke in chat (a Main or Project Agent) appears at all — with
+`success_rate` and `avg_duration_ms` null, since those are execution concepts.
+`forge-ctl project analytics <project-id>` renders the same figures, with
+`--from` / `--to` to bound the window.
 
 Main Agent tools are limited to discovery, configured web search, Project
 lifecycle/organization, bounded portfolio summaries, and explicit handoff. A
@@ -1000,6 +1049,17 @@ backfilled local repository may report `repository_initialized=skipped` with
 `filesystem_verified=false`: V087 verifies only persisted repository linkage,
 workflow role requirements, and effectively eligible identities. It
 does not inspect the filesystem or fabricate a successful initialization.
+
+The provisioning operation's `current_checkpoint` also reports
+`repository_scaffolded`, which runs between `preflight` and
+`repository_initialized`. It is `completed` when the approved Charter's
+`scaffold` block was applied (or was already present on disk), `skipped`
+without a scaffold or for operations that predate it, and fails with
+`scaffold_runtime_unavailable` (the configured create-spark command cannot be
+spawned; install `bun` or set `FORGE_SCAFFOLD_COMMAND`) or
+`repository_scaffold_failed` (create-spark refused the template or pack set,
+timed out, or the target directory was occupied). Both are retryable; the
+checkpoint details keep the command and the bounded tool output.
 
 The Worker, independent-reviewer, and repository actions are owner/admin-only
 and use optimistic concurrency. Each request supplies the version shown by
@@ -1137,6 +1197,14 @@ default. A `--effort` flag requires a Smith build that accepts it.
 state, the server auto-escalates to the user-routing-override path. MCP
 `forge_transition_task` is unchanged — it still emits `triggered_by="system"`
 and does not support user override (REST-only for now).
+
+`POST /api/v1/tasks/{id}/gates/{state_name}/approve` and `/reject` accept the
+current Task `version`. A gate with blocking entry checks is not decision-ready
+until its entry barrier settles: Task responses keep `awaiting_human = false`
+for that Task snapshot, and an early decision returns HTTP 409 with
+`code: "validation_error"`. The response's `awaiting_human` value and `version`
+are derived from the same Task snapshot so a barrier-clear write cannot expose
+readiness paired with the version it just invalidated.
 
 ## Task intent actions
 
@@ -2294,3 +2362,29 @@ Execution chat history is backed by Forge JSONL logs plus execution prompt
 metadata, not by agent-private transcript storage. See
 [execution-logs.md](execution-logs.md) for the adapter-specific details and
 log schema.
+
+### Agent Chat turn activity logs
+
+Every Main/Project Agent Chat turn writes the same Forge JSONL log while it
+runs, at `<data-dir>/agent-chat-logs/<turn_job_id>.jsonl`. A native turn
+records `thinking` deltas, one `tool_call` per validated call (tool name,
+every top-level argument key name, and an optional `input` object — a
+bounded, flat, credential-masked preview of the argument values, present
+only when at least one field survives filtering: at most 8 fields, string
+values truncated to 160 chars, content-shaped and secret-shaped keys
+dropped, and inline secrets in surviving values masked to `***`), one
+`tool_result` carrying the bounded `ToolResultSummary` (status, code, safe
+message, correlation id, and the typed Forge `operation` such as
+`task.propose` or `skill.section`), and `assistant_delta` reply text. A
+CLI-backed turn writes its adapter's stream into the same file. Retried
+attempts of one turn append to the same log behind a `system` `turn_divider`
+entry.
+
+`GET /api/v1/agent-chats/{chat_id}/turns/{turn_id}/logs` serves that log with
+the execution-log query parameters (`from_sequence`, `limit`, `tail`) and
+response shape (`items`, `has_more`, `next_sequence`). It is owner-scoped like
+every other chat resource, a turn id is only readable through its own chat,
+and a queued turn with no file yet returns an empty page rather than an error.
+The web chat follows a live turn's log once per second to show what the Agent
+is doing (reading the operating skill, proposing a Task, running a command,
+writing the reply) and keeps the settled log under the reply it produced.

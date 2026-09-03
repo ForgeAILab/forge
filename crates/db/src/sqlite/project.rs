@@ -53,6 +53,7 @@ impl ProjectRepo for SqliteDb {
         .await?;
         for checkpoint in [
             "preflight",
+            "repository_scaffolded",
             "repository_initialized",
             "repository_registered",
             "repository_linked",
@@ -288,15 +289,19 @@ impl ProjectRepo for SqliteDb {
         }
         if let Some(paused_at) = input.paused_at {
             project.paused_at = paused_at;
+            // An explicit pause/resume through this general update is a
+            // manual/external action, never the dispatcher's own reasoning.
+            project.system_pause_reason = None;
         }
         project.updated_at = input.updated_at;
         sqlx::query(
-            "UPDATE project SET name = ?, settings = ?, primary_repo_id = ?, paused_at = ?, project_hooks_json = ?, project_work_epoch = ?, updated_at = ? WHERE id = ?",
+            "UPDATE project SET name = ?, settings = ?, primary_repo_id = ?, paused_at = ?, system_pause_reason = ?, project_hooks_json = ?, project_work_epoch = ?, updated_at = ? WHERE id = ?",
         )
         .bind(&project.name)
         .bind(&project.settings)
         .bind(project.primary_repo_id.as_deref())
         .bind(project.paused_at.as_deref())
+        .bind(project.system_pause_reason.as_deref())
         .bind(&project.project_hooks_json)
         .bind(project.project_work_epoch)
         .bind(&project.updated_at)
@@ -329,6 +334,7 @@ impl ProjectRepo for SqliteDb {
         }
         if let Some(paused_at) = input.paused_at {
             project.paused_at = paused_at;
+            project.system_pause_reason = None;
         }
         if let Some(project_hooks_json) = project_hooks_json {
             project.project_hooks_json = project_hooks_json;
@@ -337,13 +343,14 @@ impl ProjectRepo for SqliteDb {
         let result = sqlx::query(
             "UPDATE project
              SET name = ?, settings = ?, primary_repo_id = ?, paused_at = ?,
-                 project_hooks_json = ?, version = version + 1, updated_at = ?
+                 system_pause_reason = ?, project_hooks_json = ?, version = version + 1, updated_at = ?
              WHERE id = ? AND version = ?",
         )
         .bind(&project.name)
         .bind(&project.settings)
         .bind(project.primary_repo_id.as_deref())
         .bind(project.paused_at.as_deref())
+        .bind(project.system_pause_reason.as_deref())
         .bind(&project.project_hooks_json)
         .bind(&project.updated_at)
         .bind(&project.id)
@@ -394,15 +401,37 @@ impl ProjectRepo for SqliteDb {
     }
 
     async fn set_paused_at(&self, id: &str, paused_at: Option<String>) -> Result<()> {
-        let result = sqlx::query("UPDATE project SET paused_at = ?, updated_at = ? WHERE id = ?")
-            .bind(paused_at.as_deref())
-            .bind(now_rfc3339())
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        // Both callers (pause_project, resume_project) are an explicit,
+        // external pause/resume, so this always clears any system reason —
+        // pausing manually never carries one, and resuming (manual or the
+        // dispatcher's own) makes any prior reason moot.
+        let result = sqlx::query(
+            "UPDATE project SET paused_at = ?, system_pause_reason = NULL, updated_at = ? WHERE id = ?",
+        )
+        .bind(paused_at.as_deref())
+        .bind(now_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
+        Ok(())
+    }
+
+    async fn set_system_pause_reason(&self, id: &str, paused_at: &str, reason: &str) -> Result<()> {
+        // Guarded on `paused_at IS NULL`: only pauses a currently-active
+        // Project. A concurrent pause (manual or another reconciliation
+        // tick) makes this a benign no-op rather than an error.
+        sqlx::query(
+            "UPDATE project SET paused_at = ?, system_pause_reason = ?, updated_at = ? WHERE id = ? AND paused_at IS NULL",
+        )
+        .bind(paused_at)
+        .bind(reason)
+        .bind(now_rfc3339())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -524,6 +553,13 @@ impl ProjectRepo for SqliteDb {
                   JOIN agent_chat c ON c.id = h.source_chat_id OR c.id = h.target_chat_id
                   WHERE c.project_id = ?)",
             "DELETE FROM agent_chat_message WHERE chat_id IN
+                 (SELECT id FROM agent_chat WHERE project_id = ?)",
+            // Topics only ever cascade in from `agent_chat`, never explicitly
+            // deleted otherwise -- by the time that cascade reaches them the
+            // parent Chat row is already gone, so their own guard (which
+            // joins back to `agent_chat`) can no longer match. Clearing them
+            // here, while the Chat still exists, keeps the guard meaningful.
+            "DELETE FROM agent_chat_topic WHERE chat_id IN
                  (SELECT id FROM agent_chat WHERE project_id = ?)",
             // A handed-off Genesis session exists only as this Project's origin
             // record, and its CHECK forbids the NULL the Project's removal would

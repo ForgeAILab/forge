@@ -49,6 +49,20 @@ impl TaskDispatcher {
             if self.is_stopped() {
                 break;
             }
+            // Creation gives a Task the Project's default assignees, so a Task
+            // with no role assignment at all was proposed before those
+            // defaults existed in Project settings (e.g. while the Project
+            // was still paused for having no repository). Apply them now
+            // rather than skipping the Task on every scan with nothing in
+            // the log.
+            if TaskRoleAssignmentRepo::list_by_task(&*self.db, &task.id)
+                .await?
+                .is_empty()
+            {
+                if let Err(error) = self.task_service.assign_project_default_roles(&task).await {
+                    tracing::warn!(task_id = %task.id, %error, "Task has no role assignments and the Project defaults could not be applied");
+                }
+            }
             let Some(target) = self
                 .resolve_initial_schedule_target(workflow, &task)
                 .await?

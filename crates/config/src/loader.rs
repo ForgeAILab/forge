@@ -119,6 +119,12 @@ impl ForgeConfig {
             }
         }
 
+        if let Some(scaffold) = file.scaffold {
+            if let Some(command) = scaffold.command {
+                self.scaffold.command = command;
+            }
+        }
+
         if let Some(project) = file.project {
             self.project.values.extend(project);
         }
@@ -180,6 +186,9 @@ impl ForgeConfig {
         if let Some(value) = env_value("FORGE_MEDIA_UPLOAD_LIMIT_BYTES") {
             self.server.media_upload_limit_bytes =
                 parse_env_u64("FORGE_MEDIA_UPLOAD_LIMIT_BYTES", &value)?;
+        }
+        if let Some(value) = env_value("FORGE_SCAFFOLD_COMMAND") {
+            self.scaffold.command = value;
         }
         Ok(())
     }

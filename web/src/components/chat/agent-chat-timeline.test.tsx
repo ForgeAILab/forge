@@ -1,12 +1,14 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { AgentChatTimeline, ChatComposer } from './agent-chat-timeline'
+import { AgentChatTimeline, ChatComposer, parseTokenUsage } from './agent-chat-timeline'
 import type { AgentChat, AgentChatMessage, AgentChatTurn } from '@/features/agent-chat/types'
+import type { LogEntry } from '@/types/generated'
 
 const mocks = vi.hoisted(() => ({
   listAgentChatMessages: vi.fn(),
   listAgentChatTurns: vi.fn(),
+  listAgentChatTurnLogs: vi.fn(),
   listAgentHandoffs: vi.fn(),
   navigate: vi.fn(),
 }))
@@ -14,8 +16,53 @@ const mocks = vi.hoisted(() => ({
 vi.mock('@/features/agent-chat/api', () => ({
   listAgentChatMessages: mocks.listAgentChatMessages,
   listAgentChatTurns: mocks.listAgentChatTurns,
+  listAgentChatTurnLogs: mocks.listAgentChatTurnLogs,
   listAgentHandoffs: mocks.listAgentHandoffs,
 }))
+
+const emptyLogPage = { items: [], has_more: false, next_sequence: null }
+
+function turnLog(sequence: number, kind: LogEntry['kind'], payload: unknown): LogEntry {
+  return {
+    schema_version: 1,
+    sequence,
+    timestamp: `2026-08-13T12:00:${String(sequence).padStart(2, '0')}Z`,
+    execution_id: 'turn-1',
+    kind,
+    stream: 'main',
+    payload,
+    truncated: false,
+  }
+}
+
+const skillReadLogs: LogEntry[] = [
+  turnLog(0, 'thinking', { text: 'Check the operating skill first.' }),
+  turnLog(1, 'tool_call', {
+    call_id: 'call-1',
+    name: 'forge_project_orchestration_read',
+    argument_keys: ['arguments', 'operation'],
+  }),
+  turnLog(2, 'tool_result', {
+    call_id: 'call-1',
+    name: 'forge_project_orchestration_read',
+    is_error: false,
+    success: true,
+    summary: {
+      status: 'succeeded',
+      code: 'ok',
+      safe_message: 'the tool call completed successfully',
+      retryable: false,
+      recovery_action: null,
+      correlation_id: 'call-1',
+      operation: 'skill.section',
+    },
+  }),
+  turnLog(3, 'tool_call', {
+    call_id: 'call-2',
+    name: 'forge_task_command',
+    argument_keys: ['args', 'program'],
+  }),
+]
 
 vi.mock('@tanstack/react-router', () => ({
   useNavigate: () => mocks.navigate,
@@ -143,11 +190,76 @@ describe('AgentChatTimeline polling', () => {
       turnComplete ? [completedTurn] : [queuedTurn],
     )
     mocks.listAgentHandoffs.mockResolvedValue([])
+    mocks.listAgentChatTurnLogs.mockResolvedValue(emptyLogPage)
   })
 
   afterEach(() => {
     vi.useRealTimers()
     vi.clearAllMocks()
+  })
+
+  it('shows what a live turn is doing from its activity log', async () => {
+    mocks.listAgentChatMessages.mockResolvedValue({
+      items: [userMessage],
+      next_cursor: null,
+      has_more: false,
+    })
+    mocks.listAgentChatTurns.mockResolvedValue([{ ...queuedTurn, status: 'leased' }])
+    mocks.listAgentChatTurnLogs.mockResolvedValue({
+      items: skillReadLogs,
+      has_more: false,
+      next_sequence: 4,
+    })
+
+    renderTimeline()
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    // The in-flight command names the current step instead of a generic label.
+    await vi.waitFor(() => expect(screen.getByText('Running a command…')).toBeTruthy())
+    expect(screen.queryByText('Thinking…')).toBeNull()
+    expect(screen.getByLabelText('Agent activity in progress')).toBeTruthy()
+    expect(screen.getByText('Read the operating skill')).toBeTruthy()
+    expect(screen.getByText('skill.section')).toBeTruthy()
+    expect(screen.getByText('Running a command')).toBeTruthy()
+    expect(mocks.listAgentChatTurnLogs).toHaveBeenCalledWith(
+      'chat-1',
+      'turn-1',
+      expect.objectContaining({ from_sequence: 0 }),
+    )
+  })
+
+  it('keeps a settled turn\'s activity under the reply it produced', async () => {
+    mocks.listAgentChatMessages.mockResolvedValue({
+      items: [userMessage, assistantMessage],
+      next_cursor: null,
+      has_more: false,
+    })
+    mocks.listAgentChatTurns.mockResolvedValue([completedTurn])
+    mocks.listAgentChatTurnLogs.mockResolvedValue({
+      items: skillReadLogs.slice(0, 3),
+      has_more: false,
+      next_sequence: 3,
+    })
+
+    renderTimeline()
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    const toggle = screen.getByRole('button', { name: 'Toggle agent activity' })
+    await vi.waitFor(() =>
+      expect(toggle.textContent).toContain('1 tool call · thought it through'),
+    )
+    expect(screen.queryByText('Read the operating skill')).toBeNull()
+    fireEvent.click(toggle)
+    expect(screen.getByText('Read the operating skill')).toBeTruthy()
+    expect(screen.getByLabelText('Agent activity')).toBeTruthy()
   })
 
   it('shows the completed assistant response after polling without remounting the timeline', async () => {
@@ -324,6 +436,7 @@ describe('AgentChatTimeline session dividers', () => {
     vi.useFakeTimers()
     mocks.listAgentChatTurns.mockResolvedValue([])
     mocks.listAgentHandoffs.mockResolvedValue([])
+    mocks.listAgentChatTurnLogs.mockResolvedValue(emptyLogPage)
   })
 
   afterEach(() => {
@@ -366,6 +479,83 @@ describe('AgentChatTimeline session dividers', () => {
     })
 
     expect(screen.queryByRole('separator')).toBeNull()
+  })
+})
+
+describe('AgentChatTimeline wake prompts', () => {
+  const wakeMessage: AgentChatMessage = {
+    ...userMessage,
+    id: 'message-wake',
+    author_type: 'system',
+    outcome: 'attention_wake',
+    content: [
+      '### Attention wake: Task completed; reconcile validation, evidence, and readiness',
+      '',
+      'Category: delivery_followup — recommended action: reconcile_delivery.',
+      'Incident: attention:delivery_followup:project:p1:task:t1',
+      'DELIVERY FOLLOW-UP WORK ORDER',
+      'Settle yourself, in this turn: budget-semantics, category-lifecycle.',
+    ].join('\n'),
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    mocks.listAgentChatMessages.mockResolvedValue({
+      items: [wakeMessage],
+      next_cursor: null,
+      has_more: false,
+    })
+    mocks.listAgentChatTurns.mockResolvedValue([])
+    mocks.listAgentHandoffs.mockResolvedValue([])
+    mocks.listAgentChatTurnLogs.mockResolvedValue(emptyLogPage)
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.clearAllMocks()
+  })
+
+  it('collapses a wake to its summary and reveals the full prompt on demand', async () => {
+    renderTimeline()
+    await act(async () => {
+      await vi.runOnlyPendingTimersAsync()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    const toggle = screen.getByRole('button', { name: /Attention wake/ })
+    expect(toggle.textContent).toContain(
+      'Task completed; reconcile validation, evidence, and readiness',
+    )
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    expect(screen.queryByText(/DELIVERY FOLLOW-UP WORK ORDER/)).toBeNull()
+    expect(screen.queryByText(/### Attention wake/)).toBeNull()
+
+    fireEvent.click(toggle)
+
+    expect(toggle.getAttribute('aria-expanded')).toBe('true')
+    const prompt = screen.getByText(/DELIVERY FOLLOW-UP WORK ORDER/)
+    expect(prompt.textContent).toContain('recommended action: reconcile_delivery')
+    expect(prompt.textContent).not.toContain('### Attention wake')
+
+    fireEvent.click(toggle)
+    expect(screen.queryByText(/DELIVERY FOLLOW-UP WORK ORDER/)).toBeNull()
+  })
+})
+
+describe('parseTokenUsage', () => {
+  it('shows the cached share of the input next to the totals', () => {
+    expect(parseTokenUsage({ input: 77535, output: 898, cache_read: 61440, cache_write: 0 })).toBe(
+      '77,535 in · 61,440 cached · 898 out',
+    )
+    expect(parseTokenUsage({ input: 100, output: 5, cache_read: 0, cache_write: 90 })).toBe(
+      '100 in · 90 cache write · 5 out',
+    )
+  })
+
+  it('still reads usage recorded before cache counts existed', () => {
+    expect(parseTokenUsage({ input: 725218, output: 11942 })).toBe('725,218 in · 11,942 out')
+    expect(parseTokenUsage({})).toBeNull()
   })
 })
 

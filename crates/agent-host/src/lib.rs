@@ -7,6 +7,7 @@ mod native;
 pub mod operation_catalog;
 pub(crate) mod operation_contract;
 mod protected_store;
+mod tool_preview;
 mod transport;
 mod typed_tools;
 
@@ -66,6 +67,7 @@ pub use protected_store::{
     CreateOAuthCredential, CredentialRevocationOutcome, OAuthCredentialBundle,
     SqliteProtectedRuntimeStore,
 };
+pub use tool_preview::build_tool_argument_preview;
 pub use typed_tools::{CommandObservation, PROJECT_VERIFICATION_CHECKOUT_DIR};
 pub use typed_tools::{
     FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL, FORGE_MAIN_ORCHESTRATION_READ_TOOL,
@@ -256,8 +258,18 @@ pub struct AgentTurnRequest {
 pub struct AgentTurnOutput {
     pub runtime_session_id: String,
     pub text: String,
+    /// Input tokens the provider read fresh, excluding anything served from
+    /// or written to its prompt cache. The three input counters are disjoint,
+    /// so context size is `input_tokens + cache_read_tokens +
+    /// cache_write_tokens` and no consumer can double-count a cached prefix.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Input tokens the provider served from its prompt cache. Disjoint from
+    /// `input_tokens`.
+    pub cache_read_tokens: u64,
+    /// Input tokens the provider wrote to its prompt cache. Disjoint from
+    /// `input_tokens`.
+    pub cache_write_tokens: u64,
     /// Final Agent Runtime context/LCM metadata. Bodies and protected state
     /// are intentionally absent; Forge links this to its domain manifest.
     pub context_manifest: Option<RuntimeContextManifestLink>,
@@ -272,9 +284,19 @@ pub trait TurnEventSink: Send + Sync + fmt::Debug {
     /// exist only as liveness/progress signals.
     async fn reasoning_delta(&self, _text: &str, _redacted: bool) {}
 
-    /// A validated tool call left the model. Argument values are withheld by
-    /// the runtime; only the top-level key names are visible.
-    async fn tool_call_started(&self, _call_id: &str, _name: &str, _argument_keys: &[String]) {}
+    /// A validated tool call left the model. `argument_keys` is every
+    /// top-level key name, unfiltered. `argument_preview` is the bounded,
+    /// credential-masked subset of those arguments' values Forge is willing
+    /// to persist and render (see `tool_preview::build_tool_argument_preview`
+    /// for the exact contract); it is empty when nothing survives filtering.
+    async fn tool_call_started(
+        &self,
+        _call_id: &str,
+        _name: &str,
+        _argument_keys: &[String],
+        _argument_preview: &serde_json::Map<String, serde_json::Value>,
+    ) {
+    }
 
     /// A tool call finished. `summary` is the same bounded, redaction-safe
     /// result the model and the UI tool card receive: a stable code, a safe

@@ -24,6 +24,7 @@ import type { AgentChatEntry } from '@/features/agent-chat/types'
 import { MainChatTopicControl } from '@/features/agent-chat/MainChatTopicControl'
 import { ProjectCharterApprovalCard } from '@/features/project-charter/ProjectCharterApprovalCard'
 import { ProjectExecutionSetupPanel } from '@/features/project-execution/ProjectExecutionSetupPanel'
+import { ProjectDecisionCard } from '@/features/project-execution/ProjectDecisionCard'
 import { useChatSelection } from '@/stores/chat'
 import { useProjectsInfiniteQuery } from '@/api/hooks'
 import { cn } from '@/lib/cn'
@@ -228,6 +229,7 @@ export function ChatPage({ projectId }: { projectId?: string }) {
             className="order-1 min-h-0 min-w-0 max-h-[min(42vh,32rem)] overflow-y-auto border-b border-border-subtle bg-muted/10 p-3 sm:p-4 xl:order-2 xl:max-h-none xl:border-b-0 xl:border-l xl:p-3"
             aria-label="Project status and approvals"
           >
+            <ProjectDecisionCard projectId={projectId} className="mb-3" />
             <ProjectExecutionSetupPanel projectId={projectId} compact />
             <ProjectCharterApprovalCard
               projectId={projectId}

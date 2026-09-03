@@ -30,6 +30,12 @@ pub enum AttentionCategory {
     /// authoritative validation, evidence, and milestone readiness. It is not
     /// itself a validation or release signal.
     DeliveryFollowup,
+    /// The user recorded a decision the Project Agent was waiting on — a
+    /// milestone definition revision approved or rejected, a proposed
+    /// Decision approved or rejected, a Document revision approved. It
+    /// exists to hand that decision to the Agent as a wake and resolves as
+    /// soon as the wake turn is admitted.
+    DecisionRecorded,
     RuntimeOffline,
     BudgetThreshold,
     CommitmentOverdue,

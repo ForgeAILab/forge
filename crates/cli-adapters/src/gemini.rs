@@ -183,7 +183,7 @@ impl CodingExecutorAdapter for GeminiAdapter {
             ctx.description.clone()
         };
         let mut cmd = Self::build_command(&config, &prompt);
-        cmd.current_dir(&ctx.worktree_path);
+        crate::command::run_in_worktree(&mut cmd, &ctx.worktree_path);
 
         let mut child = cmd.spawn()?;
 
@@ -246,10 +246,7 @@ impl CodingExecutorAdapter for GeminiAdapter {
         };
 
         let after_sha = if outcome == ExecutionOutcome::Completed {
-            let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
-            match crate::commit::commit_worktree_changes(Path::new(&ctx.worktree_path), &subject)
-                .await
-            {
+            match crate::commit::commit_execution_changes(&ctx).await {
                 Ok(Some(sha)) => Some(sha),
                 Ok(None) => git::get_current_sha(Path::new(&ctx.worktree_path))
                     .await

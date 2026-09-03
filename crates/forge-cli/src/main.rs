@@ -95,6 +95,9 @@ async fn main() {
     // Genesis repo provisioning inside the services crate) fall back to this
     // env var; export the configured value so every path agrees.
     std::env::set_var("FORGE_WORKSPACE_ROOT", &workspace_root);
+    // Same reason: Genesis provisioning runs the scaffold command from the
+    // services crate and reads it from the environment.
+    std::env::set_var("FORGE_SCAFFOLD_COMMAND", &config.scaffold.command);
 
     info!(
         bind_addr = %effective_config.server.bind,
@@ -107,6 +110,7 @@ async fn main() {
         data_dir = %effective_config.forge.data_dir.display(),
         db_path = %db_path.display(),
         workspace_root = %workspace_root.display(),
+        scaffold_command = %config.scaffold.command,
         "initializing forge"
     );
 

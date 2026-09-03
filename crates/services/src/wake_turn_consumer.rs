@@ -41,6 +41,11 @@ const LEASE_SECONDS: i64 = 60;
 const POLL_INTERVAL: TokioDuration = TokioDuration::from_secs(1);
 const MAX_TURN_ATTEMPTS: i64 = 3;
 const MAX_DETAIL_CHARS: usize = 2_000;
+
+/// `outcome` of the system message that carries a wake prompt. The chat
+/// timeline keys on it to collapse the work order to its summary line; the
+/// wording of the prompt itself is not a contract.
+pub const ATTENTION_WAKE_MESSAGE_OUTCOME: &str = "attention_wake";
 pub(crate) const DELIVERY_FOLLOWUP_POSTCONDITION_SCHEMA: &str =
     "forge.delivery-followup-postcondition/v1";
 pub(crate) const DELIVERY_FOLLOWUP_READINESS_EVENT: &str = "milestone.readiness.evaluated";
@@ -404,7 +409,11 @@ impl WakeTurnConsumer {
             )
             .await
             {
-                Ok(_) => return Ok(delivered),
+                Ok(_) => {
+                    self.settle_decision_incident(expected_attention.as_ref(), event)
+                        .await;
+                    return Ok(delivered);
+                }
                 Err(error) if transient_db_error(&error) => {
                     tracing::debug!(event_id = %event.id, %error,
                         "wake admission raced current authority; deferring");
@@ -532,7 +541,11 @@ impl WakeTurnConsumer {
             )
             .await
             {
-                Ok(_) => return Ok(delivered),
+                Ok(_) => {
+                    self.settle_decision_incident(expected_attention.as_ref(), &event)
+                        .await;
+                    return Ok(delivered);
+                }
                 Err(error) if transient_db_error(&error) => {
                     tracing::debug!(event_id = %event.id, attempt, %error,
                         "wake retry admission raced current authority");
@@ -1258,7 +1271,7 @@ impl WakeTurnConsumer {
             content_guard_json: "{}".to_owned(),
             sensitivity: "internal".to_owned(),
             status: AgentChatMessageStatus::Complete,
-            outcome: None,
+            outcome: Some(ATTENTION_WAKE_MESSAGE_OUTCOME.to_owned()),
             model: None,
             profile_id: Some(turn.profile_id.clone()),
             session_id: None,
@@ -1279,6 +1292,41 @@ impl WakeTurnConsumer {
             created_at: now,
         };
         Ok(AdmitAgentChatTurn { message, turn })
+    }
+
+    /// A `decision_recorded` incident exists only to hand the user's decision
+    /// to the Agent. Once the wake turn is durably admitted it has done its
+    /// job; resolving it keeps Mission Control from listing a settled
+    /// decision as outstanding attention. The admission is already committed,
+    /// so a failure here is logged rather than retried.
+    async fn settle_decision_incident(
+        &self,
+        expected_attention: Option<&db::ExpectedAttentionSnapshot>,
+        event: &DomainEvent,
+    ) {
+        let Some(snapshot) = expected_attention else {
+            return;
+        };
+        if crate::attention_service::incident_key_category(&snapshot.dedupe_key)
+            != Some(crate::attention_service::DECISION_RECORDED_CATEGORY)
+        {
+            return;
+        }
+        if let Err(error) = AttentionRepo::resolve_attention_by_dedupe(
+            &*self.db,
+            &snapshot.dedupe_key,
+            &event.id,
+            &now_rfc3339(),
+        )
+        .await
+        {
+            tracing::warn!(
+                event_id = %event.id,
+                incident_key = %snapshot.dedupe_key,
+                %error,
+                "decision_recorded incident stayed open after its wake was admitted"
+            );
+        }
     }
 
     fn disposition(&self, spec: DispositionSpec<'_>) -> CreateAgentWakeDisposition {
@@ -1567,13 +1615,45 @@ fn wake_content(
             Some(state) => delivery_followup_directive(state),
             None => String::new(),
         };
+    let decision_requirement = decision_directive(attention);
     format!(
         "### Attention wake: {}\n\nCategory: {} — recommended action: {}.\nIncident: {}{}\nAssess the current state with your tools and take the action this incident requires. If a decision genuinely belongs to the user, ask for it; otherwise proceed.",
         attention.summary,
         attention.attention_type,
         attention.recommended_action,
         attention.dedupe_key,
-        format_args!("{details}{delivery_requirement}")
+        format_args!("{details}{delivery_requirement}{decision_requirement}")
+    )
+}
+
+/// The work order behind a `decision_recorded` wake: say what the user
+/// decided and tell the Agent to continue from it rather than ask again.
+fn decision_directive(attention: &db::AttentionProjection) -> String {
+    if attention.attention_type != crate::attention_service::DECISION_RECORDED_CATEGORY {
+        return String::new();
+    }
+    let details = serde_json::from_str::<Value>(&attention.details_json).unwrap_or(Value::Null);
+    let decision = details.get("decision");
+    let field = |key: &str| {
+        decision
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+    };
+    let outcome = field("outcome").unwrap_or_else(|| "decided on".to_owned());
+    let target = match field("target_type").as_deref() {
+        Some("milestone") => "the milestone definition revision of milestone",
+        Some("project_decision") | Some("project_decision_candidate") => "the proposed Decision",
+        Some("project_document_approval") => "the Document revision approval",
+        _ => "the pending item",
+    };
+    let target_id = field("target_id").unwrap_or_default();
+    let revision = field("revision_id")
+        .map(|revision_id| format!(" (revision {revision_id})"))
+        .unwrap_or_default();
+    format!(
+        "\nUSER DECISION\nThe user {outcome} {target} {target_id}{revision}. That decision is recorded and authoritative: do not ask the user to confirm it again and do not re-propose it. Read `project.current_state`, then continue from the decision in this turn — plan, queue, or dispatch the work it unblocks, or state precisely what still blocks it.\n"
     )
 }
 
@@ -1757,4 +1837,66 @@ pub fn wake_turn_consumer_name() -> &'static str {
 
 pub fn wake_turn_consumer_lease_owner() -> String {
     format!("wake-turn-consumer-{}", new_uuid_v4())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attention(attention_type: &str, details_json: &str) -> db::AttentionProjection {
+        db::AttentionProjection {
+            id: "attention-1".to_owned(),
+            attention_type: attention_type.to_owned(),
+            scope_type: "project".to_owned(),
+            scope_id: "project-1".to_owned(),
+            identity_id: Some("identity-1".to_owned()),
+            source_event_id: "event-1".to_owned(),
+            priority: 65,
+            status: "open".to_owned(),
+            summary: "The user recorded a decision; continue from it".to_owned(),
+            details_json: details_json.to_owned(),
+            dedupe_key: format!("attention:{attention_type}:project:project-1:milestone:m-1"),
+            occurred_at: "2026-09-02T00:00:00Z".to_owned(),
+            updated_at: "2026-09-02T00:00:00Z".to_owned(),
+            version: 1,
+            acknowledged_at: None,
+            snoozed_until: None,
+            resolved_at: None,
+            updated_by_user_id: None,
+            recommended_action: "continue_from_decision".to_owned(),
+            source_sequence: Some(1),
+        }
+    }
+
+    #[test]
+    fn decision_wakes_say_what_the_user_decided() {
+        let content = wake_content(
+            &attention(
+                "decision_recorded",
+                r#"{"decision":{"outcome":"approved","target_type":"milestone","target_id":"m-1","revision_id":"rev-2","decided_by":"user"}}"#,
+            ),
+            None,
+        );
+        assert!(content
+            .starts_with("### Attention wake: The user recorded a decision; continue from it"));
+        assert!(content.contains("USER DECISION"));
+        assert!(content.contains(
+            "The user approved the milestone definition revision of milestone m-1 (revision rev-2)."
+        ));
+        assert!(content.contains("do not ask the user to confirm it again"));
+    }
+
+    #[test]
+    fn other_wakes_carry_no_decision_directive() {
+        let content = wake_content(&attention("run_stalled", "{}"), None);
+        assert!(!content.contains("USER DECISION"));
+        assert!(content.starts_with("### Attention wake: "));
+    }
+
+    #[test]
+    fn a_decision_without_details_still_directs_the_agent() {
+        let directive = decision_directive(&attention("decision_recorded", "{}"));
+        assert!(directive.contains("The user decided on the pending item"));
+        assert!(directive.contains("continue from the decision"));
+    }
 }

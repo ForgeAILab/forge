@@ -76,6 +76,7 @@ pub mod task_diagnostics;
 pub mod task_dispatcher;
 pub mod task_service;
 pub mod terminal_service;
+pub mod turn_log_sink;
 pub mod types;
 pub mod wake_turn_consumer;
 pub mod workflow;
@@ -113,8 +114,8 @@ pub use agent_chat_turn_policy::{
     FailureDecision as AgentChatFailureDecision, LeaseDecision as AgentChatLeaseDecision,
 };
 pub use agent_chat_turn_worker::{
-    AgentChatTurnRunner, AgentChatTurnWorker, CliAgentChatSessionBackend, CompletedAgentChatTurn,
-    FederatedAgentChatTurnRunner,
+    AgentChatTurnLogRoot, AgentChatTurnRunner, AgentChatTurnWorker, CliAgentChatSessionBackend,
+    CompletedAgentChatTurn, FederatedAgentChatTurnRunner,
 };
 pub use agent_service::AgentService;
 pub use agent_turn_admission::{

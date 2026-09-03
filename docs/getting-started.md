@@ -107,7 +107,7 @@ FORGE_DATA_DIR=./test cargo run -p forge-cli    # override data dir via env
 Useful env vars: `FORGE_DATA_DIR`, `FORGE_WORKSPACE_ROOT`,
 `FORGE_WORKSPACE_CLEANUP_DELAY_SECONDS`, `FORGE_PUBLIC_SEARCH_ENDPOINT`,
 `FORGE_PUBLIC_SEARCH_TIMEOUT_MS`, `FORGE_PUBLIC_SEARCH_MAX_RESPONSE_BYTES`,
-`FORGE_WEB_DIST_DIR`, `RUST_LOG`.
+`FORGE_SCAFFOLD_COMMAND`, `FORGE_WEB_DIST_DIR`, `RUST_LOG`.
 
 ### Optional bounded public web search
 
@@ -142,6 +142,25 @@ The equivalent environment variables are `FORGE_PUBLIC_SEARCH_ENDPOINT`,
 JWT signing uses `server.jwt_secret` in the config file or `FORGE_JWT_SECRET`
 when set. Otherwise Forge reads or creates `<data_dir>/jwt_secret.bin` on first
 start (mode `0600` on Unix). Set an explicit secret in production deployments.
+
+### Repository scaffolding
+
+Projects whose approved Charter names a spark scaffold are provisioned by
+running create-spark on the Forge host. The default command is pinned:
+
+```yaml
+scaffold:
+  command: bunx @forgeailab/create-spark@0.4.5   # FORGE_SCAFFOLD_COMMAND
+```
+
+`bun` is the only host dependency it needs, and only for scaffolded Projects.
+spark 0.4.5 is the first release whose npm package is self-contained; earlier
+versions fail with "Catalog directories (templates/, packs/) not found" outside
+the spark monorepo.
+Point the command at a local spark checkout to develop against unreleased
+templates (`bun /path/to/spark/packages/create-spark/src/cli.ts`); the
+`SPARK_ROOT` environment variable is passed through. A missing runtime is a
+typed, retryable `scaffold_runtime_unavailable` provisioning failure.
 
 ### Local development data dir
 
@@ -327,7 +346,13 @@ Project.
 The `forge.main.project-discovery/v2` skill keeps discovery bounded (at most two
 consequential questions per turn) and records facts, decisions, research,
 assumptions, and hypotheses separately. It proposes the Project name/mode,
-scope, non-goals, success signal, constraints, and a Project Agent. Review the
+scope, non-goals, success signal, constraints, and a Project Agent. For a web
+product it also settles the repository scaffold as one user decision: a spark
+template (`nextjs` or `vite-react`) and the smallest pack set the outcomes
+need, recorded in the Charter's `scaffold` block. Non-web products and
+user-supplied repositories leave the block absent. The scaffold is a material
+technology constraint, so after approval it changes only through a Charter
+amendment. Review the
 rendered Charter, its content/render digests, and the selected identity's
 current Profile. Do not treat a chat answer or a ready-looking brief as
 approval: only the exact revision can be approved.
@@ -430,8 +455,15 @@ defaults remain convenient bulk choices and can be changed at any time.
 ### 5. Repository provisioning and setup recovery
 
 Genesis provisioning is a durable, checkpointed operation covering preflight,
-filesystem initialization, repository registration, Project linkage, and role
-assignment. While `execution_setup_state` is `provisioning`, the panel shows
+repository scaffolding, filesystem initialization, repository registration,
+Project linkage, and role assignment. When the approved Charter carries a
+`scaffold` block, the `repository_scaffolded` checkpoint runs the configured
+create-spark command (`bunx @forgeailab/create-spark@0.4.5` by default, so
+`bun` must be installed on the Forge host), exports the approved Charter to
+`docs/spark/project.md`, appends a Forge section to the scaffold's
+`AGENTS.md`, and the first commit on `main` contains the whole scaffold,
+including `.claude/skills/` for Task Workers. Without a scaffold the checkpoint
+is `skipped` and the repository starts with a README. While `execution_setup_state` is `provisioning`, the panel shows
 the checkpoint and attempt count. Refresh
 `GET /api/v1/projects/{id}/execution-setup`; provisioning is not success until
 the server reports `ready`.
@@ -535,6 +567,7 @@ conflict; they are the links between chat, Project truth, and repository work.
 | Missing reviewer default | No Project-wide reviewer default is selected | Nothing is blocked until a Task workflow needs the role; assign any enabled Agent on that Task, including its Worker. |
 | `execution_setup_state: provisioning` | Durable setup is still reconciling | Refresh the projection; wait for `ready` or follow the recorded retry action. |
 | `execution_setup_state: failed` | A checkpoint stopped with a typed error | Fix the recorded cause and retry the same provisioning operation with its current version and a new idempotency key. |
+| `scaffold_runtime_unavailable` or `repository_scaffold_failed` | The `repository_scaffolded` checkpoint could not run create-spark, or create-spark refused the template or pack set | Install `bun` (or fix `FORGE_SCAFFOLD_COMMAND`) and retry; for a bad pack set, amend the Charter's `scaffold` block, then retry the same provisioning operation. The partial directory is removed before the failure is recorded. |
 | `version_conflict`, `digest_conflict`, or stale projection | Another command changed the authoritative revision | Refetch current state and re-propose/retry with the correct version; do not overwrite immutable history. |
 | Wake `deferred` or `setup_required` | Delivery could not safely admit a turn yet | Follow the durable retry/setup action; the event remains traceable and is reconsidered after state changes. |
 | `execution_gate: reconciliation_required` | Two traceability records disagree, or the active plan is invalid | Open Project Overview, read the one-sentence replacement effect, then choose **Accept** or **Reject**. Task-scoped conflicts remain scoped and do not freeze unrelated work. |

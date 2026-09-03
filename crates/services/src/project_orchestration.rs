@@ -272,6 +272,14 @@ pub fn render_project_charter(content: &ProjectCharterContent) -> String {
         }
     }
 
+    // Rendered only when present so Charters that predate the block keep
+    // their render digests byte-for-byte.
+    if let Some(scaffold) = &content.scaffold {
+        output.push_str("\n## Scaffold\n\n");
+        field(&mut output, "Template", &scaffold.template);
+        list_field(&mut output, "Packs", &scaffold.packs);
+    }
+
     output.push_str("\n## Knowledge Ledger\n\n");
     if content.knowledge_ledger.items.is_empty() {
         output.push_str("- none recorded\n");
@@ -494,6 +502,7 @@ pub fn evaluate_charter_readiness(
     }
 
     check_scope_coherence(content, &mut gaps);
+    check_scaffold(content, &mut gaps);
     check_risks(content, &mut gaps);
     check_knowledge_ledger(content, &mut gaps);
 
@@ -1023,6 +1032,60 @@ fn check_scope_coherence(content: &ProjectCharterContent, gaps: &mut Vec<Charter
     }
 }
 
+/// A scaffold names spark ids. Forge does not carry spark's catalog — the
+/// create-spark run at provisioning is the authority on which template and
+/// packs exist — but an id that is not even a slug can never resolve, and a
+/// pack listed twice is a contradiction the user should see before approval.
+fn check_scaffold(content: &ProjectCharterContent, gaps: &mut Vec<CharterReadinessGap>) {
+    let Some(scaffold) = &content.scaffold else {
+        return;
+    };
+    if !is_scaffold_slug(&scaffold.template) {
+        gap(
+            gaps,
+            CharterReadinessGapKind::IncoherentContent,
+            "scaffold_template_invalid",
+            "Scaffold template must be a spark template id (lowercase letters, digits, and hyphens).",
+            true,
+            Some("scaffold"),
+            None,
+        );
+    }
+    if scaffold.packs.iter().any(|pack| !is_scaffold_slug(pack)) {
+        gap(
+            gaps,
+            CharterReadinessGapKind::IncoherentContent,
+            "scaffold_pack_invalid",
+            "Every scaffold pack must be a spark pack id (lowercase letters, digits, and hyphens).",
+            true,
+            Some("scaffold"),
+            None,
+        );
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    if scaffold
+        .packs
+        .iter()
+        .any(|pack| !seen.insert(pack.as_str()))
+    {
+        gap(
+            gaps,
+            CharterReadinessGapKind::IncoherentContent,
+            "scaffold_pack_duplicated",
+            "A scaffold pack is listed more than once.",
+            true,
+            Some("scaffold"),
+            None,
+        );
+    }
+}
+
+fn is_scaffold_slug(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_lowercase() || first.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
 fn check_risks(content: &ProjectCharterContent, gaps: &mut Vec<CharterReadinessGap>) {
     let mut ids = BTreeSet::new();
     for risk in &content.constraints_and_risks.risks {
@@ -1312,6 +1375,7 @@ fn section_order() -> &'static [&'static str] {
         "scope",
         "success",
         "constraints_and_risks",
+        "scaffold",
         "knowledge_ledger",
         "handoff_note",
     ]
@@ -1344,6 +1408,10 @@ fn section_values(content: &ProjectCharterContent) -> BTreeMap<&'static str, Val
         "constraints_and_risks",
         serde_json::to_value(&content.constraints_and_risks)
             .expect("Charter constraints serialize"),
+    );
+    values.insert(
+        "scaffold",
+        serde_json::to_value(&content.scaffold).expect("Charter scaffold serializes"),
     );
     values.insert(
         "knowledge_ledger",
@@ -1526,6 +1594,7 @@ mod tests {
                 risks: vec![],
             },
             knowledge_ledger: CharterKnowledgeLedger { items: vec![] },
+            scaffold: None,
             handoff_note: Some(CharterHandoffNote {
                 recommended_first_action: Some("draft the Delivery Brief".to_owned()),
                 bounded_summary: Some("start with the smallest verifiable flow".to_owned()),
@@ -1596,6 +1665,72 @@ mod tests {
         assert!(first.contains("\\# ignore \\- fake instruction"));
         assert!(!first.contains("\n# ignore"));
         assert!(!first.contains("[x](javascript"));
+    }
+
+    #[test]
+    fn scaffold_is_absent_from_canonical_json_and_render_until_present() {
+        let mut value = content(ProductMaturity::Mvp);
+        let canonical = api_types::canonical_json(&value).expect("Charter serializes");
+        assert!(
+            !canonical.contains("\"scaffold\""),
+            "an absent scaffold must not enter the digest domain"
+        );
+        let plain_render = render_project_charter(&value);
+        assert!(!plain_render.contains("## Scaffold"));
+
+        value.scaffold = Some(api_types::CharterScaffold {
+            template: "nextjs".to_owned(),
+            packs: vec!["db-sqlite".to_owned(), "ui-shadcn".to_owned()],
+        });
+        let canonical = api_types::canonical_json(&value).expect("Charter serializes");
+        assert!(canonical.contains(
+            "\"scaffold\":{\"packs\":[\"db-sqlite\",\"ui-shadcn\"],\"template\":\"nextjs\"}"
+        ));
+        let render = render_project_charter(&value);
+        assert!(render.contains(
+            "\n## Scaffold\n\n- Template: nextjs\n- Packs:\n  - db\\-sqlite\n  - ui\\-shadcn\n"
+        ));
+        assert_ne!(
+            charter_content_digest(&value),
+            charter_content_digest(&content(ProductMaturity::Mvp))
+        );
+    }
+
+    #[test]
+    fn scaffold_ids_must_be_slugs_and_packs_unique() {
+        let mut value = content(ProductMaturity::Mvp);
+        value.scaffold = Some(api_types::CharterScaffold {
+            template: "Next JS".to_owned(),
+            packs: vec!["db-sqlite".to_owned(), "db-sqlite".to_owned()],
+        });
+        let result = evaluate_charter_readiness(
+            &value,
+            ProjectMode::Compact,
+            ProductMaturity::Mvp,
+            CHARTER_READINESS_POLICY_VERSION,
+            "2026-08-13T00:00:00Z",
+        );
+        assert_eq!(result.status, CharterReadinessStatus::Blocked);
+        let codes: Vec<&str> = result.gaps.iter().map(|gap| gap.code.as_str()).collect();
+        assert!(codes.contains(&"scaffold_template_invalid"), "{codes:?}");
+        assert!(codes.contains(&"scaffold_pack_duplicated"), "{codes:?}");
+        assert!(result
+            .gaps
+            .iter()
+            .all(|gap| gap.code != "scaffold_pack_invalid"));
+
+        value.scaffold = Some(api_types::CharterScaffold {
+            template: "vite-react".to_owned(),
+            packs: vec![],
+        });
+        let result = evaluate_charter_readiness(
+            &value,
+            ProjectMode::Compact,
+            ProductMaturity::Mvp,
+            CHARTER_READINESS_POLICY_VERSION,
+            "2026-08-13T00:00:00Z",
+        );
+        assert_eq!(result.status, CharterReadinessStatus::Ready);
     }
 
     #[test]

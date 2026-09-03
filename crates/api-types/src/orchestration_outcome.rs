@@ -409,6 +409,13 @@ pub struct ToolResultSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_action: Option<RetryAction>,
     pub correlation_id: String,
+    /// The typed Forge operation the call executed (for example
+    /// `task.propose` or `skill.section`), when the tool returned an
+    /// `OrchestrationOutcome`. Typed Forge tools multiplex many operations
+    /// behind one tool name, so this is what tells a reader which one ran.
+    /// Absent for raw workspace/runtime results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
 }
 
 impl ToolResultSummary {
@@ -426,6 +433,7 @@ impl ToolResultSummary {
             retryable: false,
             recovery_action: None,
             correlation_id: correlation_id.into(),
+            operation: None,
         }
     }
 
@@ -448,6 +456,7 @@ impl ToolResultSummary {
             summary.retryable = retry.retryable;
             summary.recovery_action = Some(retry.action);
         }
+        summary.operation = Some(outcome.operation.clone());
         summary
     }
 
@@ -509,6 +518,7 @@ mod tool_result_summary_tests {
         assert!(summary.retryable);
         assert_eq!(summary.recovery_action, Some(RetryAction::RefreshAndRetry));
         assert_eq!(summary.correlation_id, "corr-1");
+        assert_eq!(summary.operation.as_deref(), Some("task.propose"));
 
         let serialized = serde_json::to_string(&summary).expect("summary serializes");
         assert!(!serialized.contains("hunter2-secret-token"));
@@ -523,6 +533,7 @@ mod tool_result_summary_tests {
         assert!(!failed.retryable);
         assert_eq!(failed.recovery_action, None);
         assert_eq!(failed.correlation_id, "call-1");
+        assert_eq!(failed.operation, None);
 
         let ok = ToolResultSummary::unclassified(false, "call-2");
         assert_eq!(ok.status, OutcomeStatus::Succeeded);

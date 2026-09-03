@@ -366,6 +366,22 @@ pub struct CharterKnowledgeLedger {
     pub items: Vec<CharterKnowledgeItem>,
 }
 
+/// The repository scaffold the Project starts from: a spark template plus the
+/// feature packs installed on top of it. Absent means the repository starts
+/// empty (a README only) — non-web products, or a repository the user brings.
+/// The block is a material technology constraint: once approved it changes
+/// only through a Charter amendment.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct CharterScaffold {
+    /// spark template id, for example `nextjs` or `vite-react`.
+    pub template: String,
+    /// spark pack ids installed after scaffolding; empty means no packs.
+    #[serde(default)]
+    pub packs: Vec<String>,
+}
+
 /// The canonical typed payload hashed by a Charter content digest.
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
@@ -378,6 +394,11 @@ pub struct ProjectCharterContent {
     pub success: CharterSuccessBoundary,
     pub constraints_and_risks: CharterConstraintsAndRisks,
     pub knowledge_ledger: CharterKnowledgeLedger,
+    /// Omitted from canonical JSON when absent so Charters that predate the
+    /// block keep their content digests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub scaffold: Option<CharterScaffold>,
     #[serde(default)]
     pub handoff_note: Option<CharterHandoffNote>,
 }

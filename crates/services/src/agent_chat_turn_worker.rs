@@ -27,8 +27,7 @@ use executors::{
 use forge_agent_host::RuntimeContextManifestLink;
 use forge_agent_host::{
     AgentSessionBackend, AgentTurnRequest, BackendCapabilities, CanonicalScope, CanonicalScopeType,
-    Message, NativeProviderConfig, Role, TurnEventSink, WorkspaceAccess,
-    MAIN_GENESIS_START_OPERATION,
+    Message, NativeProviderConfig, Role, WorkspaceAccess, MAIN_GENESIS_START_OPERATION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -64,6 +63,7 @@ use crate::{
         PROJECT_OPERATING_SKILL_SCHEMA_VERSION,
     },
     project_runtime::{load_effective_project_state, ProjectEffectiveStateProjection},
+    turn_log_sink::TurnLogSink,
     wake_turn_consumer::{
         DELIVERY_FOLLOWUP_POSTCONDITION_SCHEMA, DELIVERY_FOLLOWUP_READINESS_EVENT,
         DELIVERY_FOLLOWUP_VALIDATION_EVENT,
@@ -480,6 +480,45 @@ struct ProjectHandoffExpectation<'a> {
     delivered_at: &'a str,
 }
 
+/// Where Agent Chat turn activity logs live: `<root>/<turn_job_id>.jsonl`.
+///
+/// One value is shared by the turn runner (which writes) and the REST turn
+/// logs route (which reads), so the two can never disagree on a path. The
+/// root is re-pointed once the server's real `--data-dir` is known, exactly
+/// like the embedded agent media and project roots.
+#[derive(Clone, Debug)]
+pub struct AgentChatTurnLogRoot {
+    root: Arc<std::sync::RwLock<PathBuf>>,
+}
+
+impl AgentChatTurnLogRoot {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: Arc::new(std::sync::RwLock::new(root.into())),
+        }
+    }
+
+    pub fn set_root(&self, root: impl Into<PathBuf>) {
+        if let Ok(mut slot) = self.root.write() {
+            *slot = root.into();
+        }
+    }
+
+    pub fn root(&self) -> PathBuf {
+        self.root
+            .read()
+            .map(|root| root.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    /// The durable activity log for one turn job. Both attempts of a
+    /// retried job append to the same file; the sink writes a visible
+    /// attempt divider between them.
+    pub fn path_for(&self, turn_job_id: &str) -> PathBuf {
+        self.root().join(format!("{turn_job_id}.jsonl"))
+    }
+}
+
 #[async_trait]
 pub trait AgentChatTurnRunner: Send + Sync {
     async fn run_turn(
@@ -531,6 +570,7 @@ impl CliAgentChatSessionBackend {
         executor_type: &str,
         agent_config: Value,
         prompt: String,
+        logs_path: PathBuf,
         cancellation: CancellationToken,
     ) -> Result<(ExecutionResult, i64)> {
         if scope.scope_type != CanonicalScopeType::AgentChat
@@ -553,7 +593,6 @@ impl CliAgentChatSessionBackend {
         let executor_snapshot = cli_executor_snapshot(&executor_type, agent_config);
 
         let sandbox = chat_sandbox_path(job_id);
-        let logs_path = chat_log_path(job_id);
         if sandbox.exists() {
             std::fs::remove_dir_all(&sandbox).map_err(|_| {
                 ServiceError::invalid_operation("stale Agent Chat sandbox could not be removed")
@@ -599,6 +638,7 @@ pub struct FederatedAgentChatTurnRunner {
     db: Arc<SqliteDb>,
     embedded_agents: Arc<EmbeddedAgentService>,
     cli_backend: CliAgentChatSessionBackend,
+    turn_logs: AgentChatTurnLogRoot,
 }
 
 impl fmt::Debug for FederatedAgentChatTurnRunner {
@@ -614,12 +654,38 @@ impl FederatedAgentChatTurnRunner {
         db: Arc<SqliteDb>,
         embedded_agents: Arc<EmbeddedAgentService>,
         cli_executor: Arc<dyn TaskExecutor>,
+        turn_logs: AgentChatTurnLogRoot,
     ) -> Self {
         Self {
             db,
             embedded_agents,
             cli_backend: CliAgentChatSessionBackend::new(cli_executor),
+            turn_logs,
         }
+    }
+
+    /// The durable JSONL activity log for one turn attempt. Every runtime
+    /// event of the turn (reasoning, tool calls and their bounded results,
+    /// reply text) lands here as it happens, so the chat can show what the
+    /// Agent is doing instead of a bare spinner, and the record survives
+    /// the turn.
+    async fn turn_log_sink(&self, job: &AgentChatTurnJob) -> Arc<TurnLogSink> {
+        let sink = Arc::new(TurnLogSink::new(
+            self.turn_logs.path_for(&job.id),
+            &job.id,
+            None,
+            None,
+        ));
+        if job.attempt_count > 1 {
+            if let Err(error) = sink.write_attempt_divider(job.attempt_count).await {
+                tracing::debug!(
+                    job_id = %job.id,
+                    %error,
+                    "Agent Chat turn log divider could not be written"
+                );
+            }
+        }
+        sink
     }
 
     /// Validate and load the authority snapshot captured at turn admission.
@@ -2671,6 +2737,7 @@ impl FederatedAgentChatTurnRunner {
             }
             None => None,
         };
+        let turn_log = self.turn_log_sink(job).await;
         let started = std::time::Instant::now();
         let output = self
             .embedded_agents
@@ -2717,7 +2784,7 @@ impl FederatedAgentChatTurnRunner {
                     input: input.content,
                     cancellation,
                 },
-                Arc::new(NoopTurnEventSink),
+                turn_log,
             )
             .await
             .map_err(|error| {
@@ -2769,6 +2836,8 @@ impl FederatedAgentChatTurnRunner {
                 serde_json::json!({
                     "input": output.input_tokens,
                     "output": output.output_tokens,
+                    "cache_read": output.cache_read_tokens,
+                    "cache_write": output.cache_write_tokens,
                 })
                 .to_string(),
             ),
@@ -2994,6 +3063,10 @@ impl FederatedAgentChatTurnRunner {
             &input.content,
         );
         let config = cli_profile_execution_config(&profile)?;
+        // The CLI adapter streams its own events into the turn log; only the
+        // attempt divider comes from Forge, so a retry reads the same way on
+        // both backends.
+        drop(self.turn_log_sink(job).await);
         let scope = CanonicalScope {
             scope_type: CanonicalScopeType::AgentChat,
             scope_id: job.chat_id.clone(),
@@ -3008,6 +3081,7 @@ impl FederatedAgentChatTurnRunner {
                 &profile.executor_type,
                 config,
                 prompt,
+                self.turn_logs.path_for(&job.id),
                 cancellation,
             )
             .await?;
@@ -3090,11 +3164,13 @@ impl AgentChatTurnWorker {
         db: Arc<SqliteDb>,
         embedded_agents: Arc<EmbeddedAgentService>,
         cli_executor: Arc<dyn TaskExecutor>,
+        turn_logs: AgentChatTurnLogRoot,
     ) -> Self {
         let runner = Arc::new(FederatedAgentChatTurnRunner::new(
             Arc::clone(&db),
             embedded_agents,
             cli_executor,
+            turn_logs,
         ));
         Self::with_runner(db, runner)
     }
@@ -4822,12 +4898,6 @@ fn chat_sandbox_path(job_id: &str) -> PathBuf {
         .join(job_id)
 }
 
-fn chat_log_path(job_id: &str) -> PathBuf {
-    std::env::temp_dir()
-        .join("forge-agent-chat-logs")
-        .join(format!("{job_id}.jsonl"))
-}
-
 fn bounded_error_message(value: &str) -> String {
     value.chars().take(MAX_ERROR_CHARS).collect()
 }
@@ -4855,12 +4925,6 @@ fn classify_turn_error(error: &ServiceError) -> &'static str {
     }
 }
 
-#[derive(Debug)]
-struct NoopTurnEventSink;
-
-#[async_trait]
-impl TurnEventSink for NoopTurnEventSink {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4868,7 +4932,21 @@ mod tests {
     #[test]
     fn cli_sandbox_is_job_scoped() {
         assert!(chat_sandbox_path("job-a") != chat_sandbox_path("job-b"));
-        assert!(chat_log_path("job-a") != chat_log_path("job-b"));
+    }
+
+    #[test]
+    fn turn_logs_are_job_scoped_under_the_configured_root() {
+        let logs = AgentChatTurnLogRoot::new("/data/agent-chat-logs");
+        assert_eq!(
+            logs.path_for("job-a"),
+            PathBuf::from("/data/agent-chat-logs/job-a.jsonl")
+        );
+        assert!(logs.path_for("job-a") != logs.path_for("job-b"));
+        logs.set_root("/elsewhere");
+        assert_eq!(
+            logs.path_for("job-a"),
+            PathBuf::from("/elsewhere/job-a.jsonl")
+        );
     }
 
     #[test]

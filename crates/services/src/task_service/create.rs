@@ -75,22 +75,16 @@ impl TaskService {
         } else {
             WorkflowEngine::resolve_workflow(&project.workflow_definition)
         };
-        let no_repo = repo_id.is_none();
-        let initial_status = if no_repo {
-            workflow
-                .states
-                .iter()
-                .find(|state| state.kind == api_types::StateKind::Backlog)
-                .map(|state| state.name.clone())
-                .ok_or_else(|| ServiceError::invalid_operation("workflow has no backlog state"))?
-        } else {
-            workflow
-                .states
-                .iter()
-                .find(|state| state.kind == api_types::StateKind::Initial)
-                .map(|state| state.name.clone())
-                .ok_or_else(|| ServiceError::invalid_operation("workflow has no initial state"))?
-        };
+        // A Task with no repository (the Project has none yet) still starts
+        // in the workflow's initial state; the dispatcher pauses that
+        // Project instead of parking the Task. `backlog` is reserved for a
+        // deliberate later move by a user or the Agent.
+        let initial_status = workflow
+            .states
+            .iter()
+            .find(|state| state.kind == api_types::StateKind::Initial)
+            .map(|state| state.name.clone())
+            .ok_or_else(|| ServiceError::invalid_operation("workflow has no initial state"))?;
         let effective_task_type = task_type.unwrap_or_else(|| {
             if is_subtask {
                 "sub_task".to_owned()
@@ -260,21 +254,15 @@ impl TaskService {
             .ok_or_else(|| ServiceError::not_found("project", project_id.clone()))?;
         let repo_id = project.primary_repo_id.clone();
         let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
-        let initial_status = if repo_id.is_none() {
-            workflow
-                .states
-                .iter()
-                .find(|state| state.kind == api_types::StateKind::Backlog)
-                .map(|state| state.name.clone())
-                .ok_or_else(|| ServiceError::invalid_operation("workflow has no backlog state"))?
-        } else {
-            workflow
-                .states
-                .iter()
-                .find(|state| state.kind == api_types::StateKind::Initial)
-                .map(|state| state.name.clone())
-                .ok_or_else(|| ServiceError::invalid_operation("workflow has no initial state"))?
-        };
+        // See the other `create_task*` variant: a repository-less Task
+        // still starts in the workflow's initial state; the dispatcher
+        // pauses the Project rather than parking the Task in `backlog`.
+        let initial_status = workflow
+            .states
+            .iter()
+            .find(|state| state.kind == api_types::StateKind::Initial)
+            .map(|state| state.name.clone())
+            .ok_or_else(|| ServiceError::invalid_operation("workflow has no initial state"))?;
 
         let now = now_rfc3339();
         let effective_task_type = task_type.unwrap_or_else(|| "task".to_owned());
@@ -467,7 +455,11 @@ impl TaskService {
         Ok(assignments)
     }
 
-    async fn assign_project_default_roles(&self, task: &Task) -> Result<()> {
+    /// Give `task` the Project's default assignee for every workflow role it
+    /// does not already cover. Task creation does this for a Task created
+    /// once the defaults exist; the dispatcher does it again when it releases
+    /// a Task that was parked before provisioning wrote those defaults.
+    pub(crate) async fn assign_project_default_roles(&self, task: &Task) -> Result<()> {
         let covered_roles = TaskRoleAssignmentRepo::list_by_task(&*self.db, &task.id)
             .await?
             .into_iter()

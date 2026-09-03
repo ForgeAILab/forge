@@ -19,6 +19,28 @@ export const qk = {
   projectReconciliations: (id: string) => ['projects', id, 'reconciliations'] as const,
   projectRelease: (projectId: string, releaseId: string) =>
     ['projects', projectId, 'releases', releaseId] as const,
+  projectDocument: (projectId: string, documentId: string) =>
+    ['projects', projectId, 'documents', documentId] as const,
+  projectDocumentRevisions: (projectId: string, documentId: string) =>
+    ['projects', projectId, 'documents', documentId, 'revisions'] as const,
+  projectDocumentRevision: (projectId: string, documentId: string, revisionId: string) =>
+    ['projects', projectId, 'documents', documentId, 'revisions', revisionId] as const,
+  projectDocumentRevisionDiff: (
+    projectId: string,
+    documentId: string,
+    revisionId: string,
+    baseRevisionId: string | null,
+  ) =>
+    [
+      'projects',
+      projectId,
+      'documents',
+      documentId,
+      'revisions',
+      revisionId,
+      'diff',
+      baseRevisionId ?? 'base',
+    ] as const,
   projectPages: (limit: number) => ['projects', 'pages', limit] as const,
   projectHookRuns: (projectId: string) => ['projects', projectId, 'project-hook-runs'] as const,
   projectHookRunPages: (projectId: string, limit: number) =>

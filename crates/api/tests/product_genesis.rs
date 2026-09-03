@@ -986,6 +986,7 @@ fn exact_charter_content() -> api_types::ProjectCharterContent {
                 blocking: false,
             }],
         },
+        scaffold: None,
         handoff_note: Some(api_types::CharterHandoffNote {
             recommended_first_action: Some(
                 "Create the first Project-local execution plan.".to_owned(),

@@ -319,6 +319,7 @@ mod tests {
             workflow_template_name: None,
             primary_repo_id: None,
             paused_at: None,
+            system_pause_reason: None,
             owner_id: None,
             project_hooks_json: "[]".to_owned(),
             project_work_epoch: 0,

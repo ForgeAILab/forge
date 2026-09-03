@@ -197,6 +197,14 @@ memory, and session provenance. Connected but unbound identities do not create
 additional chats. There are no participants, addressing rules, responder
 policies, arbitrary threads, or bounded multi-agent rounds.
 
+A running chat turn is observable, not a black box. `FederatedAgentChatTurnRunner`
+hands the native runtime a `TurnLogSink` (`services::turn_log_sink`, shared
+with embedded Task execution) that writes every runtime event to
+`<data-dir>/agent-chat-logs/<turn_job_id>.jsonl` in the Forge log schema, and
+`GET /agent-chats/{chat_id}/turns/{turn_id}/logs` serves it. `AppState`
+carries one `AgentChatTurnLogRoot` for both the writer and the route, re-pointed
+when the real `--data-dir` arrives with the effective config.
+
 Creating an operational Project creates its Project Agent binding and Project
 Agent Chat atomically. A migrated Project with no single safe binding is
 explicitly `agent_setup_required` and keeps its Project/Task data readable, but
@@ -887,10 +895,16 @@ prose.
 
 After that transaction commits, `project_provisioning` reconciles execution
 setup as one durable, leased, finite, idempotent operation (also resumed on
-creation replay). Its checkpoints cover preflight, filesystem initialization,
-repository registration, Project linkage, and role assignment. It initializes
-or verifies a local git repository (first commit on `main`) under
-`<workspace_root>/repos/`, registers or reuses one matching logical repository,
+creation replay). Its checkpoints cover preflight, repository scaffolding, filesystem
+initialization, repository registration, Project linkage, and role assignment.
+When the approved Charter carries a `scaffold` block, `repository_scaffolded`
+runs the configured create-spark command (`FORGE_SCAFFOLD_COMMAND`, exported
+by `forge-cli` from `[scaffold] command`) into the deterministic repository
+directory, exports the approved Charter revision to `docs/spark/project.md`,
+and appends a Forge section to the scaffold's `AGENTS.md`; otherwise the
+checkpoint is `skipped`. It then initializes
+or verifies a local git repository (first commit on `main`, holding the
+scaffold when one ran) under `<workspace_root>/repos/`, registers or reuses one matching logical repository,
 links it with Project-version CAS, and resolves canonical Worker and (when
 required) independent-reviewer assignments from current workflow
 policy. Main/Project-bound identities are never eligible, and a credential-less
@@ -1122,6 +1136,21 @@ directs the Agent to cancel such a Task and settle its checks itself, and to
 respond to a failed check by dispatching the implementation Task that fixes
 the defect.
 
+A decision the user records on something the Project Agent proposed — a
+milestone definition revision approved or rejected
+(`milestone.definition.transitioned`), a Decision approved
+(`project.decision.approved`) or a candidate rejected
+(`project.decision.candidate_rejected`), a Document revision approved
+(`project.document.approved`) — creates a `decision_recorded` Attention
+incident for that Project Agent and wakes it. The classifier requires
+`actor_type = user`, so an Agent approving its own proposal never wakes
+itself. The wake message carries the decision (`details.decision`) and a
+directive to continue from it rather than ask the user to confirm again; the
+wake consumer resolves the incident right after the turn is admitted, because
+the incident exists only to deliver the decision. The web Project Chat
+surfaces the same decisions with one-click actions (the "Needs your decision"
+card), so approving in the chat is the whole loop: record, wake, continue.
+
 Every terminal `done` Task transition also creates a `delivery_followup`
 Attention incident for that Project Agent. The follow-up asks it to reconcile
 the Task outcome into authoritative validation, evidence, and milestone
@@ -1222,7 +1251,14 @@ system comment instructing the assigned worker to inspect the preserved diff,
 finish or clean it up, validate it, and commit before completion, then schedules
 a deferred redispatch. Exhausted retries block visibly instead of looping.
 Read-only planner/reviewer and read-only task-type runs remain governed by the
-separate restore-and-fail backstop.
+separate restore-and-fail backstop. CLI adapters commit whatever a
+write-capable run leaves in its worktree after the process exits, but never
+for a read-only run: the untracked build output a reviewer's checks leave
+behind is cleanup for that backstop, not authored work, and committing it
+would move HEAD and fail the review. Every CLI adapter also exports
+`PWD=<worktree>` next to the child's working directory, because tools that
+trust `$PWD` over `getcwd()` (OpenCode does) would otherwise resolve the
+Forge server's own checkout as their project.
 
 ### Daemon lifecycle and execution recovery
 
@@ -1378,7 +1414,14 @@ defined states.
 
 `StateKind` classifies states:
 
-- **`backlog`** — parking lot; agent claims rejected.
+- **`backlog`** — parking lot; agent claims rejected. Reserved for a
+  deliberate later move by a user or the Agent (e.g. reprioritizing); a Task
+  never starts here. A Task proposed while its Project has no primary
+  repository still starts in the workflow's initial state — the Project
+  itself is paused instead (see below), and initial scheduling gives a Task
+  with no role assignments at all the Project's default assignees before
+  dispatching it, since those defaults can be written to Project settings
+  after such a Task was proposed.
 - **`initial`** — exactly one per workflow; validation rejects zero or multiple.
 - **`active`** — work state; may declare a role such as `coder`.
 - **`gate`** — validation/processing state; `gate_config.max_rejections`
@@ -1386,6 +1429,22 @@ defined states.
 - **`terminal`** — absorbing state; outbound transitions and non-terminal
   cancellation targets are rejected.
 - **`custom`** — no built-in behavior beyond graph validation.
+
+A Project's Tasks never sit in `backlog` just because the Project has no
+primary repository — that used to be Task creation's rule, and nothing ever
+released those Tasks once a repository was attached. Instead, the Task
+dispatcher's own scan (`TaskDispatcher::sync_repository_pause`, ahead of its
+per-project dispatch/recovery in `check_once`) pauses the Project itself when
+`primary_repo_id` is `None`, recording `system_pause_reason =
+"missing_repository"` on it (migration V128); it resumes a Project paused for
+exactly that reason once a repository is attached. A user's own pause via
+`POST /projects/{id}/pause` (or any general Project update that sets
+`paused_at`) always clears `system_pause_reason`, so a deliberate pause is
+never auto-resumed and never mistaken for this automatic one, and this
+reconciliation never touches a Project already paused for a different
+reason. `dispatch_initial_task` still checks `task.repo_id.is_none()` before
+launching anything, so nothing changes for a Task that somehow reaches an
+active state without a repository.
 
 `WorkflowEngine::transition` lifecycle for `A → B`:
 
@@ -1403,6 +1462,12 @@ defined states.
 5. Backfill `transition_log.hook_results_json`.
 6. If an `after_enter` hook returns `HookResult::Cascade`, recursively
    transition with `triggered_by = "system"`; cascade depth is limited to 3.
+
+A state with blocking `before_enter` hooks is persisted with a running entry
+barrier until those hooks settle. Task responses derive `awaiting_human` from
+the same Task snapshot as the returned optimistic `version`; a running barrier
+therefore cannot expose a gate decision using a version that the barrier-clear
+write is about to invalidate.
 
 **Dispatch failure entering an active state:** when a dispatch hook
 (`dispatch_role_agent` / `dispatch_fix_agent` / `dispatch_executor`) fails

@@ -14,20 +14,24 @@
 //! operation/checkpoint projection carries the blocker and its retry action.
 
 use std::{
+    io::ErrorKind,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::Arc,
 };
 
-use api_types::{RetryAction, SetupRequirement};
+use api_types::{CharterScaffold, RetryAction, SetupRequirement};
 use chrono::{Duration, Utc};
 use db::{
     new_uuid_v4, now_rfc3339, CreateProjectProvisioningError, CreateProjectProvisioningOperation,
-    CreateRepo, PageRequest, Project, ProjectProvisioningOperation, ProjectProvisioningRepo,
-    ProjectRepo, ReconcileProjectProvisioningCheckpoint, ReconcileProjectProvisioningMetadata,
-    Repo, RepoRepo, SortBy, SortOrder, SqliteDb, UpdateProject, UpdateProjectProvisioningOperation,
-    UpsertProjectProvisioningCheckpoint, WorkMode,
+    CreateRepo, PageRequest, Project, ProjectOrchestrationRepo, ProjectProvisioningOperation,
+    ProjectProvisioningRepo, ProjectRepo, ReconcileProjectProvisioningCheckpoint,
+    ReconcileProjectProvisioningMetadata, Repo, RepoRepo, SortBy, SortOrder, SqliteDb,
+    UpdateProject, UpdateProjectProvisioningOperation, UpsertProjectProvisioningCheckpoint,
+    WorkMode,
 };
 use serde_json::{json, Value};
+use tokio::process::Command;
 
 use crate::{
     execution_setup::{
@@ -39,13 +43,22 @@ use crate::{
 const DEFAULT_BRANCH: &str = "main";
 const MAX_ATTEMPTS: i64 = 3;
 const LEASE_SECONDS: i64 = 300;
-const CHECKPOINTS: [&str; 5] = [
+const CHECKPOINTS: [&str; 6] = [
     "preflight",
+    "repository_scaffolded",
     "repository_initialized",
     "repository_registered",
     "repository_linked",
     "roles_assigned",
 ];
+/// Environment variable `forge-cli` exports from `[scaffold] command`; the
+/// services crate reads it the same way it reads `FORGE_WORKSPACE_ROOT`.
+pub const SCAFFOLD_COMMAND_ENV: &str = "FORGE_SCAFFOLD_COMMAND";
+/// Written by create-spark into every scaffold; its presence is how a
+/// directory proves it already is one.
+const SCAFFOLD_MARKER: &str = "spark.config.json";
+const SCAFFOLD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+const SCAFFOLD_OUTPUT_TAIL_CHARS: usize = 2_000;
 
 /// Reconcile a setup action's already-committed repository/role view into the
 /// durable provisioning projection.  User actions do not consume a
@@ -126,11 +139,32 @@ pub(crate) async fn reconcile_project_setup_metadata(
         .into_iter()
         .map(|checkpoint| (checkpoint.checkpoint.clone(), checkpoint))
         .collect::<std::collections::HashMap<_, _>>();
+    // A setup action supplies the repository itself, so the scaffold step is
+    // moot unless Genesis provisioning already ran it: keep a completed or
+    // skipped row verbatim, otherwise record that setup superseded it.
+    let (scaffold_status, scaffold_details) = match checkpoints.get("repository_scaffolded") {
+        Some(current) if current.status == "completed" || current.status == "skipped" => (
+            current.status.clone(),
+            serde_json::from_str::<Value>(&current.details_json).unwrap_or_else(|_| json!({})),
+        ),
+        _ => (
+            "skipped".to_owned(),
+            json!({
+                "source": "execution_setup_action",
+                "reason": "repository_supplied_by_setup_action",
+            }),
+        ),
+    };
     let checkpoint_details = [
         (
             "preflight",
             "completed",
             json!({"source": "execution_setup_action", "verified": true}),
+        ),
+        (
+            "repository_scaffolded",
+            scaffold_status.as_str(),
+            scaffold_details,
         ),
         (
             "repository_initialized",
@@ -596,6 +630,12 @@ async fn reconcile_operation(
     )
     .await?;
 
+    operation = begin_checkpoint(db, operation, "repository_scaffolded", lease_owner).await?;
+    operation = match scaffold_repository(db, &project, operation, lease_owner).await? {
+        ScaffoldStep::Continue(operation) => operation,
+        ScaffoldStep::Failed(operation) => return Ok(operation),
+    };
+
     operation = begin_checkpoint(db, operation, "repository_initialized", lease_owner).await?;
     let repo_path = initialize_repository(db, &project, &operation, lease_owner).await?;
     operation = complete_checkpoint(
@@ -752,6 +792,82 @@ async fn complete_checkpoint(
             completed_at: Some(now.clone()),
             created_at: current.created_at,
             updated_at: now,
+        },
+    )
+    .await?;
+    load_owned_operation(db, &operation, lease_owner).await
+}
+
+/// Mark a checkpoint `skipped`: nothing to do, recorded with the reason so
+/// ready verification and the setup projection can tell it from `pending`.
+async fn skip_checkpoint(
+    db: &Arc<SqliteDb>,
+    operation: ProjectProvisioningOperation,
+    checkpoint: &str,
+    details: Value,
+    lease_owner: &str,
+) -> Result<ProjectProvisioningOperation> {
+    let operation = load_owned_operation(db, &operation, lease_owner).await?;
+    let current =
+        ProjectProvisioningRepo::get_provisioning_checkpoint(&**db, &operation.id, checkpoint)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("Project provisioning checkpoint is missing")
+            })?;
+    let now = now_rfc3339();
+    ProjectProvisioningRepo::upsert_provisioning_checkpoint(
+        &**db,
+        UpsertProjectProvisioningCheckpoint {
+            id: current.id,
+            operation_id: operation.id.clone(),
+            checkpoint: checkpoint.to_owned(),
+            status: "skipped".to_owned(),
+            attempt_count: current.attempt_count,
+            error_code: None,
+            error_message: None,
+            details_json: details.to_string(),
+            started_at: current.started_at,
+            completed_at: Some(now.clone()),
+            created_at: current.created_at,
+            updated_at: now,
+        },
+    )
+    .await?;
+    load_owned_operation(db, &operation, lease_owner).await
+}
+
+/// Persist a running checkpoint's details without changing its status, so a
+/// later failure record (which keeps the row's details) carries the plan and
+/// the tool output that explain it.
+async fn persist_checkpoint_details(
+    db: &Arc<SqliteDb>,
+    operation: ProjectProvisioningOperation,
+    checkpoint: &str,
+    details: Value,
+    lease_owner: &str,
+) -> Result<ProjectProvisioningOperation> {
+    let operation = load_owned_operation(db, &operation, lease_owner).await?;
+    let current =
+        ProjectProvisioningRepo::get_provisioning_checkpoint(&**db, &operation.id, checkpoint)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("Project provisioning checkpoint is missing")
+            })?;
+    ProjectProvisioningRepo::upsert_provisioning_checkpoint(
+        &**db,
+        UpsertProjectProvisioningCheckpoint {
+            id: current.id,
+            operation_id: operation.id.clone(),
+            checkpoint: checkpoint.to_owned(),
+            status: current.status,
+            attempt_count: current.attempt_count,
+            error_code: current.error_code,
+            error_message: current.error_message,
+            details_json: details.to_string(),
+            started_at: current.started_at,
+            completed_at: current.completed_at,
+            created_at: current.created_at,
+            updated_at: now_rfc3339(),
         },
     )
     .await?;
@@ -935,11 +1051,40 @@ async fn ready_operation_is_verified(
         let Some(checkpoint) = checkpoints.get(checkpoint_name) else {
             return Ok(false);
         };
-        let completed = if checkpoint_name == "repository_initialized" && repo.local_path.is_none()
-        {
-            checkpoint.status == "skipped"
-        } else {
-            checkpoint.status == "completed"
+        if checkpoint_name == "repository_scaffolded" && checkpoint.status == "pending" {
+            // The operation was ready before scaffolding existed (a V087
+            // backfill, or rows repaired after the fact). Nothing was
+            // skipped by mistake: record that and keep the operation ready
+            // rather than reopening it to re-provision a verified repository.
+            let now = now_rfc3339();
+            ProjectProvisioningRepo::upsert_provisioning_checkpoint(
+                &**db,
+                UpsertProjectProvisioningCheckpoint {
+                    id: checkpoint.id.clone(),
+                    operation_id: operation.id.clone(),
+                    checkpoint: checkpoint_name.to_owned(),
+                    status: "skipped".to_owned(),
+                    attempt_count: checkpoint.attempt_count,
+                    error_code: None,
+                    error_message: None,
+                    details_json: json!({"reason": "ready_before_scaffold"}).to_string(),
+                    started_at: checkpoint.started_at.clone(),
+                    completed_at: Some(now.clone()),
+                    created_at: checkpoint.created_at.clone(),
+                    updated_at: now,
+                },
+            )
+            .await?;
+            continue;
+        }
+        let completed = match checkpoint_name {
+            "repository_initialized" if repo.local_path.is_none() => checkpoint.status == "skipped",
+            // Skipped is the normal outcome without a Charter scaffold, and
+            // the backfilled state of every operation that predates it.
+            "repository_scaffolded" => {
+                checkpoint.status == "completed" || checkpoint.status == "skipped"
+            }
+            _ => checkpoint.status == "completed",
         };
         if !completed || checkpoint.completed_at.is_none() {
             return Ok(false);
@@ -1075,6 +1220,7 @@ fn checkpoint_path(details_json: &str) -> Option<PathBuf> {
 
 fn checkpoint_failure_code(checkpoint: &str) -> &'static str {
     match checkpoint {
+        "repository_scaffolded" => "repository_scaffold_failed",
         "repository_initialized" => "repository_initialization_failed",
         "repository_registered" => "repository_registration_failed",
         "repository_linked" => "repository_link_failed",
@@ -1085,6 +1231,9 @@ fn checkpoint_failure_code(checkpoint: &str) -> &'static str {
 
 fn checkpoint_failure_message(checkpoint: &str) -> &'static str {
     match checkpoint {
+        "repository_scaffolded" => {
+            "Project repository could not be scaffolded from the Charter's spark template"
+        }
         "repository_initialized" => "Project repository could not be initialized or verified",
         "repository_registered" => "Project repository could not be registered",
         "repository_linked" => "Project repository could not be linked",
@@ -1096,7 +1245,8 @@ fn checkpoint_failure_message(checkpoint: &str) -> &'static str {
 fn failure_current_checkpoint(checkpoint: &str) -> &'static str {
     match checkpoint {
         "preflight" => "preflight",
-        "repository_initialized" => "preflight",
+        "repository_scaffolded" => "preflight",
+        "repository_initialized" => "repository_scaffolded",
         "repository_registered" => "repository_initialized",
         "repository_linked" => "repository_registered",
         "roles_assigned" => "repository_linked",
@@ -1143,34 +1293,11 @@ async fn initialize_repository(
     )
     .await?
     .ok_or_else(|| ServiceError::invalid_operation("Project provisioning checkpoint is missing"))?;
-    let repo_path = if let Some(path) = checkpoint_path(&checkpoint.details_json) {
-        path
-    } else if let Some(primary_repo_id) = project.primary_repo_id.as_deref() {
-        RepoRepo::get_by_id(&**db, primary_repo_id)
-            .await?
-            .and_then(|repo| repo.local_path.map(PathBuf::from))
-            .unwrap_or_else(|| repos_root().join(repo_directory_name(&project.name, &project.id)))
-    } else {
-        // A repository row can be durable even when the Project link was the
-        // interrupted step. Reuse its local path before deriving a name from
-        // the mutable Project name.
-        let page = RepoRepo::list_by_project(
-            &**db,
-            &project.id,
-            PageRequest {
-                cursor: None,
-                limit: 500,
-                include_total: false,
-                sort_by: SortBy::Id,
-                sort_order: SortOrder::Asc,
-            },
-        )
-        .await?;
-        page.items
-            .into_iter()
-            .find_map(|repo| repo.local_path.map(PathBuf::from))
-            .unwrap_or_else(|| repos_root().join(repo_directory_name(&project.name, &project.id)))
+    let persisted = match checkpoint_path(&checkpoint.details_json) {
+        Some(path) => Some(path),
+        None => persisted_repository_path(db, &operation.id).await?,
     };
+    let repo_path = resolve_repository_path(db, project, persisted).await?;
 
     // Persist the target before touching the filesystem.  If the process
     // stops after this write, a renamed Project still resumes in the same
@@ -1213,16 +1340,26 @@ async fn initialize_repository(
 
     if !git::is_git_repo(&repo_path).await {
         git::init(&repo_path).await?;
-        let readme = format!(
-            "# {}\n\nRepository created by Forge Product Genesis.\n",
-            project.name
-        );
-        tokio::fs::write(repo_path.join("README.md"), readme)
-            .await
-            .map_err(|error| {
-                ServiceError::invalid_operation(format!("write Project repository README: {error}"))
-            })?;
-        git::commit_all(&repo_path, "Initialize repository").await?;
+        let scaffolded = repo_path.join(SCAFFOLD_MARKER).is_file();
+        if !repo_path.join("README.md").exists() {
+            let readme = format!(
+                "# {}\n\nRepository created by Forge Product Genesis.\n",
+                project.name
+            );
+            tokio::fs::write(repo_path.join("README.md"), readme)
+                .await
+                .map_err(|error| {
+                    ServiceError::invalid_operation(format!(
+                        "write Project repository README: {error}"
+                    ))
+                })?;
+        }
+        let message = if scaffolded {
+            "Initialize repository from spark scaffold"
+        } else {
+            "Initialize repository"
+        };
+        git::commit_all(&repo_path, message).await?;
         if !git::branch_exists(&repo_path, DEFAULT_BRANCH).await? {
             git::rename_current_branch(&repo_path, DEFAULT_BRANCH).await?;
         }
@@ -1240,6 +1377,481 @@ async fn initialize_repository(
     }
     Ok(repo_path)
 }
+
+/// The repository path a filesystem checkpoint of this operation already
+/// persisted, if any. Both the scaffold and the init checkpoint record the
+/// directory before touching it, and each must honour the other's record:
+/// a scaffold that ran on attempt one and an init that runs on attempt two
+/// have to land in the same directory even if the derived name changed.
+async fn persisted_repository_path(
+    db: &Arc<SqliteDb>,
+    operation_id: &str,
+) -> Result<Option<PathBuf>> {
+    for checkpoint in ["repository_initialized", "repository_scaffolded"] {
+        if let Some(row) =
+            ProjectProvisioningRepo::get_provisioning_checkpoint(&**db, operation_id, checkpoint)
+                .await?
+        {
+            if let Some(path) = checkpoint_path(&row.details_json) {
+                return Ok(Some(path));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The one deterministic directory every filesystem checkpoint agrees on:
+/// a path already persisted by a checkpoint, else the primary or any durable
+/// repository row's local path, else the slugged Project name plus id prefix.
+async fn resolve_repository_path(
+    db: &Arc<SqliteDb>,
+    project: &Project,
+    persisted: Option<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(path) = persisted {
+        return Ok(path);
+    }
+    if let Some(primary_repo_id) = project.primary_repo_id.as_deref() {
+        return Ok(RepoRepo::get_by_id(&**db, primary_repo_id)
+            .await?
+            .and_then(|repo| repo.local_path.map(PathBuf::from))
+            .unwrap_or_else(|| {
+                repos_root().join(repo_directory_name(&project.name, &project.id))
+            }));
+    }
+    // A repository row can be durable even when the Project link was the
+    // interrupted step. Reuse its local path before deriving a name from
+    // the mutable Project name.
+    let page = RepoRepo::list_by_project(
+        &**db,
+        &project.id,
+        PageRequest {
+            cursor: None,
+            limit: 500,
+            include_total: false,
+            sort_by: SortBy::Id,
+            sort_order: SortOrder::Asc,
+        },
+    )
+    .await?;
+    Ok(page
+        .items
+        .into_iter()
+        .find_map(|repo| repo.local_path.map(PathBuf::from))
+        .unwrap_or_else(|| repos_root().join(repo_directory_name(&project.name, &project.id))))
+}
+
+enum ScaffoldStep {
+    Continue(ProjectProvisioningOperation),
+    Failed(ProjectProvisioningOperation),
+}
+
+struct ApprovedCharterScaffold {
+    revision_id: String,
+    content_digest: String,
+    rendered_view: String,
+    scaffold: CharterScaffold,
+}
+
+struct ScaffoldFailure {
+    code: &'static str,
+    message: String,
+    output_tail: String,
+}
+
+/// The scaffold named by the Project's current approved Charter revision.
+/// Provisioning reads the approved revision, never a draft: amending the
+/// Charter and retrying is how a bad template or pack set gets corrected.
+async fn load_approved_charter_scaffold(
+    db: &Arc<SqliteDb>,
+    project: &Project,
+) -> Result<Option<ApprovedCharterScaffold>> {
+    let Some(charter) =
+        ProjectOrchestrationRepo::get_project_charter_by_project_id(&**db, &project.id).await?
+    else {
+        return Ok(None);
+    };
+    let Some(revision_id) = charter.current_approved_revision_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some(revision) =
+        ProjectOrchestrationRepo::get_project_charter_revision(&**db, revision_id).await?
+    else {
+        return Ok(None);
+    };
+    // Read only the block this checkpoint needs. Provisioning must keep
+    // working for Charters saved under an earlier or later content schema,
+    // so the full `ProjectCharterContent` (which denies unknown fields) is
+    // deliberately not the parse target here.
+    #[derive(serde::Deserialize)]
+    struct ScaffoldOnly {
+        #[serde(default)]
+        scaffold: Option<CharterScaffold>,
+    }
+    let content: ScaffoldOnly = serde_json::from_str(&revision.content_json).map_err(|error| {
+        ServiceError::invalid_operation(format!(
+            "approved Charter revision {revision_id} content is unreadable: {error}"
+        ))
+    })?;
+    Ok(content.scaffold.map(|scaffold| ApprovedCharterScaffold {
+        revision_id: revision.id,
+        content_digest: revision.content_digest,
+        rendered_view: revision.rendered_view,
+        scaffold,
+    }))
+}
+
+/// `FORGE_SCAFFOLD_COMMAND` split on whitespace, falling back to the pinned
+/// default when `forge-cli` did not export one (tests, embedded use).
+fn scaffold_command() -> Vec<String> {
+    std::env::var(SCAFFOLD_COMMAND_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| config::DEFAULT_SCAFFOLD_COMMAND.to_owned())
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Stand the repository directory up from the approved Charter's spark
+/// template and packs. Idempotent by inspection of the target: an existing
+/// scaffold or git repository is never re-run, and a partial directory left
+/// by a failed run is removed so the next attempt starts clean. create-spark
+/// refuses an existing target, which is why the directory must not exist yet
+/// when the command runs.
+async fn scaffold_repository(
+    db: &Arc<SqliteDb>,
+    project: &Project,
+    operation: ProjectProvisioningOperation,
+    lease_owner: &str,
+) -> Result<ScaffoldStep> {
+    let Some(approved) = load_approved_charter_scaffold(db, project).await? else {
+        let operation = skip_checkpoint(
+            db,
+            operation,
+            "repository_scaffolded",
+            json!({"reason": "no_scaffold"}),
+            lease_owner,
+        )
+        .await?;
+        return Ok(ScaffoldStep::Continue(operation));
+    };
+
+    let operation = load_owned_operation(db, &operation, lease_owner).await?;
+    let persisted = persisted_repository_path(db, &operation.id).await?;
+    let repo_path = resolve_repository_path(db, project, persisted).await?;
+    let mut details = json!({
+        "path": repo_path.to_string_lossy(),
+        "template": approved.scaffold.template,
+        "packs": approved.scaffold.packs,
+        "charter_revision_id": approved.revision_id,
+    });
+    // Persist the target before touching the filesystem, like the init
+    // checkpoint does, so an interrupted run resumes on the same directory.
+    let operation = persist_checkpoint_details(
+        db,
+        operation,
+        "repository_scaffolded",
+        details.clone(),
+        lease_owner,
+    )
+    .await?;
+
+    if repo_path.join(SCAFFOLD_MARKER).is_file() {
+        details["already_present"] = json!(true);
+        let operation =
+            complete_checkpoint(db, operation, "repository_scaffolded", details, lease_owner)
+                .await?;
+        return Ok(ScaffoldStep::Continue(operation));
+    }
+    if git::is_git_repo(&repo_path).await {
+        details["reason"] = json!("existing_repository");
+        let operation =
+            skip_checkpoint(db, operation, "repository_scaffolded", details, lease_owner).await?;
+        return Ok(ScaffoldStep::Continue(operation));
+    }
+    match tokio::fs::read_dir(&repo_path).await {
+        Ok(mut entries) => {
+            let occupied = entries
+                .next_entry()
+                .await
+                .map_err(|error| {
+                    ServiceError::invalid_operation(format!(
+                        "inspect Project repository directory {}: {error}",
+                        repo_path.display()
+                    ))
+                })?
+                .is_some();
+            if occupied {
+                details["output_tail"] = json!(
+                    "target directory exists and is neither a spark scaffold nor a git repository"
+                );
+                let operation = persist_checkpoint_details(
+                    db,
+                    operation,
+                    "repository_scaffolded",
+                    details,
+                    lease_owner,
+                )
+                .await?;
+                let operation = fail_operation(
+                    db,
+                    operation,
+                    lease_owner,
+                    ProvisioningFailure {
+                        checkpoint: "repository_scaffolded",
+                        code: "repository_scaffold_failed",
+                        message: "Project repository directory already exists but is neither a spark scaffold nor a git repository; move it aside and retry",
+                        retryable: true,
+                        current_checkpoint: "preflight",
+                    },
+                )
+                .await?;
+                return Ok(ScaffoldStep::Failed(operation));
+            }
+            tokio::fs::remove_dir(&repo_path).await.map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "remove empty Project repository directory {}: {error}",
+                    repo_path.display()
+                ))
+            })?;
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ServiceError::invalid_operation(format!(
+                "inspect Project repository directory {}: {error}",
+                repo_path.display()
+            )));
+        }
+    }
+
+    let parent = repo_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(repos_root);
+    tokio::fs::create_dir_all(&parent).await.map_err(|error| {
+        ServiceError::invalid_operation(format!(
+            "create Project repositories directory {}: {error}",
+            parent.display()
+        ))
+    })?;
+    let dir_name = repo_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| repo_directory_name(&project.name, &project.id));
+    let command = scaffold_command();
+    details["command"] = json!(command.join(" "));
+
+    // Dependency installation can take a while on a cold cache; keep the
+    // lease current before the bounded run rather than risking expiry.
+    let operation = renew_owned_lease(db, &operation, lease_owner).await?;
+    match run_scaffold_command(&command, &parent, &dir_name, &approved.scaffold).await {
+        Ok(output_tail) => {
+            details["output_tail"] = json!(output_tail);
+            write_scaffold_exports(&repo_path, project, &approved).await?;
+            let operation =
+                complete_checkpoint(db, operation, "repository_scaffolded", details, lease_owner)
+                    .await?;
+            Ok(ScaffoldStep::Continue(operation))
+        }
+        Err(failure) => {
+            remove_partial_scaffold(&repo_path).await;
+            details["output_tail"] = json!(failure.output_tail);
+            let operation = persist_checkpoint_details(
+                db,
+                operation,
+                "repository_scaffolded",
+                details,
+                lease_owner,
+            )
+            .await?;
+            let operation = fail_operation(
+                db,
+                operation,
+                lease_owner,
+                ProvisioningFailure {
+                    checkpoint: "repository_scaffolded",
+                    code: failure.code,
+                    message: &failure.message,
+                    retryable: true,
+                    current_checkpoint: "preflight",
+                },
+            )
+            .await?;
+            Ok(ScaffoldStep::Failed(operation))
+        }
+    }
+}
+
+async fn run_scaffold_command(
+    command: &[String],
+    cwd: &Path,
+    dir_name: &str,
+    scaffold: &CharterScaffold,
+) -> std::result::Result<String, ScaffoldFailure> {
+    let Some((program, base_args)) = command.split_first() else {
+        return Err(ScaffoldFailure {
+            code: "scaffold_runtime_unavailable",
+            message: format!("scaffold command is empty; set {SCAFFOLD_COMMAND_ENV}"),
+            output_tail: String::new(),
+        });
+    };
+    let mut args = base_args.to_vec();
+    args.push(dir_name.to_owned());
+    args.push("--template".to_owned());
+    args.push(scaffold.template.clone());
+    args.push("--yes".to_owned());
+    if scaffold.packs.is_empty() {
+        args.push("--no-packs".to_owned());
+    } else {
+        args.push("--packs".to_owned());
+        args.push(scaffold.packs.join(","));
+    }
+
+    let mut child = Command::new(program);
+    child
+        .args(&args)
+        .current_dir(cwd)
+        .env("NO_COLOR", "1")
+        .env("CI", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let output = match tokio::time::timeout(SCAFFOLD_TIMEOUT, child.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) if error.kind() == ErrorKind::NotFound => {
+            return Err(ScaffoldFailure {
+                code: "scaffold_runtime_unavailable",
+                message: format!(
+                    "scaffold command `{program}` is not installed on the Forge host; install bun or set {SCAFFOLD_COMMAND_ENV}"
+                ),
+                output_tail: String::new(),
+            });
+        }
+        Ok(Err(error)) => {
+            return Err(ScaffoldFailure {
+                code: "repository_scaffold_failed",
+                message: format!("scaffold command `{program}` could not start: {error}"),
+                output_tail: String::new(),
+            });
+        }
+        Err(_) => {
+            return Err(ScaffoldFailure {
+                code: "repository_scaffold_failed",
+                message: format!(
+                    "scaffold command exceeded {} seconds and was stopped",
+                    SCAFFOLD_TIMEOUT.as_secs()
+                ),
+                output_tail: String::new(),
+            });
+        }
+    };
+    let output_tail = scaffold_output_tail(&output.stdout, &output.stderr);
+    if output.status.success() {
+        return Ok(output_tail);
+    }
+    let last_line = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("exit status {}", output.status));
+    Err(ScaffoldFailure {
+        code: "repository_scaffold_failed",
+        message: format!("create-spark failed: {last_line}"),
+        output_tail,
+    })
+}
+
+fn scaffold_output_tail(stdout: &[u8], stderr: &[u8]) -> String {
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(stdout).trim_end(),
+        String::from_utf8_lossy(stderr).trim_end()
+    );
+    let combined = combined.trim();
+    let skip = combined
+        .chars()
+        .count()
+        .saturating_sub(SCAFFOLD_OUTPUT_TAIL_CHARS);
+    combined.chars().skip(skip).collect()
+}
+
+/// A directory the failed run created but never turned into a git repository
+/// is this operation's own debris; leaving it would make every retry fail on
+/// "target directory already exists".
+async fn remove_partial_scaffold(repo_path: &Path) {
+    if !repo_path.exists() || repo_path.join(".git").exists() {
+        return;
+    }
+    if let Err(error) = tokio::fs::remove_dir_all(repo_path).await {
+        tracing::warn!(
+            path = %repo_path.display(),
+            error = %error,
+            "partial spark scaffold could not be removed; the next attempt will report it"
+        );
+    }
+}
+
+/// Put Forge's truth into the scaffold before the first commit: the approved
+/// Charter as `docs/spark/project.md` (an export, stamped with its revision)
+/// and a Forge section in `AGENTS.md` so every Task Worker reading the
+/// repository knows planning and tracking live in Forge.
+async fn write_scaffold_exports(
+    repo_path: &Path,
+    project: &Project,
+    approved: &ApprovedCharterScaffold,
+) -> Result<()> {
+    let docs_dir = repo_path.join("docs").join("spark");
+    tokio::fs::create_dir_all(&docs_dir)
+        .await
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "create {} in the scaffold: {error}",
+                docs_dir.display()
+            ))
+        })?;
+    let project_md = format!(
+        "# {}\n\n> Exported by Forge from the approved Project Charter (revision `{}`, content digest `{}`).\n> Forge is the source of truth for this Project: Tasks, reviews, milestones, and releases live in Forge, not in `docs/spark/changes/`.\n\n{}",
+        project.name, approved.revision_id, approved.content_digest, approved.rendered_view
+    );
+    tokio::fs::write(docs_dir.join("project.md"), project_md)
+        .await
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "write docs/spark/project.md in the scaffold: {error}"
+            ))
+        })?;
+
+    let agents_path = repo_path.join("AGENTS.md");
+    let mut agents = match tokio::fs::read_to_string(&agents_path).await {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(ServiceError::invalid_operation(format!(
+                "read AGENTS.md in the scaffold: {error}"
+            )));
+        }
+    };
+    if !agents.contains("\n## Forge\n") && !agents.starts_with("## Forge\n") {
+        if !agents.is_empty() && !agents.ends_with('\n') {
+            agents.push('\n');
+        }
+        if !agents.is_empty() {
+            agents.push('\n');
+        }
+        agents.push_str(FORGE_AGENTS_SECTION);
+        tokio::fs::write(&agents_path, agents)
+            .await
+            .map_err(|error| {
+                ServiceError::invalid_operation(format!("write AGENTS.md in the scaffold: {error}"))
+            })?;
+    }
+    Ok(())
+}
+
+const FORGE_AGENTS_SECTION: &str = "## Forge\n\nThis repository belongs to a Forge Project. Forge owns planning and execution: the approved Charter is exported to `docs/spark/project.md`, Tasks are created, reviewed, and merged in Forge, and the Task brief you receive is the plan. Do not create `docs/spark/changes/` folders or edit a `tasks.md`; report scope discoveries as follow-up work in your Task report. The `worker-guidelines` lens is in force.\n";
 
 async fn find_or_register_repository(
     db: &Arc<SqliteDb>,

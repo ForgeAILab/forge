@@ -19,7 +19,6 @@ import {
 } from '@phosphor-icons/react'
 import { apiFetchBlob } from '@/api/client'
 import {
-  useApproveMilestoneRevision,
   useProjectOverviewQuery,
   useRecordManualMilestoneCheck,
   useReleaseProjectMilestone,
@@ -38,9 +37,15 @@ import {
 } from '@/components/ui/dialog'
 import { ProjectCharterAdoptionBanner } from '@/features/project-charter/ProjectCharterAdoptionBanner'
 import { ProjectStageOrientation } from '@/features/project-workbench/ProjectStageOrientation'
+import { DocumentFreshnessDialog } from '@/features/project-documents/DocumentFreshnessDialog'
 import { DecisionCandidateCard } from '@/features/project-execution/DecisionCandidateCard'
 import { ProjectExecutionSetupPanel } from '@/features/project-execution/ProjectExecutionSetupPanel'
 import { ReconciliationReviewCard } from '@/features/project-execution/ReconciliationReviewCard'
+import { MilestoneRevisionApprovalControl } from '@/features/project-execution/MilestoneRevisionApprovalControl'
+import {
+  createUserAuthorization,
+  newIdempotencyKey,
+} from '@/features/project-execution/user-authorization'
 import { getApiErrorCode, getApiErrorMessage, isApiStatus } from '@/lib/api-error'
 import { useAuthStore } from '@/stores/auth'
 import { clearDeletedProjectScope, resolveNextProjectId } from '@/stores/project-scope'
@@ -97,28 +102,6 @@ function numberValue(value: number | bigint | null | undefined): number | null {
   if (value === null || value === undefined) return null
   const number = typeof value === 'bigint' ? Number(value) : value
   return Number.isFinite(number) ? number : null
-}
-
-function newIdempotencyKey(prefix: string): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID()
-  }
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`
-}
-
-function createUserAuthorization(
-  action: string,
-  authorizationBasis = 'interactive_user_release',
-): AuthorizationProvenance {
-  const user = useAuthStore.getState().user
-  if (!user) throw new Error('Sign in again before completing this user-authorized action.')
-  return {
-    principal: { kind: 'user', id: user.id, display_name: user.display_name ?? null },
-    authorization_basis: authorizationBasis,
-    action,
-    event_id: newIdempotencyKey(action),
-    occurred_at: new Date().toISOString(),
-  }
 }
 
 async function sha256Hex(value: string): Promise<string> {
@@ -760,7 +743,17 @@ function ScopeList({
   )
 }
 
-function DocumentFreshnessPanel({ documents }: { documents: DocumentFreshness[] }) {
+function DocumentFreshnessPanel({
+  projectId,
+  documents,
+}: {
+  projectId: string
+  documents: DocumentFreshness[]
+}) {
+  // A freshness row is a summary; the record behind it (approved text,
+  // working text, the diff between them, and the revision history) opens in
+  // place so "changes pending" is something the user can actually read.
+  const [selected, setSelected] = useState<DocumentFreshness | null>(null)
   return (
     <SectionCard title="Document freshness" eyebrow="Canonical Project Documents">
       {documents.length === 0 ? (
@@ -769,7 +762,12 @@ function DocumentFreshnessPanel({ documents }: { documents: DocumentFreshness[] 
         <ul className="divide-y divide-border-subtle">
           {documents.map((document) => (
             <li key={document.document_id} className="min-w-0 py-3 first:pt-0 last:pb-0">
-              <div className="flex min-w-0 items-start gap-2">
+              <button
+                type="button"
+                onClick={() => setSelected(document)}
+                aria-label={`Inspect ${humanize(document.kind)} document`}
+                className="-mx-1.5 flex w-[calc(100%+0.75rem)] min-w-0 items-start gap-2 rounded-md px-1.5 py-1 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
                 <FileText size={16} className="mt-0.5 shrink-0 text-muted-foreground" aria-hidden />
                 <div className="min-w-0 flex-1">
                   <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -799,11 +797,22 @@ function DocumentFreshnessPanel({ documents }: { documents: DocumentFreshness[] 
                     <p className="mt-1 break-words text-xs text-warning">{document.reason}</p>
                   ) : null}
                 </div>
-              </div>
+                <span className="inline-flex shrink-0 items-center gap-1 text-micro font-semibold text-primary">
+                  Inspect <ArrowUpRight size={12} aria-hidden />
+                </span>
+              </button>
             </li>
           ))}
         </ul>
       )}
+      <DocumentFreshnessDialog
+        projectId={projectId}
+        document={selected}
+        open={selected !== null}
+        onOpenChange={(open) => {
+          if (!open) setSelected(null)
+        }}
+      />
     </SectionCard>
   )
 }
@@ -1604,77 +1613,6 @@ function NextActionCard({
   )
 }
 
-/**
- * The one user action behind `milestone_definition_approval`: approve the
- * milestone's current `proposed` definition revision in place. Until it is
- * approved every downstream action is measured against an unapproved
- * contract, and the stale banner's Refresh only re-fetches the same state.
- */
-function MilestoneRevisionApprovalControl({
-  projectId,
-  target,
-  expectedVersion,
-}: {
-  projectId: string
-  target: ProjectMilestoneOverview
-  expectedVersion: number | null
-}) {
-  const approval = useApproveMilestoneRevision()
-  const [error, setError] = useState<string | null>(null)
-  const revisionNumber = numberValue(target.definition.revision_number)
-  const milestoneVersion = expectedVersion ?? numberValue(target.milestone.version)
-
-  async function approve() {
-    setError(null)
-    approval.reset?.()
-    if (milestoneVersion === null) {
-      setError('The milestone version is unavailable; refresh the Overview and try again.')
-      return
-    }
-    try {
-      await approval.mutateAsync({
-        projectId,
-        milestoneId: target.milestone.id,
-        revisionId: target.definition.id,
-        expectedMilestoneVersion: milestoneVersion,
-        idempotencyKey: newIdempotencyKey('milestone-revision-approve'),
-        authorization: createUserAuthorization(
-          'project.milestone.revision.transition',
-          'interactive_user_approval',
-        ),
-      })
-    } catch (caught) {
-      setError(
-        getApiErrorMessage(
-          caught,
-          'The definition revision could not be approved. Refresh the Overview and try again.',
-        ),
-      )
-    }
-  }
-
-  return (
-    <div className="mt-3 flex flex-col gap-2">
-      <p className="text-xs leading-5 text-muted-foreground">
-        {target.milestone.display_label}: definition revision{' '}
-        {revisionNumber ?? '—'} is {humanize(target.definition.lifecycle)}.
-      </p>
-      <div>
-        <Button size="sm" disabled={approval.isPending} onClick={() => void approve()}>
-          {approval.isPending
-            ? 'Approving…'
-            : `Approve definition revision ${revisionNumber ?? ''}`.trim()}
-        </Button>
-      </div>
-      {error ? (
-        <p role="alert" className="break-words text-xs leading-5 text-destructive">
-          {error}
-        </p>
-      ) : null}
-    </div>
-  )
-}
-
 function ReleaseReviewDialog({
   candidate,
   open,
@@ -1793,7 +1731,10 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
           : {
               fingerprint,
               key: newIdempotencyKey('project-milestone-release'),
-              authorization: createUserAuthorization('project.milestone.release'),
+              authorization: createUserAuthorization(
+                'project.milestone.release',
+                'interactive_user_release',
+              ),
             }
       releaseAttemptRef.current = attempt
       const release = await releaseMutation.mutateAsync({
@@ -2124,7 +2065,10 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
           )}
           {hideDocuments ? null : (
             <div id="documents" className="order-4 min-w-0 scroll-mt-24 xl:order-none">
-              <DocumentFreshnessPanel documents={overview.document_freshness} />
+              <DocumentFreshnessPanel
+                projectId={projectId}
+                documents={overview.document_freshness}
+              />
             </div>
           )}
           {hideDecisions ? null : (

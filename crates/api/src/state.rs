@@ -5,11 +5,11 @@ use db::SqliteDb;
 use events::EventBus;
 use executors::{AdapterRegistry, FallbackExecutor, TaskExecutor};
 use services::{
-    AgentActionService, AgentChatTurnWorker, AgentInboxService, AgentService, AuthService,
-    CommitmentService, DaemonService, EmbeddedAgentService, MemoryService, MergeService,
-    NotificationService, OperatorStatusEmitter, OperatorStatusService, ProjectHookService,
-    ProviderAuthorizationService, TaskService, TerminalActivityTracker, TerminalService,
-    WorkspaceCleanupScheduler, WorkspaceExecutionLockManager,
+    AgentActionService, AgentChatTurnLogRoot, AgentChatTurnWorker, AgentInboxService, AgentService,
+    AuthService, CommitmentService, DaemonService, EmbeddedAgentService, MemoryService,
+    MergeService, NotificationService, OperatorStatusEmitter, OperatorStatusService,
+    ProjectHookService, ProviderAuthorizationService, TaskService, TerminalActivityTracker,
+    TerminalService, WorkspaceCleanupScheduler, WorkspaceExecutionLockManager,
 };
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -68,6 +68,10 @@ pub struct AppState {
     pub agent_chat_service: Arc<services::AgentChatService<SqliteDb>>,
     pub main_chat_topic_service: Arc<services::MainChatTopicService<SqliteDb>>,
     pub agent_chat_turn_worker: Arc<AgentChatTurnWorker>,
+    /// Where each Agent Chat turn's durable activity log (tool calls,
+    /// reasoning, reply deltas) lives; shared by the turn worker that writes
+    /// it and the turn logs route that serves it.
+    pub agent_chat_turn_logs: AgentChatTurnLogRoot,
     pub commitment_service: Arc<CommitmentService>,
     pub agent_inbox_service: Arc<AgentInboxService>,
     pub agent_action_service: Arc<AgentActionService>,
@@ -288,10 +292,13 @@ impl AppState {
         let operator_status_service = Arc::new(OperatorStatusService::new(Arc::clone(&db)));
         let operator_status_emitter =
             Arc::new(OperatorStatusEmitter::start(Arc::clone(&event_bus)));
+        let agent_chat_turn_logs =
+            AgentChatTurnLogRoot::new(agent_chat_turn_log_root(&effective_config));
         let agent_chat_turn_worker = Arc::new(AgentChatTurnWorker::new(
             Arc::clone(&db),
             Arc::clone(&embedded_agent_service),
             Arc::clone(&task_executor),
+            agent_chat_turn_logs.clone(),
         ));
         let auth_service = Arc::new(AuthService::new(Arc::clone(&db), jwt_secret, bcrypt_cost));
         let oauth_service = Arc::new(services::OAuthService::new(
@@ -313,6 +320,7 @@ impl AppState {
             agent_chat_service,
             main_chat_topic_service,
             agent_chat_turn_worker,
+            agent_chat_turn_logs,
             commitment_service,
             agent_inbox_service,
             agent_action_service,
@@ -362,6 +370,8 @@ impl AppState {
             config.workspace.root.clone(),
             config.forge.data_dir.join("projects"),
         );
+        self.agent_chat_turn_logs
+            .set_root(agent_chat_turn_log_root(&config));
         self.oauth_service = Arc::new(services::OAuthService::new(
             Arc::clone(&self.db),
             Arc::clone(&self.auth_service),
@@ -416,6 +426,12 @@ pub fn test_jwt_secret() -> Vec<u8> {
 
 pub fn test_bcrypt_cost() -> u32 {
     TEST_BCRYPT_COST
+}
+
+/// `<data-dir>/agent-chat-logs/<turn_job_id>.jsonl` holds one Agent Chat
+/// turn's durable activity log.
+fn agent_chat_turn_log_root(config: &ForgeConfig) -> PathBuf {
+    config.forge.data_dir.join("agent-chat-logs")
 }
 
 fn effective_config_for_workspace(workspace_root: PathBuf) -> ForgeConfig {

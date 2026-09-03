@@ -99,6 +99,16 @@ impl CommandBuilder {
     }
 }
 
+/// Point a child process at the Task worktree.
+///
+/// `current_dir` alone is not enough: a tool that trusts `$PWD` over
+/// `getcwd()` — OpenCode resolves its project directory from it — would
+/// otherwise inherit the Forge server's own working directory and run the
+/// Task against the wrong checkout.
+pub fn run_in_worktree(command: &mut Command, worktree_path: &str) {
+    command.current_dir(worktree_path).env("PWD", worktree_path);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +167,28 @@ mod tests {
             envs.get(&OsString::from("MY_VAR")),
             Some(&OsString::from("profile_val"))
         );
+    }
+}
+
+#[cfg(test)]
+mod worktree_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn worktree_children_see_the_worktree_as_pwd() {
+        let mut command = CommandBuilder::new("true").build();
+        run_in_worktree(&mut command, "/tmp/worktree");
+
+        let std_command = command.as_std();
+        assert_eq!(
+            std_command.get_current_dir(),
+            Some(std::path::Path::new("/tmp/worktree"))
+        );
+        let pwd = std_command
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new("PWD"))
+            .and_then(|(_, value)| value);
+        assert_eq!(pwd, Some(OsStr::new("/tmp/worktree")));
     }
 }

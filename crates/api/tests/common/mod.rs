@@ -273,6 +273,7 @@ pub async fn configure_execution_test_setup(
     .expect("test project provisioning operation ready update");
     for checkpoint in [
         "preflight",
+        "repository_scaffolded",
         "repository_initialized",
         "repository_registered",
         "repository_linked",

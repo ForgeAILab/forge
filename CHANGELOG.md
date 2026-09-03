@@ -6,6 +6,236 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-03
+
+### Added
+
+- **Project analytics now counts the Agent Chat surfaces, not just Task
+  executions.** `GET /api/v1/projects/{id}/analytics` previously read only
+  `execution_usage`, so the Genesis discovery that produced a Project and the
+  Project Agent's own orchestration turns were invisible — for three measured
+  MVP Projects that was roughly two thirds of the tokens spent. The response
+  gains `token_usage.by_surface` (`task_execution`, `project_chat`,
+  `genesis_chat`, each with a `run_count`) and `token_usage.chat_turn_count`,
+  the totals include chat, and `by_model` / `by_agent` cover both surfaces so a
+  Main or Project Agent appears at all. `genesis_chat` is bounded by its
+  Genesis session's own lifetime, so a shared Main chat never bills one Project
+  for another's discovery. `forge-ctl project analytics <project-id>` renders
+  the same breakdown, with `--from` / `--to`.
+
+### Fixed
+
+- **A Codex Task run's token usage is no longer recorded as just its last
+  turn.** The Codex adapter overwrote `TurnRunResult::usage` on every
+  `thread/tokenUsage/updated` notification, so a whole session was recorded as
+  its final exchange. A measured UnitSwap implementation run consumed 655,299
+  input and 16,658 output tokens and was recorded as 41,290 and 247 — a 16x
+  input undercount. The notifications carry each turn's delta in `last`, and
+  those deltas now accumulate; `reasoningOutputTokens`, previously dropped
+  entirely, counts as output the way the embedded host already counts it, and
+  `cacheWriteInputTokens` is read instead of being hardcoded to zero.
+- **A locally dispatched execution is no longer killed milliseconds after it
+  starts.** A new execution carries an already-expired `dispatch-pending:`
+  lease marker by design, so a crash between the row write and the runner's
+  first claim leaves something reclaimable. The heartbeat monitor treated that
+  marker as a dead owner, and an independent-review execution was observed
+  failing 8ms after creation with `execution_stalled` and "Execution owner
+  lease expired" — no review ever ran, and nothing re-dispatched. Recovery now
+  leaves an unclaimed dispatch marker alone for 30 seconds, which is longer
+  than the runner's handoff and still reclaims a genuinely orphaned row. A
+  marker past its hard deadline, and any real owner's expired lease, stay
+  immediately eligible.
+
+### Breaking
+
+- **Recorded token counters are now disjoint across every executor.**
+  `execution_usage.input_tokens` and the `input` field of an Agent Chat
+  message's `token_usage_json` previously meant different things depending on
+  which executor produced the row: the Claude Code and Smith adapters
+  reported input *excluding* the cached prefix, while the Codex adapter and
+  the embedded runtime reported it *including* both the cache read and the
+  cache write. A per-project or cross-agent total was therefore
+  uninterpretable — summing `input + cache_read + cache_write` double-counted
+  the cached prefix for two of the four executors, and using `input` alone
+  undercounted it for the other two.
+  All four now normalize at the adapter/host boundary to one convention:
+  `input_tokens` counts only tokens read fresh, and context size is
+  `input_tokens + cache_read_tokens + cache_write_tokens`. The Codex adapter
+  subtracts `cachedInputTokens` from the `inputTokens` it is handed (Codex's
+  own `totalTokens` confirms the overlap), and the embedded host reports
+  `InputUncached` rather than the runtime's window-pressure `input_tokens()`
+  roll-up, whose inclusive meaning is documented on
+  `AgentTurnOutput::input_tokens`.
+  Rows written before this change keep the old mixed semantics; usage
+  recorded by the embedded runtime and the Codex adapter reads high on
+  `input_tokens` for historical executions and chat turns.
+
+
+### Added
+
+- **Projects start from a spark scaffold.** The Project Charter gains an
+  optional `scaffold` block (`template`, `packs`), the Main discovery skill
+  (`forge.main.project-discovery/v2@5`, migration V126) settles it as one
+  user decision for web products, and Genesis provisioning gains a
+  `repository_scaffolded` checkpoint that runs the configured create-spark
+  command (`[scaffold] command` / `FORGE_SCAFFOLD_COMMAND`, default
+  `bunx @forgeailab/create-spark@0.4.5`) before the repository's first commit.
+  spark 0.4.5 is the first release whose npm package carries its templates
+  and packs (0.4.4 shipped only `src/` and cannot scaffold outside the spark
+  monorepo); until it is published, point `FORGE_SCAFFOLD_COMMAND` at a local
+  spark checkout (`bun <spark>/packages/create-spark/src/cli.ts`).
+  The scaffold ships `AGENTS.md`, `CLAUDE.md`, `.claude/skills/` (including
+  the `worker-guidelines` lens), and `.codex/skills/`, so every Task Worker
+  starts with repository-level guidance; Forge exports the approved Charter
+  into `docs/spark/project.md` and appends a Forge section to `AGENTS.md`.
+  `bun` is a host dependency only for scaffolded Projects; a missing runtime
+  is the typed, retryable `scaffold_runtime_unavailable`, and a create-spark
+  refusal is `repository_scaffold_failed` with the bounded tool output. The
+  checkpoint table's name list is rebuilt to admit the new checkpoint, and
+  every existing operation is backfilled with it as `skipped`, so previously
+  provisioned Projects stay `ready`. Charters without a scaffold keep their
+  content and render digests byte-for-byte: the block is omitted from
+  canonical JSON when absent and rendered only when present.
+
+### Added
+
+- **The chat shows what the Agent is doing.** A Main/Project Agent Chat turn
+  no longer sits behind a bare spinner: the runtime's reasoning, every tool
+  call with its bounded result (including the typed Forge operation it ran,
+  such as `skill.section` or `task.propose`), and the reply as it streams are
+  written to a durable per-turn activity log
+  (`<data-dir>/agent-chat-logs/<turn_job_id>.jsonl`, Forge JSONL log schema)
+  and served by `GET /api/v1/agent-chats/{chat_id}/turns/{turn_id}/logs`
+  with the execution-log paging contract. The web timeline follows a live
+  turn's log to label the current step ("Reading the operating skill…",
+  "Running a command…", "Writing a reply…") above a compact activity feed,
+  shows the feed on a failed turn, and keeps a collapsible "N tool calls"
+  summary under each reply. `ToolResultSummary` gains an optional `operation`.
+  Native Task execution and chat turns now share one `TurnLogSink`. Each
+  `tool_call` entry now also carries a bounded, credential-masked argument
+  preview (command, path, operation, typed params) instead of key names
+  alone.
+- **Document freshness rows open the document.** Each row of the Project
+  Overview's "Document freshness" panel is now a button that opens the
+  document in place: a "Changes" tab shows the server's line diff between
+  the working and approved revisions (or the whole working revision as
+  additions when nothing is approved yet), "Working revision" and "Approved
+  revision" render either revision's view, and "History" lists every
+  immutable revision with its lifecycle, author, change summary, and digest.
+  The dialog is read-only; approval stays with the typed next-action surface.
+
+### Added
+
+- **Approving in the chat wakes the Project Agent.** The Project Agent Chat
+  gains a "Needs your decision" card above the status panel: the milestone
+  definition revision the Agent proposed (with its acceptance-check summary)
+  and any pending Decision proposals, each with a one-click Approve or
+  Reject. A decision the *user* records — a milestone definition revision
+  approved or rejected, a Decision approved or a candidate rejected, a
+  Document revision approved — is now a wake for the Project Agent: the
+  Attention projection classifies it as the new `decision_recorded`
+  category (`AttentionCategory::DecisionRecorded`, recommended action
+  `continue_from_decision`), the wake prompt states what was decided and
+  tells the Agent to continue from it without asking again, and the
+  incident resolves as soon as the wake turn is admitted so it never lingers
+  in Mission Control. An Agent's own approval never wakes the Agent that
+  made it. The user no longer has to type "approve" after clicking Approve.
+  The Overview's milestone approval control moved to
+  `features/project-execution/MilestoneRevisionApprovalControl` and is
+  shared by both pages.
+
+### Fixed
+
+- **A Project with no repository pauses instead of stranding its Tasks in
+  backlog forever.** Task creation used to park a Task in `backlog` with no
+  repository when the Project had none yet (for example while scaffold
+  provisioning was still failing), and nothing promoted it once provisioning
+  succeeded — the Project Agent saw "3/3 Tasks in backlog", had no typed
+  action to move them, and the scheduler never looked at backlog. `backlog`
+  is reserved for a deliberate later move by a user or the Agent; a Task
+  never starts there. Instead, the Task dispatcher now pauses a Project with
+  no primary repository (recording why, in the new
+  `system_pause_reason` field — "missing_repository", migration V128) and
+  resumes it once a repository is attached, so the Project's own status
+  makes the blocker visible instead of its Tasks silently parking. A user's
+  own pause (`POST /projects/{id}/pause`, or any Project update that sets
+  `paused_at`) always clears that reason, so a deliberate pause is never
+  auto-resumed and never mistaken for this automatic one. Initial scheduling
+  also now gives any Task that has no role assignment at all the Project's
+  default assignees (Project settings can gain those defaults after such a
+  Task was proposed, which is why some Tasks also had no coder or reviewer)
+  before dispatching it. Existing stuck Projects heal on the dispatcher's
+  first scan after upgrade.
+
+- **Deleting a Project could fail if it had ever produced a memory item, an
+  Agent Chat message with a profile or handoff, a Main Chat topic, or a
+  handful of other append-only rows.** Those tables paired an
+  `ON DELETE SET NULL` foreign key with their own unconditional
+  append-only/immutable trigger on the very same column — `SET NULL` is a
+  physical UPDATE, so the moment the Project's teardown reached the task,
+  execution, profile, or message one of those immutable rows pointed at,
+  SQLite's own cascade collided with the immutability guard and aborted the
+  whole delete with `database is malformed`-adjacent `SQLITE_CONSTRAINT`
+  errors (most visibly `memory items are append-only`). Migration V129
+  drops the FK enforcement on those historical-reference columns — they
+  become plain, unenforced columns that can dangle, exactly like
+  `domain_event` already does — instead of relaxing the immutability
+  guarantee itself, and scopes two previously-unconditional delete guards
+  (`agent_chat_topic`, `forge_memory_source_binding`) to
+  `project_deletion_guard`, matching `agent_chat_message` and
+  `agent_handoff`. Project deletion also now explicitly clears a Project's
+  Agent Chat topics before the final cascade, since they only ever cascaded
+  in from `agent_chat` and their guard needs that row to still exist to
+  match.
+
+### Changed
+
+- **Chat message status shows cached tokens.** The per-message footer
+  ("gpt-5.6-sol · 28s · 77,535 in · 898 out") now also shows the prompt-cache
+  share of the input ("61,440 cached", and "cache write" when a cache was
+  written). `AgentTurnOutput` gains `cache_read_tokens` and
+  `cache_write_tokens` from the runtime's `InputCached` / `CacheWrite`
+  counters, and a chat message's `token_usage_json` gains `cache_read` and
+  `cache_write` next to `input` and `output`; messages recorded before this
+  keep rendering without them.
+- **Wake prompts collapse to their summary in the chat.** A policy-admitted
+  wake used to land in the Main/Project Agent Chat as its entire work order
+  (incident details, delivery follow-up directive, and all) in one flat
+  paragraph. The wake's `system` trigger message now carries
+  `outcome: "attention_wake"` (migration `V127` backfills earlier wake
+  prompts), and the timeline renders it as one line — "Attention wake · Task
+  completed; reconcile validation, evidence, and readiness" — with the full
+  prompt the Agent received behind a toggle, copyable as-is.
+
+### Fixed
+
+- **CLI executors run in the Task worktree even when the tool trusts `$PWD`.**
+  Forge set the child's working directory but let it inherit the server's
+  own `PWD`, and OpenCode resolves its project directory from that variable —
+  so every OpenCode execution started inside the Forge checkout (a reviewer
+  was observed reading `test/forge.db` and `~/.forge` credential files to find
+  its worktree). Every CLI adapter (Claude Code, Codex, Cursor, Gemini, Smith,
+  OpenCode) now exports `PWD=<worktree>` alongside `current_dir`.
+- **Read-only executions no longer auto-commit their leftovers.** After a
+  run, CLI adapters commit whatever the worktree holds. For a reviewer that
+  had just run `next build`, that turned `next-env.d.ts` and
+  `tsconfig.tsbuildinfo` into an `agent: Review task…` commit, which moved
+  HEAD and made the runner discard the run as a read-only policy breach —
+  failing every first review attempt of a Next.js Task. The post-run commit
+  now honours the read-only worktree policy (reviewer and planner roles,
+  planning and discovery Tasks): untracked build output is left for the
+  runner's existing cleanup and the review verdict stands.
+- **A Review gate no longer reports `awaiting_human` before its entry has
+  settled.** Entering a state with blocking `before_enter` hooks persists the
+  transition behind a running entry barrier, and the engine clears that barrier
+  (bumping the Task version) once the hooks finish. `awaiting_human` could
+  already read true in between, so a client that read the Task and then
+  approved or rejected with that version hit a spurious `version_conflict`.
+  `awaiting_human` is now derived from the same Task snapshot as the returned
+  `version`, staying false while that snapshot's barrier is running. The
+  `POST /api/v1/tasks/{id}/gates/{state}/approve` and `/reject` endpoints also
+  refuse with 409 `validation_error` until it clears.
+
 ## [0.9.0] - 2026-09-02
 
 ### Breaking

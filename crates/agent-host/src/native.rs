@@ -365,7 +365,12 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             .checkpoint_store(self.protected_store.clone())
             .interaction_broker(Arc::new(self.interaction_broker.clone()))
             .security_subject(SecuritySubject::new(binding.identity_id))
-            .lcm(Arc::new(lcm));
+            .lcm(Arc::new(lcm))
+            // Forge reduces raw arguments to a bounded, credential-masked
+            // preview (`tool_preview::build_tool_argument_preview`) before
+            // they are ever persisted or rendered; without this opt-in the
+            // runtime withholds argument values by default.
+            .emit_raw_tool_arguments(true);
         builder = composition.apply(builder);
         if let Some(prompt) = request.system_prompt.as_deref() {
             builder = builder.system_prompt(prompt);
@@ -415,9 +420,14 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
                             call,
                             name,
                             argument_keys,
+                            arguments,
                             ..
                         } => {
-                            sink.tool_call_started(call.as_str(), name, argument_keys)
+                            let preview = arguments
+                                .as_ref()
+                                .map(crate::build_tool_argument_preview)
+                                .unwrap_or_default();
+                            sink.tool_call_started(call.as_str(), name, argument_keys, &preview)
                                 .await;
                         }
                         RuntimeEvent::ToolCallCompleted {
@@ -500,10 +510,16 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
         Ok(AgentTurnOutput {
             runtime_session_id: request.runtime_session_id,
             text,
-            input_tokens: usage.input_tokens(),
+            // Disjoint by contract (see `AgentTurnOutput::input_tokens`): the
+            // runtime's `input_tokens()` folds the cached and cache-write
+            // prefixes back in, which would double-count them against the
+            // two counters below once they reach `execution_usage`.
+            input_tokens: usage.get(CounterKind::InputUncached),
             output_tokens: usage
                 .get(CounterKind::Output)
                 .saturating_add(usage.get(CounterKind::Reasoning)),
+            cache_read_tokens: usage.get(CounterKind::InputCached),
+            cache_write_tokens: usage.get(CounterKind::CacheWrite),
             context_manifest,
             pending_interaction_id,
         })

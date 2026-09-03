@@ -488,3 +488,165 @@ async fn agent_chat_turn_parks_awaiting_input_and_can_be_cancelled() {
     .await;
     assert_eq!(cancelled.status, AgentChatTurnStatus::Cancelled);
 }
+
+#[tokio::test]
+async fn agent_chat_turn_logs_serve_the_turns_durable_activity() {
+    let workspace = common::TestDir::new("agent-chat-turn-logs");
+    let harness = common::test_app(workspace.path(), "agent-chat-turn-logs").await;
+    // The harness has no `--data-dir`; keep this test's logs inside its own
+    // workspace instead of the default `~/.forge`.
+    harness
+        .state
+        .agent_chat_turn_logs
+        .set_root(workspace.path().join("agent-chat-logs"));
+    let token = common::test_jwt();
+
+    let connected: ConnectedEmbeddedAgentResponse = common::connect_embedded_agent(
+        &harness.app,
+        &token,
+        "main-logs-agent",
+        "main-logs",
+        "main-logs-secret",
+        json!({"permissions": ["read_agent_chat", "propose_message"]}),
+        json!({"allowed": ["read_agent_chat", "propose_message"]}),
+    )
+    .await;
+    let binding: MainAgentBindingResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::PUT,
+        "/api/v1/account/main-agent",
+        &token,
+        json!({
+            "identity_id": connected.agent.id,
+            "profile_id": connected.profile.id,
+            "expected_version": 0,
+            "autonomy_policy": {}
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let send_response: SendAgentChatMessageResponse = common::json_request_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/agent-chats/{}/messages", binding.chat_id),
+        &token,
+        json!({"content": "What is the Agent doing?"}),
+        StatusCode::CREATED,
+    )
+    .await;
+    let turn = send_response.turn_job.expect("admitted turn job");
+    let logs_uri = format!(
+        "/api/v1/agent-chats/{}/turns/{}/logs",
+        binding.chat_id, turn.id
+    );
+
+    // A queued turn has recorded nothing yet: an empty page, not an error.
+    let empty: serde_json::Value = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &logs_uri,
+        &token,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(empty["items"], json!([]));
+    assert_eq!(empty["has_more"], false);
+
+    // The worker writes through the same root the route reads.
+    let sink = services::turn_log_sink::TurnLogSink::new(
+        harness.state.agent_chat_turn_logs.path_for(&turn.id),
+        &turn.id,
+        None,
+        None,
+    );
+    let argument_preview =
+        forge_agent_host::build_tool_argument_preview(&json!({"operation": "read"}));
+    forge_agent_host::TurnEventSink::tool_call_started(
+        &sink,
+        "call-1",
+        "forge_scope_read",
+        &["operation".to_owned()],
+        &argument_preview,
+    )
+    .await;
+    let mut summary = api_types::ToolResultSummary::unclassified(false, "call-1");
+    summary.operation = Some("skill.section".to_owned());
+    forge_agent_host::TurnEventSink::tool_call_finished(
+        &sink,
+        "call-1",
+        "forge_scope_read",
+        false,
+        &summary,
+    )
+    .await;
+    forge_agent_host::TurnEventSink::text_delta(&sink, "Reading the operating skill.").await;
+
+    let page: serde_json::Value = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &logs_uri,
+        &token,
+        StatusCode::OK,
+    )
+    .await;
+    let items = page["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 3);
+    assert_eq!(items[0]["kind"], "tool_call");
+    assert_eq!(items[0]["execution_id"], turn.id);
+    assert_eq!(items[0]["payload"]["name"], "forge_scope_read");
+    assert_eq!(items[0]["payload"]["input"], json!({"operation": "read"}));
+    assert_eq!(items[1]["kind"], "tool_result");
+    assert_eq!(items[1]["payload"]["summary"]["operation"], "skill.section");
+    assert_eq!(items[2]["kind"], "assistant_delta");
+    assert_eq!(page["has_more"], false);
+    assert_eq!(page["next_sequence"], 3);
+
+    // Keyset paging matches `/executions/{id}/logs`.
+    let first: serde_json::Value = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("{logs_uri}?limit=1"),
+        &token,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(first["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(first["has_more"], true);
+    assert_eq!(first["next_sequence"], 1);
+    let rest: serde_json::Value = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("{logs_uri}?from_sequence=2"),
+        &token,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(rest["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(rest["items"][0]["sequence"], 2);
+
+    // A turn id is only readable through its own chat, and only by its owner.
+    let _missing: ErrorResponse = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!(
+            "/api/v1/agent-chats/{}/turns/not-a-turn/logs",
+            binding.chat_id
+        ),
+        &token,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(&logs_uri)
+                .body(Body::empty())
+                .expect("build unauthenticated request"),
+        )
+        .await
+        .expect("router response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}

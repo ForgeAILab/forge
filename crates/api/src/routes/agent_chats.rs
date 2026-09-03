@@ -38,7 +38,10 @@ use services::{
 
 use crate::{
     errors::{ApiError, ApiResult},
-    routes::auth::AuthenticatedUser,
+    routes::{
+        auth::AuthenticatedUser,
+        executions::{read_log_page, LogsQuery},
+    },
     state::AppState,
 };
 
@@ -259,6 +262,30 @@ pub async fn list_agent_chat_turns(
         .await?;
     let jobs = AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&*state.db, &chat_id).await?;
     Ok(Json(jobs.into_iter().map(turn_response).collect()))
+}
+
+/// One page of a turn's durable activity log: the reasoning, tool calls
+/// with their bounded results, and reply deltas the runtime emitted while the
+/// turn ran, in the same Forge JSONL log shape as `/executions/{id}/logs`.
+/// A turn that has not started yet has no log and reads as an empty page.
+pub async fn get_agent_chat_turn_logs(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path((chat_id, turn_id)): Path<(String, String)>,
+    Query(params): Query<LogsQuery>,
+) -> ApiResult<Json<Value>> {
+    state
+        .agent_chat_service
+        .get_authorized_chat(&user.user_id, &chat_id)
+        .await?;
+    let job = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*state.db, &turn_id)
+        .await?
+        .filter(|job| job.chat_id == chat_id)
+        .ok_or_else(|| ApiError::not_found("agent_chat_turn", turn_id.clone()))?;
+    let page = read_log_page(&state.agent_chat_turn_logs.path_for(&job.id), &params).await?;
+    Ok(Json(page.unwrap_or_else(
+        || json!({"items": [], "has_more": false, "next_sequence": null}),
+    )))
 }
 
 pub async fn cancel_agent_chat_turn(

@@ -673,5 +673,47 @@ async fn v087_backfill_is_truthful_and_role_specific() {
         "completed checkpoints must retain completed_at"
     );
 
+    // V126 introduces `repository_scaffolded`. Operations that predate it are
+    // backfilled `skipped` (with a completion time) so ready verification
+    // keeps treating them as complete, and the ready operation stays ready.
+    let scaffolded = sqlx::query(
+        "SELECT c.status, c.details_json, c.completed_at, o.status AS operation_status
+           FROM project_provisioning_checkpoint c
+           JOIN project_provisioning_operation o ON o.id = c.operation_id
+          WHERE o.project_id = 'project-ready' AND c.checkpoint = 'repository_scaffolded'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("V126 backfilled the scaffold checkpoint");
+    assert_eq!(
+        scaffolded.try_get::<String, _>("status").unwrap(),
+        "skipped"
+    );
+    assert_eq!(
+        scaffolded.try_get::<String, _>("operation_status").unwrap(),
+        "ready"
+    );
+    assert!(scaffolded
+        .try_get::<Option<String>, _>("completed_at")
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            &scaffolded.try_get::<String, _>("details_json").unwrap()
+        )
+        .unwrap()["reason"],
+        "predates_scaffold"
+    );
+    let backfilled: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM project_provisioning_operation o
+          WHERE NOT EXISTS (
+              SELECT 1 FROM project_provisioning_checkpoint c
+               WHERE c.operation_id = o.id AND c.checkpoint = 'repository_scaffolded')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("backfill coverage counts");
+    assert_eq!(backfilled, 0, "every operation carries the new checkpoint");
+
     fs::remove_dir_all(dir).expect("migration directory cleans");
 }

@@ -295,3 +295,114 @@ async fn transition_to_review_runs_configured_review_runner() {
         Some(ReviewStatus::Passed)
     );
 }
+
+#[tokio::test]
+async fn is_awaiting_human_stays_false_while_review_entry_barrier_is_running() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "review".to_owned()).await;
+    let now = now_rfc3339();
+    let execution = ExecutionRepo::create(
+        &*db,
+        db::CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent_id),
+            role: default_roles::CODER.to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("completed coder execution creates");
+    ReviewRepo::create(
+        &*db,
+        db::CreateReview {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            execution_id: execution.id,
+            attempt_number: 1,
+            status: ReviewStatus::AwaitingHuman,
+            step_results_json: json!({ "ci_steps": [] }).to_string(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("awaiting_human review creates");
+
+    assert!(
+        service
+            .is_awaiting_human(task.id.clone())
+            .await
+            .expect("awaiting human resolves"),
+        "a settled review gate with an awaiting_human review is ready for a decision"
+    );
+
+    // Mirror the engine: a transition into review is persisted behind a running
+    // entry barrier while the blocking before_enter hooks execute, and the
+    // review record can already read awaiting_human before that barrier clears.
+    let running = TaskRepo::set_entry_barrier(
+        &*db,
+        &task.id,
+        task.version,
+        Some(
+            json!({
+                "state": "review",
+                "status": "running",
+                "started_at": now,
+            })
+            .to_string(),
+        ),
+        &now_rfc3339(),
+    )
+    .await
+    .expect("running entry barrier sets");
+    assert!(
+        !service
+            .is_task_awaiting_human(&running)
+            .await
+            .expect("awaiting human resolves"),
+        "the gate is not ready for a decision while its entry barrier is still running"
+    );
+
+    let cleared =
+        TaskRepo::set_entry_barrier(&*db, &task.id, running.version, None, &now_rfc3339())
+            .await
+            .expect("entry barrier clears");
+    assert_eq!(cleared.version, running.version + 1);
+    assert!(
+        !service
+            .is_task_awaiting_human(&running)
+            .await
+            .expect("stale snapshot readiness resolves"),
+        "a stale running-barrier snapshot must not be paired with readiness from a newer version"
+    );
+    assert!(
+        service
+            .is_task_awaiting_human(&cleared)
+            .await
+            .expect("awaiting human resolves"),
+        "the gate becomes ready once the entry barrier has cleared"
+    );
+}

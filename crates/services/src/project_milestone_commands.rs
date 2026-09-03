@@ -1904,6 +1904,7 @@ fn project_from_value(value: &Value) -> Result<Project> {
         workflow_template_name: optional_value_string(value, "workflow_template_name")?,
         primary_repo_id: optional_value_string(value, "primary_repo_id")?,
         paused_at: optional_value_string(value, "paused_at")?,
+        system_pause_reason: optional_value_string(value, "system_pause_reason")?,
         owner_id: optional_value_string(value, "owner_id")?,
         project_hooks_json: required_value(value, "project_hooks_json")?,
         project_work_epoch: required_value_i64(value, "project_work_epoch")?,

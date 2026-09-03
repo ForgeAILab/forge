@@ -485,6 +485,210 @@ async fn build_dispatcher(
     )
 }
 
+/// A bare Project with no repository, as it looks before provisioning
+/// attaches one — the shape `dispatcher_pauses_a_project_with_no_repository`
+/// and its neighbors exercise.
+async fn seed_unprovisioned_project(db: &db::SqliteDb, name: &str) -> String {
+    let now = now_rfc3339();
+    let project_id = new_uuid_v4();
+    ProjectRepo::create(
+        db,
+        CreateProject {
+            id: project_id.clone(),
+            name: name.to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("project creates");
+    project_id
+}
+
+#[tokio::test]
+async fn dispatcher_pauses_a_project_with_no_primary_repository() {
+    let db = Arc::new(sqlite_db().await);
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let project_id = seed_unprovisioned_project(&db, "Unprovisioned").await;
+    let (dispatcher, _rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    dispatcher.check_once().await.expect("dispatcher runs");
+
+    let project = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists");
+    assert!(project.paused_at.is_some());
+    assert_eq!(
+        project.system_pause_reason.as_deref(),
+        Some(super::repo_pause_sync::MISSING_REPOSITORY)
+    );
+}
+
+#[tokio::test]
+async fn dispatcher_resumes_a_project_it_paused_once_its_repository_is_attached() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let project_id = seed_unprovisioned_project(&db, "Unprovisioned").await;
+    let (dispatcher, _rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+    dispatcher.check_once().await.expect("dispatcher runs");
+    let paused = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists");
+    assert!(paused.paused_at.is_some());
+
+    // Provisioning succeeds later and attaches the repository, the way a
+    // retried scaffold does.
+    setup_git_repo(repo_dir.path());
+    let repo_id = new_uuid_v4();
+    RepoRepo::create(
+        &*db,
+        CreateRepo {
+            id: repo_id.clone(),
+            project_id: project_id.clone(),
+            name: "forge".to_owned(),
+            remote_url: repo_dir.path().to_string_lossy().into_owned(),
+            local_path: Some(repo_dir.path().to_string_lossy().into_owned()),
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("repo creates");
+    ProjectRepo::update(
+        &*db,
+        UpdateProject {
+            id: project_id.clone(),
+            name: None,
+            settings: None,
+            primary_repo_id: Some(Some(repo_id)),
+            paused_at: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("project repository attaches");
+
+    dispatcher.check_once().await.expect("dispatcher runs");
+
+    let resumed = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists");
+    assert!(resumed.paused_at.is_none());
+    assert!(resumed.system_pause_reason.is_none());
+}
+
+#[tokio::test]
+async fn dispatcher_leaves_a_deliberately_paused_project_alone() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let project_id = seed_unprovisioned_project(&db, "Manually paused").await;
+    // A user pause carries no system reason, exactly like the real
+    // `POST /projects/{id}/pause` route.
+    let paused_at = now_rfc3339();
+    ProjectRepo::set_paused_at(&*db, &project_id, Some(paused_at.clone()))
+        .await
+        .expect("manual pause sets paused_at");
+    let (dispatcher, _rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    dispatcher.check_once().await.expect("dispatcher runs");
+
+    let still_paused = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists");
+    assert_eq!(still_paused.paused_at.as_deref(), Some(paused_at.as_str()));
+    assert!(still_paused.system_pause_reason.is_none());
+
+    // Attaching a repository must not auto-resume a pause the dispatcher
+    // never issued.
+    let repo_id = seed_project_repo(&db, repo_dir.path()).await.1;
+    ProjectRepo::update(
+        &*db,
+        UpdateProject {
+            id: project_id.clone(),
+            name: None,
+            settings: None,
+            primary_repo_id: Some(Some(repo_id)),
+            paused_at: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("project repository attaches");
+
+    dispatcher.check_once().await.expect("dispatcher runs");
+
+    let untouched = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists");
+    assert_eq!(untouched.paused_at.as_deref(), Some(paused_at.as_str()));
+}
+
+#[tokio::test]
+async fn dispatcher_gives_unassigned_initial_tasks_the_project_defaults() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    // Already released to `todo` but never assigned: exactly the shape a Task
+    // proposed before provisioning has once it leaves backlog.
+    let task = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        "released but unassigned",
+        "todo",
+        1,
+    )
+    .await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Offline, AgentStatus::Idle).await;
+    ProjectRepo::update(
+        &*db,
+        UpdateProject {
+            id: project_id.clone(),
+            name: None,
+            settings: Some(
+                serde_json::json!({
+                    "default_role_assignments": [
+                        { "role_name": "coder", "assignee_type": "agent", "assignee_id": agent_id }
+                    ]
+                })
+                .to_string(),
+            ),
+            primary_repo_id: None,
+            paused_at: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("project defaults update");
+    let (dispatcher, _rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    dispatcher.check_once().await.expect("dispatcher runs");
+
+    let coder = TaskRoleAssignmentRepo::get_by_task_and_role(
+        &*db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+    )
+    .await
+    .expect("assignment loads")
+    .expect("unassigned Task received the Project's default coder");
+    assert_eq!(coder.assignee_id.as_deref(), Some(agent_id.as_str()));
+}
+
 #[tokio::test]
 async fn dispatcher_check_once_does_not_dispatch_after_stop() {
     let db = Arc::new(sqlite_db().await);

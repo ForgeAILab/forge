@@ -1,13 +1,15 @@
-import { Fragment, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import {
   ArrowDown,
   ArrowUpRight,
+  BellRinging,
   CaretDown,
   Check,
   CheckCircle,
   ChatCircleDots,
   CircleNotch,
   Copy,
+  Lightning,
   PaperPlaneTilt,
   WarningCircle,
   XCircle,
@@ -20,7 +22,15 @@ import { ErrorPanel, EmptyPanel, LoadingPanel } from '@/features/federation/comp
 import { ChatMarkdown } from '@/components/chat/chat-markdown'
 import { LoadingState } from '@/components/chat/loading-state'
 import {
+  activitySummaryLabel,
+  currentActivityLabel,
+  summarizeTurnActivity,
+  TurnActivityFeed,
+  turnActivityEntries,
+} from '@/components/chat/turn-activity-feed'
+import {
   useAgentChatMessagesQuery,
+  useAgentChatTurnLogsQuery,
   useAgentChatTurnsQuery,
   useAgentHandoffsForProjectsQuery,
 } from '@/features/agent-chat/hooks'
@@ -49,6 +59,9 @@ const EMPTY_PENDING_TURNS: AgentChatTurn[] = []
 /** Gap between two messages after which the timeline shows a session divider. */
 const SESSION_GAP_MS = 2 * 60 * 60 * 1000
 
+/** How many of the newest agent replies load their activity summary eagerly. */
+const RECENT_ACTIVITY_PREFETCH = 3
+
 export type ChatCommand = {
   name: string
   description: string
@@ -74,13 +87,25 @@ function formatDuration(ms: bigint | number | null | undefined): string | null {
   return `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)}s`
 }
 
-function parseTokenUsage(json: Record<string, unknown> | null): string | null {
+/**
+ * "77,535 in · 61,440 cached · 898 out": the cached share is part of the
+ * input count, shown because it is what makes a long turn cheap.
+ */
+export function parseTokenUsage(json: Record<string, unknown> | null): string | null {
   if (!json) return null
   const input = json.input
   const output = json.output
   if (typeof input !== 'number' && typeof output !== 'number') return null
+  const cacheRead = json.cache_read
+  const cacheWrite = json.cache_write
   const parts: string[] = []
   if (typeof input === 'number') parts.push(`${input.toLocaleString()} in`)
+  if (typeof cacheRead === 'number' && cacheRead > 0) {
+    parts.push(`${cacheRead.toLocaleString()} cached`)
+  }
+  if (typeof cacheWrite === 'number' && cacheWrite > 0) {
+    parts.push(`${cacheWrite.toLocaleString()} cache write`)
+  }
   if (typeof output === 'number') parts.push(`${output.toLocaleString()} out`)
   return parts.join(' · ')
 }
@@ -205,16 +230,87 @@ function UserMessage({ message, handoff }: { message: AgentChatMessage; handoff?
   )
 }
 
+/**
+ * What the Agent did to produce a reply: the turn's recorded tool calls and
+ * reasoning, collapsed under the message. Recent turns are loaded eagerly so
+ * their summary reads at a glance; older ones load when opened.
+ */
+function TurnActivityDisclosure({
+  chatId,
+  turnId,
+  prefetch,
+}: {
+  chatId: string
+  turnId: string
+  prefetch: boolean
+}) {
+  const [open, setOpen] = useState(false)
+  const logsQuery = useAgentChatTurnLogsQuery(chatId, turnId, {
+    live: false,
+    enabled: open || prefetch,
+  })
+  const entries = useMemo(
+    () => turnActivityEntries(logsQuery.data ?? [], { includeReply: false }),
+    [logsQuery.data],
+  )
+  const summary = summarizeTurnActivity(entries)
+  const summaryLabel = activitySummaryLabel(summary)
+  const loaded = logsQuery.data !== undefined
+
+  if (loaded && entries.length === 0 && !open) return null
+
+  return (
+    <div className="mb-2 min-w-0">
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-label="Toggle agent activity"
+        onClick={() => setOpen((current) => !current)}
+        className="inline-flex max-w-full items-center gap-1.5 rounded-md px-1 py-0.5 text-micro text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <Lightning size={12} aria-hidden />
+        <span className="truncate">{loaded && summaryLabel ? summaryLabel : 'Show activity'}</span>
+        <CaretDown
+          size={11}
+          className={cn('transition-transform', open ? 'rotate-0' : '-rotate-90')}
+          aria-hidden
+        />
+      </button>
+      {open ? (
+        <div className="ml-1 mt-1 border-l border-border-subtle pl-2">
+          {logsQuery.isLoading ? (
+            <span className="px-1.5 text-xs text-muted-foreground">Loading activity…</span>
+          ) : logsQuery.isError ? (
+            <span className="px-1.5 text-xs text-destructive" role="alert">
+              The activity for this turn could not be loaded.
+            </span>
+          ) : entries.length === 0 ? (
+            <span className="px-1.5 text-xs text-muted-foreground">
+              No activity was recorded for this turn.
+            </span>
+          ) : (
+            <TurnActivityFeed entries={entries} />
+          )}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 function AgentMessage({
   message,
   agentName,
   chat,
   handoff,
+  turn,
+  prefetchActivity = false,
 }: {
   message: AgentChatMessage
   agentName?: string
   chat: AgentChat
   handoff?: AgentHandoff
+  turn?: AgentChatTurn
+  prefetchActivity?: boolean
 }) {
   const duration = formatDuration(message.duration_ms)
   const tokens = parseTokenUsage(message.token_usage_json)
@@ -230,6 +326,9 @@ function AgentMessage({
           <ArrowUpRight size={11} aria-hidden />
           Handoff from Main Agent
         </p>
+      ) : null}
+      {turn ? (
+        <TurnActivityDisclosure chatId={chat.id} turnId={turn.id} prefetch={prefetchActivity} />
       ) : null}
       <div className="prose prose-sm max-w-none break-words dark:prose-invert">
         <ChatMarkdown text={message.content} />
@@ -294,25 +393,92 @@ function SystemMessage({ message }: { message: AgentChatMessage }) {
   )
 }
 
+const WAKE_HEADING = /^###\s*Attention wake:\s*(.*)$/m
+
+/**
+ * The wake prompt's one-line summary and the work order under it. The prompt
+ * opens with a `### Attention wake: <summary>` heading; a prompt without one
+ * keeps its whole content as the body.
+ */
+export function parseWakePrompt(content: string): { summary: string; body: string } {
+  const match = WAKE_HEADING.exec(content)
+  if (!match) return { summary: 'Attention wake', body: content.trim() }
+  const summary = match[1].trim() || 'Attention wake'
+  const body = (content.slice(0, match.index) + content.slice(match.index + match[0].length)).trim()
+  return { summary, body }
+}
+
+/**
+ * A wake that Forge admitted on the Agent's behalf: the incident summary at
+ * a glance, with the full work order the Agent received behind a toggle.
+ */
+function WakeMessage({ message }: { message: AgentChatMessage }) {
+  const [open, setOpen] = useState(false)
+  const { summary, body } = parseWakePrompt(message.content)
+
+  return (
+    <article
+      aria-label={`Forge wake ${toNumber(message.sequence)}`}
+      className="flex min-w-0 flex-col items-center gap-1.5 px-4"
+    >
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+        className="inline-flex min-w-0 max-w-xl items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <BellRinging size={13} className="shrink-0" aria-hidden />
+        <span className="min-w-0 truncate">
+          <span className="font-medium text-foreground/80">Attention wake</span>
+          <span aria-hidden> · </span>
+          {summary}
+        </span>
+        <CaretDown
+          size={11}
+          className={cn('shrink-0 transition-transform', open ? 'rotate-0' : '-rotate-90')}
+          aria-hidden
+        />
+      </button>
+      {open ? (
+        <div className="w-full max-w-xl rounded-lg border border-border-subtle bg-muted/30 px-3 py-2 text-left">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-micro font-medium uppercase tracking-[0.08em] text-muted-foreground/80">
+              Prompt the Agent received
+            </span>
+            <CopyButton text={message.content} />
+          </div>
+          <p className="mt-1 whitespace-pre-wrap break-words text-xs leading-5 text-muted-foreground">
+            {body || message.content}
+          </p>
+        </div>
+      ) : null}
+    </article>
+  )
+}
+
 /**
  * A finite turn rendered as its own agent-side timeline entry — never inside
  * the user message that admitted it. Live turns show a compact expandable
  * activity row; terminal turns show a clear outcome with a visible retry.
  */
 function TurnActivity({
+  chatId,
   turn,
   inputContent,
   onCancel,
   canceling,
   onRetry,
   canRetry,
+  onActivityChange,
 }: {
+  chatId: string
   turn: AgentChatTurn
   inputContent: string
   onCancel?: (turn: AgentChatTurn) => Promise<void>
   canceling?: boolean
   onRetry: (content: string) => Promise<void>
   canRetry: boolean
+  onActivityChange?: () => void
 }) {
   const [open, setOpen] = useState(false)
   const [retrying, setRetrying] = useState(false)
@@ -320,6 +486,23 @@ function TurnActivity({
   const state = normalizeTurnState(turn.status)
   const attemptCount = toNumber(turn.attempt_count)
   const maxAttempts = toNumber(turn.max_attempts)
+  const live = isLiveTurn(turn)
+  // The turn's durable activity log: reasoning, tool calls and their bounded
+  // results, and the reply as it streams. Followed while the turn is live so
+  // the timeline shows what the Agent is doing, not just that it is busy.
+  const logsQuery = useAgentChatTurnLogsQuery(chatId, turn.id, { live })
+  const entries = useMemo(
+    () => turnActivityEntries(logsQuery.data ?? [], { includeReply: true }),
+    [logsQuery.data],
+  )
+  const entryCount = entries.length
+  const lastEntry = entries[entries.length - 1]
+  const activityKey = lastEntry
+    ? `${entryCount}:${lastEntry.kind}:${lastEntry.kind === 'assistant' || lastEntry.kind === 'thinking' ? lastEntry.text.length : lastEntry.status ?? ''}`
+    : '0'
+  useEffect(() => {
+    onActivityChange?.()
+  }, [activityKey, onActivityChange])
 
   async function retry() {
     setRetryError(null)
@@ -360,6 +543,9 @@ function TurnActivity({
             {failed ? 'Turn failed' : 'Cancelled'}
           </span>
         </div>
+        {entries.length > 0 ? (
+          <TurnActivityFeed entries={entries} className="mt-2" />
+        ) : null}
         {turn.error ? (
           <p className="mt-1.5 break-words text-xs leading-5 text-muted-foreground">{turn.error}</p>
         ) : null}
@@ -418,7 +604,12 @@ function TurnActivity({
           onClick={() => setOpen((current) => !current)}
           className="flex items-center gap-2 rounded-lg px-1.5 py-1 transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
-          <LoadingState compact label={turnLabel(state)} status={state} startedAt={turn.created_at} />
+          <LoadingState
+            compact
+            label={currentActivityLabel(entries) ?? turnLabel(state)}
+            status={state}
+            startedAt={turn.created_at}
+          />
           <CaretDown
             size={12}
             className={cn(
@@ -451,6 +642,9 @@ function TurnActivity({
             </span>
           ))}
         </div>
+      ) : null}
+      {entries.length > 0 ? (
+        <TurnActivityFeed entries={entries} live className="mt-1.5 max-w-3xl" />
       ) : null}
     </div>
   )
@@ -695,6 +889,10 @@ export function AgentChatTimeline({
   const [retrying, setRetrying] = useState(false)
   const [cancelingTurnId, setCancelingTurnId] = useState<string | null>(null)
   const [cancelError, setCancelError] = useState<string | null>(null)
+  // Bumped whenever a live turn's activity feed grows, so auto-scroll keeps
+  // following the Agent's work and not only whole messages.
+  const [activityVersion, setActivityVersion] = useState(0)
+  const bumpActivity = useCallback(() => setActivityVersion((current) => current + 1), [])
   const messages = useMemo(
     () =>
       [...(messagesQuery.data?.items ?? [])].sort(
@@ -737,6 +935,25 @@ export function AgentChatTimeline({
   const orphanTurns = useMemo(
     () => visibleTurns.filter((turn) => !messageIds.has(turn.input_message_id)),
     [messageIds, visibleTurns],
+  )
+  // The turn that produced each agent message, so its recorded activity can
+  // sit with the reply it led to.
+  const turnByResponseMessage = useMemo(() => {
+    const byMessage = new Map<string, AgentChatTurn>()
+    for (const turn of turns) {
+      if (turn.response_message_id) byMessage.set(turn.response_message_id, turn)
+    }
+    return byMessage
+  }, [turns])
+  const recentAgentMessageIds = useMemo(
+    () =>
+      new Set(
+        messages
+          .filter((message) => message.author_type === 'agent')
+          .slice(-RECENT_ACTIVITY_PREFETCH)
+          .map((message) => message.id),
+      ),
+    [messages],
   )
   const canRetry = chat.status === 'ready' && !turnInFlight && !retrying
 
@@ -784,7 +1001,7 @@ export function AgentChatTimeline({
   useEffect(() => {
     if (!autoScroll) return
     endRef.current?.scrollIntoView?.({ block: 'end' })
-  }, [autoScroll, messages.length, turns.length])
+  }, [autoScroll, messages.length, turns.length, activityVersion])
 
   if (messagesQuery.isLoading) return <LoadingPanel label="Loading chat timeline" />
   if (messagesQuery.isError) {
@@ -801,12 +1018,14 @@ export function AgentChatTimeline({
     return (
       <TurnActivity
         key={turn.id}
+        chatId={chat.id}
         turn={turn}
         inputContent={inputContent}
         onCancel={onCancelTurn && isLiveTurn(turn) ? cancelTurn : undefined}
         canceling={cancelingTurnId === turn.id}
         onRetry={retrySend}
         canRetry={canRetry && !cancelingTurnId}
+        onActivityChange={bumpActivity}
       />
     )
   }
@@ -855,6 +1074,10 @@ export function AgentChatTimeline({
                 // as a timeline separator rather than a chat bubble so a
                 // fresh topic reads as a context break, not more chatter.
                 <TimelineDivider label={message.content} />
+              ) : message.outcome === 'attention_wake' ? (
+                // A wake prompt is a full work order; the timeline shows its
+                // summary line and keeps the prompt behind a toggle.
+                <WakeMessage message={message} />
               ) : message.author_type === 'system' ? (
                 <SystemMessage message={message} />
               ) : (
@@ -863,6 +1086,8 @@ export function AgentChatTimeline({
                   agentName={agentName}
                   chat={chat}
                   handoff={handoffFor(message)}
+                  turn={turnByResponseMessage.get(message.id)}
+                  prefetchActivity={recentAgentMessageIds.has(message.id)}
                 />
               )}
               {(turnsByMessage.get(message.id) ?? []).map((turn) =>

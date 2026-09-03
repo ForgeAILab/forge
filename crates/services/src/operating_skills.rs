@@ -32,7 +32,7 @@ pub const MAIN_OPERATING_SKILL_POLICY_JSON: &str =
 pub const MAIN_OPERATING_SKILL_POLICY_DIGEST: &str =
     "9dc9e64f97e693c2dd384a5d60aede819aac52f95fc30fea1f56ac7b7b1075a8";
 pub const MAIN_OPERATING_SKILL_CONTENT_DIGEST: &str =
-    "91e84ce9663dfee33c30de8b752a24f6fe96b0e43e2867a9bd819e573cb0461c";
+    "e7c86568049d54ed42e2f09a9cbaceee77e69f4b043546bb975a3679d43ded11";
 
 /// The baseline skill is compiled into the server and rendered fresh each
 /// turn, so unlike the two seeded skills it has no database row to validate
@@ -660,6 +660,7 @@ A small Project is ready for Charter approval when all of the following are cohe
 - initial in-scope outcome(s) and at least one explicit non-goal;
 - a success signal or acceptance statement;
 - material constraints, risks, or a statement that none are known;
+- for a web product, the repository scaffold (spark template and pack set), or an explicit decision to start without one;
 - unresolved assumptions and research explicitly queued rather than hidden.
 For production or critical maturity, also resolve or queue data sensitivity, integrations, security/compliance, operations, migration, failure/recovery, and launch constraints.
 
@@ -675,8 +676,15 @@ RESEARCH
 - Do not use authenticated browser state, credentials, private accounts, or cross-Project data unless a separate explicit user-authorized mechanism permits it.
 - Stop when the decision is sufficiently informed. Put deeper research, experiments, repository inspection, and evidence-producing work into the Project research queue for the Project Agent.
 
+SCAFFOLD
+- Forge can stand the Project repository up from a spark scaffold before the first Task runs, so a web product (site, SaaS, dashboard, internal tool) settles its scaffold as one user decision before the readiness gate: propose one template and the smallest pack set the in-scope outcomes need, with a one-line rationale, ask once, and record the answer in the Charter `scaffold` block (`template`, `packs`). An empty pack list is valid.
+- Templates: `nextjs` (Next.js App Router; server-rendered apps, SaaS, dashboards) and `vite-react` (Vite + React single-page app; static or Cloudflare Workers deploys).
+- Packs, at most one per exclusive capability: db (`db-sqlite`, `db-postgres`, `db-supabase`), auth (`auth-better-auth`, `auth-better-auth-pg`, `auth-supabase`), payments (`payments-stripe`), ui (`ui-shadcn`), sync (`sync-zero`); freely combinable: `api-trpc`, `email-resend`, `analytics-posthog`, `storage-s3`, `ai-anthropic`, `ai-openai`, `admin-dashboard`, `docker-compose-dev`, `testing-playwright`, `deploy-vercel`, `deploy-cloudflare`. Pair packs with the chosen db (for example `auth-better-auth-pg` with `db-postgres`). This catalog matches the create-spark version Forge pins; an id outside it fails at provisioning with a typed, retryable error.
+- Leave `scaffold` absent when the product is not a web application (a CLI, a library, a service in another language) or when the user brings an existing repository; describe the intended stack under technology constraints instead.
+- The scaffold is a material technology constraint. Once the Charter is approved it changes only through a Charter amendment, never through a Project Agent default.
+
 CHARTER OUTPUT
-Maintain a typed Project Charter draft with identity, problem and people, core experience, initial scope, definition of success, constraints and risks, an epistemic knowledge ledger, and provenance/change summary. The ledger contains observed facts, user decisions, research findings, assumptions, hypotheses, open decisions, and a research queue. Save changes as a new immutable draft revision; do not overwrite an earlier revision.
+Maintain a typed Project Charter draft with identity, problem and people, core experience, initial scope, definition of success, constraints and risks, the scaffold block when one was settled, an epistemic knowledge ledger, and provenance/change summary. The ledger contains observed facts, user decisions, research findings, assumptions, hypotheses, open decisions, and a research queue. Save changes as a new immutable draft revision; do not overwrite an earlier revision.
 
 TURN RESPONSE
 Talk with the user like a thoughtful product partner, not a form. A normal discovery turn is short conversational prose: react to what the user just said, reflect the one or two things it settles, then ask at most two focused questions that move discovery forward. Do not structure normal turns with headers, section lists, or status scaffolds, and never paste the Charter draft or its sections into chat while discovery is ongoing.
@@ -837,6 +845,7 @@ const PROJECT_SKILL_SECTION_TASKS: &str = r#"TASK ORCHESTRATION
 - Every implementation Task must change the repository: its completion contract requires a commit on the Task branch, and a run that completes with nothing committed fails and burns the retry budget. Never create a Task to verify, validate, or gather evidence for delivered work — integrated verification and evidence capture are your own work in your Project workspace (see the milestones section). When verification finds a defect, create the implementation Task that fixes it, not one that re-checks it.
 - Link every Task immutably to its governing Charter revision and, when present, the relevant milestone and artifact revisions. Avoid duplication; use idempotency and inspect current Project work first.
 - Repository-capable implementation Tasks may become runnable immediately after Charter-backed Project creation and repository setup. Forge issues Task-scoped WorkspaceLeases only to the exact role assignment for that execution.
+- When the approved Charter carries a `scaffold` block, Genesis provisioning already stood the repository up from that spark template and pack set (the first commit holds `spark.config.json`, `AGENTS.md`, `.claude/skills/`, and the Charter exported to `docs/spark/project.md`). That is the stack: brief Tasks to build on it, never to re-scaffold or swap it. A different template or pack set is a material technology change and needs a Charter amendment first.
 - You may split, sequence, replace, reassign, or retry Tasks without new approval while preserving the Chartered outcome and origin provenance. Material Charter changes and irreversible external actions retain their applicable user approval.
 - Delegate repository work to Task Workers. Use agent review, no review, or human-required review as configured by the Task workflow. Any enabled configured Agent—including this Project Agent—may fill Worker or reviewer roles, and the Project Agent may decide a human-required Task review through `task.review`.
 - Task Workers and reviewers append worklog entries as they work, and each entry carries the execution and role that wrote it. Read them as the account of what a run did and hand that account forward; they are narration, never workflow truth.
@@ -1127,6 +1136,8 @@ mod tests {
         const V125_MIGRATION: &str = include_str!(
             "../../db/migrations/V125__validation_cites_the_agents_own_observations.sql"
         );
+        const V126_MIGRATION: &str =
+            include_str!("../../db/migrations/V126__spark_scaffold_at_genesis.sql");
         const V106_MIGRATION: &str =
             include_str!("../../db/migrations/V106__charter_execution_and_agent_availability.sql");
 
@@ -1149,8 +1160,8 @@ mod tests {
             hex::encode(Sha256::digest(value.as_bytes()))
         }
 
-        let main_revision_id = "forge.main.project-discovery/v2@4";
-        let seeded_main = seeded_body(V106_MIGRATION, "Forge Main Agent");
+        let main_revision_id = "forge.main.project-discovery/v2@5";
+        let seeded_main = seeded_body(V126_MIGRATION, "Forge Main Agent");
         assert_eq!(
             seeded_main,
             canonical_main_operating_skill_body(),

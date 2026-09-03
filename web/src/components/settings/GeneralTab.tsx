@@ -21,6 +21,7 @@ interface GeneralTabProps {
   isSaving: boolean
   paused: boolean
   pausedAt?: string | null
+  systemPauseReason?: string | null
   pausePending: boolean
   name: string
   ciSteps: string[]
@@ -47,6 +48,7 @@ export function GeneralTab({
   isSaving,
   paused,
   pausedAt,
+  systemPauseReason,
   pausePending,
   name,
   ciSteps,
@@ -124,6 +126,12 @@ export function GeneralTab({
                 </span>
               ) : null}
             </div>
+            {paused && systemPauseReason === 'missing_repository' ? (
+              <p className="mt-2 max-w-md text-xs leading-5 text-muted-foreground">
+                Paused automatically: this Project has no repository yet. It resumes on its own
+                once one is attached; resuming it here will not let Tasks run without one.
+              </p>
+            ) : null}
           </SettingsSection>
           <SettingsSection
             title="CI steps"

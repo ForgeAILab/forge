@@ -1,4 +1,5 @@
 import { apiFetch } from '@/api/client'
+import type { LogEntry } from '@/types/generated'
 import type { AgentChatDetailResponse } from '@/types/generated/bindings/AgentChatDetailResponse'
 import type { AgentChatMessageListResponse } from '@/types/generated/bindings/AgentChatMessageListResponse'
 import type { AgentChatTurnJobResponse } from '@/types/generated/bindings/AgentChatTurnJobResponse'
@@ -24,6 +25,7 @@ export const agentChatApiPaths = {
   messages: (chatId: string) => `/agent-chats/${chatId}/messages`,
   turns: (chatId: string) => `/agent-chats/${chatId}/turns`,
   cancelTurn: (chatId: string, turnId: string) => `/agent-chats/${chatId}/turns/${turnId}/cancel`,
+  turnLogs: (chatId: string, turnId: string) => `/agent-chats/${chatId}/turns/${turnId}/logs`,
   handoffs: (projectId: string) => `/projects/${projectId}/agent-handoffs`,
   handoff: (projectId: string, handoffId: string) =>
     `/projects/${projectId}/agent-handoffs/${handoffId}`,
@@ -79,6 +81,41 @@ export function cancelAgentChatTurn(
     method: 'POST',
     body: JSON.stringify(input),
   })
+}
+
+export type AgentChatTurnLogsParams = {
+  from_sequence?: number
+  limit?: number
+  tail?: number
+}
+
+/** One keyset page of a turn's durable activity log (same shape as execution logs). */
+export type AgentChatTurnLogsPage = {
+  items: LogEntry[]
+  has_more: boolean
+  next_sequence: number | null
+}
+
+export async function listAgentChatTurnLogs(
+  chatId: string,
+  turnId: string,
+  params?: AgentChatTurnLogsParams,
+): Promise<AgentChatTurnLogsPage> {
+  const page = await apiFetch<Partial<AgentChatTurnLogsPage> | undefined>(
+    agentChatApiPaths.turnLogs(chatId, turnId),
+    {
+      search: {
+        from_sequence: params?.from_sequence,
+        limit: params?.limit,
+        tail: params?.tail,
+      },
+    },
+  )
+  return {
+    items: page?.items ?? [],
+    has_more: page?.has_more ?? false,
+    next_sequence: page?.next_sequence ?? null,
+  }
 }
 
 export function listAgentHandoffs(

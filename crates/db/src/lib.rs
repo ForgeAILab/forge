@@ -42,6 +42,7 @@ pub use repository::{
     AgentTokenBreakdown, CiStepStats, ExecutionUsageRepo, ExternalLinkRepo, IntegrationRepo,
     ModelTokenBreakdown, OAuthAuthorizationCodeRepo, OAuthClientRepo, OAuthRefreshTokenRepo,
     PersonalAccessTokenRepo, ProjectAnalyticsRepo, ProjectMemberRepo, ProjectReviewSummary,
-    ProjectTokenStats, RefreshTokenRepo, SystemSettingRepo, TaskRoleAssignmentRepo,
-    TaskUsageSummary, TerminalSessionRepo, TransitionLogRepo, UpsertExecutionUsage, UserRepo,
+    ProjectTokenStats, RefreshTokenRepo, SurfaceTokenBreakdown, SystemSettingRepo,
+    TaskRoleAssignmentRepo, TaskUsageSummary, TerminalSessionRepo, TransitionLogRepo,
+    UpsertExecutionUsage, UserRepo,
 };

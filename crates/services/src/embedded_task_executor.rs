@@ -13,17 +13,16 @@ use std::{
     sync::{Arc, Mutex as StdMutex, OnceLock},
 };
 
-use api_types::ToolResultSummary;
 use async_trait::async_trait;
 use db::{AgentProfileRepo, AgentRepo, ExecutionRepo, ExecutionStatus, SqliteDb};
 use executors::{
     ExecutionContext, ExecutionFailureClass, ExecutionOutcome, ExecutionResult, ExecutorError,
-    LogKind, LogStream, LogWriter, TaskExecutor, TokenUsage,
+    LogKind, TaskExecutor, TokenUsage,
 };
 use forge_agent_host::{
     AgentHostError, AgentSessionBackend, AgentTurnLimit, AgentTurnRequest, CanonicalScope,
     CanonicalScopeType, NativeAgentRuntimeBackend, NativeProviderConfig,
-    RuntimeContextManifestLink, TurnEventSink, WorkspaceAccess,
+    RuntimeContextManifestLink, WorkspaceAccess,
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
@@ -31,6 +30,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     embedded_agent_service::{CreateScopedSession, EmbeddedAgentService, RequestedCanonicalScope},
+    turn_log_sink::{TurnLogSink, TurnProgressObserver},
     ContextManifestInput, ContextManifestService, ContextSourceInput, Result, ServiceError,
 };
 
@@ -57,6 +57,24 @@ pub(crate) struct EmbeddedExecutionLease {
 #[derive(Debug, Clone)]
 struct EmbeddedExecutionLeaseState {
     execution_version: i64,
+}
+
+/// Turn events are semantic progress only.  They never renew the execution
+/// owner lease: the server-controlled runner heartbeat does that
+/// independently, so a quiet provider request or long-running tool remains
+/// live while its owner is healthy.
+#[async_trait]
+impl TurnProgressObserver for EmbeddedExecutionLease {
+    async fn record_progress(&self) {
+        let progress_at = db::now_rfc3339();
+        if let Err(error) = self.record_progress(progress_at, db::now_rfc3339()).await {
+            tracing::debug!(
+                execution_id = %self.execution_id,
+                %error,
+                "failed to record native execution semantic progress"
+            );
+        }
+    }
 }
 
 impl std::fmt::Debug for EmbeddedExecutionLease {
@@ -248,7 +266,7 @@ impl EmbeddedTaskExecutor {
         ctx: &ExecutionContext,
         agent: db::Agent,
         task_role: &str,
-        log_sink: Arc<NativeTaskLogSink>,
+        log_sink: Arc<TurnLogSink>,
         cancellation: CancellationToken,
     ) -> Result<executors::ExecutionResult> {
         let owner_user_id = agent.owner_id.clone().ok_or_else(|| {
@@ -796,11 +814,11 @@ impl TaskExecutor for EmbeddedTaskExecutor {
 
         let cancellation = CancellationToken::new();
         let execution_lease = execution_lease_for(&ctx.execution_id);
-        let log_sink = Arc::new(NativeTaskLogSink::new(
+        let log_sink = Arc::new(TurnLogSink::new(
             &ctx.logs_path,
             &ctx.execution_id,
             ctx.log_sender.clone(),
-            execution_lease,
+            execution_lease.map(|lease| lease as Arc<dyn TurnProgressObserver>),
         ));
         let result = self
             .run_native_turn(
@@ -825,120 +843,6 @@ impl TaskExecutor for EmbeddedTaskExecutor {
             .cancel(&active.runtime_session_id)
             .await
             .map_err(|error| ExecutorError::Other(error.to_string()))
-    }
-}
-
-/// Log sink preserving the standard Forge JSONL/event stream contract.
-///
-/// Events are semantic progress only.  They never renew the execution owner
-/// lease: the server-controlled runner heartbeat does that independently, so
-/// a quiet provider request or long-running tool remains live while its owner
-/// is healthy.
-struct NativeTaskLogSink {
-    writer: Mutex<LogWriter>,
-    lease: Option<Arc<EmbeddedExecutionLease>>,
-}
-
-impl std::fmt::Debug for NativeTaskLogSink {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("NativeTaskLogSink")
-            .finish_non_exhaustive()
-    }
-}
-
-impl NativeTaskLogSink {
-    fn new(
-        path: &str,
-        execution_id: &str,
-        sender: Option<tokio::sync::mpsc::UnboundedSender<executors::LogEntry>>,
-        lease: Option<Arc<EmbeddedExecutionLease>>,
-    ) -> Self {
-        let mut writer = LogWriter::new(path, execution_id.to_owned(), 10 * 1024 * 1024);
-        if let Some(sender) = sender {
-            writer.set_log_sender(sender);
-        }
-        Self {
-            writer: Mutex::new(writer),
-            lease,
-        }
-    }
-
-    async fn write(&self, kind: LogKind, payload: serde_json::Value) -> std::io::Result<()> {
-        self.writer
-            .lock()
-            .await
-            .write(kind, LogStream::Main, payload)
-            .await
-    }
-
-    async fn record_progress(&self) {
-        let Some(lease) = self.lease.as_ref() else {
-            return;
-        };
-        let progress_at = db::now_rfc3339();
-        if let Err(error) = lease.record_progress(progress_at, db::now_rfc3339()).await {
-            tracing::debug!(
-                execution_id = %lease.execution_id,
-                %error,
-                "failed to record native execution semantic progress"
-            );
-        }
-    }
-}
-
-#[async_trait]
-impl TurnEventSink for NativeTaskLogSink {
-    async fn text_delta(&self, text: &str) {
-        let _ = self
-            .write(LogKind::AssistantDelta, serde_json::json!({"text": text}))
-            .await;
-        self.record_progress().await;
-    }
-
-    async fn reasoning_delta(&self, text: &str, redacted: bool) {
-        if !redacted {
-            let _ = self
-                .write(LogKind::Thinking, serde_json::json!({"text": text}))
-                .await;
-        }
-        self.record_progress().await;
-    }
-
-    async fn tool_call_started(&self, call_id: &str, name: &str, argument_keys: &[String]) {
-        let _ = self
-            .write(
-                LogKind::ToolCall,
-                serde_json::json!({
-                    "call_id": call_id,
-                    "name": name,
-                    "argument_keys": argument_keys,
-                }),
-            )
-            .await;
-        self.record_progress().await;
-    }
-
-    async fn tool_call_finished(
-        &self,
-        call_id: &str,
-        name: &str,
-        is_error: bool,
-        summary: &ToolResultSummary,
-    ) {
-        let _ = self
-            .write(
-                LogKind::ToolResult,
-                serde_json::json!({
-                    "call_id": call_id,
-                    "name": name,
-                    "is_error": is_error,
-                    "success": !is_error,
-                    "summary": summary,
-                }),
-            )
-            .await;
-        self.record_progress().await;
     }
 }
 
@@ -1235,66 +1139,5 @@ mod tests {
         assert!(git::is_worktree_clean(repo.path())
             .await
             .expect("worktree cleanliness reads"));
-    }
-
-    #[tokio::test]
-    async fn tool_call_finished_persists_the_bounded_summary_in_the_durable_log() {
-        // Characterizes F14: before this change, `tool_call_finished` accepted
-        // only `is_error`, so the durable log kept `call_id`/`name`/`is_error`/
-        // `success` and discarded the structured outcome's code, safe
-        // message, correlation id, and recovery action entirely.
-        let dir = tempfile::tempdir().expect("temp dir creates");
-        let log_path = dir.path().join("exec.jsonl");
-        let sink = NativeTaskLogSink::new(log_path.to_str().unwrap(), "exec-1", None, None);
-
-        let mut outcome = api_types::OrchestrationOutcome::failed(
-            api_types::OutcomeCode::VersionConflict,
-            "task.propose",
-            api_types::CanonicalScopeRef::new(api_types::OutcomeScopeType::Task, "task-1"),
-            "corr-1",
-            "the authorized resource changed; refresh current state and retry",
-        );
-        outcome.retry = Some(api_types::RetryInstruction::new(
-            api_types::RetryAction::RefreshAndRetry,
-            true,
-        ));
-        // Simulates a protected internal cause a command boundary logs but
-        // never returns to a caller. It must not reach the durable log
-        // through the tool-result summary path.
-        outcome.result = Some(serde_json::json!({
-            "internal_cause": "db error: password=hunter2-secret-token",
-        }));
-        let summary = ToolResultSummary::from_orchestration_outcome(&outcome);
-
-        sink.tool_call_finished(
-            "call-1",
-            "forge_project_orchestration_propose",
-            true,
-            &summary,
-        )
-        .await;
-
-        let raw = tokio::fs::read_to_string(&log_path)
-            .await
-            .expect("durable log reads");
-        assert!(!raw.contains("hunter2-secret-token"));
-        assert!(!raw.contains("internal_cause"));
-
-        let entry: serde_json::Value =
-            serde_json::from_str(raw.lines().next().expect("one log line writes"))
-                .expect("log entry parses as JSON");
-        let payload = &entry["payload"];
-        assert_eq!(payload["call_id"], "call-1");
-        assert_eq!(payload["is_error"], true);
-        assert_eq!(payload["success"], false);
-        assert_eq!(payload["summary"]["status"], "failed");
-        assert_eq!(payload["summary"]["code"], "version_conflict");
-        assert_eq!(
-            payload["summary"]["safe_message"],
-            "the authorized resource changed; refresh current state and retry"
-        );
-        assert_eq!(payload["summary"]["correlation_id"], "corr-1");
-        assert_eq!(payload["summary"]["retryable"], true);
-        assert_eq!(payload["summary"]["recovery_action"], "refresh_and_retry");
     }
 }

@@ -84,7 +84,7 @@ async fn task_proposal_rest_and_native_share_command_receipts_mcp_is_direct_task
     assert!(rest_proposal["receipt_id"].as_str().is_some());
     assert!(rest_proposal["event_id"].as_str().is_some());
     assert_eq!(rest_proposal["task"]["title"], "REST proposal");
-    assert_eq!(rest_proposal["task"]["status"], "backlog");
+    assert_eq!(rest_proposal["task"]["status"], "todo");
     let rest_task_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM task WHERE project_id = ? AND title = 'REST proposal'",
     )
@@ -148,10 +148,7 @@ async fn task_proposal_rest_and_native_share_command_receipts_mcp_is_direct_task
         .as_str()
         .expect("native task id")
         .to_owned();
-    assert_eq!(
-        native_result_body["domain_result"]["task_status"],
-        "backlog"
-    );
+    assert_eq!(native_result_body["domain_result"]["task_status"], "todo");
     let native_receipt_id = native_result["receipt_id"]
         .as_str()
         .expect("native receipt id");

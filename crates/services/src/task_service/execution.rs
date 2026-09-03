@@ -58,15 +58,30 @@ pub(super) fn publish_terminal_execution_event(service: &TaskService, execution:
 }
 
 pub(super) async fn clear_execution_retry_metadata(db: &SqliteDb, task: &Task) -> Result<()> {
+    clear_execution_retry_metadata_inner(db, task, true).await
+}
+
+pub(super) async fn clear_execution_retry_metadata_preserving_dispatch(
+    db: &SqliteDb,
+    task: &Task,
+) -> Result<()> {
+    clear_execution_retry_metadata_inner(db, task, false).await
+}
+
+async fn clear_execution_retry_metadata_inner(
+    db: &SqliteDb,
+    task: &Task,
+    clear_deferred_dispatch: bool,
+) -> Result<()> {
     let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
         ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
     })?;
     let mut changed = false;
-    for key in [
-        "execution_retry_count",
-        "last_execution_failure_at",
-        "deferred_dispatch",
-    ] {
+    let mut keys = vec!["execution_retry_count", "last_execution_failure_at"];
+    if clear_deferred_dispatch {
+        keys.push("deferred_dispatch");
+    }
+    for key in keys {
         changed |= metadata.extra.remove(key).is_some();
     }
     if changed {

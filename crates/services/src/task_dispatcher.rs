@@ -16,6 +16,7 @@ use crate::{workflow::engine::WorkflowEngine, Result, TaskService};
 mod active_recovery;
 mod helpers;
 mod initial_scheduling;
+mod repo_pause_sync;
 mod workspace_blocking;
 
 pub struct TaskDispatcher {
@@ -95,6 +96,13 @@ impl TaskDispatcher {
         for project in self.list_projects().await? {
             if self.is_stopped() {
                 break;
+            }
+            // Reconciles pause state before the paused-project skip below,
+            // since it is also what resumes a Project once its repository
+            // shows up. Either direction leaves this scan's in-memory
+            // `project` stale, so skip acting on it this tick either way.
+            if self.sync_repository_pause(&project).await? {
+                continue;
             }
             if project.paused_at.is_some() {
                 continue;

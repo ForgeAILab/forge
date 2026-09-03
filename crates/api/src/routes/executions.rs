@@ -61,8 +61,22 @@ pub async fn get_logs(
         return Ok(Json(serde_json::json!({"items": [], "has_more": false})));
     };
 
-    let log_path = std::path::Path::new(&path);
+    match read_log_page(std::path::Path::new(&path), &params).await? {
+        Some(page) => Ok(Json(page)),
+        None => Err(ApiError::execution_logs_unavailable(format!(
+            "log file not found for execution {id}"
+        ))),
+    }
+}
 
+/// One page of a Forge JSONL log as the public `{items, has_more,
+/// next_sequence}` shape. `None` means the file does not exist yet; each
+/// caller decides whether that is an error (an execution that claimed a
+/// log path) or simply nothing recorded so far (a queued chat turn).
+pub(crate) async fn read_log_page(
+    log_path: &std::path::Path,
+    params: &LogsQuery,
+) -> ApiResult<Option<serde_json::Value>> {
     let limit = params
         .limit
         .unwrap_or(DEFAULT_LOG_LIMIT)
@@ -75,15 +89,11 @@ pub async fn get_logs(
 
     let result = match result {
         Ok(r) => r,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ApiError::execution_logs_unavailable(format!(
-                "log file not found for execution {id}"
-            )));
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(ApiError::bad_request(error.to_string())),
     };
 
-    Ok(Json(serde_json::json!({
+    Ok(Some(serde_json::json!({
         "items": result.entries,
         "has_more": result.has_more,
         "next_sequence": result.next_sequence,

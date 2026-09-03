@@ -12,8 +12,10 @@ use std::{
 use chrono::{Duration, Utc};
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentConnectionHealthRepo,
-    AgentRepo, AgentStatus, CreateAgentIdentity, CreateAgentProfile, CreateProject, CreateRepo,
-    Project, ProjectRepo, RepoRepo, SqliteDb, UpsertAgentConnectionHealth, WorkMode,
+    AgentRepo, AgentStatus, CreateAgentIdentity, CreateAgentProfile, CreateProject,
+    CreateProjectCharter, CreateProjectCharterRevision, CreateProjectCharterRevisionAtomically,
+    CreateRepo, Project, ProjectOrchestrationRepo, ProjectRepo, RepoRepo, SqliteDb,
+    UpsertAgentConnectionHealth, User, UserRepo, WorkMode,
 };
 use serde_json::Value;
 use sqlx::Row;
@@ -78,10 +80,11 @@ async fn checkpoint_statuses(db: &SqliteDb, operation_id: &str) -> Vec<(String, 
          WHERE operation_id = ?
          ORDER BY CASE checkpoint
              WHEN 'preflight' THEN 1
-             WHEN 'repository_initialized' THEN 2
-             WHEN 'repository_registered' THEN 3
-             WHEN 'repository_linked' THEN 4
-             WHEN 'roles_assigned' THEN 5
+             WHEN 'repository_scaffolded' THEN 2
+             WHEN 'repository_initialized' THEN 3
+             WHEN 'repository_registered' THEN 4
+             WHEN 'repository_linked' THEN 5
+             WHEN 'roles_assigned' THEN 6
          END",
     )
     .bind(operation_id)
@@ -110,6 +113,17 @@ async fn provisioning_error_codes(db: &SqliteDb, operation_id: &str) -> Vec<Stri
     .into_iter()
     .map(|row| row.try_get("code").expect("provisioning error code reads"))
     .collect()
+}
+
+async fn provisioning_error_messages(db: &SqliteDb, operation_id: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT message FROM project_provisioning_error
+         WHERE operation_id = ? ORDER BY created_at, id",
+    )
+    .bind(operation_id)
+    .fetch_all(db.pool())
+    .await
+    .expect("Project provisioning error messages query")
 }
 
 async fn database() -> Arc<SqliteDb> {
@@ -346,7 +360,13 @@ async fn repository_success_creates_one_git_repo_link_and_usable_role_defaults()
         .expect("successful Genesis provisioning");
 
     let operation = provisioning_operation(&fixture.db, &fixture.project.id).await;
-    assert_eq!(operation.status, "ready");
+    assert_eq!(
+        operation.status,
+        "ready",
+        "provisioning did not finish: {:?} / {:?}",
+        operation.last_error_code,
+        provisioning_error_messages(&fixture.db, &operation.id).await
+    );
     assert_eq!(operation.current_checkpoint, "completed");
     assert_eq!(operation.attempt_count, 1);
     assert_eq!(operation.max_attempts, 3);
@@ -356,6 +376,7 @@ async fn repository_success_creates_one_git_repo_link_and_usable_role_defaults()
         checkpoint_statuses(&fixture.db, &operation.id).await,
         vec![
             ("preflight".to_owned(), "completed".to_owned()),
+            ("repository_scaffolded".to_owned(), "skipped".to_owned()),
             ("repository_initialized".to_owned(), "completed".to_owned()),
             ("repository_registered".to_owned(), "completed".to_owned()),
             ("repository_linked".to_owned(), "completed".to_owned()),
@@ -725,12 +746,14 @@ async fn operation_row_repair_restores_missing_checkpoint_rows_before_replay() {
     assert_eq!(operation.status, "ready");
     assert_eq!(
         checkpoint_statuses(&fixture.db, &operation.id).await.len(),
-        5
+        6
     );
     assert!(checkpoint_statuses(&fixture.db, &operation.id)
         .await
         .into_iter()
-        .all(|(_, status)| status == "completed"));
+        .all(|(checkpoint, status)| {
+            status == "completed" || (checkpoint == "repository_scaffolded" && status == "skipped")
+        }));
 
     remove_path(&fixture.repo_path).await;
 }
@@ -842,4 +865,445 @@ async fn renamed_project_reuses_repository_checkpoint_path() {
         .with_file_name(format!("renamed-genesis-{}", renamed.id))
         .exists());
     remove_path(&old_path).await;
+}
+
+// ---------------------------------------------------------------------------
+// Charter scaffold: the `repository_scaffolded` checkpoint.
+//
+// The tests below set `FORGE_SCAFFOLD_COMMAND`, which is process-wide, so
+// they serialize on one lock; the other cases in this file never read it
+// because their Projects carry no Charter scaffold.
+// ---------------------------------------------------------------------------
+
+fn scaffold_env_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+const SCAFFOLD_REVISION_VIEW: &str = "# Scaffolded Project\n\n- Working name: Scaffolded Project\n";
+
+/// Attach an approved Charter whose content carries a scaffold block. Only
+/// the block matters to provisioning, which reads it leniently.
+async fn attach_scaffold_charter(
+    fixture: &ProjectFixture,
+    template: &str,
+    packs: &[&str],
+) -> String {
+    let db = &fixture.db;
+    let now = now_rfc3339();
+    let account_id = new_uuid_v4();
+    UserRepo::create_user(
+        &**db,
+        &User {
+            id: account_id.clone(),
+            email: format!("{account_id}@characterization.test"),
+            password_hash: "test".to_owned(),
+            display_name: Some("Characterization".to_owned()),
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("account creates");
+    // The atomic Charter path only lets the Project's owner (or a privileged
+    // member) attach a Charter, so the fixture Project adopts this account.
+    sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
+        .bind(&account_id)
+        .bind(&fixture.project.id)
+        .execute(db.pool())
+        .await
+        .expect("Project owner sets");
+    let charter_id = new_uuid_v4();
+    let revision_id = new_uuid_v4();
+    let content = serde_json::json!({
+        "identity": {"working_name": "Scaffolded Project", "one_line_vision": "prove scaffolding", "maturity": "mvp"},
+        "scaffold": {"template": template, "packs": packs},
+    });
+    ProjectOrchestrationRepo::create_project_charter_revision_atomically(
+        &**db,
+        CreateProjectCharterRevisionAtomically {
+            project_id: Some(fixture.project.id.clone()),
+            genesis_session_id: None,
+            account_id: account_id.clone(),
+            charter: CreateProjectCharter {
+                id: charter_id.clone(),
+                account_id: account_id.clone(),
+                genesis_session_id: None,
+                project_mode: "compact".to_owned(),
+                maturity: "mvp".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            revision: CreateProjectCharterRevision {
+                id: revision_id.clone(),
+                charter_id: charter_id.clone(),
+                expected_charter_version: 1,
+                project_mode: "compact".to_owned(),
+                maturity: "mvp".to_owned(),
+                base_revision: 0,
+                base_revision_id: None,
+                lifecycle: "draft".to_owned(),
+                schema_version: "forge.project-charter/v1".to_owned(),
+                render_version: "forge.project-charter-render/v1".to_owned(),
+                content_json: content.to_string(),
+                rendered_view: SCAFFOLD_REVISION_VIEW.to_owned(),
+                change_summary: "scaffolded Charter".to_owned(),
+                author_type: "user".to_owned(),
+                author_id: Some(account_id.clone()),
+                source_message_id: None,
+                source_turn_job_id: None,
+                source_refs_json: "[]".to_owned(),
+                content_digest: "scaffold-content-digest".to_owned(),
+                rendered_digest: "scaffold-render-digest".to_owned(),
+                created_at: now.clone(),
+                command_receipt: None,
+                action_execution: None,
+            },
+            command_receipt: None,
+            action_execution: None,
+        },
+    )
+    .await
+    .expect("Charter revision creates");
+    // The pointer trigger requires an approved revision; approval is the
+    // user's exact-receipt flow, which this fixture stands in for.
+    sqlx::query("UPDATE project_charter_revision SET lifecycle = 'approved' WHERE id = ?")
+        .bind(&revision_id)
+        .execute(db.pool())
+        .await
+        .expect("revision approves");
+    sqlx::query("UPDATE project_charter SET current_approved_revision_id = ? WHERE id = ?")
+        .bind(&revision_id)
+        .bind(&charter_id)
+        .execute(db.pool())
+        .await
+        .expect("approved pointer sets");
+    revision_id
+}
+
+/// A stand-in for create-spark: creates the target directory with the files a
+/// real scaffold carries, records its arguments, and honours the refusal that
+/// matters here (an existing target directory).
+async fn fake_create_spark(exit_code: i32) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("forge-fake-create-spark-{}", new_uuid_v4()));
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .expect("fake command directory creates");
+    let script = dir.join("create-spark");
+    let body = format!(
+        "#!/bin/sh\n\
+         target=\"$1\"\n\
+         if [ -e \"$target\" ]; then echo \"Target directory already exists: $target\" >&2; exit 1; fi\n\
+         mkdir -p \"$target/docs/spark\" \"$target/.claude/skills/worker-guidelines\"\n\
+         printf '{{\"appName\":\"%s\",\"template\":\"%s\"}}\\n' \"$target\" \"$3\" > \"$target/spark.config.json\"\n\
+         printf '# AGENTS.md\\n\\nOperating rules for %s.\\n' \"$target\" > \"$target/AGENTS.md\"\n\
+         printf 'placeholder north star\\n' > \"$target/docs/spark/project.md\"\n\
+         printf 'node_modules\\n' > \"$target/.gitignore\"\n\
+         printf '# %s\\n\\nScaffolded by spark.\\n' \"$target\" > \"$target/README.md\"\n\
+         printf 'lens\\n' > \"$target/.claude/skills/worker-guidelines/SKILL.md\"\n\
+         echo \"$@\" > \"$target/ARGS\"\n\
+         if [ {exit_code} -ne 0 ]; then echo 'Unknown pack \"nope\". Registered packs: db-sqlite' >&2; exit {exit_code}; fi\n\
+         echo 'Created'\n"
+    );
+    tokio::fs::write(&script, body)
+        .await
+        .expect("fake command writes");
+    let mut permissions = tokio::fs::metadata(&script)
+        .await
+        .expect("fake command metadata")
+        .permissions();
+    use std::os::unix::fs::PermissionsExt;
+    permissions.set_mode(0o755);
+    tokio::fs::set_permissions(&script, permissions)
+        .await
+        .expect("fake command becomes executable");
+    script
+}
+
+async fn checkpoint_details(db: &SqliteDb, operation_id: &str, checkpoint: &str) -> Value {
+    let details: String = sqlx::query_scalar(
+        "SELECT details_json FROM project_provisioning_checkpoint
+         WHERE operation_id = ? AND checkpoint = ?",
+    )
+    .bind(operation_id)
+    .bind(checkpoint)
+    .fetch_one(db.pool())
+    .await
+    .expect("checkpoint details query");
+    serde_json::from_str(&details).expect("checkpoint details are JSON")
+}
+
+#[tokio::test]
+async fn charter_scaffold_runs_the_command_and_commits_the_exported_charter() {
+    let _guard = scaffold_env_lock().lock().await;
+    let fixture = create_project(false).await;
+    remove_path(&fixture.repo_path).await;
+    create_native_agent(&fixture.db, "Scaffold Worker").await;
+    let revision_id =
+        attach_scaffold_charter(&fixture, "nextjs", &["db-sqlite", "ui-shadcn"]).await;
+    let script = fake_create_spark(0).await;
+    std::env::set_var("FORGE_SCAFFOLD_COMMAND", script.to_string_lossy().as_ref());
+
+    services::project_provisioning::provision_genesis_project(&fixture.db, &fixture.project.id)
+        .await
+        .expect("scaffolded Genesis provisioning");
+    std::env::remove_var("FORGE_SCAFFOLD_COMMAND");
+
+    let operation = provisioning_operation(&fixture.db, &fixture.project.id).await;
+    assert_eq!(operation.status, "ready");
+    assert_eq!(operation.attempt_count, 1);
+    assert_eq!(operation.last_error_code, None);
+    assert_eq!(
+        checkpoint_statuses(&fixture.db, &operation.id).await[..2],
+        [
+            ("preflight".to_owned(), "completed".to_owned()),
+            ("repository_scaffolded".to_owned(), "completed".to_owned()),
+        ]
+    );
+    let details = checkpoint_details(&fixture.db, &operation.id, "repository_scaffolded").await;
+    assert_eq!(details["template"], "nextjs");
+    assert_eq!(
+        details["packs"],
+        serde_json::json!(["db-sqlite", "ui-shadcn"])
+    );
+    assert_eq!(details["charter_revision_id"], revision_id);
+    assert_eq!(
+        details["path"],
+        fixture.repo_path.to_string_lossy().as_ref()
+    );
+    assert!(details["command"]
+        .as_str()
+        .expect("command recorded")
+        .ends_with("create-spark"));
+
+    // create-spark received the deterministic directory name, the template,
+    // and the pack list — non-interactively.
+    let args = tokio::fs::read_to_string(fixture.repo_path.join("ARGS"))
+        .await
+        .expect("fake command recorded its arguments");
+    assert_eq!(
+        args.trim(),
+        format!(
+            "{} --template nextjs --yes --packs db-sqlite,ui-shadcn",
+            fixture.repo_path.file_name().unwrap().to_string_lossy()
+        )
+    );
+
+    // Forge's exports replaced the placeholder and joined the first commit.
+    let project_md = tokio::fs::read_to_string(fixture.repo_path.join("docs/spark/project.md"))
+        .await
+        .expect("exported Charter exists");
+    assert!(project_md.contains(&format!("revision `{revision_id}`")));
+    assert!(project_md.contains("Forge is the source of truth"));
+    assert!(project_md.ends_with(SCAFFOLD_REVISION_VIEW));
+    let agents = tokio::fs::read_to_string(fixture.repo_path.join("AGENTS.md"))
+        .await
+        .expect("AGENTS.md exists");
+    assert!(agents.starts_with("# AGENTS.md\n"));
+    assert!(agents.contains("\n## Forge\n"));
+    assert!(agents.contains("`worker-guidelines` lens is in force"));
+    assert!(fixture.repo_path.join("spark.config.json").is_file());
+    assert!(git::is_worktree_clean(&fixture.repo_path)
+        .await
+        .expect("worktree status reads"));
+    let readme = tokio::fs::read_to_string(fixture.repo_path.join("README.md"))
+        .await
+        .expect("the scaffold's README survives");
+    assert!(
+        !readme.contains("Repository created by Forge Product Genesis"),
+        "no README is fabricated over a scaffold: {readme}"
+    );
+
+    remove_path(&fixture.repo_path).await;
+    remove_path(script.parent().unwrap()).await;
+}
+
+#[tokio::test]
+async fn missing_scaffold_runtime_is_a_typed_retryable_failure_that_a_retry_clears() {
+    let _guard = scaffold_env_lock().lock().await;
+    let fixture = create_project(false).await;
+    remove_path(&fixture.repo_path).await;
+    create_native_agent(&fixture.db, "Runtime Worker").await;
+    attach_scaffold_charter(&fixture, "vite-react", &[]).await;
+    std::env::set_var(
+        "FORGE_SCAFFOLD_COMMAND",
+        "/nonexistent/forge-characterization/bunx @forgeailab/create-spark",
+    );
+
+    services::project_provisioning::provision_genesis_project(&fixture.db, &fixture.project.id)
+        .await
+        .expect("provisioning records the blocker instead of erroring");
+
+    let operation = provisioning_operation(&fixture.db, &fixture.project.id).await;
+    assert_eq!(operation.status, "setup_required");
+    assert_eq!(operation.current_checkpoint, "preflight");
+    assert_eq!(operation.attempt_count, 1);
+    assert!(operation.retryable);
+    assert_eq!(
+        operation.last_error_code.as_deref(),
+        Some("scaffold_runtime_unavailable")
+    );
+    assert_eq!(
+        provisioning_error_codes(&fixture.db, &operation.id).await,
+        vec!["scaffold_runtime_unavailable".to_owned()]
+    );
+    assert_eq!(
+        checkpoint_statuses(&fixture.db, &operation.id).await[1],
+        ("repository_scaffolded".to_owned(), "failed".to_owned())
+    );
+    assert_eq!(repo_count(&fixture.db, &fixture.project.id).await, 0);
+    assert!(!fixture.repo_path.exists(), "nothing was created on disk");
+
+    // The host installs the runtime and retries the same operation.
+    let script = fake_create_spark(0).await;
+    std::env::set_var("FORGE_SCAFFOLD_COMMAND", script.to_string_lossy().as_ref());
+    services::project_provisioning::provision_genesis_project(&fixture.db, &fixture.project.id)
+        .await
+        .expect("retry provisions");
+    std::env::remove_var("FORGE_SCAFFOLD_COMMAND");
+
+    let operation = provisioning_operation(&fixture.db, &fixture.project.id).await;
+    assert_eq!(operation.status, "ready");
+    assert_eq!(operation.attempt_count, 2);
+    let args = tokio::fs::read_to_string(fixture.repo_path.join("ARGS"))
+        .await
+        .expect("fake command recorded its arguments");
+    assert!(args
+        .trim()
+        .ends_with("--template vite-react --yes --no-packs"));
+    assert_eq!(repo_count(&fixture.db, &fixture.project.id).await, 1);
+
+    remove_path(&fixture.repo_path).await;
+    remove_path(script.parent().unwrap()).await;
+}
+
+#[tokio::test]
+async fn refused_scaffold_removes_the_partial_directory_and_keeps_the_tool_output() {
+    let _guard = scaffold_env_lock().lock().await;
+    let fixture = create_project(false).await;
+    remove_path(&fixture.repo_path).await;
+    create_native_agent(&fixture.db, "Refusal Worker").await;
+    attach_scaffold_charter(&fixture, "nextjs", &["nope"]).await;
+    let script = fake_create_spark(3).await;
+    std::env::set_var("FORGE_SCAFFOLD_COMMAND", script.to_string_lossy().as_ref());
+
+    services::project_provisioning::provision_genesis_project(&fixture.db, &fixture.project.id)
+        .await
+        .expect("provisioning records the refusal");
+    std::env::remove_var("FORGE_SCAFFOLD_COMMAND");
+
+    let operation = provisioning_operation(&fixture.db, &fixture.project.id).await;
+    assert_eq!(operation.status, "setup_required");
+    assert!(operation.retryable);
+    assert_eq!(
+        operation.last_error_code.as_deref(),
+        Some("repository_scaffold_failed")
+    );
+    let message: String = sqlx::query_scalar(
+        "SELECT last_error_message FROM project_provisioning_operation WHERE id = ?",
+    )
+    .bind(&operation.id)
+    .fetch_one(fixture.db.pool())
+    .await
+    .expect("error message reads");
+    assert!(message.contains("Unknown pack \"nope\""), "{message}");
+    let details = checkpoint_details(&fixture.db, &operation.id, "repository_scaffolded").await;
+    assert!(details["output_tail"]
+        .as_str()
+        .expect("tool output kept")
+        .contains("Registered packs: db-sqlite"));
+    assert!(
+        !fixture.repo_path.exists(),
+        "the partial directory is removed so the next attempt starts clean"
+    );
+    assert_eq!(repo_count(&fixture.db, &fixture.project.id).await, 0);
+
+    remove_path(script.parent().unwrap()).await;
+}
+
+#[tokio::test]
+async fn retry_after_a_scaffold_failure_keeps_one_repository_path() {
+    let _guard = scaffold_env_lock().lock().await;
+    let fixture = create_project(false).await;
+    remove_path(&fixture.repo_path).await;
+    create_native_agent(&fixture.db, "Path Worker").await;
+    attach_scaffold_charter(&fixture, "nextjs", &["db-sqlite"]).await;
+    std::env::set_var(
+        "FORGE_SCAFFOLD_COMMAND",
+        "/nonexistent/forge-characterization/create-spark",
+    );
+    services::project_provisioning::provision_genesis_project(&fixture.db, &fixture.project.id)
+        .await
+        .expect("first attempt records the blocker");
+    let operation = provisioning_operation(&fixture.db, &fixture.project.id).await;
+    assert_eq!(
+        operation.last_error_code.as_deref(),
+        Some("scaffold_runtime_unavailable")
+    );
+    let first_path = checkpoint_details(&fixture.db, &operation.id, "repository_scaffolded").await
+        ["path"]
+        .as_str()
+        .expect("first attempt persisted its target")
+        .to_owned();
+    assert_eq!(first_path, fixture.repo_path.to_string_lossy());
+
+    // Between attempts the Project is renamed, so a fresh derivation would
+    // point somewhere else. Both filesystem checkpoints must keep using the
+    // directory the first attempt recorded.
+    sqlx::query("UPDATE project SET name = ? WHERE id = ?")
+        .bind("Renamed After Scaffold Failure")
+        .bind(&fixture.project.id)
+        .execute(fixture.db.pool())
+        .await
+        .expect("Project renames");
+    let script = fake_create_spark(0).await;
+    std::env::set_var("FORGE_SCAFFOLD_COMMAND", script.to_string_lossy().as_ref());
+    services::project_provisioning::provision_genesis_project(&fixture.db, &fixture.project.id)
+        .await
+        .expect("retry provisions");
+    std::env::remove_var("FORGE_SCAFFOLD_COMMAND");
+
+    let operation = provisioning_operation(&fixture.db, &fixture.project.id).await;
+    assert_eq!(operation.status, "ready");
+    let scaffold_path = checkpoint_details(&fixture.db, &operation.id, "repository_scaffolded")
+        .await["path"]
+        .as_str()
+        .expect("scaffold path")
+        .to_owned();
+    let init_path = checkpoint_details(&fixture.db, &operation.id, "repository_initialized").await
+        ["path"]
+        .as_str()
+        .expect("init path")
+        .to_owned();
+    assert_eq!(scaffold_path, first_path);
+    assert_eq!(
+        init_path, first_path,
+        "init must commit the directory the scaffold filled"
+    );
+    let project = ProjectRepo::get_by_id(&*fixture.db, &fixture.project.id)
+        .await
+        .expect("Project reloads")
+        .expect("Project present");
+    let repo = RepoRepo::get_by_id(
+        &*fixture.db,
+        project.primary_repo_id.as_deref().expect("primary repo"),
+    )
+    .await
+    .expect("repo reloads")
+    .expect("repo present");
+    assert_eq!(repo.local_path.as_deref(), Some(first_path.as_str()));
+    assert!(Path::new(&first_path).join("spark.config.json").is_file());
+    assert!(git::is_worktree_clean(Path::new(&first_path))
+        .await
+        .expect("worktree status reads"));
+    let renamed_derivation = repo_path(&project);
+    assert_ne!(renamed_derivation, PathBuf::from(&first_path));
+    assert!(
+        !renamed_derivation.exists(),
+        "no second directory is created"
+    );
+
+    remove_path(Path::new(&first_path)).await;
+    remove_path(script.parent().unwrap()).await;
 }

@@ -136,7 +136,7 @@ impl CodingExecutorAdapter for OpencodeAdapter {
         };
 
         let mut cmd = Self::build_command(&config, &prompt);
-        cmd.current_dir(&ctx.worktree_path);
+        crate::command::run_in_worktree(&mut cmd, &ctx.worktree_path);
 
         let mut child = cmd.spawn()?;
 
@@ -272,16 +272,14 @@ impl CodingExecutorAdapter for OpencodeAdapter {
             });
         }
 
-        let after_sha = if let Ok(false) =
-            git::is_worktree_clean(Path::new(&ctx.worktree_path)).await
-        {
-            let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
-            crate::commit::commit_worktree_changes(Path::new(&ctx.worktree_path), &subject)
-                .await
-                .unwrap_or(None)
-        } else {
-            None
-        };
+        let after_sha =
+            if let Ok(false) = git::is_worktree_clean(Path::new(&ctx.worktree_path)).await {
+                crate::commit::commit_execution_changes(&ctx)
+                    .await
+                    .unwrap_or(None)
+            } else {
+                None
+            };
         let after_sha = match after_sha {
             Some(sha) => Some(sha),
             None => git::get_current_sha(Path::new(&ctx.worktree_path))

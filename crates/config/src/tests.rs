@@ -562,7 +562,40 @@ fn clear_forge_env() {
         "FORGE_BCRYPT_COST",
         "FORGE_CORS_ORIGINS",
         "FORGE_MEDIA_UPLOAD_LIMIT_BYTES",
+        "FORGE_SCAFFOLD_COMMAND",
     ] {
         env::remove_var(key);
     }
+}
+
+#[test]
+fn scaffold_command_defaults_then_file_then_env() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    clear_forge_env();
+
+    let dir = tempdir().expect("tempdir");
+    let missing_path = dir.path().join("missing-forge.yaml");
+    let config = ForgeConfig::load(Some(&missing_path), ConfigOverrides::default())
+        .expect("default config loads");
+    assert_eq!(config.scaffold.command, crate::DEFAULT_SCAFFOLD_COMMAND);
+
+    let config_path = dir.path().join("forge.yaml");
+    fs::write(
+        &config_path,
+        "scaffold:\n  command: bun /opt/spark/packages/create-spark/src/cli.ts\n",
+    )
+    .expect("write config");
+    let config = ForgeConfig::load(Some(&config_path), ConfigOverrides::default())
+        .expect("file config loads");
+    assert_eq!(
+        config.scaffold.command,
+        "bun /opt/spark/packages/create-spark/src/cli.ts"
+    );
+
+    env::set_var("FORGE_SCAFFOLD_COMMAND", "/usr/local/bin/create-spark-fake");
+    let config = ForgeConfig::load(Some(&config_path), ConfigOverrides::default())
+        .expect("env config loads");
+    assert_eq!(config.scaffold.command, "/usr/local/bin/create-spark-fake");
+
+    clear_forge_env();
 }

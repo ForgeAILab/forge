@@ -268,7 +268,7 @@ impl ClaudeCodeAdapter {
         let worktree = Path::new(&ctx.worktree_path);
         let mut cmd =
             Self::build_command_for_cwd(&config, resume_session_id.as_deref(), Some(worktree));
-        cmd.current_dir(&ctx.worktree_path);
+        crate::command::run_in_worktree(&mut cmd, &ctx.worktree_path);
         let run_started_at = std::time::SystemTime::now();
         let claude_home = dirs::home_dir();
 
@@ -349,10 +349,7 @@ impl ClaudeCodeAdapter {
             None => stream.agent_session_id.clone(),
         };
         let after_sha = if status == ExecutionOutcome::Completed {
-            let subject = crate::commit::build_commit_subject(Some(&ctx.description), &ctx.task_id);
-            match crate::commit::commit_worktree_changes(Path::new(&ctx.worktree_path), &subject)
-                .await
-            {
+            match crate::commit::commit_execution_changes(&ctx).await {
                 Ok(Some(sha)) => Some(sha),
                 Ok(None) => git::get_current_sha(Path::new(&ctx.worktree_path))
                     .await

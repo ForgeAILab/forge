@@ -9,7 +9,13 @@ pub(crate) struct FileConfig {
     pub agent: Option<FileAgentDefaults>,
     pub public_search: Option<FilePublicSearchConfig>,
     pub terminal: Option<FileTerminalConfig>,
+    pub scaffold: Option<FileScaffoldConfig>,
     pub project: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct FileScaffoldConfig {
+    pub command: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

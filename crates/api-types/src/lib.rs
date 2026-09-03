@@ -416,6 +416,7 @@ fn export_typescript() {
     CharterRevisionLifecycle::export().expect("export CharterRevisionLifecycle");
     CharterRisk::export().expect("export CharterRisk");
     CharterScope::export().expect("export CharterScope");
+    CharterScaffold::export().expect("export CharterScaffold");
     CharterSuccessBoundary::export().expect("export CharterSuccessBoundary");
     CharterSupersession::export().expect("export CharterSupersession");
     CreateProjectFromCharterApprovalRequest::export()

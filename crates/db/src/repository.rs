@@ -1318,6 +1318,11 @@ pub trait ProjectRepo: Send + Sync {
         by: i64,
     ) -> Result<i64>;
     async fn set_paused_at(&self, id: &str, paused_at: Option<String>) -> Result<()>;
+    /// Pause a Project the Task dispatcher found with no primary
+    /// repository, recording why. Only an unpaused Project pauses; a
+    /// concurrent pause (manual or another reconciliation tick) is a benign
+    /// no-op.
+    async fn set_system_pause_reason(&self, id: &str, paused_at: &str, reason: &str) -> Result<()>;
     async fn delete(&self, id: &str) -> Result<()>;
 }
 
@@ -2472,6 +2477,23 @@ pub struct AgentTokenBreakdown {
     pub avg_duration_ms: Option<i64>,
 }
 
+/// Where a Project's tokens were spent. Task executions are only part of the
+/// bill: the Genesis discovery that produced the Project and the Project
+/// Agent's own orchestration turns are recorded on chat messages, and for a
+/// small Project they routinely outweigh the code work.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SurfaceTokenBreakdown {
+    /// `task_execution`, `project_chat`, or `genesis_chat`.
+    pub surface: String,
+    /// Task executions for `task_execution`, Agent Chat turns otherwise.
+    pub run_count: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub cost_usd: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectTokenStats {
     pub total_input_tokens: i64,
@@ -2480,8 +2502,11 @@ pub struct ProjectTokenStats {
     pub total_cache_write_tokens: i64,
     pub total_cost_usd: Option<f64>,
     pub execution_count: i64,
+    /// Agent Chat turns counted in the totals, across both chat surfaces.
+    pub chat_turn_count: i64,
     pub by_model: Vec<ModelTokenBreakdown>,
     pub by_agent: Vec<AgentTokenBreakdown>,
+    pub by_surface: Vec<SurfaceTokenBreakdown>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

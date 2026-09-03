@@ -5,10 +5,16 @@ import type { CharterHandoffNote } from "./CharterHandoffNote";
 import type { CharterIdentity } from "./CharterIdentity";
 import type { CharterKnowledgeLedger } from "./CharterKnowledgeLedger";
 import type { CharterProblemAndPeople } from "./CharterProblemAndPeople";
+import type { CharterScaffold } from "./CharterScaffold";
 import type { CharterScope } from "./CharterScope";
 import type { CharterSuccessBoundary } from "./CharterSuccessBoundary";
 
 /**
  * The canonical typed payload hashed by a Charter content digest.
  */
-export type ProjectCharterContent = { identity: CharterIdentity, problem_and_people: CharterProblemAndPeople, core_experience: CharterCoreExperience, scope: CharterScope, success: CharterSuccessBoundary, constraints_and_risks: CharterConstraintsAndRisks, knowledge_ledger: CharterKnowledgeLedger, handoff_note: CharterHandoffNote | null, };
+export type ProjectCharterContent = { identity: CharterIdentity, problem_and_people: CharterProblemAndPeople, core_experience: CharterCoreExperience, scope: CharterScope, success: CharterSuccessBoundary, constraints_and_risks: CharterConstraintsAndRisks, knowledge_ledger: CharterKnowledgeLedger,
+/**
+ * Omitted from canonical JSON when absent so Charters that predate the
+ * block keep their content digests.
+ */
+scaffold?: CharterScaffold, handoff_note: CharterHandoffNote | null, };

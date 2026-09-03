@@ -753,6 +753,7 @@ function toolCallToolName(record: PayloadRecord | undefined): string {
 
 function toolCallInput(record: PayloadRecord | undefined): unknown {
   return (
+    asRecord(record?.input) ??
     asRecord(asRecord(record?.params)?._meta)?.tool_params ??
     asRecord(record?.params)?.arguments ??
     record?.params ??

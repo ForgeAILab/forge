@@ -1562,6 +1562,7 @@ async fn project_turn_uses_issued_handoff_without_rewalking_mutable_main_history
                 b"hand04-characterization-key",
             )),
             Arc::new(UnreachableExecutor),
+            services::AgentChatTurnLogRoot::new(std::env::temp_dir().join("forge-test-turn-logs")),
         );
         let error = services::AgentChatTurnRunner::run_turn(
             &runner,
