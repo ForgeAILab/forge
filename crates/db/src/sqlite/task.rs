@@ -282,13 +282,22 @@ impl TaskRepo for SqliteDb {
     }
 
     async fn update(&self, input: UpdateTask) -> Result<Task> {
-        let mut task = self.get_task_required(&input.id, true).await?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
+            .bind(&input.id)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        let mut task = map_task(task_row)?;
         if task.deleted_at.is_some() {
             return Err(DbError::InvalidSoftDelete);
         }
         if task.version != input.expected_version {
             return Err(DbError::VersionConflict);
         }
+        let previous_error_annotation = task.error_annotation.clone();
+        let previous_blocked_json = task.blocked_json.clone();
+        let previous_failed_json = task.failed_json.clone();
         if let Some(title) = input.title {
             task.title = title;
         }
@@ -368,10 +377,19 @@ impl TaskRepo for SqliteDb {
             .push(" AND version = ")
             .push_bind(input.expected_version)
             .push(" AND deleted_at IS NULL");
-        let result = query.build().execute(&self.pool).await?;
+        let result = query.build().execute(&mut *transaction).await?;
         if result.rows_affected() == 0 {
             return Err(DbError::VersionConflict);
         }
+        if interruption_fields_changed(
+            &previous_error_annotation,
+            &previous_blocked_json,
+            &previous_failed_json,
+            &task,
+        ) {
+            append_task_interruption_event(self, &mut transaction, &task).await?;
+        }
+        transaction.commit().await?;
         Ok(task)
     }
 
@@ -681,6 +699,9 @@ impl TaskRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
         let previous_status = task.status.clone();
+        let previous_error_annotation = task.error_annotation.clone();
+        let previous_blocked_json = task.blocked_json.clone();
+        let previous_failed_json = task.failed_json.clone();
         let target_status = input.status.clone();
         task.status = target_status;
         if input.assignee_id.is_some() {
@@ -744,6 +765,15 @@ impl TaskRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
 
+        if interruption_fields_changed(
+            &previous_error_annotation,
+            &previous_blocked_json,
+            &previous_failed_json,
+            &task,
+        ) {
+            append_task_interruption_event(self, &mut transaction, &task).await?;
+        }
+
         let event_id = new_uuid_v4();
         let event = CreateDomainEvent {
             id: event_id.clone(),
@@ -770,6 +800,27 @@ impl TaskRepo for SqliteDb {
         transaction.commit().await?;
         Ok(task)
     }
+}
+
+fn interruption_fields_changed(
+    previous_error_annotation: &Option<String>,
+    previous_blocked_json: &Option<String>,
+    previous_failed_json: &Option<String>,
+    task: &Task,
+) -> bool {
+    previous_error_annotation != &task.error_annotation
+        || previous_blocked_json != &task.blocked_json
+        || previous_failed_json != &task.failed_json
+}
+
+async fn append_task_interruption_event(
+    db: &SqliteDb,
+    transaction: &mut Transaction<'_, Sqlite>,
+    task: &Task,
+) -> Result<()> {
+    let event = CreateDomainEvent::task_interruption_changed(task);
+    DomainEventRepo::append_event_in_tx(db, transaction, &event).await?;
+    Ok(())
 }
 
 fn search_like_pattern(term: &str) -> String {

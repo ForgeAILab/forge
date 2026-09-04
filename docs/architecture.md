@@ -486,7 +486,9 @@ cascades Task state. A zero-row CAS is a concurrent winner, not a second
 failure: a late runner/daemon result is retained only as a bounded,
 deduplicated `execution.late_terminal_rejected` diagnostic (protected error
 text is truncated) and cannot overwrite execution, Task, lease, or readiness
-truth.
+truth. The terminal event is a per-attempt audit record and a resolution input
+for any `progress_warning`; it does not directly create action-required
+Attention or wake an Agent.
 
 ### Charter, Documents, Decisions, and effective state
 
@@ -1109,11 +1111,20 @@ lease/attempt metadata.
 Execution terminal outcomes are written by the winning execution terminal CAS:
 the terminal row, active `WorkspaceLease` disposition, and one durable
 `execution.completed`, `execution.failed`, or `execution.cancelled` event are
-committed together. The Attention projection can derive an
-`execution_failed` incident from that event, while `execution.progressed` and
-`execution.progress_warning` remain separate semantic-progress signals.
-Project-scoped incidents with no more specific responder wake the active
-Project Agent binding, whose default wake budget is 10 admissions per hour.
+committed together. These terminal events remain per-attempt audit records and
+inputs for resolving `progress_warning`; they do not directly create
+action-required Attention or wake an Agent. The Task dispatcher applies the
+attempt result to the Task's effective disposition and commits one atomic
+`task.interruption_changed` event. That post-disposition event creates or
+resolves action-required Attention and is the only ordinary source of a
+Project-Agent recovery wake. Human notifications remain driven by the
+corresponding committed Task outcome, never by the raw attempt event.
+Automatic/deferred retries and expected cancellation or reassignment are
+therefore silent. If a terminal
+execution remains manually resumable but no Task disposition is committed by
+the bounded settlement grace, the orphan safety net promotes it to an
+actionable Attention item; the retained `execution_failed` category remains
+available for that diagnostic path and historical projections.
 Observation belongs to the run that made it. A Task session holds a worktree
 and a process and captures what its own run did (`task.evidence`,
 `task.worklog`). The Project Agent holds its own verification workspace — a
@@ -1210,6 +1221,15 @@ actions carry scope, payload hash, dedupe, correlation/causation, requested
 permission, and an `allowed`, `approval_required`, or `denied` policy result.
 Protected actions cannot be self-approved. Task proposals enter the existing
 Task service/workflow and do not become authoritative work before persistence.
+
+The provider-facing generic coordination tool accepts the canonical nested
+`payload` and optional flat aliases for its declared operation fields, whether
+they arrive at the root or inside the tolerated `parameters` wrapper.
+Preparation merges those shapes, rejects conflicting duplicates, drops null
+aliases, and sends only the canonical envelope to policy and service
+validation. Required fields remain enforced there so a malformed model call
+returns a correctable tool error instead of terminating at provider schema
+validation.
 
 Attention is a deterministic, rebuildable projection of human input,
 validation/review state, stalls, health, budget thresholds, and overdue
@@ -1371,9 +1391,15 @@ gate.
 
 These review modes are Task workflow behavior, not Project approval layers.
 Project defaults may select a mode, and an individual Task may override it.
-When an execution is stopped or cancelled, Attention records the exact Task,
-role, reason, and recovery action and admits a wake for the configured Project
-Agent when available.
+An execution stop or cancellation first remains an attempt-level audit event.
+Automatic/deferred retries and expected cancellation or reassignment do not
+create Attention or a wake. Once Task disposition is settled, the atomic
+`task.interruption_changed` event records the effective Task state, reason,
+execution reference, and any advertised recovery actions; only an actionable
+result admits a wake for the configured Project Agent. The corresponding
+committed Task outcome remains the source of any human notification. A manually
+resumable terminal attempt with no disposition past the bounded settlement
+grace is handled by the orphan safety net as an actionable exception.
 
 ### Workflow engine (in progress)
 
@@ -1643,10 +1669,12 @@ likewise derives no failure semantics from workflow state names — gate
 reject/bounce targets come only from explicit `reject`/`fail` trigger edges or
 `gate_config.reject_target`.
 
-Hard failures and recovery states surface to the user as notifications:
+Human-facing notifications are task-outcome driven, not per-attempt:
 `task.failed` when `fail_task` sets `failed_json` (which also clears any stale
 blocking annotation), and `task.recovery_required` when crash recovery or an
-agent heartbeat timeout annotates a task for manual recovery.
+agent heartbeat timeout annotates a task for manual recovery. A raw
+`execution.failed` or `execution.cancelled` event is audit-only (and may
+resolve a `progress_warning`); it does not notify or wake by itself.
 Graceful-shutdown recoveries auto-resume at the next startup and are not
 notified. In the derived `workflow_exception` summary, a hard failure
 supersedes any blocking annotation — `recover_task` only accepts

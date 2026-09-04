@@ -979,6 +979,22 @@ async fn before_enter_blocks_when_required_before_work_hook_fails() {
         .iter()
         .any(|value| value == "skip_hook_once"));
     assert!(recovery_actions.iter().any(|value| value == "cancel_task"));
+    let interruption_payload: String = sqlx::query_scalar(
+        "SELECT payload_json FROM domain_event
+         WHERE event_type = 'task.interruption_changed' AND entity_id = ?
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(&task.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("blocking annotation commits an interruption event");
+    let interruption: serde_json::Value =
+        serde_json::from_str(&interruption_payload).expect("interruption event parses");
+    assert_eq!(interruption["requires_intervention"], true);
+    assert_eq!(
+        interruption["interruption"]["recovery_actions"],
+        annotation["recovery_actions"]
+    );
     let log_path = annotation["hook"]["log_path"]
         .as_str()
         .expect("hook log path recorded");

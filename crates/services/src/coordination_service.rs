@@ -17,7 +17,7 @@ use forge_agent_host::{
     operation_contract, OperationClassification, MAIN_CHARTER_DRAFT_OPERATION,
     MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION, MAIN_GENESIS_START_OPERATION,
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_RELEASE_OPERATION, TASK_ADAPTIVE_OPERATION,
-    TASK_PROPOSE_OPERATION, TASK_REVIEW_OPERATION,
+    TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -1304,6 +1304,37 @@ async fn authorize_action_approver(
     Ok(())
 }
 
+/// Whether a direct command is admitted for this permission and payload.
+///
+/// This is a second gate in front of the catalog: an operation the catalog
+/// classifies as `DirectCommand` still executes only if it appears here.
+/// `task.recover` was declared, implemented end to end, and named by the
+/// Project operating skill -- but omitted from this list, so every recovery
+/// attempt was refused as an unadmitted direct command. That left a Task
+/// which fails by construction retrying forever with no reachable remedy,
+/// because the doctrine's prescribed fix (cancelling it) is one of that
+/// operation's own actions. Kept pure and crate-visible so the paired test
+/// can hold it against the catalog instead of trusting it to stay in sync.
+pub(crate) fn is_admitted_direct_command(
+    operation: &str,
+    requested_permission: &str,
+    payload_json: Option<&str>,
+) -> bool {
+    if payload_json.is_some_and(|payload| is_allowed_project_draft_operation(operation, payload)) {
+        return true;
+    }
+    if is_allowed_main_orchestration_operation(requested_permission, operation) {
+        return true;
+    }
+    matches!(
+        operation,
+        TASK_ADAPTIVE_OPERATION
+            | TASK_PROPOSE_OPERATION
+            | TASK_REVIEW_OPERATION
+            | TASK_RECOVER_OPERATION
+    ) && requested_permission == "propose_task"
+}
+
 async fn evaluate_action_policy(
     db: &SqliteDb,
     actor_identity_id: &str,
@@ -1431,15 +1462,7 @@ async fn evaluate_action_policy(
     let payload_value =
         payload_json.and_then(|payload| serde_json::from_str::<Value>(payload).ok());
     let classification = classify_operation(operation, payload_value.as_ref());
-    let project_draft_allowed =
-        payload_json.is_some_and(|payload| is_allowed_project_draft_operation(operation, payload));
-    let main_orchestration_allowed =
-        is_allowed_main_orchestration_operation(requested_permission, operation);
-    let direct_allowed = project_draft_allowed
-        || main_orchestration_allowed
-        || (operation == TASK_ADAPTIVE_OPERATION && requested_permission == "propose_task")
-        || (operation == TASK_PROPOSE_OPERATION && requested_permission == "propose_task")
-        || (operation == TASK_REVIEW_OPERATION && requested_permission == "propose_task");
+    let direct_allowed = is_admitted_direct_command(operation, requested_permission, payload_json);
     if matches!(classification, OperationClassification::Denied) {
         return Ok((
             AgentActionPolicyResult::Denied,
@@ -2383,5 +2406,70 @@ mod tests {
             })
             .await;
         assert!(unrelated.is_err());
+    }
+
+    /// Every operation the catalog classifies as a Coordination
+    /// `DirectCommand` must also be admitted by the direct-command gate with
+    /// its own canonical permission. These are two independent lists, and
+    /// when they drifted the result was silent and expensive: `task.recover`
+    /// was declared, implemented, and documented, yet every call was refused
+    /// as "not admitted for this permission or payload" — so a Task that
+    /// fails by construction retried indefinitely with no reachable remedy.
+    #[test]
+    fn every_coordination_direct_command_is_admitted_with_its_own_permission() {
+        use forge_agent_host::{OperationExposure, OperationSurface, MIGRATED_OPERATION_CONTRACTS};
+
+        let mut checked = 0;
+        for contract in MIGRATED_OPERATION_CONTRACTS {
+            // Only `GenericProposal` operations reach this gate: they are
+            // composed into `forge_scope_propose` and executed through the
+            // shared direct-command path. A `TypedProposal` (task.worklog,
+            // task.evidence) is dispatched earlier to its own handler, which
+            // carries its own scope authorization, so it never consults this
+            // list and must not be required to appear in it.
+            if contract.surface != OperationSurface::Coordination
+                || contract.classification != OperationClassification::DirectCommand
+                || contract.exposure != OperationExposure::GenericProposal
+            {
+                continue;
+            }
+            let permission = contract
+                .supported_scopes
+                .iter()
+                .find_map(|scope| contract.permission.for_scope(*scope))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} has no permission for any supported scope",
+                        contract.operation
+                    )
+                });
+            assert!(
+                is_admitted_direct_command(contract.operation, permission, None),
+                "{} is a Coordination direct command with permission `{permission}` but the \
+                 direct-command gate refuses it; add it to `is_admitted_direct_command`",
+                contract.operation
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 4,
+            "expected task.propose/adaptive/review/recover, saw {checked}"
+        );
+    }
+
+    /// The gate is a permission check, not a name check: the right operation
+    /// with someone else's permission stays refused.
+    #[test]
+    fn a_direct_command_is_refused_under_the_wrong_permission() {
+        assert!(!is_admitted_direct_command(
+            TASK_RECOVER_OPERATION,
+            "read_project",
+            None
+        ));
+        assert!(!is_admitted_direct_command(
+            "task.nonexistent",
+            "propose_task",
+            None
+        ));
     }
 }

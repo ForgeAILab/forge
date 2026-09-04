@@ -7,7 +7,7 @@ use db::{
     AttentionRepo, ClaimDomainEvents, ClaimExecutionLease, CreateAgentIdentity, CreateAgentProfile,
     CreateDomainEvent, CreateExecution, CreateProject, DomainEventRepo, ExecutionLeaseDisposition,
     ExecutionRepo, ExecutionStatus, ProjectRepo, ResumePolicy, SelectAgentProfile, SqliteDb,
-    StopReason, TerminalizeExecution, UpdateAgentChatTurnJob, User, UserRepo,
+    StopReason, TaskRepo, TerminalizeExecution, UpdateAgentChatTurnJob, UpdateTask, User, UserRepo,
 };
 use services::{
     wake_attention_incident_digest, AgentChatService, AgentChatTurnRunner, AgentChatTurnWorker,
@@ -2005,12 +2005,11 @@ async fn setup_required_wake_reconsiders_after_binding_change() {
     assert_eq!(turn_count, 1);
 }
 
-/// The whole autonomy loop, end to end: a Task execution fails → the durable
-/// `execution.failed` event → Attention projects an incident and admits a
-/// wake for the Project Agent binding → the wake consumer queues a turn on
-/// the Project chat. No user message anywhere.
+/// The whole autonomy loop, end to end: a Task execution fails, its durable
+/// attempt event remains audit-only, the effective Task interruption commits,
+/// and only that post-disposition event wakes the Project Agent.
 #[tokio::test]
-async fn failed_execution_wakes_the_project_agent_end_to_end() {
+async fn actionable_task_interruption_wakes_the_project_agent_end_to_end() {
     let (db, database_path) = file_database().await;
     let identity_id = new_uuid_v4();
     let profile_id = identity_with_profile(&db, &identity_id).await;
@@ -2102,6 +2101,46 @@ async fn failed_execution_wakes_the_project_agent_end_to_end() {
     )
     .await
     .unwrap();
+    let task = TaskRepo::get_by_id(&*db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let annotation = serde_json::json!({
+        "type": "executor_failed",
+        "blocking_reason": "executor_failed",
+        "blocked_by": "system:executor",
+        "blocked_at": now,
+        "blocked_execution_id": execution_id,
+        "artifact": {"kind": "execution", "id": execution_id},
+        "recovery_actions": ["reexecute", "reset_to_initial", "cancel_task"]
+    });
+    TaskRepo::update(
+        &*db,
+        UpdateTask {
+            id: task.id,
+            expected_version: task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(Some(annotation.to_string())),
+            blocked_json: Some(Some(
+                serde_json::json!({
+                    "reason": "gemini exited with status 1",
+                    "kind": "internal_command_failed",
+                    "execution_id": execution_id
+                })
+                .to_string(),
+            )),
+            failed_json: Some(None),
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
     AttentionService::new(Arc::clone(&db))
         .project_once(100)
         .await
@@ -2114,7 +2153,7 @@ async fn failed_execution_wakes_the_project_agent_end_to_end() {
     .unwrap();
     assert_eq!(
         wake_count, 1,
-        "failed execution must admit exactly one wake"
+        "only the actionable Task disposition must admit one wake"
     );
 
     consumer.run_once(100).await.unwrap();
@@ -2131,7 +2170,7 @@ async fn failed_execution_wakes_the_project_agent_end_to_end() {
     .unwrap();
     assert_eq!(status, "queued");
     assert_eq!(responder, identity_id);
-    assert!(content.contains("Task execution stopped"));
+    assert!(content.contains("Task needs recovery"));
     drop(db);
     let _ = std::fs::remove_file(database_path);
 }

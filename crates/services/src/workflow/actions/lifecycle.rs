@@ -215,14 +215,35 @@ async fn annotate_before_work_hook_block(
         "recovery_actions": ["retry_hook", "update_workspace_and_retry_hook", "skip_hook_once", "cancel_task"],
     });
 
-    sqlx::query(
+    // `before_enter` owns the Task version used by the surrounding workflow
+    // transition, so this annotation deliberately retains that historical
+    // version behavior. The recovery event still commits atomically with the
+    // annotation and uses its own mutation id for dedupe.
+    let updated_at = now_rfc3339();
+    let mut transaction = db::begin_immediate(ctx.db.pool()).await?;
+    let update = sqlx::query(
         "UPDATE task SET error_annotation = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
     )
     .bind(annotation.to_string())
-    .bind(now_rfc3339())
+    .bind(&updated_at)
     .bind(&task.id)
-    .execute(ctx.db.pool())
+    .execute(&mut *transaction)
     .await?;
+    if update.rows_affected() != 1 {
+        return Err(db::DbError::NotFound);
+    }
+    let mut interruption_snapshot = task.clone();
+    interruption_snapshot.error_annotation = Some(annotation.to_string());
+    interruption_snapshot.updated_at = updated_at;
+    let mut interruption_event =
+        db::CreateDomainEvent::task_interruption_changed(&interruption_snapshot);
+    interruption_event.dedupe_key = Some(format!(
+        "task-interruption-hook:{}:{}",
+        task.id, interruption_event.id
+    ));
+    db::DomainEventRepo::append_event_in_tx(&*ctx.db, &mut transaction, &interruption_event)
+        .await?;
+    transaction.commit().await?;
     Ok(())
 }
 

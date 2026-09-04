@@ -192,6 +192,17 @@ impl TaskBoardRepo for SqliteDb {
             });
         }
 
+        let updated_task_row =
+            sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
+                .bind(&input.task_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let updated_task = map_task(updated_task_row)?;
+        if task.blocked_json != updated_task.blocked_json {
+            let interruption_event = CreateDomainEvent::task_interruption_changed(&updated_task);
+            DomainEventRepo::append_event_in_tx(self, &mut tx, &interruption_event).await?;
+        }
+
         let transition_input = CreateTransitionLog {
             id: input.transition_log_id.clone(),
             task_id: input.task_id.clone(),
@@ -219,11 +230,6 @@ impl TaskBoardRepo for SqliteDb {
         );
         DomainEventRepo::append_event_in_tx(self, &mut tx, &transition_event).await?;
 
-        let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
-            .bind(&input.task_id)
-            .fetch_one(&mut *tx)
-            .await?;
-        let updated_task = map_task(task_row)?;
         let board_revision =
             sqlx::query_scalar::<_, i64>("SELECT board_revision FROM project WHERE id = ?")
                 .bind(&input.project_id)

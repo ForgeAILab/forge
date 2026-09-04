@@ -541,9 +541,17 @@ execution record exposes owner health, lease expiry/hard deadline, heartbeat,
 and semantic progress separately. A quiet provider/tool call remains healthy
 while its owner lease is current, and a hard deadline still bounds it.
 
-Terminal execution events—including explicit stops and cancellations—feed
-Attention and the durable `agent-wake-turns`
-consumer. A relevant Project incident is recorded as exactly one of
+Terminal execution events—including explicit stops and cancellations—remain
+per-attempt audit records and may resolve a semantic progress warning; they do
+not directly feed Attention or the durable `agent-wake-turns` consumer. The
+dispatcher commits the effective Task disposition as one atomic
+`task.interruption_changed` event. Only an actionable post-disposition Task
+state creates/resolves Attention and can wake the Project Agent or notify a
+human. Automatic/deferred retries and expected cancellation or reassignment
+are silent. A manually resumable terminal run with no Task disposition past
+the bounded settlement grace is promoted by the orphan safety net as an
+actionable Attention item. A relevant Project incident is recorded as exactly
+one of
 `turn_admitted`, `deterministically_suppressed`, `deferred`, or
 `setup_required`. An admitted wake uses the same responder resolver, current
 Profile selection, canonical Project scope, and turn runner as a user message

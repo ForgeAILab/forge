@@ -6,6 +6,30 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-09-04
+
+### Fixed
+
+- **Provider-flattened Task proposals now reach the canonical payload
+  validator.** The generic coordination schema exposes operation fields both
+  inside `payload` and as optional flat aliases (including inside the tolerated
+  `parameters` envelope). Preparation merges the mixed envelope and lifts the
+  aliases into one canonical payload, while rejecting conflicting duplicates.
+  This keeps missing required fields correctable in-turn and lets
+  `task.recover` reliably carry `task_id`, `reason`, and `action` without
+  restoring provider-side turn failures.
+
+### Changed
+
+- **Execution attempt failures are now audit-only until Task disposition.**
+  `execution.failed` and `execution.cancelled` remain durable per-attempt
+  audit/progress-warning events, but automatic/deferred retries and expected
+  cancellation or reassignment do not wake or notify. An atomic
+  `task.interruption_changed` event represents the effective Task disposition;
+  only its actionable outcome drives Project-Agent or human attention. A
+  manually resumable terminal attempt with no disposition past the bounded
+  settlement grace is handled by the orphan safety net.
+
 ## [0.9.1] - 2026-09-03
 
 ### Added

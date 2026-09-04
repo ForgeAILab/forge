@@ -1497,7 +1497,24 @@ impl CoordinationToolProvider {
             .filter(|value| value.is_object())
             .cloned()
             .ok_or_else(|| {
-                AgentHostError::Unsupported("proposal payload must be an object".into())
+                // The schema declares `payload` nullable rather than
+                // required (a cross-provider compatibility choice), so a
+                // model can legally omit it and some do -- sending the
+                // operation's fields at the top level, or inside an invented
+                // wrapper. Naming the expected shape is the only thing that
+                // lets it correct the call; the bare message left the Agent
+                // with a non-retryable dead end.
+                let operation_hint = arguments
+                    .get("operation")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<operation>");
+                AgentHostError::Unsupported(format!(
+                    "proposal payload must be an object: put this operation's own fields \
+                     inside a `payload` object, as {{\"operation\": \"{operation_hint}\", \
+                     \"payload\": {{ ...fields... }}, \"dedupe_key\": \"...\", \
+                     \"correlation_id\": \"...\"}}. The `payload` property description \
+                     lists the fields each operation takes."
+                ))
             })?;
         let descriptor = operation_descriptor(scope.scope_type, operation, Some(&payload));
         let classification = descriptor.classification;
@@ -1825,7 +1842,7 @@ impl CoordinationToolProvider {
             })?;
             let payload: TaskReviewPayload =
                 typed_command_payload(operation, scope, &correlation_id, payload)?;
-            let (policy_result, _) = self
+            let (policy_result, policy_reason) = self
                 .actions
                 .evaluate_direct_command_policy(
                     actor_identity_id,
@@ -1838,6 +1855,14 @@ impl CoordinationToolProvider {
                 .await
                 .map_err(service_error)?;
             if !matches!(policy_result, AgentActionPolicyResult::Allowed) {
+                // The evaluator's reason is the only thing that says which
+                // ceiling refused this. Dropping it left an opaque
+                // `policy_denied` that no operator or Agent could act on.
+                tracing::warn!(
+                    operation,
+                    diagnostic = policy_reason.as_deref().unwrap_or("no reason recorded"),
+                    "task review command policy denied"
+                );
                 return Err(AgentHostError::Authority(
                     "Task review command policy did not admit execution".to_owned(),
                 ));
@@ -1926,7 +1951,7 @@ impl CoordinationToolProvider {
                     "task_id must name a Task in this Project".to_owned(),
                 ));
             }
-            let (policy_result, _) = self
+            let (policy_result, policy_reason) = self
                 .actions
                 .evaluate_direct_command_policy(
                     actor_identity_id,
@@ -1939,6 +1964,14 @@ impl CoordinationToolProvider {
                 .await
                 .map_err(service_error)?;
             if !matches!(policy_result, AgentActionPolicyResult::Allowed) {
+                // The evaluator's reason is the only thing that says which
+                // ceiling refused this. Dropping it left an opaque
+                // `policy_denied` that no operator or Agent could act on.
+                tracing::warn!(
+                    operation,
+                    diagnostic = policy_reason.as_deref().unwrap_or("no reason recorded"),
+                    "task recovery command policy denied"
+                );
                 return Err(AgentHostError::Authority(
                     "Task recovery command policy did not admit execution".to_owned(),
                 ));

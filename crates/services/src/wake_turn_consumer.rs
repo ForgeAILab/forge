@@ -1598,6 +1598,80 @@ fn delivery_followup_task_id(attention: &db::AttentionProjection) -> Option<Stri
         .map(str::to_owned)
 }
 
+/// Recover the bounded recovery snapshot attached to an execution failure.
+///
+/// New Attention rows carry an object so that a scheduled retry can be
+/// distinguished from a failure that needs intervention. Older rows used the
+/// recovery action array directly; keep those rows readable, but treat their
+/// actions as a context snapshot rather than authority.
+fn execution_recovery_snapshot(attention: &db::AttentionProjection) -> (Vec<String>, bool) {
+    let details = serde_json::from_str::<Value>(&attention.details_json).unwrap_or(Value::Null);
+    let Some(recovery) = details.get("recovery") else {
+        return (Vec::new(), false);
+    };
+
+    match recovery {
+        Value::Object(recovery) => {
+            let actions = recovery
+                .get("actions")
+                .and_then(Value::as_array)
+                .map(|actions| {
+                    actions
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|action| !action.trim().is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let automatic_retry = recovery
+                .get("automatic_retry")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            (actions, automatic_retry)
+        }
+        Value::Array(actions) => (
+            actions
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|action| !action.trim().is_empty())
+                .map(str::to_owned)
+                .collect(),
+            false,
+        ),
+        _ => (Vec::new(), false),
+    }
+}
+
+/// Give execution-failure wakes a constrained work order. The action list is
+/// only the Attention's snapshot; `task.recover` remains server-authorized
+/// against the current Task state.
+fn execution_failed_directive(attention: &db::AttentionProjection) -> String {
+    let (actions, automatic_retry) = execution_recovery_snapshot(attention);
+    let action_snapshot = if actions.is_empty() {
+        "No recovery action is advertised by this Attention snapshot.".to_owned()
+    } else {
+        format!(
+            "Attention snapshot actions (context only): {}.",
+            actions.join(", ")
+        )
+    };
+
+    if automatic_retry {
+        format!(
+            "EXECUTION FAILURE RECOVERY\nAutomatic retry is scheduled or in progress. This wake is observation-only: refresh the current Task state and inspect/diagnose the execution, but do not manually retry, reexecute, resume, or invoke `task.recover` while that retry is pending. {action_snapshot} After it settles, use only a recovery action currently advertised by the current Task; the server remains authoritative and may reject stale or unsupported actions."
+        )
+    } else if actions.is_empty() {
+        format!(
+            "EXECUTION FAILURE RECOVERY\nRefresh the current Task state and inspect/diagnose the failed execution. {action_snapshot} Do not invoke `task.recover` unless the current Task advertises a recovery action; this wake grants no recovery action."
+        )
+    } else {
+        format!(
+            "EXECUTION FAILURE RECOVERY\nRefresh the current Task state before acting. {action_snapshot} Use only a recovery action currently advertised by the current Task; this list is a context snapshot, and the server remains authoritative and may reject stale or unsupported actions."
+        )
+    }
+}
+
 fn wake_content(
     attention: &db::AttentionProjection,
     delivery: Option<&DeliveryFollowupState>,
@@ -1616,13 +1690,19 @@ fn wake_content(
             None => String::new(),
         };
     let decision_requirement = decision_directive(attention);
+    let final_instruction = if attention.attention_type == "execution_failed" {
+        execution_failed_directive(attention)
+    } else {
+        "Assess the current state with your tools and take the action this incident requires. If a decision genuinely belongs to the user, ask for it; otherwise proceed.".to_owned()
+    };
     format!(
-        "### Attention wake: {}\n\nCategory: {} — recommended action: {}.\nIncident: {}{}\nAssess the current state with your tools and take the action this incident requires. If a decision genuinely belongs to the user, ask for it; otherwise proceed.",
+        "### Attention wake: {}\n\nCategory: {} — recommended action: {}.\nIncident: {}{}\n{}",
         attention.summary,
         attention.attention_type,
         attention.recommended_action,
         attention.dedupe_key,
-        format_args!("{details}{delivery_requirement}{decision_requirement}")
+        format_args!("{details}{delivery_requirement}{decision_requirement}"),
+        final_instruction,
     )
 }
 
@@ -1891,6 +1971,7 @@ mod tests {
         let content = wake_content(&attention("run_stalled", "{}"), None);
         assert!(!content.contains("USER DECISION"));
         assert!(content.starts_with("### Attention wake: "));
+        assert!(content.contains("otherwise proceed."));
     }
 
     #[test]
@@ -1898,5 +1979,71 @@ mod tests {
         let directive = decision_directive(&attention("decision_recorded", "{}"));
         assert!(directive.contains("The user decided on the pending item"));
         assert!(directive.contains("continue from the decision"));
+    }
+
+    #[test]
+    fn execution_failure_wake_uses_only_currently_advertised_actions() {
+        let content = wake_content(
+            &attention(
+                "execution_failed",
+                r#"{"recovery":{"requires_intervention":true,"actions":["reexecute","cancel_task"],"automatic_retry":false}}"#,
+            ),
+            None,
+        );
+
+        assert!(content.contains("EXECUTION FAILURE RECOVERY"));
+        assert!(content.contains("Refresh the current Task state before acting"));
+        assert!(content.contains("reexecute, cancel_task"));
+        assert!(content.contains("Use only a recovery action currently advertised"));
+        assert!(content.contains("server remains authoritative"));
+        assert!(!content.contains("otherwise proceed."));
+    }
+
+    #[test]
+    fn execution_failure_with_automatic_retry_is_observation_only() {
+        let content = wake_content(
+            &attention(
+                "execution_failed",
+                r#"{"recovery":{"requires_intervention":false,"actions":["reexecute"],"automatic_retry":true}}"#,
+            ),
+            None,
+        );
+
+        assert!(content.contains("Automatic retry is scheduled or in progress"));
+        assert!(content.contains("observation-only"));
+        assert!(content.contains("do not manually retry, reexecute, resume"));
+        assert!(content.contains("or invoke `task.recover`"));
+        assert!(content.contains("reexecute"));
+        assert!(content.contains("use only a recovery action currently advertised"));
+        assert!(!content.contains("otherwise proceed."));
+    }
+
+    #[test]
+    fn execution_failure_without_actions_does_not_grant_recovery() {
+        let content = wake_content(
+            &attention(
+                "execution_failed",
+                r#"{"recovery":{"requires_intervention":false,"actions":[],"automatic_retry":false}}"#,
+            ),
+            None,
+        );
+
+        assert!(content.contains("inspect/diagnose the failed execution"));
+        assert!(content.contains("No recovery action is advertised"));
+        assert!(content.contains(
+            "Do not invoke `task.recover` unless the current Task advertises a recovery action"
+        ));
+        assert!(!content.contains("otherwise proceed."));
+    }
+
+    #[test]
+    fn execution_failure_legacy_recovery_array_remains_context_only() {
+        let content = wake_content(
+            &attention("execution_failed", r#"{"recovery":["reexecute"]}"#),
+            None,
+        );
+
+        assert!(content.contains("Attention snapshot actions (context only): reexecute"));
+        assert!(content.contains("Use only a recovery action currently advertised"));
     }
 }

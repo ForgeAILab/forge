@@ -1020,17 +1020,90 @@ fn tolerate_parameters_envelope(schema: Value) -> Value {
     envelope
 }
 
-/// Undo the envelope `tolerate_parameters_envelope` admits: a call that carries
-/// only `parameters` is the call inside it.
-fn unwrap_parameters_envelope(arguments: Value) -> Value {
-    let is_envelope = arguments.as_object().is_some_and(|object| {
-        object.len() == 1 && object.get("parameters").is_some_and(Value::is_object)
-    });
-    if is_envelope {
-        arguments["parameters"].clone()
-    } else {
-        arguments
+/// Undo the envelope `tolerate_parameters_envelope` admits. Providers emit
+/// both a complete wrapper and a mixed shape with canonical fields outside
+/// plus operation fields inside `parameters`; merge either form before Forge
+/// validates it, rejecting ambiguous duplicates.
+fn unwrap_parameters_envelope(mut arguments: Value) -> Result<Value, RuntimeError> {
+    let Some(object) = arguments.as_object_mut() else {
+        return Ok(arguments);
+    };
+    let Some(parameters) = object.remove("parameters") else {
+        return Ok(arguments);
+    };
+    let Value::Object(parameters) = parameters else {
+        return Err(RuntimeError::tool("parameters must be an object"));
+    };
+    for (field, value) in parameters {
+        if let Some(outer) = object.get(&field) {
+            if outer != &value {
+                return Err(RuntimeError::tool(format!(
+                    "Forge tool field `{field}` conflicts with parameters.{field}"
+                )));
+            }
+        } else {
+            object.insert(field, value);
+        }
     }
+    Ok(arguments)
+}
+
+/// Canonicalize provider-friendly flat coordination fields into `payload`.
+/// The runtime schema exposes both forms because several function-calling
+/// providers lose the nested object while still producing its fields. The
+/// server receives only the canonical envelope.
+fn lift_coordination_payload(
+    arguments: &mut Value,
+    operations: &BTreeSet<String>,
+) -> Result<(), RuntimeError> {
+    let Some(payload_properties) = coordination_payload_properties(operations) else {
+        return Ok(());
+    };
+    let Some(payload_properties) = payload_properties.as_object() else {
+        return Ok(());
+    };
+    let Some(object) = arguments.as_object_mut() else {
+        return Ok(());
+    };
+    let mut flat_payload = Map::new();
+    for field in payload_properties.keys() {
+        if let Some(value) = object.remove(field) {
+            // Provider schemas declare aliases nullable so an explicit null
+            // reaches `prepare`; null means omitted and must not become an
+            // operation-specific payload field.
+            if !value.is_null() {
+                flat_payload.insert(field.clone(), value);
+            }
+        }
+    }
+    if flat_payload.is_empty() {
+        return Ok(());
+    }
+
+    match object.get_mut("payload") {
+        None | Some(Value::Null) => {
+            object.insert("payload".to_owned(), Value::Object(flat_payload));
+        }
+        Some(Value::Object(payload)) => {
+            for (field, value) in flat_payload {
+                if let Some(nested) = payload.get(&field) {
+                    if nested != &value {
+                        return Err(RuntimeError::tool(format!(
+                            "Forge proposal field `{field}` conflicts with payload.{field}"
+                        )));
+                    }
+                } else {
+                    payload.insert(field, value);
+                }
+            }
+        }
+        Some(_) => {
+            return Err(RuntimeError::tool(
+                "Forge orchestration payload must be an object",
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl ForgeScopeReadTool {
@@ -1118,7 +1191,7 @@ impl Tool for ForgeScopeReadTool {
         arguments: Value,
         ctx: &PreparationContext,
     ) -> Result<PreparedToolCall, RuntimeError> {
-        let arguments = unwrap_parameters_envelope(arguments);
+        let arguments = unwrap_parameters_envelope(arguments)?;
         let object = arguments
             .as_object()
             .ok_or_else(|| RuntimeError::tool("Forge read arguments must be an object"))?;
@@ -1371,10 +1444,11 @@ impl ForgeScopeProposeTool {
             if !guidance.is_empty() {
                 payload_property["description"] = json!(guidance);
             }
-            if let Some(properties) = coordination_payload_properties(&self.operations) {
-                payload_property["properties"] = properties;
+            let payload_properties = coordination_payload_properties(&self.operations);
+            if let Some(properties) = payload_properties.as_ref() {
+                payload_property["properties"] = properties.clone();
             }
-            json!({
+            let mut schema = json!({
                 "type": "object",
                 "required": ["operation", "payload", "dedupe_key", "correlation_id"],
                 "properties": {
@@ -1395,7 +1469,16 @@ impl ForgeScopeProposeTool {
                     "causation_depth": {"type": ["integer", "null"], "minimum": 0, "maximum": 8}
                 },
                 "additionalProperties": false
-            })
+            });
+            // Provider-friendly aliases. `prepare` removes these and builds
+            // the canonical payload object, so the service boundary still
+            // sees exactly one envelope shape.
+            if let Some(Value::Object(properties)) = payload_properties {
+                if let Some(root) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+                    root.extend(properties);
+                }
+            }
+            schema
         };
         ToolSpec::new(
             self.tool_name,
@@ -1420,7 +1503,8 @@ impl Tool for ForgeScopeProposeTool {
         arguments: Value,
         ctx: &PreparationContext,
     ) -> Result<PreparedToolCall, RuntimeError> {
-        let mut arguments = unwrap_parameters_envelope(arguments);
+        let mut arguments = unwrap_parameters_envelope(arguments)?;
+        lift_coordination_payload(&mut arguments, &self.operations)?;
         let operation = required_string(&arguments, "operation")?.to_owned();
         let operation = operation.as_str();
         if !self.operations.contains(operation) {
@@ -2390,6 +2474,72 @@ mod tests {
             .await
             .expect_err("an enveloped call missing dedupe_key is refused in prepare");
         assert!(refused.to_string().contains("dedupe_key"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn generic_recovery_lifts_flat_provider_fields_into_payload() {
+        let operation = crate::operation_catalog::TASK_RECOVER_OPERATION;
+        let tool = ForgeScopeProposeTool::new(
+            "agent-1".to_owned(),
+            CanonicalScope {
+                scope_type: CanonicalScopeType::Project,
+                scope_id: "project-1".to_owned(),
+                workspace_access: WorkspaceAccess::Deny,
+            },
+            vec![operation.to_owned()],
+            Arc::new(TestProvider::default()),
+        );
+        let mixed = json!({
+            "operation": operation,
+            "dedupe_key": "recover-task-1",
+            "correlation_id": "recover-task-1",
+            "parameters": {
+                "operation": operation,
+                "task_id": "task-1",
+                "reason": "the executor stopped",
+                "action": "reexecute"
+            }
+        });
+        let validator = jsonschema::validator_for(&tool.spec().input_schema).expect("schema");
+        assert!(
+            validator.validate(&mixed).is_ok(),
+            "provider-facing schema admits mixed flat recovery fields"
+        );
+        let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
+            root: "<none>".to_owned(),
+        });
+        let prepared = tool
+            .prepare(mixed, &command_preparation_context(workspace.clone()))
+            .await
+            .expect("flat recovery call prepares");
+        assert_eq!(prepared.arguments()["operation"], operation);
+        assert_eq!(prepared.arguments()["payload"]["task_id"], "task-1");
+        assert_eq!(
+            prepared.arguments()["payload"]["reason"],
+            "the executor stopped"
+        );
+        assert_eq!(prepared.arguments()["payload"]["action"], "reexecute");
+        assert!(prepared.arguments().get("parameters").is_none());
+        assert!(prepared.arguments().get("task_id").is_none());
+
+        let conflict = tool
+            .prepare(
+                json!({
+                    "operation": operation,
+                    "payload": {
+                        "task_id": "task-1",
+                        "reason": "the executor stopped",
+                        "action": "cancel_task"
+                    },
+                    "action": "reexecute",
+                    "dedupe_key": "recover-task-1-conflict",
+                    "correlation_id": "recover-task-1-conflict"
+                }),
+                &command_preparation_context(workspace),
+            )
+            .await
+            .expect_err("conflicting flat and nested fields are ambiguous");
+        assert!(conflict.to_string().contains("conflicts"), "{conflict}");
     }
 
     #[tokio::test]

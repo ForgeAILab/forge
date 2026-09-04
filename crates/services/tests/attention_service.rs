@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
+use chrono::{Duration, Utc};
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
     AttentionRepo, CreateAgentIdentity, CreateAgentProfile, CreateAttentionProjection,
-    CreateDomainEvent, CreateProject, CreateTask, DomainEventRepo, ProjectRepo, SqliteDb, TaskRepo,
-    UpdateAttentionLifecycle,
+    CreateDomainEvent, CreateExecution, CreateProject, CreateTask, DomainEventRepo, ExecutionRepo,
+    ExecutionStatus, ProjectRepo, ResumePolicy, SqliteDb, TaskRepo, UpdateAttentionLifecycle,
 };
 use services::{
     workflow::{default_autonomous_workflow, default_workflow},
@@ -56,6 +57,119 @@ async fn identity(db: &SqliteDb, id: &str) {
             daemon_id: None,
             created_at: now.clone(),
             updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// Create a Project with the supplied identity as its active Project Agent.
+/// Project creation seeds the setup-required binding; this helper only fills
+/// in the binding fields that wake admission requires.
+async fn configured_project(db: &Arc<SqliteDb>, identity_id: &str, name: &str) -> String {
+    let profile_id: String =
+        sqlx::query_scalar("SELECT selected_profile_id FROM agent_identity WHERE id = ?")
+            .bind(identity_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let project_id = new_uuid_v4();
+    let now = now_rfc3339();
+    ProjectRepo::create(
+        &**db,
+        CreateProject {
+            id: project_id.clone(),
+            name: name.to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE project_agent_binding
+         SET identity_id = ?, profile_id = ?, state = 'active', wake_budget = 10,
+             version = version + 1, updated_at = ?
+         WHERE project_id = ? AND state = 'agent_setup_required'",
+    )
+    .bind(identity_id)
+    .bind(profile_id)
+    .bind(&now)
+    .bind(&project_id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    project_id
+}
+
+async fn project_task(db: &Arc<SqliteDb>, project_id: &str, title: &str) -> db::Task {
+    let now = now_rfc3339();
+    TaskRepo::create(
+        &**db,
+        CreateTask {
+            id: new_uuid_v4(),
+            project_id: project_id.to_owned(),
+            repo_id: None,
+            parent_task_id: None,
+            subtask_order: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: title.to_owned(),
+            description: None,
+            task_type: "task".to_owned(),
+            status: "in_progress".to_owned(),
+            is_automation: false,
+            priority: 0,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+async fn append_attention_event(
+    db: &Arc<SqliteDb>,
+    event_type: &str,
+    task_id: &str,
+    project_id: &str,
+    payload: serde_json::Value,
+) {
+    append_attention_event_at(db, event_type, task_id, project_id, payload, &now_rfc3339()).await;
+}
+
+async fn append_attention_event_at(
+    db: &Arc<SqliteDb>,
+    event_type: &str,
+    task_id: &str,
+    project_id: &str,
+    payload: serde_json::Value,
+    created_at: &str,
+) {
+    DomainEventRepo::append_event(
+        &**db,
+        CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: event_type.to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: task_id.to_owned(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "project".to_owned(),
+            scope_id: project_id.to_owned(),
+            correlation_id: new_uuid_v4(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(new_uuid_v4()),
+            payload_json: payload.to_string(),
+            created_at: created_at.to_owned(),
         },
     )
     .await
@@ -339,10 +453,8 @@ async fn retry_exhausted_agent_chat_is_suppressed_before_binding_setup() {
     .await
     .unwrap();
 
-    AttentionService::new(Arc::clone(&db))
-        .project_once(100)
-        .await
-        .unwrap();
+    let service = AttentionService::new(Arc::clone(&db));
+    service.project_once(100).await.unwrap();
     let (reason, attention_scope): (String, String) = sqlx::query_as(
         "SELECT
             json_extract(payload_json, '$.reason'),
@@ -627,6 +739,140 @@ async fn resolved_attention_is_suppressed_with_incident_reference() {
 }
 
 #[tokio::test]
+async fn recovered_task_suppresses_a_stale_interruption_wake_before_budget() {
+    let db = database().await;
+    let identity_id = new_uuid_v4();
+    identity(&db, &identity_id).await;
+    let project_id = configured_project(&db, &identity_id, "stale-recovery-project").await;
+    let task = project_task(&db, &project_id, "Already recovered").await;
+    let source_event = DomainEventRepo::append_event(
+        &*db,
+        CreateDomainEvent {
+            id: new_uuid_v4(),
+            event_type: "task.interruption_changed".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: task.id.clone(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "task".to_owned(),
+            scope_id: task.id.clone(),
+            correlation_id: new_uuid_v4(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(new_uuid_v4()),
+            payload_json: serde_json::json!({
+                "task_id": task.id,
+                "task_version": task.version,
+                "requires_intervention": true,
+                "interruption": {
+                    "source": "blocked",
+                    "recovery_actions": ["reexecute"]
+                }
+            })
+            .to_string(),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    let incident_key = format!(
+        "attention:execution_failed:project:{project_id}:task:{}",
+        task.id
+    );
+    let attention = AttentionRepo::insert_attention(
+        &*db,
+        CreateAttentionProjection {
+            id: new_uuid_v4(),
+            attention_type: "execution_failed".to_owned(),
+            scope_type: "project".to_owned(),
+            scope_id: project_id.clone(),
+            identity_id: Some(identity_id.clone()),
+            source_event_id: source_event.id.clone(),
+            priority: 85,
+            status: "open".to_owned(),
+            summary: "Task needs recovery".to_owned(),
+            details_json: serde_json::json!({
+                "source_event_type": "task.interruption_changed",
+                "entity_type": "task",
+                "entity_id": task.id,
+                "scope_type": "project",
+                "scope_id": project_id,
+                "recovery": {
+                    "requires_intervention": true,
+                    "actions": ["reexecute"],
+                    "automatic_retry": false
+                }
+            })
+            .to_string(),
+            dedupe_key: incident_key.clone(),
+            occurred_at: source_event.created_at.clone(),
+            updated_at: now_rfc3339(),
+            acknowledged_at: None,
+            snoozed_until: None,
+            resolved_at: None,
+            updated_by_user_id: None,
+            recommended_action: "inspect_task".to_owned(),
+            source_sequence: Some(source_event.sequence),
+        },
+    )
+    .await
+    .unwrap();
+
+    let result = AttentionService::new(Arc::clone(&db))
+        .admit_wake(WakeAdmissionRequest {
+            identity_id,
+            scope_type: "project".to_owned(),
+            scope_id: project_id.clone(),
+            incident_key,
+            lease_owner: "stale-recovery-worker".to_owned(),
+            correlation_id: source_event.correlation_id,
+            causation_id: Some(source_event.id),
+            caused_by_identity_id: None,
+            reaction_depth: 0,
+            now: now_rfc3339(),
+            lease_seconds: 30,
+            cooldown_seconds: 60,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        WakeAdmissionResult::Suppressed {
+            reason: WakeSuppressionReason::ResolvedIncident
+        }
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM attention_projection WHERE id = ?")
+            .bind(&attention.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        "resolved"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM agent_wake_budget_window WHERE scope_id = ?",
+        )
+        .bind(&project_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'agent.wake.admitted' AND scope_id = ?",
+        )
+        .bind(&project_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn projection_worker_drains_events_reports_health_and_stops() {
     let db = database().await;
     let project_id = new_uuid_v4();
@@ -872,6 +1118,404 @@ async fn projected_incident_emits_one_durable_wake_action_and_replay_is_suppress
 }
 
 #[tokio::test]
+async fn auto_retried_execution_failure_is_audit_only() {
+    let db = database().await;
+    let identity_id = new_uuid_v4();
+    identity(&db, &identity_id).await;
+    let project_id = configured_project(&db, &identity_id, "auto-retry-project").await;
+    let task = project_task(&db, &project_id, "Retry without waking the Project Agent").await;
+    let execution_id = new_uuid_v4();
+    let now = now_rfc3339();
+
+    // Use a real terminal Execution row so the projection exercises the
+    // retry/resume policy boundary rather than trusting prose in the event.
+    ExecutionRepo::create(
+        &*db,
+        CreateExecution {
+            id: execution_id.clone(),
+            task_id: task.id.clone(),
+            agent_id: Some(identity_id),
+            role: "coder".to_owned(),
+            status: ExecutionStatus::Failed,
+            stop_reason: Some(db::StopReason::ExecutorFailed),
+            stopped_by: Some("system:executor".to_owned()),
+            resume_policy: Some(ResumePolicy::Auto),
+            stopped_at: Some(now.clone()),
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: Some("transient executor failure".to_owned()),
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    append_attention_event(
+        &db,
+        "execution.failed",
+        &task.id,
+        &project_id,
+        serde_json::json!({
+            "execution_id": execution_id,
+            "task_id": task.id,
+            "role": "coder",
+            "status": "failed",
+            "stop_reason": "executor_failed",
+            "error": "transient executor failure",
+        }),
+    )
+    .await;
+
+    AttentionService::new(Arc::clone(&db))
+        .project_once(100)
+        .await
+        .unwrap();
+
+    let attention_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM attention_projection
+         WHERE attention_type = 'execution_failed' AND scope_id = ?",
+    )
+    .bind(&project_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let wake_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event
+         WHERE event_type = 'agent.wake.admitted' AND scope_id = ?",
+    )
+    .bind(&project_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        attention_count, 0,
+        "automatic retry must not create Attention"
+    );
+    assert_eq!(wake_count, 0, "automatic retry must not wake Project Agent");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_wake_lease WHERE scope_id = ?",)
+            .bind(&project_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn undisposed_manual_execution_failure_becomes_actionable_after_grace() {
+    let db = database().await;
+    let identity_id = new_uuid_v4();
+    identity(&db, &identity_id).await;
+    let project_id = configured_project(&db, &identity_id, "orphaned-failure-project").await;
+    let task = project_task(&db, &project_id, "Recover an orphaned terminal attempt").await;
+    let execution_id = new_uuid_v4();
+    let terminal_at = (Utc::now() - Duration::minutes(1)).to_rfc3339();
+
+    ExecutionRepo::create(
+        &*db,
+        CreateExecution {
+            id: execution_id.clone(),
+            task_id: task.id.clone(),
+            agent_id: Some(identity_id),
+            role: "coder".to_owned(),
+            status: ExecutionStatus::Failed,
+            stop_reason: Some(db::StopReason::ExecutorFailed),
+            stopped_by: Some("system:executor".to_owned()),
+            resume_policy: Some(ResumePolicy::Manual),
+            stopped_at: Some(terminal_at.clone()),
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: Some("terminalization committed before disposition".to_owned()),
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: terminal_at.clone(),
+            updated_at: terminal_at.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    append_attention_event_at(
+        &db,
+        "execution.failed",
+        &task.id,
+        &project_id,
+        serde_json::json!({
+            "execution_id": execution_id,
+            "task_id": task.id,
+            "role": "coder",
+            "status": "failed",
+            "stop_reason": "executor_failed",
+        }),
+        &terminal_at,
+    )
+    .await;
+
+    let service = AttentionService::new(Arc::clone(&db));
+    service.project_once(100).await.unwrap();
+
+    let attention: (String, String) = sqlx::query_as(
+        "SELECT status, details_json FROM attention_projection
+         WHERE attention_type = 'execution_failed' AND scope_id = ?",
+    )
+    .bind(&project_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(attention.0, "open");
+    let details: serde_json::Value = serde_json::from_str(&attention.1).unwrap();
+    assert_eq!(details["source_event_type"], "execution.failed");
+    assert_eq!(details["recovery"]["requires_intervention"], true);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'agent.wake.admitted' AND scope_id = ?",
+        )
+        .bind(&project_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        1
+    );
+
+    // A late Task disposition updates the same incident rather than creating
+    // an execution-keyed duplicate, and its later recovery resolves it.
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let blocked = TaskRepo::update(
+        &*db,
+        db::UpdateTask {
+            id: task.id.clone(),
+            expected_version: current.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(Some(
+                serde_json::json!({
+                    "type": "executor_failed",
+                    "recovery_actions": ["reexecute", "cancel_task"]
+                })
+                .to_string(),
+            )),
+            blocked_json: Some(Some(
+                serde_json::json!({
+                    "reason": "late dispatcher disposition",
+                    "kind": "executor_failed",
+                    "execution_id": execution_id
+                })
+                .to_string(),
+            )),
+            failed_json: None,
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    service.project_once(100).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM attention_projection
+             WHERE attention_type = 'execution_failed' AND scope_id = ?",
+        )
+        .bind(&project_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'agent.wake.admitted' AND scope_id = ?",
+        )
+        .bind(&project_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        1,
+        "late Task disposition must not create a second wake for the incident"
+    );
+
+    TaskRepo::update(
+        &*db,
+        db::UpdateTask {
+            id: task.id.clone(),
+            expected_version: blocked.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(None),
+            blocked_json: Some(None),
+            failed_json: None,
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    service.project_once(100).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM attention_projection
+             WHERE attention_type = 'execution_failed' AND scope_id = ?",
+        )
+        .bind(&project_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        "resolved"
+    );
+}
+
+#[tokio::test]
+async fn actionable_task_interruption_wakes_once_and_resolution_closes_attention() {
+    let db = database().await;
+    let identity_id = new_uuid_v4();
+    identity(&db, &identity_id).await;
+    let project_id = configured_project(&db, &identity_id, "interruption-project").await;
+    let task = project_task(&db, &project_id, "Recover actionable interruption").await;
+    let execution_id = new_uuid_v4();
+    let now = now_rfc3339();
+    let blocked_json = serde_json::json!({
+        "reason": "executor failed",
+        "created_at": now,
+        "kind": "executor_failed",
+        "execution_id": execution_id
+    })
+    .to_string();
+    let error_annotation = serde_json::json!({
+        "type": "executor_failed",
+        "recovery_actions": ["reexecute", "cancel_task"]
+    })
+    .to_string();
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    TaskRepo::update(
+        &*db,
+        db::UpdateTask {
+            id: task.id.clone(),
+            expected_version: current.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(Some(error_annotation)),
+            blocked_json: Some(Some(blocked_json)),
+            failed_json: Some(None),
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let service = AttentionService::new(Arc::clone(&db));
+    service.project_once(100).await.unwrap();
+
+    let attention: (String, String, String) = sqlx::query_as(
+        "SELECT attention_type, status, details_json FROM attention_projection
+         WHERE attention_type = 'execution_failed' AND scope_id = ?",
+    )
+    .bind(&project_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(attention.0, "execution_failed");
+    assert_eq!(attention.1, "open");
+    let details: serde_json::Value = serde_json::from_str(&attention.2).unwrap();
+    assert_eq!(
+        details["recovery"]["actions"],
+        serde_json::json!(["reexecute", "cancel_task"])
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'agent.wake.admitted' AND scope_id = ?",
+        )
+        .bind(&project_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        1
+    );
+
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    TaskRepo::update(
+        &*db,
+        db::UpdateTask {
+            id: task.id.clone(),
+            expected_version: current.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(None),
+            blocked_json: Some(None),
+            failed_json: Some(None),
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    service.project_once(100).await.unwrap();
+
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM attention_projection
+         WHERE attention_type = 'execution_failed' AND scope_id = ?",
+    )
+    .bind(&project_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(status, "resolved");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM domain_event
+             WHERE event_type = 'agent.wake.admitted' AND scope_id = ?",
+        )
+        .bind(&project_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        1,
+        "resolution must not admit a second wake"
+    );
+}
+
+#[tokio::test]
 async fn completed_task_wakes_project_agent_until_readiness_is_reconciled() {
     let db = database().await;
     let identity_id = new_uuid_v4();
@@ -988,7 +1632,7 @@ async fn completed_task_wakes_project_agent_until_readiness_is_reconciled() {
 }
 
 #[tokio::test]
-async fn cancelled_execution_notifies_the_configured_project_agent_with_recovery_context() {
+async fn expected_cancellation_is_audit_only_without_attention_or_wake() {
     let db = database().await;
     let identity_id = new_uuid_v4();
     identity(&db, &identity_id).await;
@@ -1053,6 +1697,36 @@ async fn cancelled_execution_notifies_the_configured_project_agent_with_recovery
     )
     .await
     .unwrap();
+    let execution_id = new_uuid_v4();
+    ExecutionRepo::create(
+        &*db,
+        CreateExecution {
+            id: execution_id.clone(),
+            task_id: task.id.clone(),
+            agent_id: Some(identity_id.clone()),
+            role: "coder".to_owned(),
+            status: ExecutionStatus::Cancelled,
+            stop_reason: Some(db::StopReason::UserCancelled),
+            stopped_by: Some("user:api".to_owned()),
+            resume_policy: Some(ResumePolicy::None),
+            stopped_at: Some(now.clone()),
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
     DomainEventRepo::append_event(
         &*db,
         CreateDomainEvent {
@@ -1069,10 +1743,10 @@ async fn cancelled_execution_notifies_the_configured_project_agent_with_recovery
             causation_depth: 0,
             dedupe_key: Some(new_uuid_v4()),
             payload_json: serde_json::json!({
-                "execution_id": new_uuid_v4(),
+                "execution_id": execution_id,
                 "task_id": task.id,
                 "role": "coder",
-                "stop_reason": "user_requested",
+                "stop_reason": "user_cancelled",
                 "error": "execution stopped for reassignment"
             })
             .to_string(),
@@ -1087,36 +1761,32 @@ async fn cancelled_execution_notifies_the_configured_project_agent_with_recovery
         .await
         .unwrap();
 
-    let attention: (String, String, String, String, Option<String>) = sqlx::query_as(
-        "SELECT attention_type, summary, details_json, recommended_action, identity_id
-         FROM attention_projection
-         WHERE scope_type = 'project' AND scope_id = ?",
+    let attention_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM attention_projection
+         WHERE attention_type = 'execution_failed' AND scope_id = ?",
     )
     .bind(&project_id)
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert_eq!(attention.0, "execution_failed");
-    assert_eq!(attention.1, "Task execution stopped");
-    assert_eq!(attention.3, "inspect_run");
-    assert_eq!(attention.4.as_deref(), Some(identity_id.as_str()));
-    let details: serde_json::Value = serde_json::from_str(&attention.2).unwrap();
-    assert_eq!(
-        details["task"]["task_title"],
-        "Recover interrupted delivery"
-    );
-    assert_eq!(details["task"]["task_status"], "in_progress");
-    assert_eq!(details["role"], "coder");
-    assert_eq!(details["stop_reason"], "user_requested");
-    assert_eq!(details["recovery"][0], "inspect_task");
-    let admitted_identity: String = sqlx::query_scalar(
-        "SELECT json_extract(payload_json, '$.identity_id')
-         FROM domain_event WHERE event_type = 'agent.wake.admitted'",
+    let admitted_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event
+         WHERE event_type = 'agent.wake.admitted' AND scope_id = ?",
     )
+    .bind(&project_id)
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert_eq!(admitted_identity, identity_id);
+    assert_eq!(attention_count, 0);
+    assert_eq!(admitted_count, 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_wake_lease WHERE scope_id = ?",)
+            .bind(&project_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 /// Seed a Project with `workflow_definition` and one Task parked in `review`,

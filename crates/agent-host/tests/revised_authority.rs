@@ -634,3 +634,45 @@ fn core_agent_chat_scope_has_no_task_mutation_or_filesystem() {
         .is_err()
     );
 }
+
+/// Scratch diagnostic: the propose tool must both require `payload` and
+/// describe `task.recover`'s fields, or the model has no way to form the call.
+#[test]
+fn project_propose_tool_requires_payload_and_documents_recover() {
+    let composition = ScopeToolComposition::for_scope_with_permissions_and_project_chat(
+        "identity-project",
+        CanonicalScope {
+            scope_type: CanonicalScopeType::AgentChat,
+            scope_id: "chat-proj".to_owned(),
+            workspace_access: WorkspaceAccess::Deny,
+        },
+        None,
+        None,
+        &broad_permissions(),
+        true,
+        Some(Arc::new(NoopProvider)),
+    )
+    .expect("project chat composition");
+    let tool = composition
+        .tools()
+        .into_iter()
+        .find(|tool| tool.spec().name == "forge_scope_propose")
+        .expect("propose tool");
+    let schema = tool.spec().input_schema.clone();
+    let full = schema.to_string();
+    assert!(
+        full.contains("task.recover"),
+        "recover guidance missing from the propose schema"
+    );
+    assert!(
+        full.contains("cancel_task"),
+        "cancel_task action not described to the model"
+    );
+    // `task.recover` must be reachable at all: it is the only remedy for a
+    // Task that fails by construction, and it was absent from the advertised
+    // operation enum's admitted set until the direct-command gate was fixed.
+    assert!(
+        full.contains("task.recover"),
+        "task.recover must be advertised on the project propose surface"
+    );
+}

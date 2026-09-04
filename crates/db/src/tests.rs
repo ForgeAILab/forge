@@ -35,6 +35,119 @@ fn page(limit: i64) -> PageRequest {
     }
 }
 
+#[tokio::test]
+async fn task_interruption_changes_are_atomic_and_bounded() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, _) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        None,
+        "todo".to_owned(),
+        "interruption task",
+    )
+    .await;
+    let task = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task lookup succeeds")
+        .expect("task exists");
+    let annotation = serde_json::json!({
+        "type": "manual_stop",
+        "recovery_actions": ["resume_session", "retry_execution"],
+    })
+    .to_string();
+    let failed_reason = "x".repeat(2048);
+    let failed = serde_json::json!({
+        "kind": "executor_failed",
+        "reason": failed_reason,
+        "execution_id": "execution-1",
+        "message": "unbounded details must not be copied",
+    })
+    .to_string();
+    let updated = TaskRepo::update(
+        &db,
+        UpdateTask {
+            id: task_id.clone(),
+            expected_version: task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(Some(annotation)),
+            blocked_json: None,
+            failed_json: Some(Some(failed)),
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("task interruption updates");
+    assert_eq!(updated.version, task.version + 1);
+
+    let cleared = TaskRepo::update_status(
+        &db,
+        UpdateTaskStatus {
+            id: task_id.clone(),
+            expected_version: updated.version,
+            status: updated.status.clone(),
+            assignee_id: None,
+            error_annotation: Some(None),
+            blocked_json: Some(None),
+            failed_json: Some(None),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("task interruption clears");
+    assert_eq!(cleared.version, updated.version + 1);
+
+    let events = DomainEventRepo::list_events_after(&db, 0, 100)
+        .await
+        .expect("domain events list");
+    let interruption_events = events
+        .iter()
+        .filter(|event| {
+            event.event_type == "task.interruption_changed" && event.entity_id == task_id
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(interruption_events.len(), 2);
+
+    let first: serde_json::Value = serde_json::from_str(&interruption_events[0].payload_json)
+        .expect("interruption payload parses");
+    assert_eq!(first["task_id"], task_id);
+    assert_eq!(first["task_version"], updated.version);
+    assert_eq!(first["requires_intervention"], true);
+    assert_eq!(first["interruption"]["source"], "failed");
+    assert_eq!(first["interruption"]["kind"], "executor_failed");
+    assert_eq!(
+        first["interruption"]["reason"]
+            .as_str()
+            .expect("bounded reason is a string")
+            .chars()
+            .count(),
+        512
+    );
+    assert_eq!(first["interruption"]["execution_id"], "execution-1");
+    assert_eq!(
+        first["interruption"]["recovery_actions"],
+        serde_json::json!(["resume_session", "retry_execution"])
+    );
+    let expected_dedupe = format!("task-interruption-update:{task_id}:{}", updated.version);
+    assert_eq!(
+        interruption_events[0].dedupe_key.as_deref(),
+        Some(expected_dedupe.as_str())
+    );
+
+    let second: serde_json::Value = serde_json::from_str(&interruption_events[1].payload_json)
+        .expect("cleared interruption payload parses");
+    assert_eq!(second["task_version"], cleared.version);
+    assert_eq!(second["requires_intervention"], false);
+    assert!(second["interruption"].is_null());
+}
+
 async fn sqlite_db() -> SqliteDb {
     let pool = create_sqlite_pool("sqlite::memory:")
         .await
@@ -3788,6 +3901,95 @@ async fn compare_and_move_is_atomic_versioned_and_idempotent() {
         TaskBoardRepo::compare_and_move_task(&db, stale_board).await,
         Err(DbError::BoardRevisionConflict { .. })
     ));
+}
+
+#[tokio::test]
+async fn compare_and_move_emits_interruption_resolution_with_the_task_update() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, _) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        &repo_id,
+        None,
+        "todo".to_owned(),
+        "blocked move",
+    )
+    .await;
+    let task = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let blocked = TaskRepo::update(
+        &db,
+        UpdateTask {
+            id: task_id.clone(),
+            expected_version: task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: None,
+            blocked_json: Some(Some(r#"{"reason":"needs a decision"}"#.to_owned())),
+            failed_json: None,
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("task becomes blocked");
+    let board_revision = TaskBoardRepo::board_revision(&db, &project_id)
+        .await
+        .expect("board revision loads");
+
+    let committed = TaskBoardRepo::compare_and_move_task(
+        &db,
+        CompareAndMoveTask {
+            operation_id: new_uuid_v4(),
+            project_id: project_id.clone(),
+            task_id: task_id.clone(),
+            task_version: blocked.version,
+            board_revision,
+            target_status: "todo".to_owned(),
+            target_column_statuses: vec!["todo".to_owned()],
+            before_id: None,
+            after_id: None,
+            entry_barrier_json: None,
+            transition_log_id: new_uuid_v4(),
+            trigger_name: None,
+            triggered_by: "user:board_drag".to_owned(),
+            trigger_reason: "resolve the block by moving the task".to_owned(),
+            rejection: false,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("move commits");
+    let moved = match committed {
+        MoveTaskPersistence::Committed { result, .. } => result.task,
+        MoveTaskPersistence::Replayed(_) => panic!("first move must commit"),
+    };
+    assert!(moved.blocked_json.is_none());
+
+    let events = DomainEventRepo::list_events_after(&db, 0, 100)
+        .await
+        .expect("events list");
+    let interruption_payloads = events
+        .iter()
+        .filter(|event| {
+            event.event_type == "task.interruption_changed" && event.entity_id == task_id
+        })
+        .map(|event| {
+            serde_json::from_str::<serde_json::Value>(&event.payload_json)
+                .expect("interruption payload parses")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(interruption_payloads.len(), 2);
+    assert_eq!(interruption_payloads[0]["requires_intervention"], true);
+    assert_eq!(interruption_payloads[1]["requires_intervention"], false);
+    assert_eq!(interruption_payloads[1]["task_version"], moved.version);
 }
 
 #[tokio::test]

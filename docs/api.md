@@ -681,6 +681,41 @@ readiness evaluation. It is an orchestration prompt, not a validation result,
 readiness decision, or release approval; a committed milestone readiness
 evaluation resolves the Project's open delivery follow-ups.
 
+Execution terminal events are per-attempt audit records. `execution.failed` and
+`execution.cancelled` may resolve a stale `progress_warning`, but do not by
+themselves create action-required Attention, a Project-Agent wake, or a human
+notification. The dispatcher first commits the effective Task disposition as
+one atomic `task.interruption_changed` event; only an actionable
+post-disposition Task state creates or resolves the Attention item and can
+drive a wake or notification. Automatic/deferred retries and expected
+cancellation or reassignment are silent. A manually resumable terminal run
+with no Task disposition after the bounded settlement grace is surfaced by
+the orphan safety net as an actionable Attention item.
+
+The post-disposition event payload is bounded and carries the current Task
+version:
+
+```json
+{
+  "task_id": "task-uuid",
+  "task_version": 12,
+  "task_status": "in_progress",
+  "requires_intervention": true,
+  "interruption": {
+    "source": "blocked",
+    "kind": "executor_failed",
+    "reason": "Executor stopped before completing the Task",
+    "execution_id": "execution-uuid",
+    "recovery_actions": ["reexecute", "cancel_task"]
+  }
+}
+```
+
+`interruption` is `null` when the interruption is cleared. Its recovery list
+is a snapshot of typed Task annotation data, not an authorization grant;
+consumers must refresh the current Task and use only actions it still
+advertises.
+
 `AttentionCategory` also includes `decision_recorded` (recommended action
 `continue_from_decision`). Forge projects it when the *user* records a
 decision the Project Agent was waiting on: a milestone definition revision
@@ -1469,7 +1504,11 @@ through the REST endpoints above and as `notification.created` SSE events.
 and `project_hook.notify`. `task.recovery_required` fires when crash recovery
 or an agent heartbeat timeout leaves a task needing manual recovery;
 graceful-shutdown recoveries auto-resume at the next startup and are not
-notified.
+notified. `execution.failed` and `execution.cancelled` are deliberately not
+notification sources: they are durable per-attempt audit/progress-warning
+resolution events. Human `task.blocked` and `task.failed` notifications are
+emitted only from the committed Task outcome after disposition, never from an
+individual attempt failure.
 
 ## Pagination
 
@@ -2207,7 +2246,9 @@ bus. Useful for the web UI and for long-running scripts that want to react to
 state changes (`task.status_changed`, `task.moved`, `execution.completed`, …) without
 polling. Daemon command-stream lifecycle changes emit `daemon.connected` and
 `daemon.offline` so clients can refresh daemon availability without waiting for
-polling or stale-heartbeat cleanup.
+polling or stale-heartbeat cleanup. Execution terminal events on this stream
+are audit/progress-warning inputs, not `notification.created` signals or Agent
+wake instructions; clients should wait for the post-disposition Task event.
 
 Each newly committed board move publishes exactly one `task.moved` event. Its
 context contains `project_id`, `operation_id`, `old_status`, `new_status`,

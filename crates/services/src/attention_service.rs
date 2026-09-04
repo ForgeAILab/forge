@@ -29,6 +29,10 @@ const CONSUMER_LEASE_SECONDS: i64 = 30;
 const CONSUMER_STALE_SECONDS: i64 = 90;
 const MAX_ATTENTION_SUMMARY_LEN: usize = 160;
 const PROJECTION_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
+/// Terminal execution truth is committed before Task recovery disposition.
+/// Give that short saga time to settle before treating a still-manual,
+/// undisposed terminal attempt as an actionable orphan.
+const TERMINAL_DISPOSITION_GRACE_SECONDS: i64 = 30;
 const WAKE_LEASE_SECONDS: i64 = 60;
 const WAKE_COOLDOWN_SECONDS: i64 = 300;
 /// Maximum causal hop count for an admitted autonomous wake.  A wake decision
@@ -41,6 +45,18 @@ pub struct AttentionProjectionRun {
     pub claimed_events: usize,
     pub processed_events: usize,
     pub last_sequence: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectionOutcome {
+    Completed,
+    Deferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventCategoryDecision {
+    Ready(Option<&'static str>),
+    Deferred,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +141,8 @@ struct WakeDecisionContext {
     incident_digest: Option<String>,
     attention_status: Option<String>,
     attention_version: Option<i64>,
+    task_id: Option<String>,
+    requires_current_task_intervention: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -259,7 +277,27 @@ impl AttentionService {
             .unwrap_or(0);
 
         for event in events {
-            if let Err(error) = self.project_event(&event).await {
+            let projection = self.project_event(&event).await;
+            if matches!(projection, Ok(ProjectionOutcome::Deferred)) {
+                // The execution terminal CAS is deliberately earlier than
+                // retry/block disposition. Release this batch immediately so
+                // the next poll can observe the settled Task instead of
+                // waiting for the ordinary 30-second crash lease.
+                let released_at = now_rfc3339();
+                sqlx::query(
+                    "UPDATE event_processing_lease
+                     SET leased_until = ?, updated_at = ?
+                     WHERE consumer_name = ? AND lease_owner = ?",
+                )
+                .bind(&released_at)
+                .bind(&released_at)
+                .bind(CONSUMER_NAME)
+                .bind(&owner)
+                .execute(self.db.pool())
+                .await?;
+                break;
+            }
+            if let Err(error) = projection {
                 // A semantic dedupe/check conflict can never succeed on
                 // retry: retrying the same event forever wedges the cursor
                 // and silences the entire wake pipeline. Quarantine the
@@ -330,7 +368,7 @@ impl AttentionService {
             consumer_name: CONSUMER_NAME.to_owned(),
             last_sequence,
             last_started_at: None,
-            last_success_at: if claimed_events == 0 {
+            last_success_at: if processed_events == 0 {
                 None
             } else {
                 Some(now_rfc3339())
@@ -403,6 +441,22 @@ impl AttentionService {
         let details_json: String = row.try_get("details_json")?;
         let recommended_action: String = row.try_get("recommended_action")?;
         let version: i64 = row.try_get("version")?;
+        let details = serde_json::from_str::<Value>(&details_json).unwrap_or(Value::Null);
+        let requires_current_task_intervention = attention_type == "execution_failed"
+            && details.get("source_event_type").and_then(Value::as_str)
+                == Some("task.interruption_changed")
+            && details
+                .pointer("/recovery/requires_intervention")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        let task_id = requires_current_task_intervention
+            .then(|| {
+                details
+                    .get("entity_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .flatten();
         Ok(WakeDecisionContext {
             attention_id: Some(id),
             source_event_id: Some(source_event_id.clone()),
@@ -419,6 +473,8 @@ impl AttentionService {
             )),
             attention_status: Some(status),
             attention_version: Some(version),
+            task_id,
+            requires_current_task_intervention,
         })
     }
 
@@ -532,6 +588,71 @@ impl AttentionService {
             return Ok(WakeAdmissionResult::Suppressed {
                 reason: WakeSuppressionReason::ResolvedIncident,
             });
+        }
+
+        // The Task row is the action authority. A recovery that wins after
+        // projection but before admission must suppress the stale wake in the
+        // same write transaction that would otherwise consume budget.
+        if context.requires_current_task_intervention {
+            let active = if let Some(task_id) = context.task_id.as_deref() {
+                let row = sqlx::query(
+                    "SELECT error_annotation, blocked_json, failed_json
+                     FROM task WHERE id = ? AND deleted_at IS NULL",
+                )
+                .bind(task_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+                row.is_some_and(|row| {
+                    let error_annotation = row
+                        .try_get::<Option<String>, _>("error_annotation")
+                        .ok()
+                        .flatten();
+                    let blocked_json = row
+                        .try_get::<Option<String>, _>("blocked_json")
+                        .ok()
+                        .flatten();
+                    let failed_json = row
+                        .try_get::<Option<String>, _>("failed_json")
+                        .ok()
+                        .flatten();
+                    interruption_fields_require_intervention(
+                        error_annotation.as_deref(),
+                        blocked_json.as_deref(),
+                        failed_json.as_deref(),
+                    )
+                })
+            } else {
+                false
+            };
+            if !active {
+                if let Some(attention_id) = context.attention_id.as_deref() {
+                    sqlx::query(
+                        "UPDATE attention_projection
+                         SET status = 'resolved', resolved_at = ?, snoozed_until = NULL,
+                             updated_at = ?, version = version + 1
+                         WHERE id = ? AND status <> 'resolved'",
+                    )
+                    .bind(&now)
+                    .bind(&now)
+                    .bind(attention_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                }
+                self.append_wake_decision_in_tx(
+                    &mut transaction,
+                    &request,
+                    &context,
+                    WakeDecisionEvent::Suppressed(WakeSuppressionReason::ResolvedIncident),
+                    None,
+                    None,
+                    &now,
+                )
+                .await?;
+                transaction.commit().await?;
+                return Ok(WakeAdmissionResult::Suppressed {
+                    reason: WakeSuppressionReason::ResolvedIncident,
+                });
+            }
         }
 
         let (budget, budget_scope_type, budget_scope_id) = self
@@ -1612,10 +1733,14 @@ impl AttentionService {
         ))
     }
 
-    async fn project_event(&self, event: &DomainEvent) -> Result<()> {
-        if let Some(category) = classify_event(event) {
+    async fn project_event(&self, event: &DomainEvent) -> Result<ProjectionOutcome> {
+        let category = match self.event_category(event).await? {
+            EventCategoryDecision::Ready(category) => category,
+            EventCategoryDecision::Deferred => return Ok(ProjectionOutcome::Deferred),
+        };
+        if let Some(category) = category {
             if category == "review_ready" && !self.review_needs_a_person(event).await? {
-                return Ok(());
+                return Ok(ProjectionOutcome::Completed);
             }
             let (scope_type, scope_id) = self.event_scope(event).await?;
             // Attention's historical materialization table accepts the
@@ -1631,7 +1756,7 @@ impl AttentionService {
             let incident_key = attention_incident_key(category, event, &scope_type, &scope_id);
             let (priority, summary, recommended_action) = category_metadata(category);
             let task_context = if event.entity_type == "task" {
-                sqlx::query("SELECT title, status FROM task WHERE id = ?")
+                sqlx::query("SELECT title, status, version FROM task WHERE id = ?")
                     .bind(&event.entity_id)
                     .fetch_optional(self.db.pool())
                     .await?
@@ -1639,6 +1764,7 @@ impl AttentionService {
                         json!({
                             "task_title": bounded_text(row.try_get::<String, _>("title").unwrap_or_default()),
                             "task_status": row.try_get::<String, _>("status").unwrap_or_default(),
+                            "task_version": row.try_get::<i64, _>("version").unwrap_or_default(),
                         })
                     })
             } else {
@@ -1665,8 +1791,22 @@ impl AttentionService {
                     "decided_by": "user",
                 })
             });
+            let interruption = event_payload
+                .get("interruption")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let recovery_actions = interruption
+                .get("recovery_actions")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let requires_intervention = event_payload
+                .get("requires_intervention")
+                .and_then(Value::as_bool)
+                .unwrap_or(category == "execution_failed");
             let details_json = serde_json::to_string(&json!({
                 "source_event_id": event.id,
+                "source_event_type": event.event_type,
                 "source_sequence": event.sequence,
                 "entity_type": event.entity_type,
                 "entity_id": event.entity_id,
@@ -1677,7 +1817,12 @@ impl AttentionService {
                 "role": event_payload.get("role").and_then(Value::as_str).map(|value| bounded_text(value.to_owned())),
                 "stop_reason": event_payload.get("stop_reason").and_then(Value::as_str).map(|value| bounded_text(value.to_owned())),
                 "error": event_payload.get("error").and_then(Value::as_str).map(|value| bounded_text(value.to_owned())),
-                "recovery": ["inspect_task", "assign_or_confirm_role", "retry_once"],
+                "interruption": interruption,
+                "recovery": {
+                    "requires_intervention": requires_intervention,
+                    "actions": recovery_actions,
+                    "automatic_retry": false,
+                },
             }))
             .map_err(|error| ServiceError::Domain(error.to_string()))?;
             let attention = AttentionRepo::insert_attention(
@@ -1712,6 +1857,10 @@ impl AttentionService {
                 incident_digest: Some(wake_attention_incident_digest(&attention)),
                 attention_status: Some(attention.status.clone()),
                 attention_version: Some(attention.version),
+                task_id: (event.event_type == "task.interruption_changed")
+                    .then(|| event.entity_id.clone()),
+                requires_current_task_intervention: event.event_type == "task.interruption_changed"
+                    && requires_intervention,
             };
 
             // Wake admission happens only after the rebuildable Attention row
@@ -1813,7 +1962,84 @@ impl AttentionService {
             .execute(self.db.pool())
             .await?;
         }
-        Ok(())
+        Ok(ProjectionOutcome::Completed)
+    }
+
+    /// Decide whether a durable event represents an actionable incident.
+    /// Raw terminal execution events are audit facts, not recovery commands:
+    /// the atomic `task.interruption_changed` event normally owns Attention.
+    /// A manual terminal attempt that never receives any Task disposition is
+    /// retained as a bounded-grace orphan safety net.
+    async fn event_category(&self, event: &DomainEvent) -> Result<EventCategoryDecision> {
+        if event
+            .event_type
+            .eq_ignore_ascii_case("task.interruption_changed")
+            && classify_event(event).is_some()
+        {
+            let current = db::TaskRepo::get_by_id(&*self.db, &event.entity_id, false).await?;
+            if !current.as_ref().is_some_and(task_requires_intervention) {
+                return Ok(EventCategoryDecision::Ready(None));
+            }
+        }
+        if !matches!(
+            event.event_type.to_ascii_lowercase().as_str(),
+            "execution.failed" | "execution.cancelled"
+        ) {
+            return Ok(EventCategoryDecision::Ready(classify_event(event)));
+        }
+
+        let payload = serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
+        let Some(execution_id) = payload.get("execution_id").and_then(Value::as_str) else {
+            return Ok(EventCategoryDecision::Ready(None));
+        };
+        let Some(execution) = db::ExecutionRepo::get_by_id(&*self.db, execution_id).await? else {
+            return Ok(EventCategoryDecision::Ready(None));
+        };
+        if matches!(
+            execution.resume_policy,
+            Some(db::ResumePolicy::Auto | db::ResumePolicy::None)
+        ) {
+            return Ok(EventCategoryDecision::Ready(None));
+        }
+        let Some(task) = db::TaskRepo::get_by_id(&*self.db, &execution.task_id, false).await?
+        else {
+            return Ok(EventCategoryDecision::Ready(None));
+        };
+
+        // An interruption mutation and its event commit together. Let that
+        // post-disposition event own the incident so the raw attempt cannot
+        // create a duplicate wake or overwrite its typed recovery actions.
+        if task_requires_intervention(&task) {
+            return Ok(EventCategoryDecision::Ready(None));
+        }
+        if crate::deferred_dispatch::is_pending(&task, Utc::now()) {
+            return Ok(EventCategoryDecision::Ready(None));
+        }
+        let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
+            return Ok(EventCategoryDecision::Ready(None));
+        };
+        let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
+        );
+        if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal) {
+            return Ok(EventCategoryDecision::Ready(None));
+        }
+
+        let settled_before = Utc::now() - Duration::seconds(TERMINAL_DISPOSITION_GRACE_SECONDS);
+        let terminal_at = parse_rfc3339(&event.created_at).unwrap_or(settled_before);
+        if terminal_at > settled_before {
+            return Ok(EventCategoryDecision::Deferred);
+        }
+
+        tracing::warn!(
+            task_id = %task.id,
+            execution_id = %execution.id,
+            event_id = %event.id,
+            "terminal execution remained manually resumable without a Task disposition"
+        );
+        Ok(EventCategoryDecision::Ready(Some("execution_failed")))
     }
 
     async fn attention_projection_scope(
@@ -2887,6 +3113,33 @@ fn is_execution_semantic_progress_event(event_type: &str) -> bool {
     event_type == "execution.progressed"
 }
 
+fn task_requires_intervention(task: &db::Task) -> bool {
+    interruption_fields_require_intervention(
+        task.error_annotation.as_deref(),
+        task.blocked_json.as_deref(),
+        task.failed_json.as_deref(),
+    )
+}
+
+fn interruption_fields_require_intervention(
+    error_annotation: Option<&str>,
+    blocked_json: Option<&str>,
+    failed_json: Option<&str>,
+) -> bool {
+    if failed_json.is_some() || blocked_json.is_some() {
+        return true;
+    }
+    error_annotation
+        .and_then(|annotation| serde_json::from_str::<Value>(annotation).ok())
+        .and_then(|annotation| {
+            annotation
+                .get("recovery_actions")
+                .and_then(Value::as_array)
+                .map(|actions| !actions.is_empty())
+        })
+        .unwrap_or(false)
+}
+
 /// Attention category for a decision the user recorded on something the
 /// Project Agent was waiting for. The wake consumer resolves the incident
 /// once the wake turn is admitted; it is a hand-off, not a lasting incident.
@@ -3031,11 +3284,16 @@ fn classify_event(event: &DomainEvent) -> Option<&'static str> {
     if matches!(event_type.as_str(), "task.done" | "task.completed") {
         return Some("delivery_followup");
     }
-    if matches!(
-        event_type.as_str(),
-        "execution.failed" | "execution.cancelled"
-    ) {
-        return Some("execution_failed");
+    if event_type == "task.interruption_changed" {
+        return serde_json::from_str::<Value>(&event.payload_json)
+            .ok()
+            .and_then(|payload| {
+                payload
+                    .get("requires_intervention")
+                    .and_then(Value::as_bool)
+            })
+            .unwrap_or(false)
+            .then_some("execution_failed");
     }
     None
 }
@@ -3092,6 +3350,18 @@ fn resolution_categories(event: &DomainEvent) -> Vec<&'static str> {
     if event_type == "execution.completed" {
         categories.push("execution_failed");
     }
+    if event_type == "task.interruption_changed"
+        && !serde_json::from_str::<Value>(&event.payload_json)
+            .ok()
+            .and_then(|payload| {
+                payload
+                    .get("requires_intervention")
+                    .and_then(Value::as_bool)
+            })
+            .unwrap_or(false)
+    {
+        categories.push("execution_failed");
+    }
     if event_type.contains("review")
         && (event_type.contains("passed") || event_type.contains("approved"))
     {
@@ -3128,7 +3398,7 @@ fn category_metadata(category: &str) -> (i64, &'static str, &'static str) {
         "retry_exhausted" => (90, "Retry budget exhausted", "review_retry"),
         "review_ready" => (55, "Work is ready for review", "review"),
         "review_risk" => (85, "Review reported a risk", "inspect_review"),
-        "execution_failed" => (85, "Task execution stopped", "inspect_run"),
+        "execution_failed" => (85, "Task needs recovery", "inspect_task"),
         "delivery_followup" => (
             70,
             "Task completed; reconcile validation, evidence, and readiness",
@@ -3566,14 +3836,35 @@ mod tests {
         );
         assert_eq!(
             classify_event(&event("execution.failed", r#"{"error":"boom"}"#)),
-            Some("execution_failed")
+            None
         );
         assert_eq!(
             classify_event(&event(
                 "execution.cancelled",
-                r#"{"stop_reason":"user_requested"}"#
+                r#"{"stop_reason":"user_cancelled"}"#
+            )),
+            None
+        );
+        assert_eq!(
+            classify_event(&event(
+                "task.interruption_changed",
+                r#"{"requires_intervention":true}"#
             )),
             Some("execution_failed")
+        );
+        assert_eq!(
+            classify_event(&event(
+                "task.interruption_changed",
+                r#"{"requires_intervention":false}"#
+            )),
+            None
+        );
+        assert_eq!(
+            resolution_categories(&event(
+                "task.interruption_changed",
+                r#"{"requires_intervention":false}"#
+            )),
+            vec!["execution_failed"]
         );
         assert_eq!(
             classify_event(&event(

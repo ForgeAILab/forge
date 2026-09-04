@@ -849,6 +849,18 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
             "and unknown fields are rejected."
         ));
     }
+    if operations.contains(TASK_RECOVER_OPERATION) {
+        lines.push(concat!(
+            "task.recover — repair a Task that stopped, instead of replacing it. ",
+            "Fields: task_id (required, a Task in this Project); ",
+            "reason (required: state what stopped it); ",
+            "action (required: \"resume_session\", \"reexecute\", \"reset_to_initial\", ",
+            "\"reset_retry_window\", or \"cancel_task\"). ",
+            "Use cancel_task for a Task that cannot succeed as specified — a read-only ",
+            "task_type whose work needs repository writes will fail every retry, and ",
+            "cancelling it is the remedy rather than proposing a duplicate."
+        ));
+    }
     if lines.is_empty() {
         String::new()
     } else {
@@ -867,7 +879,10 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
 /// `additionalProperties` open because every admitted operation shares this
 /// one envelope; each description names its owning operation.
 pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> Option<Value> {
-    if !operations.contains("task.propose") && !operations.contains(TASK_ADAPTIVE_OPERATION) {
+    if !operations.contains("task.propose")
+        && !operations.contains(TASK_ADAPTIVE_OPERATION)
+        && !operations.contains(TASK_RECOVER_OPERATION)
+    {
         return None;
     }
     let mut properties = json!({
@@ -899,6 +914,22 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
         "milestone_id": {
             "type": ["string", "null"],
             "description": "task.propose: optional; defaults to the active baseline's primary milestone."
+        },
+        "task_id": {
+            "type": ["string", "null"],
+            "description": "task.recover: required Task id in this Project."
+        },
+        "reason": {
+            "type": ["string", "null"],
+            "description": "task.recover: required; state what stopped this Task."
+        },
+        "action": {
+            "type": ["string", "null"],
+            "description": concat!(
+                "task.recover: required, one of \"resume_session\", \"reexecute\", ",
+                "\"reset_to_initial\", \"reset_retry_window\", \"cancel_task\". Also the ",
+                "task.adaptive action field."
+            )
         },
         "capability_class": {
             "type": ["string", "null"],

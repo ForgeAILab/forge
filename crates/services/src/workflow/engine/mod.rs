@@ -1213,6 +1213,22 @@ impl WorkflowEngine {
                         )
                         .await?;
                     }
+                    if task.blocked_json.is_some() {
+                        let mut interruption_snapshot = task.clone();
+                        interruption_snapshot.status = target_state.clone();
+                        interruption_snapshot.blocked_json = None;
+                        interruption_snapshot.entry_barrier_json = entry_barrier_json.clone();
+                        interruption_snapshot.version = version + 1;
+                        interruption_snapshot.updated_at = updated_at.clone();
+                        let interruption_event =
+                            CreateDomainEvent::task_interruption_changed(&interruption_snapshot);
+                        DomainEventRepo::append_event_in_tx(
+                            &*self.db,
+                            &mut transaction,
+                            &interruption_event,
+                        )
+                        .await?;
+                    }
                     let event = CreateDomainEvent::task_transition(
                         transition_log_id.clone(),
                         task_id.clone(),

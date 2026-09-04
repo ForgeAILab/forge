@@ -574,6 +574,81 @@ pub struct CreateDomainEvent {
 }
 
 impl CreateDomainEvent {
+    /// Build the bounded recovery-disposition event for a Task interruption
+    /// mutation. Writers append this in the same transaction as the Task row
+    /// so attempt-level failures can remain audit-only without losing the
+    /// action-required boundary.
+    pub fn task_interruption_changed(task: &Task) -> Self {
+        let failed = task
+            .failed_json
+            .as_deref()
+            .map(parse_event_json_object)
+            .unwrap_or_default();
+        let blocked = task
+            .blocked_json
+            .as_deref()
+            .map(parse_event_json_object)
+            .unwrap_or_default();
+        let annotation = task
+            .error_annotation
+            .as_deref()
+            .map(parse_event_json_object)
+            .unwrap_or_default();
+        let recovery_actions = event_recovery_actions(&annotation);
+        let requires_intervention = task.failed_json.is_some()
+            || task.blocked_json.is_some()
+            || !recovery_actions.is_empty();
+        let interruption = if task.failed_json.is_some() {
+            Some(event_interruption_details(
+                "failed",
+                &failed,
+                &recovery_actions,
+            ))
+        } else if task.blocked_json.is_some() {
+            Some(event_interruption_details(
+                "blocked",
+                &blocked,
+                &recovery_actions,
+            ))
+        } else if !recovery_actions.is_empty() {
+            Some(event_interruption_details(
+                "annotation",
+                &annotation,
+                &recovery_actions,
+            ))
+        } else {
+            None
+        };
+        let event_id = crate::new_uuid_v4();
+
+        Self {
+            id: event_id.clone(),
+            event_type: "task.interruption_changed".to_owned(),
+            entity_type: "task".to_owned(),
+            entity_id: task.id.clone(),
+            actor_type: "system".to_owned(),
+            actor_id: None,
+            scope_type: "task".to_owned(),
+            scope_id: task.id.clone(),
+            correlation_id: event_id,
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some(format!(
+                "task-interruption-update:{}:{}",
+                task.id, task.version
+            )),
+            payload_json: serde_json::json!({
+                "task_id": interruption_bounded_text(&task.id, 128),
+                "task_version": task.version,
+                "task_status": interruption_bounded_text(&task.status, 128),
+                "requires_intervention": requires_intervention,
+                "interruption": interruption,
+            })
+            .to_string(),
+            created_at: task.updated_at.clone(),
+        }
+    }
+
     /// Build the bounded, replayable ledger record for a task status
     /// transition. The transition-log id is deliberately reused as the event
     /// id/correlation key so retries cannot create a second source of truth.
@@ -631,6 +706,56 @@ impl CreateDomainEvent {
             created_at,
         }
     }
+}
+
+fn event_interruption_details(
+    source: &str,
+    value: &serde_json::Value,
+    recovery_actions: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "source": source,
+        "kind": value
+            .get("kind")
+            .or_else(|| value.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .map(|text| interruption_bounded_text(text, 128)),
+        "reason": value
+            .get("reason")
+            .or_else(|| value.get("blocking_reason"))
+            .or_else(|| value.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .map(|text| interruption_bounded_text(text, 512)),
+        "execution_id": value
+            .get("execution_id")
+            .or_else(|| value.get("blocked_execution_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(|text| interruption_bounded_text(text, 128)),
+        "recovery_actions": recovery_actions,
+    })
+}
+
+fn parse_event_json_object(raw: &str) -> serde_json::Value {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()))
+}
+
+fn event_recovery_actions(value: &serde_json::Value) -> Vec<String> {
+    value
+        .get("recovery_actions")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .take(16)
+        .map(|text| interruption_bounded_text(text, 128))
+        .collect()
+}
+
+fn interruption_bounded_text(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
 }
 
 fn bounded_event_text(value: &str, max_bytes: usize) -> String {
