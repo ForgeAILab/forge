@@ -1,4 +1,4 @@
-use db::{ExecutionRepo, ProjectMemberRepo, ProjectRepo, TaskRepo};
+use db::{ExecutionRepo, ProjectRepo, TaskDependencyRepo, TaskRepo};
 use serde_json::{json, Value};
 
 use crate::{
@@ -15,7 +15,16 @@ pub(crate) async fn dispatch(
     method: &str,
     params: Value,
 ) -> Result<Value, McpToolError> {
-    dispatch_with_context(state, &McpContext::default(), method, params).await
+    dispatch_with_context(
+        state,
+        &McpContext {
+            project_id: None,
+            user_id: Some("mcp-test-user".to_owned()),
+        },
+        method,
+        params,
+    )
+    .await
 }
 
 pub(crate) async fn dispatch_with_context(
@@ -83,7 +92,7 @@ fn known_tool(name: &str, scoped_project: bool) -> bool {
 }
 
 /// Attach a current version only after the target has been resolved inside
-/// the authenticated project scope. A raw database conflict does not carry an
+/// the authenticated user's allowed Project scope. A raw database conflict does not carry an
 /// object identity, and returning a guessed id would leak or misdirect the
 /// model's retry; unresolved conflicts therefore remain intentionally opaque.
 async fn enrich_authorized_conflict(
@@ -93,23 +102,58 @@ async fn enrich_authorized_conflict(
     context: &McpContext,
     error: McpToolError,
 ) -> McpToolError {
-    if context.user_id.is_none()
-        || context.project_id.is_none()
-        || error.is_protocol()
-        || !error.is_version_conflict()
-    {
+    if error.is_protocol() || !error.is_version_conflict() {
         return error;
     }
+    let Some(user_id) = context.user_id.as_deref() else {
+        return error;
+    };
     let Some(arguments) = arguments.as_object() else {
         return error;
     };
+    if matches!(
+        tool_name,
+        "forge_update_project" | "forge_update_project_lifecycle_hooks"
+    ) {
+        let Some(project_id) = arguments.get("project_id").and_then(Value::as_str) else {
+            return error;
+        };
+        if context
+            .project_id
+            .as_deref()
+            .is_some_and(|scope| scope != project_id)
+        {
+            return error;
+        }
+        let Ok(Some(project)) =
+            ProjectRepo::get_visible_by_id(&*state.db, project_id, user_id).await
+        else {
+            return error;
+        };
+        return error.with_authorized_current_target(
+            "project",
+            project.id,
+            "version",
+            project.version,
+        );
+    }
     let Some(task_id) = task_version_target(tool_name, arguments) else {
         return error;
     };
     let Ok(Some(task)) = TaskRepo::get_by_id(&*state.db, task_id, false).await else {
         return error;
     };
-    if context.project_id.as_deref() != Some(task.project_id.as_str()) {
+    if context
+        .project_id
+        .as_deref()
+        .is_some_and(|scope| scope != task.project_id)
+    {
+        return error;
+    }
+    if !matches!(
+        ProjectRepo::get_visible_by_id(&*state.db, &task.project_id, user_id).await,
+        Ok(Some(_))
+    ) {
         return error;
     }
     error.with_authorized_current_target("task", task.id, "version", task.version)
@@ -135,12 +179,13 @@ async fn apply_project_scope(
     mut arguments: Value,
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
-    let Some(project_id) = context.project_id.as_deref() else {
-        return Ok(arguments);
-    };
-
-    if let Some(user_id) = context.user_id.as_deref() {
-        assert_project_membership(state, project_id, user_id).await?;
+    let user_id = context
+        .user_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| McpToolError::new(-32001, "authenticated MCP user is required"))?;
+    if let Some(project_id) = context.project_id.as_deref() {
+        assert_project_access(state, project_id, user_id).await?;
     }
 
     let object = arguments
@@ -148,20 +193,38 @@ async fn apply_project_scope(
         .ok_or_else(|| McpToolError::new(-32602, "tool arguments must be an object"))?;
 
     if tool_accepts_project_id(tool_name) {
-        match object.get("project_id").and_then(Value::as_str) {
-            Some(existing) if existing == project_id => {}
-            Some(_) => {
-                return Err(McpToolError::new(
-                    -32602,
-                    "project_id does not match scoped MCP project",
-                )
-                .with_data(json!({ "project_id": project_id })));
+        if let Some(project_id) = context.project_id.as_deref() {
+            match object.get("project_id").and_then(Value::as_str) {
+                Some(existing) if existing == project_id => {}
+                Some(_) => {
+                    return Err(McpToolError::new(
+                        -32602,
+                        "project_id does not match scoped MCP project",
+                    )
+                    .with_data(json!({ "project_id": project_id })));
+                }
+                None => {
+                    object.insert(
+                        "project_id".to_owned(),
+                        Value::String(project_id.to_owned()),
+                    );
+                }
             }
-            None => {
-                object.insert(
-                    "project_id".to_owned(),
-                    Value::String(project_id.to_owned()),
-                );
+        }
+        if let Some(project_id) = object
+            .get("project_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+        {
+            assert_project_access(state, project_id, user_id).await?;
+            if tool_name == "forge_create_task" {
+                if let Some(parent_id) = object
+                    .get("parent_task_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                {
+                    assert_task_access(state, Some(project_id), parent_id, user_id).await?;
+                }
             }
         }
         return Ok(arguments);
@@ -169,13 +232,33 @@ async fn apply_project_scope(
 
     if let Some(field_name) = task_scope_field(tool_name) {
         let task_id = required_string_arg(object, field_name)?;
-        assert_task_in_scope(state, project_id, task_id).await?;
+        assert_task_access(state, context.project_id.as_deref(), task_id, user_id).await?;
+        if matches!(
+            tool_name,
+            "forge_add_task_dependency" | "forge_remove_task_dependency"
+        ) {
+            let depends_on_id = required_string_arg(object, "depends_on_id")?;
+            assert_task_access(state, context.project_id.as_deref(), depends_on_id, user_id)
+                .await?;
+        }
+        if tool_name == "forge_list_task_dependencies" {
+            for depends_on_id in TaskDependencyRepo::list_dependencies(&*state.db, task_id).await? {
+                assert_task_access(
+                    state,
+                    context.project_id.as_deref(),
+                    &depends_on_id,
+                    user_id,
+                )
+                .await?;
+            }
+        }
         return Ok(arguments);
     }
 
     if tool_name == "forge_follow_up_execution" {
         let execution_id = required_string_arg(object, "execution_id")?;
-        assert_execution_in_scope(state, project_id, execution_id).await?;
+        assert_execution_access(state, context.project_id.as_deref(), execution_id, user_id)
+            .await?;
     }
 
     Ok(arguments)
@@ -207,7 +290,10 @@ fn task_scope_field(tool_name: &str) -> Option<&'static str> {
         | "forge_get_task_diff"
         | "forge_list_executions"
         | "forge_update_task"
-        | "forge_transition_task" => Some("task_id"),
+        | "forge_transition_task"
+        | "forge_add_task_dependency"
+        | "forge_remove_task_dependency"
+        | "forge_list_task_dependencies" => Some("task_id"),
         "forge_create_sub_tasks" => Some("parent_task_id"),
         _ => None,
     }
@@ -224,15 +310,22 @@ fn required_string_arg<'a>(
         .ok_or_else(|| McpToolError::new(-32602, format!("missing required field `{field_name}`")))
 }
 
-async fn assert_task_in_scope(
+async fn assert_task_access(
     state: &AppState,
-    project_id: &str,
+    project_id: Option<&str>,
     task_id: &str,
+    user_id: &str,
 ) -> Result<(), McpToolError> {
     let task = TaskRepo::get_by_id(&*state.db, task_id, false)
         .await?
         .ok_or_else(|| McpToolError::not_found("task", task_id.to_owned()))?;
-    if task.project_id != project_id {
+    if ProjectRepo::get_visible_by_id(&*state.db, &task.project_id, user_id)
+        .await?
+        .is_none()
+    {
+        return Err(McpToolError::not_found("task", task_id.to_owned()));
+    }
+    if project_id.is_some_and(|scope| task.project_id != scope) {
         return Err(
             McpToolError::new(-32602, "task does not belong to scoped MCP project").with_data(
                 json!({
@@ -245,36 +338,27 @@ async fn assert_task_in_scope(
     Ok(())
 }
 
-async fn assert_execution_in_scope(
+async fn assert_execution_access(
     state: &AppState,
-    project_id: &str,
+    project_id: Option<&str>,
     execution_id: &str,
+    user_id: &str,
 ) -> Result<(), McpToolError> {
     let execution = ExecutionRepo::get_by_id(&*state.db, execution_id)
         .await?
         .ok_or_else(|| McpToolError::not_found("execution", execution_id.to_owned()))?;
-    assert_task_in_scope(state, project_id, &execution.task_id).await
+    assert_task_access(state, project_id, &execution.task_id, user_id).await
 }
 
-async fn assert_project_membership(
+async fn assert_project_access(
     state: &AppState,
     project_id: &str,
     user_id: &str,
 ) -> Result<(), McpToolError> {
-    let project = ProjectRepo::get_by_id(&*state.db, project_id)
+    ProjectRepo::get_visible_by_id(&*state.db, project_id, user_id)
         .await?
         .ok_or_else(|| McpToolError::not_found("project", project_id.to_owned()))?;
-
-    if project.owner_id.as_deref() == Some(user_id) {
-        return Ok(());
-    }
-
-    let member = ProjectMemberRepo::get_member(&*state.db, project_id, user_id).await?;
-    if member.is_some() {
-        return Ok(());
-    }
-
-    Err(McpToolError::new(-32001, "project not accessible"))
+    Ok(())
 }
 
 fn handle_initialize() -> Result<Value, McpToolError> {

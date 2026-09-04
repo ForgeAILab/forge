@@ -449,6 +449,22 @@ pub fn api_router(state: AppState) -> Router {
                 .post(routes::agent_chats::start_agent_chat_topic),
         )
         .route(
+            "/api/v1/agent-chats/{chat_id}/inquiries",
+            get(routes::agent_inquiries::list_agent_chat_inquiries),
+        )
+        .route(
+            "/api/v1/inquiries/{id}",
+            get(routes::agent_inquiries::get_agent_inquiry),
+        )
+        .route(
+            "/api/v1/inquiries/{id}/logs",
+            get(routes::agent_inquiries::get_agent_inquiry_logs),
+        )
+        .route(
+            "/api/v1/inquiries/{id}/cancel",
+            post(routes::agent_inquiries::cancel_agent_inquiry),
+        )
+        .route(
             "/api/v1/projects/{id}/agent-handoffs",
             get(routes::agent_chats::list_agent_handoffs)
                 .post(routes::agent_chats::create_agent_handoff),

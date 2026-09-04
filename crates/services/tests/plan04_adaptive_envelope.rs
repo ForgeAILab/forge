@@ -89,7 +89,7 @@ async fn fixture_with_allowed_operations(
     )
     .await
     .expect("repo");
-    ProjectRepo::update(
+    ProjectRepo::update_at_version(
         &*db,
         UpdateProject {
             id: PROJECT_ID.to_owned(),
@@ -99,6 +99,12 @@ async fn fixture_with_allowed_operations(
             paused_at: None,
             updated_at: NOW.to_owned(),
         },
+        ProjectRepo::get_by_id(&*db, PROJECT_ID)
+            .await
+            .expect("fixture Project lookup")
+            .expect("fixture Project exists")
+            .version,
+        None,
     )
     .await
     .expect("primary repo");

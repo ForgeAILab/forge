@@ -7,11 +7,11 @@
  * The block is a material technology constraint: once approved it changes
  * only through a Charter amendment.
  */
-export type CharterScaffold = {
+export type CharterScaffold = { 
 /**
  * spark template id, for example `nextjs` or `vite-react`.
  */
-template: string,
+template: string, 
 /**
  * spark pack ids installed after scaffolding; empty means no packs.
  */

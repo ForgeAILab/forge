@@ -36,7 +36,7 @@ use forge_agent_host::{
     WorkspaceAccess, MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
     MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READINESS_OPERATION, MAIN_CHARTER_READ_OPERATION,
     MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION, MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
-    MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
+    MAIN_GENESIS_START_OPERATION, MAIN_INQUIRY_RUN_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CHARTER_READ_OPERATION,
     PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
     PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
@@ -52,6 +52,7 @@ use uuid::Uuid;
 
 use crate::{
     agent_chat_policy::guard_agent_chat_content,
+    agent_inquiry_runner::{InquiryRequest, InquiryRunner},
     coordination_service::{AgentActionService, ProposeActionInput},
     memory::{MemoryAccessContext, MemoryService},
     project_agent_actions::ExecuteDirectProjectCommandInput,
@@ -194,6 +195,11 @@ pub struct CoordinationToolProvider {
     /// Root of the media store. Evidence capture writes the bytes it was given
     /// here before recording the Task media row that references them.
     media_root: Arc<RwLock<Option<PathBuf>>>,
+    /// Dispatches ephemeral inquiry sub-agents. Attached after construction
+    /// for the same reason `task_service` is: the runner reaches the native
+    /// backend, which holds this provider, so wiring it at construction would
+    /// close a cycle.
+    inquiry_runner: Arc<RwLock<Option<Arc<dyn InquiryRunner>>>>,
 }
 
 impl std::fmt::Debug for CoordinationToolProvider {
@@ -215,6 +221,7 @@ impl CoordinationToolProvider {
             public_search: Arc::new(RwLock::new(None)),
             task_service: Arc::new(RwLock::new(None)),
             media_root: Arc::new(RwLock::new(None)),
+            inquiry_runner: Arc::new(RwLock::new(None)),
             db,
         }
     }
@@ -240,6 +247,19 @@ impl CoordinationToolProvider {
 
     fn task_service_handle(&self) -> Option<Arc<TaskService>> {
         self.task_service.read().ok().and_then(|slot| slot.clone())
+    }
+
+    pub fn set_inquiry_runner(&self, runner: Arc<dyn InquiryRunner>) {
+        if let Ok(mut slot) = self.inquiry_runner.write() {
+            *slot = Some(runner);
+        }
+    }
+
+    fn inquiry_runner_handle(&self) -> Option<Arc<dyn InquiryRunner>> {
+        self.inquiry_runner
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
     }
 
     /// Check the immutable command identity before evaluating mutable policy.
@@ -1040,6 +1060,100 @@ impl CoordinationToolProvider {
     /// Agent that cannot run anything still has to be able to read what the run
     /// found before it cites that run as authority, and before it decides the
     /// outcome needs a corrective Task.
+    /// Dispatch one ephemeral inquiry sub-agent and block on its findings.
+    ///
+    /// `main_account_id` is what confines this to a Main Chat: it rejects a
+    /// Project Chat outright and requires an Account scope's id to be the
+    /// caller's own, so an inquiry can only ever be run against the account
+    /// that dispatched it.
+    async fn inquiry_run(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        arguments: Value,
+    ) -> Result<Value, AgentHostError> {
+        let runner = self.inquiry_runner_handle().ok_or_else(|| {
+            AgentHostError::Unsupported("inquiries are not available on this server".to_owned())
+        })?;
+        let account_id = self
+            .authorization
+            .main_account_id(actor_identity_id, scope)
+            .await
+            .map_err(native_scope_error)?;
+        // The run record hangs off the conversation the user is watching, so
+        // an inquiry is only dispatchable from a chat, never from a bare
+        // Account session (which is what an inquiry sub-agent itself holds).
+        let chat_id = match scope.scope_type {
+            CanonicalScopeType::AgentChat => scope.scope_id.clone(),
+            _ => {
+                return Err(AgentHostError::Authority(
+                    "inquiries are dispatched from a Main Chat".to_owned(),
+                ));
+            }
+        };
+        let title = arguments
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AgentHostError::Unsupported("an inquiry needs a title".to_owned()))?
+            .to_owned();
+        let question = arguments
+            .get("question")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AgentHostError::Unsupported("an inquiry needs a question".to_owned()))?
+            .to_owned();
+        let context = arguments
+            .get("context")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+
+        let chat_id_for_log = chat_id.clone();
+        let outcome = runner
+            .dispatch(
+                InquiryRequest {
+                    chat_id,
+                    // The turn job is not addressable from inside a tool
+                    // call; the chat binding is what the run record needs.
+                    turn_job_id: None,
+                    identity_id: actor_identity_id.to_owned(),
+                    account_id,
+                    title,
+                    question,
+                    context,
+                },
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .inspect_err(|error| {
+                // A bare `internal_failure` with nothing in the log is not
+                // debuggable, and the model can only see the safe message.
+                tracing::warn!(%error, chat_id = %chat_id_for_log, "inquiry dispatch failed");
+            })
+            .map_err(service_error)?;
+
+        Ok(json!({
+            "inquiry_id": outcome.inquiry_id,
+            "status": outcome.status.to_string(),
+            "findings": outcome.findings,
+            "findings_path": outcome.findings_path,
+            "duration_ms": outcome.duration_ms,
+            // Disjoint counters: context size is input + cache_read +
+            // cache_write. They are reported separately so neither the model
+            // nor the analytics rollup can double-count a cached prefix.
+            "token_usage": {
+                "input_tokens": outcome.input_tokens,
+                "output_tokens": outcome.output_tokens,
+                "cache_read_tokens": outcome.cache_read_tokens,
+                "cache_write_tokens": outcome.cache_write_tokens,
+            },
+        }))
+    }
+
     async fn project_observations_read(
         &self,
         actor_identity_id: &str,
@@ -2999,6 +3113,9 @@ impl ForgeToolProvider for CoordinationToolProvider {
                 .execute(actor_identity_id, scope, operation, arguments)
                 .await
                 .map_err(native_scope_error),
+            MAIN_INQUIRY_RUN_OPERATION => {
+                self.inquiry_run(actor_identity_id, scope, arguments).await
+            }
             PROJECT_CURRENT_STATE_OPERATION => {
                 self.project_current_state_read(actor_identity_id, scope, arguments)
                     .await
@@ -3851,6 +3968,7 @@ fn workspace_access_name(access: WorkspaceAccess) -> &'static str {
         WorkspaceAccess::TaskRead => "task_read",
         WorkspaceAccess::TaskWrite => "task_write",
         WorkspaceAccess::ProjectVerify => "project_verify",
+        WorkspaceAccess::AccountScratch => "account_scratch",
     }
 }
 

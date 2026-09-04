@@ -173,7 +173,7 @@ async fn seed_execution(db: &db::SqliteDb, logs_path: Option<PathBuf>) -> String
     )
     .await
     .expect("repo creates");
-    ProjectRepo::update(
+    ProjectRepo::update_at_version(
         db,
         UpdateProject {
             id: project_id.clone(),
@@ -183,6 +183,12 @@ async fn seed_execution(db: &db::SqliteDb, logs_path: Option<PathBuf>) -> String
             paused_at: None,
             updated_at: now_rfc3339(),
         },
+        ProjectRepo::get_by_id(db, &project_id)
+            .await
+            .expect("fixture Project lookup")
+            .expect("fixture Project exists")
+            .version,
+        None,
     )
     .await
     .expect("project primary repo updates");

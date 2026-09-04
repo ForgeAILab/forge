@@ -7,6 +7,8 @@ pub mod agent_chat_policy;
 pub mod agent_chat_service;
 pub mod agent_chat_turn_policy;
 pub mod agent_chat_turn_worker;
+pub mod agent_inquiry_runner;
+pub mod agent_inquiry_service;
 pub mod agent_service;
 pub mod agent_turn_admission;
 pub mod attention_service;
@@ -116,6 +118,9 @@ pub use agent_chat_turn_policy::{
 pub use agent_chat_turn_worker::{
     AgentChatTurnLogRoot, AgentChatTurnRunner, AgentChatTurnWorker, CliAgentChatSessionBackend,
     CompletedAgentChatTurn, FederatedAgentChatTurnRunner,
+};
+pub use agent_inquiry_runner::{
+    EmbeddedInquiryRunner, InquiryOutcome, InquiryRequest, InquiryRunner,
 };
 pub use agent_service::AgentService;
 pub use agent_turn_admission::{

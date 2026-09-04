@@ -64,7 +64,7 @@ async fn seed_project_repo_and_task(db: &SqliteDb, task_id: &str, status: &str) 
     )
     .await
     .expect("repo creates");
-    ProjectRepo::update(
+    ProjectRepo::update_at_version(
         db,
         UpdateProject {
             id: project_id.clone(),
@@ -74,6 +74,12 @@ async fn seed_project_repo_and_task(db: &SqliteDb, task_id: &str, status: &str) 
             paused_at: None,
             updated_at: now_rfc3339(),
         },
+        ProjectRepo::get_by_id(db, &project_id)
+            .await
+            .expect("fixture Project lookup")
+            .expect("fixture Project exists")
+            .version,
+        None,
     )
     .await
     .expect("project primary repo updates");
@@ -1096,7 +1102,7 @@ async fn seed_custom_workflow_task(
     )
     .await
     .expect("repo creates");
-    ProjectRepo::update(
+    ProjectRepo::update_at_version(
         db,
         UpdateProject {
             id: project_id.clone(),
@@ -1106,6 +1112,12 @@ async fn seed_custom_workflow_task(
             paused_at: None,
             updated_at: now_rfc3339(),
         },
+        ProjectRepo::get_by_id(db, &project_id)
+            .await
+            .expect("fixture Project lookup")
+            .expect("fixture Project exists")
+            .version,
+        None,
     )
     .await
     .expect("project primary repo updates");
@@ -1340,7 +1352,7 @@ async fn gate_approve_reject_on_custom_gate_states() {
     )
     .await
     .expect("repo creates");
-    ProjectRepo::update(
+    ProjectRepo::update_at_version(
         &*db,
         UpdateProject {
             id: project_id.clone(),
@@ -1350,6 +1362,12 @@ async fn gate_approve_reject_on_custom_gate_states() {
             paused_at: None,
             updated_at: now_rfc3339(),
         },
+        ProjectRepo::get_by_id(&*db, &project_id)
+            .await
+            .expect("fixture Project lookup")
+            .expect("fixture Project exists")
+            .version,
+        None,
     )
     .await
     .expect("project primary repo updates");
@@ -1768,7 +1786,7 @@ async fn planning_gate_reject_back_to_itself() {
     )
     .await
     .expect("repo creates");
-    ProjectRepo::update(
+    ProjectRepo::update_at_version(
         &*db,
         UpdateProject {
             id: project_id.clone(),
@@ -1778,6 +1796,12 @@ async fn planning_gate_reject_back_to_itself() {
             paused_at: None,
             updated_at: now_rfc3339(),
         },
+        ProjectRepo::get_by_id(&*db, &project_id)
+            .await
+            .expect("fixture Project lookup")
+            .expect("fixture Project exists")
+            .version,
+        None,
     )
     .await
     .expect("project primary repo updates");

@@ -227,6 +227,7 @@ impl TaskBoardRepo for SqliteDb {
             &transition_input.trigger_reason,
             transition_input.rejection,
             transition_input.created_at.clone(),
+            input.workflow_snapshot,
         );
         DomainEventRepo::append_event_in_tx(self, &mut tx, &transition_event).await?;
 

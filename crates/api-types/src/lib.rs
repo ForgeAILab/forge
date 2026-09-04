@@ -5,6 +5,7 @@ mod auth;
 
 mod actor;
 mod agent_chats;
+mod agent_inquiries;
 mod analytics;
 mod coordination;
 mod core;
@@ -34,6 +35,7 @@ mod workflow;
 
 pub use actor::*;
 pub use agent_chats::*;
+pub use agent_inquiries::*;
 pub use analytics::*;
 pub use auth::*;
 pub use coordination::*;
@@ -230,6 +232,11 @@ fn export_typescript() {
     AgentChatListResponse::export().expect("export AgentChatListResponse");
     AgentChatMessagesQuery::export().expect("export AgentChatMessagesQuery");
     AgentChatMessageListResponse::export().expect("export AgentChatMessageListResponse");
+    AgentInquiryStatus::export().expect("export AgentInquiryStatus");
+    AgentInquiryTokenUsage::export().expect("export AgentInquiryTokenUsage");
+    AgentInquiryResponse::export().expect("export AgentInquiryResponse");
+    AgentInquiryListResponse::export().expect("export AgentInquiryListResponse");
+    CancelAgentInquiryRequest::export().expect("export CancelAgentInquiryRequest");
     CreateEmbeddedAgentRequest::export().expect("export CreateEmbeddedAgentRequest");
     ConnectEmbeddedProfileRequest::export().expect("export ConnectEmbeddedProfileRequest");
     CanonicalScopeRequest::export().expect("export CanonicalScopeRequest");
@@ -333,6 +340,9 @@ fn export_typescript() {
     WorkflowConfigField::export().expect("export WorkflowConfigField");
     PromptBuilderRegistryEntry::export().expect("export PromptBuilderRegistryEntry");
     WorkflowDefinition::export().expect("export WorkflowDefinition");
+    TaskWorkflowStateSnapshot::export().expect("export TaskWorkflowStateSnapshot");
+    TaskWorkflowTransitionSnapshot::export().expect("export TaskWorkflowTransitionSnapshot");
+    TaskTransitionEventPayload::export().expect("export TaskTransitionEventPayload");
     WorkflowTemplateSummary::export().expect("export WorkflowTemplateSummary");
     WorkflowTemplateResponse::export().expect("export WorkflowTemplateResponse");
     SaveWorkflowTemplateRequest::export().expect("export SaveWorkflowTemplateRequest");

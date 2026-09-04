@@ -944,7 +944,7 @@ command = "other"
         )
         .await
         .expect("repo creates");
-        db::ProjectRepo::update(
+        db::ProjectRepo::update_at_version(
             &*state.db,
             db::UpdateProject {
                 id: project_id.clone(),
@@ -954,6 +954,12 @@ command = "other"
                 paused_at: None,
                 updated_at: now,
             },
+            db::ProjectRepo::get_by_id(&*state.db, &project_id)
+                .await
+                .expect("fixture Project lookup")
+                .expect("fixture Project exists")
+                .version,
+            None,
         )
         .await
         .expect("project updates");

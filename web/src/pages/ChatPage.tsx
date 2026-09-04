@@ -4,6 +4,7 @@ import { ArrowUpRight, GearSix } from '@phosphor-icons/react'
 import { Avatar } from '@/components/ui/avatar'
 import { ErrorPanel, LoadingPanel, StatusDot } from '@/features/federation/components'
 import { AgentChatTimeline, type ChatCommand } from '@/components/chat/agent-chat-timeline'
+import { AgentInquiryList } from '@/components/chat/agent-inquiry-list'
 import { ChatSetupRequired } from '@/components/chat/chat-setup-required'
 import {
   ProductGenesisCharterCard,
@@ -98,6 +99,10 @@ export function ChatPage({ projectId }: { projectId?: string }) {
         : chatNeedsSetup || !activeSource
           ? 'setup_required'
           : 'ready'
+  // Inquiries are a Main Chat concept only (a Project Agent chat never
+  // dispatches `inquiry.run`), and need a real chat id to query against.
+  const showMainInquiries = !projectId && activeState === 'ready' && Boolean(chatQuery.data)
+  const showAside = Boolean(projectId) || showMainInquiries
 
   useEffect(() => {
     if (!chatQuery.data) return
@@ -219,7 +224,7 @@ export function ChatPage({ projectId }: { projectId?: string }) {
       <div
         className={cn(
           'min-h-0 flex-1',
-          projectId
+          showAside
             ? 'grid grid-rows-[auto_minmax(0,1fr)] xl:grid-cols-[minmax(0,1fr)_20rem] xl:grid-rows-[minmax(0,1fr)]'
             : 'flex flex-col',
         )}
@@ -236,11 +241,18 @@ export function ChatPage({ projectId }: { projectId?: string }) {
               className="mx-0 mt-3 sm:mx-0 sm:p-3"
             />
           </aside>
+        ) : showMainInquiries && chatQuery.data ? (
+          <aside
+            className="order-1 min-h-0 min-w-0 max-h-[min(42vh,32rem)] overflow-y-auto border-b border-border-subtle bg-muted/10 p-3 sm:p-4 xl:order-2 xl:max-h-none xl:border-b-0 xl:border-l xl:p-3"
+            aria-label="Main Agent inquiries"
+          >
+            <AgentInquiryList chatId={chatQuery.data.id} />
+          </aside>
         ) : null}
         <div
           className={cn(
             'min-h-0 min-w-0 flex-col',
-            projectId ? 'order-2 flex xl:order-1' : 'flex flex-1',
+            showAside ? 'order-2 flex xl:order-1' : 'flex flex-1',
           )}
         >
           {chatsQuery.isLoading || (activeChatId && chatQuery.isLoading) ? (

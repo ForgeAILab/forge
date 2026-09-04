@@ -41,10 +41,11 @@ use crate::{
         MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
         MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION,
         MAIN_CHARTER_READINESS_OPERATION, MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
-        OperationExposure, OperationSurface, PROJECT_CHARTER_ADOPTION_OPERATION,
-        PROJECT_CURRENT_STATE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
-        PROJECT_SKILL_SECTION_NAMES, PROJECT_SKILL_SECTION_OPERATION, TASK_EVIDENCE_OPERATION,
-        TASK_WORKLOG_OPERATION, operation_names_for_surface,
+        MAIN_INQUIRY_RUN_OPERATION, OperationExposure, OperationSurface,
+        PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CURRENT_STATE_OPERATION,
+        PROJECT_OBSERVATIONS_OPERATION, PROJECT_SKILL_SECTION_NAMES,
+        PROJECT_SKILL_SECTION_OPERATION, TASK_EVIDENCE_OPERATION, TASK_WORKLOG_OPERATION,
+        operation_names_for_surface,
     },
     operation_contract::{
         coordination_payload_guidance, coordination_payload_properties,
@@ -202,11 +203,14 @@ impl TaskToolRole {
             (_, None) => Err(AgentHostError::Authority(
                 "Task tool composition requires a server-issued Task role".to_owned(),
             )),
-            (WorkspaceAccess::Deny | WorkspaceAccess::ProjectVerify, _) => {
-                Err(AgentHostError::Authority(
-                    "Task tool composition requires TaskRead or TaskWrite access".to_owned(),
-                ))
-            }
+            (
+                WorkspaceAccess::Deny
+                | WorkspaceAccess::ProjectVerify
+                | WorkspaceAccess::AccountScratch,
+                _,
+            ) => Err(AgentHostError::Authority(
+                "Task tool composition requires TaskRead or TaskWrite access".to_owned(),
+            )),
         }
     }
 }
@@ -340,8 +344,26 @@ impl ScopeToolComposition {
                 "Project verification composition requires the host-issued checkout".to_owned(),
             ));
         }
+        // The Main Agent, and every ephemeral inquiry sub-agent it dispatches,
+        // may hold an account scratch directory for working notes and
+        // findings. It is not a checkout: no repository is present in it, so
+        // there is no route from this surface back to any repository.
+        let account_scratch = matches!(
+            scope.scope_type,
+            CanonicalScopeType::Account | CanonicalScopeType::AgentChat
+        ) && scope.workspace_access == WorkspaceAccess::AccountScratch;
+        if account_scratch
+            && workspace_root
+                .filter(|root| !root.trim().is_empty())
+                .is_none()
+        {
+            return Err(AgentHostError::Authority(
+                "account scratch composition requires the host-issued directory".to_owned(),
+            ));
+        }
         if !matches!(scope.scope_type, CanonicalScopeType::Task)
             && !project_verification
+            && !account_scratch
             && workspace_root.is_some()
         {
             return Err(AgentHostError::Authority(
@@ -419,10 +441,10 @@ impl ScopeToolComposition {
             CanonicalScopeType::Account
             | CanonicalScopeType::Project
             | CanonicalScopeType::AgentChat => {
-                // Verification is read-and-run only. There is no write tool
-                // here on purpose: this Agent checks the delivered software, it
-                // does not author it, and nothing it does in this checkout can
-                // reach the repository.
+                // Verification is read-write-and-run, but only ever against
+                // the disposable checkout: this Agent checks the delivered
+                // software, it does not author it. There is no commit or push
+                // route, so nothing it does here can reach the repository.
                 if project_verification {
                     let root = workspace_root.expect("validated verification checkout");
                     tools.push(Arc::new(TaskReadTool));
@@ -438,6 +460,22 @@ impl ScopeToolComposition {
                     coverage_set.insert(Permission::FsRead);
                     coverage_set.insert(Permission::ProcessSpawn);
                     coverage_set.insert(Permission::FsWrite);
+                    let _ = root;
+                }
+                // Account scratch is read/write/run inside a plain directory.
+                // Commands run at the scratch root because there is no
+                // checkout subdirectory to confine them to.
+                if account_scratch {
+                    let root = workspace_root.expect("validated account scratch directory");
+                    tools.push(Arc::new(TaskReadTool));
+                    tools.push(Arc::new(TaskWriteTool));
+                    tools.push(Arc::new(TaskCommandTool {
+                        observer: None,
+                        command_dir: None,
+                    }));
+                    coverage_set.insert(Permission::FsRead);
+                    coverage_set.insert(Permission::FsWrite);
+                    coverage_set.insert(Permission::ProcessSpawn);
                     let _ = root;
                 }
                 if let Some(provider) = provider {
@@ -517,11 +555,39 @@ impl ScopeToolComposition {
                             &orchestration_reads,
                             allowed_permissions,
                         );
+                        // The depth cap. An inquiry sub-agent runs under the
+                        // Account scope, so withholding the dispatch
+                        // operation there -- rather than asking a model not
+                        // to use it -- makes recursion structurally
+                        // impossible: only a Main Agent Chat can ever start
+                        // an inquiry.
+                        let orchestration_reads = if dispatches_inquiries(scope.scope_type) {
+                            orchestration_reads
+                        } else {
+                            orchestration_reads
+                                .into_iter()
+                                .filter(|operation| operation != MAIN_INQUIRY_RUN_OPERATION)
+                                .collect()
+                        };
                         let orchestration_proposals = filter_operations(
                             scope.scope_type,
                             &orchestration_proposals,
                             allowed_permissions,
                         );
+                        // An inquiry reads and reports; it never proposes.
+                        // Withholding the whole proposal surface is what
+                        // makes that true structurally, and permissions
+                        // alone would not: `genesis.start` is gated on
+                        // `propose_discovery`, the same permission a
+                        // sub-agent needs for public research, so a
+                        // permission-only boundary would hand a research
+                        // sub-agent Product Genesis on its dispatcher's
+                        // account.
+                        let orchestration_proposals = if is_inquiry_scope(&scope) {
+                            Vec::new()
+                        } else {
+                            orchestration_proposals
+                        };
                         let (read_name, propose_name, scope_label) =
                             orchestration_descriptor(surface);
                         if !orchestration_reads.is_empty() {
@@ -839,6 +905,25 @@ fn public_search_permission(
         (CanonicalScopeType::AgentChat, true) => "read_agent_chat",
         (CanonicalScopeType::Task, _) => "__unknown_public_search_permission__",
     }
+}
+
+/// Whether this composition is an ephemeral inquiry sub-agent's own scope.
+///
+/// An inquiry runs under the Account scope with a scratch directory, which is
+/// a shape nothing else uses: a Main Chat holds `account_scratch` too but is
+/// an Agent Chat, and every other Account session denies filesystem access.
+fn is_inquiry_scope(scope: &CanonicalScope) -> bool {
+    scope.is_ephemeral_inquiry()
+}
+
+/// Whether a scope may dispatch an ephemeral inquiry sub-agent.
+///
+/// Only an Agent Chat can: a Main Chat is a conversation a user is watching,
+/// which is what makes an inquiry's cost and its run record legible. The
+/// Account scope an inquiry itself runs under is deliberately excluded, and
+/// that exclusion is what caps dispatch depth at one.
+fn dispatches_inquiries(scope_type: CanonicalScopeType) -> bool {
+    matches!(scope_type, CanonicalScopeType::AgentChat)
 }
 
 fn orchestration_surface(
@@ -2023,6 +2108,18 @@ fn reject_authority_overrides(arguments: &Value) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+/// Whether the read path admits this operation's arguments envelope.
+///
+/// The admitted nested names below are a second gate in front of the JSON
+/// schema the model is shown. Exposed so the two can be pinned to each other
+/// in a test: an operation advertised with arguments this refuses fails as an
+/// opaque internal error, which is unusable for the model and invisible in
+/// the log.
+#[must_use]
+pub fn admits_orchestration_read_argument(operation: &str, arguments: &Value) -> bool {
+    validate_orchestration_read_arguments(operation, arguments).is_ok()
+}
+
 fn validate_orchestration_read_arguments(
     operation: &str,
     arguments: &Value,
@@ -2070,6 +2167,7 @@ fn validate_orchestration_read_arguments(
             PROJECT_CURRENT_STATE_OPERATION => &["limit"],
             PROJECT_OBSERVATIONS_OPERATION => &["task_id", "limit"],
             PROJECT_SKILL_SECTION_OPERATION => &["section"],
+            MAIN_INQUIRY_RUN_OPERATION => &["title", "question", "context"],
             _ => &[],
         };
         if let Some(field) = nested

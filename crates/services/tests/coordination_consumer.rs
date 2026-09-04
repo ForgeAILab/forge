@@ -96,7 +96,7 @@ async fn task_outcome_reconciliation_replays_after_cursor_reset_without_duplicat
             title: "Deliver outcome".to_owned(),
             description: None,
             task_type: "task".to_owned(),
-            status: "done".to_owned(),
+            status: "shipped".to_owned(),
             is_automation: false,
             priority: 0,
             subtask_order: None,
@@ -127,6 +127,20 @@ async fn task_outcome_reconciliation_replays_after_cursor_reset_without_duplicat
         .await
         .unwrap();
 
+    let mut effective_workflow = services::workflow::default_workflow::default_workflow();
+    effective_workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == "done")
+        .unwrap()
+        .name = "shipped".to_owned();
+    let snapshot = services::workflow::transition_event::transition_workflow_snapshot(
+        &task,
+        &effective_workflow,
+        "in_progress",
+        "shipped",
+    )
+    .unwrap();
     DomainEventRepo::append_event(
         &*db,
         CreateDomainEvent::task_transition(
@@ -134,16 +148,32 @@ async fn task_outcome_reconciliation_replays_after_cursor_reset_without_duplicat
             task.id.clone(),
             project_id,
             "in_progress",
-            "done",
+            "shipped",
             None,
             "system:workflow",
             "delivery accepted",
             false,
             now,
+            snapshot,
         ),
     )
     .await
     .unwrap();
+
+    // Replay must use the committed custom terminal meaning, even when the
+    // current definition would interpret the same state as ongoing work.
+    effective_workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == "shipped")
+        .unwrap()
+        .kind = api_types::StateKind::Active;
+    sqlx::query("UPDATE project SET workflow_definition = ? WHERE id = ?")
+        .bind(serde_json::to_string(&effective_workflow).unwrap())
+        .bind(project_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
 
     let first = CoordinationOutcomeConsumer::new(Arc::clone(&db), "consumer-1")
         .run_once(100)
@@ -524,6 +554,13 @@ async fn binding_replacement_requires_explicit_transfer_and_keeps_outcomes_with_
             "continuity delivery accepted",
             false,
             now,
+            services::workflow::transition_event::transition_workflow_snapshot(
+                &task,
+                &services::workflow::default_workflow::default_workflow(),
+                "in_progress",
+                "done",
+            )
+            .unwrap(),
         ),
     )
     .await

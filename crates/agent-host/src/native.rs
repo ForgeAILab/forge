@@ -44,9 +44,65 @@ use crate::{
 pub struct NativeAgentRuntimeBackend {
     protected_store: Arc<SqliteProtectedRuntimeStore>,
     interaction_broker: InteractionBrokerHandle,
-    active: Arc<Mutex<HashMap<String, SessionHandle>>>,
+    active: Arc<Mutex<HashMap<String, ActiveNativeSession>>>,
     forge_tool_provider: Option<Arc<dyn ForgeToolProvider>>,
     provider_override: Option<Arc<dyn Provider>>,
+}
+
+struct ActiveNativeSession {
+    generation: String,
+    session: SessionHandle,
+}
+
+/// Cancelling a caller may drop the backend future while the runtime's
+/// independently spawned driver is still active. Keep cancellation and
+/// registry cleanup tied to that future's lifetime.
+struct ActiveNativeTurn {
+    session: SessionHandle,
+    runtime_session_id: String,
+    generation: String,
+    active: Arc<Mutex<HashMap<String, ActiveNativeSession>>>,
+    finished: bool,
+}
+
+impl ActiveNativeTurn {
+    fn finish(&mut self) {
+        remove_active_turn(&self.active, &self.runtime_session_id, &self.generation);
+        self.finished = true;
+    }
+}
+
+fn remove_active_turn(
+    active: &Mutex<HashMap<String, ActiveNativeSession>>,
+    runtime_session_id: &str,
+    generation: &str,
+) {
+    let Ok(mut active) = active.lock() else {
+        return;
+    };
+    if active
+        .get(runtime_session_id)
+        .is_some_and(|entry| entry.generation == generation)
+    {
+        active.remove(runtime_session_id);
+    }
+}
+
+impl Drop for ActiveNativeTurn {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.session.cancel_session(CancelReason::Shutdown);
+        let session = self.session.clone();
+        let active = Arc::clone(&self.active);
+        let runtime_session_id = self.runtime_session_id.clone();
+        let generation = self.generation.clone();
+        tokio::spawn(async move {
+            let _ = session.shutdown().await;
+            remove_active_turn(&active, &runtime_session_id, &generation);
+        });
+    }
 }
 
 impl NativeAgentRuntimeBackend {
@@ -247,11 +303,12 @@ impl fmt::Debug for NativeAgentRuntimeBackend {
 #[async_trait]
 impl AgentSessionBackend for NativeAgentRuntimeBackend {
     fn capabilities(&self, scope: &CanonicalScope) -> BackendCapabilities {
+        let persistent = !scope.is_ephemeral_inquiry();
         BackendCapabilities {
             native_runtime: true,
-            persistent_session: true,
-            protected_checkpoints: true,
-            lcm: true,
+            persistent_session: persistent,
+            protected_checkpoints: persistent,
+            lcm: persistent,
             cancel: true,
             steer: true,
             workspace: scope.workspace_access,
@@ -263,6 +320,9 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
         request: AgentTurnRequest,
         sink: Arc<dyn TurnEventSink>,
     ) -> Result<AgentTurnOutput, AgentHostError> {
+        if request.cancellation.is_cancelled() {
+            return Err(AgentHostError::Runtime("turn cancelled".to_owned()));
+        }
         request.scope.validate()?;
         let binding = self
             .protected_store
@@ -289,6 +349,14 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             CanonicalScopeType::Task => Some(workspace.root().to_owned()),
             CanonicalScopeType::AgentChat
                 if binding.scope.workspace_access == WorkspaceAccess::ProjectVerify =>
+            {
+                Some(workspace.root().to_owned())
+            }
+            // The Main Agent and the ephemeral inquiry sub-agents it
+            // dispatches compose against an account scratch directory. No
+            // repository is present in it, so there is nothing to write back.
+            CanonicalScopeType::Account | CanonicalScopeType::AgentChat
+                if binding.scope.workspace_access == WorkspaceAccess::AccountScratch =>
             {
                 Some(workspace.root().to_owned())
             }
@@ -326,28 +394,38 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
         ));
         let provider = self.provider(&request)?;
         let model_id = ModelId::new(&request.provider.model);
-        let lcm_store = self
-            .protected_store
-            .lcm_store_for_runtime_session(
-                &request.runtime_session_id,
-                scope_type_name(request.scope.scope_type),
-                &request.scope.scope_id,
+        let persistent = !binding.scope.is_ephemeral_inquiry();
+        let mut lcm_link = None;
+        let lcm = if persistent {
+            let lcm_store = self
+                .protected_store
+                .lcm_store_for_runtime_session(
+                    &request.runtime_session_id,
+                    scope_type_name(request.scope.scope_type),
+                    &request.scope.scope_id,
+                )
+                .await?;
+            lcm_link = Some((
+                lcm_store.timeline_id().to_owned(),
+                lcm_store.authorization_revision().to_owned(),
+            ));
+            let lcm_binding =
+                lcm_store.runtime_binding(SessionId::new(&request.runtime_session_id))?;
+            let lcm = LcmCoordinator::new(
+                Arc::new(lcm_store),
+                Arc::new(DeterministicLcmSummaryModel::default()),
+                Arc::new(StaticLcmTimelineResolver::new(lcm_binding)),
+                LcmCoordinatorPolicy {
+                    input_budget_tokens: conversation_budget_tokens(&request, &composition),
+                    pressure: forge_lcm_pressure_policy(&request),
+                    ..LcmCoordinatorPolicy::default()
+                },
             )
-            .await?;
-        let lcm_timeline_id = lcm_store.timeline_id().to_owned();
-        let lcm_binding_revision = lcm_store.authorization_revision().to_owned();
-        let lcm_binding = lcm_store.runtime_binding(SessionId::new(&request.runtime_session_id))?;
-        let lcm = LcmCoordinator::new(
-            Arc::new(lcm_store),
-            Arc::new(DeterministicLcmSummaryModel::default()),
-            Arc::new(StaticLcmTimelineResolver::new(lcm_binding)),
-            LcmCoordinatorPolicy {
-                input_budget_tokens: conversation_budget_tokens(&request, &composition),
-                pressure: forge_lcm_pressure_policy(&request),
-                ..LcmCoordinatorPolicy::default()
-            },
-        )
-        .map_err(|error| AgentHostError::Configuration(error.to_string()))?;
+            .map_err(|error| AgentHostError::Configuration(error.to_string()))?;
+            Some(lcm)
+        } else {
+            None
+        };
         let mut builder = RuntimeBuilder::new(model_id.clone())
             .provider_name(request.provider.provider.clone())
             .provider(provider)
@@ -361,16 +439,19 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
                 ),
             ))
             .workspace(workspace)
-            .session_store(self.protected_store.clone())
-            .checkpoint_store(self.protected_store.clone())
             .interaction_broker(Arc::new(self.interaction_broker.clone()))
             .security_subject(SecuritySubject::new(binding.identity_id))
-            .lcm(Arc::new(lcm))
             // Forge reduces raw arguments to a bounded, credential-masked
             // preview (`tool_preview::build_tool_argument_preview`) before
             // they are ever persisted or rendered; without this opt-in the
             // runtime withholds argument values by default.
             .emit_raw_tool_arguments(true);
+        if let Some(lcm) = lcm {
+            builder = builder
+                .session_store(self.protected_store.clone())
+                .checkpoint_store(self.protected_store.clone())
+                .lcm(Arc::new(lcm));
+        }
         builder = composition.apply(builder);
         if let Some(prompt) = request.system_prompt.as_deref() {
             builder = builder.system_prompt(prompt);
@@ -382,24 +463,54 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             .start_session(
                 StartSession::new()
                     .with_id(SessionId::new(&request.runtime_session_id))
-                    .with_history(request.history),
+                    .with_history(if persistent {
+                        request.history
+                    } else {
+                        Vec::new()
+                    }),
             )
             .await
             .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
         let mut events = session.subscribe();
+        if request.cancellation.is_cancelled() {
+            return Err(AgentHostError::Runtime("turn cancelled".to_owned()));
+        }
+        let generation = db::new_uuid_v4();
+        {
+            let mut active = self.active.lock().map_err(|_| {
+                AgentHostError::Runtime("active session registry failed".to_owned())
+            })?;
+            if active.contains_key(&request.runtime_session_id) {
+                return Err(AgentHostError::Runtime(
+                    "a turn is already active for this runtime session".to_owned(),
+                ));
+            }
+            active.insert(
+                request.runtime_session_id.clone(),
+                ActiveNativeSession {
+                    generation: generation.clone(),
+                    session: session.clone(),
+                },
+            );
+        }
+        let mut active_turn = ActiveNativeTurn {
+            session: session.clone(),
+            runtime_session_id: request.runtime_session_id.clone(),
+            generation,
+            active: Arc::clone(&self.active),
+            finished: false,
+        };
         let turn = session
             .send(UserInput::text(request.input))
             .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
-        self.active
-            .lock()
-            .map_err(|_| AgentHostError::Runtime("active session registry failed".to_owned()))?
-            .insert(request.runtime_session_id.clone(), session.clone());
         let turn_id = turn.id().clone();
         let mut last_turn_error: Option<String> = None;
         let finish_result = loop {
             tokio::select! {
                 _ = request.cancellation.cancelled() => {
                     turn.interrupt(CancelReason::UserRequested);
+                    session.shutdown().await
+                        .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
                     break Ok(TurnFinish::Cancelled { reason: CancelReason::UserRequested });
                 }
                 event = events.next() => {
@@ -454,16 +565,21 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
                 }
             }
         };
+        if finish_result.is_err() {
+            session
+                .shutdown()
+                .await
+                .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
+        } else {
+            turn.completed().await;
+        }
         let persist_result = session
             .persist()
             .await
             .map_err(|error| AgentHostError::Runtime(error.to_string()));
-        self.active
-            .lock()
-            .map_err(|_| AgentHostError::Runtime("active session registry failed".to_owned()))?
-            .remove(&request.runtime_session_id);
         let finish = finish_result?;
         persist_result?;
+        active_turn.finish();
 
         let pending_interaction_id = match finish {
             TurnFinish::Completed => None,
@@ -499,12 +615,13 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             .unwrap_or_default();
         let snapshot = session.snapshot();
         let context_manifest =
-            RuntimeContextManifestLink::from_snapshot(&snapshot).map(|manifest| {
-                manifest.with_lcm_binding(
-                    lcm_timeline_id,
-                    lcm_binding_revision,
+            RuntimeContextManifestLink::from_snapshot(&snapshot).map(|manifest| match lcm_link {
+                Some((timeline_id, binding_revision)) => manifest.with_lcm_binding(
+                    timeline_id,
+                    binding_revision,
                     FORGE_LCM_STORE_REVISION,
-                )
+                ),
+                None => manifest,
             });
         let usage = snapshot.usage.total();
         Ok(AgentTurnOutput {
@@ -531,7 +648,7 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             .lock()
             .map_err(|_| AgentHostError::Runtime("active session registry failed".to_owned()))?
             .get(runtime_session_id)
-            .cloned()
+            .map(|entry| entry.session.clone())
             .ok_or(AgentHostError::SessionNotFound)?;
         session
             .interrupt_current_turn(CancelReason::UserRequested)
@@ -545,7 +662,7 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             .lock()
             .map_err(|_| AgentHostError::Runtime("active session registry failed".to_owned()))?
             .get(runtime_session_id)
-            .cloned()
+            .map(|entry| entry.session.clone())
             .ok_or(AgentHostError::SessionNotFound)?;
         session
             .steer_current_turn(None, UserInput::text(content))
@@ -636,6 +753,28 @@ fn workspace_for_scope(
             if !canonical.is_dir() {
                 return Err(AgentHostError::Authority(
                     "Project verification checkout is not a directory".to_owned(),
+                ));
+            }
+            Ok(Arc::new(TaskWorkspace::new(canonical)))
+        }
+        CanonicalScopeType::Account | CanonicalScopeType::AgentChat
+            if scope.workspace_access == WorkspaceAccess::AccountScratch =>
+        {
+            let path = workspace_path
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    AgentHostError::Authority(
+                        "account scratch scope requires a host-issued directory".to_owned(),
+                    )
+                })?;
+            let canonical = std::fs::canonicalize(path).map_err(|_| {
+                AgentHostError::Authority(
+                    "account scratch directory is not an existing directory".to_owned(),
+                )
+            })?;
+            if !canonical.is_dir() {
+                return Err(AgentHostError::Authority(
+                    "account scratch path is not a directory".to_owned(),
                 ));
             }
             Ok(Arc::new(TaskWorkspace::new(canonical)))

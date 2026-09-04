@@ -1199,6 +1199,8 @@ pub struct CompareAndMoveTask {
     pub after_id: Option<String>,
     pub entry_barrier_json: Option<String>,
     pub transition_log_id: String,
+    /// Server-derived effective workflow semantics, pinned to task_version.
+    pub workflow_snapshot: serde_json::Value,
     pub trigger_name: Option<String>,
     pub triggered_by: String,
     pub trigger_reason: String,
@@ -2992,4 +2994,52 @@ enum_strings!(AgentActionExecutionStatus {
     Started => "started",
     Succeeded => "succeeded",
     Failed => "failed",
+});
+
+/// One ephemeral, read-only Main-agent sub-agent run ("inquiry"). It is a
+/// run log the Main session can inspect and cancel, not a work item: no
+/// repo, no task flow, no state machine. The four token counters mirror
+/// `agent_host::AgentTurnOutput` and are disjoint (context size = input +
+/// cache_read + cache_write) -- never sum or collapse them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentInquiry {
+    pub id: String,
+    pub chat_id: String,
+    pub turn_job_id: Option<String>,
+    pub identity_id: String,
+    pub owner_user_id: String,
+    pub title: String,
+    pub question: String,
+    pub status: AgentInquiryStatus,
+    pub findings: Option<String>,
+    pub findings_path: Option<String>,
+    pub workspace_path: Option<String>,
+    pub error: Option<String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub duration_ms: Option<i64>,
+    pub version: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+/// Closed set. The only user verb over an inquiry is cancel: deliberately no
+/// retry, assignment, dependency, milestone, or review concept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentInquiryStatus {
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+enum_strings!(AgentInquiryStatus {
+    Running => "running",
+    Succeeded => "succeeded",
+    Failed => "failed",
+    Cancelled => "cancelled",
 });

@@ -91,7 +91,7 @@ async fn seeded_review(ci_steps: Vec<&str>) -> SeededReview {
     )
     .await
     .expect("repo creates");
-    ProjectRepo::update(
+    ProjectRepo::update_at_version(
         &*db,
         UpdateProject {
             id: project_id.clone(),
@@ -101,6 +101,12 @@ async fn seeded_review(ci_steps: Vec<&str>) -> SeededReview {
             paused_at: None,
             updated_at: now_rfc3339(),
         },
+        ProjectRepo::get_by_id(&*db, &project_id)
+            .await
+            .expect("fixture Project lookup")
+            .expect("fixture Project exists")
+            .version,
+        None,
     )
     .await
     .expect("project primary repo updates");

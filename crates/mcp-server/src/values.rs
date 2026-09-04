@@ -100,6 +100,7 @@ pub(crate) fn project_value(project: Project) -> Value {
         "name": project.name,
         "settings": json_string(Some(project.settings)),
         "workflow_template_name": project.workflow_template_name,
+        "version": project.version,
         "paused_at": project.paused_at,
         "paused": paused,
         "created_at": project.created_at,

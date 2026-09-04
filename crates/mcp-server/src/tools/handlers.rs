@@ -607,17 +607,25 @@ pub(super) async fn forge_list_agents(
 pub(super) async fn forge_list_projects(
     state: &AppState,
     params: Value,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
     let params: ListProjectsParams = parse_params(params)?;
-    let page =
-        ProjectRepo::list(&*state.db, page_request(params.cursor, params.limit, None)?).await?;
+    let page = ProjectRepo::list_visible(
+        &*state.db,
+        authenticated_user(context)?,
+        page_request(params.cursor, params.limit, None)?,
+    )
+    .await?;
     Ok(project_page_value(page))
 }
 
 pub(super) async fn forge_create_project(
     state: &AppState,
     params: Value,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
+    require_account_scope(context)?;
+    let user_id = authenticated_user(context)?;
     let params: CreateProjectParams = parse_params(params)?;
     if params.name.trim().is_empty() {
         return Err(McpToolError::new(-32602, "name must not be empty"));
@@ -631,7 +639,7 @@ pub(super) async fn forge_create_project(
             settings: "{}".to_owned(),
             workflow_definition: "{}".to_string(),
             primary_repo_id: None,
-            owner_id: None,
+            owner_id: Some(user_id.to_owned()),
             created_at: now.clone(),
             updated_at: now,
         },
@@ -672,7 +680,7 @@ pub(super) async fn forge_update_project(
         None => None,
     };
 
-    let project = ProjectRepo::update(
+    let project = ProjectRepo::update_at_version(
         &*state.db,
         UpdateProject {
             id: params.project_id,
@@ -682,6 +690,8 @@ pub(super) async fn forge_update_project(
             paused_at: params.paused.map(|paused| paused.then(now_rfc3339)),
             updated_at: now_rfc3339(),
         },
+        params.version,
+        None,
     )
     .await?;
     Ok(project_value(project))
@@ -695,6 +705,9 @@ pub(super) async fn forge_update_project_lifecycle_hooks(
     let project = ProjectRepo::get_by_id(&*state.db, &params.project_id)
         .await?
         .ok_or_else(|| McpToolError::not_found("project", params.project_id.clone()))?;
+    if project.version != params.version {
+        return Err(db::DbError::VersionConflict.into());
+    }
     let mut settings: Value = serde_json::from_str(&project.settings).map_err(|error| {
         McpToolError::new(
             -32602,
@@ -713,7 +726,7 @@ pub(super) async fn forge_update_project_lifecycle_hooks(
     settings_object.insert("lifecycle_hooks".to_owned(), hooks);
     validate_project_settings(state, &project.id, &settings).await?;
 
-    let project = ProjectRepo::update(
+    let project = ProjectRepo::update_at_version(
         &*state.db,
         UpdateProject {
             id: project.id,
@@ -723,6 +736,8 @@ pub(super) async fn forge_update_project_lifecycle_hooks(
             paused_at: None,
             updated_at: now_rfc3339(),
         },
+        params.version,
+        None,
     )
     .await?;
     Ok(project_value(project))

@@ -264,6 +264,13 @@ impl EmbeddedAgentService {
         self.tool_provider.set_task_service(task_service);
     }
 
+    /// Attach the inquiry runner so a Main Chat can dispatch ephemeral
+    /// research sub-agents. Wired after construction because the runner needs
+    /// a handle back to this service.
+    pub fn set_inquiry_runner(&self, runner: Arc<dyn crate::agent_inquiry_runner::InquiryRunner>) {
+        self.tool_provider.set_inquiry_runner(runner);
+    }
+
     /// Attach the media storage root so a Task session can capture the
     /// artifacts its run produced as authoritative evidence.
     pub fn set_media_root(&self, media_root: std::path::PathBuf) {
@@ -306,6 +313,52 @@ impl EmbeddedAgentService {
             // visible instead of showing up later as a denied scope.
             Err(error) => {
                 tracing::warn!(%error, project_id, "Project Agent workspace unavailable");
+                None
+            }
+        }
+    }
+
+    /// Resolve the Main Agent's scratch directory, provisioning it on first
+    /// use. Unlike the Project Agent workspace this holds no repository at
+    /// all: it is where Main and its inquiries keep findings and notes.
+    pub async fn main_agent_workspace(&self, account_id: &str) -> Option<std::path::PathBuf> {
+        let (_, workspaces_root) = self.workspace_roots()?;
+        match crate::task_service::workspace::ensure_main_agent_workspace(
+            &workspaces_root,
+            account_id,
+        )
+        .await
+        {
+            Ok(workspace) => Some(workspace),
+            // Main still works without a scratch directory; it just cannot
+            // keep notes or dispatch an inquiry. Log rather than swallow.
+            Err(error) => {
+                tracing::warn!(%error, account_id, "Main Agent workspace unavailable");
+                None
+            }
+        }
+    }
+
+    /// Resolve one inquiry's private directory inside the dispatching
+    /// account's scratch root.
+    pub async fn inquiry_workspace(
+        &self,
+        account_id: &str,
+        inquiry_id: &str,
+    ) -> Option<std::path::PathBuf> {
+        let (_, workspaces_root) = self.workspace_roots()?;
+        match crate::task_service::workspace::ensure_inquiry_workspace(
+            &workspaces_root,
+            account_id,
+            inquiry_id,
+        )
+        .await
+        {
+            Ok(path) => Some(path),
+            // Swallowing this silently turns into an opaque tool failure with
+            // nothing to chase; say why the directory could not be made.
+            Err(error) => {
+                tracing::warn!(%error, account_id, inquiry_id, "inquiry workspace unavailable");
                 None
             }
         }
@@ -948,6 +1001,85 @@ impl EmbeddedAgentService {
         .await
     }
 
+    /// Create or resume the session an ephemeral inquiry sub-agent runs in.
+    ///
+    /// This deliberately does not go through [`Self::authorize_scope`]: the
+    /// scope is host-derived rather than caller-requested, and it is the one
+    /// Account scope that carries a scratch directory. Ownership is still
+    /// enforced, through the identity that dispatched the inquiry.
+    ///
+    /// One authority/session record serves every inquiry an account runs. Two existing
+    /// constraints force that shape: `main_account_id` requires an Account
+    /// scope's id to be the owner's id, so the id cannot vary per inquiry,
+    /// and `create_context_scope` keys on `(identity, scope_type, scope_id,
+    /// task_role)`, so a per-inquiry scope row is not expressible either.
+    /// The native backend omits snapshot/checkpoint/LCM stores for this scope,
+    /// so each inquiry starts with empty history and usage. [`crate::agent_inquiry_runner`]
+    /// serializes inquiries per account so two turns never share one live
+    /// runtime session.
+    pub async fn create_inquiry_session(
+        &self,
+        actor_user_id: &str,
+        identity_id: &str,
+    ) -> Result<AgentSession> {
+        let identity = self
+            .require_owned_identity(identity_id, actor_user_id)
+            .await?;
+        if identity.paused {
+            return Err(ServiceError::AgentPaused {
+                agent_id: identity.id,
+            });
+        }
+        let profile = AgentProfileRepo::get_profile(&*self.db, &identity.profile_id)
+            .await?
+            .filter(|profile| profile.identity_id == identity.id)
+            .ok_or_else(|| ServiceError::not_found("agent_profile", identity.profile_id.clone()))?;
+        self.require_profile_source_enabled(&profile).await?;
+        if profile.backend_kind != "native" {
+            return Err(ServiceError::invalid_operation(
+                "inquiries require a native Agent Profile",
+            ));
+        }
+        // Resolve the scratch directory before the scope asserts it. A scope
+        // that advertises `account_scratch` without a directory is a binding
+        // the runtime correctly refuses at turn time.
+        if self.main_agent_workspace(actor_user_id).await.is_none() {
+            return Err(ServiceError::invalid_operation(
+                "the Main Agent scratch workspace is unavailable",
+            ));
+        }
+        let canonical = CanonicalScope {
+            scope_type: CanonicalScopeType::Account,
+            scope_id: actor_user_id.to_owned(),
+            workspace_access: WorkspaceAccess::AccountScratch,
+        };
+        canonical
+            .validate()
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        let capabilities = capabilities_for_profile(&profile, &canonical);
+        let session = self
+            .persist_authorized_session(
+                identity,
+                profile.clone(),
+                canonical,
+                None,
+                None,
+                None,
+                scope_authority_json(actor_user_id, &RequestedCanonicalScope::Account),
+            )
+            .await?;
+        if serde_json::from_str::<BackendCapabilities>(&session.capabilities_json).ok()
+            == Some(capabilities)
+        {
+            Ok(session)
+        } else {
+            // Earlier inquiry sessions advertised persistent conversation
+            // stores. Rotate through the normal versioned transaction so the
+            // derived capabilities become current without deleting history.
+            self.rotate_authorized_session(&session, &profile).await
+        }
+    }
+
     /// Create or resume the session for an already-admitted Agent Chat turn.
     ///
     /// Interactive callers must continue through [`Self::authorize_scope`],
@@ -1101,13 +1233,16 @@ impl EmbeddedAgentService {
             ));
         }
 
-        // A Project Agent Chat carries its own workspace, so the frozen session
+        // Both chat kinds carry their own workspace, so the frozen session
         // must resolve the same access the turn will assert. Building `Deny`
-        // here and `ProjectVerify` at turn time is a binding mismatch, which
-        // the runtime correctly refuses.
-        let workspace_access = match project_id.as_deref() {
-            Some(project_id) if self.project_agent_workspace(project_id).await.is_some() => {
+        // here and a workspace access at turn time is a binding mismatch,
+        // which the runtime correctly refuses.
+        let workspace_access = match (project_id.as_deref(), chat.account_id.as_deref()) {
+            (Some(project_id), _) if self.project_agent_workspace(project_id).await.is_some() => {
                 WorkspaceAccess::ProjectVerify
+            }
+            (None, Some(account_id)) if self.main_agent_workspace(account_id).await.is_some() => {
+                WorkspaceAccess::AccountScratch
             }
             _ => WorkspaceAccess::Deny,
         };
@@ -1143,11 +1278,21 @@ impl EmbeddedAgentService {
         authority_json: Value,
     ) -> Result<AgentSession> {
         let now = now_rfc3339();
-        let project_workspace_path = match (canonical.workspace_access, project_id.as_deref()) {
+        let scope_workspace_path = match (canonical.workspace_access, project_id.as_deref()) {
             (WorkspaceAccess::ProjectVerify, Some(project_id)) => self
                 .project_agent_workspace(project_id)
                 .await
                 .map(|path| path.to_string_lossy().into_owned()),
+            // The scratch directory belongs to the account that owns the
+            // identity, so it is resolved from ownership rather than from the
+            // opaque scope id.
+            (WorkspaceAccess::AccountScratch, _) => match identity.owner_id.as_deref() {
+                Some(account_id) => self
+                    .main_agent_workspace(account_id)
+                    .await
+                    .map(|path| path.to_string_lossy().into_owned()),
+                None => None,
+            },
             _ => None,
         };
         let scope = AgentContextScopeRepo::create_context_scope(
@@ -1161,11 +1306,13 @@ impl EmbeddedAgentService {
                 task_id,
                 task_role,
                 workspace_access: workspace_access_name(canonical.workspace_access).to_owned(),
-                // A `project_verify` scope owns its workspace directly; every
-                // other scope leaves this NULL and the Task `workspace` table
-                // stays the authority.
+                // A `project_verify` or `account_scratch` scope owns its
+                // directory directly; every other scope leaves this NULL and
+                // the Task `workspace` table stays the authority.
                 workspace_path: match canonical.workspace_access {
-                    WorkspaceAccess::ProjectVerify => project_workspace_path.clone(),
+                    WorkspaceAccess::ProjectVerify | WorkspaceAccess::AccountScratch => {
+                        scope_workspace_path.clone()
+                    }
                     _ => None,
                 },
                 authority_json: authority_json.to_string(),
@@ -1566,14 +1713,23 @@ impl EmbeddedAgentService {
                 // exercise the delivered software rather than reason about it.
                 // There is no write tool in that composition and the checkout
                 // is never a delivery worktree.
-                let workspace_access = match chat.project_id.as_deref() {
-                    Some(project_id)
-                        if self.project_agent_workspace(project_id).await.is_some() =>
-                    {
-                        WorkspaceAccess::ProjectVerify
-                    }
-                    _ => WorkspaceAccess::Deny,
-                };
+                let workspace_access =
+                    match (chat.project_id.as_deref(), chat.account_id.as_deref()) {
+                        (Some(project_id), _)
+                            if self.project_agent_workspace(project_id).await.is_some() =>
+                        {
+                            WorkspaceAccess::ProjectVerify
+                        }
+                        // A Main Chat holds an account scratch directory: no
+                        // repository, nothing to push, just somewhere to keep
+                        // findings instead of carrying them in context.
+                        (None, Some(account_id))
+                            if self.main_agent_workspace(account_id).await.is_some() =>
+                        {
+                            WorkspaceAccess::AccountScratch
+                        }
+                        _ => WorkspaceAccess::Deny,
+                    };
                 Ok(CanonicalScope {
                     scope_type: CanonicalScopeType::AgentChat,
                     scope_id: chat_id.clone(),
@@ -2208,8 +2364,12 @@ fn capabilities_for_profile(
     canonical: &CanonicalScope,
 ) -> BackendCapabilities {
     if profile.backend_kind == "native" {
+        let persistent = !canonical.is_ephemeral_inquiry();
         BackendCapabilities {
             workspace: canonical.workspace_access,
+            persistent_session: persistent,
+            protected_checkpoints: persistent,
+            lcm: persistent,
             ..native_capabilities()
         }
     } else {
@@ -2270,6 +2430,7 @@ fn workspace_access_name(access: WorkspaceAccess) -> &'static str {
         WorkspaceAccess::TaskRead => "task_read",
         WorkspaceAccess::TaskWrite => "task_write",
         WorkspaceAccess::ProjectVerify => "project_verify",
+        WorkspaceAccess::AccountScratch => "account_scratch",
     }
 }
 
@@ -2279,6 +2440,7 @@ fn parse_workspace_access(value: &str) -> Result<WorkspaceAccess> {
         "task_read" => Ok(WorkspaceAccess::TaskRead),
         "task_write" => Ok(WorkspaceAccess::TaskWrite),
         "project_verify" => Ok(WorkspaceAccess::ProjectVerify),
+        "account_scratch" => Ok(WorkspaceAccess::AccountScratch),
         _ => Err(ServiceError::invalid_operation(
             "stored workspace access is invalid",
         )),
@@ -2393,7 +2555,9 @@ fn scope_permission_set(
             WorkspaceAccess::TaskWrite => {
                 vec!["read_task", "read_memory", "task_read", "task_write"]
             }
-            WorkspaceAccess::Deny | WorkspaceAccess::ProjectVerify => Vec::new(),
+            WorkspaceAccess::Deny
+            | WorkspaceAccess::ProjectVerify
+            | WorkspaceAccess::AccountScratch => Vec::new(),
         },
     };
     if scope.scope_type == CanonicalScopeType::AgentChat && project_agent_chat {

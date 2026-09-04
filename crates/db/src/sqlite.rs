@@ -8,20 +8,21 @@ use crate::{
     AgentChatTurnJobRepo, AgentChatTurnState, AgentCommitment, AgentCommitmentEvidence,
     AgentCommitmentLifecycle, AgentCommitmentListQuery, AgentCommitmentRepo, AgentCommitmentStatus,
     AgentCommitmentTransfer, AgentHandoff, AgentHandoffRepo, AgentInboxItem, AgentInboxListQuery,
-    AgentInboxRepo, AgentListQuery, AgentProfile, AgentProfileRepo, AgentQuestion,
-    AgentQuestionListQuery, AgentRepo, AgentStatus, AgentTaskListQuery, AgentTokenBreakdown,
-    AgentWakeDisposition, AgentWakeDispositionKind, AgentWakeDispositionRepo, AnswerAgentQuestion,
-    AppliedProjectExecutionSetupCommand, ApplyProjectExecutionSetupCommand,
+    AgentInboxRepo, AgentInquiry, AgentInquiryRepo, AgentListQuery, AgentProfile, AgentProfileRepo,
+    AgentQuestion, AgentQuestionListQuery, AgentRepo, AgentStatus, AgentTaskListQuery,
+    AgentTokenBreakdown, AgentWakeDisposition, AgentWakeDispositionKind, AgentWakeDispositionRepo,
+    AnswerAgentQuestion, AppliedProjectExecutionSetupCommand, ApplyProjectExecutionSetupCommand,
     AttentionConsumerHealth, AttentionListQuery, AttentionProjection, AttentionRepo,
     CancelAgentChatTurn, CiStepStats, ClaimDomainEvents, ClaimExecutionLease, ClaimTask,
     ClaimedTask, CommandReceiptRepo, CompleteAgentChatControlTransfer, CompleteAgentChatTurn,
-    CompleteAgentCommitment, CompleteClaimedWake, CompleteDomainEvent, CompletedAgentChatTurn,
-    CreateAccountMainAgentBinding, CreateAgent, CreateAgentAction, CreateAgentActionApproval,
-    CreateAgentActionExecution, CreateAgentChat, CreateAgentChatMessage, CreateAgentChatTurnJob,
-    CreateAgentCommitment, CreateAgentCommitmentEvidence, CreateAgentHandoff, CreateAgentIdentity,
-    CreateAgentInboxItem, CreateAgentProfile, CreateAgentQuestion, CreateAgentWakeDisposition,
-    CreateAttentionProjection, CreateDomainEvent, CreateExecution, CreateNotification,
-    CreatePrMetadata, CreatePrProviderConfig, CreateProject, CreateProjectAdmissionReceipt,
+    CompleteAgentCommitment, CompleteAgentInquiry, CompleteClaimedWake, CompleteDomainEvent,
+    CompletedAgentChatTurn, CreateAccountMainAgentBinding, CreateAgent, CreateAgentAction,
+    CreateAgentActionApproval, CreateAgentActionExecution, CreateAgentChat, CreateAgentChatMessage,
+    CreateAgentChatTurnJob, CreateAgentCommitment, CreateAgentCommitmentEvidence,
+    CreateAgentHandoff, CreateAgentIdentity, CreateAgentInboxItem, CreateAgentInquiry,
+    CreateAgentProfile, CreateAgentQuestion, CreateAgentWakeDisposition, CreateAttentionProjection,
+    CreateDomainEvent, CreateExecution, CreateNotification, CreatePrMetadata,
+    CreatePrProviderConfig, CreateProject, CreateProjectAdmissionReceipt,
     CreateProjectAgentBinding, CreateProjectHookRun, CreateProjectIntegration,
     CreateProjectMediaAsset, CreateProjectMediaAttachment, CreateProjectMediaAttachmentMutation,
     CreateProjectProvisioningError, CreateProjectProvisioningOperation,
@@ -66,7 +67,9 @@ use std::str::FromStr;
 mod action;
 mod agent;
 mod agent_chat;
+pub use agent_chat::supported_main_baseline_revision;
 mod agent_chat_topic;
+mod agent_inquiry;
 mod agent_wake;
 mod analytics;
 mod attention;

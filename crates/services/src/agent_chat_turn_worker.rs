@@ -2724,19 +2724,27 @@ impl FederatedAgentChatTurnRunner {
                 .await?
                 .as_ref()
                 .and_then(crate::embedded_agent_service::entry_provider_account_id);
-        // The Project Agent runs its turn inside its own workspace: `forge/`
-        // for what it writes, `checkout/` for the software it exercises.
-        let verification_checkout = match AgentChatRepo::get_agent_chat(&*self.db, &job.chat_id)
-            .await?
-            .and_then(|chat| chat.project_id)
-        {
-            Some(project_id) => {
-                self.embedded_agents
-                    .project_agent_workspace(&project_id)
-                    .await
-            }
-            None => None,
-        };
+        // Both Agents run their turn inside their own workspace. The Project
+        // Agent gets `forge/` for what it writes and `checkout/` for the
+        // software it exercises; the Main Agent gets an account scratch
+        // directory that holds no repository at all.
+        let chat = AgentChatRepo::get_agent_chat(&*self.db, &job.chat_id).await?;
+        let (turn_workspace, turn_workspace_access) =
+            match chat.as_ref().and_then(|chat| chat.project_id.clone()) {
+                Some(project_id) => (
+                    self.embedded_agents
+                        .project_agent_workspace(&project_id)
+                        .await,
+                    WorkspaceAccess::ProjectVerify,
+                ),
+                None => match chat.as_ref().and_then(|chat| chat.account_id.clone()) {
+                    Some(account_id) => (
+                        self.embedded_agents.main_agent_workspace(&account_id).await,
+                        WorkspaceAccess::AccountScratch,
+                    ),
+                    None => (None, WorkspaceAccess::Deny),
+                },
+            };
         let turn_log = self.turn_log_sink(job).await;
         let started = std::time::Instant::now();
         let output = self
@@ -2749,11 +2757,11 @@ impl FederatedAgentChatTurnRunner {
                     scope: CanonicalScope {
                         scope_type: CanonicalScopeType::AgentChat,
                         scope_id: job.chat_id.clone(),
-                        workspace_access: verification_checkout
+                        workspace_access: turn_workspace
                             .as_ref()
-                            .map_or(WorkspaceAccess::Deny, |_| WorkspaceAccess::ProjectVerify),
+                            .map_or(WorkspaceAccess::Deny, |_| turn_workspace_access),
                     },
-                    workspace_path: verification_checkout
+                    workspace_path: turn_workspace
                         .as_ref()
                         .map(|path| path.to_string_lossy().into_owned()),
                     provider: {
@@ -3776,14 +3784,14 @@ impl AgentChatTurnWorker {
 }
 
 #[derive(Debug, Deserialize)]
-struct NativeProfileConfig {
-    base_url: String,
+pub(crate) struct NativeProfileConfig {
+    pub(crate) base_url: String,
     #[serde(default = "default_context_tokens")]
-    context_tokens: u32,
+    pub(crate) context_tokens: u32,
     #[serde(default = "default_max_input_tokens")]
-    max_input_tokens: u32,
+    pub(crate) max_input_tokens: u32,
     #[serde(default = "default_max_output_tokens")]
-    max_output_tokens: u32,
+    pub(crate) max_output_tokens: u32,
 }
 
 fn default_context_tokens() -> u32 {
