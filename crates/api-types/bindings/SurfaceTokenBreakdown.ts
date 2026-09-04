@@ -6,11 +6,11 @@
  * Agent's own orchestration turns are recorded on chat messages, and for a
  * small Project they routinely outweigh the code work.
  */
-export type SurfaceTokenBreakdown = {
+export type SurfaceTokenBreakdown = { 
 /**
  * `task_execution`, `project_chat`, or `genesis_chat`.
  */
-surface: string,
+surface: string, 
 /**
  * Task executions for `task_execution`, Agent Chat turns otherwise.
  */

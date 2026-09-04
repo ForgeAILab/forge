@@ -128,6 +128,7 @@ pub(crate) struct GetProjectParams {
 #[derive(Debug, Deserialize)]
 pub(crate) struct UpdateProjectParams {
     pub(crate) project_id: String,
+    pub(crate) version: i64,
     pub(crate) name: Option<String>,
     pub(crate) settings: Option<Value>,
     pub(crate) paused: Option<bool>,
@@ -136,6 +137,7 @@ pub(crate) struct UpdateProjectParams {
 #[derive(Debug, Deserialize)]
 pub(crate) struct UpdateProjectLifecycleHooksParams {
     pub(crate) project_id: String,
+    pub(crate) version: i64,
     pub(crate) lifecycle_hooks: LifecycleHooks,
 }
 

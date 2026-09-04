@@ -193,6 +193,10 @@ database for historical provenance.
 | POST   | `/api/v1/agent-chats/{chat_id}/turns/{turn_id}/cancel` | `V071+` — Cancel an owned non-terminal turn with `expected_version` and an idempotency key |
 | GET    | `/api/v1/agent-chats/{chat_id}/topics` | `V103+` — List the chat's immutable topic epochs, newest first, with the current one marked |
 | POST   | `/api/v1/agent-chats/{chat_id}/topics` | `V103+` — Start a new topic epoch in the same chat; denied while a turn is live or a Genesis session/approval needs an explicit decision |
+| GET    | `/api/v1/agent-chats/{chat_id}/inquiries` | `V130+` — List the chat's Main Agent inquiry runs with opaque keyset pagination |
+| GET    | `/api/v1/inquiries/{id}` | `V130+` — Read one Main Agent inquiry run |
+| GET    | `/api/v1/inquiries/{id}/logs` | `V130+` — One page of a sub-agent's durable activity log |
+| POST   | `/api/v1/inquiries/{id}/cancel` | `V130+` — Cancel a non-terminal inquiry run with `expected_version` |
 | GET    | `/api/v1/projects/{id}/agent-handoffs` | `V071+` — List immutable Main-to-Project handoff records |
 | POST   | `/api/v1/projects/{id}/agent-handoffs` | `V071+` — Publish one bounded, provenance-linked handoff and at most one target turn |
 | GET    | `/api/v1/projects/{id}/agent-handoffs/{handoff_id}` | `V071+` — Inspect an authorized handoff and delivery receipt |
@@ -673,7 +677,8 @@ Direct receipts linked to an `AgentActionExecution` are omitted from the
 direct stream so one approved execution cannot appear twice.
 
 `AttentionCategory` includes `delivery_followup`. Forge projects it when a
-Task reaches `done` so the bound Project Agent can reconcile authoritative
+Task reaches a successful terminal state (`done` in the default workflow) so
+the bound Project Agent can reconcile authoritative
 validation, evidence, and milestone readiness. The wake the Agent receives names
 the affected milestones and their outstanding required acceptance checks, and
 the turn must commit the corresponding validation result before it owes a
@@ -691,6 +696,20 @@ drive a wake or notification. Automatic/deferred retries and expected
 cancellation or reassignment are silent. A manually resumable terminal run
 with no Task disposition after the bounded settlement grace is surfaced by
 the orphan safety net as an actionable Attention item.
+Intentional Pause/Stop retains manual recovery actions but publishes
+`requires_intervention: false`, so those controls do not trigger autonomous
+recovery. A stopped attempt superseded by a running, newer, or explicitly
+linked attempt is not an orphan; admission rechecks this before spending wake
+budget.
+
+New durable `task.transitioned` events freeze a `workflow_snapshot` of the
+definition used by the transition. It contains `definition_digest`,
+`parent_task_id`, `source_task_version`, and the `from_state` and `to_state`
+snapshots (`name`, `kind`, `canonical_phase`, `requires_user_approval`, and
+`is_cancellation`). Consumers use this recorded meaning, not today's Project
+workflow or Task parent, when replaying review, delivery, and cancellation.
+Historical events without a snapshot retain unknown semantics and are not
+reclassified from the current workflow; stored history is not rewritten.
 
 The post-disposition event payload is bounded and carries the current Task
 version:
@@ -849,20 +868,21 @@ identity id, mutates no Charter prose, and freezes no approval by itself.
 Project Agent validation results use the typed `project.validation` operation.
 A `record` payload must include the current positive
 `expected_milestone_version` alongside `milestone_id`, `check_id`,
-`definition_revision_id`, `status`, `result`, `input_digest`, and
-`observed_task_id`. `status` uses
+`definition_revision_id`, `status`, `result`, and `input_digest`.
+`observed_task_id` is optional. `status` uses
 the same vocabulary as the user-facing manual attestation route (`pass`, `fail`,
 `blocked`, `stale`, `unavailable`) and is translated to the persisted outcome
 the same way. It exists
 because an acceptance check asserts *integrated* behaviour, which is wider than
 the single Task under review: a check can cover a feature delivered earlier
 that later work must keep working, and a Task review only looks at the code
-that Task changed. `observed_task_id` names the Task whose run produced the observation, and
-Forge verifies it belongs to the Project and reached a delivered state; an
+that Task changed. When supplied, `observed_task_id` names the Task whose run
+produced the observation, and Forge verifies it belongs to the Project and
+has reached `review`, `merging`, or `done`; an
 optional `evidence_asset_id` names the captured artifact backing it, and both
 are written into the validation manifest readiness reads back. A Project Agent
-session has no workspace and no process, so it cites the run that observed
-rather than reporting a first-hand observation of its own. The command derives
+may instead report first-hand observations from its own Project verification
+workspace without inventing a Task citation. The command derives
 the governing Charter revision and the
 check version itself rather than accepting them, and it refuses any check whose
 `source_kind` is `manual` —
@@ -1027,6 +1047,85 @@ even if the original binding is now historical.
 The V071+ request/response types and nested message/turn resources are the live
 contract. Clients should use the singular routes and types listed above; no
 compatibility aliases are provided.
+
+### Main Agent inquiries
+
+The Main Agent can dispatch `inquiry.run`: an ephemeral, read-only sub-agent
+turn that works in its own scratch workspace (`WorkspaceAccess::AccountScratch`
+— not a repo checkout, no git, no remote), streams its work to the UI as a
+visible run record, and returns a bounded findings abstract to the parent
+turn. An inquiry is composed only into a Main Chat, never a Project Chat.
+Canonical vocabulary is "inquiry" — it is a run log, not a Task, and carries
+none of the Task concepts: no retry, assignment, dependency, milestone, or
+review. The only user verb is cancel. Status is a closed set: `running`,
+`succeeded`, `failed`, `cancelled`.
+
+`GET /api/v1/agent-chats/{chat_id}/inquiries` lists inquiries for one chat with
+opaque keyset pagination (`limit`, `cursor`; response `items`, `has_more`,
+`next_cursor`, newest first):
+
+```json
+{
+  "items": [
+    {
+      "id": "inquiry-uuid",
+      "chat_id": "chat-uuid",
+      "title": "Check whether the retry budget config changed",
+      "question": "Has crates/config/src/defaults.rs changed the default retry budget in the last month?",
+      "status": "succeeded",
+      "findings": "Bounded findings abstract text...",
+      "findings_path": "inquiry-uuid/findings.md",
+      "error": null,
+      "token_usage": {
+        "input_tokens": 812,
+        "output_tokens": 340,
+        "cache_read_tokens": 1200,
+        "cache_write_tokens": 0
+      },
+      "duration_ms": 4821,
+      "version": 1,
+      "created_at": "2026-09-03T12:00:00Z",
+      "started_at": "2026-09-03T12:00:00Z",
+      "finished_at": "2026-09-03T12:00:05Z"
+    }
+  ],
+  "has_more": false,
+  "next_cursor": null
+}
+```
+
+`GET /api/v1/inquiries/{id}` returns one `AgentInquiryResponse` in the same
+shape as a list item. `owner_user_id`, `identity_id`, and `workspace_path` are
+deliberately not part of the response: internal, not part of the public
+surface. `findings_path` is a relative path under the inquiry's scratch
+workspace; the parent turn (and a caller with filesystem access to that
+workspace) reads it only when it needs more than the bounded abstract already
+in `findings`.
+
+`GET /api/v1/inquiries/{id}/logs` returns one page of the sub-agent's durable
+activity log — its reasoning, tool calls with their bounded results, and reply
+deltas — in the same Forge JSONL page shape as `/executions/{id}/logs` and an
+Agent Chat turn's log (`{"items": [...], "has_more": bool, "next_sequence":
+N|null}`), and it takes the same query parameters. An inquiry that has not
+written anything yet reads as an empty page rather than `404`, because that is
+the normal first state of every run. The log is authorized exactly like the
+record it belongs to, so it is never a side channel around chat ownership.
+
+`POST /api/v1/inquiries/{id}/cancel` accepts `{"expected_version": N}` and
+transitions a non-terminal inquiry to `cancelled`. A stale `expected_version`
+or an already-terminal inquiry returns `409 version_conflict` instead of
+rewriting the durable outcome, the same optimistic-concurrency convention used
+for Agent Chat turn cancellation. Cancelling also stops the sub-agent's
+in-flight provider call, not just the record; a run that finished in the
+meantime is simply left as it is. Cancelling the calling chat turn cancels any
+inquiry it was blocked on, because an inquiry runs under a child of the
+caller's cancellation token.
+
+`token_usage`'s four counters (`input_tokens`, `output_tokens`,
+`cache_read_tokens`, `cache_write_tokens`) mirror `agent_host::AgentTurnOutput`
+and are **disjoint** — the context size a turn consumed is
+`input_tokens + cache_read_tokens + cache_write_tokens`. Never sum all four
+into one "input" number; `output_tokens` is not part of context size.
 
 ## Projects
 
@@ -1258,6 +1357,8 @@ latest awaiting-human review when present and otherwise use gate capabilities.
 `pause` stops the running execution without a state transition and records a
 manual-stop annotation plus an audit comment. `resume` uses the existing
 session-follow-up/recovery primitives and falls back to a fresh dispatch.
+The manual-stop annotation keeps recovery controls available to the user;
+it does not itself request a Project-Agent recovery wake.
 
 When an action is not available, the endpoint returns `409` with
 `code: "task_action.unavailable"` and structured `details`:
@@ -1512,14 +1613,22 @@ individual attempt failure.
 
 ## Pagination
 
-All list endpoints use opaque keyset cursors and return `items` (not `data`).
-The existing task-board lists use base64-encoded JSON
-`{sort_by, sort_order, last_value, last_id}`; orchestration artifact lists use
-an equivalent server-opaque cursor and do not expose their sort tuple. The
-`db` layer (or route projection) reads one extra keyset row to determine
-`has_more`.
+Paginated list endpoints return `items` (not `data`) and opaque cursors.
+Pass a returned cursor back unchanged with the same filters and sort; its
+encoding is not a client contract. Project, Task, Execution, Agent, Attention,
+and Agent Chat message lists use offset cursors. Dedicated orchestration
+artifact lists use keysets, while activity-log cursors track file positions.
+Offset pages can shift if concurrent writes change the result ordering; do
+not assume snapshot or keyset guarantees for those endpoints.
+
+The `db` layer (or route projection) generally reads one extra item to determine
+`has_more`. Project visibility is filtered before pagination and counts, so
+inaccessible Projects neither consume page slots nor inflate `total`.
 
 ### Query parameters
+
+These are the Task-list parameters; other list endpoints expose their own
+subset and defaults.
 
 | Param | Description |
 |-------|-------------|
@@ -2269,14 +2378,24 @@ install` writes the query-string form because the supported client config files
 store only the server URL.
 
 When a user is authenticated, Forge binds the MCP call to that server-issued
-user identity. A project-scoped MCP connection may also use the `project_id`
-query parameter or `x-forge-project-id` header; project membership is checked
-before project-scoped reads and the supplied project id cannot override that
-binding. The embedded-agent inspection surfaces never accept a caller-supplied
+user identity. REST and MCP Project visibility includes the owner, Project
+members, and Projects without an owner. Project list filtering happens before
+pagination and counts. Task, parent/dependency, and Execution references must
+belong to a visible Project even on an unscoped MCP connection.
+A project-scoped MCP connection may also use the `project_id` query parameter
+or `x-forge-project-id` header; access is checked before Project operations and
+the supplied Project id cannot override that binding.
+The embedded-agent inspection surfaces never accept a caller-supplied
 authority identity, return raw credentials, protected session state, or
 checkpoint bodies. Binding, message-send, and handoff mutations derive actor
 and scope from the authenticated MCP context; identity, Project, chat, and
 Task IDs are only references that Forge authorizes.
+
+`forge_get_project` and `forge_list_projects` expose the current Project
+`version`. Both `forge_update_project` and
+`forge_update_project_lifecycle_hooks` require that `version`, including on
+Project-scoped connections. A stale value returns `version_conflict` without
+overwriting newer settings or hooks; refresh the Project before retrying.
 
 | Tool | Purpose |
 |------|---------|

@@ -4,14 +4,9 @@ Use this checklist for public beta releases.
 
 ## Local Verification
 
-- [ ] Run `./scripts/ci-rust.sh`.
-- [ ] Run `cargo audit`.
-- [ ] Run `./scripts/ci-web.sh`.
-- [ ] Run `cd web && pnpm exec playwright install --with-deps chromium && pnpm run e2e`.
+- [ ] Run focused tests for the changed behavior; leave full Rust, web, browser, and security suites to CI.
+- [ ] Check formatting and release-version consistency.
 - [ ] Run a repository history secret scan before making release artifacts public.
-- [ ] Build a release archive locally and verify it contains `forge`, `forge-ctl`, and `web/dist/index.html`.
-- [ ] Install from a release archive and confirm `forge` serves the web UI outside the repo checkout.
-- [ ] Build the Docker image and confirm `/usr/local/share/forge/web/dist/index.html` exists.
 
 ## GitHub Repository Settings
 
@@ -25,10 +20,12 @@ Use this checklist for public beta releases.
 ## Release Steps
 
 - [ ] Update `CHANGELOG.md`.
-- [ ] Confirm `Cargo.toml`, crate versions, and `web/package.json` versions match.
+- [ ] Confirm the workspace version in `Cargo.toml`, its package entries in `Cargo.lock`, and `web/package.json` match. `forge-client` retains its independent version; the npm bootstrapper receives the release tag version in the release workflow.
+- [ ] Merge the reviewed release PR and confirm the full CI, security, and code-scanning checks pass on the exact release commit before tagging.
 - [ ] Tag the release with `vX.Y.Z`.
 - [ ] Wait for `.github/workflows/release.yml` to publish artifacts and `SHA256SUMS`.
-- [ ] Download one archive, verify its checksum, install it, and smoke-test `forge --help` plus browser navigation.
+- [ ] Download one archive, verify its checksum and the presence of `forge`, `forge-ctl`, and `web/dist/index.html`, install it, and smoke-test `forge --help` plus browser navigation outside the repo checkout using an isolated data directory.
+- [ ] Confirm the published Docker image contains `/usr/local/share/forge/web/dist/index.html`.
 - [ ] Publish release notes that call the release a public beta/developer preview.
 
 ## Post-Release

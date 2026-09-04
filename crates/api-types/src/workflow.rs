@@ -163,6 +163,55 @@ pub enum CanonicalPhase {
     Done,
 }
 
+/// The effective meaning of one state when a Task transition committed.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct TaskWorkflowStateSnapshot {
+    pub name: String,
+    pub kind: StateKind,
+    pub canonical_phase: CanonicalPhase,
+    pub requires_user_approval: bool,
+    pub is_cancellation: bool,
+}
+
+/// Immutable workflow inputs carried by a newly committed Task transition.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct TaskWorkflowTransitionSnapshot {
+    pub definition_digest: String,
+    pub parent_task_id: Option<String>,
+    pub source_task_version: i64,
+    pub from_state: TaskWorkflowStateSnapshot,
+    pub to_state: TaskWorkflowStateSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct TaskTransitionEventPayload {
+    pub transition_log_id: String,
+    pub project_id: String,
+    pub from_state: String,
+    pub to_state: String,
+    pub trigger_name: Option<String>,
+    pub trigger_reason: String,
+    pub rejection: bool,
+    /// Missing on historical events whose effective workflow was not saved.
+    /// Such events retain unknown semantics; current workflow state is not history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workflow_snapshot: Option<TaskWorkflowTransitionSnapshot>,
+}
+
+impl TaskTransitionEventPayload {
+    pub fn known_workflow_snapshot(&self) -> Option<&TaskWorkflowTransitionSnapshot> {
+        self.workflow_snapshot.as_ref().filter(|snapshot| {
+            snapshot.from_state.name == self.from_state
+                && snapshot.to_state.name == self.to_state
+                && !snapshot.definition_digest.is_empty()
+        })
+    }
+}
+
 impl FromStr for CanonicalPhase {
     type Err = String;
 

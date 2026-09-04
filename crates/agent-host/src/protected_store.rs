@@ -330,6 +330,7 @@ impl SqliteProtectedRuntimeStore {
             "task_read" => crate::WorkspaceAccess::TaskRead,
             "task_write" => crate::WorkspaceAccess::TaskWrite,
             "project_verify" => crate::WorkspaceAccess::ProjectVerify,
+            "account_scratch" => crate::WorkspaceAccess::AccountScratch,
             _ => {
                 return Err(crate::AgentHostError::Authority(
                     "persisted workspace access is invalid".to_owned(),
@@ -383,10 +384,15 @@ impl SqliteProtectedRuntimeStore {
                 "Task session has no active persisted workspace".to_owned(),
             ));
         }
-        // A Project Agent Chat owns its verification workspace; every other
-        // non-Task scope remains filesystem-denied.
+        // A Project Agent Chat owns its verification checkout and a Main Agent
+        // Chat (or an inquiry sub-agent under the account scope) owns its
+        // scratch directory; every other non-Task scope remains
+        // filesystem-denied.
         if !matches!(scope.scope_type, crate::CanonicalScopeType::Task)
-            && scope.workspace_access != crate::WorkspaceAccess::ProjectVerify
+            && !matches!(
+                scope.workspace_access,
+                crate::WorkspaceAccess::ProjectVerify | crate::WorkspaceAccess::AccountScratch
+            )
             && persisted_workspace_path.is_some()
         {
             return Err(crate::AgentHostError::Authority(
@@ -398,6 +404,15 @@ impl SqliteProtectedRuntimeStore {
         {
             return Err(crate::AgentHostError::Authority(
                 "Project verification session has no persisted workspace".to_owned(),
+            ));
+        }
+        // A scratch scope that advertises a directory it does not have would
+        // compose file tools over nothing; fail closed the same way.
+        if scope.workspace_access == crate::WorkspaceAccess::AccountScratch
+            && persisted_workspace_path.is_none()
+        {
+            return Err(crate::AgentHostError::Authority(
+                "account scratch session has no persisted workspace".to_owned(),
             ));
         }
         if identity_paused != 0 || identity_archived_at.is_some() {
@@ -1291,6 +1306,16 @@ fn scope_permission_set(
     project_charter_setup_required: bool,
 ) -> BTreeSet<String> {
     let mut values: Vec<&str> = match scope_type {
+        // An inquiry sub-agent runs under the Account scope with a scratch
+        // directory. It gets the bounded account reads and public research
+        // only: withholding the propose permissions here is what keeps a
+        // sub-agent structurally unable to create a Project, publish a
+        // handoff, or otherwise act on the account that dispatched it.
+        crate::CanonicalScopeType::Account
+            if workspace_access == crate::WorkspaceAccess::AccountScratch =>
+        {
+            vec!["read_account", "propose_discovery"]
+        }
         crate::CanonicalScopeType::Account => vec![
             "read_account",
             "propose_discovery",
@@ -1330,7 +1355,9 @@ fn scope_permission_set(
             crate::WorkspaceAccess::TaskWrite => {
                 vec!["read_task", "read_memory", "task_read", "task_write"]
             }
-            crate::WorkspaceAccess::Deny | crate::WorkspaceAccess::ProjectVerify => vec![],
+            crate::WorkspaceAccess::Deny
+            | crate::WorkspaceAccess::ProjectVerify
+            | crate::WorkspaceAccess::AccountScratch => vec![],
         },
     };
     if matches!(scope_type, crate::CanonicalScopeType::AgentChat) && project_agent_chat {

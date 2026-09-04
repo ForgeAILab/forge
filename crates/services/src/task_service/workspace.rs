@@ -602,6 +602,90 @@ pub(crate) fn default_workspace_root() -> PathBuf {
         .unwrap_or_else(|_| std::env::temp_dir().join("forge").join("worktrees"))
 }
 
+/// The account-owned scratch root, holding one directory per Main Agent
+/// account. It sits beside the Project Agent workspaces rather than inside
+/// any of them: nothing here belongs to a Project.
+pub const MAIN_AGENT_WORKSPACES_DIR: &str = "main-agents";
+/// The Main Agent's own durable notes, inside its scratch directory.
+pub const MAIN_AGENT_NOTES_DIR: &str = "notes";
+/// The parent of every ephemeral inquiry's private directory. It lives
+/// inside the Main Agent's scratch root on purpose: the dispatcher can read
+/// a sub-agent's findings file without the sub-agent's own directory ever
+/// being writable by anything else.
+pub const MAIN_AGENT_INQUIRIES_DIR: &str = "inquiries";
+
+/// Ensure the Main Agent's scratch directory.
+///
+/// This is deliberately not a repository: no clone, no worktree, no remote,
+/// nothing to push. It exists so the Main Agent and the ephemeral inquiries
+/// it dispatches can keep findings and working notes on disk instead of
+/// carrying them in a conversation that has to survive all day. Because no
+/// repository is ever placed here, "cannot write to a repository" holds
+/// because there is none, not because a tool was withheld.
+pub async fn ensure_main_agent_workspace(
+    workspaces_root: &Path,
+    account_id: &str,
+) -> Result<PathBuf> {
+    let workspaces_root = std::fs::canonicalize(workspaces_root).unwrap_or_else(|_| {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(workspaces_root))
+            .unwrap_or_else(|_| workspaces_root.to_path_buf())
+    });
+    let workspace = workspaces_root
+        .join(MAIN_AGENT_WORKSPACES_DIR)
+        .join(account_id);
+    std::fs::create_dir_all(workspace.join(MAIN_AGENT_NOTES_DIR)).map_err(|error| {
+        ServiceError::invalid_operation(format!("Main Agent workspace is unavailable: {error}"))
+    })?;
+    std::fs::create_dir_all(workspace.join(MAIN_AGENT_INQUIRIES_DIR)).map_err(|error| {
+        ServiceError::invalid_operation(format!("Main Agent workspace is unavailable: {error}"))
+    })?;
+    write_scratch_workspace_boundary(&workspace)?;
+    Ok(workspace)
+}
+
+/// Ensure one inquiry's private directory inside the dispatching account's
+/// scratch root. Each inquiry gets its own so that concurrent sub-agents
+/// cannot overwrite each other's findings.
+pub async fn ensure_inquiry_workspace(
+    workspaces_root: &Path,
+    account_id: &str,
+    inquiry_id: &str,
+) -> Result<PathBuf> {
+    let workspace = ensure_main_agent_workspace(workspaces_root, account_id).await?;
+    let inquiry = workspace.join(MAIN_AGENT_INQUIRIES_DIR).join(inquiry_id);
+    std::fs::create_dir_all(&inquiry).map_err(|error| {
+        ServiceError::invalid_operation(format!("inquiry workspace is unavailable: {error}"))
+    })?;
+    Ok(inquiry)
+}
+
+/// The same upward-search guard the verification workspace uses. A scratch
+/// directory lives inside the Forge data directory, which on a development
+/// server sits inside Forge's own repository, so a `cargo` invocation here
+/// would otherwise climb into Forge's workspace and be refused.
+fn write_scratch_workspace_boundary(workspace: &Path) -> Result<()> {
+    let manifest = workspace.join("Cargo.toml");
+    if manifest.exists() {
+        return Ok(());
+    }
+    std::fs::write(
+        &manifest,
+        "# Forge Main Agent scratch boundary.\n\
+         # Cargo searches upward for a workspace root; this manifest is that root, so\n\
+         # a build here never resolves against whatever repository holds this data\n\
+         # directory. Nothing in this tree is a repository.\n\
+         [workspace]\n\
+         members = []\n\
+         resolver = \"2\"\n",
+    )
+    .map_err(|error| {
+        ServiceError::invalid_operation(format!(
+            "Main Agent workspace boundary could not be written: {error}"
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -676,7 +760,7 @@ mod tests {
         )
         .await
         .expect("repo creates");
-        ProjectRepo::update(
+        ProjectRepo::update_at_version(
             db,
             UpdateProject {
                 id: project_id.clone(),
@@ -686,6 +770,12 @@ mod tests {
                 paused_at: None,
                 updated_at: now_rfc3339(),
             },
+            ProjectRepo::get_by_id(db, &project_id)
+                .await
+                .expect("fixture Project lookup")
+                .expect("fixture Project exists")
+                .version,
+            None,
         )
         .await
         .expect("project primary repo updates");
@@ -908,7 +998,7 @@ mod tests {
         )
         .await
         .expect("repo creates");
-        ProjectRepo::update(
+        ProjectRepo::update_at_version(
             db,
             UpdateProject {
                 id: project_id.clone(),
@@ -918,6 +1008,12 @@ mod tests {
                 paused_at: None,
                 updated_at: now_rfc3339(),
             },
+            ProjectRepo::get_by_id(db, &project_id)
+                .await
+                .expect("fixture Project lookup")
+                .expect("fixture Project exists")
+                .version,
+            None,
         )
         .await
         .expect("project primary repo updates");

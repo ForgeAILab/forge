@@ -28,13 +28,14 @@ use forge_agent_host::{
     MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
     MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READINESS_OPERATION, MAIN_CHARTER_READ_OPERATION,
     MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION, MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
-    MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION, MIGRATED_OPERATION_CONTRACTS,
-    PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CHARTER_READ_OPERATION,
-    PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
-    PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
-    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_SKILL_SECTION_OPERATION,
-    PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_EVIDENCE_OPERATION,
-    TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION,
+    MAIN_GENESIS_START_OPERATION, MAIN_INQUIRY_RUN_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
+    MIGRATED_OPERATION_CONTRACTS, PROJECT_CHARTER_ADOPTION_OPERATION,
+    PROJECT_CHARTER_READ_OPERATION, PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION,
+    PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
+    PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
+    PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION,
+    TASK_EVIDENCE_OPERATION, TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION,
+    TASK_WORKLOG_OPERATION,
 };
 use serde_json::{json, Value};
 use services::{CoordinationToolProvider, TaskService};
@@ -356,7 +357,7 @@ async fn seed_project(db: &SqliteDb) {
     )
     .await
     .expect("repository");
-    ProjectRepo::update(
+    ProjectRepo::update_at_version(
         db,
         UpdateProject {
             id: PROJECT_ID.to_owned(),
@@ -366,6 +367,12 @@ async fn seed_project(db: &SqliteDb) {
             paused_at: None,
             updated_at: NOW.to_owned(),
         },
+        ProjectRepo::get_by_id(db, PROJECT_ID)
+            .await
+            .expect("fixture Project lookup")
+            .expect("fixture Project exists")
+            .version,
+        None,
     )
     .await
     .expect("primary repository");
@@ -1115,6 +1122,47 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
         );
         covered_operations.insert(operation.to_owned());
     }
+
+    // Dispatching an inquiry belongs to a Main *Chat*, not to the bare
+    // Account scope above: the Account scope is what an inquiry sub-agent
+    // itself runs under, and withholding the operation there is what caps
+    // dispatch depth at one. So the coverage for it lives on its own
+    // composition rather than on `main`.
+    let main_chat_composition =
+        ScopeToolComposition::for_scope_with_permissions_and_project_context(
+            AGENT_ID,
+            CanonicalScope {
+                scope_type: CanonicalScopeType::AgentChat,
+                scope_id: "main-chat-scope-composition".to_owned(),
+                workspace_access: WorkspaceAccess::Deny,
+            },
+            None,
+            None,
+            &broad_permissions(),
+            ProjectChatToolContext {
+                is_project_agent_chat: false,
+                charter_setup_required: false,
+            },
+            Some(Arc::new(fixture.provider.clone())),
+        )
+        .expect("Main Chat composition");
+    let main_chat_reads = main_chat_composition
+        .tools()
+        .into_iter()
+        .find(|tool| tool.spec().name == FORGE_MAIN_ORCHESTRATION_READ_TOOL)
+        .expect("Main Chat orchestration read tool")
+        .spec()
+        .input_schema["properties"]["operation"]["enum"]
+        .as_array()
+        .expect("Main Chat read operation enum")
+        .clone();
+    assert!(
+        main_chat_reads
+            .iter()
+            .any(|value| value == MAIN_INQUIRY_RUN_OPERATION),
+        "Main Chat composition must expose {MAIN_INQUIRY_RUN_OPERATION}"
+    );
+    covered_operations.insert(MAIN_INQUIRY_RUN_OPERATION.to_owned());
 
     let expected_operations = MIGRATED_OPERATION_CONTRACTS
         .iter()

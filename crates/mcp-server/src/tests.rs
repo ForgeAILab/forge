@@ -21,6 +21,9 @@ use crate::{
     AppState,
 };
 
+#[path = "tests/project_contract.rs"]
+mod project_contract;
+
 fn run_async<T>(future: impl Future<Output = T>) -> T {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -34,7 +37,23 @@ async fn sqlite_state() -> AppState {
         .await
         .expect("pool creates");
     run_migrations(&pool).await.expect("migrations run");
-    AppState::new(Arc::new(SqliteDb::new(pool)), Arc::new(EventBus::new(16)))
+    let state = AppState::new(Arc::new(SqliteDb::new(pool)), Arc::new(EventBus::new(16)));
+    let now = now_rfc3339();
+    UserRepo::create_user(
+        &*state.db,
+        &db::User {
+            id: "mcp-test-user".to_owned(),
+            email: "mcp-test@example.test".to_owned(),
+            password_hash: "test".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("MCP fixture user");
+    state
 }
 
 async fn seed_chat_account(state: &AppState) -> (String, String, String) {
@@ -201,7 +220,7 @@ async fn seed_project_repo(state: &AppState) -> (String, String) {
     )
     .await
     .expect("repo creates");
-    ProjectRepo::update(
+    ProjectRepo::update_at_version(
         &*state.db,
         UpdateProject {
             id: project.id.clone(),
@@ -211,6 +230,12 @@ async fn seed_project_repo(state: &AppState) -> (String, String) {
             paused_at: None,
             updated_at: now_rfc3339(),
         },
+        ProjectRepo::get_by_id(&*state.db, &project.id)
+            .await
+            .expect("fixture Project lookup")
+            .expect("fixture Project exists")
+            .version,
+        None,
     )
     .await
     .expect("project primary repo updates");
@@ -405,7 +430,7 @@ async fn call_tool_scoped(
         state,
         &McpContext {
             project_id: Some(project_id.to_owned()),
-            user_id: None,
+            user_id: Some("mcp-test-user".to_owned()),
         },
         "tools/call",
         json!({
@@ -627,7 +652,7 @@ fn scoped_tools_list_marks_project_id_optional() {
             &state,
             &McpContext {
                 project_id: Some("project-1".to_owned()),
-                user_id: None,
+                user_id: Some("mcp-test-user".to_owned()),
             },
             "tools/list",
             json!({}),
@@ -675,8 +700,9 @@ fn unknown_method_returns_method_not_found() {
 fn embedded_read_tools_require_authenticated_server_identity() {
     run_async(async {
         let state = sqlite_state().await;
-        let error = dispatch(
+        let error = dispatch_with_context(
             &state,
+            &McpContext::default(),
             "tools/call",
             json!({
                 "name": "forge_list_agent_profiles",
@@ -687,8 +713,9 @@ fn embedded_read_tools_require_authenticated_server_identity() {
         .expect_err("profile reads must not accept an unbound caller identity");
         assert_eq!(error.code, -32001);
 
-        let error = dispatch(
+        let error = dispatch_with_context(
             &state,
+            &McpContext::default(),
             "tools/call",
             json!({
                 "name": "forge_get_main_agent",
@@ -1085,7 +1112,7 @@ fn forge_create_task_rejects_missing_project_id_with_field_error() {
 }
 
 #[test]
-fn forge_create_task_rejects_unknown_project_with_field_error() {
+fn forge_create_task_hides_unknown_project_before_dispatch() {
     run_async(async {
         let state = sqlite_state().await;
         let error = call_tool_error(
@@ -1098,10 +1125,7 @@ fn forge_create_task_rejects_unknown_project_with_field_error() {
         )
         .await;
 
-        assert_eq!(error.code, -32602);
-        let data = error.data.expect("error data");
-        assert_eq!(data["field"], "project_id");
-        assert_eq!(data["accepted"]["constraint"], "existing project id");
+        assert_eq!(error.code, -32004);
     });
 }
 
@@ -1138,7 +1162,7 @@ fn scoped_mcp_rejects_mismatched_project_id() {
             &state,
             &McpContext {
                 project_id: Some(project_id),
-                user_id: None,
+                user_id: Some("mcp-test-user".to_owned()),
             },
             "tools/call",
             json!({
@@ -1186,7 +1210,7 @@ fn scoped_mcp_rejects_task_id_tool_for_other_project() {
             &state,
             &McpContext {
                 project_id: Some(scoped_project_id),
-                user_id: None,
+                user_id: Some("mcp-test-user".to_owned()),
             },
             "tools/call",
             json!({
@@ -1214,7 +1238,7 @@ fn scoped_mcp_rejects_parent_task_id_tool_for_other_project() {
             &state,
             &McpContext {
                 project_id: Some(scoped_project_id),
-                user_id: None,
+                user_id: Some("mcp-test-user".to_owned()),
             },
             "tools/call",
             json!({
@@ -1247,7 +1271,7 @@ fn scoped_mcp_rejects_execution_id_tool_for_other_project() {
             &state,
             &McpContext {
                 project_id: Some(scoped_project_id),
-                user_id: None,
+                user_id: Some("mcp-test-user".to_owned()),
             },
             "tools/call",
             json!({
@@ -1443,6 +1467,7 @@ fn forge_update_project_updates_mutable_fields() {
             "forge_update_project",
             json!({
                 "project_id": project_id,
+                "version": ProjectRepo::get_by_id(&*state.db, &project_id).await.unwrap().unwrap().version,
                 "name": "Updated Forge",
                 "settings": {
                     "retry_budgets": {
@@ -1472,6 +1497,7 @@ fn forge_update_project_lifecycle_hooks_replaces_hooks_only() {
             "forge_update_project",
             json!({
                 "project_id": project_id,
+                "version": ProjectRepo::get_by_id(&*state.db, &project_id).await.unwrap().unwrap().version,
                 "settings": {
                     "retry_budgets": {
                         "review": 4,
@@ -1487,6 +1513,7 @@ fn forge_update_project_lifecycle_hooks_replaces_hooks_only() {
             "forge_update_project_lifecycle_hooks",
             json!({
                 "project_id": project_id,
+                "version": ProjectRepo::get_by_id(&*state.db, &project_id).await.unwrap().unwrap().version,
                 "lifecycle_hooks": {
                     "before_work": [
                         {
@@ -1533,6 +1560,7 @@ fn forge_update_project_lifecycle_hooks_validates_blocking_event() {
                 "name": "forge_update_project_lifecycle_hooks",
                 "arguments": {
                     "project_id": project_id,
+                    "version": ProjectRepo::get_by_id(&*state.db, &project_id).await.unwrap().unwrap().version,
                     "lifecycle_hooks": {
                         "on_work_start": [
                             {

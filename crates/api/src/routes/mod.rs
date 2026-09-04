@@ -26,6 +26,7 @@ use crate::errors::{ApiError, ApiResult};
 
 pub mod admin;
 pub mod agent_chats;
+pub mod agent_inquiries;
 pub mod agents;
 pub mod auth;
 pub mod clis;

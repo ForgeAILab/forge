@@ -61,6 +61,7 @@ pub mod engine;
 pub mod inherited_subtask_workflow;
 pub mod registry;
 pub mod template_service;
+pub mod transition_event;
 pub mod validation;
 
 pub use dispatch::{AgentDispatchContext, AgentPrompt, PromptBuilder};

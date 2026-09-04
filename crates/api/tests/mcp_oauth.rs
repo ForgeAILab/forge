@@ -142,7 +142,8 @@ async fn mcp_oauth_token_subject_is_used_for_membership() {
     );
     let body = response_json(response).await;
     assert_eq!(body["result"]["isError"], true);
-    assert_eq!(body["result"]["structuredContent"]["code"], "policy_denied");
+    // An inaccessible Project is indistinguishable from a missing one.
+    assert_eq!(body["result"]["structuredContent"]["code"], "not_found");
     assert_eq!(body["result"]["structuredContent"]["status"], "failed");
     assert_eq!(
         body["result"]["structuredContent"]["operation"],
@@ -157,7 +158,7 @@ async fn mcp_oauth_token_subject_is_used_for_membership() {
     );
     assert_eq!(
         body["result"]["structuredContent"]["safe_message"],
-        "the caller is not authorized for this operation"
+        "the requested resource was not found"
     );
     assert!(!body.to_string().contains("project not accessible"));
 }

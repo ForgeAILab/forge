@@ -157,7 +157,7 @@ async fn seed_project(db: &SqliteDb, project_id: &str, repo_id: &str) {
     )
     .await
     .expect("repository");
-    ProjectRepo::update(
+    ProjectRepo::update_at_version(
         db,
         UpdateProject {
             id: project_id.to_owned(),
@@ -167,6 +167,12 @@ async fn seed_project(db: &SqliteDb, project_id: &str, repo_id: &str) {
             paused_at: None,
             updated_at: NOW.to_owned(),
         },
+        ProjectRepo::get_by_id(db, project_id)
+            .await
+            .expect("fixture Project lookup")
+            .expect("fixture Project exists")
+            .version,
+        None,
     )
     .await
     .expect("primary repository");

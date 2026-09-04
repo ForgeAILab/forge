@@ -24,7 +24,6 @@ import {
   TaskExecutionsPanel,
   reviewStatusColors,
 } from '@/components/task-detail/task-executions-panel'
-import { TaskPrSummaryCard } from '@/components/task-detail/task-pr-summary-card'
 import { TaskSubtasksPanel } from '@/components/task-detail/task-subtasks-panel'
 import { TaskDependenciesPanel } from '@/components/task-detail/task-dependencies-panel'
 import { TaskBlockingBanner } from '@/components/task-detail/task-blocking-banner'
@@ -400,7 +399,6 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
                 />
                 {!task.workflow_exception ? <TaskBlockingBanner task={task} /> : null}
 
-                <TaskPrSummaryCard task={task} />
 
                 <div>
                   <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">

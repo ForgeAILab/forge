@@ -1145,6 +1145,12 @@ impl WorkflowEngine {
                 && to_state.kind != StateKind::Terminal
                 && !task.is_automation;
             let transition_log_id = new_uuid_v4();
+            let workflow_snapshot = crate::workflow::transition_event::transition_workflow_snapshot(
+                &task,
+                workflow,
+                &current_status,
+                &target_state,
+            )?;
             let (mut task, transition_log, board_move_outcome) =
                 if let Some(move_request) = board_move {
                     let persistence = TaskBoardRepo::compare_and_move_task(
@@ -1161,6 +1167,7 @@ impl WorkflowEngine {
                             after_id: move_request.after_id,
                             entry_barrier_json: entry_barrier_json.clone(),
                             transition_log_id: transition_log_id.clone(),
+                            workflow_snapshot: workflow_snapshot.clone(),
                             trigger_name: trigger_name.clone(),
                             triggered_by: actor.display(),
                             trigger_reason: reason.clone(),
@@ -1240,6 +1247,7 @@ impl WorkflowEngine {
                         &reason,
                         rejection,
                         updated_at.clone(),
+                        workflow_snapshot,
                     );
                     DomainEventRepo::append_event_in_tx(&*self.db, &mut transaction, &event).await?;
                     sqlx::query(

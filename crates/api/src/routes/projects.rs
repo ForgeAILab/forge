@@ -197,22 +197,13 @@ pub async fn list_projects(
     user: AuthenticatedUser,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<PaginatedResponse<ProjectResponse>>> {
-    let page = ProjectRepo::list(&*state.db, page_request(&params)?).await?;
+    let page = ProjectRepo::list_visible(&*state.db, &user.user_id, page_request(&params)?).await?;
     let has_more = page.next_cursor.is_some();
     let next_cursor = page.next_cursor;
     let total_count = page.total_count.and_then(|count| u64::try_from(count).ok());
-    // Owner visibility is canonical even if a legacy/direct-create row was
-    // left without its best-effort membership row.  Membership additionally
-    // grants visibility to collaborators; owner_id = NULL denotes a public
-    // system Project.
-    let mut visible_items = Vec::new();
-    for project in page.items {
-        if project_is_visible(&state, &project, &user.user_id).await? {
-            visible_items.push(project);
-        }
-    }
     let response = PaginatedResponse {
-        items: visible_items
+        items: page
+            .items
             .into_iter()
             .map(project_response)
             .collect::<ApiResult<Vec<_>>>()?,
@@ -228,12 +219,7 @@ pub async fn get_project(
     user: AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<ProjectResponse>> {
-    let project = ProjectRepo::get_by_id(&*state.db, &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", id.clone()))?;
-    if !project_is_visible(&state, &project, &user.user_id).await? {
-        return Err(ApiError::not_found("project", id));
-    }
+    let project = require_project_visible(&state, &id, &user.user_id).await?;
     Ok(Json(project_response(project)?))
 }
 
@@ -718,28 +704,9 @@ async fn require_project_visible(
     project_id: &str,
     user_id: &str,
 ) -> ApiResult<db::Project> {
-    let project = ProjectRepo::get_by_id(&*state.db, project_id)
+    ProjectRepo::get_visible_by_id(&*state.db, project_id, user_id)
         .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    if !project_is_visible(state, &project, user_id).await? {
-        return Err(ApiError::not_found("project", project_id.to_owned()));
-    }
-    Ok(project)
-}
-
-async fn project_is_visible(
-    state: &AppState,
-    project: &db::Project,
-    user_id: &str,
-) -> ApiResult<bool> {
-    if project.owner_id.is_none() || project.owner_id.as_deref() == Some(user_id) {
-        return Ok(true);
-    }
-    Ok(
-        db::ProjectMemberRepo::get_member(&*state.db, &project.id, user_id)
-            .await?
-            .is_some(),
-    )
+        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))
 }
 
 fn project_hook_run_response(run: ProjectHookRun) -> ProjectHookRunResponse {

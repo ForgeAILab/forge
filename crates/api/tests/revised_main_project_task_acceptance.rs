@@ -320,16 +320,18 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
         required_string(&project_agent, &["agent", "id"])
     );
 
-    // The Main chat is a continuity scope with no workspace at all. The
-    // Project chat gets its own verification workspace -- it may read and run,
-    // never author repository changes -- so its access is `project_verify`,
-    // not a Task-scoped write grant.
+    // Neither chat receives a Task-scoped write grant, and neither can reach
+    // a repository. The Main chat holds an account scratch directory --
+    // somewhere to keep findings and the work of the inquiry sub-agents it
+    // dispatches -- which contains no repository at all. The Project chat
+    // gets its own verification checkout, which it may read and run but never
+    // author changes into.
     for (identity_id, profile_id, chat_id, expected_access) in [
         (
             main_identity.as_str(),
             main_profile.as_str(),
             main_chat_id.as_str(),
-            "deny",
+            "account_scratch",
         ),
         (
             project_identity.as_str(),

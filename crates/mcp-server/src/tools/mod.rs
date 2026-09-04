@@ -40,9 +40,9 @@ pub(crate) async fn dispatch_tool(
         "forge_transition_task" => handlers::forge_transition_task(state, arguments).await,
         "forge_register_agent" => handlers::forge_register_agent(state, arguments).await,
         "forge_list_agents" => handlers::forge_list_agents(state, arguments).await,
-        "forge_list_projects" => handlers::forge_list_projects(state, arguments).await,
+        "forge_list_projects" => handlers::forge_list_projects(state, arguments, context).await,
         "forge_get_project" => handlers::forge_get_project(state, arguments).await,
-        "forge_create_project" => handlers::forge_create_project(state, arguments).await,
+        "forge_create_project" => handlers::forge_create_project(state, arguments, context).await,
         "forge_update_project" => handlers::forge_update_project(state, arguments).await,
         "forge_update_project_lifecycle_hooks" => {
             handlers::forge_update_project_lifecycle_hooks(state, arguments).await

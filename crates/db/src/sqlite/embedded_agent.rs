@@ -224,11 +224,57 @@ impl AgentContextScopeRepo for SqliteDb {
         if scope.project_id != input.project_id
             || scope.task_id != input.task_id
             || scope.task_role != input.task_role
-            || scope.workspace_access != input.workspace_access
         {
             return Err(DbError::Check(
                 "canonical context scope already exists with different scope linkage".to_owned(),
             ));
+        }
+        // A chat scope stored before its chat owned a workspace holds `deny`,
+        // and a chat whose workspace becomes unavailable resolves back to it.
+        // This access is server-derived at resolution time, never caller
+        // input, so moving a non-Task scope between `deny` and the workspace
+        // it now owns is the same scope re-resolved rather than a different
+        // one. Without this, every Main Chat that predates its scratch
+        // directory -- which is every existing one -- fails admission with an
+        // opaque linkage error. A Task scope keeps the strict check: its
+        // access is bound to the role it was issued for.
+        if scope.workspace_access != input.workspace_access {
+            let owned_workspace =
+                |access: &str| matches!(access, "project_verify" | "account_scratch" | "deny");
+            let re_resolved = input.scope_type != "task"
+                && owned_workspace(&scope.workspace_access)
+                && owned_workspace(&input.workspace_access);
+            if !re_resolved {
+                return Err(DbError::Check(
+                    "canonical context scope already exists with different scope linkage"
+                        .to_owned(),
+                ));
+            }
+            let updated = sqlx::query(
+                "UPDATE agent_context_scope
+                 SET workspace_access = ?, workspace_path = ?, version = version + 1,
+                     updated_at = ?
+                 WHERE id = ? AND version = ?",
+            )
+            .bind(&input.workspace_access)
+            .bind(input.workspace_path.as_deref())
+            .bind(&input.updated_at)
+            .bind(&scope.id)
+            .bind(scope.version)
+            .execute(&self.pool)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Err(DbError::VersionConflict);
+            }
+            scope = self
+                .get_context_scope_for_identity(
+                    &input.identity_id,
+                    &input.scope_type,
+                    &input.scope_id,
+                    input.task_role.as_deref(),
+                )
+                .await?
+                .ok_or(DbError::NotFound)?;
         }
 
         if !context_scope_authority_matches(

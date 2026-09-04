@@ -85,4 +85,9 @@ export const qk = {
   pats: () => ['pats'] as const,
   projectMembers: (projectId: string) => ['projects', projectId, 'members'] as const,
   projectAgents: (projectId: string) => ['projects', projectId, 'agents'] as const,
+  agentInquiries: (chatId: string) => ['agent-chats', chatId, 'inquiries'] as const,
+  agentInquiryPages: (chatId: string, limit: number) =>
+    ['agent-chats', chatId, 'inquiries', limit] as const,
+  agentInquiry: (id: string) => ['inquiries', id] as const,
+  agentInquiryLogs: (id: string) => ['inquiries', id, 'logs'] as const,
 }

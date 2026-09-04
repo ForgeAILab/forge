@@ -677,7 +677,7 @@ async fn seed_project_repo_agent(db: &SqliteDb) -> (String, String, String) {
     )
     .await
     .expect("repo creates");
-    ProjectRepo::update(
+    ProjectRepo::update_at_version(
         db,
         UpdateProject {
             id: project_id.clone(),
@@ -687,6 +687,12 @@ async fn seed_project_repo_agent(db: &SqliteDb) -> (String, String, String) {
             paused_at: None,
             updated_at: now_rfc3339(),
         },
+        ProjectRepo::get_by_id(db, &project_id)
+            .await
+            .expect("fixture Project lookup")
+            .expect("fixture Project exists")
+            .version,
+        None,
     )
     .await
     .expect("project primary repo updates");
@@ -3835,6 +3841,7 @@ async fn compare_and_move_is_atomic_versioned_and_idempotent() {
         after_id: Some(first_id),
         entry_barrier_json: None,
         transition_log_id: new_uuid_v4(),
+        workflow_snapshot: serde_json::Value::Null,
         trigger_name: None,
         triggered_by: "user:board_drag".to_owned(),
         trigger_reason: "board reorder".to_owned(),
@@ -3958,6 +3965,7 @@ async fn compare_and_move_emits_interruption_resolution_with_the_task_update() {
             after_id: None,
             entry_barrier_json: None,
             transition_log_id: new_uuid_v4(),
+            workflow_snapshot: serde_json::Value::Null,
             trigger_name: None,
             triggered_by: "user:board_drag".to_owned(),
             trigger_reason: "resolve the block by moving the task".to_owned(),
@@ -4043,6 +4051,7 @@ async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
             after_id: Some(after_id.clone()),
             entry_barrier_json: None,
             transition_log_id: new_uuid_v4(),
+            workflow_snapshot: serde_json::Value::Null,
             trigger_name: None,
             triggered_by: "user:board_drag".to_owned(),
             trigger_reason: "board reorder".to_owned(),
@@ -4089,6 +4098,7 @@ async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
             after_id: None,
             entry_barrier_json: None,
             transition_log_id: new_uuid_v4(),
+            workflow_snapshot: serde_json::Value::Null,
             trigger_name: None,
             triggered_by: "user:board_drag".to_owned(),
             trigger_reason: "board move".to_owned(),
@@ -4130,6 +4140,7 @@ async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
             after_id: None,
             entry_barrier_json: None,
             transition_log_id: new_uuid_v4(),
+            workflow_snapshot: serde_json::Value::Null,
             trigger_name: None,
             triggered_by: "user:board_drag".to_owned(),
             trigger_reason: "board move".to_owned(),
@@ -4315,7 +4326,7 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
     let now = now_rfc3339();
     let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
 
-    let project = ProjectRepo::update(
+    let project = ProjectRepo::update_at_version(
         &db,
         UpdateProject {
             id: project_id.clone(),
@@ -4325,6 +4336,12 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
             paused_at: None,
             updated_at: now.clone(),
         },
+        ProjectRepo::get_by_id(&db, &project_id)
+            .await
+            .expect("fixture Project lookup")
+            .expect("fixture Project exists")
+            .version,
+        None,
     )
     .await
     .expect("project updates");

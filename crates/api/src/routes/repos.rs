@@ -75,7 +75,7 @@ pub async fn create_repo(
         )
         .await?;
     }
-    ProjectRepo::update(
+    ProjectRepo::update_at_version(
         &*state.db,
         UpdateProject {
             id: project_id,
@@ -85,6 +85,8 @@ pub async fn create_repo(
             paused_at: None,
             updated_at: now_rfc3339(),
         },
+        project.version,
+        None,
     )
     .await?;
     Ok(Json(repo_response(repo)))

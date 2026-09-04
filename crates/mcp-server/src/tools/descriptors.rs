@@ -177,20 +177,22 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
         ),
         tool_descriptor(
             "forge_update_project",
-            "Update mutable project fields. Settings are replaced when provided and must pass project settings validation.",
+            "Update mutable project fields using the current project version. Settings are replaced when provided and must pass project settings validation.",
             json!({
                 "project_id": { "type": "string" },
+                "version": { "type": "integer" },
                 "name": { "type": "string" },
                 "settings": { "type": "object" },
                 "paused": { "type": "boolean" }
             }),
-            required(scoped_project, &["project_id"], &[]),
+            required(scoped_project, &["project_id", "version"], &["version"]),
         ),
         tool_descriptor(
             "forge_update_project_lifecycle_hooks",
-            "Replace a project's lifecycle hooks without changing other project settings.",
+            "Replace a project's lifecycle hooks using the current project version, preserving other project settings.",
             json!({
                 "project_id": { "type": "string" },
+                "version": { "type": "integer" },
                 "lifecycle_hooks": {
                     "type": "object",
                     "description": "Map of lifecycle event names to hook arrays. Events: before_work, on_work_start, on_work_stop, on_task_done, on_task_cancel.",
@@ -225,8 +227,8 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
             }),
             required(
                 scoped_project,
-                &["project_id", "lifecycle_hooks"],
-                &["lifecycle_hooks"],
+                &["project_id", "version", "lifecycle_hooks"],
+                &["version", "lifecycle_hooks"],
             ),
         ),
         tool_descriptor(

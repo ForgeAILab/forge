@@ -566,7 +566,7 @@ async fn seed_awaiting_human_review(
     )
     .await
     .expect("repo creates");
-    ProjectRepo::update(
+    ProjectRepo::update_at_version(
         db,
         UpdateProject {
             id: project_id.clone(),
@@ -576,6 +576,12 @@ async fn seed_awaiting_human_review(
             paused_at: None,
             updated_at: now_rfc3339(),
         },
+        ProjectRepo::get_by_id(db, &project_id)
+            .await
+            .expect("fixture Project lookup")
+            .expect("fixture Project exists")
+            .version,
+        None,
     )
     .await
     .expect("project primary repo updates");
@@ -799,7 +805,7 @@ async fn seed_awaiting_human_review_with_workspace(
     )
     .await
     .expect("repo creates");
-    ProjectRepo::update(
+    ProjectRepo::update_at_version(
         db,
         UpdateProject {
             id: project_id.clone(),
@@ -809,6 +815,12 @@ async fn seed_awaiting_human_review_with_workspace(
             paused_at: None,
             updated_at: now_rfc3339(),
         },
+        ProjectRepo::get_by_id(db, &project_id)
+            .await
+            .expect("fixture Project lookup")
+            .expect("fixture Project exists")
+            .version,
+        None,
     )
     .await
     .expect("project primary repo updates");
@@ -945,7 +957,7 @@ async fn seed_review_with_status(db: &db::SqliteDb, status: ReviewStatus) -> Str
     )
     .await
     .expect("repo creates");
-    ProjectRepo::update(
+    ProjectRepo::update_at_version(
         db,
         UpdateProject {
             id: project_id.clone(),
@@ -955,6 +967,12 @@ async fn seed_review_with_status(db: &db::SqliteDb, status: ReviewStatus) -> Str
             paused_at: None,
             updated_at: now_rfc3339(),
         },
+        ProjectRepo::get_by_id(db, &project_id)
+            .await
+            .expect("fixture Project lookup")
+            .expect("fixture Project exists")
+            .version,
+        None,
     )
     .await
     .expect("project primary repo updates");
@@ -1069,7 +1087,7 @@ async fn seed_task_with_system_comment(db: &db::SqliteDb) -> String {
     )
     .await
     .expect("repo creates");
-    ProjectRepo::update(
+    ProjectRepo::update_at_version(
         db,
         UpdateProject {
             id: project_id.clone(),
@@ -1079,6 +1097,12 @@ async fn seed_task_with_system_comment(db: &db::SqliteDb) -> String {
             paused_at: None,
             updated_at: now_rfc3339(),
         },
+        ProjectRepo::get_by_id(db, &project_id)
+            .await
+            .expect("fixture Project lookup")
+            .expect("fixture Project exists")
+            .version,
+        None,
     )
     .await
     .expect("project primary repo updates");

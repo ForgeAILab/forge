@@ -113,7 +113,7 @@ impl TaskService {
 
         if source_task.status == request.target_status {
             return self
-                .reorder_within_column(source_task, request, target_column_statuses)
+                .reorder_within_column(source_task, request, target_column_statuses, &workflow)
                 .await;
         }
 
@@ -266,7 +266,14 @@ impl TaskService {
         task: Task,
         request: MoveTaskRequest,
         target_column_statuses: Vec<String>,
+        workflow: &api_types::WorkflowDefinition,
     ) -> Result<MoveTaskResult> {
+        let workflow_snapshot = crate::workflow::transition_event::transition_workflow_snapshot(
+            &task,
+            workflow,
+            &task.status,
+            &request.target_status,
+        )?;
         let persistence = TaskBoardRepo::compare_and_move_task(
             &*self.db,
             CompareAndMoveTask {
@@ -281,6 +288,7 @@ impl TaskService {
                 after_id: request.after_id,
                 entry_barrier_json: task.entry_barrier_json,
                 transition_log_id: new_uuid_v4(),
+                workflow_snapshot,
                 trigger_name: None,
                 triggered_by: Actor::user(UserActionSource::BoardDrag).display(),
                 trigger_reason: "board reorder".to_owned(),

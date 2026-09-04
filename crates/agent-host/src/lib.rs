@@ -47,17 +47,17 @@ pub use operation_catalog::{
     MAIN_CHARTER_APPROVAL_TARGET_OPERATION, MAIN_CHARTER_DIFF_OPERATION,
     MAIN_CHARTER_DRAFT_OPERATION, MAIN_CHARTER_READ_OPERATION, MAIN_CHARTER_READINESS_OPERATION,
     MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION, MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
-    MAIN_GENESIS_START_OPERATION, MAIN_PROJECT_CREATE_OPERATION, MIGRATED_OPERATION_CONTRACTS,
-    OperationClassification, OperationContract, OperationDescriptor, OperationExposure,
-    OperationInputContract, OperationOutputContract, OperationPermission, OperationSetupExposure,
-    OperationSurface, PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CHARTER_READ_OPERATION,
-    PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
-    PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
-    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_SKILL_SECTION_NAMES,
-    PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION, SHARED_ORCHESTRATION_OUTCOME,
-    TASK_ADAPTIVE_OPERATION, TASK_EVIDENCE_OPERATION, TASK_PROPOSE_OPERATION,
-    TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION, classify_operation,
-    contains_adaptive_authority_override, contains_authority_override,
+    MAIN_GENESIS_START_OPERATION, MAIN_INQUIRY_RUN_OPERATION, MAIN_PROJECT_CREATE_OPERATION,
+    MIGRATED_OPERATION_CONTRACTS, OperationClassification, OperationContract, OperationDescriptor,
+    OperationExposure, OperationInputContract, OperationOutputContract, OperationPermission,
+    OperationSetupExposure, OperationSurface, PROJECT_CHARTER_ADOPTION_OPERATION,
+    PROJECT_CHARTER_READ_OPERATION, PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION,
+    PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
+    PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
+    PROJECT_SKILL_SECTION_NAMES, PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION,
+    SHARED_ORCHESTRATION_OUTCOME, TASK_ADAPTIVE_OPERATION, TASK_EVIDENCE_OPERATION,
+    TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION,
+    classify_operation, contains_adaptive_authority_override, contains_authority_override,
     descriptor as operation_descriptor, is_allowed_project_direct_payload,
     is_approval_required_operation, is_denied_operation, is_project_orchestration_operation,
     is_query_operation, operation_contract, operation_contract_permission,
@@ -68,6 +68,7 @@ pub use protected_store::{
     SqliteProtectedRuntimeStore,
 };
 pub use tool_preview::build_tool_argument_preview;
+pub use typed_tools::admits_orchestration_read_argument;
 pub use typed_tools::{CommandObservation, PROJECT_VERIFICATION_CHECKOUT_DIR};
 pub use typed_tools::{
     FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL, FORGE_MAIN_ORCHESTRATION_READ_TOOL,
@@ -171,13 +172,28 @@ pub enum WorkspaceAccess {
     ///
     /// This exists so a Project Agent can exercise the delivered software
     /// itself -- build it, run its tests, start it -- without becoming a second
-    /// implementation path. There is no write tool and no commit or push route,
-    /// and the checkout is not the Task worktree any delivery came from, so
-    /// nothing done here can reach the repository.
+    /// implementation path. The Agent writes into its own `forge/` directory
+    /// while commands run in `checkout/`, and there is no commit or push
+    /// route, so nothing done here can reach the repository.
     ProjectVerify,
+    /// Read, write, and run inside an account-owned scratch directory.
+    ///
+    /// This is deliberately not a repository checkout: no clone, no remote,
+    /// no worktree. It exists so the Main Agent and the ephemeral inquiry
+    /// sub-agents it dispatches can keep working notes and findings on disk
+    /// instead of carrying them in conversation context. Because no
+    /// repository is present at all, "cannot write to a repository" holds
+    /// structurally here rather than by policy.
+    AccountScratch,
 }
 
 impl CanonicalScope {
+    /// An inquiry shares account authority, but never conversation state.
+    pub fn is_ephemeral_inquiry(&self) -> bool {
+        self.scope_type == CanonicalScopeType::Account
+            && self.workspace_access == WorkspaceAccess::AccountScratch
+    }
+
     pub fn validate(&self) -> Result<(), AgentHostError> {
         match (self.scope_type, self.workspace_access) {
             (CanonicalScopeType::Task, WorkspaceAccess::TaskRead | WorkspaceAccess::TaskWrite)
@@ -187,7 +203,11 @@ impl CanonicalScope {
                 | CanonicalScopeType::AgentChat,
                 WorkspaceAccess::Deny,
             )
-            | (CanonicalScopeType::AgentChat, WorkspaceAccess::ProjectVerify) => Ok(()),
+            | (CanonicalScopeType::AgentChat, WorkspaceAccess::ProjectVerify)
+            | (
+                CanonicalScopeType::Account | CanonicalScopeType::AgentChat,
+                WorkspaceAccess::AccountScratch,
+            ) => Ok(()),
             _ => Err(AgentHostError::Authority(
                 "filesystem access is only valid for an admitted Task scope".to_owned(),
             )),
@@ -242,10 +262,12 @@ pub struct AgentTurnRequest {
     pub forge_session_id: String,
     pub runtime_session_id: String,
     pub scope: CanonicalScope,
-    /// The host-issued Task worktree root.  Non-Task scopes must leave this
-    /// unset; the native host validates that invariant before composing the
-    /// runtime so a caller cannot smuggle a repository path into an account,
-    /// Project, or Agent Chat session.
+    /// The host-issued filesystem root.  This is the Task worktree for a Task
+    /// scope, the disposable checkout for a Project verification session, and
+    /// the account scratch directory for an `AccountScratch` session. Every
+    /// other scope must leave it unset; the native host validates that
+    /// invariant before composing the runtime so a caller cannot smuggle a
+    /// repository path into an account, Project, or Agent Chat session.
     pub workspace_path: Option<String>,
     pub provider: NativeProviderConfig,
     pub system_prompt: Option<String>,

@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react'
 import {
   type InfiniteData,
   useInfiniteQuery,
@@ -39,6 +40,12 @@ import {
   updateMemberRole,
   updateSettings,
 } from '@/api/client'
+import {
+  cancelAgentInquiry,
+  listAgentInquiries,
+  listAgentInquiryLogs,
+  type CancelAgentInquiryInput,
+} from '@/api/agent-inquiries'
 import { qk } from '@/api/query-keys'
 import { getApiErrorCode } from '@/lib/api-error'
 import { useAuthStore } from '@/stores/auth'
@@ -98,6 +105,7 @@ import type {
   UpdateSettingsRequest,
   WorkflowDefinition,
   Workspace,
+  AgentInquiryResponse,
 } from '@/types/generated'
 import type { AuthorizationProvenance } from '@/types/generated/bindings/AuthorizationProvenance'
 import type { MilestoneDefinitionRevision } from '@/types/generated/bindings/MilestoneDefinitionRevision'
@@ -1890,6 +1898,115 @@ export function useRemoveMember(projectId: string) {
     mutationFn: (userId: string) => removeMember(projectId, userId),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: qk.projectMembers(projectId) })
+    },
+  })
+}
+
+// --- Agent Inquiries ---
+// Ephemeral, read-only Main Agent sub-agent runs (`inquiry.run`). A run log,
+// not a work item: the only mutation is cancel, and only while running.
+
+const AGENT_INQUIRY_LIST_LIMIT = 50
+const AGENT_INQUIRY_POLL_INTERVAL = 3_000
+/** A running inquiry's activity (tool calls, reasoning, reply deltas) is followed at this cadence. */
+const AGENT_INQUIRY_ACTIVITY_POLL_INTERVAL = 1_000
+const AGENT_INQUIRY_LOG_PAGE_LIMIT = 1_000
+const AGENT_INQUIRY_LOG_MAX_PAGES_PER_FETCH = 20
+
+/**
+ * Extend an already-loaded activity log with everything the server has
+ * recorded since its last entry. An inquiry appends to one log with
+ * increasing sequences, so a poll only ever transfers the new tail — same
+ * idiom as `fetchAgentChatTurnLogsAfter`.
+ */
+export async function fetchAgentInquiryLogsAfter(
+  inquiryId: string,
+  previous: LogEntry[],
+): Promise<LogEntry[]> {
+  const items = [...previous]
+  let from = items.length > 0 ? items[items.length - 1].sequence + 1 : 0
+  for (let page = 0; page < AGENT_INQUIRY_LOG_MAX_PAGES_PER_FETCH; page += 1) {
+    const response = await listAgentInquiryLogs(inquiryId, {
+      from_sequence: from,
+      limit: AGENT_INQUIRY_LOG_PAGE_LIMIT,
+    })
+    items.push(...response.items)
+    if (!response.has_more || response.next_sequence === null) break
+    from = response.next_sequence
+  }
+  return items
+}
+
+/**
+ * The durable activity log of one inquiry: reasoning, tool calls with their
+ * bounded results, and reply deltas. While `live`, it follows the inquiry at
+ * the activity cadence; afterwards it is fetched once per mount so a reader
+ * who watched it run sees its final tail without re-downloading the rest.
+ */
+export function useAgentInquiryLogsQuery(
+  inquiryId: string | undefined,
+  options: { live: boolean; enabled?: boolean },
+) {
+  const queryClient = useQueryClient()
+  const queryKey = qk.agentInquiryLogs(inquiryId ?? 'none')
+  const previous = useRef({ inquiryId, live: options.live })
+  useEffect(() => {
+    const wasRunning = previous.current.inquiryId === inquiryId && previous.current.live
+    previous.current = { inquiryId, live: options.live }
+    if (!inquiryId || !wasRunning || options.live) return
+
+    const filter = { queryKey: qk.agentInquiryLogs(inquiryId) }
+    // A poll already in flight may have read before completion. Cancel it
+    // before fetching the terminal tail, including the initial empty read.
+    // Closed rows stay invalidated and drain when opened again.
+    void queryClient.cancelQueries(filter).then(() => queryClient.invalidateQueries(filter))
+  }, [inquiryId, options.live, queryClient])
+
+  return useQuery({
+    queryKey,
+    enabled: Boolean(inquiryId) && (options.enabled ?? true),
+    refetchInterval: options.live ? AGENT_INQUIRY_ACTIVITY_POLL_INTERVAL : false,
+    refetchOnMount: options.live ? true : 'always',
+    staleTime: options.live ? 0 : Number.POSITIVE_INFINITY,
+    queryFn: () =>
+      fetchAgentInquiryLogsAfter(inquiryId!, queryClient.getQueryData<LogEntry[]>(queryKey) ?? []),
+  })
+}
+
+export function useAgentInquiriesQuery(chatId: string | undefined, limit = AGENT_INQUIRY_LIST_LIMIT) {
+  return useInfiniteQuery({
+    queryKey: qk.agentInquiryPages(chatId ?? 'none', limit),
+    queryFn: ({ pageParam }) => listAgentInquiries(chatId!, { cursor: pageParam, limit }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    enabled: Boolean(chatId),
+    // Creation has no event notification. Keep discovering runs while this
+    // list is mounted, including from an empty or all-terminal cache.
+    refetchInterval: AGENT_INQUIRY_POLL_INTERVAL,
+  })
+}
+
+export function useCancelAgentInquiryMutation(chatId: string | undefined) {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, input }: { id: string; input: CancelAgentInquiryInput }) =>
+      cancelAgentInquiry(id, input),
+    onSuccess: (cancelled) => {
+      if (!chatId) return
+      // Settle the cancelled inquiry into every cached page immediately so
+      // the Cancel action disappears without waiting on the next poll tick.
+      queryClient.setQueriesData<InfiniteData<{ items: AgentInquiryResponse[] }> | undefined>(
+        { queryKey: qk.agentInquiries(chatId) },
+        (data) =>
+          data && {
+            ...data,
+            pages: data.pages.map((page) => ({
+              ...page,
+              items: page.items.map((item) => (item.id === cancelled.id ? cancelled : item)),
+            })),
+          },
+      )
+      void queryClient.invalidateQueries({ queryKey: qk.agentInquiries(chatId) })
     },
   })
 }

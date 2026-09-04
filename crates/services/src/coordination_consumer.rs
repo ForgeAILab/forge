@@ -603,6 +603,24 @@ fn is_task_outcome_event(event: &DomainEvent) -> bool {
 }
 
 fn task_outcome(event: &DomainEvent, task: &Task, payload: &Value) -> Option<TaskOutcome> {
+    if event.event_type == "task.transitioned" {
+        let transition =
+            serde_json::from_value::<api_types::TaskTransitionEventPayload>(payload.clone())
+                .ok()?;
+        let snapshot = transition.known_workflow_snapshot()?;
+        if snapshot.from_state.name == snapshot.to_state.name
+            || snapshot.to_state.kind != api_types::StateKind::Terminal
+        {
+            return None;
+        }
+        return if snapshot.to_state.is_cancellation {
+            Some(TaskOutcome::Cancelled {
+                reason: transition.trigger_reason,
+            })
+        } else {
+            Some(TaskOutcome::Delivered)
+        };
+    }
     let state = payload
         .get("to_state")
         .and_then(Value::as_str)

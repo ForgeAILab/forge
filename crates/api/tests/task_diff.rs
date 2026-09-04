@@ -210,7 +210,7 @@ async fn create_project_and_repo(harness: &Harness) -> (String, String, PathBuf,
     )
     .await
     .expect("repo creates");
-    ProjectRepo::update(
+    ProjectRepo::update_at_version(
         &*harness.state.db,
         UpdateProject {
             id: project.id.clone(),
@@ -220,6 +220,12 @@ async fn create_project_and_repo(harness: &Harness) -> (String, String, PathBuf,
             paused_at: None,
             updated_at: now_rfc3339(),
         },
+        ProjectRepo::get_by_id(&*harness.state.db, &project.id)
+            .await
+            .expect("fixture Project lookup")
+            .expect("fixture Project exists")
+            .version,
+        None,
     )
     .await
     .expect("project primary repo updates");

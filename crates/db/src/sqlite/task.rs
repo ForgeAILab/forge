@@ -1,6 +1,23 @@
 use super::*;
 use std::collections::HashSet;
 
+async fn load_task<'e, E>(executor: E, id: &str, include_deleted: bool) -> Result<Option<Task>>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let sql = if include_deleted {
+        format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?")
+    } else {
+        format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ? AND deleted_at IS NULL")
+    };
+    sqlx::query(&sql)
+        .bind(id)
+        .fetch_optional(executor)
+        .await?
+        .map(map_task)
+        .transpose()
+}
+
 #[async_trait]
 impl TaskRepo for SqliteDb {
     async fn create(&self, input: CreateTask) -> Result<Task> {
@@ -46,17 +63,16 @@ impl TaskRepo for SqliteDb {
     }
 
     async fn get_by_id(&self, id: &str, include_deleted: bool) -> Result<Option<Task>> {
-        let sql = if include_deleted {
-            format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?")
-        } else {
-            format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ? AND deleted_at IS NULL")
-        };
-        sqlx::query(&sql)
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?
-            .map(map_task)
-            .transpose()
+        load_task(&self.pool, id, include_deleted).await
+    }
+
+    async fn get_by_id_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        id: &str,
+        include_deleted: bool,
+    ) -> Result<Option<Task>> {
+        load_task(&mut **transaction, id, include_deleted).await
     }
 
     async fn list(&self, query: TaskListQuery) -> Result<Page<Task>> {

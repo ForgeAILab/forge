@@ -21,6 +21,16 @@ pub const MAIN_CHARTER_READINESS_OPERATION: &str = "charter.readiness";
 pub const MAIN_CHARTER_DIFF_OPERATION: &str = "charter.diff";
 pub const MAIN_CHARTER_APPROVAL_TARGET_OPERATION: &str = "charter.approval_target";
 pub const MAIN_PROJECT_CREATE_OPERATION: &str = "project.create";
+/// Dispatch one ephemeral read-only sub-agent to answer a bounded question,
+/// and return its findings to the calling turn.
+///
+/// This is deliberately not a Task: there is no worktree, no workflow state,
+/// no review, and no dispatch queue. One nested turn runs with the account
+/// read surface and an account scratch directory, its transcript never enters
+/// the caller's history, and only a bounded abstract comes back. It exists so
+/// Main can spend a research excursion's context somewhere other than the
+/// conversation that has to survive all day.
+pub const MAIN_INQUIRY_RUN_OPERATION: &str = "inquiry.run";
 pub const PROJECT_CURRENT_STATE_OPERATION: &str = "project.current_state";
 /// Read what a Task run actually reported: its worklog entries and the
 /// artifacts it captured. This is how a Project Agent checks an observation
@@ -301,6 +311,24 @@ pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
         supported_scopes: MAIN_SCOPES,
         classification: OperationClassification::ApprovalRequiredAction,
         permission: OperationPermission::ProposeProject,
+        output: SHARED_ORCHESTRATION_OUTCOME,
+    },
+    OperationContract {
+        operation: MAIN_INQUIRY_RUN_OPERATION,
+        surface: OperationSurface::MainOrchestration,
+        exposure: OperationExposure::TypedRead,
+        input: OperationInputContract::ReadArguments,
+        setup: OperationSetupExposure::Always,
+        supported_scopes: MAIN_SCOPES,
+        // A Query runs directly instead of queueing an approval envelope: the
+        // caller is blocked on the answer, so an Action round trip would only
+        // strand the turn. Authority is bounded by the sub-agent's read-only
+        // surface, not by a gate.
+        classification: OperationClassification::Query,
+        // Gated on research authority rather than a plain read: this spends
+        // provider tokens, so it should be revocable independently of the
+        // bounded Main reads.
+        permission: OperationPermission::ProposeDiscovery,
         output: SHARED_ORCHESTRATION_OUTCOME,
     },
     OperationContract {

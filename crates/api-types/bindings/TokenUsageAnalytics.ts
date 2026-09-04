@@ -3,7 +3,7 @@ import type { AgentTokenBreakdown } from "./AgentTokenBreakdown";
 import type { ModelTokenBreakdown } from "./ModelTokenBreakdown";
 import type { SurfaceTokenBreakdown } from "./SurfaceTokenBreakdown";
 
-export type TokenUsageAnalytics = { total_input_tokens: bigint, total_output_tokens: bigint, total_cache_read_tokens: bigint, total_cache_write_tokens: bigint, total_cost_usd: number | null, execution_count: bigint,
+export type TokenUsageAnalytics = { total_input_tokens: bigint, total_output_tokens: bigint, total_cache_read_tokens: bigint, total_cache_write_tokens: bigint, total_cost_usd: number | null, execution_count: bigint, 
 /**
  * Agent Chat turns counted in the totals, across both chat surfaces.
  */

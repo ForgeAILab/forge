@@ -6,6 +6,121 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-09-04
+
+### Breaking
+
+- **MCP Project writes require `version`.** `forge_update_project` and
+  `forge_update_project_lifecycle_hooks` now enforce optimistic concurrency,
+  matching REST. Read the current version from the Project response before
+  updating; stale writes return `version_conflict`.
+- **Task transition events carry frozen workflow semantics.** New durable
+  `task.transitioned` payloads include `workflow_snapshot`. Historical events
+  without one are preserved but no longer infer review/delivery semantics
+  from the current workflow or literal state names during replay.
+
+### Added
+
+- **The Main Agent can dispatch a read-only inquiry sub-agent turn
+  (`inquiry.run`).** An inquiry runs in its own scratch workspace (not a repo
+  checkout — no git, no remote), streams its work to the UI as a visible run
+  record, and returns a bounded findings abstract to the parent turn. It is a
+  run log, not a Task: no retry, assignment, dependency, milestone, or review
+  concept, and the only user verb is cancel. New endpoints
+  `GET /api/v1/agent-chats/{chat_id}/inquiries`, `GET /api/v1/inquiries/{id}`,
+  and `POST /api/v1/inquiries/{id}/cancel` expose `AgentInquiryResponse` /
+  `AgentInquiryListResponse`, closed-set status (`running`, `succeeded`,
+  `failed`, `cancelled`), and disjoint token counters (context size =
+  `input_tokens + cache_read_tokens + cache_write_tokens`). Composed only into
+  a Main Chat, never a Project Chat.
+- **A sub-agent's work is watchable while it runs.** An inquiry writes the same
+  Forge JSONL activity log an Agent Chat turn writes — reasoning, tool calls
+  with bounded results, reply deltas — served by
+  `GET /api/v1/inquiries/{id}/logs` in the same page shape as
+  `/executions/{id}/logs`. An inquiry that has logged nothing yet reads as an
+  empty page, not a `404`.
+- **Cancelling an inquiry stops its provider call.** `POST
+  /api/v1/inquiries/{id}/cancel` now signals the running turn as well as
+  marking the record, so a cancel takes effect immediately instead of at the
+  10-minute timeout. Cancelling the calling chat turn also cancels any inquiry
+  it was blocked on. If the run finishes in the same instant, the user's
+  cancellation wins and the caller is told the inquiry was cancelled rather
+  than receiving a tool error.
+
+### Fixed
+
+- **REST and MCP agree on Project visibility.** Owner/member/public filtering
+  precedes Project pagination and counts. Unscoped authenticated MCP calls
+  also authorize referenced Tasks, dependencies, and Executions.
+- **Project writes share one versioned path.** Removed the versionless
+  repository update API; first-repository selection now checks and increments
+  the Project version rather than silently overwriting concurrent changes.
+- **Inquiry runs have fresh runtime state and reliable cancellation.** Runs
+  share account authority metadata, not conversation snapshots, checkpoints,
+  LCM history, or accumulated usage. Dropping the caller cancels its inquiry;
+  timeout cancels and drains the backend before releasing the account lock.
+- **Inquiry activity stays current.** Mounted lists discover new runs from
+  empty or all-terminal caches, and expanded logs fetch the final output when
+  a run completes, fails, or is cancelled.
+- **Client and architecture drift removed.** Deleted the phantom Task
+  `pr_summary` client field and unused card, removed the unwired workflow
+  cache, and corrected documentation for the canonical workflow engine and
+  Project Agent verification authority.
+- **Task recovery respects manual stops and newer attempts.** Pause/Stop keeps
+  the user's recovery controls without requesting autonomous recovery. An old
+  failed/cancelled attempt cannot become an orphan once a successor exists;
+  wake admission rechecks supersession before consuming budget.
+- **Attention follows custom workflow semantics.** Renamed human review gates
+  and successful terminal states retain review and delivery follow-up, while
+  the configured cancellation target resolves incidents without claiming
+  delivery. State names alone no longer determine Attention behavior.
+- **An Agent Chat whose workspace access changes no longer fails admission.**
+  `agent_context_scope` treated a stored `deny` row and a newly resolved
+  self-owned workspace as two different scopes, so a chat that predated its
+  workspace — every existing Main Chat, and any Project Chat older than
+  `project_verify` — was refused with an opaque "canonical context scope
+  already exists with different scope linkage". Workspace access is derived by
+  the server at resolution time, so a non-Task scope moving between `deny` and
+  the workspace it owns is now re-resolved in place under a version check. A
+  Task scope keeps the strict check, since its access is bound to the role it
+  was issued for.
+- **`account_scratch` is admitted by the runtime authority checks.** The
+  protected store rejected it as an invalid persisted access, and then as a
+  non-Task session "bound to a workspace". A scratch session that advertises a
+  directory it does not have now fails closed the same way a verification
+  session does.
+- **A failing inquiry says why.** Dispatch failures were reported to the model
+  as a bare `internal_failure` with nothing in the server log; the dispatch
+  error and an unavailable inquiry workspace are now logged.
+- **A cancelled inquiry records how long it ran.** The runner's completing
+  write is refused once the record is terminal, so a user-cancelled run had no
+  `duration_ms` at all; it is now derived at cancel time.
+
+### Changed
+
+- **The Main Agent baseline operating skill is now `forge.main.baseline/v1@3`.**
+  Its boundaries previously said the Main Agent had no filesystem authority,
+  which contradicted the scratch workspace and inquiry surface it now composes
+  — so it would have been told it could not use tools it was holding. v3 states
+  the corrected boundary (no repository or Workspace authority; one scratch
+  directory that contains no repository and reaches none), describes the
+  directory layout (`notes/`, `inquiries/<id>/`), says plainly that it is the
+  Main Agent's only writable memory since a Main Chat can read the account's
+  semantic memory but cannot publish to it, and adds doctrine for when to
+  dispatch an inquiry. The v2 body is retained verbatim so turns admitted
+  before this cutover still render the exact contract they froze.
+- **A Main Agent Chat now holds an account scratch workspace.** Its canonical
+  scope resolves to the new `account_scratch` workspace access instead of
+  `deny`, so the Main Agent can keep findings and notes on disk rather than
+  carrying them in a conversation that has to survive all day. The directory
+  is deliberately not a repository — no clone, no worktree, no remote — so
+  "cannot write to a repository" holds because there is none, not because a
+  tool was withheld. Migration `V131` widens the `agent_context_scope`
+  workspace constraints to admit it, and pins it to an `account` row or an
+  `agent_chat` row with no Project, which is the Main-only rule restated where
+  the data lives. Anything reading `agent_context_scope.workspace_access` for
+  a Main Chat now sees `account_scratch`.
+
 ## [0.9.2] - 2026-09-04
 
 ### Fixed

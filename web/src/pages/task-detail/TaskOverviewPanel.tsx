@@ -15,7 +15,6 @@ import { TaskExecutionApprovalNotice } from '@/features/project-execution/TaskEx
 import { TaskBlockingBanner } from '@/components/task-detail/task-blocking-banner'
 import { WorkflowExceptionPanel } from '@/components/task-detail/workflow-exception-panel'
 import { TaskExternalLinks } from '@/components/task-detail/task-external-links'
-import { TaskPrSummaryCard } from '@/components/task-detail/task-pr-summary-card'
 import { WorkflowHealthBadge } from '@/components/workflow-health-badge'
 import { Button } from '@/components/ui/button'
 import { CollapsibleSection } from '@/components/ui/collapsible-section'
@@ -466,7 +465,6 @@ export function TaskOverviewPanel({
               onCancelTask={onCancelTask}
             />
             {!task.workflow_exception ? <TaskBlockingBanner task={task} /> : null}
-            <TaskPrSummaryCard task={task} />
 
             {task.plan_progress || task.plan_artifact ? (
               <PlanChecklist progress={task.plan_progress} artifact={task.plan_artifact} />

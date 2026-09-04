@@ -354,14 +354,6 @@ export interface PrProviderStatus {
   polling_interval_seconds: number
 }
 
-export interface PrSummary {
-  pr_url?: string | null
-  pr_state: string
-  source_branch: string
-  target_branch: string
-  merge_status: string
-}
-
 export interface TaskExecutionObservability {
   execution_count: number
   active_execution_id?: string | null
@@ -566,7 +558,6 @@ export interface Task {
   role_assignments: TaskRoleAssignmentResponse[]
   remaining_retries: Record<string, number>
   execution_actions?: ExecutionAction[]
-  pr_summary?: PrSummary | null
   awaiting_human?: boolean
   error_annotation?: TaskAnnotation | null
   blocked?: InterruptionMetadata | null

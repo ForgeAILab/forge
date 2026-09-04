@@ -6,8 +6,8 @@ use events::EventBus;
 use executors::{AdapterRegistry, FallbackExecutor, TaskExecutor};
 use services::{
     AgentActionService, AgentChatTurnLogRoot, AgentChatTurnWorker, AgentInboxService, AgentService,
-    AuthService, CommitmentService, DaemonService, EmbeddedAgentService, MemoryService,
-    MergeService, NotificationService, OperatorStatusEmitter, OperatorStatusService,
+    AuthService, CommitmentService, DaemonService, EmbeddedAgentService, EmbeddedInquiryRunner,
+    MemoryService, MergeService, NotificationService, OperatorStatusEmitter, OperatorStatusService,
     ProjectHookService, ProviderAuthorizationService, TaskService, TerminalActivityTracker,
     TerminalService, WorkspaceCleanupScheduler, WorkspaceExecutionLockManager,
 };
@@ -67,6 +67,7 @@ pub struct AppState {
     pub embedded_agent_service: Arc<EmbeddedAgentService>,
     pub agent_chat_service: Arc<services::AgentChatService<SqliteDb>>,
     pub main_chat_topic_service: Arc<services::MainChatTopicService<SqliteDb>>,
+    pub agent_inquiry_service: Arc<services::agent_inquiry_service::AgentInquiryService<SqliteDb>>,
     pub agent_chat_turn_worker: Arc<AgentChatTurnWorker>,
     /// Where each Agent Chat turn's durable activity log (tool calls,
     /// reasoning, reply deltas) lives; shared by the turn worker that writes
@@ -186,6 +187,16 @@ impl AppState {
             Arc::clone(&agent_chat_service),
             services::ProductGenesisService::for_sqlite(Arc::clone(&db)),
         ));
+        // Shared by the inquiry runner and the Agent Chat turn worker (which
+        // write) and the two logs routes (which read), so they can never
+        // disagree on a path.
+        let agent_chat_turn_logs =
+            AgentChatTurnLogRoot::new(agent_chat_turn_log_root(&effective_config));
+        let agent_inquiry_service =
+            Arc::new(services::agent_inquiry_service::AgentInquiryService::new(
+                Arc::clone(&db),
+                Arc::clone(&agent_chat_service),
+            ));
         let commitment_service = Arc::new(CommitmentService::new(Arc::clone(&db)));
         let agent_inbox_service = Arc::new(AgentInboxService::new(Arc::clone(&db)));
         let agent_action_service = Arc::new(AgentActionService::new(Arc::clone(&db)));
@@ -251,6 +262,18 @@ impl AppState {
         );
         execution_events.set_task_service(Arc::downgrade(&task_service));
         embedded_agent_service.set_task_service(Arc::clone(&task_service));
+        // Lets a Main Chat dispatch ephemeral read-only inquiry sub-agents.
+        // The handle back to the service is weak, so this does not keep the
+        // runtime graph alive past shutdown.
+        let inquiry_runner = Arc::new(EmbeddedInquiryRunner::new(
+            Arc::clone(&db),
+            Arc::downgrade(&embedded_agent_service),
+            agent_chat_turn_logs.clone(),
+        ));
+        embedded_agent_service.set_inquiry_runner(inquiry_runner.clone());
+        // The REST cancel route reaches the same runner, so stopping an
+        // inquiry stops the provider call and not just the record.
+        agent_inquiry_service.set_runner(inquiry_runner);
         // Task sessions capture evidence into the same media store the user
         // upload routes write to, so a captured artifact and an uploaded one
         // are the same kind of asset to everything downstream.
@@ -292,8 +315,6 @@ impl AppState {
         let operator_status_service = Arc::new(OperatorStatusService::new(Arc::clone(&db)));
         let operator_status_emitter =
             Arc::new(OperatorStatusEmitter::start(Arc::clone(&event_bus)));
-        let agent_chat_turn_logs =
-            AgentChatTurnLogRoot::new(agent_chat_turn_log_root(&effective_config));
         let agent_chat_turn_worker = Arc::new(AgentChatTurnWorker::new(
             Arc::clone(&db),
             Arc::clone(&embedded_agent_service),
@@ -319,6 +340,7 @@ impl AppState {
             embedded_agent_service,
             agent_chat_service,
             main_chat_topic_service,
+            agent_inquiry_service,
             agent_chat_turn_worker,
             agent_chat_turn_logs,
             commitment_service,

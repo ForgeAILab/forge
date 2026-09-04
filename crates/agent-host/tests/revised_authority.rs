@@ -10,7 +10,7 @@ use agent_runtime::core::{
 use async_trait::async_trait;
 use forge_agent_host::{
     AgentHostError, CanonicalScope, CanonicalScopeType, FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL,
-    ForgeToolProvider, ScopeToolComposition, WorkspaceAccess,
+    FORGE_MAIN_ORCHESTRATION_READ_TOOL, ForgeToolProvider, ScopeToolComposition, WorkspaceAccess,
 };
 use serde_json::Value;
 
@@ -633,6 +633,194 @@ fn core_agent_chat_scope_has_no_task_mutation_or_filesystem() {
         )
         .is_err()
     );
+}
+
+/// The Main Agent keeps its working notes on disk instead of in the
+/// conversation. The directory is a scratch space, not a checkout: nothing in
+/// it is a repository, so there is no route from this surface back to one.
+#[test]
+fn main_agent_scratch_workspace_grants_read_write_and_run() {
+    let composition = ScopeToolComposition::for_scope_with_permissions_and_project_chat(
+        "identity-main",
+        CanonicalScope {
+            scope_type: CanonicalScopeType::AgentChat,
+            scope_id: "chat-main".to_owned(),
+            workspace_access: WorkspaceAccess::AccountScratch,
+        },
+        None,
+        Some("/tmp/forge-account-scratch"),
+        &broad_permissions(),
+        false,
+        Some(Arc::new(NoopProvider)),
+    )
+    .expect("account scratch composition is valid");
+    let names = composition.tool_names();
+    assert!(
+        names.iter().any(|name| name == "forge_task_write"),
+        "the Main Agent must be able to keep findings and notes on disk"
+    );
+    assert!(
+        names.iter().any(|name| name.contains("read")),
+        "the Main Agent must be able to read back what it wrote"
+    );
+    assert!(
+        names.iter().any(|name| name.contains("command")),
+        "the Main Agent must be able to run tooling over its own scratch"
+    );
+
+    // Without a directory the scope fails closed rather than silently
+    // composing a workspace-less Main session that advertises file tools.
+    assert!(
+        ScopeToolComposition::for_scope_with_permissions_and_project_chat(
+            "identity-main",
+            CanonicalScope {
+                scope_type: CanonicalScopeType::AgentChat,
+                scope_id: "chat-main".to_owned(),
+                workspace_access: WorkspaceAccess::AccountScratch,
+            },
+            None,
+            None,
+            &broad_permissions(),
+            false,
+            Some(Arc::new(NoopProvider)),
+        )
+        .is_err(),
+        "an account scratch scope without a directory must fail closed"
+    );
+}
+
+/// The depth cap, checked where it is enforced. A Main Chat may dispatch an
+/// inquiry; the Account scope an inquiry runs under never sees the operation
+/// at all, so a sub-agent cannot start another one no matter what it is told.
+#[test]
+fn a_main_chat_can_dispatch_an_inquiry_and_an_inquiry_cannot() {
+    let dispatcher = ScopeToolComposition::for_scope_with_permissions_and_project_chat(
+        "identity-main",
+        CanonicalScope {
+            scope_type: CanonicalScopeType::AgentChat,
+            scope_id: "chat-main".to_owned(),
+            workspace_access: WorkspaceAccess::AccountScratch,
+        },
+        None,
+        Some("/tmp/forge-account-scratch"),
+        &broad_permissions(),
+        false,
+        Some(Arc::new(NoopProvider)),
+    )
+    .expect("Main Chat composition is valid");
+    assert!(
+        advertised_operations(&dispatcher, FORGE_MAIN_ORCHESTRATION_READ_TOOL)
+            .iter()
+            .any(|operation| operation == "inquiry.run"),
+        "a Main Chat must be able to dispatch a research sub-agent"
+    );
+
+    let sub_agent = ScopeToolComposition::for_scope_with_permissions_and_project_chat(
+        "identity-main",
+        CanonicalScope {
+            scope_type: CanonicalScopeType::Account,
+            scope_id: "account-1".to_owned(),
+            workspace_access: WorkspaceAccess::AccountScratch,
+        },
+        None,
+        Some("/tmp/forge-account-scratch/inquiries/inq-1"),
+        &broad_permissions(),
+        false,
+        Some(Arc::new(NoopProvider)),
+    )
+    .expect("inquiry composition is valid");
+    assert!(
+        !advertised_operations(&sub_agent, FORGE_MAIN_ORCHESTRATION_READ_TOOL)
+            .iter()
+            .any(|operation| operation == "inquiry.run"),
+        "an inquiry must not be able to dispatch another inquiry"
+    );
+}
+
+/// An inquiry reads and reports. The permissions its session is issued carry
+/// no propose authority, and the composition must degrade accordingly rather
+/// than advertise operations the sub-agent could never execute.
+#[test]
+fn an_inquiry_cannot_act_on_the_account_that_dispatched_it() {
+    let inquiry_permissions: BTreeSet<String> = ["read_account", "propose_discovery"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let composition = ScopeToolComposition::for_scope_with_permissions_and_project_chat(
+        "identity-main",
+        CanonicalScope {
+            scope_type: CanonicalScopeType::Account,
+            scope_id: "account-1".to_owned(),
+            workspace_access: WorkspaceAccess::AccountScratch,
+        },
+        None,
+        Some("/tmp/forge-account-scratch/inquiries/inq-1"),
+        &inquiry_permissions,
+        false,
+        Some(Arc::new(NoopProvider)),
+    )
+    .expect("inquiry composition is valid");
+
+    let proposals = advertised_operations(&composition, FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL);
+    for denied in ["project.create", "genesis.start", "charter.draft"] {
+        assert!(
+            !proposals.iter().any(|operation| operation == denied),
+            "an inquiry must not be able to `{denied}` on its dispatcher's account"
+        );
+    }
+
+    // ...but it is still a research agent. Withholding the proposal surface
+    // must not cost it the reads it was dispatched to perform, or the
+    // sub-agent would be safe and useless.
+    let names = composition.tool_names();
+    assert!(
+        names.iter().any(|name| name == "forge_task_read"),
+        "an inquiry must be able to read its own findings directory"
+    );
+    assert!(
+        !advertised_operations(&composition, "forge_scope_read").is_empty()
+            || !advertised_operations(&composition, FORGE_MAIN_ORCHESTRATION_READ_TOOL).is_empty(),
+        "an inquiry must keep the account read surface it was dispatched to use"
+    );
+}
+
+/// The read path keeps its own allowlist of nested argument names, separate
+/// from the JSON schema the model is shown. An operation missing from it is
+/// advertised with arguments the tool then refuses, which surfaces as an
+/// opaque internal failure rather than a usable validation error — so the
+/// advertised schema and the admitted names are pinned to each other here.
+#[test]
+fn every_advertised_read_argument_is_admitted_by_the_read_path() {
+    let composition = ScopeToolComposition::for_scope_with_permissions_and_project_chat(
+        "identity-main",
+        CanonicalScope {
+            scope_type: CanonicalScopeType::AgentChat,
+            scope_id: "chat-main".to_owned(),
+            workspace_access: WorkspaceAccess::AccountScratch,
+        },
+        None,
+        Some("/tmp/forge-account-scratch"),
+        &broad_permissions(),
+        false,
+        Some(Arc::new(NoopProvider)),
+    )
+    .expect("Main Chat composition is valid");
+    assert!(
+        advertised_operations(&composition, FORGE_MAIN_ORCHESTRATION_READ_TOOL)
+            .iter()
+            .any(|operation| operation == "inquiry.run"),
+        "inquiry.run must be advertised before its arguments can matter"
+    );
+    for field in ["title", "question", "context"] {
+        let arguments = serde_json::json!({
+            "operation": "inquiry.run",
+            "arguments": { field: "x" },
+        });
+        assert!(
+            forge_agent_host::admits_orchestration_read_argument("inquiry.run", &arguments),
+            "`{field}` is advertised for inquiry.run but refused by the read path"
+        );
+    }
 }
 
 /// Scratch diagnostic: the propose tool must both require `payload` and

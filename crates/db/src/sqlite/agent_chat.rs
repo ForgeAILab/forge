@@ -2505,10 +2505,16 @@ async fn validate_agent_chat_turn_admission(
     Ok(())
 }
 
-fn supported_main_baseline_revision(revision: &str) -> bool {
+/// The compiled Main baseline revisions admission will accept.
+///
+/// This must list every revision `operating_skills` still resolves a body
+/// for. Bumping the baseline without adding it here rejects every new Main
+/// Chat message with a bare version conflict, which is exactly as confusing
+/// as it sounds -- see the paired test.
+pub fn supported_main_baseline_revision(revision: &str) -> bool {
     matches!(
         revision,
-        "forge.main.baseline/v1@1" | "forge.main.baseline/v1@2"
+        "forge.main.baseline/v1@1" | "forge.main.baseline/v1@2" | "forge.main.baseline/v1@3"
     )
 }
 
@@ -2520,8 +2526,11 @@ mod main_baseline_revision_tests {
     fn only_frozen_main_baseline_revisions_are_supported() {
         assert!(supported_main_baseline_revision("forge.main.baseline/v1@1"));
         assert!(supported_main_baseline_revision("forge.main.baseline/v1@2"));
+        assert!(supported_main_baseline_revision("forge.main.baseline/v1@3"));
+        // A revision this build has no compiled body for is refused, so a
+        // downgrade cannot render a contract it does not have.
         assert!(!supported_main_baseline_revision(
-            "forge.main.baseline/v1@3"
+            "forge.main.baseline/v1@4"
         ));
         assert!(!supported_main_baseline_revision(
             "forge.main.project-discovery/v2@2"

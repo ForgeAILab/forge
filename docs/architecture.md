@@ -95,8 +95,9 @@ domain SQL, perform lifecycle validation, invent Project scope from an input
 ID, choose a separate idempotency/approval rule, or maintain a second
 operation/permission catalog. The service derives the canonical principal and
 scope and owns authorization, validation, lifecycle, persistence, idempotency,
-and durable event creation. The pre-existing workflow-engine/legacy Task
-transition split remains outside this migrated orchestration boundary.
+and durable event creation. Task transitions remain a dedicated service and
+workflow-engine path outside this orchestration command boundary;
+`TaskService.transition()` delegates to `WorkflowEngine`.
 
 Each mutating command carries a `CommandContext` containing the principal,
 canonical scope, operation, idempotency key, canonical input digest, expected
@@ -151,8 +152,8 @@ Task scheduler, not by model instructions:
 
 | Principal | Canonical scope | Authority | Explicit boundary | Workspace |
 | --- | --- | --- | --- | --- |
-| Main Agent | Account / Main Chat | Genesis discovery, bounded research, Charter proposal/readiness, exact Project create/handoff, bounded portfolio projection | No Project-local Documents, Tasks, assignments, milestones, validation, waiver, release, or repository access | Denied |
-| Project Agent | One bound Project / Project Chat | Project Documents, Decisions, Task and assignment coordination, milestone/evidence/readiness/release-candidate proposals | No other Project, private Main history, credentials, self-validation, waiver, or release | Denied |
+| Main Agent | Account / Main Chat | Genesis discovery, bounded research and inquiries, Charter proposal/readiness, exact Project create/handoff, bounded portfolio projection | No Project-local Documents, Tasks, assignments, milestones, validation, waiver, release, or repository lease | Account scratch, not a repository checkout |
+| Project Agent | One bound Project / Project Chat | Project Documents, Decisions, Task and assignment coordination, integrated validation, milestone/evidence/readiness/release-candidate proposals | No other Project, private Main history, credentials, user-only manual attestation, waiver, or release | Self-owned Project verification checkout |
 | Task Worker | One assigned Task / attempt | Work allowed by the scheduler-issued capability profile | No portfolio, Genesis, unrelated Project/Task, approval, or release authority | Task-scoped lease |
 | Reviewer/validator | One assigned review/check | Review or attestation allowed by policy | Read-only by default; remediation requires Worker authority, while any explicitly required independent attestation remains a separate policy gate | Read-only by default |
 | Interactive user | Authorized account/Project | Exact approvals, setup choices, manual attestations/waivers, and release | Only existing authenticated user controls | Existing user controls |
@@ -289,6 +290,16 @@ actually owed. A canonical `blocked`, `failed`, or `stale` readiness result
 satisfies the reconciliation boundary; it does not imply validation or
 authorize the user-only release action.
 
+Attention interprets Task transitions through the applicable workflow's state
+kind and canonical phase. A renamed human review gate still requests review,
+and a successful terminal state still schedules delivery reconciliation; the
+workflow's cancellation target resolves existing incidents without scheduling
+delivery. Projection resolves the workflow from the event's recorded source
+state and actor, then interprets its recorded target, so later Task movement
+does not change which subtask workflow applied. State names alone confer no
+completion or review meaning; interruption records own blocked/failed
+Attention. An unknown target has no inferred lifecycle meaning.
+
 The chat worker selects the session backend from the bound identity's profile.
 A native profile uses the embedded host and an Agent Chat-scoped continuity
 timeline; a safely migrated CLI profile may use an explicit constrained chat
@@ -328,9 +339,11 @@ derives read models from those records. Authority is scoped by domain:
 The Main Agent owns global discovery and portfolio routing only. It can draft a
 Genesis Charter and publish one bounded handoff, but it cannot manage a Project
 or revise its Charter after attachment. The Project Agent owns planning and
-orchestration for exactly one Project, but cannot edit a repository, self-review,
-self-attest, self-waive, or release. Only a scheduler-issued Task
-`WorkspaceLease` grants repository authority to an assigned worker or reviewer.
+orchestration for exactly one Project and can exercise integrated software in
+its self-owned verification checkout. Typed validation commands record those
+observations; they do not replace user-only manual attestations, waivers, or
+release approval. Implementation and Task review remain workflow-managed work
+under scheduler-issued Task `WorkspaceLease` authority.
 Model output, Agent Profile text, chat prose, web pages, repository text, and
 memory are data; none can widen a permission ceiling or satisfy an approval.
 
@@ -1125,6 +1138,13 @@ execution remains manually resumable but no Task disposition is committed by
 the bounded settlement grace, the orphan safety net promotes it to an
 actionable Attention item; the retained `execution_failed` category remains
 available for that diagnostic path and historical projections.
+User Pause/Stop retains its manual-stop annotation and recovery controls, but
+records `requires_intervention: false`: an Agent must not undo an intentional
+stop. A running, newer, or explicitly linked successor excludes the stopped
+attempt from orphan recovery, even if that successor has already finished.
+Wake admission rechecks the attempt, Task disposition, deferred recovery, and
+terminal workflow state under the same transaction as wake budgeting, so
+recovery, cancellation, or deletion after projection suppresses the stale wake.
 Observation belongs to the run that made it. A Task session holds a worktree
 and a process and captures what its own run did (`task.evidence`,
 `task.worklog`). The Project Agent holds its own verification workspace — a
@@ -1147,6 +1167,65 @@ directs the Agent to cancel such a Task and settle its checks itself, and to
 respond to a failed check by dispatching the implementation Task that fixes
 the defect.
 
+The Main Agent holds a workspace of a different kind: an account scratch
+directory (`WorkspaceAccess::AccountScratch`). It is not a checkout — no
+clone, no worktree, no remote — so nothing in it can reach a repository
+because no repository is in it. It exists so Main, and the ephemeral inquiry
+sub-agents it dispatches, keep findings and notes on disk instead of in a
+conversation that has to survive all day.
+
+An **inquiry** (`inquiry.run`) is deliberately not a Task: no worktree, no
+workflow state, no review, no dispatch queue. One nested native turn runs with
+the account read surface and a per-inquiry directory under that scratch root,
+the calling turn blocks on it, and only a bounded abstract plus the path to a
+findings file re-enter the caller's context — which is the whole reason the
+operation exists. Three properties are enforced structurally rather than by
+instruction:
+
+- **Depth is capped at one.** An inquiry runs under the `Account` scope, and
+  `inquiry.run` is composed only into an `AgentChat` scope, so a sub-agent
+  never sees the operation that would start another.
+- **An inquiry cannot act.** Its composition carries no orchestration proposal
+  surface at all. A permission-only boundary would not do: `genesis.start` is
+  gated on `propose_discovery`, the same permission a sub-agent needs for
+  public research.
+- **It is Main-only.** `main_account_id` rejects a Project Chat, and migration
+  `V131` pins `account_scratch` to an `account` row or an `agent_chat` row
+  with no Project.
+
+Inquiries are serialized per account: the Account scope's id must be the
+owner's id, so runs share durable authority and session metadata. Each inquiry
+nevertheless starts with an empty, ephemeral runtime conversation: it neither
+restores nor saves session snapshots, protected checkpoints, or an LCM timeline.
+Previous inquiry messages and token usage cannot leak into the next run. Main
+Chat remains persistent; only the Account-scope scratch inquiry is ephemeral. The
+`agent_inquiry` row is a visible run log, not a work item; its only user verb
+is cancel, and its four token counters stay disjoint so a cached prefix is
+never double-counted.
+
+A sub-agent writes the same Forge JSONL activity log an Agent Chat turn writes,
+keyed by inquiry id under the shared `AgentChatTurnLogRoot`, so one log reader
+and one renderer serve both and its work is watchable while it runs. Each run
+is registered with a cancellation token and tied to the calling tool future's
+lifetime by a drop guard, which makes cancellation real:
+`POST /api/v1/inquiries/{id}/cancel` stops
+the provider call rather than only marking the record, and a cancelled chat
+turn stops the research it was blocked on. If a run completes in the same
+instant it is cancelled, the durable `status = 'running'` guard on the
+completing write means the user's cancellation wins and the caller is told the
+inquiry was cancelled instead of receiving a tool error. Dropping the caller's
+future also cancels its inquiry. The runner owns terminal persistence; timeout
+first cancels and drains the backend within a bounded shutdown window. Native
+session admission rejects another turn while shutdown cleanup remains active,
+and completion-storage errors are surfaced rather than reported as invented
+terminal outcomes. Existing inquiry sessions with obsolete persistence
+capabilities rotate through the normal versioned path without deleting history.
+
+While mounted, the inquiry list polls every three seconds even when its cached
+list is empty or all runs are terminal, so it can discover the next inquiry.
+An expanded log view refetches the final tail when its run becomes terminal;
+if collapsed, it performs that final fetch when reopened.
+
 A decision the user records on something the Project Agent proposed — a
 milestone definition revision approved or rejected
 (`milestone.definition.transitioned`), a Decision approved
@@ -1162,7 +1241,8 @@ the incident exists only to deliver the decision. The web Project Chat
 surfaces the same decisions with one-click actions (the "Needs your decision"
 card), so approving in the chat is the whole loop: record, wake, continue.
 
-Every terminal `done` Task transition also creates a `delivery_followup`
+Every successful terminal Task transition (`done` in the default workflow)
+also creates a `delivery_followup`
 Attention incident for that Project Agent. The follow-up asks it to reconcile
 the Task outcome into authoritative validation, evidence, and milestone
 readiness; the Task transition itself supplies none of those facts and never
@@ -1401,17 +1481,17 @@ committed Task outcome remains the source of any human notification. A manually
 resumable terminal attempt with no disposition past the bounded settlement
 grace is handled by the orphan safety net as an actionable exception.
 
-### Workflow engine (in progress)
+### Workflow engine
 
-Flexible workflow work is partially implemented. `WorkflowEngine` in
-`crates/services/src/workflow/engine/mod.rs` is the new data-driven path;
-`TaskService.transition()` still uses the legacy `TaskStatus`/`transition_allowed`
-path. Treat the engine as a parallel code path until the split is removed.
+`WorkflowEngine` in `crates/services/src/workflow/engine/mod.rs` is the
+data-driven Task transition path. `TaskService.transition()` supplies service
+pre-checks and delegates the transition to the engine; there is no parallel
+legacy `TaskStatus`/`transition_allowed` state machine.
 
 Workflows are project-defined JSON in `project.workflow_definition`. Empty
 string or `"{}"` resolves at runtime to the built-in `DefaultWorkflow`.
-`WorkflowCache` caches resolved definitions per project and invalidates on
-workflow updates.
+Transition entry points resolve the applicable definition directly; there is
+no process-local workflow cache to invalidate.
 
 The applicable `WorkflowDefinition` is resolved **exactly once** per transition
 entry via `WorkflowEngine::resolve_workflow_for_task`, keyed on whether the task
@@ -1437,6 +1517,16 @@ states is unchanged. All undefined-state rejections — in the engine, hook
 actions, cascades, recovery helpers, and prompt preview — flow through
 `WorkflowEngine::undefined_state_message`, which enumerates the workflow's
 defined states.
+
+Both ordinary transitions and atomic board moves record the effective
+workflow's digest and source/target state semantics in the durable
+`task.transitioned.workflow_snapshot`. The snapshot also pins the source Task
+version and parent, with the write protected by the Task version CAS. Attention
+and outcome reconciliation replay that recorded meaning after workflow edits
+or Task reparenting; current workflow state cannot supply missing history.
+Historical events without a snapshot remain unchanged and have unknown
+workflow semantics. Live authorization and recovery checks still use current
+state.
 
 `StateKind` classifies states:
 

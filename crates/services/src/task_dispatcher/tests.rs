@@ -114,7 +114,7 @@ async fn seed_project_repo(db: &db::SqliteDb, repo_path: &Path) -> (String, Stri
     )
     .await
     .expect("repo creates");
-    ProjectRepo::update(
+    ProjectRepo::update_at_version(
         db,
         UpdateProject {
             id: project_id.clone(),
@@ -124,6 +124,12 @@ async fn seed_project_repo(db: &db::SqliteDb, repo_path: &Path) -> (String, Stri
             paused_at: None,
             updated_at: now_rfc3339(),
         },
+        ProjectRepo::get_by_id(db, &project_id)
+            .await
+            .expect("fixture Project lookup")
+            .expect("fixture Project exists")
+            .version,
+        None,
     )
     .await
     .expect("project primary repo updates");
@@ -563,7 +569,7 @@ async fn dispatcher_resumes_a_project_it_paused_once_its_repository_is_attached(
     )
     .await
     .expect("repo creates");
-    ProjectRepo::update(
+    ProjectRepo::update_at_version(
         &*db,
         UpdateProject {
             id: project_id.clone(),
@@ -573,6 +579,12 @@ async fn dispatcher_resumes_a_project_it_paused_once_its_repository_is_attached(
             paused_at: None,
             updated_at: now_rfc3339(),
         },
+        ProjectRepo::get_by_id(&*db, &project_id)
+            .await
+            .expect("fixture Project lookup")
+            .expect("fixture Project exists")
+            .version,
+        None,
     )
     .await
     .expect("project repository attaches");
@@ -613,7 +625,7 @@ async fn dispatcher_leaves_a_deliberately_paused_project_alone() {
     // Attaching a repository must not auto-resume a pause the dispatcher
     // never issued.
     let repo_id = seed_project_repo(&db, repo_dir.path()).await.1;
-    ProjectRepo::update(
+    ProjectRepo::update_at_version(
         &*db,
         UpdateProject {
             id: project_id.clone(),
@@ -623,6 +635,12 @@ async fn dispatcher_leaves_a_deliberately_paused_project_alone() {
             paused_at: None,
             updated_at: now_rfc3339(),
         },
+        ProjectRepo::get_by_id(&*db, &project_id)
+            .await
+            .expect("fixture Project lookup")
+            .expect("fixture Project exists")
+            .version,
+        None,
     )
     .await
     .expect("project repository attaches");
@@ -654,7 +672,7 @@ async fn dispatcher_gives_unassigned_initial_tasks_the_project_defaults() {
     )
     .await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Offline, AgentStatus::Idle).await;
-    ProjectRepo::update(
+    ProjectRepo::update_at_version(
         &*db,
         UpdateProject {
             id: project_id.clone(),
@@ -671,6 +689,12 @@ async fn dispatcher_gives_unassigned_initial_tasks_the_project_defaults() {
             paused_at: None,
             updated_at: now_rfc3339(),
         },
+        ProjectRepo::get_by_id(&*db, &project_id)
+            .await
+            .expect("fixture Project lookup")
+            .expect("fixture Project exists")
+            .version,
+        None,
     )
     .await
     .expect("project defaults update");

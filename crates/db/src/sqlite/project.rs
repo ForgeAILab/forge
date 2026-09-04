@@ -3,6 +3,11 @@ use crate::{new_uuid_v4, now_rfc3339};
 
 const DEFAULT_PROJECT_AGENT_PERMISSION_CEILING: &str = r#"{"allowed":["read_project","read_agent_chat","read_task","read_memory","propose_task","propose_project","propose_message","propose_review","propose_commitment","propose_memory","propose_decision","propose_session"]}"#;
 
+const PROJECT_VISIBLE_TO_USER: &str = "(owner_id IS NULL OR owner_id = ? OR EXISTS (
+    SELECT 1 FROM project_member WHERE project_member.project_id = project.id
+      AND project_member.user_id = ?
+))";
+
 #[async_trait]
 impl ProjectRepo for SqliteDb {
     async fn create(&self, input: CreateProject) -> Result<Project> {
@@ -251,6 +256,53 @@ impl ProjectRepo for SqliteDb {
         .transpose()
     }
 
+    async fn get_visible_by_id(&self, id: &str, user_id: &str) -> Result<Option<Project>> {
+        sqlx::query(&format!(
+            "SELECT {PROJECT_COLUMNS} FROM project WHERE id = ? AND {PROJECT_VISIBLE_TO_USER}"
+        ))
+        .bind(id)
+        .bind(user_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(map_project)
+        .transpose()
+    }
+
+    async fn list_visible(&self, user_id: &str, page: PageRequest) -> Result<Page<Project>> {
+        let offset = decode_offset(&page.cursor)?;
+        let sql = format!(
+            "SELECT {PROJECT_COLUMNS} FROM project WHERE {PROJECT_VISIBLE_TO_USER}
+             ORDER BY {} LIMIT ? OFFSET ?",
+            order_clause_without_priority(&page)
+        );
+        let rows = sqlx::query(&sql)
+            .bind(user_id)
+            .bind(user_id)
+            .bind(limit(&page) + 1)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
+        let items = rows
+            .into_iter()
+            .map(map_project)
+            .collect::<Result<Vec<_>>>()?;
+        let total = if page.include_total {
+            Some(
+                sqlx::query_scalar::<_, i64>(&format!(
+                    "SELECT COUNT(*) FROM project WHERE {PROJECT_VISIBLE_TO_USER}"
+                ))
+                .bind(user_id)
+                .bind(user_id)
+                .fetch_one(&self.pool)
+                .await?,
+            )
+        } else {
+            None
+        };
+        page_from_items(items, &page, offset, total)
+    }
+
     async fn list(&self, page: PageRequest) -> Result<Page<Project>> {
         let offset = decode_offset(&page.cursor)?;
         let sql = format!(
@@ -272,43 +324,6 @@ impl ProjectRepo for SqliteDb {
             None
         };
         page_from_items(items, &page, offset, total)
-    }
-
-    async fn update(&self, input: UpdateProject) -> Result<Project> {
-        let mut project = ProjectRepo::get_by_id(self, &input.id)
-            .await?
-            .ok_or(DbError::NotFound)?;
-        if let Some(name) = input.name {
-            project.name = name;
-        }
-        if let Some(settings) = input.settings {
-            project.settings = settings;
-        }
-        if let Some(primary_repo_id) = input.primary_repo_id {
-            project.primary_repo_id = primary_repo_id;
-        }
-        if let Some(paused_at) = input.paused_at {
-            project.paused_at = paused_at;
-            // An explicit pause/resume through this general update is a
-            // manual/external action, never the dispatcher's own reasoning.
-            project.system_pause_reason = None;
-        }
-        project.updated_at = input.updated_at;
-        sqlx::query(
-            "UPDATE project SET name = ?, settings = ?, primary_repo_id = ?, paused_at = ?, system_pause_reason = ?, project_hooks_json = ?, project_work_epoch = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(&project.name)
-        .bind(&project.settings)
-        .bind(project.primary_repo_id.as_deref())
-        .bind(project.paused_at.as_deref())
-        .bind(project.system_pause_reason.as_deref())
-        .bind(&project.project_hooks_json)
-        .bind(project.project_work_epoch)
-        .bind(&project.updated_at)
-        .bind(&project.id)
-        .execute(&self.pool)
-        .await?;
-        Ok(project)
     }
 
     async fn update_at_version(

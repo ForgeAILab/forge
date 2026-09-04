@@ -10,7 +10,7 @@ The user-facing entry point is [README.md](README.md). Deeper material is split 
 
 When you change behavior, update the relevant `docs/` file in the same change. Treat README as a launch landing page — keep it short and link out.
 
-## Project status: Public Beta (`0.1.x`)
+## Project status: Public Beta (pre-`1.0`)
 
 Forge is in public beta. The local-first single-user product is shipping to real users, but we are still pre-`1.0` and pre-stable.
 
@@ -82,7 +82,7 @@ cd web && pnpm lint && pnpm typecheck && pnpm test
 - **Migrations** are numbered `V{NNN}__{name}.sql`. Add a new file; don't edit historical migrations even during beta — users have running databases.
 - **Errors** flow `DbError` (db) → `ServiceError` (services) → `ApiError` (api). Map at the boundaries; don't leak lower-layer error types upward.
 - **Concurrency**: tasks and agents use a `version` column. Updates require `WHERE version = ?` and increment on success. Version mismatch → `DbError::VersionConflict` → HTTP 409.
-- **Pagination**: opaque keyset cursors, response field is `items` (not `data`). The `db` layer queries `limit + 1` to compute `has_more`.
+- **Pagination**: opaque cursors, response field is `items` (not `data`). Many repository lists use offset cursors; dedicated artifact lists use keysets. Filter visibility before pagination/counts and fetch `limit + 1` to compute `has_more`; clients must not decode cursors.
 
 ## Architecture summary (reference only)
 
@@ -100,7 +100,7 @@ forge-cli → api → services → db
 - **Repository pattern** — `db` defines async traits in `repository.rs`; `SqliteDb` in `sqlite.rs` implements all of them.
 - **AppState** — `forge-cli/main.rs` constructs `Arc<SqliteDb>` and `Arc<EventBus>`, hands them to `AppState::new()` which builds `TaskService` / `AgentService` internally. `AppState` is `Clone` (all fields `Arc`) and used as Axum state.
 - **Event bus** — `events` crate wraps `tokio::sync::broadcast`; SSE at `GET /api/v1/events` subscribes.
-- **Workflow engine** — `crates/services/src/workflow/engine.rs` is the new data-driven path; `TaskService.transition()` still uses the legacy `TaskStatus`/`transition_allowed` path. Treat the engine as a parallel code path until that split is removed. Default workflow lives in `default_workflow.rs`.
+- **Workflow engine** — `TaskService.transition()` resolves the applicable workflow once and delegates to `crates/services/src/workflow/engine/mod.rs`. The wrapper, engine, and hooks share that definition. Default workflow lives in `default_workflow.rs`.
 - **Claim auto-dispatches** — `api::routes::tasks::claim_task` spawns the executor via `tokio::spawn`. There is no separate "dispatch" endpoint.
 - **Review** — `ReviewRunner` runs `task.review_config.ci_steps` as `bash -lc` commands in the worktree; empty steps auto-pass.
 - **MCP server** — `POST /mcp`, JSON-RPC, has its own `McpState`, does not depend on the `api` crate.

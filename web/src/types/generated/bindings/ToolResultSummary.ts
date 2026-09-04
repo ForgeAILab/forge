@@ -15,4 +15,12 @@ import type { RetryAction } from "./RetryAction";
  * causes, and unredacted internal error text must never be added to this
  * type or assigned into `safe_message`.
  */
-export type ToolResultSummary = { status: OutcomeStatus, code: OutcomeCode, safe_message: string, retryable: boolean, recovery_action: RetryAction | null, correlation_id: string, };
+export type ToolResultSummary = { status: OutcomeStatus, code: OutcomeCode, safe_message: string, retryable: boolean, recovery_action: RetryAction | null, correlation_id: string, 
+/**
+ * The typed Forge operation the call executed (for example
+ * `task.propose` or `skill.section`), when the tool returned an
+ * `OrchestrationOutcome`. Typed Forge tools multiplex many operations
+ * behind one tool name, so this is what tells a reader which one ran.
+ * Absent for raw workspace/runtime results.
+ */
+operation: string | null, };
