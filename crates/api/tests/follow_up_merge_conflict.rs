@@ -33,10 +33,10 @@ const EXECUTOR_SESSION_ID: &str = "33333333-3333-4333-8333-333333333333";
 
 #[tokio::test]
 async fn merge_conflict_dispatches_follow_up_executor() {
-    let repo_dir = TestDir::new("forge-merge-conflict-repo");
+    let repo_dir = common::TestDir::new("forge-merge-conflict-repo");
     let repo_path = setup_git_repo(repo_dir.path());
 
-    let workspaces_root = TestDir::new("forge-merge-conflict-workspaces");
+    let workspaces_root = common::TestDir::new("forge-merge-conflict-workspaces");
     let harness = test_app(workspaces_root.path(), CompletingCodexAdapter).await;
     let mut events_rx = harness.event_bus.subscribe();
 
@@ -288,7 +288,7 @@ struct TestHarness {
     app: Router,
     state: Arc<AppState>,
     event_bus: Arc<EventBus>,
-    _web_dist_dir: TestDir,
+    _web_dist_dir: common::TestDir,
 }
 
 async fn test_app(
@@ -337,7 +337,7 @@ async fn test_app(
         api::state::test_bcrypt_cost(),
     ));
 
-    let web_dist_dir = TestDir::new("forge-merge-conflict-web");
+    let web_dist_dir = common::TestDir::new("forge-merge-conflict-web");
     std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>").expect("write index");
     let app = build_router((*state).clone(), web_dist_dir.path().to_path_buf());
 
@@ -732,26 +732,4 @@ fn run_git(path: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
-}
-
-struct TestDir {
-    path: PathBuf,
-}
-
-impl TestDir {
-    fn new(prefix: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).expect("temp dir creates");
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
 }

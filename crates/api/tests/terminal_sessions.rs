@@ -1,9 +1,7 @@
 #![allow(dead_code)]
+mod common;
 
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use api::{build_router, AppState};
 use api_types::{
@@ -27,8 +25,8 @@ const TEST_EMAIL: &str = "test@example.com";
 struct Harness {
     app: Router,
     state: Arc<AppState>,
-    workspace_root: TestDir,
-    _web_dist_dir: TestDir,
+    workspace_root: common::TestDir,
+    _web_dist_dir: common::TestDir,
 }
 
 struct SeededTask {
@@ -42,7 +40,7 @@ async fn setup(terminal: TerminalConfig) -> Harness {
     let db = Arc::new(db::SqliteDb::new(pool));
     seed_user(&db, TEST_USER_ID, TEST_EMAIL).await;
 
-    let workspace_root = TestDir::new("forge-terminal-workspaces");
+    let workspace_root = common::TestDir::new("forge-terminal-workspaces");
     let event_bus = Arc::new(EventBus::new(256));
     let adapter_registry = Arc::new(cli_adapters::default_registry());
     let merge_service = Arc::new(services::MergeService::new(
@@ -79,7 +77,7 @@ async fn setup(terminal: TerminalConfig) -> Harness {
     state = state.with_effective_config(config);
 
     let state = Arc::new(state);
-    let web_dist_dir = TestDir::new("forge-terminal-web");
+    let web_dist_dir = common::TestDir::new("forge-terminal-web");
     std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>").unwrap();
     let app = build_router((*state).clone(), web_dist_dir.path().to_path_buf());
     Harness {
@@ -334,28 +332,6 @@ fn test_jwt_for(user_id: &str, email: &str, is_admin: bool) -> String {
         &EncodingKey::from_secret(b"test-jwt-secret-for-development"),
     )
     .unwrap()
-}
-
-struct TestDir {
-    path: PathBuf,
-}
-
-impl TestDir {
-    fn new(prefix: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).unwrap();
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
 }
 
 #[tokio::test]

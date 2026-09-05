@@ -919,65 +919,6 @@ async fn successful_dispatch_clears_stale_dispatch_failure_annotation() {
     );
 }
 
-#[tokio::test]
-#[ignore = "Blocked: engine tests cannot register a configurable test-only Cascade action without changing the production registry; built-in cascade actions target fixed default states, so they cannot drive s1 -> s2 -> s3 -> s4."]
-async fn cascade_depth_limiting() {
-    let workflow = WorkflowDefinition {
-        roles: Vec::new(),
-        states: vec![
-            with_trigger(
-                state("s0", StateKind::Initial, None, StateHooks::default()),
-                WorkflowTrigger::Accept,
-                "s1",
-            ),
-            with_trigger(
-                state(
-                    "s1",
-                    StateKind::Active,
-                    None,
-                    StateHooks {
-                        after_enter: vec![hook("test_cascade_to_s2", FailurePolicy::Log)],
-                        ..StateHooks::default()
-                    },
-                ),
-                WorkflowTrigger::Accept,
-                "s2",
-            ),
-            with_trigger(
-                state(
-                    "s2",
-                    StateKind::Active,
-                    None,
-                    StateHooks {
-                        after_enter: vec![hook("test_cascade_to_s3", FailurePolicy::Log)],
-                        ..StateHooks::default()
-                    },
-                ),
-                WorkflowTrigger::Accept,
-                "s3",
-            ),
-            with_trigger(
-                state(
-                    "s3",
-                    StateKind::Active,
-                    None,
-                    StateHooks {
-                        after_enter: vec![hook("test_cascade_to_s4", FailurePolicy::Log)],
-                        ..StateHooks::default()
-                    },
-                ),
-                WorkflowTrigger::Accept,
-                "s4",
-            ),
-            state("s4", StateKind::Active, None, StateHooks::default()),
-        ],
-        configuration: Vec::new(),
-        cancellation_state: None,
-    };
-
-    assert_eq!(workflow.states.len(), 5);
-}
-
 #[test]
 fn validate_claimable_backlog_rejection() {
     let workflow = default_workflow::default_workflow();

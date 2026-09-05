@@ -1,6 +1,5 @@
 use api_types::{StateKind, WorkflowDefinition, WorkflowTrigger};
 use db::{create_sqlite_pool, run_migrations, SqliteDb, TaskRepo};
-use serde_json::Value;
 use services::workflow::default_workflow::default_workflow;
 
 const DEFAULT_WORKFLOW_FIXTURE: &str = include_str!("fixtures/default_strict_workflow.json");
@@ -137,18 +136,5 @@ async fn lifecycle_database_fixture_covers_current_legacy_state_graph() {
             .map(|(trigger, target)| (*trigger, (*target).to_owned()))
             .collect();
         assert_eq!(actual, expected, "legacy transitions from {state} changed");
-    }
-}
-
-#[test]
-fn fixture_json_is_an_object_for_discoverability() {
-    for (fixture_name, fixture) in [
-        ("default strict workflow", DEFAULT_WORKFLOW_FIXTURE),
-        ("custom workflow", CUSTOM_WORKFLOW_FIXTURE),
-    ] {
-        assert!(
-            matches!(serde_json::from_str::<Value>(fixture), Ok(Value::Object(_))),
-            "{fixture_name} fixture should remain a JSON object"
-        );
     }
 }

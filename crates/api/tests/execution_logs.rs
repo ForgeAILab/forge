@@ -1,4 +1,6 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
+mod common;
+
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -22,9 +24,9 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn execution_logs_are_read_from_stored_logs_path() {
-    let workspace_root = TestDir::new("forge-execution-logs-workspaces");
+    let workspace_root = common::TestDir::new("forge-execution-logs-workspaces");
     let harness = test_app(workspace_root.path()).await;
-    let logs_dir = TestDir::new("forge-execution-logs");
+    let logs_dir = common::TestDir::new("forge-execution-logs");
     let logs_path = logs_dir.path().join("execution.jsonl");
 
     let execution_id = seed_execution(&harness.state.db, Some(logs_path.clone())).await;
@@ -80,7 +82,7 @@ async fn execution_logs_are_read_from_stored_logs_path() {
 struct TestHarness {
     app: Router,
     state: Arc<AppState>,
-    _web_dist_dir: TestDir,
+    _web_dist_dir: common::TestDir,
 }
 
 async fn test_app(workspace_root: &Path) -> TestHarness {
@@ -124,7 +126,7 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
         api::state::test_bcrypt_cost(),
     ));
 
-    let web_dist_dir = TestDir::new("forge-execution-logs-web");
+    let web_dist_dir = common::TestDir::new("forge-execution-logs-web");
     std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>").expect("write index");
     let app = build_router((*state).clone(), web_dist_dir.path().to_path_buf());
 
@@ -328,26 +330,4 @@ async fn raw_empty_request(app: &Router, method: Method, uri: &str) -> axum::res
         )
         .await
         .expect("router response")
-}
-
-struct TestDir {
-    path: PathBuf,
-}
-
-impl TestDir {
-    fn new(prefix: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).expect("temp dir creates");
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
 }

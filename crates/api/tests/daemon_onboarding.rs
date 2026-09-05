@@ -248,7 +248,7 @@ async fn test_app_with_state() -> (Router, Arc<AppState>) {
     (build_router((*state).clone(), web_dist_dir), state)
 }
 
-async fn create_project_and_repo(app: &Router) -> (String, String, TestDir) {
+async fn create_project_and_repo(app: &Router) -> (String, String, common::TestDir) {
     let project: ProjectResponse = json_request(
         app,
         Method::POST,
@@ -257,7 +257,7 @@ async fn create_project_and_repo(app: &Router) -> (String, String, TestDir) {
         StatusCode::OK,
     )
     .await;
-    let repo_dir = TestDir::new("forge-daemon-repo");
+    let repo_dir = common::TestDir::new("forge-daemon-repo");
     let repo_path = setup_git_repo(repo_dir.path());
     let default_branch = run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"]);
     let repo: RepoResponse = json_request(
@@ -372,28 +372,6 @@ fn run_git(path: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
-}
-
-struct TestDir {
-    path: PathBuf,
-}
-
-impl TestDir {
-    fn new(prefix: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
 }
 
 fn shell_cli_for_daemon<'a>(

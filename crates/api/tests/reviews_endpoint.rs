@@ -1,8 +1,7 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+mod common;
+
+use std::{path::Path, sync::Arc};
 
 use api::{build_router, AppState};
 use api_types::{ErrorResponse, ReviewResponse};
@@ -23,7 +22,7 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn review_detail_returns_auditor_verdict() {
-    let workspace_root = TestDir::new("forge-reviews-workspaces");
+    let workspace_root = common::TestDir::new("forge-reviews-workspaces");
     let harness = test_app(workspace_root.path()).await;
     let step_results_json = json!({
         "ci_steps": [{
@@ -58,7 +57,7 @@ async fn review_detail_returns_auditor_verdict() {
 
 #[tokio::test]
 async fn review_detail_returns_null_auditor_for_ci_only_results() {
-    let workspace_root = TestDir::new("forge-reviews-workspaces");
+    let workspace_root = common::TestDir::new("forge-reviews-workspaces");
     let harness = test_app(workspace_root.path()).await;
     let step_results_json = json!([{
         "index": 0,
@@ -84,7 +83,7 @@ async fn review_detail_returns_null_auditor_for_ci_only_results() {
 
 #[tokio::test]
 async fn unknown_review_returns_standard_not_found() {
-    let workspace_root = TestDir::new("forge-reviews-workspaces");
+    let workspace_root = common::TestDir::new("forge-reviews-workspaces");
     let harness = test_app(workspace_root.path()).await;
 
     let error: ErrorResponse = json_empty_request(
@@ -101,7 +100,7 @@ async fn unknown_review_returns_standard_not_found() {
 struct TestHarness {
     app: Router,
     state: Arc<AppState>,
-    _web_dist_dir: TestDir,
+    _web_dist_dir: common::TestDir,
 }
 
 async fn test_app(workspace_root: &Path) -> TestHarness {
@@ -145,7 +144,7 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
         api::state::test_bcrypt_cost(),
     ));
 
-    let web_dist_dir = TestDir::new("forge-reviews-web");
+    let web_dist_dir = common::TestDir::new("forge-reviews-web");
     std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>").expect("write index");
     let app = build_router((*state).clone(), web_dist_dir.path().to_path_buf());
 
@@ -341,26 +340,4 @@ fn test_jwt() -> String {
         &EncodingKey::from_secret(b"test-jwt-secret-for-development"),
     )
     .expect("encode test jwt")
-}
-
-struct TestDir {
-    path: PathBuf,
-}
-
-impl TestDir {
-    fn new(prefix: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).expect("temp dir creates");
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
 }

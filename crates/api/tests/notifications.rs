@@ -1,5 +1,7 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
-use std::{path::Path, sync::Arc, time::Duration};
+mod common;
+
+use std::{sync::Arc, time::Duration};
 
 use api::{build_router, AppState};
 use api_types::{
@@ -201,7 +203,7 @@ struct Harness {
     app: Router,
     state: Arc<AppState>,
     event_bus: Arc<EventBus>,
-    _web_dist_dir: TestDir,
+    _web_dist_dir: common::TestDir,
 }
 
 async fn test_app() -> Harness {
@@ -222,7 +224,7 @@ async fn test_app() -> Harness {
         adapter_registry,
     ));
 
-    let web_dist_dir = TestDir::new("forge-notifications-web");
+    let web_dist_dir = common::TestDir::new("forge-notifications-web");
     std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>").expect("write index");
     let app = build_router((*state).clone(), web_dist_dir.path().to_path_buf());
 
@@ -347,21 +349,5 @@ where
         serde_json::from_value(json!({})).expect("empty json")
     } else {
         serde_json::from_slice(&bytes).expect("parse JSON")
-    }
-}
-
-struct TestDir {
-    path: std::path::PathBuf,
-}
-
-impl TestDir {
-    fn new(prefix: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).expect("temp dir creates");
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
     }
 }

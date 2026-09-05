@@ -1,8 +1,6 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+mod common;
+
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use api::{build_router, serve_with_listener, AppState};
 use api_types::{DaemonFrame, DaemonRegisterResponse};
@@ -379,7 +377,7 @@ struct TestServer {
     addr: std::net::SocketAddr,
     state: Arc<AppState>,
     handle: tokio::task::JoinHandle<()>,
-    _web_dist_dir: TestDir,
+    _web_dist_dir: common::TestDir,
 }
 
 impl TestServer {
@@ -388,7 +386,9 @@ impl TestServer {
             .await
             .expect("bind test listener");
         let addr = listener.local_addr().expect("listener addr");
-        let web_dist_dir = TestDir::new("forge-api-daemon-connect-web");
+        let web_dist_dir = common::TestDir::new("forge-api-daemon-connect-web");
+        std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>")
+            .expect("write index");
         let web_dist_path = web_dist_dir.path().to_path_buf();
         let server_state = (*state).clone();
         let shutdown_signal = state.shutdown_signal.clone();
@@ -414,29 +414,6 @@ impl Drop for TestServer {
     fn drop(&mut self) {
         self.state.shutdown_signal.request();
         self.handle.abort();
-    }
-}
-
-struct TestDir {
-    path: PathBuf,
-}
-
-impl TestDir {
-    fn new(prefix: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        std::fs::write(path.join("index.html"), "<html></html>").expect("write index");
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 

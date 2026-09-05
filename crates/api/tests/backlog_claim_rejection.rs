@@ -1,4 +1,6 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
+mod common;
+
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -21,9 +23,9 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn agent_cannot_claim_task_in_backlog_state() {
-    let repo_dir = TestDir::new("forge-backlog-repo");
+    let repo_dir = common::TestDir::new("forge-backlog-repo");
     let repo_path = setup_git_repo(repo_dir.path());
-    let workspace_root = TestDir::new("forge-backlog-workspaces");
+    let workspace_root = common::TestDir::new("forge-backlog-workspaces");
     let harness = test_app(workspace_root.path()).await;
     let (project_id, _repo_id) = create_project_and_repo(&harness.app, &repo_path).await;
     let _: Value = json_request(
@@ -98,7 +100,7 @@ fn state(name: &str, kind: &str, triggers: Value) -> Value {
 struct Harness {
     app: Router,
     _state: Arc<AppState>,
-    _web_dist_dir: TestDir,
+    _web_dist_dir: common::TestDir,
 }
 
 async fn test_app(workspace_root: &Path) -> Harness {
@@ -140,7 +142,7 @@ async fn test_app(workspace_root: &Path) -> Harness {
         api::state::test_jwt_secret(),
         api::state::test_bcrypt_cost(),
     ));
-    let web_dist_dir = TestDir::new("forge-backlog-web");
+    let web_dist_dir = common::TestDir::new("forge-backlog-web");
     std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>").expect("write index");
     let app = build_router((*state).clone(), web_dist_dir.path().to_path_buf());
     Harness {
@@ -358,19 +360,4 @@ fn run_git(path: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
-}
-
-struct TestDir {
-    path: PathBuf,
-}
-
-impl TestDir {
-    fn new(prefix: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).expect("temp dir creates");
-        Self { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
 }
