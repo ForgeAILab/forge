@@ -451,8 +451,13 @@ pub async fn push(repo_path: &Path) -> Result<String> {
 // ---------------------------------------------------------------------------
 
 /// Initialize a new git repo (for testing).
+///
+/// The initial branch is pinned to `main` instead of inheriting the host's
+/// `init.defaultBranch`, so a fresh repo carries the branch Forge registers
+/// regardless of the machine it was created on.
 pub async fn init(path: &Path) -> Result<()> {
     run_git(path, &["init"]).await?;
+    run_git(path, &["symbolic-ref", "HEAD", "refs/heads/main"]).await?;
     // Set required config for commits
     run_git(path, &["config", "user.email", "test@forge.dev"]).await?;
     run_git(path, &["config", "user.name", "Forge Test"]).await?;
