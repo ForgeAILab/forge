@@ -546,8 +546,11 @@ function TurnActivity({
         {entries.length > 0 ? (
           <TurnActivityFeed entries={entries} className="mt-2" />
         ) : null}
-        {turn.error ? (
-          <p className="mt-1.5 break-words text-xs leading-5 text-muted-foreground">{turn.error}</p>
+        {turn.error_message || turn.error ? (
+          <p className="mt-1.5 break-words text-xs leading-5 text-muted-foreground">
+            {turn.error_code ? `${turn.error_code}: ` : ''}
+            {turn.error_message ?? turn.error}
+          </p>
         ) : null}
         <div className="mt-2 flex flex-wrap items-center gap-2">
           <Button
@@ -591,7 +594,9 @@ function TurnActivity({
   const detailRows = [
     `Status: ${turnLabel(state).replace('…', '')} · attempt ${Math.max(attemptCount, 1)}/${maxAttempts}`,
     turn.next_attempt_at ? `Next attempt ${formatDate(turn.next_attempt_at)}` : null,
-    turn.error ? `Last attempt: ${turn.error}` : null,
+    turn.error_message || turn.error
+      ? `Last attempt${turn.error_code ? ` (${turn.error_code})` : ''}: ${turn.error_message ?? turn.error}`
+      : null,
   ].filter((row): row is string => Boolean(row))
 
   return (

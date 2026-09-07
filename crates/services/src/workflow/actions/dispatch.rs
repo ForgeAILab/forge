@@ -142,7 +142,7 @@ impl HookAction for DispatchRoleAgent {
                     Ok(false) => {}
                     Err(reason) => return HookResult::Failed { reason },
                 }
-                let (prompt, _selection) = build_effective_prompt(
+                let (prompt, selection) = build_effective_prompt(
                     &dispatch_ctx,
                     trigger_dispatch.as_ref(),
                     state_dispatch.as_ref(),
@@ -168,6 +168,44 @@ impl HookAction for DispatchRoleAgent {
                     },
                 });
 
+                // Identity guards apply to a follow-up execution exactly as they
+                // do to an initial dispatch: it is a Task execution on the same
+                // agent, holding the same concurrency slot. Dispatching past a
+                // saturated agent minted an execution and a WorkspaceLease that
+                // no executor ever picked up, and the heartbeat monitor reaped it
+                // as an expired owner lease half a minute later, spending an
+                // execution retry on work that never started.
+                let agent = match db::AgentRepo::get_by_id(&*ctx.db, &agent_id).await {
+                    Ok(Some(agent)) => agent,
+                    Ok(None) => {
+                        return HookResult::Failed {
+                            reason: format!("agent not found: {agent_id}"),
+                        };
+                    }
+                    Err(error) => {
+                        return HookResult::Failed {
+                            reason: error.to_string(),
+                        };
+                    }
+                };
+                if agent.paused {
+                    return HookResult::Skipped {
+                        reason: "agent paused".to_string(),
+                    };
+                }
+                match has_running_execution_capacity(&ctx.db, &agent).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return HookResult::Skipped {
+                            reason: "agent at capacity".to_string(),
+                        };
+                    }
+                    Err(error) => {
+                        return HookResult::Failed {
+                            reason: error.to_string(),
+                        };
+                    }
+                }
                 if let Some(parent_execution_id) = dispatch_ctx.continuation_of_execution_id.clone()
                 {
                     let Some(task_executor) = ctx.task_executor.as_ref().cloned() else {
@@ -247,37 +285,6 @@ impl HookAction for DispatchRoleAgent {
                     }
                 };
 
-                let agent = match db::AgentRepo::get_by_id(&*ctx.db, &agent_id).await {
-                    Ok(Some(agent)) => agent,
-                    Ok(None) => {
-                        return HookResult::Failed {
-                            reason: format!("agent not found: {agent_id}"),
-                        };
-                    }
-                    Err(error) => {
-                        return HookResult::Failed {
-                            reason: error.to_string(),
-                        };
-                    }
-                };
-                if agent.paused {
-                    return HookResult::Skipped {
-                        reason: "agent paused".to_string(),
-                    };
-                }
-                match has_running_execution_capacity(&ctx.db, &agent).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return HookResult::Skipped {
-                            reason: "agent at capacity".to_string(),
-                        };
-                    }
-                    Err(error) => {
-                        return HookResult::Failed {
-                            reason: error.to_string(),
-                        };
-                    }
-                }
                 let Some(task_executor) = ctx.task_executor.as_ref().cloned() else {
                     return HookResult::Failed {
                         reason: "task executor is not configured for initial role dispatch"

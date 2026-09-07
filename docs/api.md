@@ -117,7 +117,7 @@ database for historical provenance.
 | POST   | `/api/v1/tasks/{id}/transition` | Transition status; entering `review` returns `{task, review}` inline |
 | POST   | `/api/v1/tasks/{id}/move` | Atomically move/reorder a board task with task and board concurrency checks |
 | POST   | `/api/v1/tasks/{id}/recover` | Apply a recovery action to a blocked/failed task |
-| POST   | `/api/v1/tasks/{id}/review` | Re-run the CI steps without changing state |
+| POST   | `/api/v1/tasks/{id}/review` | Re-run the configured review and apply its workflow outcome |
 | GET    | `/api/v1/tasks/{id}/diff` | Get task workspace diff |
 | GET    | `/api/v1/tasks/{id}/transitions` | Audit log of state transitions |
 | GET    | `/api/v1/tasks/{id}/roles` | List explicit Task role assignments |
@@ -350,6 +350,16 @@ retry returns the frozen receipt. Reusing the key for altered input returns
 `idempotency_conflict`; starting while another session is active returns
 `active_session_conflict`; missing Main setup returns `setup_required`. A failed
 transaction creates none of the session, receipt, event, or continuation.
+For a new native start, the leased source message must explicitly ask to create
+or start a Project/product; an unrelated Main turn cannot mint a Genesis session
+merely because its agent emitted the tool call. Exact receipt replay and the
+explicit REST user request keep their existing semantics.
+The immutable discovery instruction names the server-generated active Genesis
+session ID explicitly. Earlier terminal Genesis sessions in the same Main Chat
+therefore cannot be mistaken for the session owned by the current turn. The
+mutable session version remains available through typed reads rather than being
+frozen into the instruction. When an active session predates this behavior, the
+turn loader adds the same server-owned binding before invoking the agent.
 
 The successful native command is a turn control transfer: Forge stops the
 originating baseline provider loop, writes no duplicate assistant response for
@@ -801,6 +811,9 @@ current approved Charter and repository-backed Tasks are runnable immediately.
 Project's own records even when `capability_class` is read-only. Optional
 `depends_on_task_ids` must name accepted, non-cancelled Tasks in the same
 Project and every prerequisite must reach `done` before dispatch.
+If a prerequisite is later cancelled, Forge writes a typed durable blocker on
+each unfinished dependent instead of repeatedly rejecting dispatch. Removing
+the cancelled link clears that blocker once no cancelled prerequisites remain.
 `task_type`, when present, is the same closed enum as normal
 Task creation: `task`, `planning_task`, `sub_task`, or `discovery`; unknown
 values are rejected before the command is admitted. Terminal Task delivery,
@@ -826,6 +839,19 @@ returns bounded receipt/event, source Task, Task-id, board-revision, and
 mutable governance is rechecked; a changed payload under the same key is an
 idempotency conflict. This is a native operation only; no REST or MCP dotted
 operation is added.
+
+The ReadyOnly native `task.cancel` operation cancels a healthy or stopped
+non-terminal Task without treating cancellation as failure recovery. Its
+closed payload is `action: "cancel"`, `task_id`, `expected_task_version`, and
+a non-empty `reason`. Forge derives the Project and current Project Agent from
+the authenticated binding, rejects a Task from another Project as unavailable,
+and runs the ordinary Task cancellation lifecycle, including stopping an
+active execution. A stale version returns the current Task version with a
+refresh-and-retry instruction; retrying after the Task already reached the
+cancellation state succeeds without another transition. `task.recover`
+remains the command for stopped work that should run again. This is a native
+operation only; the existing `POST /api/v1/tasks/{id}/cancel` endpoint remains
+the human/API surface.
 
 Main Charter drafts execute directly through the shared Genesis command, while
 Charter reads/readiness/diffs/approval targets use the query boundary and do
@@ -971,6 +997,10 @@ REST resource or generated API type; no wake-disposition endpoint is exposed.
 REST callers observe an admitted wake through the normal
 `AgentChatTurnJobResponse` and its finite turn status, while setup blockers use
 the Project execution-setup projection and documented REST error details.
+Each turn response also exposes the latest stable `error_code` and bounded
+`error_message`; the legacy one-line `error` remains a display fallback. A
+provider turn that returns no text terminates with `error_code =
+"empty_response"` rather than failing later as a generic message-commit error.
 The trigger message an admitted wake appends is a `system` message whose
 `outcome` is `attention_wake` (migration `V127` backfills prompts admitted
 before that outcome existed); its content opens with a
@@ -1015,6 +1045,15 @@ Project Agent may create and manage Tasks only in its bound Project through
 `TaskService`; neither Main nor Project Agent Chat receives repository access.
 Task Workers and reviewers continue through the existing Task assignment,
 workflow, Workspace, validation, review, and delivery path.
+
+A native Task session with `task_read` receives `forge_task_read` and
+`forge_task_list`. `forge_task_list` accepts a workspace-relative `path` and an
+optional direct-entry `glob` using `*` and `?`; it returns at most 256 sorted
+entries as `{name,path,kind}` plus `truncated`. A missing path is a `not_found`
+tool error, while a directory read returns a structured `is_directory` result
+with bounded entries and directs the caller to the list tool. Worker, planner,
+reviewer, Project verification, and account-scratch surfaces receive the list
+tool whenever they receive the file reader.
 
 When configured, both Main and Project Agent native Chat sessions receive the
 read-only `forge_public_web_search` tool. It is scope-derived (Main account or
@@ -1144,12 +1183,19 @@ failure leaves no Project or handoff and keeps Genesis ready for retry.
 `DELETE /api/v1/projects/{id}` performs one guarded transaction that removes
 the Project-owned dependency graph before deleting the Project, including
 Project/Task/Project-Chat `agent_lcm_*` rows and Project chat/handoff state.
-Before the transaction, Forge stages only repositories managed as direct
-children of `<workspace_root>/repos`; it restores them on rollback and removes
-them after commit. Linked repositories elsewhere on disk are never deleted.
+Before the transaction, Forge stages repositories managed as direct children
+of `<workspace_root>/repos`, each repository cache under
+`<workspace_root>/.repos/<repo_id>`, every Task directory that belongs to the
+Project under `<workspace_root>`, and the Project Agent directory at
+`<data_dir>/projects/<project_id>`. It restores every staged path on rollback
+and removes them after commit. Only direct children of those Forge-controlled
+roots are eligible; linked repositories elsewhere on disk and symlink
+candidates are never deleted.
 Immutable-row guards are relaxed only for that exact teardown transaction;
 individual Charter, milestone, readiness, release, decision, lease,
-and evidence records remain non-deletable through ordinary writes.
+evidence, review-contract, and review-assessment records remain non-deletable
+through ordinary writes. Migration V134 preserves existing V132 review history
+while allowing its rows to follow the intended Project deletion cascade.
 
 There is no later primary-agent election. Projects imported from before the
 Charter model that cannot yield one safe binding remain `agent_setup_required`
@@ -1167,6 +1213,28 @@ optional `project_hooks` array. When provided, the server validates and stores
 the rules in `project.project_hooks_json`; saving rules does not run hook
 actions. Omitting `project_hooks` leaves existing rules unchanged; sending an
 empty array clears all rules.
+
+A ready Project Agent can configure the independent checks without receiving
+general settings authority through the typed native `project.review_config`
+operation. Its only action is `set_ci_steps`; the payload requires the Project
+version from `project.current_state` and a `ci_steps` array of at most 16 unique,
+single-line commands (2,048 characters each). An optional `setup_steps` array
+uses the same bounds and prepares the detached clean checkout before checks run;
+omission preserves the existing list and `[]` clears it. The command replaces
+only those two lists, preserving the reviewer prompt, requirement policy,
+conformance checks, retry budgets, and all unrelated settings. The Project
+update, domain event, and replay receipt commit atomically under the version
+guard.
+
+`project.current_state` exposes the effective lists as
+`effective_state.project.default_review_setup_steps` and
+`effective_state.project.default_review_ci_steps`. Agents inspect the repository
+and configure any dependency-install step plus meaningful native checks before
+proposing implementation Tasks, while preserving a non-empty user configuration
+unless the repository or validation policy changes. The defaults apply when a
+Task next enters review; changing them does not claim that a completed review has
+rerun. Discovery, planning, and explicitly read-only Tasks inherit neither list;
+use worklog/media evidence or an explicit research-specific conformance check.
 
 ### Project execution setup
 
@@ -1308,7 +1376,8 @@ Haiku 4.5. The web client uses the per-model map so, for example, Codex
 `ultra` is not offered for Luna and reasoning controls are not offered for
 Claude Haiku 4.5. Clients may still submit a custom model id because providers
 and account entitlements can expose additional models. Gemini advertises its
-stable aliases plus the current visible Gemini 3.x and 2.5 CLI models.
+stable aliases plus the current visible Gemini 3.x and 2.5 CLI models; newly
+configured Gemini API profiles default to `gemini-3.1-pro-preview`.
 
 Smith's options are not a fixed vendor list: they are discovered from the
 user's `~/.smith/config.toml` on the discovering host — configured models
@@ -2548,3 +2617,111 @@ and a queued turn with no file yet returns an empty page rather than an error.
 The web chat follows a live turn's log once per second to show what the Agent
 is doing (reading the operating skill, proposing a Task, running a command,
 writing the reply) and keeps the settled log under the reply it produced.
+
+### Review conformance contract
+
+Task review responses include `details.conformance` with `status` (`not_assessed`,
+`passed`, `failed`, `unverified`), nullable `contract`, nullable `assessment`,
+`checks`, and nullable `reason`. Historical review statuses remain unchanged;
+missing historical assessments are explicitly `not_assessed`.
+
+The contract identifies its execution, policy revision, candidate/target commits,
+Charter revision/digest, Project/Task/repository scope, requirement entries, linked
+Documents, pre-review `check_results`, and source/contract digests. Each frozen
+check result carries `check_id`, exact `command`, `exit_code`, and bounded
+`output`, allowing the reviewer to cite a completed `ci:N` result. Each
+requirement carries its verbatim text,
+source pointer, stable ID, universal flag, and optional authoritative allocation.
+`context.requirements` is the complete scope of this Task review;
+`deferred_requirement_count` and `deferred_requirements_digest` account for the
+remaining Project requirements that milestone readiness must settle.
+
+The assessment contains `contract_digest`, `verdict` (`pass` or `fail`),
+`requirements` coverage and `findings`. Policy `forge.review-conformance/2` accepts
+the requirement dispositions `satisfied`, `violated`, and `unverified`.
+`outside_task_scope` remains deserializable only for immutable v1 history; new
+reports cannot use it because out-of-scope requirements are omitted from the
+contract. Findings include `blocking`, `expected`, `actual`, and evidence. File
+evidence is `{kind:"file",path,commit_sha,start_line,end_line}`; check evidence is
+`{kind:"check",check_id}`. Satisfied claims require evidence. A violated claim or
+blocking finding may use an empty evidence array for an absence that has no positive
+file to cite, with the inspected surface explained in its rationale. The final
+response must be one JSON object: Markdown fences, marker-only verdicts,
+multiple reports, and unknown fields fail structurally. A structurally valid
+partial report is retained and omitted contract requirements make its conformance
+status `unverified`; it therefore cannot pass but does not discard valid findings.
+
+A structurally valid assessment is retained when a semantic claim or citation
+cannot be verified, and its conformance status becomes `unverified`; it follows the
+normal failed-review remediation path and does not consume execution retry budget.
+Only a response that cannot bind to the frozen contract is a reviewer execution
+failure eligible for bounded execution retry. Neither case can grant acceptance.
+
+`default_review_config` on Project settings and Task review state configuration
+accepts `requirement_ids` and `conformance_checks`. `requirement_ids` names the
+non-universal Charter requirements owned by this Task. An ID is the approved
+Charter revision ID followed by its JSON Pointer, for example
+`charter-r1:/scope/required_deliverables/0`. `POST
+/api/v1/agents/{id}/task-proposals` and the typed Project Agent `task.propose`
+operation require `review_requirement_ids` as an explicit ownership decision and
+store it in the Task review configuration. Use `[]` when the Task owns no
+non-universal Charter requirement. Proposal admission checks every supplied ID
+against the current approved Charter and rejects an omitted list, unknown IDs,
+duplicates, or universal IDs before the Task is created. `PATCH
+/api/v1/tasks/{id}` accepts an optional `review_requirement_ids` replacement with
+the Task `version`; it applies the same Charter validation and clears
+`review_passed_at` when the effective ownership list changes.
+Discovery Tasks must use `[]`; their acceptance source includes bounded Task
+worklog comments and attached media metadata so a research deliverable has a
+reviewable sink. Task acceptance, linked-Document acceptance, and requirements
+from `scope.explicit_non_goals` and `success.non_claims` are added automatically.
+All other Project requirements stay deferred to milestone readiness.
+
+Project-level `setup_steps` and `ci_steps` are inherited by Tasks that do not
+override them. In the detached clean checkout, setup commands run first and each
+required check then runs independently. Read-only discovery/planning Tasks
+suppress both lists. A Project Agent sets them through `project.review_config`;
+this keeps repository-specific preparation and check selection at Project scope.
+
+`POST /api/v1/tasks/{id}/review` synchronously re-runs the configured CI and
+auditor review, then routes the result through the normal workflow. A pass enters
+merging, a failure returns to remediation or records the exhausted-budget blocker,
+and a passing gate configured for user approval remains in review with an
+`awaiting_human` review. The response contains the settled Task snapshot and the
+new review attempt.
+
+`conformance_checks` is an array of `{id, command, requirement_ids}`. IDs must be
+unique, commands nonempty, and requirement IDs present in the resulting Task
+contract. Selecting a requirement from a check also brings it into that Task's
+scope. These commands are authorized configuration, never generated from Charter
+prose or a reviewer's report. Existing `ci_steps` are required and linked to
+`task:acceptance`. Task review configuration takes precedence over Project/workflow
+configuration and is frozen in the contract. Changes invalidate outstanding
+acceptance. Check results include `check_id`, exact `command`, `exit_code` and
+bounded `output`; failures cannot be overridden by model PASS. Pre-review CI
+results are visible to the reviewer, and Forge reruns required checks during
+conformance validation before accepting cited evidence. Checks run in a
+clean temporary checkout with a 120-second timeout and a 1 MiB output budget.
+Setup failure stops the checks and is recorded as `setup:N`; setup commands do
+not themselves satisfy a review requirement.
+
+Task review configuration can contain `requirement_allocations`, a mapping from
+requirement ID to a live Task in the same Project. A non-universal requirement
+allocated to the current Task is included; one allocated to another Task is omitted
+and counted as deferred. Universal requirements cannot be allocated. A reviewer
+cannot change scope through its response. Absent Charter context on legacy Projects
+is explicit; a passing Task assessment does not establish a Charter that the
+Project has not approved.
+
+To enforce a Rust product policy, configure a check linked to the Charter's Rust
+deliverable that validates Cargo metadata, executable/library targets and callable
+parsing/inference/schema/rendering boundaries. Merely requiring `Cargo.toml` or
+banning `package.json` is insufficient. Forge does not impose Rust on all Projects,
+and a structured report alone is not deterministic technology verification.
+
+For the `shell` executor, `review_prompt` is an explicit assessment script. Forge
+exports `FORGE_REVIEW_CONTRACT` and `FORGE_GOVERNING_CONTEXT` as quoted JSON data
+before the script. No default shell PASS is generated. Model-backed native/CLI
+reviewers receive one copy of the equivalent frozen contract in their final
+assembled prompt. Native reviewer attempts do not reuse Task conversation history,
+checkpoints, or LCM state.

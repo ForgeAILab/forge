@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use api_types::{StateKind, WorkflowDefinition};
-use db::{AgentRepo, DbError, Project, Task, TaskRoleAssignmentRepo};
+use db::{
+    AgentRepo, DbError, ExecutionRepo, ExecutionStatus, PageRequest, Project, SortBy, SortOrder,
+    Task, TaskRoleAssignmentRepo,
+};
 
 use crate::{
     agent_capacity::has_running_execution_capacity,
@@ -136,6 +139,15 @@ impl TaskDispatcher {
         let Some(role_name) = effective_role(state) else {
             return Ok(false);
         };
+        if role_name == crate::workflow::default_roles::REVIEWER
+            && self.reconcile_terminal_reviewer_execution(&task.id).await?
+        {
+            // Reconciliation may change the Task version/state, install a
+            // blocker, or schedule a deferred retry. Let the next scan work
+            // from those committed facts instead of dispatching from this
+            // stale Task snapshot.
+            return Ok(false);
+        }
         if state.kind == StateKind::Gate && helpers::auto_cascades_on_unassigned_role(state) {
             let assignment =
                 TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
@@ -178,7 +190,7 @@ impl TaskDispatcher {
             return Ok(false);
         }
         if role_name == crate::workflow::default_roles::REVIEWER
-            && !helpers::reviewer_dispatch_ready(&self.db, &task.id, &state_config).await?
+            && !helpers::reviewer_dispatch_ready(&self.db, task, &state_config).await?
         {
             return Ok(false);
         }
@@ -216,7 +228,7 @@ impl TaskDispatcher {
             workflow,
         )
         .await?;
-        let (prompt, _selection) =
+        let (prompt, selection) =
             build_effective_prompt(&dispatch_ctx, None, state_dispatch.as_ref());
         let dispatch_metadata = serde_json::json!({
             "target_role": role_name,
@@ -234,6 +246,47 @@ impl TaskDispatcher {
                 prompt.user,
                 Some(dispatch_metadata),
             )
+            .await?;
+        Ok(true)
+    }
+
+    /// Settle a reviewer execution whose terminal event was lost before it
+    /// reached the review cascade. A retry that was already scheduled is left
+    /// alone so normal deferred dispatch can launch its replacement once due.
+    async fn reconcile_terminal_reviewer_execution(&self, task_id: &str) -> Result<bool> {
+        let page = ExecutionRepo::list_by_task_and_role(
+            &*self.db,
+            task_id,
+            crate::workflow::default_roles::REVIEWER,
+            PageRequest {
+                cursor: None,
+                limit: 1,
+                include_total: false,
+                sort_by: SortBy::CreatedAt,
+                sort_order: SortOrder::Desc,
+            },
+        )
+        .await?;
+        let Some(execution) = page.items.into_iter().next() else {
+            return Ok(false);
+        };
+        if execution.status == ExecutionStatus::Running {
+            return Ok(false);
+        }
+        if !helpers::latest_stopped_execution_blocks_dispatch(
+            &self.db,
+            task_id,
+            crate::workflow::default_roles::REVIEWER,
+        )
+        .await?
+        {
+            // Auto-resumable attempts and attempts superseded by an explicit
+            // role confirmation belong to the normal dispatch path below.
+            return Ok(false);
+        }
+
+        self.task_service
+            .maybe_cascade_executor_completion(&execution.id)
             .await?;
         Ok(true)
     }

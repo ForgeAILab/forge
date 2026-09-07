@@ -13,7 +13,7 @@ use db::{
     create_sqlite_pool, run_migrations, AgentAction, AgentActionPolicyResult, AgentActionRepo,
     AgentActionStatus, AgentProfileRepo, AgentRepo, AgentStatus, CreateAgentAction,
     CreateAgentIdentity, CreateAgentProfile, CreateProject, CreateRepo, ProjectRepo, RepoRepo,
-    SqliteDb, UpdateProject,
+    SqliteDb, TaskRepo, UpdateProject,
 };
 use events::EventBus;
 use serde_json::{json, Value};
@@ -177,6 +177,22 @@ async fn seed_charter_and_milestone(
     milestone_id: &str,
     milestone_revision_id: &str,
 ) {
+    let charter: api_types::ProjectCharterContent = serde_json::from_value(json!({
+        "identity": {
+            "working_name": "Task command fixture",
+            "one_line_vision": "Exercise atomic Task proposals",
+            "maturity": "mvp"
+        },
+        "problem_and_people": {"problem_or_opportunity": "Create governed Tasks safely"},
+        "core_experience": {"primary_outcome": "Create one governed Task"},
+        "scope": {"required_deliverables": ["One atomic Task proposal"], "explicit_non_goals": ["Do not delete unrelated Tasks"]},
+        "success": {},
+        "constraints_and_risks": {"technology": ["Rust"]},
+        "knowledge_ledger": {}
+    }))
+    .expect("typed fixture Charter");
+    let charter_content = serde_json::to_string(&charter).expect("fixture Charter JSON");
+    let charter_digest = api_types::canonical_digest(&charter).expect("fixture Charter digest");
     sqlx::query(
         "INSERT INTO project_charter
          (id, account_id, project_id, project_mode, maturity, lifecycle,
@@ -197,13 +213,15 @@ async fn seed_charter_and_milestone(
          (id, charter_id, revision, lifecycle, schema_version, render_version,
           content_json, rendered_view, change_summary, author_type, author_id,
           source_refs_json, content_digest, rendered_digest, created_at)
-         VALUES (?, ?, 1, 'approved', 'charter@1', 'render@1', '{}',
+         VALUES (?, ?, 1, 'approved', 'charter@1', 'render@1', ?,
                  '# Charter', 'task command fixture', 'user', ?, '[]',
-                 'charter-content', 'charter-rendered', ?)",
+                 ?, 'charter-rendered', ?)",
     )
     .bind(charter_revision_id)
     .bind(charter_id)
+    .bind(charter_content)
     .bind(USER_ID)
+    .bind(charter_digest)
     .bind(NOW)
     .execute(db.pool())
     .await
@@ -339,6 +357,7 @@ fn payload(_project_id: &str, title: &str, task_type: &str, baseline_governed: b
         "merge_config": null,
         "role_assignments": null,
         "governance": null,
+        "review_requirement_ids": [],
         "depends_on_task_ids": [],
     });
     if baseline_governed {
@@ -348,6 +367,16 @@ fn payload(_project_id: &str, title: &str, task_type: &str, baseline_governed: b
         value["risk_class"] = Value::String("low".to_owned());
     }
     value
+}
+
+#[test]
+fn task_proposal_requires_an_explicit_review_requirement_list() {
+    let mut value = payload(BASELINE_PROJECT_ID, "Explicit scope", "task", true);
+    value
+        .as_object_mut()
+        .expect("Task payload is an object")
+        .remove("review_requirement_ids");
+    assert!(serde_json::from_value::<services::TaskProposalPayload>(value).is_err());
 }
 
 fn payload_hash(payload: &Value) -> String {
@@ -587,6 +616,185 @@ async fn task_proposal_commits_one_atomic_bundle_and_replays_frozen_task() {
         count(&fixture.db, "SELECT COUNT(*) FROM agent_action_execution").await,
         1
     );
+}
+
+#[tokio::test]
+async fn task_requirement_ids_are_validated_before_task_creation() {
+    let fixture = fixture().await;
+    let cases = [
+        (
+            "unknown",
+            format!("{CHARTER_REVISION_ID}:/scope/required_deliverables/99"),
+            "unknown Charter review requirement ID",
+        ),
+        (
+            "universal",
+            format!("{CHARTER_REVISION_ID}:/scope/explicit_non_goals/0"),
+            "universal and already applies to every Task",
+        ),
+    ];
+    for (suffix, requirement_id, expected_error) in cases {
+        let mut task_payload = payload(
+            BASELINE_PROJECT_ID,
+            &format!("Rejected {suffix} review scope"),
+            "task",
+            true,
+        );
+        task_payload["review_requirement_ids"] = json!([requirement_id]);
+        let task_action = action(
+            &fixture.db,
+            &format!("task-command-{suffix}-requirement-action"),
+            AGENT_ID,
+            BASELINE_PROJECT_ID,
+            &task_payload,
+        )
+        .await;
+        let error = propose(
+            &fixture,
+            task_action.id,
+            task_action.version,
+            &format!("task-command-{suffix}-requirement-key"),
+        )
+        .await
+        .expect_err("invalid review scope must fail before Task creation");
+        match error {
+            ServiceError::InvalidOperation { message } => {
+                assert!(message.contains(expected_error), "{message}")
+            }
+            other => panic!("unexpected review scope error: {other}"),
+        }
+    }
+    assert_eq!(
+        count(
+            &fixture.db,
+            "SELECT COUNT(*) FROM task WHERE project_id = 'task-command-baseline-project'"
+        )
+        .await,
+        0
+    );
+
+    let requirement_id = format!("{CHARTER_REVISION_ID}:/scope/required_deliverables/0");
+    let mut task_payload = payload(
+        BASELINE_PROJECT_ID,
+        "Accepted exact review scope",
+        "task",
+        true,
+    );
+    task_payload["review_requirement_ids"] = json!([requirement_id]);
+    let task_action = action(
+        &fixture.db,
+        "task-command-exact-requirement-action",
+        AGENT_ID,
+        BASELINE_PROJECT_ID,
+        &task_payload,
+    )
+    .await;
+    let created = propose(
+        &fixture,
+        task_action.id,
+        task_action.version,
+        "task-command-exact-requirement-key",
+    )
+    .await
+    .expect("exact current Charter requirement is accepted");
+    let config: Value = serde_json::from_str(
+        created
+            .task
+            .task_state_config
+            .as_deref()
+            .expect("Task review configuration"),
+    )
+    .expect("Task review configuration JSON");
+    assert_eq!(
+        config["review"]["requirement_ids"],
+        json!([format!(
+            "{CHARTER_REVISION_ID}:/scope/required_deliverables/0"
+        )])
+    );
+}
+
+#[tokio::test]
+async fn task_review_requirement_ids_can_be_replaced_with_validation() {
+    let fixture = fixture().await;
+    let requirement_id = format!("{CHARTER_REVISION_ID}:/scope/required_deliverables/0");
+    let task_payload = payload(
+        BASELINE_PROJECT_ID,
+        "Correctable review scope",
+        "task",
+        true,
+    );
+    let task_action = action(
+        &fixture.db,
+        "task-command-correctable-scope-action",
+        AGENT_ID,
+        BASELINE_PROJECT_ID,
+        &task_payload,
+    )
+    .await;
+    let created = propose(
+        &fixture,
+        task_action.id,
+        task_action.version,
+        "task-command-correctable-scope-key",
+    )
+    .await
+    .expect("Task proposal succeeds")
+    .task;
+    TaskRepo::set_review_passed_at(&*fixture.db, &created.id, Some(NOW.to_owned()), NOW)
+        .await
+        .expect("seed prior acceptance");
+
+    let updated = fixture
+        .task_service
+        .update_task(
+            created.id.clone(),
+            api_types::UpdateTaskRequest {
+                title: None,
+                description: None,
+                priority: None,
+                merge_config: None,
+                plan: None,
+                task_state_config: None,
+                review_requirement_ids: Some(vec![requirement_id.clone()]),
+                parent_task_id: None,
+                version: created.version,
+            },
+        )
+        .await
+        .expect("exact requirement scope updates");
+    let config: Value = serde_json::from_str(
+        updated
+            .task_state_config
+            .as_deref()
+            .expect("review config exists"),
+    )
+    .expect("review config parses");
+    assert_eq!(config["review"]["requirement_ids"], json!([requirement_id]));
+    assert!(updated.review_passed_at.is_none());
+
+    let error = fixture
+        .task_service
+        .update_task(
+            updated.id.clone(),
+            api_types::UpdateTaskRequest {
+                title: None,
+                description: None,
+                priority: None,
+                merge_config: None,
+                plan: None,
+                task_state_config: None,
+                review_requirement_ids: Some(vec![format!(
+                    "{CHARTER_REVISION_ID}:/scope/required_deliverables/99"
+                )]),
+                parent_task_id: None,
+                version: updated.version,
+            },
+        )
+        .await
+        .expect_err("unknown requirement cannot update Task scope");
+    assert!(error
+        .to_string()
+        .contains("unknown Charter review requirement ID"));
 }
 
 #[tokio::test]
@@ -1257,6 +1465,84 @@ async fn charter_backed_planning_and_discovery_are_read_only_and_runnable() {
         .await,
         2
     );
+}
+
+#[tokio::test]
+async fn discovery_tasks_keep_charter_requirements_deferred() {
+    let fixture = fixture().await;
+    let requirement_id =
+        format!("{PREBASELINE_CHARTER_REVISION_ID}:/scope/required_deliverables/0");
+    let mut invalid = payload(
+        PREBASELINE_PROJECT_ID,
+        "Discovery with implementation scope",
+        "discovery",
+        false,
+    );
+    invalid["review_requirement_ids"] = json!([requirement_id.clone()]);
+    let invalid_action = action(
+        &fixture.db,
+        "discovery-requirement-action",
+        AGENT_ID,
+        PREBASELINE_PROJECT_ID,
+        &invalid,
+    )
+    .await;
+    let error = propose(
+        &fixture,
+        invalid_action.id,
+        invalid_action.version,
+        "discovery-requirement-key",
+    )
+    .await
+    .expect_err("discovery requirement allocation is rejected");
+    assert!(error
+        .to_string()
+        .contains("discovery Tasks cannot own Charter review requirements"));
+
+    let valid = payload(
+        PREBASELINE_PROJECT_ID,
+        "Bounded repository research",
+        "discovery",
+        false,
+    );
+    let valid_action = action(
+        &fixture.db,
+        "discovery-empty-scope-action",
+        AGENT_ID,
+        PREBASELINE_PROJECT_ID,
+        &valid,
+    )
+    .await;
+    let task = propose(
+        &fixture,
+        valid_action.id,
+        valid_action.version,
+        "discovery-empty-scope-key",
+    )
+    .await
+    .expect("discovery with Task-local acceptance creates")
+    .task;
+    let error = fixture
+        .task_service
+        .update_task(
+            task.id,
+            api_types::UpdateTaskRequest {
+                title: None,
+                description: None,
+                priority: None,
+                merge_config: None,
+                plan: None,
+                task_state_config: None,
+                review_requirement_ids: Some(vec![requirement_id]),
+                parent_task_id: None,
+                version: task.version,
+            },
+        )
+        .await
+        .expect_err("discovery scope cannot be expanded to Charter work");
+    assert!(error
+        .to_string()
+        .contains("discovery Tasks cannot own Charter review requirements"));
 }
 
 #[tokio::test]

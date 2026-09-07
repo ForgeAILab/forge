@@ -15,7 +15,7 @@ use super::common::{
     block_task, create_review_attempt, get_role_assignment, latest_executor_execution,
     latest_review, publish_domain_event, publish_review_failed, publish_review_passed,
     review_ci_steps, review_has_auditor_verdict, review_is_ci_only, run_ci_steps_in_worktree, task,
-    workspace_id,
+    task_execution_is_read_only, workspace_id,
 };
 
 pub struct RunCiSteps;
@@ -23,6 +23,19 @@ pub struct RunCiSteps;
 #[async_trait]
 impl HookAction for RunCiSteps {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
+        let task = match task(ctx).await {
+            Ok(task) => task,
+            Err(reason) => return HookResult::Failed { reason },
+        };
+        let read_only = match task_execution_is_read_only(ctx, &task).await {
+            Ok(read_only) => read_only,
+            Err(reason) => return HookResult::Failed { reason },
+        };
+        if read_only {
+            return HookResult::Skipped {
+                reason: "read-only Task does not run implementation ci steps".to_owned(),
+            };
+        }
         let ci_steps = match review_ci_steps(&ctx.state_config) {
             Ok(ci_steps) => ci_steps,
             Err(reason) => return HookResult::Failed { reason },
@@ -33,10 +46,6 @@ impl HookAction for RunCiSteps {
             };
         }
 
-        let task = match task(ctx).await {
-            Ok(task) => task,
-            Err(reason) => return HookResult::Failed { reason },
-        };
         let Some(workspace_id) = workspace_id(ctx).await else {
             return HookResult::Skipped {
                 reason: "no workspace".to_string(),
@@ -147,7 +156,7 @@ impl HookAction for RunCiSteps {
             return HookResult::Failed {
                 reason: format!("CI step {} failed", failed_step_index),
             };
-        } else if had_review_passed {
+        } else if had_review_passed && !reviewer_assigned && !user_approval_required {
             review_details["auditor"] = json!({
                 "verdict": "pass_ci_only",
                 "reason": "CI-only re-review",
@@ -361,8 +370,16 @@ impl HookAction for AutoCascadeOnUnconfiguredReview {
             };
         }
 
-        let ci_steps = match review_ci_steps(&ctx.state_config) {
-            Ok(ci_steps) => ci_steps,
+        let task = match task(ctx).await {
+            Ok(task) => task,
+            Err(reason) => return HookResult::Failed { reason },
+        };
+        let ci_steps = match task_execution_is_read_only(ctx, &task).await {
+            Ok(true) => Vec::new(),
+            Ok(false) => match review_ci_steps(&ctx.state_config) {
+                Ok(ci_steps) => ci_steps,
+                Err(reason) => return HookResult::Failed { reason },
+            },
             Err(reason) => return HookResult::Failed { reason },
         };
         if !ci_steps.is_empty() {

@@ -355,11 +355,11 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
             render_version, canonical_body, policy_json, policy_digest,
             content_digest, created_by_type, created_at
          )
-         SELECT 'forge.project.orchestration/v1@15', operating_skill_id,
-                skill_key, 15, schema_version, render_version, canonical_body,
+         SELECT 'forge.project.orchestration/v1@16', operating_skill_id,
+                skill_key, 16, schema_version, render_version, canonical_body,
                 policy_json, policy_digest, content_digest, 'system', ?
          FROM operating_skill_revision
-         WHERE id = 'forge.project.orchestration/v1@14'",
+         WHERE id = 'forge.project.orchestration/v1@15'",
     )
     .bind(Utc::now().to_rfc3339())
     .execute(harness.state.db.pool())
@@ -367,7 +367,7 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
     .expect("seed same-key Project operating-skill revision");
     sqlx::query(
         "UPDATE operating_skill
-         SET current_revision_id = 'forge.project.orchestration/v1@15',
+         SET current_revision_id = 'forge.project.orchestration/v1@16',
              version = version + 1, updated_at = ?
          WHERE skill_key = 'forge.project.orchestration/v1'",
     )
@@ -401,7 +401,7 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
     .await
     .expect("same-key skill replacement authority");
     assert_eq!(skill_authority.0, original_authority.0);
-    assert_eq!(skill_authority.1, "forge.project.orchestration/v1@15");
+    assert_eq!(skill_authority.1, "forge.project.orchestration/v1@16");
     let admitted_after_skill_revision = request_json(
         app,
         Method::POST,
@@ -424,7 +424,7 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
     .await
     .expect("fresh turn uses current same-key operating skill");
     assert_eq!(skill_turn.0, skill_binding_id);
-    assert_eq!(skill_turn.1, "forge.project.orchestration/v1@15");
+    assert_eq!(skill_turn.1, "forge.project.orchestration/v1@16");
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM agent_handoff WHERE target_chat_id = ?",
@@ -437,7 +437,7 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
     );
     sqlx::query(
         "UPDATE operating_skill
-         SET current_revision_id = 'forge.project.orchestration/v1@14',
+         SET current_revision_id = 'forge.project.orchestration/v1@15',
              version = version + 1, updated_at = ?
          WHERE skill_key = 'forge.project.orchestration/v1'",
     )
@@ -543,7 +543,7 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
             "project_mode": "compact",
             "selected_project_agent_identity_id": mcp_identity,
             "selected_project_agent_profile_revision_id": edited_profile_id,
-            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@14",
+            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@15",
             "selected_project_agent_policy_digest": project_policy_digest(&edited_profile_policy)
         }),
         &[StatusCode::CREATED, StatusCode::OK],
@@ -778,7 +778,7 @@ async fn v076_genesis_handoff_is_atomic_and_legacy_adoption_is_explicit() {
             "project_mode": "compact",
             "selected_project_agent_identity_id": legacy_identity,
             "selected_project_agent_profile_revision_id": legacy_profile,
-            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@14",
+            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@15",
             "selected_project_agent_policy_digest": legacy_policy
         }),
         &[StatusCode::CREATED, StatusCode::OK],
@@ -821,6 +821,10 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
             "project_id": fixture.project_id,
             "title": "V076 governed task",
             "description": "The active baseline supplies stable implementation provenance.",
+            "review_requirement_ids": [format!(
+                "{}:/scope/must_have_outcomes/0",
+                fixture.charter_revision_id
+            )],
             "role_assignments": [],
             "governance": {
                 "charter_revision_id": fixture.charter_revision_id,
@@ -869,6 +873,10 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
             "project_id": fixture.project_id,
             "title": "V076 typed task",
             "description": "Task proposal must materialize only through its executor.",
+            "review_requirement_ids": [format!(
+                "{}:/scope/must_have_outcomes/0",
+                fixture.charter_revision_id
+            )],
             "role_assignments": [],
             "governance": {
                 "charter_revision_id": fixture.charter_revision_id,
@@ -2663,7 +2671,7 @@ async fn create_genesis_project(app: &Router, token: &str, prefix: &str) -> Gene
         "project_mode": "compact",
         "selected_project_agent_identity_id": project_identity,
         "selected_project_agent_profile_revision_id": project_profile,
-        "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@14",
+        "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@15",
         "selected_project_agent_policy_digest": policy_digest
     });
     let approval = request_json(
@@ -3095,7 +3103,7 @@ fn user_authorization_replay_variants(
 fn user_provenance(summary: &str) -> Value {
     json!({
         "author": {"kind": "user", "id": "test-user-id"},
-        "operating_skill_revision": "forge.project.orchestration/v1@14",
+        "operating_skill_revision": "forge.project.orchestration/v1@15",
         "source_refs": [],
         "change_summary": summary
     })

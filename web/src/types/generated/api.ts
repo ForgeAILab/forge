@@ -1,3 +1,4 @@
+import type { ReviewConformance } from './bindings/ReviewConformance'
 // Types aligned with the backend api-types crate responses.
 // PaginatedResponse<T> = { data: T[], next_cursor?, has_more, total_count? }
 
@@ -195,6 +196,10 @@ export interface TaskBlockingAnnotation {
 export type TaskAnnotation = TaskBlockingAnnotation | Record<string, unknown>
 
 export interface ReviewConfig {
+  conformance_checks?: import('./bindings/ConformanceCheck').ConformanceCheck[]
+  requirement_ids?: string[]
+  requirement_allocations?: Record<string, string>
+  setup_steps?: string[]
   ci_steps: string[]
   review_prompt?: string | null
 }
@@ -768,6 +773,7 @@ export interface AuditorVerdictEntry {
 }
 
 export interface ReviewDetails {
+  conformance: ReviewConformance
   ci_steps: StepResultEntry[]
   auditor?: AuditorVerdictEntry | null
 }
@@ -882,6 +888,8 @@ export interface UpdateTaskRequest {
   priority?: number
   merge_config?: Record<string, unknown> | null
   plan?: string
+  task_state_config?: Record<string, unknown> | null
+  review_requirement_ids?: string[]
   parent_task_id?: string | null
   version: number
 }

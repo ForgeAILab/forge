@@ -2,26 +2,24 @@ use crate::workflow::{
     default_roles,
     dispatch::{
         default_tool_names, AgentDispatchContext, AgentPrompt, PromptBuilder,
-        BUILDER_ID_REVIEWER_DEFAULT_V2, MANAGED_EXECUTION_CONTRACT,
+        BUILDER_ID_REVIEWER_CONFORMANCE_V1, MANAGED_EXECUTION_CONTRACT,
     },
 };
 
 pub struct ReviewerPromptBuilder;
 
-const VERDICT_INSTRUCTION: &str = "End your response with EXACTLY ONE verdict marker in the existing format:\n===REVIEW: PASS===\n===REVIEW: FAIL: <short reason>===";
-
 const REVIEWER_ROLE_BOUNDARY: &str = "\
 Reviewer boundary:
-- Must remain read-only, inspect diff and relevant logs, run or verify configured checks, produce structured findings, and end with one verdict marker.
+- Must remain read-only, inspect diff and relevant logs, run or verify configured checks, and produce structured findings using the frozen contract Forge appends at launch.
 - Must not edit files, stage changes, commit changes, provide vague fail reasons, or fail on style preferences without policy basis.
-- Red flags: workspace mutations, missing evidence, blocking findings without expected vs actual behavior, multiple verdict markers.";
+- Red flags: workspace mutations, missing evidence, blocking findings without expected vs actual behavior, contradictory assessments.";
 
 const REVIEWER_FINDINGS_CONTRACT: &str = "\
-Reviewer findings: Put structured findings before the verdict. Each BLOCKING finding must include evidence (file/line when available, command output when relevant) plus expected vs actual behavior. Separate NON-BLOCKING findings from BLOCKING findings.";
+Reviewer findings: Put findings in the JSON findings array. Each BLOCKING finding must include evidence (file/line when available, command output when relevant) plus expected vs actual behavior. Separate NON-BLOCKING findings from BLOCKING findings.";
 
 impl PromptBuilder for ReviewerPromptBuilder {
     fn id(&self) -> &'static str {
-        BUILDER_ID_REVIEWER_DEFAULT_V2
+        BUILDER_ID_REVIEWER_CONFORMANCE_V1
     }
 
     fn build(&self, ctx: &AgentDispatchContext) -> AgentPrompt {
@@ -83,9 +81,11 @@ impl PromptBuilder for ReviewerPromptBuilder {
             user.push('\n');
         }
 
-        if !ci_steps.is_empty() {
-            user.push_str("\nCI steps (already passed):\n");
-            user.push_str("The following automated checks ran and passed before this review was triggered. They confirm the build is green:\n");
+        if !ctx.read_only_task && !ci_steps.is_empty() {
+            user.push_str("\nRequired CI steps:\n");
+            user.push_str(
+                "Forge executes these checks independently against the reviewed content:\n",
+            );
             for step in ci_steps {
                 user.push_str("- ");
                 user.push_str(step);
@@ -110,13 +110,9 @@ impl PromptBuilder for ReviewerPromptBuilder {
             }
         }
 
-        user.push_str("\nVerdict format:\n");
-        user.push_str(VERDICT_INSTRUCTION);
-        user.push('\n');
-
         AgentPrompt {
             system: format!(
-                "You are the reviewer agent for this Forge workflow task. This is a read-only audit. Verify correctness, run the configured checks, and report clear pass/fail feedback. If you fail the review, your feedback will be sent to the coder agent to address in a follow-up attempt.\n\n{MANAGED_EXECUTION_CONTRACT}\n\n{REVIEWER_ROLE_BOUNDARY}\n\n{REVIEWER_FINDINGS_CONTRACT}\n\n{VERDICT_INSTRUCTION}"
+                "You are the reviewer agent for this Forge workflow task. This is a read-only audit. Verify correctness, run the configured checks, and report clear pass/fail feedback. If you fail the review, your feedback will be sent to the coder agent to address in a follow-up attempt.\n\n{MANAGED_EXECUTION_CONTRACT}\n\n{REVIEWER_ROLE_BOUNDARY}\n\n{REVIEWER_FINDINGS_CONTRACT}"
             ),
             user,
             tools: default_tool_names(default_roles::REVIEWER),

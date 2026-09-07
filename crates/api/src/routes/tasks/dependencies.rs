@@ -5,7 +5,9 @@ pub async fn add_dependency(
     Path(id): Path<String>,
     Json(request): Json<AddDependencyRequest>,
 ) -> ApiResult<StatusCode> {
-    TaskDependencyRepo::add_dependency(&*state.db, &id, &request.depends_on_id, &now_rfc3339())
+    state
+        .task_service
+        .add_task_dependency(&id, &request.depends_on_id)
         .await?;
     Ok(StatusCode::CREATED)
 }
@@ -14,7 +16,10 @@ pub async fn remove_dependency(
     State(state): State<AppState>,
     Path((id, dep_id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
-    TaskDependencyRepo::remove_dependency(&*state.db, &id, &dep_id).await?;
+    state
+        .task_service
+        .remove_task_dependency(&id, &dep_id)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

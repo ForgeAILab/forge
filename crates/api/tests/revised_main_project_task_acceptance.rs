@@ -215,7 +215,7 @@ async fn main_project_handoff_project_task_worker_and_main_denial() {
             "project_mode": "compact",
             "selected_project_agent_identity_id": project_identity,
             "selected_project_agent_profile_revision_id": project_profile,
-            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@14",
+            "selected_project_agent_operating_skill_revision": "forge.project.orchestration/v1@15",
             "selected_project_agent_policy_digest": project_policy_digest(
                 &project_agent["profile"]["tool_policy"]
             )
@@ -628,6 +628,10 @@ fn task_proposal_body(
         "project_id": project_id,
         "title": title,
         "description": "Acceptance task",
+        "review_requirement_ids": [format!(
+            "{}:/scope/must_have_outcomes/0",
+            governance.charter_revision_id
+        )],
         "role_assignments": [{
             "role_name": "coder",
             "assignee_type": "agent",
@@ -694,7 +698,7 @@ fn user_authorization(action: &str, event_id: &str) -> Value {
 fn user_provenance(summary: &str) -> Value {
     json!({
         "author": {"kind": "user", "id": "test-user-id"},
-        "operating_skill_revision": "forge.project.orchestration/v1@14",
+        "operating_skill_revision": "forge.project.orchestration/v1@15",
         "source_refs": [],
         "change_summary": summary
     })

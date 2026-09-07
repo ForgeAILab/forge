@@ -1287,6 +1287,8 @@ impl FederatedAgentChatTurnRunner {
                             ));
                         }
                     }
+                    let mut instruction_body = instruction_body;
+                    append_active_genesis_session_binding(&mut instruction_body, &genesis_id);
                     (
                         Some(instruction_body),
                         main_operating_context_sources(
@@ -3552,6 +3554,17 @@ impl AgentChatTurnWorker {
                             )
                             .await;
                     }
+                } else if turn.content.trim().is_empty() {
+                    tracing::warn!(job_id = %commit_job.id, "Agent Chat provider returned no text response");
+                    let _ = self
+                        .chat_service
+                        .append_failure(
+                            &commit_job,
+                            &self.lease_owner,
+                            "empty_response",
+                            "Agent returned no text response",
+                        )
+                        .await;
                 } else {
                     match self.turn_postcondition_satisfied(&commit_job).await {
                         Ok(true) => {
@@ -3884,6 +3897,18 @@ fn append_delivery_followup_retry_instruction(
     })?;
     instruction.push_str(retry);
     Ok(())
+}
+
+fn append_active_genesis_session_binding(instruction: &mut String, genesis_id: &str) {
+    let binding = format!("Active Product Genesis session ID: {genesis_id}");
+    if instruction.lines().any(|line| line.trim() == binding) {
+        return;
+    }
+    instruction.push_str("\n\n## SERVER-PROVIDED ACTIVE GENESIS BINDING\n");
+    instruction.push_str(&binding);
+    instruction.push_str(
+        "\nUse this ID for the current turn. Product Genesis session IDs mentioned elsewhere in Main Chat history are historical context and do not change this binding.\n",
+    );
 }
 
 fn build_cli_prompt(
@@ -4688,24 +4713,32 @@ fn effective_state_context(
             .active_milestones
             .iter()
             .map(|milestone| {
-                let definition_revision =
-                    milestone.definition_revision_id.as_deref().ok_or_else(|| {
-                        ServiceError::conflict(
-                            "active Project milestone has no definition revision",
-                        )
-                    })?;
-                let definition_digest =
-                    milestone.definition_digest.as_deref().ok_or_else(|| {
-                        ServiceError::conflict("active Project milestone has no definition digest")
-                    })?;
-                Ok::<_, ServiceError>(format!(
-                    "{} ({}) @{}:content:{}:v{}",
-                    milestone.milestone_key,
-                    milestone.lifecycle,
-                    definition_revision,
-                    definition_digest,
-                    milestone.version
-                ))
+                // A milestone whose definition is still a draft has no current
+                // revision; say so instead of failing the turn, so the Project
+                // Agent can see the work it still owes.
+                match (
+                    milestone.definition_revision_id.as_deref(),
+                    milestone.definition_digest.as_deref(),
+                ) {
+                    (Some(definition_revision), Some(definition_digest)) => {
+                        Ok::<_, ServiceError>(format!(
+                            "{} ({}) @{}:content:{}:v{}",
+                            milestone.milestone_key,
+                            milestone.lifecycle,
+                            definition_revision,
+                            definition_digest,
+                            milestone.version
+                        ))
+                    }
+                    (None, None) => Ok(format!(
+                        "{} ({}) @definition:none:v{} (no approved definition revision; \
+                         propose the draft definition and ask for approval)",
+                        milestone.milestone_key, milestone.lifecycle, milestone.version
+                    )),
+                    _ => Err(ServiceError::conflict(
+                        "active Project milestone definition revision and digest must be recorded together",
+                    )),
+                }
             })
             .collect::<Result<Vec<_>>>()?,
         primary_milestone_id: projection.primary_milestone_id.clone(),
@@ -5104,6 +5137,26 @@ mod tests {
     }
 
     #[test]
+    fn active_genesis_binding_is_injected_into_legacy_instructions_once() {
+        let mut legacy = "Product Genesis protocol\nPrior session: portpeek-session".to_owned();
+
+        append_active_genesis_session_binding(&mut legacy, "csvpeek-session");
+        append_active_genesis_session_binding(&mut legacy, "csvpeek-session");
+
+        assert!(legacy.contains("SERVER-PROVIDED ACTIVE GENESIS BINDING"));
+        assert!(legacy.contains("Active Product Genesis session ID: csvpeek-session"));
+        assert!(
+            legacy.contains("session IDs mentioned elsewhere in Main Chat history are historical")
+        );
+        assert_eq!(
+            legacy
+                .matches("Active Product Genesis session ID: csvpeek-session")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn delivery_followup_retry_corrects_toward_the_record_the_turn_owed() {
         let mut readiness = Some("Project operating instruction".to_owned());
         append_delivery_followup_retry_instruction(
@@ -5433,6 +5486,49 @@ mod tests {
             .iter()
             .any(|value| value.contains("unreleased changes")));
         assert_eq!(state.event_watermark.as_deref(), Some("event-8"));
+    }
+
+    /// A milestone whose definition is still a draft has no current revision.
+    /// Failing there made every Project Agent turn fail with an opaque
+    /// conflict, so the Agent could never propose the definition that would
+    /// have resolved it.
+    #[test]
+    fn a_milestone_without_an_approved_definition_is_reported_not_fatal() {
+        let projection: crate::project_runtime::ProjectEffectiveStateProjection =
+            serde_json::from_value(serde_json::json!({
+                "project": {
+                    "id": "project-1", "name": "Project", "paused": false,
+                    "charter_status": "legacy_unverified", "charter_setup_required": true,
+                    "version": 1, "created_at": "2026-09-05T00:00:00Z",
+                    "updated_at": "2026-09-05T00:00:00Z"
+                },
+                "governing_charter": null,
+                "approved_documents": [], "active_decisions": [], "invalidated_decisions": [],
+                "reconciliation_required": [], "canonical_conflicts": [],
+                "task_summary": {"total": 0, "by_status": []},
+                "validation_summary": {"total": 0, "by_outcome": []},
+                "commitments": [], "inbox": [],
+                "active_milestones": [{
+                    "id": "milestone-1", "milestone_key": "M001", "display_label": null,
+                    "lifecycle": "planned", "definition_revision_id": null,
+                    "definition_digest": null, "acceptance_checks": [],
+                    "evidence_requirements": [], "version": 2,
+                    "blocker_reasons": [], "stale_reasons": [], "reconciliation_reasons": []
+                }],
+                "primary_milestone_id": "milestone-1",
+                "readiness": {"latest": null, "by_milestone": []},
+                "releases": [],
+                "unreleased_changes": {
+                    "document_ids": [], "decision_candidate_ids": [],
+                    "active_milestone_ids": [], "reconciliation_ids": []
+                },
+                "source_event_watermark": "event-1", "source_event_sequence": 1,
+                "source_project_version": 1, "source_project_work_epoch": 1
+            }))
+            .expect("typed effective-state projection");
+        let state = effective_state_context(&projection).expect("canonical effective state");
+        assert!(state.active_milestones[0].contains("M001"));
+        assert!(state.active_milestones[0].contains("no approved definition revision"));
     }
 
     fn handoff_packet_json() -> String {

@@ -162,8 +162,8 @@ async fn merge_conflict_follow_up_resolves_and_reaches_done() {
                     && review_auditor_verdict(review) == Some("pass".to_owned())
             })
             .count(),
-        1,
-        "exactly one reviewer-backed pass review row should exist"
+        2,
+        "the resolved commit must receive a fresh reviewer-backed pass"
     );
     assert_eq!(
         reviews
@@ -173,8 +173,8 @@ async fn merge_conflict_follow_up_resolves_and_reaches_done() {
                     && review_auditor_verdict(review) == Some("pass_ci_only".to_owned())
             })
             .count(),
-        1,
-        "merge-fix re-review should run CI-only and skip the assigned reviewer"
+        0,
+        "a changed merge-fix commit cannot reuse the previous pass through CI-only review"
     );
 
     let transition_logs = db::TransitionLogRepo::list_by_task(&*harness.state.db, &created_task.id)
@@ -250,7 +250,7 @@ impl CodingExecutorAdapter for MergeConflictCodexAdapter {
         let resolve_follow_up = self.resolve_follow_up;
         let conflict_prepared = Arc::clone(&self.conflict_prepared);
         Box::pin(async move {
-            if ctx.description.contains("===REVIEW: PASS===") {
+            if common::is_conformance_review_prompt(&ctx.description) {
                 write_auditor_pass(&ctx).await?;
                 return Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
@@ -263,7 +263,7 @@ impl CodingExecutorAdapter for MergeConflictCodexAdapter {
                 });
             }
 
-            if ctx.description.contains("merge failed due to conflicts") && resolve_follow_up {
+            if conflict_prepared.load(Ordering::SeqCst) && resolve_follow_up {
                 resolve_conflict_in_worktree(Path::new(&ctx.worktree_path));
                 return Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
@@ -322,7 +322,12 @@ async fn write_auditor_pass(ctx: &ExecutionContext) -> Result<(), ExecutorError>
         .write(
             LogKind::Assistant,
             LogStream::Main,
-            json!({ "text": "Looks good.\n===REVIEW: PASS===" }),
+            json!({
+                "text": common::passing_review_assessment(
+                    &ctx.description,
+                    Path::new(&ctx.worktree_path),
+                )
+            }),
         )
         .await?;
     Ok(())

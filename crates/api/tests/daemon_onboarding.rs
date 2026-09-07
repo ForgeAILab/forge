@@ -112,11 +112,7 @@ async fn daemon_onboarding_shell_task_flow_end_to_end() {
         json!({
             "name": "daemon-onboarding-shell-reviewer",
             "executor_type": "shell",
-            "daemon_id": daemon_id,
-            "config_json": {
-                "command": "printf",
-                "args": ["===REVIEW: PASS===\\n"]
-            }
+            "daemon_id": daemon_id
         }),
         StatusCode::OK,
     )
@@ -162,6 +158,20 @@ async fn daemon_onboarding_shell_task_flow_end_to_end() {
     )
     .await;
     assert_eq!(task.status, "todo".to_owned());
+    // This smoke proves daemon discovery and a real shell worker round-trip.
+    // Conformance reviewers require a contract-bound JSON assessment, which a
+    // static `printf` fixture cannot produce. Leave this Task's reviewer
+    // unassigned so the default workflow takes its documented no-review path.
+    sqlx::query(
+        "UPDATE task_role_assignment
+         SET assignee_type = NULL, assignee_id = NULL, updated_at = ?
+         WHERE task_id = ? AND role_name = 'reviewer'",
+    )
+    .bind(db::now_rfc3339())
+    .bind(&task.id)
+    .execute(state.db.pool())
+    .await
+    .expect("leave daemon smoke review unassigned");
 
     let claimed: TaskResponse = json_request(
         &app,

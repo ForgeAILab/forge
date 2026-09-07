@@ -14,10 +14,13 @@ impl TaskService {
                 task.status
             )));
         }
-        let (review, _) = self
+        let (review, outcome) = self
             .run_review_for_task(&task)
             .await?
             .ok_or_else(|| ServiceError::invalid_operation("review runner is not configured"))?;
+        let task = self
+            .settle_rerun_review_outcome(&task, &review, outcome)
+            .await?;
         Ok((task, review))
     }
 
@@ -259,6 +262,20 @@ impl TaskService {
                 .then_some(assignment.assignee_id)
                 .flatten()
         });
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            task,
+            &project.workflow_definition,
+            &Actor::system(api_types::SystemComponent::Workflow),
+        );
+        let requires_user_approval = workflow
+            .states
+            .iter()
+            .find(|state| state.name == task.status)
+            .and_then(|state| state.gate_config.as_ref())
+            .is_some_and(|gate| gate.requires_user_approval());
         let logs_path = execution_logs_path(
             &self.workspace_root,
             &task.project_id,
@@ -271,7 +288,7 @@ impl TaskService {
         let executor_execution_id = Uuid::parse_str(&execution.id).map_err(|error| {
             ServiceError::invalid_operation(format!("invalid execution id for review: {error}"))
         })?;
-        let (review, outcome) = review_runner
+        let result = review_runner
             .run(ReviewRequest {
                 task_id,
                 executor_execution_id,
@@ -281,8 +298,66 @@ impl TaskService {
                 auditor_agent_id: reviewer_agent_id,
                 review_prompt: review_config.review_prompt,
                 executor_thread_id: execution.agent_session_id,
+                requires_user_approval,
             })
-            .await?;
-        Ok(Some((review, outcome)))
+            .await;
+        match result {
+            Ok(result) => Ok(Some(result)),
+            Err(::review::ReviewError::Conformance {
+                execution_id,
+                reason,
+            }) => {
+                let mut failed = ExecutionRepo::get_by_id(&*self.db, &execution_id)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("execution", execution_id.clone()))?;
+                failed.error = Some(reason.clone());
+                // Explicit auditor reruns are synchronous. Leave a durable recovery
+                // action on protocol failure instead of bouncing the coder.
+                self.block_task_after_executor_failure(task, &failed)
+                    .await?;
+                Err(ServiceError::invalid_operation(reason))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn settle_rerun_review_outcome(
+        &self,
+        task: &Task,
+        review: &Review,
+        outcome: ::review::ReviewOutcome,
+    ) -> Result<Task> {
+        let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+        match outcome {
+            ::review::ReviewOutcome::Passed | ::review::ReviewOutcome::PassedCiOnly => {
+                self.cascade_completed_review_task(
+                    &current,
+                    crate::workflow::default_states::MERGING,
+                    "review rerun passed",
+                    false,
+                )
+                .await?;
+            }
+            ::review::ReviewOutcome::AwaitingHuman => {}
+            ::review::ReviewOutcome::AuditorFailed { .. }
+            | ::review::ReviewOutcome::CiFailed { .. }
+            | ::review::ReviewOutcome::MergeConflict { .. } => {
+                let current =
+                    TaskRepo::set_review_passed_at(&*self.db, &current.id, None, &now_rfc3339())
+                        .await?;
+                let (current, target, reason) = self
+                    .review_failure_target(&current, Some(&review.execution_id))
+                    .await?;
+                if let Some(target) = target {
+                    self.cascade_completed_review_task(&current, &target, &reason, true)
+                        .await?;
+                }
+            }
+        }
+        TaskRepo::get_by_id(&*self.db, &task.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))
     }
 }

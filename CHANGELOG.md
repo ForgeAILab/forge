@@ -6,6 +6,207 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Breaking
+
+- Project Agent and REST Task proposals now require an explicit
+  `review_requirement_ids` array. Use the exact non-universal Charter requirement
+  IDs owned by the Task, or `[]` when it owns none; omission is rejected so
+  requirement ownership cannot disappear silently. Discovery Tasks must use `[]`
+  because their deliverables are captured as worklog/media evidence rather than
+  implementation requirements.
+- Charter requirements are universal only when they come from
+  `scope.explicit_non_goals` or `success.non_claims`. Product outcomes, platform
+  choices, evidence, publication, release, and scaffold requirements must be
+  allocated to a Task explicitly; they no longer fail every unrelated Task by
+  construction.
+- Agent reviews now require one JSON conformance assessment bound to a frozen
+  Charter/Task/commit contract. Marker-only PASS/FAIL output is rejected. The wire
+  contract policy is `forge.review-conformance/2`; the built-in prompt selector is
+  `reviewer.conformance.v1`, and stored selector choices are migrated.
+  The shell reviewer no longer fabricates PASS: configure an assessment script.
+  Existing done/PASS history stays intact and displays “Not assessed” unless it
+  has a recorded conformance assessment. Unmerged agent-reviewed work needs a
+  fresh assessment before integration, including passes recorded under an obsolete
+  conformance policy. Merge repair requires a new agent review.
+- Reviewed direct merges must fast-forward the exact reviewed commit against
+  the reviewed target. Divergence requires merge repair and a fresh assessment.
+
+### Added
+
+- Project Agents can set repository-wide independent review commands through
+  the typed `project.review_config` operation. The versioned command replaces
+  `default_review_config.ci_steps` and can set optional clean-checkout
+  `setup_steps`, preserves the rest of Project settings, commits its event and
+  replay receipt atomically, and exposes both effective lists in
+  `project.current_state` so implementation Tasks are not created behind an
+  accidental zero-check review gate.
+- `PATCH /api/v1/tasks/{id}` accepts a versioned `review_requirement_ids`
+  replacement, validates it against the current approved Charter, and clears
+  stale review acceptance when ownership changes.
+- Review details expose requirement coverage, evidence, configured check results,
+  exact Charter revision, and reviewed commit. Project/Task review configuration
+  supports requirement-linked `conformance_checks`, exact Task-owned
+  `requirement_ids`, and explicit Task allocations. Project Agent and REST Task
+  proposals accept `review_requirement_ids` and validate them against the current
+  approved Charter before Task creation. Checks run independently in a clean
+  checkout; their failures override model PASS. Semantic claims still depend on
+  the reviewer: configure product-specific checks to enforce constraints such as a
+  Rust crate with working CLI/library boundaries.
+
+### Fixed
+
+- Every Product Genesis instruction now names its server-generated active
+  session ID, and the turn loader adds the binding to historical active
+  instructions created before this fix. The Main Agent no longer has to infer
+  session ownership from earlier Main Chat history when starting a second or
+  later Project.
+- Native Task sessions can discover repository contents instead of guessing
+  paths. Every scope with `task_read` now receives bounded
+  `forge_task_list` directory enumeration with an optional direct-name glob;
+  `forge_task_read` classifies missing files as `not_found` and reports a
+  directory as `is_directory` with its entries. Reviewers no longer lose a
+  turn to opaque failures while searching for tests or implementation files.
+- Reviewers now receive each completed pre-review CI result inside the frozen
+  `ReviewContract`, including its check ID, exact command, exit code, and
+  bounded output. They can cite that result as check evidence, while Forge
+  still reruns the required check independently before accepting the report.
+- Discovery, planning, and explicitly read-only Tasks no longer inherit or run
+  Project implementation `ci_steps`. Explicit requirement-linked conformance
+  checks remain available for research-specific validation.
+- Manual review reruns now apply their result through the Task workflow. A pass
+  proceeds to merge, a failure enters bounded remediation or its blocker, and a
+  gate that requires user approval remains in review as `awaiting_human`.
+- Discovery and planning Tasks now receive a read-only investigation prompt even
+  when the workflow dispatch role is named coder/worker. Their previous prompt
+  ordered repository edits and a commit under a read-only lease, guaranteeing a
+  discarded-write failure and retry on an otherwise valid discovery run.
+- Large Charters no longer force each early Task to disposition the whole Project.
+  Task reviews cover Task acceptance, linked-Document acceptance, universal
+  Project exclusions/non-claims, and explicitly selected requirements; the
+  contract records the remaining requirement count/digest for integrated
+  milestone readiness. This prevents a 106-requirement Charter from failing
+  incomplete later work by construction.
+- Reviewer context is assembled once and each native reviewer attempt starts
+  without prior Task conversation, checkpoints, or LCM history. Previous retries
+  injected the same large contract multiple times and then accumulated earlier
+  contracts/reports until bounded hard compaction could no longer fit the turn.
+- A native reviewer can run the conformance pass at all. The review runner built
+  its auditor execution snapshot without `profile_id`, `provider`,
+  `prompt_template`, the claimed task role, or the read-only worktree marker, so
+  an embedded reviewer failed immediately with `embedded snapshot has no
+  profile_id`; the runtime then refused the `auditor` execution because only a
+  literal `reviewer` role was admitted at session authorization. Auditor
+  snapshots now carry the same identity a Task execution snapshot does, and the
+  reviewer role is served by both its `reviewer` and `auditor` executions.
+- Review remediation no longer spends an execution retry when the coder's agent
+  is busy or paused. The follow-up dispatch skipped the identity guards the
+  initial dispatch applies, so a `review_failed` follow-up on a saturated agent
+  minted an execution and a workspace lease no executor ever picked up; the
+  heartbeat monitor reaped it as an expired owner lease half a minute later. The
+  agent-not-found, agent-paused, and agent-at-capacity guards now cover both
+  dispatch paths, and a busy agent defers the follow-up instead of burning it.
+- A Task can be reviewed a second time by a native reviewer. The runtime context
+  manifest was keyed by identity, Forge session, and runtime turn id, but a
+  runtime turn id is unique only within one runtime session instance: a reviewer
+  retry rebuilds the session with clean context and its first turn reuses the
+  previous attempt's turn id under the same reused Forge session row. Every
+  re-review after remediation therefore died as `Task runtime context manifest
+  idempotency conflict`. The manifest is now keyed by execution as well, which
+  is what its request fingerprint already recorded.
+- A Project's first milestone is adopted as its primary outcome when the Project
+  has none. Genesis seeds that pointer for a Charter-created Project, but a
+  `standard` Project's Agent creates the milestone itself, so the pointer stayed
+  null; once that milestone went active, every Project Agent turn failed
+  admission with `Project with active milestones has no explicit primary
+  milestone` — and because admission fails before the Agent runs, it could never
+  set the pointer itself. An existing choice is preserved, and a later milestone
+  does not steal the pointer.
+- The `project.charter` read now returns `selectable_review_requirements`: the
+  non-universal Charter requirement catalog as `{id, text}`, with the exact IDs
+  a Task proposal must use. The read previously returned only rendered prose, so
+  a Project Agent had to synthesize `<revision_id>:<JSON Pointer>` strings and
+  guess array indices; every guess was rejected as an unknown requirement ID,
+  which blocks Task creation outright now that `review_requirement_ids` is
+  required. Doctrine and the `task.propose` schema now say to copy the IDs
+  verbatim from that catalog.
+- A complete negative or `unverified` assessment is preserved and routed through
+  normal review remediation without spending reviewer execution retry budget.
+  Violations that assert an absence may use an empty evidence list; invalid or
+  insufficient citations make the assessment unverified but no longer erase all
+  other requirement dispositions and findings.
+- A structurally valid partial assessment is also retained. Requirements the
+  reviewer omitted make the conformance result `unverified`, so useful
+  dispositions and findings survive while the review still cannot pass without
+  complete proof.
+- A review assessment is no longer discarded because a citation overshoots the
+  end of a short file. Only a start line past the last line is uncitable; an
+  end line beyond it is imprecision. A whole 106-requirement assessment, its
+  verdict and its findings were previously voided by four citations that ran
+  1-3 lines past EOF. Evidence rejections now name the file and the cited
+  range, so a recorded `unverified` reason can be acted on.
+- A Project Agent can list its Project's Tasks. Its Chat scope advertised no
+  `work.read`, so it saw only aggregate counts, could not tell its own Tasks
+  apart, and re-created the set it had already proposed. `work.read` now
+  resolves an Agent Chat scope to its bound Project and returns each Task's
+  `depends_on` edges alongside id, title, status, priority, and assignee.
+- A Project Agent can cancel a healthy queued or running Task through the new
+  ReadyOnly `task.cancel` command. The command is bound to the authenticated
+  Project and current Project Agent, requires the exact Task version and a
+  reason, stops active executions through the normal Task lifecycle, rejects
+  cross-Project IDs, and treats an already-cancelled retry as success.
+- Project deletion now stages and removes every Project-owned filesystem tree:
+  Forge-managed repositories and repository caches, all Task worktrees, and the
+  Project Agent's durable notes/disposable checkout directory. Database failure
+  restores every staged path, and linked repositories outside Forge-controlled
+  roots remain untouched. Previously the deleted rows could no longer drive
+  later cleanup, leaving build caches such as a 1.4 GB Project Agent checkout
+  orphaned.
+- A Project milestone whose definition is still a draft no longer wedges the
+  Project. The effective-state projection and the Project Agent's state context
+  treated an absent current definition revision as a conflict, so every Agent
+  turn failed with `Active Project milestone has no current definition
+  revision` — including the turn that would have proposed that definition.
+  Standard-mode Projects hit this on the first milestone their Agent created,
+  because only compact Projects are seeded with an approved baseline. The
+  milestone is now reported as having no approved definition revision.
+- Recovering a Task with a `task_id` that names no Task in the Project is a
+  correctable argument error instead of an authority refusal. It previously
+  surfaced as a non-retryable `policy_denied` advising reauthorization, so a
+  mistyped id read to the Agent as "recovery is denied to your scope" and
+  stalled the Project behind a blocker that did not exist.
+- Increased server runtime thread stacks to 16 MiB and boxed the recovery
+  re-execution future to mitigate stack overflow during Agent `task.recover`
+  calls, especially in debug builds.
+- Failed reviewer executions now consume their bounded execution retries before
+  producing a task blocker. Startup recovery, daemon disconnect, heartbeat expiry,
+  workspace-lease reaping, and the periodic dispatcher all use the same reviewer
+  settlement path, so a lost completion event or interrupted Task cascade cannot
+  leave a review stranded after its execution has terminated.
+- Recovery projections disable `resume_session` unless the stopped execution has
+  a resumable session snapshot and its agent is still assigned to that exact Task
+  role. Project Agents no longer receive an action their lease authority cannot
+  perform.
+- Cancelling a prerequisite now durably blocks every unfinished dependent with a
+  typed dependency blocker instead of polling the same rejected guard forever.
+  Removing the cancelled dependency clears that blocker when no cancelled
+  prerequisites remain; new links to cancelled prerequisites are rejected.
+- Discovery worklog comments and attached media are included in the frozen review
+  source. An unchanged checkout SHA no longer counts the repository's base commit
+  as implementation evidence.
+- Projects with immutable V132 review contracts or assessments can be deleted.
+  Migration V134 preserves existing conformance rows while allowing the intended
+  Project-to-Task-to-review cascade; direct history deletion remains rejected.
+- Clean review checkouts run configured `setup_steps` before required checks, so
+  dependency-based projects can install from their lockfile before `ci_steps`.
+  Setup failures are recorded separately and fail the review visibly.
+- Agent Chat turn responses expose stable `error_code` and bounded
+  `error_message` fields, including `empty_response`, and the web timeline renders
+  them. The Gemini catalog default now uses `gemini-3.1-pro-preview`. Native
+  Genesis creation also requires explicit Project-creation intent in the leased
+  user message, preventing a stray tool call from creating a session that blocks
+  later discovery.
+- `forge-ctl` inherits the workspace version instead of reporting `0.2.0`.
+
 ## [0.9.3] - 2026-09-04
 
 ### Breaking

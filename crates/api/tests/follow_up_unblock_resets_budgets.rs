@@ -230,10 +230,7 @@ impl CodingExecutorAdapter for ReviewFailCodexAdapter {
         let executor_calls = Arc::clone(&self.executor_calls);
         let pause_after_unblock = Arc::clone(&self.pause_after_unblock);
         Box::pin(async move {
-            if ctx
-                .description
-                .contains("===REVIEW: FAIL: <short reason>===")
-            {
+            if common::is_conformance_review_prompt(&ctx.description) {
                 write_auditor_failure(&ctx).await?;
                 return Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
@@ -289,7 +286,12 @@ async fn write_auditor_failure(ctx: &ExecutionContext) -> Result<(), ExecutorErr
         .write(
             LogKind::Assistant,
             LogStream::Main,
-            json!({ "text": format!("No.\n===REVIEW: FAIL: {REVIEW_FAIL_REASON}===") }),
+            json!({
+                "text": common::failing_review_assessment(
+                    &ctx.description,
+                    REVIEW_FAIL_REASON,
+                )
+            }),
         )
         .await?;
     Ok(())

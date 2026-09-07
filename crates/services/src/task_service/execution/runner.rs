@@ -508,6 +508,25 @@ impl TaskService {
             return Err(error);
         }
 
+        let description = match ::review::contract::prepare_prompt(
+            &self.db,
+            &execution.id,
+            &task.id,
+            std::path::Path::new(&workspace.worktree_path),
+            matches!(execution.role.as_str(), "reviewer" | "auditor"),
+            agent_config.get("executor_type").and_then(Value::as_str) == Some("shell"),
+            execution_description(&execution, &task, &agent_config),
+        )
+        .await
+        {
+            Ok(prompt) => prompt,
+            Err(reason) => {
+                self.fail_execution_before_dispatch(&execution.id, reason.clone())
+                    .await?;
+                return Err(ServiceError::invalid_operation(reason));
+            }
+        };
+
         // The scheduler owns the execution lease. Creation normally installs
         // the deterministic embedded owner atomically; older/ownerless rows
         // are claimed here immediately before launch. Every heartbeat,
@@ -576,8 +595,6 @@ impl TaskService {
             execution_before_launch.id.clone(),
             Arc::clone(&lease),
         );
-
-        let description = execution_description(&execution, &task, &agent_config);
 
         let (log_tx, mut log_rx) = tokio::sync::mpsc::unbounded_channel::<executors::LogEntry>();
         let max_turns_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1708,7 +1725,17 @@ impl TaskService {
                 ServiceError::invalid_operation("executor config snapshot missing executor_type")
             })?
             .to_owned();
-        let description = execution_description(execution, &task, &executor_config);
+        let description = ::review::contract::prepare_prompt(
+            &self.db,
+            &execution.id,
+            &task.id,
+            std::path::Path::new(&workspace.worktree_path),
+            matches!(execution.role.as_str(), "reviewer" | "auditor"),
+            executor_type == "shell",
+            execution_description(execution, &task, &executor_config),
+        )
+        .await
+        .map_err(ServiceError::invalid_operation)?;
         let max_turns = self.resolve_max_turns(&task).await?;
 
         Ok(api_types::ExecutionStartParams {
@@ -1735,7 +1762,10 @@ fn execution_description(execution: &Execution, task: &Task, agent_config: &Valu
     let is_shell_executor =
         agent_config.get("executor_type").and_then(Value::as_str) == Some("shell");
     if is_shell_executor && execution.role == crate::workflow::default_roles::REVIEWER {
-        r#"echo "===REVIEW: PASS===""#.to_owned()
+        task.task_state_config.as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .and_then(|config| config.pointer("/review/review_prompt").and_then(Value::as_str).map(str::to_owned))
+            .unwrap_or_else(|| "printf '%s\\n' 'Shell reviewer requires an explicit review_prompt producing a conformance assessment' >&2; exit 1".to_owned())
     } else {
         execution
             .summary

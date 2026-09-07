@@ -57,6 +57,9 @@ pub const PROJECT_SKILL_SECTION_NAMES: &[&str] = &[
     "release",
 ];
 pub const PROJECT_CHARTER_ADOPTION_OPERATION: &str = "project.charter.adoption";
+/// Replace the Project's default independent review commands while
+/// preserving every other Project review-policy field.
+pub const PROJECT_REVIEW_CONFIG_OPERATION: &str = "project.review_config";
 pub const PROJECT_DOCUMENT_OPERATION: &str = "project.document";
 pub const PROJECT_DECISION_OPERATION: &str = "project.decision";
 pub const PROJECT_MILESTONE_OPERATION: &str = "project.milestone";
@@ -67,6 +70,10 @@ pub const PROJECT_RELEASE_OPERATION: &str = "project.release.request";
 pub const TASK_PROPOSE_OPERATION: &str = "task.propose";
 pub const TASK_ADAPTIVE_OPERATION: &str = "task.adaptive";
 pub const TASK_REVIEW_OPERATION: &str = "task.review";
+/// Cancel a non-terminal Task in the bound Project at an exact Task version.
+/// This is a normal lifecycle command, including for a healthy queued or
+/// running Task; `task.recover` remains reserved for work that has stopped.
+pub const TASK_CANCEL_OPERATION: &str = "task.cancel";
 /// Repair a Task that stopped, instead of replacing it. A transient failure --
 /// an expired lease, a lost runtime, a dispatch race -- leaves a perfectly good
 /// Task stranded; recovering it is what the Project Agent's own protocol asks
@@ -387,6 +394,17 @@ pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
         output: SHARED_ORCHESTRATION_OUTCOME,
     },
     OperationContract {
+        operation: PROJECT_REVIEW_CONFIG_OPERATION,
+        surface: OperationSurface::ProjectOrchestration,
+        exposure: OperationExposure::TypedProposal,
+        input: OperationInputContract::ProposalEnvelope,
+        setup: OperationSetupExposure::ReadyOnly,
+        supported_scopes: PROJECT_SCOPES,
+        classification: OperationClassification::DirectCommand,
+        permission: OperationPermission::ProposeProject,
+        output: SHARED_ORCHESTRATION_OUTCOME,
+    },
+    OperationContract {
         operation: PROJECT_DOCUMENT_OPERATION,
         surface: OperationSurface::ProjectOrchestration,
         exposure: OperationExposure::TypedProposal,
@@ -487,6 +505,17 @@ pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
     },
     OperationContract {
         operation: TASK_REVIEW_OPERATION,
+        surface: OperationSurface::Coordination,
+        exposure: OperationExposure::GenericProposal,
+        input: OperationInputContract::CoordinationEnvelope,
+        setup: OperationSetupExposure::ReadyOnly,
+        supported_scopes: PROJECT_SCOPES,
+        classification: OperationClassification::DirectCommand,
+        permission: OperationPermission::ProposeTask,
+        output: SHARED_ORCHESTRATION_OUTCOME,
+    },
+    OperationContract {
+        operation: TASK_CANCEL_OPERATION,
         surface: OperationSurface::Coordination,
         exposure: OperationExposure::GenericProposal,
         input: OperationInputContract::CoordinationEnvelope,
@@ -690,7 +719,7 @@ pub fn operation_permission(
         (
             CanonicalScopeType::AgentChat,
             "agent_chat.summary" | "discovery.read" | "portfolio.read" | "project.summary"
-            | "events.read" | "inbox.read" | "commitments.read" | "delivery.read",
+            | "work.read" | "events.read" | "inbox.read" | "commitments.read" | "delivery.read",
         ) => "read_agent_chat",
         (
             CanonicalScopeType::Task,
@@ -785,6 +814,7 @@ pub fn is_allowed_project_direct_payload(operation: &str, payload: &Value) -> bo
     let action = payload.get("action").and_then(Value::as_str);
     match operation {
         PROJECT_CHARTER_ADOPTION_OPERATION => action == Some("draft_revision"),
+        PROJECT_REVIEW_CONFIG_OPERATION => action == Some("set_ci_steps"),
         PROJECT_DOCUMENT_OPERATION => matches!(
             action,
             Some("draft_revision") | Some("propose_approval") | Some("approve")
@@ -1060,6 +1090,27 @@ mod tests {
         assert_eq!(
             classify_operation(PROJECT_DECISION_OPERATION, Some(&payload)),
             OperationClassification::ApprovalRequiredAction
+        );
+    }
+
+    #[test]
+    fn project_review_config_is_a_ready_project_direct_command() {
+        let contract = operation_contract(PROJECT_REVIEW_CONFIG_OPERATION)
+            .expect("Project review-config contract");
+        assert_eq!(contract.surface, OperationSurface::ProjectOrchestration);
+        assert_eq!(contract.exposure, OperationExposure::TypedProposal);
+        assert_eq!(contract.setup, OperationSetupExposure::ReadyOnly);
+        assert_eq!(contract.permission, OperationPermission::ProposeProject);
+        assert_eq!(
+            classify_operation(
+                PROJECT_REVIEW_CONFIG_OPERATION,
+                Some(&serde_json::json!({
+                    "action": "set_ci_steps",
+                    "expected_project_version": 3,
+                    "ci_steps": ["cargo test --workspace"]
+                }))
+            ),
+            OperationClassification::DirectCommand
         );
     }
 

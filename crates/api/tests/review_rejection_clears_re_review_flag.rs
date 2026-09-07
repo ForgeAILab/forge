@@ -182,10 +182,7 @@ impl CodingExecutorAdapter for RejectClearsFlagCodexAdapter {
         let executor_calls = Arc::clone(&self.executor_calls);
         let auditor_calls = Arc::clone(&self.auditor_calls);
         Box::pin(async move {
-            if ctx
-                .description
-                .contains("===REVIEW: FAIL: <short reason>===")
-            {
+            if common::is_conformance_review_prompt(&ctx.description) {
                 auditor_calls.fetch_add(1, Ordering::SeqCst);
                 write_auditor_pass(&ctx).await?;
                 return Ok(ExecutionResult {
@@ -242,7 +239,12 @@ async fn write_auditor_pass(ctx: &ExecutionContext) -> Result<(), ExecutorError>
         .write(
             LogKind::Assistant,
             LogStream::Main,
-            json!({ "text": "Looks good.\n===REVIEW: PASS===" }),
+            json!({
+                "text": common::passing_review_assessment(
+                    &ctx.description,
+                    Path::new(&ctx.worktree_path),
+                )
+            }),
         )
         .await?;
     Ok(())

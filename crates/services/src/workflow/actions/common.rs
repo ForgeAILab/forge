@@ -70,6 +70,23 @@ pub(super) async fn task(ctx: &HookContext) -> Result<db::Task, String> {
         .ok_or_else(|| format!("task not found: {}", ctx.task_id))
 }
 
+pub(super) async fn task_execution_is_read_only(
+    ctx: &HookContext,
+    task: &db::Task,
+) -> Result<bool, String> {
+    let capability_class = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT capability_class FROM project_task_governance WHERE task_id = ?",
+    )
+    .bind(&task.id)
+    .fetch_optional(ctx.db.pool())
+    .await
+    .map_err(|error| error.to_string())?
+    .flatten();
+    crate::execution_setup::classify_task_execution(&task.task_type, capability_class.as_deref())
+        .map(|class| class.is_read_only())
+        .map_err(|error| error.to_string())
+}
+
 pub(super) async fn latest_executor_execution(ctx: &HookContext) -> Option<Execution> {
     let page = ExecutionRepo::list_by_task(
         &*ctx.db,

@@ -795,6 +795,9 @@ impl WorkflowEngine {
             let transition = workflow.trigger_between(&current_status, &target_state);
             let trigger_name = transition.map(|trigger| trigger.as_str().to_owned());
             let is_user_actor = actor.is_user();
+            let is_agent_cancellation = actor.is_agent()
+                && Self::is_cancellation_target(workflow, &target_state)
+                && from_state.kind != StateKind::Terminal;
             let none_allowance = transition.is_none()
                 && (((current_status == target_state || to_state.kind == StateKind::Initial)
                     && skip_before_exit)
@@ -807,6 +810,7 @@ impl WorkflowEngine {
                     if !skip_before_exit
                         && Self::transition_requires_system_actor(trigger, from_state, to_state)
                         && !actor.is_system()
+                        && !is_agent_cancellation
             );
             let mut actor = actor;
             let effective_skip_before_exit = if is_user_actor

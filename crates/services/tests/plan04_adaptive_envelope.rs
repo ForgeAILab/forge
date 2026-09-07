@@ -1068,6 +1068,7 @@ async fn plan04_generic_task_propose_cannot_bypass_adaptive_parent_governance() 
             "description": "This must not bypass the approved adaptive envelope.",
             "parent_task_id": ROOT_TASK_ID,
             "task_type": "planning_task",
+            "review_requirement_ids": [],
             "priority": 1,
             "merge_config": null,
             "role_assignments": null,

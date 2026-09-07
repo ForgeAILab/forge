@@ -1496,6 +1496,17 @@ pub trait ProjectExecutionSetupCommandRepo: Send + Sync {
     ) -> Result<AppliedProjectExecutionSetupCommand>;
 }
 
+/// Atomic Project review-policy mutation boundary. The Project CAS update,
+/// domain event, and durable command receipt commit together, so a lost
+/// response can be replayed without applying the settings change twice.
+#[async_trait]
+pub trait ProjectReviewConfigCommandRepo: Send + Sync {
+    async fn apply_project_review_config_command(
+        &self,
+        input: ApplyProjectReviewConfigCommand,
+    ) -> Result<AppliedProjectReviewConfigCommand>;
+}
+
 /// Durable reconciliation state for the cross-filesystem Project setup
 /// operation.  These methods are intentionally separate from `ProjectRepo`:
 /// setup readiness is not a Project version or a chat-binding lifecycle.

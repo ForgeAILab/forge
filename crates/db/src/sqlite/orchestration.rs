@@ -6445,10 +6445,20 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .execute(&mut *tx)
         .await
         .map_err(check_error)?;
+        // A Project's first milestone becomes its primary outcome. Genesis
+        // seeds that pointer for a Charter-created Project, but a `standard`
+        // Project's Agent creates the milestone itself; leaving the pointer
+        // null there produced a Project with an active milestone and no
+        // primary, which is exactly the state turn admission rejects — and
+        // because admission fails before the Agent can act, it could never
+        // set the pointer itself. COALESCE keeps an existing choice intact.
         let advanced = sqlx::query(
-            "UPDATE project SET version = version + 1, updated_at = ?
-             WHERE id = ? AND version = ?",
+            "UPDATE project
+                SET primary_milestone_id = COALESCE(primary_milestone_id, ?),
+                    version = version + 1, updated_at = ?
+              WHERE id = ? AND version = ?",
         )
+        .bind(&input.milestone.id)
         .bind(&input.milestone.updated_at)
         .bind(&input.milestone.project_id)
         .bind(input.milestone.expected_project_version)
@@ -6631,10 +6641,16 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .execute(&mut *tx)
         .await
         .map_err(orchestration_write_error)?;
+        // See `create_project_milestone_atomically`: a Project's first
+        // milestone becomes its primary outcome, or turn admission rejects the
+        // Project the moment that milestone goes active.
         let project_updated = sqlx::query(
-            "UPDATE project SET version = version + 1, updated_at = ?
-             WHERE id = ? AND version = ?",
+            "UPDATE project
+                SET primary_milestone_id = COALESCE(primary_milestone_id, ?),
+                    version = version + 1, updated_at = ?
+              WHERE id = ? AND version = ?",
         )
+        .bind(&input.milestone.id)
         .bind(&input.milestone.updated_at)
         .bind(&input.milestone.project_id)
         .bind(input.milestone.expected_project_version)

@@ -98,7 +98,15 @@ async fn forge_happy_path_end_to_end() {
         &format!("/api/v1/projects/{project_id}/tasks"),
         json!({ "title": "Happy path task",
             "description": "echo hello > greeting.txt && git add . && git commit -m 'hi'",
-            "review_config": { "ci_steps": ["test -f greeting.txt"] }
+            "review_config": { "ci_steps": ["test -f greeting.txt"], "review_prompt": r#"python3 - <<'PY'
+import json, os
+c = json.loads(os.environ['FORGE_REVIEW_CONTRACT'])
+print(json.dumps({'contract_digest': c['digest'], 'verdict': 'pass',
+  'requirements': [{'requirement_id': r['id'], 'disposition': 'satisfied',
+    'rationale': 'The configured check verifies the greeting deliverable',
+    'evidence': [{'kind': 'check', 'check_id': 'ci:0'}]} for r in c['context']['requirements']],
+  'findings': []}))
+PY"# }
         }),
         StatusCode::OK,
     )
@@ -729,8 +737,8 @@ async fn poll_until_execution_completed(db: &Arc<db::SqliteDb>, execution_id: &s
             }
             if execution.status != db::ExecutionStatus::Running {
                 panic!(
-                    "execution ended in unexpected status: {:?}",
-                    execution.status
+                    "execution ended in unexpected status: {:?}; error: {:?}",
+                    execution.status, execution.error
                 );
             }
         }

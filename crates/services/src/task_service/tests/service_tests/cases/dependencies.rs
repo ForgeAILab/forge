@@ -240,6 +240,88 @@ async fn test_unsatisfied_dependency_blocks_agent_work_but_not_user_managed_move
 }
 
 #[tokio::test]
+async fn cancelled_prerequisite_durably_blocks_dependents_until_link_is_removed() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+
+    let prerequisite = service
+        .create_task(
+            project_id.clone(),
+            "Disposable prerequisite",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("prerequisite creates");
+    let dependent = service
+        .create_task(
+            project_id,
+            "Dependent work",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("dependent creates");
+    service
+        .add_task_dependency(&dependent.id, &prerequisite.id)
+        .await
+        .expect("dependency creates");
+
+    service
+        .cancel_task(prerequisite.id.clone())
+        .await
+        .expect("prerequisite cancels");
+
+    let blocked = TaskRepo::get_by_id(&*db, &dependent.id, false)
+        .await
+        .expect("dependent reloads")
+        .expect("dependent exists");
+    let blocker: serde_json::Value =
+        serde_json::from_str(blocked.blocked_json.as_deref().expect("durable blocker"))
+            .expect("blocker parses");
+    assert_eq!(blocker["source"], "dependency_gate");
+    assert_eq!(
+        blocker["details"]["cancelled_dependency_ids"],
+        json!([prerequisite.id])
+    );
+    let annotation: api_types::TaskBlockingAnnotation = serde_json::from_str(
+        blocked
+            .error_annotation
+            .as_deref()
+            .expect("recovery annotation"),
+    )
+    .expect("annotation parses");
+    assert_eq!(annotation.blocking_reason, "dependency_cancelled");
+    assert_eq!(
+        annotation.recovery_actions,
+        vec![api_types::RecoveryAction::CancelTask]
+    );
+
+    service
+        .remove_task_dependency(&dependent.id, &prerequisite.id)
+        .await
+        .expect("dependency removes");
+    let unblocked = TaskRepo::get_by_id(&*db, &dependent.id, false)
+        .await
+        .expect("dependent reloads")
+        .expect("dependent exists");
+    assert!(unblocked.blocked_json.is_none());
+    assert!(unblocked.error_annotation.is_none());
+}
+
+#[tokio::test]
 async fn test_user_claim_bypasses_capacity_check() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));

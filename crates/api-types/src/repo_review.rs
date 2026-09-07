@@ -247,6 +247,8 @@ pub struct AuditorVerdictEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ReviewDetails {
     #[serde(default)]
+    pub conformance: crate::ReviewConformance,
+    #[serde(default)]
     pub ci_steps: Vec<StepResultEntry>,
     #[serde(default)]
     pub auditor: Option<AuditorVerdictEntry>,

@@ -471,7 +471,11 @@ async fn main_provider_cannot_submit_task_mutation() {
             &scope,
             "task.propose",
             json!({
-                "payload": {"title":"forged task", "project_id":"project-b"},
+                "payload": {
+                    "title":"forged task",
+                    "project_id":"project-b",
+                    "review_requirement_ids": []
+                },
                 "dedupe_key":"main-task-denial",
                 "correlation_id":"main-task-denial-correlation"
             }),
@@ -632,7 +636,7 @@ async fn project_proposal_target_is_derived_from_scope() {
             &scope,
             "task.propose",
             json!({
-                "payload": {"title":"bounded"},
+                "payload": {"title":"bounded", "review_requirement_ids": []},
                 "dedupe_key":"scope-target-1",
                 "correlation_id":"scope-target-correlation"
             }),
@@ -693,7 +697,10 @@ async fn implementation_proposal_without_plan_item_uses_charter_authority() {
             &scope,
             "task.propose",
             json!({
-                "payload": {"title":"implementation without traceability"},
+                "payload": {
+                    "title":"implementation without traceability",
+                    "review_requirement_ids": []
+                },
                 "dedupe_key":"baseline-missing-plan-item",
                 "correlation_id":"baseline-missing-plan-item-correlation"
             }),
@@ -738,7 +745,11 @@ async fn duplicate_plan_item_proposal_is_rejected() {
             &scope,
             "task.propose",
             json!({
-                "payload": {"title":"re-proposed done work", "plan_item_id":"pi-5"},
+                "payload": {
+                    "title":"re-proposed done work",
+                    "plan_item_id":"pi-5",
+                    "review_requirement_ids": []
+                },
                 "dedupe_key":"baseline-duplicate-plan-item",
                 "correlation_id":"baseline-duplicate-plan-item-correlation"
             }),
@@ -779,7 +790,11 @@ async fn planning_proposal_and_cancelled_plan_items_stay_proposable() {
             &scope,
             "task.propose",
             json!({
-                "payload": {"title":"investigate options", "task_type":"planning_task"},
+                "payload": {
+                    "title":"investigate options",
+                    "task_type":"planning_task",
+                    "review_requirement_ids": []
+                },
                 "dedupe_key":"baseline-planning-task",
                 "correlation_id":"baseline-planning-task-correlation"
             }),
@@ -803,7 +818,11 @@ async fn planning_proposal_and_cancelled_plan_items_stay_proposable() {
             &scope,
             "task.propose",
             json!({
-                "payload": {"title":"implement pi-2", "plan_item_id":"pi-2"},
+                "payload": {
+                    "title":"implement pi-2",
+                    "plan_item_id":"pi-2",
+                    "review_requirement_ids": []
+                },
                 "dedupe_key":"baseline-replacement-task",
                 "correlation_id":"baseline-replacement-task-correlation"
             }),
@@ -1117,7 +1136,8 @@ async fn untrusted_text_from_every_source_cannot_raise_the_server_ceiling() {
             json!({
                 "payload": {
                     "title": AUTH04_ESCALATION,
-                    "description": AUTH04_ESCALATION
+                    "description": AUTH04_ESCALATION,
+                    "review_requirement_ids": []
                 },
                 "dedupe_key": "auth04-escalation",
                 "correlation_id": "auth04-escalation-correlation"
@@ -1169,7 +1189,8 @@ async fn untrusted_text_from_every_source_cannot_raise_the_server_ceiling() {
                     "title": "forged authority",
                     "project_id": "project-b",
                     "permission": "repository_write",
-                    "governance": {"runnable": true}
+                    "governance": {"runnable": true},
+                    "review_requirement_ids": []
                 },
                 "dedupe_key": "auth04-forged-authority",
                 "correlation_id": "auth04-forged-authority-correlation"
@@ -1200,7 +1221,11 @@ async fn untrusted_text_from_every_source_cannot_raise_the_server_ceiling() {
             },
             "task.propose",
             json!({
-                "payload": {"title": AUTH04_ESCALATION, "project_id":"project-a"},
+                "payload": {
+                    "title": AUTH04_ESCALATION,
+                    "project_id":"project-a",
+                    "review_requirement_ids": []
+                },
                 "dedupe_key":"auth04-main-denial",
                 "correlation_id":"auth04-main-denial-correlation"
             }),

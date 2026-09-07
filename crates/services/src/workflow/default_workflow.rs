@@ -247,7 +247,7 @@ pub fn default_workflow() -> WorkflowDefinition {
         }
         if state.name == default_states::REVIEW {
             state.dispatch = Some(WorkflowDispatch {
-                builder: Some("reviewer.default.v2".to_string()),
+                builder: Some("reviewer.conformance.v1".to_string()),
                 execution_policy: None,
                 prompt: None,
             });

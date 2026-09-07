@@ -529,7 +529,11 @@ async fn connected_remote_daemon_receives_execution_start_request() {
     assert_eq!(params["task_id"], fixture.task_id);
     assert_eq!(params["workspace_path"], fixture.workspace_path);
     assert_eq!(params["executor_type"], "shell");
-    assert_eq!(params["prompt"]["description"], "echo remote");
+    let description = params["prompt"]["description"]
+        .as_str()
+        .expect("shell execution description");
+    assert!(description.starts_with("export FORGE_GOVERNING_CONTEXT='"));
+    assert!(description.ends_with("\necho remote"));
 
     state.daemon_connections.dispatch_incoming(
         &registration.daemon_id,

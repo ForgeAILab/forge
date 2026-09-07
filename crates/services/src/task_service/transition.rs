@@ -420,11 +420,40 @@ impl TaskService {
     }
 
     pub async fn cancel_task_as(&self, task_id: impl Into<String>, actor: Actor) -> Result<Task> {
-        let task_id = task_id.into();
+        self.cancel_task_with_options(task_id.into(), None, "cancel task".to_owned(), actor)
+            .await
+    }
+
+    pub(crate) async fn cancel_task_at_version_as(
+        &self,
+        task_id: impl Into<String>,
+        expected_version: i64,
+        reason: String,
+        actor: Actor,
+    ) -> Result<Task> {
+        self.cancel_task_with_options(task_id.into(), Some(expected_version), reason, actor)
+            .await
+    }
+
+    async fn cancel_task_with_options(
+        &self,
+        task_id: String,
+        expected_version: Option<i64>,
+        reason: String,
+        actor: Actor,
+    ) -> Result<Task> {
         validate_required("task_id", &task_id)?;
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        if let Some(expected_version) = expected_version {
+            if expected_version != task.version {
+                return Err(ServiceError::Db(db::DbError::TaskVersionConflict {
+                    expected: expected_version,
+                    actual: task.version,
+                }));
+            }
+        }
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -441,19 +470,15 @@ impl TaskService {
         if task.status == cancel_target {
             return Ok(task);
         }
-        self.cancel_running_executions_for_task(
-            &task,
-            "cancelled by task cancellation",
-            actor.clone(),
-        )
-        .await?;
+        self.cancel_running_executions_for_task(&task, &reason, actor.clone())
+            .await?;
         let result = self
             .transition(
                 task_id,
                 cancel_target,
                 TransitionOptions {
-                    version: task.version,
-                    reason: Some("cancel task".to_owned()),
+                    version: expected_version.unwrap_or(task.version),
+                    reason: Some(reason),
                     triggered_by: actor,
                     rejection: false,
                     defer_dispatch_seconds: None,
@@ -461,6 +486,17 @@ impl TaskService {
             )
             .await?;
         let task = clear_manual_advance_error_annotation(&self.db, &task, result.task).await?;
+        if let Err(error) = self.block_dependents_of_cancelled_task(&task).await {
+            // Cancellation already committed.  The dependency gate performs
+            // the same durable blocking check on the next attempted dispatch,
+            // so report the projection failure without turning a successful
+            // cancellation into a misleading request error.
+            tracing::warn!(
+                task_id = %task.id,
+                %error,
+                "failed to project cancelled prerequisite onto dependents"
+            );
+        }
         Ok(task)
     }
 

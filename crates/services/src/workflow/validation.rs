@@ -362,7 +362,7 @@ fn is_known_prompt_builder_id(builder_id: &str) -> bool {
             | "worker.autonomous.v1"
             | "worker.review_fix.v1"
             | "worker.merge_fix.v1"
-            | "reviewer.default.v2"
+            | "reviewer.conformance.v1"
     )
 }
 

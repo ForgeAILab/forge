@@ -2,4 +2,7 @@
 import type { CanonicalPhase } from "./CanonicalPhase";
 import type { StateKind } from "./StateKind";
 
+/**
+ * The effective meaning of one state when a Task transition committed.
+ */
 export type TaskWorkflowStateSnapshot = { name: string, kind: StateKind, canonical_phase: CanonicalPhase, requires_user_approval: boolean, is_cancellation: boolean, };

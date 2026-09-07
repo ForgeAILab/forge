@@ -40,6 +40,10 @@ pub struct TaskProposalPayload {
     pub priority: Option<i64>,
     pub task_type: Option<String>,
     pub task_state_config: Option<String>,
+    /// Exact non-universal Charter requirement IDs this Task owns at review.
+    /// The Project Agent can provide these at creation time without knowing
+    /// the server-generated Task ID.
+    pub review_requirement_ids: Vec<String>,
     pub merge_config: Option<Value>,
     pub role_assignments: Option<Vec<api_types::InitialRoleAssignment>>,
     #[serde(default)]
@@ -117,6 +121,50 @@ impl TaskProposalPayload {
         self.governance = derived;
         self.governance
     }
+}
+
+fn merge_review_requirement_ids(
+    task_state_config: Option<String>,
+    requirement_ids: &[String],
+) -> Result<Option<String>> {
+    if requirement_ids.is_empty() {
+        return Ok(task_state_config);
+    }
+    replace_review_requirement_ids(task_state_config, requirement_ids)
+}
+
+pub(super) fn replace_review_requirement_ids(
+    task_state_config: Option<String>,
+    requirement_ids: &[String],
+) -> Result<Option<String>> {
+    let mut seen = HashSet::new();
+    if requirement_ids
+        .iter()
+        .any(|id| id.trim().is_empty() || id.trim() != id || !seen.insert(id.as_str()))
+    {
+        return Err(ServiceError::invalid_operation(
+            "review_requirement_ids must contain unique, nonblank exact requirement IDs",
+        ));
+    }
+    let mut config = task_state_config
+        .as_deref()
+        .map(serde_json::from_str::<Value>)
+        .transpose()
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!("invalid task_state_config: {error}"))
+        })?
+        .unwrap_or_else(|| json!({}));
+    let config = config.as_object_mut().ok_or_else(|| {
+        ServiceError::invalid_operation("task_state_config must be a JSON object")
+    })?;
+    let review = config.entry("review").or_insert_with(|| json!({}));
+    let review = review.as_object_mut().ok_or_else(|| {
+        ServiceError::invalid_operation("task_state_config.review must be a JSON object")
+    })?;
+    review.insert("requirement_ids".to_owned(), json!(requirement_ids));
+    Ok(Some(serde_json::to_string(&config).map_err(|error| {
+        ServiceError::invalid_operation(format!("invalid task_state_config: {error}"))
+    })?))
 }
 
 impl TaskService {
@@ -337,6 +385,8 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", project_id.clone()))?;
+        self.validate_task_review_requirement_ids(&project, &payload.review_requirement_ids)
+            .await?;
         let parent = if let Some(parent_task_id) = payload.parent_task_id.as_deref() {
             let parent = TaskRepo::get_by_id(&*self.db, parent_task_id, false)
                 .await?
@@ -372,7 +422,18 @@ impl TaskService {
                     "Task dependencies must belong to the same Project",
                 ));
             }
-            if prerequisite.status == "cancelled" {
+            let prerequisite_workflow =
+                crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
+                    &prerequisite,
+                    &project.workflow_definition,
+                    &api_types::Actor::system(api_types::SystemComponent::Workflow),
+                );
+            if prerequisite.status
+                == prerequisite_workflow
+                    .cancellation_state
+                    .as_deref()
+                    .unwrap_or(crate::workflow::default_states::CANCELLED)
+            {
                 return Err(ServiceError::invalid_operation(
                     "Task dependencies cannot reference a cancelled Task",
                 ));
@@ -395,6 +456,11 @@ impl TaskService {
         ) {
             return Err(ServiceError::invalid_operation(
                 "task_type must be task, planning_task, sub_task, or discovery",
+            ));
+        }
+        if task_type == "discovery" && !payload.review_requirement_ids.is_empty() {
+            return Err(ServiceError::invalid_operation(
+                "discovery Tasks cannot own Charter review requirements; describe the research deliverable in Task acceptance and record it in the worklog or Task evidence",
             ));
         }
         let derived_governance = self
@@ -453,6 +519,8 @@ impl TaskService {
                     .map(|review| serde_json::json!({ "review": review }).to_string())
             }
         };
+        let task_state_config =
+            merge_review_requirement_ids(task_state_config, &payload.review_requirement_ids)?;
         let metadata_json = parent.as_ref().and_then(|_| {
             db::TaskMetadata {
                 ..db::TaskMetadata::default()
@@ -853,6 +921,40 @@ impl TaskService {
             provenance: None,
         }))
     }
+
+    pub(super) async fn validate_task_review_requirement_ids(
+        &self,
+        project: &db::Project,
+        requirement_ids: &[String],
+    ) -> Result<()> {
+        if requirement_ids.is_empty() {
+            return Ok(());
+        }
+        let revision_id = project
+            .current_charter_revision_id
+            .as_deref()
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "review_requirement_ids require a current approved Project Charter",
+                )
+            })?;
+        let revision =
+            ProjectOrchestrationRepo::get_project_charter_revision(&*self.db, revision_id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found("charter_revision", revision_id.to_owned())
+                })?;
+        let charter: api_types::ProjectCharterContent =
+            serde_json::from_str(&revision.content_json).map_err(|error| {
+                ServiceError::invalid_operation(format!("invalid Project Charter: {error}"))
+            })?;
+        ::review::contract::validate_explicit_task_requirement_ids(
+            revision_id,
+            &charter,
+            requirement_ids,
+        )
+        .map_err(ServiceError::invalid_operation)
+    }
 }
 
 #[derive(Serialize)]
@@ -1056,4 +1158,42 @@ fn frozen_task_from_receipt(receipt: &CommandReceipt) -> Result<Task> {
             .ok_or_else(|| ServiceError::Db(db::DbError::IdempotencyConflict))?,
     )
     .map_err(|_| ServiceError::Db(db::DbError::IdempotencyConflict))
+}
+
+#[cfg(test)]
+mod review_requirement_tests {
+    use super::*;
+
+    #[test]
+    fn task_proposal_merges_exact_review_requirements_without_losing_review_policy() {
+        let merged = merge_review_requirement_ids(
+            Some(r#"{"review":{"ci_steps":["cargo test"],"requirement_ids":["old"]}}"#.into()),
+            &[
+                "charter-r1:/scope/required_deliverables/0".into(),
+                "charter-r1:/success/acceptance_statements/2".into(),
+            ],
+        )
+        .expect("review requirements merge")
+        .expect("review config exists");
+        let config: Value = serde_json::from_str(&merged).expect("merged config parses");
+        assert_eq!(config["review"]["ci_steps"], json!(["cargo test"]));
+        assert_eq!(
+            config["review"]["requirement_ids"],
+            json!([
+                "charter-r1:/scope/required_deliverables/0",
+                "charter-r1:/success/acceptance_statements/2"
+            ])
+        );
+    }
+
+    #[test]
+    fn task_proposal_rejects_ambiguous_review_requirement_ids() {
+        for ids in [
+            vec!["".to_owned()],
+            vec![" requirement".to_owned()],
+            vec!["same".to_owned(), "same".to_owned()],
+        ] {
+            assert!(merge_review_requirement_ids(None, &ids).is_err());
+        }
+    }
 }

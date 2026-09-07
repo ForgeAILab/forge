@@ -389,12 +389,14 @@ Deviations, and Next Step.
 ### Reviewer verdict contract
 
 ```text
-Return structured findings first. Each blocking finding must include evidence:
-file/line when available, command output when relevant, and the expected behavior.
-
-End with exactly one verdict marker:
-===REVIEW: PASS===
-===REVIEW: FAIL: <short reason>===
+Review every requirement in the frozen Task review contract exactly once.
+Project requirements identified as deferred remain milestone-readiness work and
+do not fail this Task. Return exactly one JSON ReviewAssessment whose
+contract_digest matches the frozen contract. Satisfied requirements require
+file-at-commit or configured-check evidence. Violated absence claims may use an
+empty evidence list when the rationale states what was inspected. Use
+unverified when the available evidence settles neither satisfied nor violated.
+A pass requires every scoped requirement satisfied and no blocking findings.
 ```
 
 ### Coder handoff contract

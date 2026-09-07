@@ -147,6 +147,32 @@ impl AgentChatTurnRunner for RetryRunnerSpy {
     }
 }
 
+struct EmptyResponseRunner;
+
+#[async_trait]
+impl AgentChatTurnRunner for EmptyResponseRunner {
+    async fn run_turn(
+        &self,
+        job: &AgentChatTurnJob,
+        _cancellation: CancellationToken,
+    ) -> services::Result<CompletedAgentChatTurn> {
+        Ok(CompletedAgentChatTurn {
+            identity_id: job
+                .responder_identity_id
+                .clone()
+                .expect("admitted identity"),
+            profile_id: job.profile_id.clone().expect("admitted Profile"),
+            session_id: "empty-response-session".to_owned(),
+            model: Some("admitted-model".to_owned()),
+            content: " \n ".to_owned(),
+            token_usage_json: None,
+            duration_ms: 1,
+            context_manifest_id: None,
+            pending_interaction_id: None,
+        })
+    }
+}
+
 struct GenesisTransferRunner {
     db: Arc<SqliteDb>,
     chat_id: String,
@@ -334,6 +360,56 @@ fn frozen_provenance(job: &AgentChatTurnJob) -> serde_json::Value {
         "canonical_scope_id": job.canonical_scope_id,
         "canonical_scope_provenance_json": job.canonical_scope_provenance_json,
     })
+}
+
+#[tokio::test]
+async fn empty_provider_output_records_a_specific_visible_failure() {
+    let db = database().await;
+    let chats = AgentChatService::new(Arc::clone(&db));
+    chats
+        .set_main_binding(SetMainAgentBindingInput {
+            actor_user_id: ACCOUNT_ID.to_owned(),
+            account_id: ACCOUNT_ID.to_owned(),
+            identity_id: IDENTITY_ID.to_owned(),
+            autonomy_policy_json: "{}".to_owned(),
+            tool_policy_revision: "empty-response-policy".to_owned(),
+            expected_version: None,
+            replacement_reason: None,
+        })
+        .await
+        .expect("Main binding");
+    let chat = AgentChatRepo::get_main_chat(&*db, ACCOUNT_ID)
+        .await
+        .expect("Main Chat lookup")
+        .expect("Main Chat");
+    let admitted = chats
+        .send_message(SendAgentChatMessageInput {
+            actor_user_id: ACCOUNT_ID.to_owned(),
+            chat_id: chat.id,
+            content: "Return a response".to_owned(),
+            dedupe_key: Some("empty-response-admission".to_owned()),
+        })
+        .await
+        .expect("turn admission")
+        .turn_job;
+
+    let worker = AgentChatTurnWorker::with_runner(
+        Arc::clone(&db),
+        Arc::new(EmptyResponseRunner) as Arc<dyn AgentChatTurnRunner>,
+    );
+    assert_eq!(worker.run_once().await.expect("worker run"), 1);
+
+    let failed_attempt = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &admitted.id)
+        .await
+        .expect("turn lookup")
+        .expect("turn");
+    assert_eq!(failed_attempt.status, AgentChatTurnState::RetryWait);
+    assert_eq!(failed_attempt.error_code.as_deref(), Some("empty_response"));
+    assert_eq!(
+        failed_attempt.error_message.as_deref(),
+        Some("Agent returned no text response")
+    );
+    assert_eq!(failed_attempt.response_message_id, None);
 }
 
 #[tokio::test]

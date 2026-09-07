@@ -1155,6 +1155,43 @@ async fn task_with_executions_and_a_commit_is_never_not_started() {
     assert_ne!(evidence.progress_label, "Not started");
 }
 
+#[tokio::test]
+async fn unchanged_checkout_sha_is_not_implementation_commit_evidence() {
+    let db = database().await;
+    let project = coordinated_project(&db, "unchanged checkout evidence").await;
+    let (repo_id, _charter_revision_id) = ready_project(&db, &project).await;
+    let task_id = governed_task(&db, &project.id, &repo_id, "read-only discovery").await;
+    let now = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO execution
+         (id, task_id, agent_id, role, status, before_sha, after_sha, created_at, updated_at)
+         VALUES (?, ?, NULL, 'executor', 'completed', 'base-sha', 'base-sha', ?, ?)",
+    )
+    .bind(new_uuid_v4())
+    .bind(&task_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("unchanged execution inserts");
+
+    let task = TaskRepo::get_by_id(&*db, &task_id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    let (evidence, _blocker) = services::load_task_execution_blocker(&db, &task)
+        .await
+        .expect("evidence loads");
+    assert_eq!(evidence.execution_count, 1);
+    assert_eq!(evidence.attempt_count, 1);
+    assert!(!evidence.has_commit);
+    assert!(evidence.latest_commit_sha.is_none());
+    assert_ne!(
+        evidence.progress,
+        ExecutionProgress::ImplementationCommitted
+    );
+}
+
 /// F12(b): a `ReconciliationRequired` blocker never renders baseline-approval
 /// copy, and its permitted next action is to resolve the reconciliation, not
 /// to reauthorize a baseline that is already active and approved.

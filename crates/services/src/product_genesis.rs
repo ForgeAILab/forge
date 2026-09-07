@@ -227,7 +227,9 @@ impl ProductGenesisService {
         let initial_idea = initial_idea
             .map(|idea| bounded_text(&idea))
             .filter(|idea| !idea.is_empty());
+        let session_id = new_uuid_v4();
         let prompt_context = GenesisPromptContext {
+            genesis_session_id: Some(session_id.clone()),
             initial_idea: initial_idea.clone(),
             ..context
         };
@@ -236,7 +238,7 @@ impl ProductGenesisService {
         let session = self
             .store
             .create(NewProductGenesisSession {
-                id: new_uuid_v4(),
+                id: session_id,
                 account_id,
                 main_chat_id: main_chat_id.to_owned(),
                 prompt_revision: PRODUCT_GENESIS_PROMPT_VERSION.to_owned(),
@@ -792,6 +794,10 @@ const MAX_CONTEXT_ITEMS: usize = 8;
 /// The fields are facts/context for the protocol, not additional instructions.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GenesisPromptContext {
+    /// The server-generated, stable identity of this discovery session. The
+    /// mutable session version is read through typed operations rather than
+    /// being frozen into this immutable prompt.
+    pub genesis_session_id: Option<String>,
     pub current_understanding: String,
     pub assumptions: Vec<String>,
     pub decisions_still_required: Vec<String>,
@@ -829,6 +835,11 @@ pub fn render_product_genesis_prompt(
     let operating_context = crate::MainOperatingSkillContext {
         lifecycle: ProductGenesisLifecycle::Discovering,
         maturity,
+        genesis_id: context
+            .genesis_session_id
+            .as_deref()
+            .map(bounded_text)
+            .filter(|value| !value.is_empty()),
         current_understanding,
         observed_facts: bounded_items(&context.observed_facts),
         assumptions: bounded_items(&context.assumptions),
@@ -1030,6 +1041,7 @@ mod tests {
 
     fn context() -> GenesisPromptContext {
         GenesisPromptContext {
+            genesis_session_id: Some("genesis-current".to_owned()),
             current_understanding: "A bounded product idea".to_owned(),
             assumptions: vec!["The user has a narrow first audience".to_owned()],
             decisions_still_required: vec![
@@ -1059,6 +1071,7 @@ mod tests {
             assert!(rendered.contains("### Decisions still required"));
             assert!(rendered.contains("Product outline:"));
             assert!(rendered.contains("Maturity:"));
+            assert!(rendered.contains("Active Product Genesis session ID: genesis-current"));
             assert!(rendered.contains("at most two high-information questions"));
             assert!(rendered.contains("whether a Project or handoff was created"));
             assert!(rendered.contains("Main has no Task"));
@@ -1170,6 +1183,10 @@ mod tests {
         assert!(first
             .prompt
             .starts_with("Forge Main Agent — Project Discovery and Portfolio Protocol v2\n"));
+        assert!(first.prompt.contains(&format!(
+            "Active Product Genesis session ID: {}",
+            first.session.id
+        )));
 
         let ready = service
             .transition(TransitionProductGenesis {
@@ -1196,6 +1213,50 @@ mod tests {
             .await
             .expect_err("second active session is rejected");
         assert!(error.to_string().contains("already active"));
+    }
+
+    #[tokio::test]
+    async fn session_after_terminal_predecessor_names_only_its_own_identity() {
+        let store = Arc::new(MemoryStore::default());
+        let service = ProductGenesisService::new(store);
+        let first = service
+            .start(
+                "account-1",
+                Some("main-chat-1"),
+                ProductMaturity::Mvp,
+                Some("Build portpeek".to_owned()),
+                None,
+                GenesisPromptContext::default(),
+            )
+            .await
+            .expect("first session starts");
+        service
+            .cancel(
+                &first.session.id,
+                first.session.version,
+                Some("Project handed off for this regression".to_owned()),
+            )
+            .await
+            .expect("predecessor session closes");
+
+        let second = service
+            .start(
+                "account-1",
+                Some("main-chat-1"),
+                ProductMaturity::Mvp,
+                Some("Build csvpeek".to_owned()),
+                None,
+                GenesisPromptContext::default(),
+            )
+            .await
+            .expect("second session starts");
+
+        assert_ne!(second.session.id, first.session.id);
+        assert!(second.prompt.contains(&format!(
+            "Active Product Genesis session ID: {}",
+            second.session.id
+        )));
+        assert!(!second.prompt.contains(&first.session.id));
     }
 
     #[tokio::test]

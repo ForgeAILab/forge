@@ -734,7 +734,10 @@ impl TaskService {
             api_types::RecoveryAction::ResetToInitial,
             api_types::RecoveryAction::CancelTask,
         ];
-        if execution.agent_session_id.is_some() {
+        if self
+            .resume_session_recovery_available(&task, &execution)
+            .await?
+        {
             recovery_actions.insert(0, api_types::RecoveryAction::ResumeSession);
         }
         let annotation = api_types::TaskBlockingAnnotation {

@@ -21,6 +21,11 @@ impl TaskService {
                     "cannot dispatch follow-up for a passed CI-only review",
                 ));
             }
+            ::review::ReviewOutcome::AwaitingHuman => {
+                return Err(ServiceError::invalid_operation(
+                    "cannot dispatch follow-up while review awaits a human decision",
+                ));
+            }
             ::review::ReviewOutcome::AuditorFailed { reason } => {
                 let diff = self.best_effort_git_diff(task_id).await;
                 (

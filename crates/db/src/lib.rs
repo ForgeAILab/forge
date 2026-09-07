@@ -9,6 +9,7 @@ mod models;
 mod orchestration;
 mod pagination;
 mod repository;
+mod review_conformance;
 mod sqlite;
 mod task_metadata;
 #[cfg(test)]
@@ -24,6 +25,7 @@ pub use models::*;
 pub use orchestration::*;
 pub use pagination::*;
 pub use repository::*;
+pub use review_conformance::*;
 pub use sqlite::{supported_main_baseline_revision, SqliteDb};
 pub use sqlx::{Sqlite, SqlitePool};
 pub use task_metadata::TaskMetadata;

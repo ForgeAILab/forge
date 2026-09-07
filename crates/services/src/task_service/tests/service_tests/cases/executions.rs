@@ -1380,13 +1380,283 @@ async fn dispatch_initial_role_execution_runs_reviewer_when_agent_is_busy_on_sam
 }
 
 #[tokio::test]
-async fn failed_reviewer_execution_marks_running_review_failed() {
+async fn failed_reviewer_execution_keeps_review_running_while_retry_waits() {
+    assert_failed_reviewer_disposition(0, 3, true, false).await;
+}
+
+#[tokio::test]
+async fn failed_reviewer_execution_blocks_when_retries_are_exhausted() {
+    assert_failed_reviewer_disposition(3, 3, false, false).await;
+}
+
+#[tokio::test]
+async fn failed_reviewer_execution_blocks_when_retries_are_disabled() {
+    assert_failed_reviewer_disposition(0, 0, false, false).await;
+}
+
+#[tokio::test]
+async fn precontract_reviewer_pass_uses_bounded_protocol_failure_dispositions() {
+    for (count, budget, retry) in [(0, 3, true), (3, 3, false), (0, 0, false)] {
+        assert_failed_reviewer_disposition(count, budget, retry, true).await;
+    }
+}
+
+#[tokio::test]
+async fn settled_reviewer_outcome_reconciles_a_missed_task_cascade() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "review".to_owned()).await;
+    let now = now_rfc3339();
+    let execution = ExecutionRepo::create(
+        &*db,
+        db::CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: None,
+            role: crate::workflow::default_roles::REVIEWER.to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: Some("system:executor".to_owned()),
+            resume_policy: None,
+            stopped_at: Some(now.clone()),
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("review completed".to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("reviewer execution creates");
+    let review = ReviewRepo::create(
+        &*db,
+        db::CreateReview {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            execution_id: execution.id.clone(),
+            attempt_number: 1,
+            status: ReviewStatus::Running,
+            step_results_json: json!({ "ci_steps": [] }).to_string(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("review creates");
+    ReviewRepo::update_status(
+        &*db,
+        &review.id,
+        ReviewStatus::Failed,
+        json!({ "ci_steps": [], "auditor": { "verdict": "fail" } }).to_string(),
+        Some(now.clone()),
+        &now,
+    )
+    .await
+    .expect("review outcome commits");
+
+    service
+        .maybe_cascade_executor_completion(&execution.id)
+        .await
+        .expect("missed task cascade reconciles");
+
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert_eq!(current.status, crate::workflow::default_states::IN_PROGRESS);
+    let reviews = ReviewRepo::list_by_task(&*db, &task.id)
+        .await
+        .expect("reviews load");
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].status, ReviewStatus::Failed);
+}
+
+#[tokio::test]
+async fn complete_unverified_assessment_uses_review_remediation_without_execution_retry() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, repo_id, repo_dir) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(&db, &project_id, &repo_id, "review".to_owned()).await;
+    sqlx::query("UPDATE task SET task_state_config = ?, metadata_json = ? WHERE id = ?")
+        .bind(r#"{"retry_budgets":{"execution":3,"review":3}}"#)
+        .bind(r#"{"execution_retry_count":0}"#)
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .expect("retry policy sets");
+
+    let now = now_rfc3339();
+    let workspace = WorkspaceRepo::create(
+        &*db,
+        CreateWorkspace {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            repo_id: repo_id.clone(),
+            worktree_path: repo_dir.path().to_string_lossy().into_owned(),
+            branch: "review-candidate".to_owned(),
+            status: WorkspaceStatus::Ready,
+            before_sha: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("review workspace creates");
+    let execution = ExecutionRepo::create(
+        &*db,
+        db::CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: None,
+            role: crate::workflow::default_roles::REVIEWER.to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace.id),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("running reviewer execution creates");
+    ReviewRepo::create(
+        &*db,
+        db::CreateReview {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            execution_id: execution.id.clone(),
+            attempt_number: 1,
+            status: ReviewStatus::Running,
+            step_results_json: json!({ "ci_steps": [] }).to_string(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("running review creates");
+
+    let contract = ::review::contract::admit(&db, &execution.id, &task.id, repo_dir.path())
+        .await
+        .expect("review contract admits");
+    let report = json!({
+        "contract_digest": contract.digest,
+        "verdict": "fail",
+        "requirements": contract.context.requirements.iter().map(|requirement| json!({
+            "requirement_id": requirement.id,
+            "disposition": "unverified",
+            "rationale": "The available repository evidence is insufficient to prove this requirement",
+            "evidence": [],
+        })).collect::<Vec<_>>(),
+        "findings": [],
+    })
+    .to_string();
+    sqlx::query(
+        "UPDATE execution
+         SET status = 'completed', summary = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&report)
+    .bind(now_rfc3339())
+    .bind(&execution.id)
+    .execute(db.pool())
+    .await
+    .expect("reviewer execution completes");
+
+    service
+        .maybe_cascade_executor_completion(&execution.id)
+        .await
+        .expect("complete unverified review cascades");
+
+    let review = ReviewRepo::list_by_task(&*db, &task.id)
+        .await
+        .expect("reviews load")
+        .into_iter()
+        .next()
+        .expect("review exists");
+    assert_eq!(review.status, ReviewStatus::Failed);
+    let details: api_types::ReviewDetails =
+        serde_json::from_str(&review.step_results_json).expect("review details parse");
+    assert_eq!(
+        details.conformance.status,
+        api_types::ConformanceStatus::Unverified
+    );
+    assert!(details.conformance.assessment.is_some());
+
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert_eq!(
+        current.status,
+        crate::workflow::default_states::IN_PROGRESS,
+        "a complete negative assessment follows normal review remediation"
+    );
+    assert!(current.blocked_json.is_none());
+    assert!(current.error_annotation.is_none());
+    let metadata: serde_json::Value =
+        serde_json::from_str(current.metadata_json.as_deref().unwrap_or("{}"))
+            .expect("metadata parses");
+    assert_eq!(
+        metadata
+            .get("execution_retry_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        0
+    );
+    assert!(metadata.get("deferred_dispatch").is_none());
+
+    let completed_execution = ExecutionRepo::get_by_id(&*db, &execution.id)
+        .await
+        .expect("execution loads")
+        .expect("execution exists");
+    assert_eq!(completed_execution.resume_policy, None);
+}
+
+async fn assert_failed_reviewer_disposition(
+    retry_count: u64,
+    budget: u64,
+    should_retry: bool,
+    protocol: bool,
+) {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let mut events = event_bus.subscribe();
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
     let task = seed_task_with_status(&db, &project_id, &repo_id, "review".to_owned()).await;
+    sqlx::query("UPDATE task SET task_state_config = ?, metadata_json = ? WHERE id = ?")
+        .bind(json!({ "retry_budgets": { "execution": budget } }).to_string())
+        .bind(json!({ "execution_retry_count": retry_count }).to_string())
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .expect("retry policy sets");
     let now = now_rfc3339();
     let execution = ExecutionRepo::create(
         &*db,
@@ -1395,7 +1665,11 @@ async fn failed_reviewer_execution_marks_running_review_failed() {
             task_id: task.id.clone(),
             agent_id: Some(agent_id),
             role: crate::workflow::default_roles::REVIEWER.to_owned(),
-            status: ExecutionStatus::Failed,
+            status: if protocol {
+                ExecutionStatus::Completed
+            } else {
+                ExecutionStatus::Failed
+            },
             stop_reason: Some(db::StopReason::ExecutorFailed),
             stopped_by: Some("system:executor".to_owned()),
             resume_policy: Some(db::ResumePolicy::Manual),
@@ -1404,7 +1678,14 @@ async fn failed_reviewer_execution_marks_running_review_failed() {
             agent_session_id: Some("reviewer-session".to_owned()),
             agent_message_id: None,
             last_activity_at: None,
-            summary: Some("reviewer quit before verdict".to_owned()),
+            summary: Some(
+                if protocol {
+                    "===REVIEW: PASS==="
+                } else {
+                    "reviewer quit before verdict"
+                }
+                .to_owned(),
+            ),
             logs_path: None,
             before_sha: None,
             after_sha: None,
@@ -1443,14 +1724,25 @@ async fn failed_reviewer_execution_marks_running_review_failed() {
         .await
         .expect("reviews load");
     assert_eq!(reviews.len(), 1);
-    assert_eq!(reviews[0].status, ReviewStatus::Failed);
-    assert!(reviews[0].finished_at.is_some());
+    assert_eq!(
+        reviews[0].status,
+        if should_retry {
+            ReviewStatus::Running
+        } else {
+            ReviewStatus::Failed
+        }
+    );
+    assert_eq!(reviews[0].finished_at.is_some(), !should_retry);
     let details: serde_json::Value =
         serde_json::from_str(&reviews[0].step_results_json).expect("details parse");
     assert_eq!(details["auditor"]["verdict"], "fail");
     assert_eq!(
         details["execution"]["error"],
-        "claude-code exited with status exit status: 1"
+        if protocol {
+            "review execution has no workspace evidence"
+        } else {
+            "claude-code exited with status exit status: 1"
+        }
     );
     let current = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
@@ -1461,11 +1753,79 @@ async fn failed_reviewer_execution_marks_running_review_failed() {
         .await
         .expect("execution loads")
         .expect("execution exists");
-    assert_eq!(
-        current_execution.resume_policy,
-        Some(db::ResumePolicy::Auto),
-        "failed reviewer executions should be scheduled for automatic retry"
-    );
+    let metadata: serde_json::Value =
+        serde_json::from_str(current.metadata_json.as_deref().unwrap_or("{}"))
+            .expect("metadata parses");
+    if should_retry {
+        assert_eq!(details["execution_retry"]["execution_id"], execution.id);
+        assert_eq!(details["execution_retry"]["status"], "scheduled");
+        assert_eq!(
+            current_execution.resume_policy,
+            Some(db::ResumePolicy::Auto)
+        );
+        assert!(current.blocked_json.is_none());
+        assert!(current.error_annotation.is_none());
+        assert_eq!(metadata["execution_retry_count"], retry_count + 1);
+        assert!(metadata.get("deferred_dispatch").is_some());
+    } else {
+        assert_eq!(
+            current_execution.resume_policy,
+            Some(db::ResumePolicy::Manual)
+        );
+        let blocked: serde_json::Value = serde_json::from_str(
+            current
+                .blocked_json
+                .as_deref()
+                .expect("task has a durable blocker"),
+        )
+        .expect("blocker parses");
+        assert_eq!(blocked["kind"], "internal_command_failed");
+        assert_eq!(blocked["execution_id"], execution.id);
+        let annotation: api_types::TaskBlockingAnnotation = serde_json::from_str(
+            current
+                .error_annotation
+                .as_deref()
+                .expect("recovery annotation exists"),
+        )
+        .expect("annotation parses");
+        assert_eq!(
+            annotation.annotation_type,
+            api_types::FailureKind::ExecutorFailed
+        );
+        assert_eq!(
+            annotation.blocked_execution_id.as_deref(),
+            Some(execution.id.as_str())
+        );
+        assert!(annotation
+            .recovery_actions
+            .contains(&api_types::RecoveryAction::Reexecute));
+        assert!(!annotation
+            .recovery_actions
+            .contains(&api_types::RecoveryAction::ResumeSession));
+        assert_eq!(metadata["execution_retry_count"], retry_count);
+        assert!(metadata.get("deferred_dispatch").is_none());
+        assert!(current.failed_json.is_none());
+    }
+
+    // Repeated completion delivery must not emit another blocker or spend budget.
+    service
+        .maybe_cascade_executor_completion(&execution.id)
+        .await
+        .expect("duplicate completion succeeds");
+    let repeated = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    assert_eq!(repeated.version, current.version);
+    assert_eq!(repeated.blocked_json, current.blocked_json);
+    assert_eq!(repeated.metadata_json, current.metadata_json);
+    let mut blocker_events = 0;
+    while let Ok(event) = events.try_recv() {
+        if event.event_type == "task.blocked" && event.entity_id == task.id {
+            blocker_events += 1;
+        }
+    }
+    assert_eq!(blocker_events, usize::from(!should_retry));
 }
 
 #[tokio::test]
@@ -1507,7 +1867,7 @@ async fn human_required_review_can_be_rejected_by_the_bound_project_agent() {
             agent_session_id: Some("reviewer-session".to_owned()),
             agent_message_id: None,
             last_activity_at: None,
-            summary: Some("Looks good.\n===REVIEW: PASS===".to_owned()),
+            summary: None,
             logs_path: None,
             before_sha: None,
             after_sha: None,
@@ -1527,7 +1887,7 @@ async fn human_required_review_can_be_rejected_by_the_bound_project_agent() {
             task_id: task.id.clone(),
             execution_id: execution.id.clone(),
             attempt_number: 1,
-            status: ReviewStatus::Running,
+            status: ReviewStatus::AwaitingHuman,
             step_results_json: json!({ "ci_steps": [] }).to_string(),
             started_at: now.clone(),
             created_at: now.clone(),
@@ -1561,37 +1921,13 @@ async fn human_required_review_can_be_rejected_by_the_bound_project_agent() {
         .is_awaiting_human(task.id.clone())
         .await
         .expect("awaiting human resolves"));
-    let comments = TaskCommentRepo::list_comments(
-        &*db,
-        &task.id,
-        PageRequest {
-            cursor: None,
-            limit: 10,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Asc,
-        },
-    )
-    .await
-    .expect("comments list");
-    let reviewer_comments: Vec<_> = comments
-        .items
-        .iter()
-        .filter(|comment| comment.content == "Looks good.")
-        .collect();
-    assert_eq!(
-        reviewer_comments.len(),
-        1,
-        "reviewer completion should only publish one comment"
+    // Explicit human review does not invent an agent conformance assessment.
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&reviews[0].step_results_json)
+            .unwrap()
+            .get("conformance")
+            .is_none()
     );
-    let comment = comments
-        .items
-        .iter()
-        .find(|comment| comment.content.contains("Looks good."))
-        .expect("reviewer comment exists");
-    assert_eq!(comment.content, "Looks good.");
-    assert_eq!(comment.author_type, CommentAuthorType::Agent);
-    assert_eq!(comment.author_id.as_deref(), Some(agent_id.as_str()));
 
     // Model the completed implementation attempt that preceded review and
     // exhaust the optional automatic review-fix retry. This keeps the test

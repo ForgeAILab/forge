@@ -10,6 +10,7 @@ import { WorkflowExceptionPanel } from '@/components/task-detail/workflow-except
 import { cn } from '@/lib/cn'
 import type { RecoveryAction, Review, Task, WorkflowExceptionAction } from '@/types/generated'
 import { formatDate } from './utils'
+import { ReviewConformancePanel } from './ReviewConformancePanel'
 
 const reviewStatusClassNames: Record<Review['status'], string> = {
   running: 'bg-amber-100 text-amber-900 dark:bg-amber-900/30 dark:text-amber-300',
@@ -162,6 +163,8 @@ export function TaskReviewTab({
         </div>
       )}
 
+      {latestReview && <ReviewConformancePanel conformance={latestReview.details.conformance} />}
+
       {/* Step results */}
       <StepResultsSection latestReview={latestReview} reviewsLoading={reviewsLoading} />
 
@@ -230,6 +233,7 @@ export function TaskReviewTab({
                         </button>
                         {isExpanded && (
                           <div className="border-t bg-muted/20 px-4 py-3 space-y-2">
+                            <ReviewConformancePanel conformance={review.details.conformance} />
                             {review.step_results.length > 0 ? (
                               review.step_results.map((step) => (
                                 <ChatEntryContainer
@@ -313,7 +317,7 @@ function StepResultsSection({
           </Badge>
         ) : latestReview?.status === 'passed' && stepCount === 0 ? (
           <Badge className="border-transparent bg-emerald-100 text-emerald-900 dark:bg-emerald-900/30 dark:text-emerald-300">
-            Auto-passed
+            No CI steps
           </Badge>
         ) : null}
       </div>
@@ -344,7 +348,7 @@ function StepResultsSection({
             </div>
           ) : latestReview.status === 'passed' ? (
             <p className="text-sm text-muted-foreground">
-              No CI steps configured — review auto-passed.
+              No CI step results recorded. See the review assessment above.
             </p>
           ) : (
             <p className="text-sm text-muted-foreground">No step results available.</p>

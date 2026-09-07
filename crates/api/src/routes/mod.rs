@@ -352,6 +352,7 @@ async fn task_response_inner(
     let workflow_exception = derive_workflow_exception(
         &task,
         &workflow,
+        &task_role_assignments,
         latest_review.as_ref(),
         latest_execution.as_ref(),
         &remaining_retries,
@@ -959,6 +960,7 @@ fn parse_review_details(value: &str) -> serde_json::Result<ReviewDetails> {
     let value = serde_json::from_str::<Value>(value)?;
     if value.is_array() {
         return Ok(ReviewDetails {
+            conformance: Default::default(),
             ci_steps: serde_json::from_value(value)?,
             auditor: None,
         });

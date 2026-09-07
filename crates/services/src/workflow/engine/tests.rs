@@ -2108,6 +2108,41 @@ async fn user_override_succeeds_along_system_only_edge() {
 }
 
 #[tokio::test]
+async fn agent_can_use_a_system_trigger_only_for_the_cancellation_target() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let task_id = new_uuid_v4();
+    let mut workflow = system_only_fail_edge_workflow();
+    workflow.cancellation_state = Some("failed".to_owned());
+    workflow.states[1].kind = StateKind::Terminal;
+    seed_custom_workflow_task(&db, &task_id, "working", &workflow).await;
+    let eng = engine(Arc::clone(&db), event_bus);
+
+    let result = eng
+        .transition(
+            &task_id,
+            "failed",
+            1,
+            &workflow,
+            &api_types::Actor::agent("project-agent"),
+            "cancelled through the scoped Task command",
+            false,
+        )
+        .await
+        .expect("an authorized Agent cancellation can reach the cancellation target");
+
+    assert_eq!(result.task.status, "failed");
+    let triggered_by: String = sqlx::query_scalar(
+        "SELECT triggered_by FROM transition_log WHERE task_id = ? ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(&task_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("transition audit row");
+    assert_eq!(triggered_by, "agent:project-agent");
+}
+
+#[tokio::test]
 async fn override_not_granted_to_agents_or_system() {
     // Delta: Override authority is not granted to agents or system
     let db = Arc::new(sqlite_db().await);

@@ -45,6 +45,7 @@ async fn test_derive_workflow_exception_review_failed_no_annotation() {
     let exception = crate::task_diagnostics::derive_workflow_exception(
         &task,
         &crate::workflow::default_workflow::default_workflow(),
+        &[],
         Some(&review),
         Some(&execution),
         &remaining_retries,
@@ -201,6 +202,7 @@ async fn test_derive_workflow_exception_infers_actions_for_empty_exhausted_annot
     let exception = crate::task_diagnostics::derive_workflow_exception(
         &task,
         &crate::workflow::default_workflow::default_workflow(),
+        &[],
         Some(&review),
         Some(&execution),
         &std::collections::HashMap::new(),
@@ -291,6 +293,7 @@ async fn test_retry_exhausted_blocked_metadata_takes_precedence_over_stale_error
     let exception = crate::task_diagnostics::derive_workflow_exception(
         &task,
         &crate::workflow::default_workflow::default_workflow(),
+        &[],
         None,
         Some(&execution),
         &std::collections::HashMap::new(),
@@ -418,6 +421,7 @@ async fn test_merge_gate_stale_error_annotation_offers_retry_merge_when_window_a
     let exception = crate::task_diagnostics::derive_workflow_exception(
         &task,
         &crate::workflow::default_workflow::default_workflow(),
+        &[],
         None,
         Some(&execution),
         &std::collections::HashMap::new(),
@@ -494,6 +498,7 @@ async fn test_reviewer_execution_failure_only_offers_retry_or_pass() {
     let exception = crate::task_diagnostics::derive_workflow_exception(
         &task,
         &crate::workflow::default_workflow::default_workflow(),
+        &[],
         Some(&review),
         Some(&execution),
         &remaining_retries,
@@ -574,6 +579,7 @@ async fn test_failed_task_supersedes_blocking_annotation() {
     let exception = crate::task_diagnostics::derive_workflow_exception(
         &task,
         &crate::workflow::default_workflow::default_workflow(),
+        &[],
         None,
         None,
         &std::collections::HashMap::new(),
@@ -650,6 +656,7 @@ async fn test_annotation_hook_details_surface_as_failing_step() {
     let exception = crate::task_diagnostics::derive_workflow_exception(
         &task,
         &crate::workflow::default_workflow::default_workflow(),
+        &[],
         None,
         None,
         &std::collections::HashMap::new(),
@@ -714,6 +721,7 @@ async fn test_reworded_reason_does_not_change_offered_actions() {
         let exception = crate::task_diagnostics::derive_workflow_exception(
             &task,
             &workflow,
+            &[],
             None,
             None,
             &std::collections::HashMap::new(),
@@ -732,6 +740,110 @@ async fn test_reworded_reason_does_not_change_offered_actions() {
     // Classification rides on the structured kind alone; the reason text is
     // display-only and must not change which actions are offered.
     assert_eq!(action_sets[0], action_sets[1]);
+}
+
+#[tokio::test]
+async fn test_resume_session_requires_the_execution_agent_to_own_its_role() {
+    let db = Arc::new(sqlite_db().await);
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = seed_task_with_status(
+        &db,
+        &project_id,
+        &repo_id,
+        crate::workflow::default_states::REVIEW,
+    )
+    .await;
+    let execution = seed_execution(
+        &db,
+        &task.id,
+        Some(&agent_id),
+        crate::workflow::default_roles::REVIEWER,
+        ExecutionStatus::Failed,
+        Some("review-session"),
+        "2026-05-02T10:00:00Z",
+    )
+    .await;
+    let annotation = api_types::TaskAnnotation::Blocking(api_types::TaskBlockingAnnotation {
+        annotation_type: api_types::FailureKind::ExecutorFailed,
+        blocking_reason: "reviewer execution stopped".to_owned(),
+        blocked_by: Some("system".to_owned()),
+        blocked_at: Some(now_rfc3339()),
+        blocked_execution_id: Some(execution.id.clone()),
+        artifact: None,
+        message: None,
+        hook: None,
+        recovery_actions: vec![api_types::RecoveryAction::ResumeSession],
+    });
+    let task = db::TaskRepo::update(
+        &*db,
+        db::UpdateTask {
+            id: task.id.clone(),
+            expected_version: task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(Some(
+                serde_json::to_string(&annotation).expect("annotation serializes"),
+            )),
+            blocked_json: None,
+            failed_json: None,
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("task updates");
+
+    let exception = crate::task_diagnostics::derive_workflow_exception(
+        &task,
+        &crate::workflow::default_workflow::default_workflow(),
+        &[],
+        None,
+        Some(&execution),
+        &std::collections::HashMap::new(),
+    )
+    .expect("workflow exception derives");
+    let resume = exception
+        .actions
+        .iter()
+        .find(|action| action.kind == api_types::RecoveryAction::ResumeSession)
+        .expect("resume action remains visible for the legacy annotation");
+    assert!(!resume.enabled);
+    assert_eq!(
+        resume.disabled_reason.as_deref(),
+        Some("The stopped execution has no resumable assigned session")
+    );
+
+    seed_role_assignment(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::REVIEWER,
+        Some(&agent_id),
+    )
+    .await;
+    let role_assignments = TaskRoleAssignmentRepo::list_by_task(&*db, &task.id)
+        .await
+        .expect("role assignments list");
+    let exception = crate::task_diagnostics::derive_workflow_exception(
+        &task,
+        &crate::workflow::default_workflow::default_workflow(),
+        &role_assignments,
+        None,
+        Some(&execution),
+        &std::collections::HashMap::new(),
+    )
+    .expect("workflow exception derives");
+    let resume = exception
+        .actions
+        .iter()
+        .find(|action| action.kind == api_types::RecoveryAction::ResumeSession)
+        .expect("resume action remains visible");
+    assert!(resume.enabled);
+    assert_eq!(resume.disabled_reason, None);
 }
 
 #[tokio::test]
@@ -779,6 +891,7 @@ async fn test_unknown_kind_is_info_only_and_rejects_recovery() {
     let exception = crate::task_diagnostics::derive_workflow_exception(
         &task,
         &crate::workflow::default_workflow::default_workflow(),
+        &[],
         None,
         None,
         &std::collections::HashMap::new(),

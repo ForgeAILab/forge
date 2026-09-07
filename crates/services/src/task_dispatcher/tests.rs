@@ -390,6 +390,45 @@ async fn seed_completed_coder_execution(db: &db::SqliteDb, task_id: &str) -> Str
     execution_id
 }
 
+async fn seed_completed_reviewer_execution(
+    db: &db::SqliteDb,
+    task_id: &str,
+    agent_id: &str,
+) -> db::Execution {
+    let now = now_rfc3339();
+    ExecutionRepo::create(
+        db,
+        db::CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task_id.to_owned(),
+            agent_id: Some(agent_id.to_owned()),
+            role: crate::workflow::default_roles::REVIEWER.to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: Some("system:executor".to_owned()),
+            resume_policy: None,
+            stopped_at: Some(now.clone()),
+            parent_execution_id: None,
+            agent_session_id: Some("reviewer-session".to_owned()),
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("reviewer returned without contract evidence".to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: Some(
+                r#"{"executor_type":"shell","config":{}}"#.to_owned(),
+            ),
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("completed reviewer execution creates")
+}
+
 async fn seed_running_execution(db: &db::SqliteDb, task_id: &str, agent_id: &str, role: &str) {
     let now = now_rfc3339();
     ExecutionRepo::create(
@@ -1148,7 +1187,10 @@ async fn dispatcher_recovers_undispatched_reviewer_task() {
         .expect("reviewer execution spawned in time")
         .expect("reviewer execution context received");
     assert_eq!(ctx.task_id, task.id);
-    assert!(ctx.description.contains("===REVIEW: PASS==="));
+    // The shell reviewer no longer emits a hardcoded PASS; the dispatcher must
+    // thread the frozen review contract to it instead.
+    assert!(ctx.description.contains("FORGE_REVIEW_CONTRACT"));
+    assert!(ctx.description.contains("FORGE_GOVERNING_CONTEXT"));
     assert_eq!(
         ExecutionRepo::count_by_task_and_role(
             &*db,
@@ -1158,6 +1200,79 @@ async fn dispatcher_recovers_undispatched_reviewer_task() {
         .await
         .expect("reviewer execution count loads"),
         1
+    );
+}
+
+#[tokio::test]
+async fn dispatcher_reconciles_completed_reviewer_and_launches_its_retry() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let task = seed_task(&db, &project_id, &repo_id, "stuck review", "review", 0).await;
+    assign_role(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::REVIEWER,
+        &agent_id,
+    )
+    .await;
+    let execution = seed_completed_reviewer_execution(&db, &task.id, &agent_id).await;
+    seed_running_review(&db, &task.id, &execution.id, r#"{"ci_steps":[]}"#).await;
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    let first = dispatcher
+        .check_once()
+        .await
+        .expect("dispatcher reconciles");
+
+    assert_eq!(first, 0);
+    let review = ReviewRepo::list_by_task(&*db, &task.id)
+        .await
+        .expect("reviews load")
+        .into_iter()
+        .next()
+        .expect("review exists");
+    assert_eq!(review.status, ReviewStatus::Running);
+    let details: serde_json::Value =
+        serde_json::from_str(&review.step_results_json).expect("review details parse");
+    assert_eq!(details["execution_retry"]["execution_id"], execution.id);
+    let execution = ExecutionRepo::get_by_id(&*db, &execution.id)
+        .await
+        .expect("execution loads")
+        .expect("execution exists");
+    assert_eq!(execution.resume_policy, Some(ResumePolicy::Auto));
+
+    let deferred = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert!(deferred_dispatch::pending_until(&deferred).is_some());
+    deferred_dispatch::clear(&db, &deferred)
+        .await
+        .expect("retry backoff elapses");
+
+    let second = dispatcher
+        .check_once()
+        .await
+        .expect("dispatcher launches retry");
+
+    assert_eq!(second, 1);
+    let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("review retry spawned in time")
+        .expect("review retry context received");
+    assert_eq!(ctx.task_id, task.id);
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(
+            &*db,
+            &task.id,
+            crate::workflow::default_roles::REVIEWER
+        )
+        .await
+        .expect("reviewer execution count loads"),
+        2
     );
 }
 
@@ -1734,6 +1849,50 @@ async fn dispatcher_skips_reviewer_until_configured_ci_has_finished() {
     );
 }
 
+#[tokio::test]
+async fn dispatcher_dispatches_read_only_reviewer_without_ci_review_record() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let task = seed_task(&db, &project_id, &repo_id, "research review", "review", 0).await;
+    let task = set_review_ci_config(&db, &task).await;
+    sqlx::query("UPDATE task SET task_type = 'discovery' WHERE id = ?")
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .expect("task becomes read-only discovery work");
+    seed_completed_coder_execution(&db, &task.id).await;
+    assign_role(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::REVIEWER,
+        &agent_id,
+    )
+    .await;
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+
+    assert_eq!(dispatched, 1);
+    let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("execution spawned in time")
+        .expect("execution context received");
+    assert_eq!(ctx.task_id, task.id);
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(
+            &*db,
+            &task.id,
+            crate::workflow::default_roles::REVIEWER
+        )
+        .await
+        .expect("execution count loads"),
+        1
+    );
+}
+
 /// Attach an approved Charter so the Project becomes `charter_backed` and
 /// implementation Tasks derive their authority from that Charter.
 async fn make_project_charter_backed(db: &db::SqliteDb, project_id: &str) {
@@ -1741,6 +1900,36 @@ async fn make_project_charter_backed(db: &db::SqliteDb, project_id: &str) {
     let owner_id = new_uuid_v4();
     let charter_id = format!("{project_id}-charter");
     let revision_id = format!("{charter_id}-revision-1");
+    // The review contract recomputes this digest from the stored content, so a
+    // placeholder would fail admission before any role dispatches.
+    let charter_content = serde_json::json!({
+        "identity": {
+            "working_name": "Dispatch Charter",
+            "slug_proposal": "dispatch-charter",
+            "one_line_vision": "Keep charter-backed work dispatchable.",
+            "maturity": "mvp"
+        },
+        "problem_and_people": {
+            "problem_or_opportunity": "Charter-backed tasks must reach their worker.",
+            "target_users": ["Forge maintainers"]
+        },
+        "core_experience": {
+            "primary_outcome": "The dispatcher starts charter-backed work."
+        },
+        "scope": {
+            "must_have_outcomes": ["Dispatch charter-backed work."],
+            "explicit_non_goals": []
+        },
+        "success": {
+            "acceptance_statements": ["The configured worker receives the task."]
+        },
+        "constraints_and_risks": {},
+        "knowledge_ledger": {"items": []}
+    });
+    let charter_typed: api_types::ProjectCharterContent =
+        serde_json::from_value(charter_content.clone()).expect("fixture Charter content is valid");
+    let charter_digest = crate::project_orchestration::charter_content_digest(&charter_typed);
+    let charter_content_json = charter_content.to_string();
     sqlx::query(
         "INSERT OR IGNORE INTO user (id, email, password_hash, display_name, created_at, updated_at)
          VALUES (?, ?, 'test', NULL, ?, ?)",
@@ -1780,13 +1969,15 @@ async fn make_project_charter_backed(db: &db::SqliteDb, project_id: &str) {
              author_type, author_id, source_refs_json, content_digest,
              rendered_digest, created_at
          ) VALUES (?, ?, 1, 0, 'approved', 'forge.project-charter/v1',
-                   'forge.project-charter-render/v1', '{}', '# Project',
+                   'forge.project-charter-render/v1', ?, '# Project',
                    'dispatch quiescence fixture', 'user', ?, '[]',
-                   'dispatch-charter-content-digest', 'dispatch-charter-render-digest', ?)",
+                   ?, 'dispatch-charter-render-digest', ?)",
     )
     .bind(&revision_id)
     .bind(&charter_id)
+    .bind(&charter_content_json)
     .bind(&owner_id)
+    .bind(&charter_digest)
     .bind(&now)
     .execute(db.pool())
     .await

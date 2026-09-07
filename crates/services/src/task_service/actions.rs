@@ -37,6 +37,66 @@ pub struct TaskActionResult {
 }
 
 impl TaskService {
+    /// Cancel a healthy or stopped non-terminal Task through the Project's
+    /// currently bound Project Agent. The Project is host-derived, so a Task
+    /// from another Project is indistinguishable from a missing Task here.
+    pub async fn perform_project_agent_cancel(
+        &self,
+        project_id: &str,
+        task_id: impl Into<String>,
+        reason: String,
+        expected_task_version: i64,
+        project_agent_identity_id: &str,
+    ) -> Result<TaskActionResult> {
+        let task_id = task_id.into();
+        validate_required("task_id", &task_id)?;
+        let reason = reason.trim();
+        validate_required("reason", reason)?;
+        let binding = ProjectAgentBindingRepo::get_active_project_binding(&*self.db, project_id)
+            .await?
+            .filter(|binding| {
+                binding.state == "active"
+                    && binding.identity_id.as_deref() == Some(project_agent_identity_id)
+            })
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "Task cancellation requires the Project's currently configured Project Agent",
+                )
+            })?;
+        debug_assert_eq!(
+            binding.identity_id.as_deref(),
+            Some(project_agent_identity_id)
+        );
+        let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
+            .await?
+            .filter(|task| task.project_id == project_id)
+            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        let project = ProjectRepo::get_by_id(&*self.db, project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
+        let actor = Actor::agent(project_agent_identity_id);
+        let workflow =
+            WorkflowEngine::resolve_workflow_for_task(&task, &project.workflow_definition, &actor);
+
+        // An exact retry after a response loss should observe the requested
+        // end state as success even though cancellation incremented version.
+        if cancellation_target(&workflow).is_some_and(|target| target == task.status) {
+            return Ok(TaskActionResult {
+                task,
+                action: TaskAction::Cancel,
+            });
+        }
+
+        self.perform_task_action_as(
+            task_id,
+            TaskAction::Cancel,
+            Some(reason.to_owned()),
+            Some(expected_task_version),
+            actor,
+        )
+        .await
+    }
+
     /// Accept or reject a human-required review through the Project's bound
     /// Project Agent. The caller supplies the server-derived Project scope;
     /// this method rejects cross-Project Tasks before exposing their state.
@@ -290,7 +350,15 @@ impl TaskService {
                     .await?
                 }
             }
-            TaskAction::Cancel => self.cancel_task_as(task.id.clone(), actor).await?,
+            TaskAction::Cancel => {
+                self.cancel_task_at_version_as(
+                    task.id.clone(),
+                    transition_version,
+                    transition_reason,
+                    actor,
+                )
+                .await?
+            }
         };
 
         Ok(TaskActionResult {

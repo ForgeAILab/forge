@@ -35,7 +35,7 @@ use tower::ServiceExt;
 const FIRST_EXECUTOR_SESSION_ID: &str = "44444444-4444-4444-8444-444444444444";
 
 #[tokio::test]
-async fn ci_failure_on_re_review_clears_review_passed_at_and_blocks_task() {
+async fn ci_failure_after_merge_invalidates_review_and_surfaces_recovery_before_second_reviewer() {
     let repo_dir = common::TestDir::new("forge-ci-re-review-repo");
     let repo_path = setup_git_repo(repo_dir.path());
 
@@ -110,8 +110,8 @@ async fn ci_failure_on_re_review_clears_review_passed_at_and_blocks_task() {
 
     let follow_up_task = poll_until_merge_fix_dispatched(&harness.app, &created_task.id).await;
     assert!(
-        follow_up_task.review_passed_at.is_some(),
-        "initial auditor pass should set review_passed_at before merge-fix follow-up"
+        follow_up_task.review_passed_at.is_none(),
+        "a merge that cannot integrate the exact reviewed commit must invalidate the prior pass"
     );
 
     set_auditor_review_config(&harness, &created_task.id, &auditor_agent.id, "false").await;
@@ -121,7 +121,7 @@ async fn ci_failure_on_re_review_clears_review_passed_at_and_blocks_task() {
     let mut last_task = None;
     let task = loop {
         if start.elapsed() > std::time::Duration::from_secs(30) {
-            panic!("timed out waiting for blocked metadata to be set; last task: {last_task:?}");
+            panic!("timed out waiting for review recovery metadata; last task: {last_task:?}");
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let t: TaskResponse = empty_request(
@@ -131,33 +131,41 @@ async fn ci_failure_on_re_review_clears_review_passed_at_and_blocks_task() {
             StatusCode::OK,
         )
         .await;
-        if t.blocked.is_some() {
+        if t.workflow_exception
+            .as_ref()
+            .is_some_and(|exception| exception.exception_type == "review_failed")
+            && t.execution_observability.active_execution_id.is_none()
+            && t.execution_observability.execution_count >= 4
+        {
             break t;
         }
         last_task = Some(t);
     };
     assert_eq!(
         task.review_passed_at, None,
-        "CI-only re-review failure must clear review_passed_at"
+        "the failed fresh review must leave the invalidated pass cleared"
     );
-    let blocked = task
-        .blocked
+    let exception = task
+        .workflow_exception
         .as_ref()
-        .expect("task should have blocked metadata");
-    assert!(
-        blocked.kind == Some(api_types::FailureKind::CiFailed),
-        "blocked metadata should describe CI failure; got {:?}",
-        blocked
+        .expect("task should expose review recovery actions");
+    assert_eq!(task.status, "review");
+    assert_eq!(
+        exception
+            .failing_step
+            .as_ref()
+            .and_then(|step| step.command.as_deref()),
+        Some("false")
     );
 
     let executions = executions_for_task(&harness.app, &created_task.id).await;
     assert_eq!(
         executions
             .iter()
-            .filter(|execution| execution.role == "reviewer")
+            .filter(|execution| matches!(execution.role.as_str(), "reviewer" | "auditor"))
             .count(),
         1,
-        "CI-only re-review should skip a second auditor execution"
+        "fresh-review CI failure should stop before dispatching a second auditor"
     );
 }
 
@@ -217,10 +225,7 @@ impl CodingExecutorAdapter for CiReReviewCodexAdapter {
         let executor_calls = Arc::clone(&self.executor_calls);
         let allow_follow_up = Arc::clone(&self.allow_follow_up);
         Box::pin(async move {
-            if ctx
-                .description
-                .contains("===REVIEW: FAIL: <short reason>===")
-            {
+            if common::is_conformance_review_prompt(&ctx.description) {
                 write_auditor_pass(&ctx).await?;
                 return Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
@@ -257,7 +262,10 @@ impl CodingExecutorAdapter for CiReReviewCodexAdapter {
                 while !allow_follow_up.load(Ordering::SeqCst) {
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
-                std::fs::write(worktree_path.join("file.txt"), "resolved\n")?;
+                std::fs::write(
+                    worktree_path.join("file.txt"),
+                    format!("resolved attempt {call_index}\n"),
+                )?;
                 run_git(&worktree_path, &["add", "-A"]);
                 run_git(&worktree_path, &["commit", "-m", "resolve merge conflict"]);
                 Ok(ExecutionResult {
@@ -295,7 +303,12 @@ async fn write_auditor_pass(ctx: &ExecutionContext) -> Result<(), ExecutorError>
         .write(
             LogKind::Assistant,
             LogStream::Main,
-            json!({ "text": "Looks good.\n===REVIEW: PASS===" }),
+            json!({
+                "text": common::passing_review_assessment(
+                    &ctx.description,
+                    Path::new(&ctx.worktree_path),
+                )
+            }),
         )
         .await?;
     Ok(())
@@ -439,6 +452,7 @@ async fn set_auditor_review_config(
     ci_step: &str,
 ) {
     let config = serde_json::to_string(&json!({
+        "retry_budgets": { "review": 1 },
         "review": {
             "auditor_agent_id": auditor_agent_id,
             "review_prompt": "Pass the initial auditor review.",
@@ -483,10 +497,7 @@ async fn poll_until_merge_fix_dispatched(app: &Router, task_id: &str) -> TaskRes
                     matches!(execution.role.as_str(), "coder" | "executor")
                         && execution.status == api_types::ExecutionStatus::Running
                 });
-        if matches!(task.status.as_str(), "merge_failed" | "in_progress")
-            && task.review_passed_at.is_some()
-            && has_running_merge_fix
-        {
+        if task.status == "merge_failed" && has_running_merge_fix {
             return task;
         }
         last_task = Some(task);

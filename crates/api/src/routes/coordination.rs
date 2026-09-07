@@ -536,6 +536,7 @@ pub async fn propose_task(
         "priority": request.priority,
         "task_type": task_type,
         "task_state_config": request.task_state_config,
+        "review_requirement_ids": request.review_requirement_ids,
         "merge_config": request.merge_config,
         "role_assignments": request.role_assignments,
         "governance": request.governance,

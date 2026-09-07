@@ -5,6 +5,9 @@ running first. By default, `forge-ctl` uses the server from the stored CLI
 login, then falls back to the server URL persisted by the last `forge` launch
 under the Forge data directory.
 
+`forge-ctl --version` reports the workspace release version, matching the
+`forge` server built from the same source checkout.
+
 ## Global flags
 
 ```text

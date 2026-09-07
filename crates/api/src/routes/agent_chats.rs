@@ -717,6 +717,7 @@ fn message_response(message: AgentChatMessage) -> AgentChatMessageResponse {
 }
 
 fn turn_response(job: AgentChatTurnJob) -> AgentChatTurnJobResponse {
+    let error = job.error_message.clone().or_else(|| job.error_code.clone());
     AgentChatTurnJobResponse {
         id: job.id,
         chat_id: job.chat_id,
@@ -738,7 +739,9 @@ fn turn_response(job: AgentChatTurnJob) -> AgentChatTurnJobResponse {
         lease_expires_at: job.leased_until,
         next_attempt_at: job.next_attempt_at,
         response_message_id: job.response_message_id,
-        error: job.error_message.or(job.error_code),
+        error_code: job.error_code,
+        error_message: job.error_message,
+        error,
         correlation_id: job.correlation_id,
         version: job.version,
         created_at: job.created_at,

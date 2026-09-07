@@ -17,10 +17,10 @@ use crate::operation_catalog::{
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_CHARTER_READ_OPERATION,
     PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
     PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
-    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_SKILL_SECTION_NAMES,
-    PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION,
-    TASK_EVIDENCE_OPERATION, TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION,
-    TASK_WORKLOG_OPERATION,
+    PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION,
+    PROJECT_SKILL_SECTION_NAMES, PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION,
+    TASK_ADAPTIVE_OPERATION, TASK_CANCEL_OPERATION, TASK_EVIDENCE_OPERATION,
+    TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION,
 };
 
 pub(crate) fn object_schema(properties: Value, required: &[&str]) -> Value {
@@ -352,6 +352,28 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
             ],
             "Setup-only Project Agent adoption Charter draft. The bound Project may have no current Charter; this creates an unapproved candidate only and cannot approve, attach, apply, or authorize execution.",
         ),
+        PROJECT_REVIEW_CONFIG_OPERATION => described_object_schema(
+            json!({
+                "action":{"const":"set_ci_steps"},
+                "expected_project_version":{"type":"integer","minimum":1,"description":"Copy the current Project version from project.current_state. A conflict returns the replacement value."},
+                "ci_steps":{
+                    "type":"array",
+                    "maxItems":16,
+                    "uniqueItems":true,
+                    "items":{"type":"string","minLength":1,"maxLength":2048},
+                    "description":"Deterministic repository-native commands required for each subsequent Task review. An empty array deliberately clears the defaults. This replaces ci_steps and preserves the Project's reviewer prompt and requirement policy."
+                },
+                "setup_steps":{
+                    "type":"array",
+                    "maxItems":16,
+                    "uniqueItems":true,
+                    "items":{"type":"string","minLength":1,"maxLength":2048},
+                    "description":"Optional commands that prepare each detached clean review checkout before ci_steps run, such as pnpm install --frozen-lockfile, npm ci, pip install -r requirements.txt, or bundle install. Omit to preserve the current setup_steps; send an empty array to clear them."
+                }
+            }),
+            &["action", "expected_project_version", "ci_steps"],
+            "Set the bound Project's default clean-checkout setup and independent review commands before proposing implementation Tasks. Read project.current_state first and preserve a non-empty user configuration unless the Project's repository or validation policy has materially changed. Setup commands run before checks when a Task next enters review; they do not retroactively rerun a completed review.",
+        ),
         PROJECT_DOCUMENT_OPERATION => {
             let document_kinds = json!({
                 "type":"string",
@@ -497,10 +519,11 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
                 "milestone_id":string_or_null_schema(),
                 "capability_class":string_or_null_schema(),
                 "risk_class":string_or_null_schema(),
+                "review_requirement_ids":{"type":"array","items":{"type":"string","minLength":1},"description":"Exact non-universal requirement IDs from the approved Charter that this Task owns, copied verbatim from selectable_review_requirements in the project.charter read. Do not construct these strings: an ID that does not match the catalog exactly is rejected and no Task is created. Task acceptance, linked-Document acceptance, and universal Project exclusions/non-claims are included automatically."},
                 "depends_on_task_ids":string_array_schema()
             }),
-            &["action", "title"],
-            "Create one Task in the authenticated Project scope. The server binds the current approved Charter, optional traceability references, permissions, and Task workflow state.",
+            &["action", "title", "review_requirement_ids"],
+            "Create one Task in the authenticated Project scope. The server binds the current approved Charter, optional traceability references, permissions, and Task workflow state. review_requirement_ids is an explicit ownership decision: list only non-universal Charter requirements this Task directly owns, or use [] when it owns none. Copy each ID verbatim from selectable_review_requirements in the project.charter read rather than constructing it. Project-wide completion is evaluated at milestone readiness.",
         ),
         TASK_RECOVER_OPERATION => described_object_schema(
             json!({
@@ -541,6 +564,16 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
             }),
             &["task_id", "decision", "expected_task_version"],
             "Accept or reject an exact human-required Task review in the bound Project. This uses the normal Task workflow, version, CI, and evidence checks and cannot review another Project.",
+        ),
+        TASK_CANCEL_OPERATION => described_object_schema(
+            json!({
+                "action":{"const":"cancel"},
+                "task_id":{"type":"string","minLength":1},
+                "expected_task_version":{"type":"integer","minimum":1},
+                "reason":{"type":"string","minLength":1,"description":"Why this Task is no longer needed or should stop."}
+            }),
+            &["action", "task_id", "expected_task_version", "reason"],
+            "Cancel one non-terminal Task in the bound Project at an exact version. This is valid for healthy queued or running work and uses the normal Task cancellation lifecycle, including stopping active executions. Use task.recover only when stopped work should continue.",
         ),
         TASK_ADAPTIVE_OPERATION => {
             let child = object_schema(
@@ -856,9 +889,22 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
             "reason (required: state what stopped it); ",
             "action (required: \"resume_session\", \"reexecute\", \"reset_to_initial\", ",
             "\"reset_retry_window\", or \"cancel_task\"). ",
-            "Use cancel_task for a Task that cannot succeed as specified — a read-only ",
-            "task_type whose work needs repository writes will fail every retry, and ",
-            "cancelling it is the remedy rather than proposing a duplicate."
+            "Use this to restart work that stopped for a transient reason — an expired ",
+            "lease, a lost runtime, a dispatch race — rather than proposing a duplicate ",
+            "Task. A Task that cannot succeed as specified, such as a read-only task_type ",
+            "whose work needs repository writes, will fail every retry: stop it rather ",
+            "than duplicating it. Prefer versioned `task.cancel` for stopping a ",
+            "non-terminal Task; `cancel_task` here ends one whose outcome no longer needs ",
+            "a run at all, such as a verification-shaped Task you absorbed by settling ",
+            "its checks yourself."
+        ));
+    }
+    if operations.contains(TASK_CANCEL_OPERATION) {
+        lines.push(concat!(
+            "task.cancel — cancel one healthy or stopped non-terminal Task in the bound Project. ",
+            "Fields: action (required: \"cancel\"), task_id, expected_task_version, and a ",
+            "non-empty reason (all required). Forge stops active executions and applies the ",
+            "normal Task cancellation transition. Refresh and retry on a version conflict."
         ));
     }
     if lines.is_empty() {
@@ -881,6 +927,7 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
 pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> Option<Value> {
     if !operations.contains("task.propose")
         && !operations.contains(TASK_ADAPTIVE_OPERATION)
+        && !operations.contains(TASK_CANCEL_OPERATION)
         && !operations.contains(TASK_RECOVER_OPERATION)
     {
         return None;
@@ -917,18 +964,19 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
         },
         "task_id": {
             "type": ["string", "null"],
-            "description": "task.recover: required Task id in this Project."
+            "description": "task.recover/task.cancel: required Task id in this Project."
         },
         "reason": {
             "type": ["string", "null"],
-            "description": "task.recover: required; state what stopped this Task."
+            "description": "task.recover/task.cancel: required explanation."
         },
         "action": {
             "type": ["string", "null"],
             "description": concat!(
                 "task.recover: required, one of \"resume_session\", \"reexecute\", ",
-                "\"reset_to_initial\", \"reset_retry_window\", \"cancel_task\". Also the ",
-                "task.adaptive action field."
+                "\"reset_to_initial\", \"reset_retry_window\", or \"cancel_task\". ",
+                "task.adaptive: \"split\", \"sequence\", or \"replace\". ",
+                "task.cancel: \"cancel\"."
             )
         },
         "capability_class": {
@@ -945,18 +993,16 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
             "description": "task.propose: optional accepted Task ids in this Project; every prerequisite must reach done before dispatch. Use this for implementation-before-verification ordering instead of narration."
         }
     });
-    if operations.contains(TASK_ADAPTIVE_OPERATION) {
-        properties["action"] = json!({
-            "type": ["string", "null"],
-            "description": "task.adaptive: split, sequence, or replace."
+    if operations.contains(TASK_ADAPTIVE_OPERATION) || operations.contains(TASK_CANCEL_OPERATION) {
+        properties["expected_task_version"] = json!({
+            "type": ["integer", "null"],
+            "description": "task.adaptive/task.cancel: Task version precondition."
         });
+    }
+    if operations.contains(TASK_ADAPTIVE_OPERATION) {
         properties["source_task_id"] = json!({
             "type": ["string", "null"],
             "description": "task.adaptive: source Task id in the bound Project."
-        });
-        properties["expected_task_version"] = json!({
-            "type": ["integer", "null"],
-            "description": "task.adaptive: source Task version precondition."
         });
         properties["expected_board_revision"] = json!({
             "type": ["integer", "null"],
@@ -1335,6 +1381,41 @@ mod tests {
         assert!(!properties.contains_key("charter_prose"));
     }
 
+    #[test]
+    fn task_proposal_requires_an_explicit_review_scope_decision() {
+        let schema = orchestration_payload_schema(TASK_PROPOSE_OPERATION);
+        assert!(
+            schema["required"]
+                .as_array()
+                .expect("required fields")
+                .iter()
+                .any(|field| field == "review_requirement_ids")
+        );
+        assert_eq!(
+            schema["properties"]["review_requirement_ids"]["type"],
+            "array"
+        );
+    }
+
+    #[test]
+    fn project_review_config_replaces_a_bounded_ci_step_list() {
+        let schema = orchestration_payload_schema(PROJECT_REVIEW_CONFIG_OPERATION);
+        assert_eq!(schema["properties"]["action"]["const"], "set_ci_steps");
+        assert_eq!(schema["properties"]["ci_steps"]["maxItems"], 16);
+        assert_eq!(schema["properties"]["ci_steps"]["uniqueItems"], true);
+        assert_eq!(schema["properties"]["setup_steps"]["maxItems"], 16);
+        assert_eq!(schema["properties"]["setup_steps"]["uniqueItems"], true);
+        for required in ["action", "expected_project_version", "ci_steps"] {
+            assert!(
+                schema["required"]
+                    .as_array()
+                    .expect("required fields")
+                    .iter()
+                    .any(|field| field == required)
+            );
+        }
+    }
+
     /// An operation constant that is not imported becomes a binding pattern in
     /// `match`, silently swallowing every arm after it -- the payload schema
     /// for one operation is then served for all of them. Rust only warns. This
@@ -1344,10 +1425,12 @@ mod tests {
     fn every_operation_resolves_its_own_payload_schema() {
         let cases = [
             (TASK_ADAPTIVE_OPERATION, "split"),
+            (TASK_CANCEL_OPERATION, "cancel"),
             (TASK_RECOVER_OPERATION, "resume_session"),
             (TASK_WORKLOG_OPERATION, "append"),
             (TASK_EVIDENCE_OPERATION, "capture"),
             (PROJECT_VALIDATION_OPERATION, "record"),
+            (PROJECT_REVIEW_CONFIG_OPERATION, "set_ci_steps"),
         ];
         for (operation, expected_action) in cases {
             let schema = orchestration_payload_schema(operation);
@@ -1406,5 +1489,32 @@ mod tests {
         assert!(properties.get("action").is_some());
         assert!(properties.get("source_task_id").is_some());
         assert!(properties.get("ordered_task_ids").is_some());
+    }
+
+    #[test]
+    fn combined_task_command_action_guidance_names_every_discriminator() {
+        let operations = [
+            TASK_ADAPTIVE_OPERATION.to_owned(),
+            TASK_CANCEL_OPERATION.to_owned(),
+            TASK_RECOVER_OPERATION.to_owned(),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let properties = coordination_payload_properties(&operations).expect("flat properties");
+        let action_description = properties["action"]["description"]
+            .as_str()
+            .expect("action guidance");
+
+        for discriminator in [
+            "task.recover: required",
+            "\"resume_session\"",
+            "task.adaptive: \"split\", \"sequence\", or \"replace\"",
+            "task.cancel: \"cancel\"",
+        ] {
+            assert!(
+                action_description.contains(discriminator),
+                "combined action guidance must name {discriminator}: {action_description}"
+            );
+        }
     }
 }

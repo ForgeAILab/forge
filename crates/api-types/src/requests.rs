@@ -44,6 +44,11 @@ pub struct UpdateTaskRequest {
     pub merge_config: Option<Value>,
     pub plan: Option<String>,
     pub task_state_config: Option<Value>,
+    /// Replace the exact non-universal Charter requirements owned by this
+    /// Task. `None` preserves the current scope; an explicit empty list clears
+    /// it. The server validates every ID against the current approved Charter.
+    #[serde(default)]
+    pub review_requirement_ids: Option<Vec<String>>,
     #[serde(default)]
     pub parent_task_id: Option<Option<String>>,
     pub version: i64,

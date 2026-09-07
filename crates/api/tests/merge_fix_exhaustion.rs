@@ -169,8 +169,8 @@ async fn merge_fix_budget_exhaustion_blocks_after_second_conflict() {
         "merge-fix exhaustion should block at the merge gate"
     );
     assert!(
-        blocked.review_passed_at.is_some(),
-        "review_passed_at remains set after merge-fix exhaustion"
+        blocked.review_passed_at.is_none(),
+        "merge-fix exhaustion must not retain a pass for an unintegrated commit"
     );
 
     let final_executions = executions_for_task(&harness.app, &created_task.id).await;
@@ -194,8 +194,8 @@ async fn merge_fix_budget_exhaustion_blocks_after_second_conflict() {
                     && review_auditor_verdict(review) != Some("pass_ci_only".to_owned())
             })
             .count(),
-        1,
-        "exactly one reviewer-backed pass review row should exist"
+        2,
+        "each candidate presented to the merge gate must have its own reviewer-backed pass"
     );
     assert_eq!(
         reviews
@@ -205,8 +205,8 @@ async fn merge_fix_budget_exhaustion_blocks_after_second_conflict() {
                     && review_auditor_verdict(review) == Some("pass_ci_only".to_owned())
             })
             .count(),
-        1,
-        "merge-fix re-review should record one CI-only pass row"
+        0,
+        "merge retry cannot reuse a pass after the merge gate invalidates it"
     );
 
     let transition_logs = db::TransitionLogRepo::list_by_task(&*harness.state.db, &created_task.id)
@@ -274,7 +274,7 @@ impl CodingExecutorAdapter for MergeConflictCodexAdapter {
         let resolve_follow_up = self.resolve_follow_up;
         let conflict_prepared = Arc::clone(&self.conflict_prepared);
         Box::pin(async move {
-            if ctx.description.contains("===REVIEW: PASS===") {
+            if common::is_conformance_review_prompt(&ctx.description) {
                 write_auditor_pass(&ctx).await?;
                 return Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
@@ -348,7 +348,12 @@ async fn write_auditor_pass(ctx: &ExecutionContext) -> Result<(), ExecutorError>
         .write(
             LogKind::Assistant,
             LogStream::Main,
-            json!({ "text": "Looks good.\n===REVIEW: PASS===" }),
+            json!({
+                "text": common::passing_review_assessment(
+                    &ctx.description,
+                    Path::new(&ctx.worktree_path),
+                )
+            }),
         )
         .await?;
     Ok(())

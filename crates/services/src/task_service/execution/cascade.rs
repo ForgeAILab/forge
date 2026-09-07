@@ -391,6 +391,16 @@ impl TaskService {
         guard: &str,
         reason: &str,
     ) -> Result<()> {
+        let mut recovery_actions = vec![
+            api_types::RecoveryAction::Reexecute,
+            api_types::RecoveryAction::CancelTask,
+        ];
+        if self
+            .resume_session_recovery_available(task, execution)
+            .await?
+        {
+            recovery_actions.insert(0, api_types::RecoveryAction::ResumeSession);
+        }
         let annotation = api_types::TaskBlockingAnnotation {
             annotation_type: api_types::FailureKind::WorkflowGuardRejected,
             blocking_reason: guard.to_owned(),
@@ -406,11 +416,7 @@ impl TaskService {
             }),
             message: Some(reason.to_owned()),
             hook: None,
-            recovery_actions: vec![
-                api_types::RecoveryAction::ResumeSession,
-                api_types::RecoveryAction::Reexecute,
-                api_types::RecoveryAction::CancelTask,
-            ],
+            recovery_actions,
         };
         let annotation = serde_json::to_string(&annotation).map_err(|error| {
             ServiceError::invalid_operation(format!(
@@ -739,12 +745,24 @@ impl TaskService {
             }
         }
 
+        self.block_task_after_executor_failure(&task, execution)
+            .await
+    }
+
+    pub(in crate::task_service) async fn block_task_after_executor_failure(
+        &self,
+        task: &Task,
+        execution: &Execution,
+    ) -> Result<()> {
         let mut recovery_actions = vec![
             api_types::RecoveryAction::Reexecute,
             api_types::RecoveryAction::ResetToInitial,
             api_types::RecoveryAction::CancelTask,
         ];
-        if execution.agent_session_id.is_some() {
+        if self
+            .resume_session_recovery_available(task, execution)
+            .await?
+        {
             recovery_actions.insert(0, api_types::RecoveryAction::ResumeSession);
         }
         let annotation = api_types::TaskBlockingAnnotation {
@@ -827,6 +845,37 @@ impl TaskService {
             },
         });
         Ok(())
+    }
+
+    /// A resume action is useful only when the stopped execution can pass the
+    /// same identity/role checks as the WorkspaceLease it will request.  Keep
+    /// impossible actions out of the durable annotation instead of inviting a
+    /// coordinator to call a recovery route that is guaranteed to fail.
+    pub(super) async fn resume_session_recovery_available(
+        &self,
+        task: &Task,
+        execution: &Execution,
+    ) -> Result<bool> {
+        let (Some(agent_id), Some(_session_id), Some(_snapshot)) = (
+            execution.agent_id.as_deref(),
+            execution.agent_session_id.as_deref(),
+            execution.executor_config_snapshot_json.as_deref(),
+        ) else {
+            return Ok(false);
+        };
+
+        if let Some(assignment) =
+            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, &execution.role)
+                .await?
+        {
+            return Ok(assignment.assignee_type == Some(AssigneeKind::Agent)
+                && assignment.assignee_id.as_deref() == Some(agent_id));
+        }
+
+        // Legacy Tasks may predate role-assignment rows.  Their task-level
+        // assignee remains the scheduler's authority fallback.
+        Ok(task.assignee_type.as_deref() == Some("agent")
+            && task.assignee_id.as_deref() == Some(agent_id))
     }
 
     async fn maybe_schedule_execution_retry(
@@ -950,6 +999,31 @@ impl TaskService {
             .ensure_current_review_for_reviewer(&task.id, &execution.id)
             .await?;
         if review.execution_id == execution.id && review.status != ReviewStatus::Running {
+            if review.status == ReviewStatus::Failed
+                && (task.blocked_json.is_some()
+                    || task.failed_json.is_some()
+                    || task.error_annotation.is_some())
+            {
+                tracing::debug!(
+                    task_id = %task.id,
+                    execution_id = %execution.id,
+                    review_id = %review.id,
+                    "failed reviewer completion already produced a durable task disposition"
+                );
+                return Ok(());
+            }
+            if matches!(review.status, ReviewStatus::Passed | ReviewStatus::Failed) {
+                tracing::warn!(
+                    task_id = %task.id,
+                    execution_id = %execution.id,
+                    review_id = %review.id,
+                    status = %review.status,
+                    "review outcome was committed without its task cascade; reconciling"
+                );
+                return self
+                    .reconcile_settled_reviewer_completion(&task, execution, &review)
+                    .await;
+            }
             tracing::debug!(
                 task_id = %task.id,
                 execution_id = %execution.id,
@@ -966,23 +1040,63 @@ impl TaskService {
         }
         let user_approval_required = self.gate_requires_user_approval(&task).await?;
         let final_message = reviewer_final_message(execution).await?;
-        let (status, auditor_details) = match ::review::auditor::parse_verdict(&final_message) {
-            ::review::auditor::AuditorVerdict::Passed if user_approval_required => {
-                (ReviewStatus::AwaitingHuman, json!({ "verdict": "pass" }))
+        let conformance = match execution.workspace_id.as_deref() {
+            Some(id) => {
+                let workspace = WorkspaceRepo::get_by_id(&*self.db, id)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("workspace", id.to_owned()))?;
+                ::review::contract::evaluate(
+                    &self.db,
+                    &execution.id,
+                    std::path::Path::new(&workspace.worktree_path),
+                    &final_message,
+                )
+                .await
             }
-            ::review::auditor::AuditorVerdict::Passed => {
-                (ReviewStatus::Passed, json!({ "verdict": "pass" }))
-            }
-            ::review::auditor::AuditorVerdict::Failed { reason } => (
-                ReviewStatus::Failed,
-                json!({ "verdict": "fail", "reason": reason }),
-            ),
+            None => Err("review execution has no workspace evidence".to_owned()),
         };
+        let conformance = match conformance {
+            // A structurally valid assessment is a terminal review outcome even
+            // when some claims remain unverified. Preserve it and route the
+            // Task through normal review remediation. Only a response that
+            // could not be bound to the contract is an execution/protocol
+            // failure eligible for reviewer retry.
+            Ok(result)
+                if result.status != api_types::ConformanceStatus::Unverified
+                    || result.assessment.is_some() =>
+            {
+                result
+            }
+            result => {
+                let reason = match result {
+                    Ok(result) => result
+                        .reason
+                        .unwrap_or_else(|| "review conformance is unverified".to_owned()),
+                    Err(reason) => reason,
+                };
+                let mut failed = execution.clone();
+                failed.error = Some(reason);
+                return self
+                    .fail_review_for_reviewer_execution_exit(&task, &failed, review)
+                    .await;
+            }
+        };
+        let passed = conformance.status == api_types::ConformanceStatus::Passed;
+        let status = if passed && user_approval_required {
+            ReviewStatus::AwaitingHuman
+        } else if passed {
+            ReviewStatus::Passed
+        } else {
+            ReviewStatus::Failed
+        };
+        let auditor_details = json!({ "verdict": if passed { "pass" } else { "fail" }, "reason": conformance.reason });
         let comment = reviewer_comment(status.clone(), review.attempt_number, &final_message);
 
         let finished_at = now_rfc3339();
         let mut review_details = normalize_review_details(&review.step_results_json);
         review_details["auditor"] = auditor_details;
+        review_details["conformance"] = serde_json::to_value(&conformance)
+            .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
         if status == ReviewStatus::AwaitingHuman {
             review_details["user_approval"] = json!({
                 "status": "awaiting_human",
@@ -1089,6 +1203,53 @@ impl TaskService {
         Ok(())
     }
 
+    async fn reconcile_settled_reviewer_completion(
+        &self,
+        task: &Task,
+        execution: &Execution,
+        review: &Review,
+    ) -> Result<()> {
+        let now = now_rfc3339();
+        match review.status {
+            ReviewStatus::Passed => {
+                let task = if task.review_passed_at.is_some() {
+                    task.clone()
+                } else {
+                    TaskRepo::set_review_passed_at(
+                        &*self.db,
+                        &task.id,
+                        Some(review.finished_at.clone().unwrap_or_else(|| now.clone())),
+                        &now,
+                    )
+                    .await?
+                };
+                self.cascade_completed_review_task(
+                    &task,
+                    crate::workflow::default_states::MERGING,
+                    "review passed",
+                    false,
+                )
+                .await
+            }
+            ReviewStatus::Failed => {
+                let task = if task.review_passed_at.is_none() {
+                    task.clone()
+                } else {
+                    TaskRepo::set_review_passed_at(&*self.db, &task.id, None, &now).await?
+                };
+                let (task, target, reason) = self
+                    .review_failure_target(&task, Some(&execution.id))
+                    .await?;
+                if let Some(target) = target {
+                    self.cascade_completed_review_task(&task, &target, &reason, true)
+                        .await?;
+                }
+                Ok(())
+            }
+            ReviewStatus::Running | ReviewStatus::AwaitingHuman | ReviewStatus::Cancelled => Ok(()),
+        }
+    }
+
     async fn fail_review_for_reviewer_execution_exit(
         &self,
         task: &Task,
@@ -1102,12 +1263,83 @@ impl TaskService {
             "verdict": "fail",
             "reason": reason,
         });
+        if let Some(conformance) =
+            db::ReviewConformanceRepo::review_conformance(&*self.db, &execution.id).await?
+        {
+            review_details["conformance"] = serde_json::to_value(conformance)
+                .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+        }
         review_details["execution"] = json!({
             "id": execution.id,
             "status": execution.status.to_string(),
             "stop_reason": execution.stop_reason.as_ref().map(ToString::to_string),
             "error": execution.error.as_deref(),
         });
+
+        // Duplicate terminal delivery for an execution whose retry was
+        // already scheduled must be inert.  The review intentionally remains
+        // Running while the replacement attempt is pending, so review status
+        // alone cannot provide this idempotency guard.
+        if review_details
+            .pointer("/execution_retry/execution_id")
+            .and_then(Value::as_str)
+            == Some(execution.id.as_str())
+        {
+            return Ok(());
+        }
+
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            task,
+            &project.workflow_definition,
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
+        );
+        let current_state = workflow
+            .states
+            .iter()
+            .find(|state| state.name == task.status);
+        if self
+            .maybe_schedule_execution_retry(
+                execution,
+                task,
+                current_state.map(|state| &state.config),
+                current_state.and_then(|state| state.gate_config.as_ref()),
+            )
+            .await?
+        {
+            review_details["execution_retry"] = json!({
+                "execution_id": execution.id,
+                "status": "scheduled",
+                "scheduled_at": finished_at.clone(),
+            });
+            let updated_review = ReviewRepo::update_status(
+                &*self.db,
+                &review.id,
+                ReviewStatus::Running,
+                review_details.to_string(),
+                None,
+                &finished_at,
+            )
+            .await?;
+            self.publish_domain_event_by_dedupe(&format!(
+                "review-status:{}:{}:{}",
+                updated_review.id, updated_review.status, finished_at
+            ))
+            .await;
+            self.publish_reviewer_comment(
+                execution,
+                &task.id,
+                format!(
+                    "Reviewer execution {} failed; an automatic retry was scheduled",
+                    execution.id
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+
         let updated_review = ReviewRepo::update_status(
             &*self.db,
             &review.id,
@@ -1152,31 +1384,8 @@ impl TaskService {
         )
         .await?;
 
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &api_types::Actor::system(api_types::SystemComponent::Workflow),
-        );
-        let current_state = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status);
-        if self
-            .maybe_schedule_execution_retry(
-                execution,
-                &task,
-                current_state.map(|state| &state.config),
-                current_state.and_then(|state| state.gate_config.as_ref()),
-            )
-            .await?
-        {
-            return Ok(());
-        }
-
-        Ok(())
+        self.block_task_after_executor_failure(&task, execution)
+            .await
     }
 
     async fn ensure_current_review_for_reviewer(
@@ -1239,7 +1448,7 @@ impl TaskService {
         }
     }
 
-    async fn review_failure_target(
+    pub(crate) async fn review_failure_target(
         &self,
         task: &Task,
         execution_id: Option<&str>,
@@ -1494,7 +1703,7 @@ impl TaskService {
         )))
     }
 
-    async fn cascade_completed_review_task(
+    pub(crate) async fn cascade_completed_review_task(
         &self,
         task: &Task,
         target: &str,
@@ -1631,12 +1840,16 @@ async fn reviewer_final_message(execution: &Execution) -> Result<String> {
                 continue;
             };
             if entry.kind == executors::LogKind::Assistant {
-                append_reviewer_log_text(&entry.payload, &mut message);
+                let mut candidate = String::new();
+                append_reviewer_log_text(&entry.payload, &mut candidate);
+                if !candidate.trim().is_empty() {
+                    message = candidate;
+                }
             } else if entry.kind == executors::LogKind::SessionInfo
                 && entry.payload.get("subtype").and_then(Value::as_str) == Some("success")
             {
                 if let Some(result) = entry.payload.get("result").and_then(Value::as_str) {
-                    message.push_str(result);
+                    message = result.to_owned();
                 }
             } else if entry.kind == executors::LogKind::Stdout {
                 if let Some(line) = entry.payload.get("line").and_then(Value::as_str) {
@@ -1743,24 +1956,19 @@ fn reviewer_comment(status: ReviewStatus, attempt_number: i64, final_message: &s
         }
         _ => format!("Review updated (attempt {attempt_number})"),
     };
-    let cleaned = strip_review_verdict_marker(final_message).trim().to_owned();
-    if cleaned.is_empty() {
+    let Ok(report) = serde_json::from_str::<api_types::ReviewAssessment>(final_message) else {
+        return fallback;
+    };
+    let findings = report
+        .findings
+        .iter()
+        .map(|f| format!("Expected {}; actual {}", f.expected, f.actual))
+        .collect::<Vec<_>>();
+    if findings.is_empty() {
         fallback
     } else {
-        cleaned
+        format!("{fallback}\n\n{}", findings.join("\n"))
     }
-}
-
-fn strip_review_verdict_marker(message: &str) -> String {
-    let mut cleaned = message.replace("===REVIEW: PASS===", "");
-    while let Some(start) = cleaned.find("===REVIEW: FAIL: ") {
-        let Some(relative_end) = cleaned[start + "===REVIEW: FAIL: ".len()..].find("===") else {
-            break;
-        };
-        let end = start + "===REVIEW: FAIL: ".len() + relative_end + "===".len();
-        cleaned.replace_range(start..end, "");
-    }
-    cleaned
 }
 
 #[cfg(test)]
@@ -1868,14 +2076,14 @@ mod reviewer_message_tests {
     }
 
     #[test]
-    fn reviewer_comment_uses_clean_final_message() {
+    fn reviewer_comment_summarizes_structured_findings() {
         let comment = reviewer_comment(
             ReviewStatus::Passed,
             1,
-            "No blocking issues found.\n===REVIEW: PASS===",
+            r#"{"contract_digest":"digest","verdict":"pass","requirements":[],"findings":[]}"#,
         );
 
-        assert_eq!(comment, "No blocking issues found.");
+        assert_eq!(comment, "Review passed (attempt 1)");
     }
 
     #[test]

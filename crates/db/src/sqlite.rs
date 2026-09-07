@@ -58,6 +58,10 @@ use crate::{
     UpsertProjectProvisioningCheckpoint, Workspace, WorkspaceLease, WorkspaceLeaseRepo,
     WorkspaceRepo, WorkspaceStatus,
 };
+use crate::{
+    AppliedProjectReviewConfigCommand, ApplyProjectReviewConfigCommand,
+    ProjectReviewConfigCommandRepo,
+};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
@@ -99,6 +103,7 @@ mod project_execution_setup;
 mod project_hook_run;
 mod project_member;
 mod project_provisioning;
+mod project_review_config;
 mod provider_authorization;
 mod repo;
 mod review;

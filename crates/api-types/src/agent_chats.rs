@@ -240,6 +240,11 @@ pub struct AgentChatTurnJobResponse {
     pub lease_expires_at: Option<String>,
     pub next_attempt_at: Option<String>,
     pub response_message_id: Option<String>,
+    /// Stable machine-readable reason for the latest failed attempt.
+    pub error_code: Option<String>,
+    /// Bounded provider/runtime detail for the latest failed attempt.
+    pub error_message: Option<String>,
+    /// Human-facing fallback retained for clients that need one line.
     pub error: Option<String>,
     pub correlation_id: String,
     /// Optimistic concurrency token for turn updates/cancellation.

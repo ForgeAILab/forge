@@ -100,6 +100,16 @@ impl TaskService {
                 "task_type must be task, planning_task, sub_task, or discovery",
             ));
         }
+        let review_requirement_ids =
+            super::update::review_requirement_ids_from_config(task_state_config.as_deref())?
+                .unwrap_or_default();
+        if effective_task_type == "discovery" && !review_requirement_ids.is_empty() {
+            return Err(ServiceError::invalid_operation(
+                "discovery Tasks cannot own Charter review requirements; describe the research deliverable in Task acceptance and record it in the worklog or Task evidence",
+            ));
+        }
+        self.validate_task_review_requirement_ids(&project, &review_requirement_ids)
+            .await?;
         if let (Some(parent_task_id), Some(requested_governance)) =
             (parent_task_id.as_deref(), governance.as_ref())
         {
