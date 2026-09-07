@@ -6,6 +6,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-07
+
 ### Breaking
 
 - Project Agent and REST Task proposals now require an explicit
@@ -208,6 +210,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - `forge-ctl` inherits the workspace version instead of reporting `0.2.0`.
 
 ## [0.9.3] - 2026-09-04
+
+> Prepared but never tagged: no `v0.9.3` release artifacts were published.
+> Everything below shipped to users as part of `0.10.0`.
 
 ### Breaking
 
