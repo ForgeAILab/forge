@@ -218,7 +218,7 @@ impl CodingExecutorAdapter for CursorAdapter {
                 agent_session_id: stream.agent_session_id,
                 summary: stream.summary,
                 error: None,
-                usage: None,
+                usage_reports: Vec::new(),
                 ..Default::default()
             });
         }
@@ -230,7 +230,7 @@ impl CodingExecutorAdapter for CursorAdapter {
                 agent_session_id: stream.agent_session_id,
                 summary: stream.summary,
                 error: Some(error),
-                usage: None,
+                usage_reports: Vec::new(),
                 ..Default::default()
             });
         }
@@ -242,7 +242,7 @@ impl CodingExecutorAdapter for CursorAdapter {
                 agent_session_id: stream.agent_session_id,
                 summary: stream.summary,
                 error: Some(cursor_run_error(status, &stream.stderr_tail)),
-                usage: None,
+                usage_reports: Vec::new(),
                 ..Default::default()
             });
         }
@@ -268,7 +268,7 @@ impl CodingExecutorAdapter for CursorAdapter {
             agent_session_id: stream.agent_session_id,
             summary: stream.summary,
             error: None,
-            usage: None,
+            usage_reports: Vec::new(),
             ..Default::default()
         })
     }

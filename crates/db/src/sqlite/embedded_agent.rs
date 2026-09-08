@@ -30,6 +30,23 @@ impl CredentialHandleRepo for SqliteDb {
             .transpose()
     }
 
+    async fn get_credential_handle_for_owner(
+        &self,
+        id: &str,
+        owner_user_id: &str,
+    ) -> Result<Option<CredentialHandle>> {
+        sqlx::query(
+            "SELECT * FROM credential_handle
+             WHERE id = ? AND owner_user_id = ?",
+        )
+        .bind(id)
+        .bind(owner_user_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(map_credential_handle)
+        .transpose()
+    }
+
     async fn list_credential_handles(&self, owner_user_id: &str) -> Result<Vec<CredentialHandle>> {
         sqlx::query(
             "SELECT * FROM credential_handle

@@ -10,10 +10,11 @@ use std::{
 };
 
 use api_types::{
-    AgentResponse, AgentStatus, CanonicalPhase, ClaimTaskRequest, CreateAgentRequest,
-    CreateProjectRequest, CreateRepoRequest, CreateTaskRequest, DaemonResponse,
-    ExecutionEvidenceSummary, PaginatedResponse, ProjectResponse, RepoResponse,
-    TaskExecutionObservability, TaskResponse, TaskType, WorkMode,
+    ActivityCounts, AgentResponse, AgentStatus, CanonicalPhase, ClaimTaskRequest, CostCoverage,
+    CostKind, CostSummary, CreateAgentRequest, CreateProjectRequest, CreateRepoRequest,
+    CreateTaskRequest, DaemonResponse, ExecutionEvidenceSummary, PaginatedResponse,
+    ProjectResponse, RepoResponse, TaskExecutionObservability, TaskResponse, TaskType,
+    TokenCounters, UsageAggregate, UsageCostCoverage, WorkMode,
 };
 use axum::{
     extract::{Path as AxumPath, State},
@@ -439,15 +440,9 @@ async fn create_agent_route(
         status: AgentStatus::Idle,
         active_task_count: Some(0),
         effective_status: Some("idle".to_owned()),
-        total_runs: 0,
         avg_duration_ms: None,
         success_rate: None,
-        total_input_tokens: 0,
-        total_output_tokens: 0,
-        total_cache_read_tokens: 0,
-        total_cache_write_tokens: 0,
-        total_tokens: 0,
-        total_cost_usd: None,
+        usage: empty_usage(),
         is_default: request.is_default.unwrap_or(false),
         paused: false,
         owner_id: None,
@@ -582,7 +577,19 @@ fn task_response(
         workflow_health: None,
         workflow_exception: None,
         execution_observability: TaskExecutionObservability {
-            execution_count: 0,
+            counts: ActivityCounts {
+                task_execution_count: 0,
+                chat_turn_count: 0,
+                inquiry_count: 0,
+                provider_attempt_count: 0,
+            },
+            tokens: TokenCounters {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            cost: empty_usage().cost,
             active_execution_id: None,
             active_role: None,
             active_started_at: None,
@@ -594,12 +601,6 @@ fn task_response(
             latest_stopped_at: None,
             latest_runtime_seconds: None,
             total_runtime_seconds: 0.0,
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            total_cache_read_tokens: 0,
-            total_cache_write_tokens: 0,
-            total_tokens: 0,
-            total_cost_usd: None,
         },
         task_state_config: None,
         review_passed_at: None,
@@ -614,6 +615,62 @@ fn task_response(
         version: 1,
         created_at: now(),
         updated_at: now(),
+    }
+}
+
+fn empty_usage() -> UsageAggregate {
+    UsageAggregate {
+        counts: ActivityCounts {
+            task_execution_count: 0,
+            chat_turn_count: 0,
+            inquiry_count: 0,
+            provider_attempt_count: 0,
+        },
+        tokens: TokenCounters {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        },
+        cost: CostSummary {
+            kind: CostKind::None,
+            coverage: CostCoverage::NoUsage,
+            provider_reported: None,
+            estimated: None,
+            known_subtotal: None,
+            complete_total: None,
+            usage_coverage: UsageCostCoverage {
+                total_runs_or_turns: 0,
+                pending_runs_or_turns: 0,
+                no_provider_call_runs_or_turns: 0,
+                fully_metered_runs_or_turns: 0,
+                fully_costed_runs_or_turns: 0,
+                partially_costed_runs_or_turns: 0,
+                unavailable_cost_runs_or_turns: 0,
+                total_provider_attempts: 0,
+                settled_provider_attempts: 0,
+                pending_provider_attempts: 0,
+                unsettled_provider_attempts: 0,
+                metered_provider_attempts: 0,
+                unmetered_provider_attempts: 0,
+                costed_provider_attempts: 0,
+                unpriced_provider_attempts: 0,
+                priced_tokens: TokenCounters {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                unpriced_tokens: TokenCounters {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                reasons: Vec::new(),
+            },
+            sources: Vec::new(),
+        },
     }
 }
 

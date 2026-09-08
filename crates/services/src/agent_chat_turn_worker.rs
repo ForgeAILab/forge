@@ -18,7 +18,7 @@ use db::{
     AgentChatMessageStatus, AgentChatRepo, AgentChatTransactionRepo, AgentChatTurnJob,
     AgentChatTurnJobRepo, AgentProfile, AgentProfileRepo, AgentRepo, AgentSession,
     CompleteAgentChatControlTransfer, CredentialHandleRepo, PageRequest, ProjectAgentBindingRepo,
-    ProjectRepo, SqliteDb,
+    ProjectRepo, SqliteDb, UsageInvocationLifecycle, UsageLedgerRepo,
 };
 use executors::{
     merge_overrides, ExecutionContext, ExecutionOutcome, ExecutionOverrides, ExecutionResult,
@@ -78,13 +78,18 @@ const MAX_ACTIVE_TURNS: usize = 32;
 const MAX_HISTORY: i64 = 100;
 const MAX_ERROR_CHARS: usize = 512;
 const MAX_CLI_ASSISTANT_CHARS: usize = 500;
+
+fn checked_duration_ms(duration: Duration) -> Result<i64> {
+    i64::try_from(duration.as_millis()).map_err(|_| {
+        ServiceError::invalid_operation("Agent Chat duration overflows the persisted range")
+    })
+}
 const PROJECT_HANDOFF_SCHEMA_VERSION: &str = "forge.project-charter-handoff/v1";
 const PROJECT_CONTEXT_DIGEST_SCHEMA_VERSION: &str = "forge.project-context-reference/v1";
 #[cfg(test)]
 const MAX_HANDOFF_BOUNDED_CHARS: usize = 12_000;
 const DELIVERY_FOLLOWUP_POSTCONDITION_FAILED: &str = "delivery_followup_postcondition_failed";
-const DELIVERY_FOLLOWUP_POSTCONDITION_MESSAGE: &str =
-    "Delivery follow-up returned without committing the acceptance-check result or readiness evaluation it owed";
+const DELIVERY_FOLLOWUP_POSTCONDITION_MESSAGE: &str = "Delivery follow-up returned without committing the acceptance-check result or readiness evaluation it owed";
 const DELIVERY_FOLLOWUP_VALIDATION_RETRY_INSTRUCTION: &str = r#"
 
 ## SERVER-OWNED DELIVERY FOLLOW-UP RETRY
@@ -526,6 +531,52 @@ pub trait AgentChatTurnRunner: Send + Sync {
         job: &AgentChatTurnJob,
         cancellation: CancellationToken,
     ) -> Result<CompletedAgentChatTurn>;
+
+    /// Validate immutable responder/scope authority before the accounting
+    /// ledger admits a provider attempt. Test doubles may use the default;
+    /// the production federated runner authenticates the frozen snapshot.
+    async fn validate_admission_authority(&self, _job: &AgentChatTurnJob) -> Result<()> {
+        Ok(())
+    }
+
+    /// Validate that the frozen backend can make a provider attempt before
+    /// the usage ledger creates its invocation. Test runners keep the default
+    /// so characterization tests can exercise the worker without a provider.
+    async fn validate_provider_availability(&self, _job: &AgentChatTurnJob) -> Result<()> {
+        Ok(())
+    }
+
+    /// Run one provider attempt while retaining every typed usage report the
+    /// adapter observed, including reports attached to a terminal failure.
+    /// The default keeps existing test doubles source-compatible.
+    async fn run_turn_with_usage(
+        &self,
+        job: &AgentChatTurnJob,
+        cancellation: CancellationToken,
+    ) -> AgentChatTurnRunOutcome {
+        match self.run_turn(job, cancellation).await {
+            Ok(turn) => AgentChatTurnRunOutcome::Completed {
+                turn,
+                usage_reports: Vec::new(),
+            },
+            Err(error) => AgentChatTurnRunOutcome::Failed {
+                error,
+                usage_reports: Vec::new(),
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum AgentChatTurnRunOutcome {
+    Completed {
+        turn: CompletedAgentChatTurn,
+        usage_reports: Vec<executors::UsageReport>,
+    },
+    Failed {
+        error: ServiceError,
+        usage_reports: Vec<executors::UsageReport>,
+    },
 }
 
 /// Narrow legacy CLI adapter for migrated Agent Chats. It deliberately uses a
@@ -627,9 +678,20 @@ impl CliAgentChatSessionBackend {
                 let _ = std::fs::remove_dir_all(&sandbox);
                 return Err(ServiceError::invalid_operation("Agent Chat CLI turn was cancelled"));
             }
-        }?;
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(error) if !error.usage_reports().is_empty() => ExecutionResult {
+                status: ExecutionOutcome::Failed,
+                error: Some(error.to_string()),
+                usage_reports: error.usage_reports().to_owned(),
+                ..ExecutionResult::default()
+            },
+            Err(error) => return Err(error.into()),
+        };
         let _ = std::fs::remove_dir_all(&sandbox);
-        Ok((result, started.elapsed().as_millis() as i64))
+        let duration_ms = checked_duration_ms(started.elapsed())?;
+        Ok((result, duration_ms))
     }
 }
 
@@ -639,6 +701,8 @@ pub struct FederatedAgentChatTurnRunner {
     embedded_agents: Arc<EmbeddedAgentService>,
     cli_backend: CliAgentChatSessionBackend,
     turn_logs: AgentChatTurnLogRoot,
+    observed_usage:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<executors::UsageReport>>>>,
 }
 
 impl fmt::Debug for FederatedAgentChatTurnRunner {
@@ -661,7 +725,26 @@ impl FederatedAgentChatTurnRunner {
             embedded_agents,
             cli_backend: CliAgentChatSessionBackend::new(cli_executor),
             turn_logs,
+            observed_usage: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    async fn remember_usage(&self, job_id: &str, reports: Vec<executors::UsageReport>) {
+        if reports.is_empty() {
+            return;
+        }
+        self.observed_usage
+            .lock()
+            .await
+            .insert(job_id.to_owned(), reports);
+    }
+
+    async fn take_usage(&self, job_id: &str) -> Vec<executors::UsageReport> {
+        self.observed_usage
+            .lock()
+            .await
+            .remove(job_id)
+            .unwrap_or_default()
     }
 
     /// The durable JSONL activity log for one turn attempt. Every runtime
@@ -805,6 +888,11 @@ impl FederatedAgentChatTurnRunner {
             expected_skill_key,
         ) = match chat.kind.as_str() {
             "account_main" => {
+                if chat.project_id.is_some() {
+                    return Err(ServiceError::invalid_operation(
+                        "Main Agent Chat unexpectedly has a Project scope",
+                    ));
+                }
                 let account_id = chat.account_id.as_deref().ok_or_else(|| {
                     ServiceError::invalid_operation("Main Agent Chat has no account scope")
                 })?;
@@ -836,6 +924,11 @@ impl FederatedAgentChatTurnRunner {
                 )
             }
             "project" => {
+                if chat.account_id.is_some() {
+                    return Err(ServiceError::invalid_operation(
+                        "Project Agent Chat unexpectedly has an account scope",
+                    ));
+                }
                 let project_id = chat.project_id.as_deref().ok_or_else(|| {
                     ServiceError::invalid_operation("Project Agent Chat has no Project scope")
                 })?;
@@ -1301,7 +1394,7 @@ impl FederatedAgentChatTurnRunner {
                             "server_owned_main_genesis_operating_skill",
                             "main_genesis_context",
                             &references,
-                        ),
+                        )?,
                     )
                 } else {
                     let active_genesis_id = if frozen_authority.is_some() {
@@ -1389,7 +1482,7 @@ impl FederatedAgentChatTurnRunner {
                             "server_owned_main_baseline_operating_skill",
                             "main_baseline_context",
                             &references,
-                        ),
+                        )?,
                     )
                 }
             }
@@ -1787,7 +1880,7 @@ impl FederatedAgentChatTurnRunner {
                 &setup_skill_revision_id,
                 &setup_skill_content_digest,
                 &context_references,
-            );
+            )?;
             return Ok(ProjectOperatingSkillSnapshot {
                 instruction,
                 context_sources,
@@ -2177,8 +2270,8 @@ impl FederatedAgentChatTurnRunner {
                             || recomputed_digest != receipt_payload_digest
                         {
                             return Err(ServiceError::invalid_operation(
-                            "Genesis Project admission receipt does not match its immutable handoff",
-                        ));
+                                "Genesis Project admission receipt does not match its immutable handoff",
+                            ));
                         }
                         let receipt_handoff_id = receipt_handoff_id.to_owned();
                         let historical_payload_hash = hash_parts(
@@ -2217,8 +2310,8 @@ impl FederatedAgentChatTurnRunner {
                             != Some(receipt_payload_digest.as_str())
                         {
                             return Err(ServiceError::invalid_operation(
-                            "Charter-adoption admission receipt does not match its consumed approval",
-                        ));
+                                "Charter-adoption admission receipt does not match its consumed approval",
+                            ));
                         }
                         (None, receipt_payload_digest, receipt_source_kind)
                     }
@@ -2677,7 +2770,7 @@ impl FederatedAgentChatTurnRunner {
             &binding_skill_revision_id,
             &skill_content_digest,
             &context_references,
-        );
+        )?;
         Ok(ProjectOperatingSkillSnapshot {
             instruction,
             context_sources,
@@ -2749,7 +2842,7 @@ impl FederatedAgentChatTurnRunner {
             };
         let turn_log = self.turn_log_sink(job).await;
         let started = std::time::Instant::now();
-        let output = self
+        let output = match self
             .embedded_agents
             .native_backend()
             .run_turn(
@@ -2797,15 +2890,100 @@ impl FederatedAgentChatTurnRunner {
                 turn_log,
             )
             .await
-            .map_err(|error| {
+        {
+            Ok(output) => output,
+            Err(forge_agent_host::AgentHostError::RuntimeWithUsage {
+                message,
+                usage_reports,
+            }) => {
+                let mapped = usage_reports
+                    .iter()
+                    .enumerate()
+                    .map(|(sequence, report)| {
+                        crate::chat_usage::usage_report_from_host(
+                            report,
+                            "chat",
+                            job.attempt_count.checked_sub(1).ok_or_else(|| {
+                                ServiceError::invalid_operation("chat attempt count is invalid")
+                            })?,
+                            u32::try_from(sequence).map_err(|_| {
+                                ServiceError::invalid_operation("usage report sequence overflows")
+                            })?,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                self.remember_usage(&job.id, mapped).await;
+                return Err(ServiceError::invalid_operation(format!(
+                    "native Agent Chat turn failed: {message}"
+                )));
+            }
+            Err(error) => {
                 tracing::warn!(
                     job_id = %job.id,
                     chat_id = %job.chat_id,
                     %error,
                     "native Agent Chat turn failed"
                 );
-                ServiceError::invalid_operation(format!("native Agent Chat turn failed: {error}"))
-            })?;
+                return Err(ServiceError::invalid_operation(format!(
+                    "native Agent Chat turn failed: {error}"
+                )));
+            }
+        };
+        let mut usage_reports = output
+            .usage_reports
+            .iter()
+            .enumerate()
+            .map(|(sequence, report)| {
+                crate::chat_usage::usage_report_from_host(
+                    report,
+                    "chat",
+                    job.attempt_count.checked_sub(1).ok_or_else(|| {
+                        ServiceError::invalid_operation("chat attempt count is invalid")
+                    })?,
+                    u32::try_from(sequence).map_err(|_| {
+                        ServiceError::invalid_operation("usage report sequence overflows")
+                    })?,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if usage_reports.is_empty() {
+            let attempt_ordinal = job
+                .attempt_count
+                .checked_sub(1)
+                .ok_or_else(|| ServiceError::invalid_operation("chat attempt count is invalid"))?;
+            let counters = executors::UsageCounters {
+                input_tokens: Some(output.input_tokens),
+                output_tokens: Some(output.output_tokens),
+                cache_read_tokens: Some(output.cache_read_tokens),
+                cache_write_tokens: Some(output.cache_write_tokens),
+            };
+            usage_reports.push(executors::UsageReport {
+                report_id: format!("{}:native", job.id),
+                request_id: None,
+                report_sequence: 0,
+                candidate_key: Some("chat".to_owned()),
+                attempt_ordinal: u32::try_from(attempt_ordinal).map_err(|_| {
+                    ServiceError::invalid_operation("chat attempt ordinal overflows")
+                })?,
+                provider_id: profile.provider.clone(),
+                model_id: Some(model.clone()),
+                counters,
+                telemetry_state: match output.telemetry_state {
+                    forge_agent_host::AgentTurnTelemetryState::Metered => {
+                        executors::UsageTelemetryState::Metered
+                    }
+                    forge_agent_host::AgentTurnTelemetryState::Unmetered => {
+                        executors::UsageTelemetryState::Unmetered
+                    }
+                },
+                context_tokens: None,
+                selected_tier: None,
+                reported_cost_usd: None,
+                outcome: None,
+                partial: false,
+            });
+        }
+        self.remember_usage(&job.id, usage_reports).await;
         let content = output.text.trim().to_owned();
         guard_agent_chat_content(&content)?;
         let context_manifest_id = if let Some(manifest) = output.context_manifest.as_ref() {
@@ -2842,16 +3020,11 @@ impl FederatedAgentChatTurnRunner {
             session_id: session.id,
             model: Some(model),
             content,
-            token_usage_json: Some(
-                serde_json::json!({
-                    "input": output.input_tokens,
-                    "output": output.output_tokens,
-                    "cache_read": output.cache_read_tokens,
-                    "cache_write": output.cache_write_tokens,
-                })
-                .to_string(),
-            ),
-            duration_ms: started.elapsed().as_millis() as i64,
+            // Typed ledger settlement is the accounting authority. Keep the
+            // legacy field empty on all newly admitted turns; public
+            // projections read the immutable ledger events instead.
+            token_usage_json: None,
+            duration_ms: checked_duration_ms(started.elapsed())?,
             context_manifest_id,
             pending_interaction_id: output.pending_interaction_id,
         })
@@ -2886,11 +3059,24 @@ impl FederatedAgentChatTurnRunner {
             runtime_manifest,
             operating_context_sources,
         )?;
-        let runtime_sources = runtime_manifest_sources(runtime_manifest);
+        let runtime_sources = runtime_manifest_sources(runtime_manifest)?;
         let mut sources = operating_context_sources.to_vec();
-        let source_offset = sources.len() as i64;
+        let source_offset = i64::try_from(sources.len()).map_err(|_| {
+            ServiceError::invalid_operation(
+                "Agent Chat context source count overflows the persisted range",
+            )
+        })?;
         for (offset, mut source) in runtime_sources.into_iter().enumerate() {
-            source.ordinal = source_offset + offset as i64;
+            let offset = i64::try_from(offset).map_err(|_| {
+                ServiceError::invalid_operation(
+                    "Agent Chat runtime context source count overflows the persisted range",
+                )
+            })?;
+            source.ordinal = source_offset.checked_add(offset).ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "Agent Chat context source ordinal overflows the persisted range",
+                )
+            })?;
             sources.push(source);
         }
         let service = ContextManifestService::new(Arc::clone(&self.db));
@@ -3082,7 +3268,7 @@ impl FederatedAgentChatTurnRunner {
             scope_id: job.chat_id.clone(),
             workspace_access: WorkspaceAccess::Deny,
         };
-        let (result, duration_ms) = self
+        let (mut result, duration_ms) = self
             .cli_backend
             .run_turn(
                 &scope,
@@ -3095,6 +3281,17 @@ impl FederatedAgentChatTurnRunner {
                 cancellation,
             )
             .await?;
+        let attempt_ordinal = job
+            .attempt_count
+            .checked_sub(1)
+            .ok_or_else(|| ServiceError::invalid_operation("chat attempt count is invalid"))?;
+        for report in &mut result.usage_reports {
+            report.candidate_key = Some("chat".to_owned());
+            report.attempt_ordinal = u32::try_from(attempt_ordinal)
+                .map_err(|_| ServiceError::invalid_operation("chat attempt ordinal overflows"))?;
+        }
+        self.remember_usage(&job.id, result.usage_reports.clone())
+            .await;
         let content = cli_result_content(result)?;
         guard_agent_chat_content(&content)?;
         let context_manifest_id = if operating_context_sources.is_empty() {
@@ -3128,6 +3325,57 @@ impl FederatedAgentChatTurnRunner {
 
 #[async_trait]
 impl AgentChatTurnRunner for FederatedAgentChatTurnRunner {
+    async fn validate_admission_authority(&self, job: &AgentChatTurnJob) -> Result<()> {
+        if job.canonical_scope_type != "agent_chat" || job.canonical_scope_id != job.chat_id {
+            return Err(ServiceError::invalid_operation(
+                "Agent Chat turn has a mismatched canonical scope",
+            ));
+        }
+        let chat = AgentChatRepo::get_agent_chat(&*self.db, &job.chat_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent_chat", job.chat_id.clone()))?;
+        let identity_id = job
+            .responder_identity_id
+            .as_deref()
+            .ok_or_else(|| ServiceError::invalid_operation("Agent Chat job has no responder"))?;
+        let agent = AgentRepo::get_by_id(&*self.db, identity_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent_identity", identity_id.to_owned()))?;
+        let profile_id = job
+            .profile_id
+            .as_deref()
+            .ok_or_else(|| ServiceError::invalid_operation("Agent Chat job has no profile"))?;
+        let profile = AgentProfileRepo::get_profile(&*self.db, profile_id)
+            .await?
+            .filter(|profile| profile.identity_id == agent.id)
+            .ok_or_else(|| ServiceError::not_found("agent_profile", profile_id.to_owned()))?;
+        self.load_frozen_authority(&chat, job, &agent, &profile)
+            .await?;
+        Ok(())
+    }
+
+    async fn validate_provider_availability(&self, job: &AgentChatTurnJob) -> Result<()> {
+        let identity_id = job
+            .responder_identity_id
+            .as_deref()
+            .ok_or_else(|| ServiceError::invalid_operation("Agent Chat job has no responder"))?;
+        let agent = AgentRepo::get_by_id(&*self.db, identity_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent_identity", identity_id.to_owned()))?;
+        let profile_id = job
+            .profile_id
+            .as_deref()
+            .ok_or_else(|| ServiceError::invalid_operation("Agent Chat job has no profile"))?;
+        let profile = AgentProfileRepo::get_profile(&*self.db, profile_id)
+            .await?
+            .filter(|profile| profile.identity_id == agent.id)
+            .ok_or_else(|| ServiceError::not_found("agent_profile", profile_id.to_owned()))?;
+        let owner_user_id = agent.owner_id.as_deref().ok_or_else(|| {
+            ServiceError::invalid_operation("Agent identity has no account owner")
+        })?;
+        crate::chat_usage::validate_provider_availability(&self.db, &profile, owner_user_id).await
+    }
+
     async fn run_turn(
         &self,
         job: &AgentChatTurnJob,
@@ -3141,6 +3389,25 @@ impl AgentChatTurnRunner for FederatedAgentChatTurnRunner {
             _ => Err(ServiceError::invalid_operation(
                 "selected Agent Chat backend is unsupported",
             )),
+        }
+    }
+
+    async fn run_turn_with_usage(
+        &self,
+        job: &AgentChatTurnJob,
+        cancellation: CancellationToken,
+    ) -> AgentChatTurnRunOutcome {
+        let result = self.run_turn(job, cancellation).await;
+        let usage_reports = self.take_usage(&job.id).await;
+        match result {
+            Ok(turn) => AgentChatTurnRunOutcome::Completed {
+                turn,
+                usage_reports,
+            },
+            Err(error) => AgentChatTurnRunOutcome::Failed {
+                error,
+                usage_reports,
+            },
         }
     }
 }
@@ -3328,7 +3595,7 @@ impl AgentChatTurnWorker {
                 api_types::AgentChatTurnStatus::Failed => "failed",
                 _ => "retry_wait",
             };
-            sqlx::query(
+            let updated = sqlx::query(
                 "UPDATE agent_chat_turn_job
                  SET status = ?, lease_owner = NULL, leased_until = NULL,
                      next_attempt_at = ?, error_code = 'lease_expired',
@@ -3340,10 +3607,38 @@ impl AgentChatTurnWorker {
             .bind(decision.next_attempt_at.map(|value| value.to_rfc3339()))
             .bind(decision.error)
             .bind(&now)
-            .bind(id)
+            .bind(&id)
             .bind(&now)
             .execute(self.db.pool())
             .await?;
+            if updated.rows_affected() == 1 {
+                // A lease expiry is the recovery boundary for an invocation
+                // whose provider result is no longer replayable. Preserve an
+                // explicit coverage gap instead of allowing the next retry's
+                // fresh attempt to absorb the old provider call.
+                for invocation in
+                    UsageLedgerRepo::list_usage_invocations_for_source(&*self.db, &id).await?
+                {
+                    if matches!(
+                        invocation.lifecycle,
+                        UsageInvocationLifecycle::Started
+                            | UsageInvocationLifecycle::PendingSettlement
+                    ) {
+                        let _ = UsageLedgerRepo::mark_usage_invocation_unsettled(
+                            &*self.db,
+                            db::MarkUsageInvocationUnsettled {
+                                id: invocation.id,
+                                expected_version: invocation.version,
+                                terminal_reason: "chat lease expired without replayable result"
+                                    .to_owned(),
+                                settled_at: now.clone(),
+                                updated_at: now.clone(),
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
         }
         self.recover_parked().await?;
         Ok(())
@@ -3455,12 +3750,159 @@ impl AgentChatTurnWorker {
         Ok(())
     }
 
+    /// Re-run the immutable responder/scope checks before creating an
+    /// accounting invocation.  A forged or partially-corrupted queued row
+    /// must fail closed without allowing its chat/account/project lookup to
+    /// become a pricing write authority.
+    async fn validate_usage_admission_authority(&self, job: &AgentChatTurnJob) -> Result<()> {
+        // The production runner authenticates the immutable responder/binding
+        // snapshot before this helper performs any lookup used by pricing
+        // admission.  Keeping this call first also gives forged jobs a
+        // fail-closed boundary when a runner has a stronger authority source.
+        self.runner.validate_admission_authority(job).await?;
+        if job.canonical_scope_type != "agent_chat" || job.canonical_scope_id != job.chat_id {
+            return Err(ServiceError::invalid_operation(
+                "Agent Chat turn has a mismatched canonical scope",
+            ));
+        }
+        let input =
+            AgentChatMessageRepo::get_agent_chat_message(&*self.db, &job.triggering_message_id)
+                .await?
+                .filter(|message| message.chat_id == job.chat_id)
+                .ok_or_else(|| {
+                    ServiceError::not_found("agent_chat_message", job.triggering_message_id.clone())
+                })?;
+        let chat = AgentChatRepo::get_agent_chat(&*self.db, &job.chat_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent_chat", job.chat_id.clone()))?;
+        let identity_id = job
+            .responder_identity_id
+            .as_deref()
+            .ok_or_else(|| ServiceError::invalid_operation("Agent Chat job has no responder"))?;
+        let agent = AgentRepo::get_by_id(&*self.db, identity_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent_identity", identity_id.to_owned()))?;
+        let profile_id = job
+            .profile_id
+            .as_deref()
+            .ok_or_else(|| ServiceError::invalid_operation("Agent Chat job has no profile"))?;
+        let profile = AgentProfileRepo::get_profile(&*self.db, profile_id)
+            .await?
+            .filter(|profile| profile.identity_id == agent.id)
+            .ok_or_else(|| ServiceError::not_found("agent_profile", profile_id.to_owned()))?;
+        if input.chat_id != chat.id
+            || agent.owner_id.is_none()
+            || profile.identity_id != agent.id
+            || job.responder_identity_id.as_deref() != Some(agent.id.as_str())
+            || job.profile_id.as_deref() != Some(profile.id.as_str())
+        {
+            return Err(ServiceError::invalid_operation(
+                "Agent Chat responder provenance is invalid",
+            ));
+        }
+        match chat.kind.as_str() {
+            "account_main" => {
+                if chat.project_id.is_some() {
+                    return Err(ServiceError::invalid_operation(
+                        "Main Agent Chat unexpectedly has a Project scope",
+                    ));
+                }
+                let account_id = chat.account_id.as_deref().ok_or_else(|| {
+                    ServiceError::invalid_operation("Main Agent Chat has no account scope")
+                })?;
+                if agent.owner_id.as_deref() != Some(account_id) {
+                    return Err(ServiceError::invalid_operation(
+                        "Main Agent identity is not owned by the Chat account",
+                    ));
+                }
+            }
+            "project" => {
+                if chat.account_id.is_some() {
+                    return Err(ServiceError::invalid_operation(
+                        "Project Agent Chat unexpectedly has an account scope",
+                    ));
+                }
+                let project_id = chat.project_id.as_deref().ok_or_else(|| {
+                    ServiceError::invalid_operation("Project Agent Chat has no Project scope")
+                })?;
+                let project = ProjectRepo::get_by_id(&*self.db, project_id)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
+                if project.owner_id.is_none()
+                    || agent.owner_id.as_deref() != project.owner_id.as_deref()
+                {
+                    return Err(ServiceError::invalid_operation(
+                        "Project Agent identity is not owned by the Project account",
+                    ));
+                }
+            }
+            _ => {
+                return Err(ServiceError::invalid_operation(
+                    "usage admission requires a canonical Agent Chat",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn process_claimed(&self, job: AgentChatTurnJob, cancellation: CancellationToken) {
         // RetryWait is a retry of this same logical admission, not a new turn.
         // Keep the claimed job (including its frozen responder/Profile/policy
         // provenance) as the runner input; claim/lease bookkeeping may change
         // status, attempt count, and version, but must never re-resolve the
         // current binding or Profile here.
+        if cancellation.is_cancelled() {
+            return;
+        }
+        if let Err(error) = self.validate_usage_admission_authority(&job).await {
+            tracing::warn!(job_id = %job.id, error = %error, "Agent Chat authority validation failed before usage admission");
+            let _ = self
+                .chat_service
+                .append_failure(
+                    &job,
+                    &self.lease_owner,
+                    "usage_admission_authority_failed",
+                    "Agent Chat authority could not be verified before provider admission",
+                )
+                .await;
+            return;
+        }
+        if let Err(error) = self.runner.validate_provider_availability(&job).await {
+            tracing::warn!(job_id = %job.id, error = %error, "Agent Chat provider unavailable before usage admission");
+            let _ = self
+                .chat_service
+                .append_failure(
+                    &job,
+                    &self.lease_owner,
+                    "provider_unavailable",
+                    "Agent Chat provider is unavailable before provider admission",
+                )
+                .await;
+            return;
+        }
+        let admission = match crate::chat_usage::admit_chat_usage(&self.db, &job).await {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                tracing::warn!(job_id = %job.id, error = %error, "Agent Chat usage admission failed");
+                let _ = self
+                    .chat_service
+                    .append_failure(
+                        &job,
+                        &self.lease_owner,
+                        "usage_admission_failed",
+                        "Agent Chat usage admission could not be committed",
+                    )
+                    .await;
+                return;
+            }
+        };
+        if matches!(
+            admission.lifecycle,
+            db::UsageInvocationLifecycle::Settled | db::UsageInvocationLifecycle::Unsettled
+        ) {
+            tracing::warn!(job_id = %job.id, "Agent Chat provider invocation is already terminal");
+            return;
+        }
         let stop = CancellationToken::new();
         let turn_cancellation = cancellation.child_token();
         let renewal =
@@ -3475,21 +3917,29 @@ impl AgentChatTurnWorker {
         let mut control_transfer = None;
         let mut result = None;
         if baseline_turn {
-            let run = self.runner.run_turn(&job, turn_cancellation.clone());
+            let run = self
+                .runner
+                .run_turn_with_usage(&job, turn_cancellation.clone());
             tokio::pin!(run);
             tokio::select! {
                 completed = &mut run => result = Some(completed),
-                transfer = self.wait_for_genesis_control_transfer(&job.id) => {
-                    control_transfer = Some(transfer);
-                    // The typed command has already committed the durable
-                    // continuation. Stop the baseline provider loop so it
-                    // cannot add a redundant conversational response.
-                    turn_cancellation.cancel();
-                    let _ = tokio::time::timeout(Duration::from_secs(5), &mut run).await;
-                }
+                    transfer = self.wait_for_genesis_control_transfer(&job.id) => {
+                        control_transfer = Some(transfer);
+                        // The typed command has already committed the durable
+                        // continuation. Stop the baseline provider loop so it
+                        // cannot add a redundant conversational response.
+                        turn_cancellation.cancel();
+                        if let Ok(outcome) = tokio::time::timeout(Duration::from_secs(5), &mut run).await {
+                            result = Some(outcome);
+                        }
+                    }
             }
         } else {
-            result = Some(self.runner.run_turn(&job, turn_cancellation).await);
+            result = Some(
+                self.runner
+                    .run_turn_with_usage(&job, turn_cancellation)
+                    .await,
+            );
         }
         stop.cancel();
         let _ = renewal.await;
@@ -3509,20 +3959,61 @@ impl AgentChatTurnWorker {
                 .flatten();
         }
         if let Some(transfer) = control_transfer {
-            if let Err(error) = AgentChatTransactionRepo::complete_agent_chat_control_transfer(
-                &*self.db,
-                CompleteAgentChatControlTransfer {
-                    turn_job_id: commit_job.id.clone(),
-                    expected_version: commit_job.version,
-                    lease_owner: self.lease_owner.clone(),
-                    command_receipt_id: transfer.command_receipt_id,
-                    continuation_turn_id: transfer.continuation_turn_id,
-                    genesis_session_id: transfer.genesis_session_id,
-                    updated_at: now_rfc3339(),
-                },
-            )
-            .await
+            let (provider_finished, usage_reports) = match result.take() {
+                Some(AgentChatTurnRunOutcome::Completed { usage_reports, .. })
+                | Some(AgentChatTurnRunOutcome::Failed { usage_reports, .. }) => {
+                    (true, usage_reports)
+                }
+                None => (false, Vec::new()),
+            };
+            let settlements = if provider_finished {
+                match crate::chat_usage::build_chat_usage_settlements(
+                    &self.db,
+                    &commit_job.id,
+                    &usage_reports,
+                    &now_rfc3339(),
+                )
+                .await
+                {
+                    Ok(settlements) => settlements,
+                    Err(error) => {
+                        let _ = self
+                            .settle_reports_if_cancelled(&commit_job.id, &usage_reports)
+                            .await;
+                        tracing::warn!(job_id = %commit_job.id, error = %error, "Genesis control-transfer usage settlement preparation failed");
+                        return;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            if let Err(error) =
+                AgentChatTransactionRepo::complete_agent_chat_control_transfer_with_usage(
+                    &*self.db,
+                    db::CompleteAgentChatControlTransferWithUsage {
+                        terminal: CompleteAgentChatControlTransfer {
+                            turn_job_id: commit_job.id.clone(),
+                            expected_version: commit_job.version,
+                            lease_owner: self.lease_owner.clone(),
+                            command_receipt_id: transfer.command_receipt_id,
+                            continuation_turn_id: transfer.continuation_turn_id,
+                            genesis_session_id: transfer.genesis_session_id,
+                            updated_at: now_rfc3339(),
+                        },
+                        settlements,
+                        provider_finished,
+                    },
+                )
+                .await
             {
+                // Cancellation can win after the baseline provider observes
+                // the Genesis handoff but before this composite acquires the
+                // turn CAS.  The cancelled terminal state must remain the
+                // authority; drain any reports that were already observed
+                // without attempting to rewrite it.
+                let _ = self
+                    .settle_reports_if_cancelled(&commit_job.id, &usage_reports)
+                    .await;
                 tracing::warn!(job_id = %commit_job.id, error = %error, "Agent Chat Genesis control transfer commit failed");
             }
             return;
@@ -3532,53 +4023,116 @@ impl AgentChatTurnWorker {
             return;
         };
         match result {
-            Ok(turn) => {
+            AgentChatTurnRunOutcome::Completed {
+                turn,
+                usage_reports,
+            } => {
+                if commit_job.status == db::AgentChatTurnState::Cancelled {
+                    let _ = self
+                        .settle_reports_if_cancelled(&commit_job.id, &usage_reports)
+                        .await;
+                    return;
+                }
+                let settlements = match crate::chat_usage::build_chat_usage_settlements(
+                    &self.db,
+                    &commit_job.id,
+                    &usage_reports,
+                    &now_rfc3339(),
+                )
+                .await
+                {
+                    Ok(settlements) => settlements,
+                    Err(error) => {
+                        let _ = self
+                            .settle_reports_if_cancelled(&commit_job.id, &usage_reports)
+                            .await;
+                        tracing::warn!(job_id = %commit_job.id, error = %error, "Agent Chat usage settlement preparation failed");
+                        return;
+                    }
+                };
                 if let Some(pending_interaction_id) = turn.pending_interaction_id {
                     if let Err(error) = self
                         .chat_service
-                        .append_awaiting_input(
+                        .append_awaiting_input_with_usage(
                             &commit_job,
                             &self.lease_owner,
                             &pending_interaction_id,
+                            settlements.clone(),
                         )
                         .await
                     {
                         tracing::warn!(job_id = %commit_job.id, error = %error, "Agent Chat awaiting input commit failed");
-                        let _ = self
+                        if self
+                            .settle_reports_if_cancelled(&commit_job.id, &usage_reports)
+                            .await
+                        {
+                            return;
+                        }
+                        if let Err(fallback_error) = self
                             .chat_service
-                            .append_failure(
+                            .append_failure_with_usage(
                                 &commit_job,
                                 &self.lease_owner,
                                 "awaiting_input_commit_failed",
                                 "Agent Chat awaiting input state could not be committed",
+                                settlements.clone(),
                             )
-                            .await;
+                            .await
+                        {
+                            let _ = self
+                                .settle_reports_if_cancelled(&commit_job.id, &usage_reports)
+                                .await;
+                            tracing::warn!(job_id = %commit_job.id, error = %fallback_error, "Agent Chat awaiting input fallback failure commit failed");
+                        }
                     }
                 } else if turn.content.trim().is_empty() {
                     tracing::warn!(job_id = %commit_job.id, "Agent Chat provider returned no text response");
-                    let _ = self
+                    if let Err(error) = self
                         .chat_service
-                        .append_failure(
+                        .append_failure_with_usage(
                             &commit_job,
                             &self.lease_owner,
                             "empty_response",
                             "Agent returned no text response",
+                            settlements.clone(),
                         )
-                        .await;
+                        .await
+                    {
+                        let _ = self
+                            .settle_reports_if_cancelled(&commit_job.id, &usage_reports)
+                            .await;
+                        tracing::warn!(job_id = %commit_job.id, error = %error, "Agent Chat empty-response failure commit failed");
+                    }
                 } else {
                     match self.turn_postcondition_satisfied(&commit_job).await {
                         Ok(true) => {
-                            if let Err(error) = self.commit_success(&commit_job, turn).await {
+                            if let Err(error) = self
+                                .commit_success(&commit_job, turn, settlements.clone())
+                                .await
+                            {
                                 tracing::warn!(job_id = %commit_job.id, error = %error, "Agent Chat response commit failed");
-                                let _ = self
+                                if self
+                                    .settle_reports_if_cancelled(&commit_job.id, &usage_reports)
+                                    .await
+                                {
+                                    return;
+                                }
+                                if let Err(fallback_error) = self
                                     .chat_service
-                                    .append_failure(
+                                    .append_failure_with_usage(
                                         &commit_job,
                                         &self.lease_owner,
                                         "response_commit_failed",
                                         "Agent Chat response could not be committed",
+                                        settlements.clone(),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    let _ = self
+                                        .settle_reports_if_cancelled(&commit_job.id, &usage_reports)
+                                        .await;
+                                    tracing::warn!(job_id = %commit_job.id, error = %fallback_error, "Agent Chat response fallback failure commit failed");
+                                }
                             }
                         }
                         Ok(false) => {
@@ -3586,43 +4140,114 @@ impl AgentChatTurnWorker {
                                 job_id = %commit_job.id,
                                 "Agent Chat delivery follow-up postcondition was not committed"
                             );
-                            let _ = self
+                            if let Err(error) = self
                                 .chat_service
-                                .append_failure(
+                                .append_failure_with_usage(
                                     &commit_job,
                                     &self.lease_owner,
                                     DELIVERY_FOLLOWUP_POSTCONDITION_FAILED,
                                     DELIVERY_FOLLOWUP_POSTCONDITION_MESSAGE,
+                                    settlements.clone(),
                                 )
-                                .await;
+                                .await
+                            {
+                                let _ = self
+                                    .settle_reports_if_cancelled(&commit_job.id, &usage_reports)
+                                    .await;
+                                tracing::warn!(job_id = %commit_job.id, error = %error, "Agent Chat delivery postcondition failure commit failed");
+                            }
                         }
                         Err(error) => {
                             tracing::warn!(job_id = %commit_job.id, error = %error, "Agent Chat turn postcondition check failed");
-                            let _ = self
+                            if let Err(commit_error) = self
                                 .chat_service
-                                .append_failure(
+                                .append_failure_with_usage(
                                     &commit_job,
                                     &self.lease_owner,
                                     "turn_postcondition_check_failed",
                                     "Agent Chat turn postcondition could not be verified",
+                                    settlements.clone(),
                                 )
-                                .await;
+                                .await
+                            {
+                                let _ = self
+                                    .settle_reports_if_cancelled(&commit_job.id, &usage_reports)
+                                    .await;
+                                tracing::warn!(job_id = %commit_job.id, error = %commit_error, "Agent Chat postcondition failure commit failed");
+                            }
                         }
                     }
                 }
             }
-            Err(error) => {
+            AgentChatTurnRunOutcome::Failed {
+                error,
+                usage_reports,
+            } => {
+                if commit_job.status == db::AgentChatTurnState::Cancelled {
+                    let _ = self
+                        .settle_reports_if_cancelled(&commit_job.id, &usage_reports)
+                        .await;
+                    return;
+                }
                 let code = classify_turn_error(&error);
                 let message = bounded_error_message(&error.to_string());
+                let settlements = match crate::chat_usage::build_chat_usage_settlements(
+                    &self.db,
+                    &commit_job.id,
+                    &usage_reports,
+                    &now_rfc3339(),
+                )
+                .await
+                {
+                    Ok(settlements) => settlements,
+                    Err(error) => {
+                        let _ = self
+                            .settle_reports_if_cancelled(&commit_job.id, &usage_reports)
+                            .await;
+                        tracing::warn!(job_id = %commit_job.id, error = %error, "Agent Chat failure usage settlement preparation failed");
+                        return;
+                    }
+                };
                 if let Err(commit_error) = self
                     .chat_service
-                    .append_failure(&commit_job, &self.lease_owner, code, &message)
+                    .append_failure_with_usage(
+                        &commit_job,
+                        &self.lease_owner,
+                        code,
+                        &message,
+                        settlements,
+                    )
                     .await
                 {
+                    let _ = self
+                        .settle_reports_if_cancelled(&commit_job.id, &usage_reports)
+                        .await;
                     tracing::warn!(job_id = %commit_job.id, error = %commit_error, "Agent Chat failure could not be persisted");
                 }
             }
         }
+    }
+
+    async fn settle_reports_if_cancelled(
+        &self,
+        source_id: &str,
+        reports: &[executors::UsageReport],
+    ) -> bool {
+        let cancelled = AgentChatTurnJobRepo::get_agent_chat_turn_job(&*self.db, source_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|job| job.status == db::AgentChatTurnState::Cancelled);
+        if !cancelled {
+            return false;
+        }
+        if let Err(error) =
+            crate::chat_usage::settle_late_chat_usage(&self.db, source_id, reports, &now_rfc3339())
+                .await
+        {
+            tracing::warn!(source_id, error = %error, "cancelled Agent Chat usage late drain failed");
+        }
+        true
     }
 
     async fn wait_for_genesis_control_transfer(
@@ -3677,9 +4302,10 @@ impl AgentChatTurnWorker {
         &self,
         job: &AgentChatTurnJob,
         turn: CompletedAgentChatTurn,
+        settlements: Vec<db::UsageLedgerSettlement>,
     ) -> Result<CommittedAgentChatResponse> {
         self.chat_service
-            .append_success(
+            .append_success_with_usage(
                 job,
                 &self.lease_owner,
                 AppendAgentChatSuccessInput {
@@ -3687,9 +4313,14 @@ impl AgentChatTurnWorker {
                     model: turn.model,
                     session_id: Some(turn.session_id),
                     context_manifest_id: turn.context_manifest_id,
-                    token_usage_json: turn.token_usage_json,
+                    // The typed ledger is the accounting authority for newly
+                    // admitted turns.  Do not copy the legacy JSON payload
+                    // back into the message row, even when a runner/test
+                    // supplies one on the internal completion value.
+                    token_usage_json: None,
                     duration_ms: Some(turn.duration_ms),
                 },
+                settlements,
             )
             .await
     }
@@ -4143,7 +4774,7 @@ fn agent_chat_server_request_fingerprint(
 
 fn runtime_manifest_sources(
     runtime_manifest: &RuntimeContextManifestLink,
-) -> Vec<ContextSourceInput> {
+) -> Result<Vec<ContextSourceInput>> {
     let source_revision = runtime_manifest.context_fingerprint.clone();
     let covered = runtime_manifest
         .summaries
@@ -4170,7 +4801,8 @@ fn runtime_manifest_sources(
                     disposition: String,
                     retention_priority: i64,
                     fragment_fingerprint: String,
-                    sensitivity: String| {
+                    sensitivity: String|
+     -> Result<()> {
         if source_ids.insert(source_id.clone()) {
             sources.push(ContextSourceInput {
                 ordinal,
@@ -4183,8 +4815,11 @@ fn runtime_manifest_sources(
                 fragment_fingerprint,
                 sensitivity,
             });
-            ordinal = ordinal.saturating_add(1);
+            ordinal = ordinal.checked_add(1).ok_or_else(|| {
+                ServiceError::invalid_operation("runtime context source ordinal overflows")
+            })?;
         }
+        Ok(())
     };
 
     if let Some(timeline_id) = runtime_manifest.lcm_timeline_id.as_deref() {
@@ -4200,7 +4835,7 @@ fn runtime_manifest_sources(
             100,
             fingerprint_id(timeline_id),
             "internal".to_owned(),
-        );
+        )?;
     }
     for segment in &runtime_manifest.segments {
         push(
@@ -4220,7 +4855,7 @@ fn runtime_manifest_sources(
             },
             segment.content_hash.clone(),
             segment.sensitivity.clone(),
-        );
+        )?;
     }
     for summary in &runtime_manifest.summaries {
         push(
@@ -4232,7 +4867,7 @@ fn runtime_manifest_sources(
             100,
             fingerprint_id(&summary.summary),
             "sensitive".to_owned(),
-        );
+        )?;
         for covered_id in &summary.covered {
             push(
                 covered_id.clone(),
@@ -4243,7 +4878,7 @@ fn runtime_manifest_sources(
                 10,
                 fingerprint_id(covered_id),
                 "sensitive".to_owned(),
-            );
+            )?;
         }
     }
     for summary in &runtime_manifest.lossless_summaries {
@@ -4260,12 +4895,12 @@ fn runtime_manifest_sources(
                 .clone()
                 .unwrap_or_else(|| summary.source_fingerprint.clone()),
             summary.classification.sensitivity.clone(),
-        );
+        )?;
     }
     // Keep the local variable meaningful in the no-summary case and make the
     // dedupe rule explicit for reviewers: source IDs are never repeated.
     let _ = segment_ids;
-    sources
+    Ok(sources)
 }
 
 fn fingerprint_id(value: &str) -> String {
@@ -4791,7 +5426,7 @@ fn project_operating_context_sources(
     skill_revision_id: &str,
     skill_content_digest: &str,
     context_references: &[OperatingContextReference],
-) -> Vec<ContextSourceInput> {
+) -> Result<Vec<ContextSourceInput>> {
     let mut sources = Vec::with_capacity(context_references.len() + 1);
     sources.push(ContextSourceInput {
         ordinal: 0,
@@ -4808,8 +5443,12 @@ fn project_operating_context_sources(
         sensitivity: "internal".to_owned(),
     });
     for (ordinal, reference) in context_references.iter().enumerate() {
+        let ordinal = i64::try_from(ordinal)
+            .map_err(|_| ServiceError::invalid_operation("context source ordinal overflows"))?
+            .checked_add(1)
+            .ok_or_else(|| ServiceError::invalid_operation("context source ordinal overflows"))?;
         sources.push(ContextSourceInput {
-            ordinal: ordinal as i64 + 1,
+            ordinal,
             source_id: format!(
                 "project_context:{}:{}",
                 reference.source_type, reference.source_id
@@ -4823,7 +5462,7 @@ fn project_operating_context_sources(
             sensitivity: reference.sensitivity.clone(),
         });
     }
-    sources
+    Ok(sources)
 }
 
 fn main_operating_context_sources(
@@ -4833,7 +5472,7 @@ fn main_operating_context_sources(
     selection_reason: &str,
     context_prefix: &str,
     context_references: &[OperatingContextReference],
-) -> Vec<ContextSourceInput> {
+) -> Result<Vec<ContextSourceInput>> {
     let mut sources = Vec::with_capacity(context_references.len() + 1);
     sources.push(ContextSourceInput {
         ordinal: 0,
@@ -4847,8 +5486,12 @@ fn main_operating_context_sources(
         sensitivity: "internal".to_owned(),
     });
     for (ordinal, reference) in context_references.iter().enumerate() {
+        let ordinal = i64::try_from(ordinal)
+            .map_err(|_| ServiceError::invalid_operation("context source ordinal overflows"))?
+            .checked_add(1)
+            .ok_or_else(|| ServiceError::invalid_operation("context source ordinal overflows"))?;
         sources.push(ContextSourceInput {
-            ordinal: ordinal as i64 + 1,
+            ordinal,
             source_id: format!(
                 "{context_prefix}:{}:{}",
                 reference.source_type, reference.source_id
@@ -4862,7 +5505,7 @@ fn main_operating_context_sources(
             sensitivity: reference.sensitivity.clone(),
         });
     }
-    sources
+    Ok(sources)
 }
 
 fn cli_result_content(result: ExecutionResult) -> Result<String> {
@@ -4970,9 +5613,220 @@ fn classify_turn_error(error: &ServiceError) -> &'static str {
 mod tests {
     use super::*;
 
+    struct AuthorityOnlyRunner;
+
+    #[async_trait::async_trait]
+    impl AgentChatTurnRunner for AuthorityOnlyRunner {
+        async fn run_turn(
+            &self,
+            _job: &AgentChatTurnJob,
+            _cancellation: CancellationToken,
+        ) -> Result<CompletedAgentChatTurn> {
+            Err(ServiceError::invalid_operation(
+                "forged authority test must stop before provider execution",
+            ))
+        }
+    }
+
+    async fn worker_test_db() -> Arc<SqliteDb> {
+        let pool = db::create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("in-memory pool");
+        db::run_migrations(&pool).await.expect("migrations apply");
+        Arc::new(SqliteDb::new(pool))
+    }
+
     #[test]
     fn cli_sandbox_is_job_scoped() {
         assert!(chat_sandbox_path("job-a") != chat_sandbox_path("job-b"));
+    }
+
+    #[test]
+    fn chat_terminalization_rejects_duration_overflow_without_clamping() {
+        let too_long = Duration::from_millis(
+            u64::try_from(i64::MAX)
+                .expect("i64::MAX fits in u64")
+                .checked_add(1)
+                .expect("test duration fits in u64"),
+        );
+        assert!(checked_duration_ms(too_long).is_err());
+    }
+
+    #[tokio::test]
+    async fn forged_cross_account_chat_job_fails_before_usage_admission() {
+        let db = worker_test_db().await;
+        let now = db::now_rfc3339();
+        for (id, email) in [
+            ("chat-owner", "chat-owner@example.test"),
+            ("agent-owner", "agent-owner@example.test"),
+        ] {
+            db::UserRepo::create_user(
+                &*db,
+                &db::User {
+                    id: id.to_owned(),
+                    email: email.to_owned(),
+                    password_hash: "test".to_owned(),
+                    display_name: None,
+                    is_admin: false,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .await
+            .expect("test user");
+        }
+
+        let agent = db::AgentRepo::create_identity_with_profile(
+            &*db,
+            db::CreateAgentIdentity {
+                id: "forged-agent".to_owned(),
+                name: "Forged Agent".to_owned(),
+                description: None,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: db::AgentStatus::Idle,
+                last_heartbeat_at: None,
+                is_default: false,
+                paused: false,
+                owner_id: Some("agent-owner".to_owned()),
+                visibility: "account".to_owned(),
+                account_permission_ceiling: "{}".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            db::CreateAgentProfile {
+                id: "forged-profile".to_owned(),
+                identity_id: "forged-agent".to_owned(),
+                backend_kind: "cli".to_owned(),
+                executor_type: "codex".to_owned(),
+                provider: None,
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "[]".to_owned(),
+                tool_policy_json: "{}".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: None,
+                daemon_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("test agent");
+        let chat = db::AgentChatRepo::get_main_chat(&*db, "chat-owner")
+            .await
+            .expect("test chat lookup")
+            .expect("test Main Chat");
+        let trigger = db::AgentChatMessageRepo::append_agent_chat_message(
+            &*db,
+            db::CreateAgentChatMessage {
+                id: "owner-trigger".to_owned(),
+                chat_id: chat.id.clone(),
+                sequence: 0,
+                author_type: db::AgentChatMessageAuthorType::User,
+                author_id: Some("chat-owner".to_owned()),
+                content: "hello".to_owned(),
+                content_guard_json: "{}".to_owned(),
+                sensitivity: "public".to_owned(),
+                status: db::AgentChatMessageStatus::Complete,
+                outcome: None,
+                model: None,
+                profile_id: None,
+                session_id: None,
+                context_manifest_id: None,
+                token_usage_json: None,
+                duration_ms: None,
+                error: None,
+                correlation_id: "correlation".to_owned(),
+                causation_id: None,
+                handoff_id: None,
+                source_type: "native".to_owned(),
+                source_id: None,
+                source_message_id: None,
+                source_room_id: None,
+                source_conversation_id: None,
+                source_sequence: None,
+                source_metadata_json: "{}".to_owned(),
+                created_at: now.clone(),
+            },
+        )
+        .await
+        .expect("test trigger");
+        let job = db::AgentChatTurnJobRepo::create_agent_chat_turn_job(
+            &*db,
+            db::CreateAgentChatTurnJob {
+                id: "forged-job".to_owned(),
+                chat_id: chat.id.clone(),
+                triggering_message_id: trigger.id,
+                responder_identity_id: agent.id,
+                profile_id: "forged-profile".to_owned(),
+                responder_binding_id: None,
+                responder_binding_version: None,
+                responder_identity_version: None,
+                profile_version: None,
+                operating_skill_revision_id: None,
+                policy_revision: None,
+                policy_digest: None,
+                permission_policy_digest: None,
+                tool_policy_digest: None,
+                admission_digest: None,
+                canonical_scope_provenance_json: None,
+                canonical_scope_type: "agent_chat".to_owned(),
+                canonical_scope_id: chat.id.clone(),
+                dedupe_key: "forged-dedupe".to_owned(),
+                max_attempts: 3,
+                correlation_id: "correlation".to_owned(),
+                causation_id: None,
+                causation_depth: 0,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("test job");
+        let worker =
+            AgentChatTurnWorker::with_runner(Arc::clone(&db), Arc::new(AuthorityOnlyRunner));
+        sqlx::query(
+            "UPDATE agent_chat_turn_job
+             SET status = 'leased', lease_owner = ?, leased_until = ?,
+                 attempt_count = 1, version = version + 1, updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(&worker.lease_owner)
+        .bind(&now)
+        .bind(&now)
+        .bind(&job.id)
+        .execute(db.pool())
+        .await
+        .expect("lease test job");
+        let leased = db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &job.id)
+            .await
+            .expect("leased job read")
+            .expect("leased job");
+        worker
+            .process_claimed(leased, CancellationToken::new())
+            .await;
+
+        let usage_rows: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM pricing_selection)
+                  + (SELECT COUNT(*) FROM usage_invocation)
+                  + (SELECT COUNT(*) FROM usage_event)",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("usage rows count");
+        assert_eq!(
+            usage_rows, 0,
+            "forged authority must not write accounting rows"
+        );
+        let current = db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*db, &job.id)
+            .await
+            .expect("terminal job read")
+            .expect("terminal job");
+        assert_eq!(current.status, db::AgentChatTurnState::RetryWait);
     }
 
     #[test]
@@ -5236,7 +6090,8 @@ mod tests {
                     "test",
                 ),
             ],
-        );
+        )
+        .expect("context source ordinals fit");
         assert_eq!(sources.len(), 3);
         assert_eq!(sources[0].source_type, "server_operating_skill");
         assert_eq!(
@@ -5279,7 +6134,8 @@ mod tests {
                     "test",
                 ),
             ],
-        );
+        )
+        .expect("context source ordinals fit");
         assert_ne!(
             duplicate_resource_sources[1].source_id,
             duplicate_resource_sources[2].source_id
@@ -5358,7 +6214,8 @@ mod tests {
                 "6f3a4f5e",
                 "opaque_handoff_provenance_only",
             )],
-        );
+        )
+        .expect("context source ordinals fit");
         for secret in main_secrets {
             assert!(!prompt.contains(secret), "prompt leaked {secret}");
             assert!(
@@ -6005,7 +6862,8 @@ mod tests {
                     "bounded_account_portfolio_projection",
                 ),
             ],
-        );
+        )
+        .expect("context source ordinals fit");
         assert_eq!(
             sources[0].source_id,
             "operating_skill:forge.main.project-discovery/v2"
@@ -6051,7 +6909,8 @@ mod tests {
                     "bounded_account_portfolio_projection",
                 ),
             ],
-        );
+        )
+        .expect("context source ordinals fit");
         assert_eq!(
             sources[0].source_id,
             "operating_skill:forge.main.baseline/v1"

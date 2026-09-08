@@ -3,10 +3,10 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use api_types::{
     AgentBindingSummary, AgentContinuityHealth, AgentDetailResponse, AgentScopeSummary,
-    AgentSessionSummary, AgentUsageSummary, AttentionCategory, AttentionConsumerHealthResponse,
-    AttentionItem, AttentionLifecycle, MissionControlAgentHealth, MissionControlCapacity,
+    AgentSessionSummary, AttentionCategory, AttentionConsumerHealthResponse, AttentionItem,
+    AttentionLifecycle, MissionControlAgentHealth, MissionControlCapacity,
     MissionControlCoordinationActivity, MissionControlHomeResponse, MissionControlRecentOutcome,
-    MissionControlWorkItem,
+    MissionControlWorkItem, UsageAggregate,
 };
 use chrono::{DateTime, Duration, Utc};
 use db::{
@@ -19,7 +19,7 @@ use db::{
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sqlx::{sqlite::SqliteRow, Row, Sqlite, Transaction};
+use sqlx::{Row, Sqlite, Transaction};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -2875,69 +2875,8 @@ impl AttentionService {
         Ok(visible.len() as i64)
     }
 
-    async fn agent_usage_summary(&self, identity_id: &str) -> Result<AgentUsageSummary> {
-        let execution = sqlx::query(
-            "SELECT COUNT(DISTINCT eu.execution_id) AS execution_count,
-                    SUM(eu.input_tokens) AS input_tokens,
-                    SUM(eu.output_tokens) AS output_tokens,
-                    SUM(eu.cache_read_tokens) AS cache_read_tokens,
-                    SUM(eu.cache_write_tokens) AS cache_write_tokens,
-                    SUM(eu.cost_usd) AS cost_usd
-             FROM execution_usage eu
-             JOIN execution e ON e.id = eu.execution_id
-             WHERE e.agent_id = ?",
-        )
-        .bind(identity_id)
-        .fetch_one(self.db.pool())
-        .await?;
-        let chat = sqlx::query(
-            "SELECT COUNT(token_usage_json) AS execution_count,
-                    SUM(CASE WHEN json_valid(token_usage_json)
-                             THEN CAST(json_extract(token_usage_json, '$.input') AS INTEGER)
-                             ELSE 0 END) AS input_tokens,
-                    SUM(CASE WHEN json_valid(token_usage_json)
-                             THEN CAST(json_extract(token_usage_json, '$.output') AS INTEGER)
-                             ELSE 0 END) AS output_tokens,
-                    SUM(CASE WHEN json_valid(token_usage_json)
-                             THEN CAST(json_extract(token_usage_json, '$.cache_read') AS INTEGER)
-                             ELSE 0 END) AS cache_read_tokens,
-                    SUM(CASE WHEN json_valid(token_usage_json)
-                             THEN CAST(json_extract(token_usage_json, '$.cache_write') AS INTEGER)
-                             ELSE 0 END) AS cache_write_tokens,
-                    SUM(CASE WHEN json_valid(token_usage_json)
-                             THEN CAST(json_extract(token_usage_json, '$.cost_usd') AS REAL)
-                             ELSE 0 END) AS cost_usd
-             FROM agent_chat_message
-             WHERE author_type = 'agent' AND author_id = ? AND token_usage_json IS NOT NULL",
-        )
-        .bind(identity_id)
-        .fetch_one(self.db.pool())
-        .await?;
-
-        let execution_count = execution.try_get::<i64, _>("execution_count")?
-            + chat.try_get::<i64, _>("execution_count")?;
-        let input_tokens =
-            optional_i64(&execution, "input_tokens")? + optional_i64(&chat, "input_tokens")?;
-        let output_tokens =
-            optional_i64(&execution, "output_tokens")? + optional_i64(&chat, "output_tokens")?;
-        let cache_read_tokens = optional_i64(&execution, "cache_read_tokens")?
-            + optional_i64(&chat, "cache_read_tokens")?;
-        let cache_write_tokens = optional_i64(&execution, "cache_write_tokens")?
-            + optional_i64(&chat, "cache_write_tokens")?;
-        let execution_cost = optional_f64(&execution, "cost_usd")?;
-        let chat_cost = optional_f64(&chat, "cost_usd")?;
-        let cost_usd = execution_cost
-            .into_iter()
-            .chain(chat_cost)
-            .reduce(|left, right| left + right);
-        Ok(AgentUsageSummary {
-            execution_count,
-            input_tokens,
-            output_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
-            cost_usd,
-        })
+    async fn agent_usage_summary(&self, identity_id: &str) -> Result<UsageAggregate> {
+        crate::usage_projection::usage_aggregate_for_agent(&self.db, identity_id).await
     }
 
     async fn visible_coordination_count(
@@ -3587,14 +3526,6 @@ fn mission_work_item(task: db::Task) -> MissionControlWorkItem {
 
 fn bounded_summary(summary: &str) -> String {
     bounded_text(summary.to_owned())
-}
-
-fn optional_i64(row: &SqliteRow, column: &str) -> std::result::Result<i64, sqlx::Error> {
-    Ok(row.try_get::<Option<i64>, _>(column)?.unwrap_or(0))
-}
-
-fn optional_f64(row: &SqliteRow, column: &str) -> std::result::Result<Option<f64>, sqlx::Error> {
-    row.try_get::<Option<f64>, _>(column)
 }
 
 fn subscription_count(serialized: &str) -> i64 {

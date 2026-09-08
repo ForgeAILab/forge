@@ -1090,7 +1090,7 @@ fn validate_effective_state(projection: &ProjectEffectiveStateProjection) -> Res
             _ => {
                 return Err(ServiceError::conflict(
                     "Project milestone definition revision and digest must be recorded together",
-                ))
+                ));
             }
         }
         if milestone.version < 1 {

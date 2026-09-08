@@ -1,4 +1,5 @@
 import { expect, test, type Page } from './fixtures'
+import { emptyUsage } from '../src/test-utils/usage'
 
 declare global {
   interface Window {
@@ -128,7 +129,7 @@ function mockTask() {
       updated_at: '2026-05-20T00:00:00Z',
     },
     execution_observability: {
-      execution_count: 0,
+      ...emptyUsage,
       active_execution_id: null,
       active_role: null,
       active_started_at: null,
@@ -140,12 +141,6 @@ function mockTask() {
       latest_stopped_at: null,
       latest_runtime_seconds: null,
       total_runtime_seconds: 0,
-      total_input_tokens: 0,
-      total_output_tokens: 0,
-      total_cache_read_tokens: 0,
-      total_cache_write_tokens: 0,
-      total_tokens: 0,
-      total_cost_usd: null,
     },
     plan_progress: null,
     plan_artifact: null,

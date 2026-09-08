@@ -4,10 +4,16 @@ import type {
   CancelProviderAuthorizationRequest,
   CreateProviderEntryRequest,
   DisconnectCredentialResponse,
+  PricingCatalogModelsQuery,
+  PricingCatalogModelsResponse,
+  PricingCatalogRefreshRequest,
+  PricingCatalogStatus,
+  ProviderPricing,
   ProviderAuthorizationOperationResponse,
   ProviderEntriesResponse,
   ProviderEntryResponse,
   ProviderEntryTestResponse,
+  ReplaceProviderPricingRequest,
   RenameProviderEntryRequest,
   SetCliRuntimeAvailabilityRequest,
   SetProviderEntryAvailabilityRequest,
@@ -211,6 +217,84 @@ export function getProviderUsage(id: string): Promise<ProviderUsage> {
   return apiFetch<ProviderUsage>(`/providers/${id}/usage`)
 }
 
+/** Current server-owned models.dev catalog status. */
+export function getPricingCatalogStatus(): Promise<PricingCatalogStatus> {
+  return apiFetch<PricingCatalogStatus>('/providers/pricing-catalog/status')
+}
+
+/** Explicitly refresh the server-owned catalog using its idempotency key. */
+export function refreshPricingCatalog(
+  input: PricingCatalogRefreshRequest,
+): Promise<PricingCatalogStatus> {
+  return apiFetch<PricingCatalogStatus>('/providers/pricing-catalog/refresh', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+}
+
+/**
+ * Lists exact provider-scoped catalog rows. `cursor` is opaque and model IDs
+ * stay in query parameters so a valid ID such as `qwen/foo` is not split into
+ * a route segment.
+ */
+export function listPricingCatalogModels(
+  query: PricingCatalogModelsQuery = {
+    limit: null,
+    cursor: null,
+    provider_id: null,
+    query: null,
+  },
+): Promise<PricingCatalogModelsResponse> {
+  return apiFetch<PricingCatalogModelsResponse>('/providers/pricing-catalog/models', {
+    search: {
+      limit: query.limit ?? undefined,
+      cursor: query.cursor ?? undefined,
+      provider_id: query.provider_id ?? undefined,
+      query: query.query ?? undefined,
+    },
+  })
+}
+
+/** Read exact pricing bindings for one connected provider entry. */
+export function getProviderPricing(subjectId: string): Promise<ProviderPricing> {
+  return apiFetch<ProviderPricing>(`/providers/${subjectId}/pricing`)
+}
+
+/** Replace all exact pricing bindings for one connected provider entry. */
+export function replaceProviderPricing(
+  subjectId: string,
+  input: ReplaceProviderPricingRequest,
+): Promise<ProviderPricing> {
+  return apiFetch<ProviderPricing>(`/providers/${subjectId}/pricing`, {
+    method: 'PUT',
+    body: JSON.stringify(input),
+  })
+}
+
+function cliRuntimePricingPath(daemonId: string, executorType: string): string {
+  return `/providers/cli-runtimes/${encodeURIComponent(daemonId)}/${encodeURIComponent(executorType)}/pricing`
+}
+
+/** Read exact pricing bindings for one discovered CLI runtime. */
+export function getCliRuntimePricing(
+  daemonId: string,
+  executorType: string,
+): Promise<ProviderPricing> {
+  return apiFetch<ProviderPricing>(cliRuntimePricingPath(daemonId, executorType))
+}
+
+/** Replace all exact pricing bindings for one discovered CLI runtime. */
+export function replaceCliRuntimePricing(
+  daemonId: string,
+  executorType: string,
+  input: ReplaceProviderPricingRequest,
+): Promise<ProviderPricing> {
+  return apiFetch<ProviderPricing>(cliRuntimePricingPath(daemonId, executorType), {
+    method: 'PUT',
+    body: JSON.stringify(input),
+  })
+}
+
 export function startProviderAuthorization(
   input: StartProviderAuthorizationRequest,
 ): Promise<ProviderAuthorizationOperationResponse> {
@@ -230,10 +314,10 @@ export function cancelProviderAuthorization(
   id: string,
   input: CancelProviderAuthorizationRequest,
 ): Promise<ProviderAuthorizationOperationResponse> {
-  return apiFetch<ProviderAuthorizationOperationResponse>(
-    `/provider-authorizations/${id}/cancel`,
-    { method: 'POST', body: JSON.stringify(input) },
-  )
+  return apiFetch<ProviderAuthorizationOperationResponse>(`/provider-authorizations/${id}/cancel`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
 }
 
 export function getAgentConnectionHealth(

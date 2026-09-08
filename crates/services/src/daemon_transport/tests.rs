@@ -14,7 +14,7 @@ use serde_json::json;
 
 use super::{
     execution_lease_owner, DaemonConnection, DaemonConnectionRegistry, DaemonExecutionEventHandler,
-    ServerExecutionEventSink,
+    DaemonTerminalDisposition, ServerExecutionEventSink,
 };
 use crate::ServiceError;
 
@@ -38,6 +38,47 @@ impl DaemonExecutionEventHandler for NoopHandler {
         _notification: api_types::ExecutionTerminalNotification,
     ) -> Result<(), ServiceError> {
         Ok(())
+    }
+
+    async fn handle_terminal_with_ack(
+        &self,
+        _daemon_id: &str,
+        _connection_id: u64,
+        _notification: api_types::ExecutionTerminalNotification,
+    ) -> Result<DaemonTerminalDisposition, ServiceError> {
+        Ok(DaemonTerminalDisposition::Acknowledge)
+    }
+}
+
+struct ConflictHandler;
+
+#[async_trait]
+impl DaemonExecutionEventHandler for ConflictHandler {
+    async fn handle_log(
+        &self,
+        _daemon_id: &str,
+        _connection_id: u64,
+        _notification: api_types::ExecutionLogNotification,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+
+    async fn handle_terminal(
+        &self,
+        _daemon_id: &str,
+        _connection_id: u64,
+        _notification: api_types::ExecutionTerminalNotification,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+
+    async fn handle_terminal_with_ack(
+        &self,
+        _daemon_id: &str,
+        _connection_id: u64,
+        _notification: api_types::ExecutionTerminalNotification,
+    ) -> Result<DaemonTerminalDisposition, ServiceError> {
+        Ok(DaemonTerminalDisposition::Conflict)
     }
 }
 
@@ -218,6 +259,24 @@ fn execution_event_sink(
     Arc::new(ServerExecutionEventSink::new(db, event_bus, workspace_root))
 }
 
+fn accept_protocol_handshake(
+    registry: &DaemonConnectionRegistry,
+    daemon_id: &str,
+    connection_id: u64,
+) {
+    assert!(registry.dispatch_incoming_for_connection(
+        daemon_id,
+        connection_id,
+        api_types::DaemonFrame::Notification {
+            method: api_types::METHOD_DAEMON_HANDSHAKE.to_owned(),
+            params: json!({
+                "protocol_revision": api_types::DAEMON_PROTOCOL_REVISION,
+                "capabilities": api_types::DAEMON_REQUIRED_CAPABILITIES,
+            }),
+        },
+    ));
+}
+
 #[derive(Debug, Deserialize)]
 struct TestResponse {
     message: String,
@@ -227,7 +286,9 @@ struct TestResponse {
 async fn daemon_transport_registry_happy_path_completes_typed_response() {
     let registry = make_registry();
     let (connection, mut outbound) = DaemonConnection::new("daemon-1".to_owned());
+    let connection_id = connection.id();
     registry.register("daemon-1".to_owned(), connection);
+    accept_protocol_handshake(&registry, "daemon-1", connection_id);
 
     let dispatcher = registry.clone();
     let handle = tokio::spawn(async move {
@@ -259,7 +320,9 @@ async fn daemon_transport_registry_happy_path_completes_typed_response() {
 async fn daemon_transport_registry_timeout_returns_daemon_timeout() {
     let registry = make_registry();
     let (connection, _outbound) = DaemonConnection::new("daemon-1".to_owned());
+    let connection_id = connection.id();
     registry.register("daemon-1".to_owned(), connection);
+    accept_protocol_handshake(&registry, "daemon-1", connection_id);
 
     let result: Result<TestResponse, ServiceError> = registry
         .send_request_with_timeout(
@@ -278,6 +341,149 @@ async fn daemon_transport_registry_timeout_returns_daemon_timeout() {
 }
 
 #[tokio::test]
+async fn incompatible_daemon_handshake_is_rejected_before_dispatch() {
+    let registry = make_registry();
+    let (connection, mut outbound) = DaemonConnection::new("daemon-incompatible".to_owned());
+    let connection_id = connection.id();
+    registry.register("daemon-incompatible".to_owned(), connection);
+
+    assert!(registry.dispatch_incoming_for_connection(
+        "daemon-incompatible",
+        connection_id,
+        api_types::DaemonFrame::Notification {
+            method: api_types::METHOD_DAEMON_HANDSHAKE.to_owned(),
+            params: json!({
+                "protocol_revision": 1,
+                "capabilities": []
+            }),
+        },
+    ));
+
+    let rejection = outbound.recv().await.expect("protocol rejection frame");
+    let api_types::DaemonFrame::Error { error, .. } = rejection else {
+        panic!("expected protocol rejection error");
+    };
+    assert_eq!(error.code, api_types::DAEMON_PROTOCOL_INCOMPATIBLE);
+    assert!(!registry.is_connected("daemon-incompatible"));
+
+    let result: Result<TestResponse, ServiceError> = registry
+        .send_request("daemon-incompatible", "execution.start", json!({}), 1)
+        .await;
+    assert!(matches!(
+        result,
+        Err(ServiceError::InvalidOperation { message })
+            if message.contains(api_types::DAEMON_PROTOCOL_INCOMPATIBLE)
+    ));
+}
+
+#[tokio::test]
+async fn pre_handshake_dispatch_is_rejected_without_sending_a_request() {
+    let registry = make_registry();
+    let (connection, mut outbound) = DaemonConnection::new("daemon-pre-handshake".to_owned());
+    registry.register("daemon-pre-handshake".to_owned(), connection);
+
+    let result: Result<TestResponse, ServiceError> = registry
+        .send_request("daemon-pre-handshake", "execution.start", json!({}), 1)
+        .await;
+    assert!(matches!(
+        result,
+        Err(ServiceError::InvalidOperation { message })
+            if message.contains(api_types::DAEMON_PROTOCOL_INCOMPATIBLE)
+    ));
+    assert!(matches!(
+        outbound.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn terminal_success_sends_ack_and_conflict_does_not() {
+    let event_bus = Arc::new(EventBus::new(16));
+    let handler = Arc::new(NoopHandler) as Arc<dyn DaemonExecutionEventHandler>;
+    let registry = Arc::new(DaemonConnectionRegistry::new(event_bus, handler));
+    let (connection, mut outbound) = DaemonConnection::new("daemon-terminal-ack".to_owned());
+    let connection_id = connection.id();
+    registry.register("daemon-terminal-ack".to_owned(), connection);
+    accept_protocol_handshake(&registry, "daemon-terminal-ack", connection_id);
+    let notification = json!({
+        "terminal_report_id": "terminal-report-1",
+        "execution_id": "execution-1",
+        "exit_code": 0,
+        "signal": null,
+        "error": null,
+        "ts": now_rfc3339(),
+        "status": "completed",
+        "usage_reports": []
+    });
+
+    registry.dispatch_incoming_for_connection(
+        "daemon-terminal-ack",
+        connection_id,
+        api_types::DaemonFrame::Notification {
+            method: api_types::METHOD_EXECUTION_TERMINAL.to_owned(),
+            params: notification,
+        },
+    );
+    let ack = outbound.recv().await.expect("terminal ack request");
+    let api_types::DaemonFrame::Request { id, method, params } = ack else {
+        panic!("expected terminal acknowledgement request");
+    };
+    assert_eq!(method, api_types::METHOD_EXECUTION_TERMINAL_ACK);
+    assert_eq!(params["terminal_report_id"], "terminal-report-1");
+    registry.dispatch_incoming_for_connection(
+        "daemon-terminal-ack",
+        connection_id,
+        api_types::DaemonFrame::Response {
+            id,
+            result: json!({
+                "terminal_report_id": "terminal-report-1",
+                "execution_id": "execution-1",
+                "acknowledged": true
+            }),
+        },
+    );
+
+    let conflict_event_bus = Arc::new(EventBus::new(16));
+    let conflict_handler = Arc::new(ConflictHandler) as Arc<dyn DaemonExecutionEventHandler>;
+    let conflict_registry = Arc::new(DaemonConnectionRegistry::new(
+        conflict_event_bus,
+        conflict_handler,
+    ));
+    let (conflict_connection, mut conflict_outbound) =
+        DaemonConnection::new("daemon-terminal-conflict".to_owned());
+    let conflict_connection_id = conflict_connection.id();
+    conflict_registry.register("daemon-terminal-conflict".to_owned(), conflict_connection);
+    accept_protocol_handshake(
+        &conflict_registry,
+        "daemon-terminal-conflict",
+        conflict_connection_id,
+    );
+    conflict_registry.dispatch_incoming_for_connection(
+        "daemon-terminal-conflict",
+        conflict_connection_id,
+        api_types::DaemonFrame::Notification {
+            method: api_types::METHOD_EXECUTION_TERMINAL.to_owned(),
+            params: json!({
+                "terminal_report_id": "terminal-report-conflict",
+                "execution_id": "execution-1",
+                "exit_code": 0,
+                "signal": null,
+                "error": null,
+                "ts": now_rfc3339(),
+                "status": "completed",
+                "usage_reports": []
+            }),
+        },
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), conflict_outbound.recv())
+            .await
+            .is_err(),
+        "conflicting terminal sink result must not send an acknowledgement"
+    );
+}
+
+#[tokio::test]
 async fn stale_connection_cannot_resolve_current_connection_request() {
     let registry = make_registry();
     let (first, _first_outbound) = DaemonConnection::new("daemon-incarnation".to_owned());
@@ -286,6 +492,7 @@ async fn stale_connection_cannot_resolve_current_connection_request() {
     let (second, mut second_outbound) = DaemonConnection::new("daemon-incarnation".to_owned());
     let second_id = second.id();
     registry.register("daemon-incarnation".to_owned(), second);
+    accept_protocol_handshake(&registry, "daemon-incarnation", second_id);
 
     let dispatcher = registry.clone();
     let mut request = tokio::spawn(async move {
@@ -361,6 +568,7 @@ fn register_daemon_connection(registry: &DaemonConnectionRegistry, daemon_id: &s
     let (connection, _outbound) = DaemonConnection::new(daemon_id.to_owned());
     let connection_id = connection.id();
     registry.register(daemon_id.to_owned(), connection);
+    accept_protocol_handshake(registry, daemon_id, connection_id);
     connection_id
 }
 

@@ -5,15 +5,13 @@ import { useOperationsStatusQuery, useRefreshOperationsMutation } from '@/api/ho
 import { ErrorBanner } from '@/components/error-banner'
 import { PlanChecklist } from '@/components/plan-checklist'
 import { PolicyBadge } from '@/components/policy-badge'
-import {
-  formatCostUsd,
-  formatRuntimeSeconds,
-  formatTokenCount,
-} from '@/components/task-execution-observability'
+import { CostSummaryView } from '@/components/analytics/CostSummary'
+import { formatRuntimeSeconds, formatTokenCount } from '@/components/task-execution-observability'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/cn'
 import { productTerm } from '@/lib/i18n'
+import { formatMoneyAmount } from '@/lib/money-format'
 import type {
   ActiveExecutionSummary,
   AgentPressureSummary,
@@ -128,10 +126,10 @@ function EntityLink({ href, children }: { href?: string; children: ReactNode }) 
 function tokenTotal(tokens: TokenTotalsSummary | null): number | null {
   if (!tokens) return null
   return (
-    tokens.input_tokens +
-    tokens.output_tokens +
-    tokens.cache_read_tokens +
-    tokens.cache_write_tokens
+    tokens.tokens.input_tokens +
+    tokens.tokens.output_tokens +
+    tokens.tokens.cache_read_tokens +
+    tokens.tokens.cache_write_tokens
   )
 }
 
@@ -213,9 +211,20 @@ function ActiveExecutionsSection({ executions }: { executions: ActiveExecutionSu
                 ) : null}
                 {execution.token_totals ? (
                   <span
-                    title={`${formatTokenCount(execution.token_totals.input_tokens)} input / ${formatTokenCount(execution.token_totals.output_tokens)} output / ${formatCostUsd(execution.token_totals.cost_usd)}`}
+                    title={`${formatTokenCount(execution.token_totals.tokens.input_tokens)} input / ${formatTokenCount(execution.token_totals.tokens.output_tokens)} output`}
                   >
                     {formatTokenCount(tokenTotal(execution.token_totals), true)} tokens
+                  </span>
+                ) : null}
+                {execution.token_totals ? (
+                  <span>
+                    {execution.token_totals.cost.coverage === 'pending'
+                      ? 'Cost pending'
+                      : execution.token_totals.cost.coverage === 'complete' && execution.token_totals.cost.complete_total
+                        ? formatMoneyAmount(execution.token_totals.cost.complete_total)
+                        : execution.token_totals.cost.coverage === 'no_usage'
+                          ? 'No usage'
+                          : 'Cost unknown'}
                   </span>
                 ) : null}
                 {formatRateLimitSnapshot(execution.rate_limit_snapshot) ? (
@@ -560,21 +569,20 @@ export function OperationsPage() {
       </div>
 
       {status.usage_summary ? (
-        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-          <StatCard
-            label="Usage"
-            value={status.usage_summary.available ? 'Available' : 'Partial'}
-          />
-          <StatCard label="Input Tokens" value={status.usage_summary.total_input_tokens ?? '-'} />
-          <StatCard label="Output Tokens" value={status.usage_summary.total_output_tokens ?? '-'} />
-          <StatCard
-            label="Cost"
-            value={
-              status.usage_summary.total_cost_usd == null
-                ? '-'
-                : `$${status.usage_summary.total_cost_usd.toFixed(4)}`
-            }
-          />
+        <div className="space-y-3">
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+            <StatCard
+              label="Task executions"
+              value={status.usage_summary.counts.task_execution_count}
+            />
+            <StatCard
+              label="Provider attempts"
+              value={status.usage_summary.counts.provider_attempt_count}
+            />
+            <StatCard label="Input Tokens" value={status.usage_summary.tokens.input_tokens} />
+            <StatCard label="Output Tokens" value={status.usage_summary.tokens.output_tokens} />
+          </div>
+          <CostSummaryView summary={status.usage_summary.cost} />
         </div>
       ) : null}
 

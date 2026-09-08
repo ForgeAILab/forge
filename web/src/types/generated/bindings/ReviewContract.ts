@@ -2,4 +2,10 @@
 import type { ConformanceCheckResult } from "./ConformanceCheckResult";
 import type { ReviewGoverningContext } from "./ReviewGoverningContext";
 
-export type ReviewContract = { execution_id: string, policy: string, commit_sha: string, base_sha: string, context: ReviewGoverningContext, check_results: Array<ConformanceCheckResult>, digest: string, };
+export type ReviewContract = { execution_id: string, policy: string, commit_sha: string, base_sha: string, context: ReviewGoverningContext,
+/**
+ * Results Forge recorded before dispatching the reviewer. These are
+ * immutable reviewer inputs; conformance admission reruns required checks
+ * before accepting the assessment.
+ */
+check_results: Array<ConformanceCheckResult>, digest: string, };

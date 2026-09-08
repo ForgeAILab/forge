@@ -489,7 +489,10 @@ impl CodexAdapter {
             .await?;
         let mut outcome = run.outcome.unwrap_or(ExecutionOutcome::Failed);
         let mut summary = run.summary;
-        let mut usage = run.usage;
+        let mut usage_reports = run.usage_reports;
+        for report in &mut usage_reports {
+            report.fill_identity(None, config.model.as_deref());
+        }
 
         if outcome == ExecutionOutcome::Cancelled {
             let _ = client.cancel_turn(thread_id.clone(), turn_id).await;
@@ -523,7 +526,10 @@ impl CodexAdapter {
                     if let Some(s) = followup.summary {
                         summary = Some(s);
                     }
-                    usage = merge_usage(usage, followup.usage);
+                    for mut report in followup.usage_reports {
+                        report.fill_identity(None, config.model.as_deref());
+                        client::append_usage_report(&mut usage_reports, report);
+                    }
                 }
             }
         }
@@ -543,7 +549,7 @@ impl CodexAdapter {
                 agent_session_id: run.thread_id.or(Some(thread_id)),
                 summary,
                 error,
-                usage: usage.map(|usage| usage_with_model(usage, &config)),
+                usage_reports,
                 ..Default::default()
             });
         }
@@ -558,7 +564,7 @@ impl CodexAdapter {
                 agent_session_id,
                 summary,
                 error: None,
-                usage: usage.map(|usage| usage_with_model(usage, &config)),
+                usage_reports,
                 ..Default::default()
             });
         }
@@ -574,7 +580,7 @@ impl CodexAdapter {
                     agent_session_id,
                     summary,
                     error: Some(error.to_string()),
-                    usage: usage.map(|usage| usage_with_model(usage, &config)),
+                    usage_reports,
                     ..Default::default()
                 });
             }
@@ -586,7 +592,7 @@ impl CodexAdapter {
             agent_session_id,
             summary,
             error: None,
-            usage: usage.map(|usage| usage_with_model(usage, &config)),
+            usage_reports,
             ..Default::default()
         })
     }
@@ -597,41 +603,6 @@ fn is_missing_codex_thread_error(error: &ExecutorError) -> bool {
         .to_string()
         .to_ascii_lowercase()
         .contains("thread not found")
-}
-
-fn merge_usage(
-    current: Option<executors::TokenUsage>,
-    next: Option<executors::TokenUsage>,
-) -> Option<executors::TokenUsage> {
-    match (current, next) {
-        (None, next) => next,
-        (current, None) => current,
-        (Some(mut current), Some(next)) => {
-            current.input_tokens += next.input_tokens;
-            current.output_tokens += next.output_tokens;
-            current.cache_read_tokens += next.cache_read_tokens;
-            current.cache_write_tokens += next.cache_write_tokens;
-            current.cost_usd = match (current.cost_usd, next.cost_usd) {
-                (Some(left), Some(right)) => Some(left + right),
-                (left, None) => left,
-                (None, right) => right,
-            };
-            if current.model.is_none() {
-                current.model = next.model;
-            }
-            Some(current)
-        }
-    }
-}
-
-fn usage_with_model(
-    mut usage: executors::TokenUsage,
-    config: &CodexConfig,
-) -> executors::TokenUsage {
-    if usage.model.is_none() {
-        usage.model = config.model.clone();
-    }
-    usage
 }
 
 pub(crate) fn codex_event_error_message(raw: &Value) -> Option<String> {

@@ -135,7 +135,7 @@ async fn ci_failure_after_merge_invalidates_review_and_surfaces_recovery_before_
             .as_ref()
             .is_some_and(|exception| exception.exception_type == "review_failed")
             && t.execution_observability.active_execution_id.is_none()
-            && t.execution_observability.execution_count >= 4
+            && t.execution_observability.counts.task_execution_count >= 4
         {
             break t;
         }
@@ -233,7 +233,7 @@ impl CodingExecutorAdapter for CiReReviewCodexAdapter {
                     agent_session_id: Some("auditor-session".to_owned()),
                     summary: Some("auditor passed the implementation".to_owned()),
                     error: None,
-                    usage: None,
+                    usage_reports: Vec::new(),
                     ..Default::default()
                 });
             }
@@ -255,7 +255,7 @@ impl CodingExecutorAdapter for CiReReviewCodexAdapter {
                     agent_session_id: Some(FIRST_EXECUTOR_SESSION_ID.to_owned()),
                     summary: Some("executor completed conflicting change".to_owned()),
                     error: None,
-                    usage: None,
+                    usage_reports: Vec::new(),
                     ..Default::default()
                 })
             } else {
@@ -274,7 +274,7 @@ impl CodingExecutorAdapter for CiReReviewCodexAdapter {
                     agent_session_id: Some(format!("merge-follow-up-session-{call_index}")),
                     summary: Some("coder resolved merge conflict".to_owned()),
                     error: None,
-                    usage: None,
+                    usage_reports: Vec::new(),
                     ..Default::default()
                 })
             }

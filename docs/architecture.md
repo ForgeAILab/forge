@@ -1017,6 +1017,69 @@ lease, evidence, review-contract, or review-assessment record remain rejected.
 V134 rebuilds the V132 conformance foreign keys and delete guards without losing
 rows, allowing those review records to cascade only during parent teardown.
 
+### Usage accounting and provider pricing
+
+Usage accounting is an append-only ledger at the provider-call grain. A Task
+execution remains one workflow attempt, but every fallback candidate that
+actually reaches a provider owns a distinct `usage_invocation`; Project Chat,
+ordinary Main Chat, Genesis Chat, and Main inquiries use the same lifecycle.
+Candidates skipped before a provider call remain route provenance and create no
+invocation. Historical attribution is frozen from admission-time identity and
+pricing-subject revisions rather than reconstructed through mutable Agent or
+provider bindings.
+
+Pre-V135 Projects whose stored owner no longer resolves to a current account
+principal do not receive fabricated accounting ownership. Their Task attempts
+remain visible in domain-run denominators as no-provider/no-usage coverage, but
+Forge creates no ownerless runtime invocation or usage row until a real account
+principal can be proved.
+
+Admission freezes the eligible immutable rate revision for every Task route
+candidate, or for the selected chat/inquiry provider call. Immediately before
+external provider work, Forge durably moves the stable invocation to `started`;
+if that write fails, it does not call the provider. Normal completion commits
+the domain terminal compare-and-swap, invocation settlement, non-overlapping
+usage events, and durable domain/outbox event in one SQLite transaction. A
+cancellation that wins while provider work drains keeps the domain result
+cancelled and moves the accounting obligation to `pending_settlement`; the
+drain may settle usage later without changing the cancellation. Recovery marks
+a started obligation `unsettled` only when no replayable provider result
+survives, and any provider retry receives a new attempt identity.
+
+Usage events carry disjoint nullable input, output, cache-read, and cache-write
+counters. Explicit metered zero is distinct from absent telemetry. A
+reported-money-only call creates one event with null counters; a settled call
+with neither counters nor reported money creates no event while its invocation
+remains visible as unmetered. Event and invocation idempotency keys come from
+immutable domain/request identities. Exact duplicate reports are no-ops after
+payload equality validation; conflicting reuse is a version conflict, never an
+additive update.
+
+Remote daemons transport the complete per-candidate usage vector and retain a
+terminal notification until the server acknowledges the composite transaction.
+Daemons that do not advertise the required protocol revision are rejected
+before dispatch so Forge never silently falls back to flattened or missing
+accounting. Late owner/CAS losers cannot append usage.
+
+Provider rates are immutable estimate inputs, not billing authority. Forge
+refreshes the fixed models.dev catalog endpoint only through an explicit
+authorized operation, activates a candidate snapshot atomically after bounded
+validation, and keeps the last known good snapshot on failure. Exact
+provider-entry/runtime plus model bindings and versioned manual overrides
+select rates; missing identity, rate, or tier evidence stays unknown. Catalog
+refresh and override publication affect future admissions only, while an
+explicit retrospective operation may create a separately versioned estimate.
+
+New money paths use integer nano-USD values and an `i128` intermediate. Forge
+sums the four measurable token buckets, divides once by one million with
+half-away-from-zero rounding per usage event, and aggregates stored event
+amounts. Provider-reported money and Forge estimates remain separate, never
+contribute twice, and are projected with explicit complete, partial,
+unavailable, pending, or no-usage coverage. The ledger stores only bounded
+identifiers, counters, timestamps, amount/rate provenance, and redacted reason
+codes—never prompts, completions, reasoning, tool content, schemas, commands,
+files, credentials, or raw provider streams.
+
 ### Direct Agent Runtime host and LCM
 
 Agent Settings at `/agents` is the single account-owned surface, organized as

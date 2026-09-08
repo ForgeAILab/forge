@@ -438,11 +438,13 @@ async fn build_agent_response(
         .as_str()
         .to_owned();
     let stats = ExecutionRepo::stats_by_agent(&*state.db, &agent.id).await?;
+    let usage = services::usage_projection::usage_aggregate_for_agent(&state.db, &agent.id).await?;
     Ok(agent_response(
         agent,
         active_task_count,
         Some(effective_status),
         stats,
+        usage,
     ))
 }
 

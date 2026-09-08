@@ -282,7 +282,7 @@ impl CodingExecutorAdapter for MergeConflictCodexAdapter {
                     agent_session_id: Some(AUDITOR_SESSION_ID.to_owned()),
                     summary: Some("auditor passed the implementation".to_owned()),
                     error: None,
-                    usage: None,
+                    usage_reports: Vec::new(),
                     ..Default::default()
                 });
             }
@@ -297,7 +297,7 @@ impl CodingExecutorAdapter for MergeConflictCodexAdapter {
                     agent_session_id: Some(FOLLOW_UP_SESSION_ID.to_owned()),
                     summary: Some("merge conflict follow-up completed".to_owned()),
                     error: None,
-                    usage: None,
+                    usage_reports: Vec::new(),
                     ..Default::default()
                 });
             }
@@ -320,7 +320,7 @@ impl CodingExecutorAdapter for MergeConflictCodexAdapter {
                 agent_session_id: Some(EXECUTOR_SESSION_ID.to_owned()),
                 summary: Some("executor completed".to_owned()),
                 error: None,
-                usage: None,
+                usage_reports: Vec::new(),
                 ..Default::default()
             })
         })
@@ -438,7 +438,7 @@ impl CodingExecutorAdapter for CompletingCodexAdapter {
                 agent_session_id: Some("merge-follow-up-session".to_owned()),
                 summary: Some("executor completed".to_owned()),
                 error: None,
-                usage: None,
+                usage_reports: Vec::new(),
                 ..Default::default()
             })
         })

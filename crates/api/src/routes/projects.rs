@@ -1,14 +1,13 @@
 use std::{collections::HashSet, path::PathBuf};
 
 use api_types::{
-    parse_project_hooks_json, AgentTokenBreakdown as ApiAgentTokenBreakdown, CiStepAnalytics,
+    parse_project_hooks_json, CiStepAnalytics, CostCoverage,
     CreateProjectFromCharterApprovalRequest, CreateProjectFromCharterApprovalResponse,
-    CreateProjectRequest, ModelTokenBreakdown as ApiModelTokenBreakdown, PaginatedResponse,
-    ProjectAnalyticsResponse, ProjectHookRunResponse, ProjectHookRunStatus,
-    ProjectHookRunsResponse, ProjectResponse, ProjectSettings, ReviewConfig,
-    ReviewSummaryAnalytics, StateKind, SurfaceTokenBreakdown as ApiSurfaceTokenBreakdown,
-    TestLifecycleHookRequest, TokenUsageAnalytics, UpdateProjectRequest,
-    UpdateProjectWorkflowRequest, WorkflowDefinition,
+    CreateProjectRequest, OutcomeCostMetric, OutcomeCostScope, OutcomeEligibility,
+    OutcomeIneligibilityReason, OutcomeKind, PaginatedResponse, ProjectAnalyticsResponse,
+    ProjectHookRunResponse, ProjectHookRunStatus, ProjectHookRunsResponse, ProjectResponse,
+    ProjectSettings, ReviewConfig, ReviewSummaryAnalytics, StateKind, TestLifecycleHookRequest,
+    UpdateProjectRequest, UpdateProjectWorkflowRequest, WorkflowDefinition,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -17,10 +16,9 @@ use axum::{
     Json,
 };
 use db::{
-    new_uuid_v4, now_rfc3339, AgentProfileRepo, AgentRepo, AgentTokenBreakdown, CiStepStats,
-    CreateProject, ModelTokenBreakdown, PageRequest, ProjectAnalyticsRepo, ProjectHookRun,
-    ProjectHookRunRepo, ProjectRepo, ProjectReviewSummary, ProjectTokenStats, RepoRepo, SortBy,
-    SortOrder, SurfaceTokenBreakdown, UpdateProject,
+    new_uuid_v4, now_rfc3339, AgentProfileRepo, AgentRepo, CiStepStats, CreateProject, PageRequest,
+    ProjectAnalyticsRepo, ProjectHookRun, ProjectHookRunRepo, ProjectRepo, ProjectReviewSummary,
+    RepoRepo, SortBy, SortOrder, UpdateProject, UsageAnalyticsRepo,
 };
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde::Deserialize;
@@ -254,15 +252,15 @@ pub async fn list_project_hook_runs(
 
 pub async fn get_project_analytics(
     State(state): State<AppState>,
+    user: AuthenticatedUser,
     Path(id): Path<String>,
     Query(params): Query<AnalyticsQuery>,
 ) -> Result<Json<ProjectAnalyticsResponse>, ApiError> {
-    ProjectRepo::get_by_id(&*state.db, &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", id.clone()))?;
+    require_project_visible(&state, &id, &user.user_id).await?;
 
     let from = params.from.as_deref();
     let to = params.to.as_deref();
+    validate_analytics_window(from, to)?;
 
     let ci_steps = ProjectAnalyticsRepo::get_project_ci_analytics(&*state.db, &id, from, to)
         .await?
@@ -296,115 +294,25 @@ pub async fn get_project_analytics(
         .collect();
 
     let token_usage =
-        ProjectAnalyticsRepo::get_project_token_analytics(&*state.db, &id, from, to).await?;
-    let ProjectTokenStats {
-        total_input_tokens,
-        total_output_tokens,
-        total_cache_read_tokens,
-        total_cache_write_tokens,
-        total_cost_usd,
-        execution_count,
-        chat_turn_count,
-        by_model,
-        by_agent,
-        by_surface,
-    } = token_usage;
-    let token_usage = TokenUsageAnalytics {
-        total_input_tokens,
-        total_output_tokens,
-        total_cache_read_tokens,
-        total_cache_write_tokens,
-        total_cost_usd,
-        execution_count,
-        chat_turn_count,
-        by_surface: by_surface
-            .into_iter()
-            .map(
-                |SurfaceTokenBreakdown {
-                     surface,
-                     run_count,
-                     input_tokens,
-                     output_tokens,
-                     cache_read_tokens,
-                     cache_write_tokens,
-                     cost_usd,
-                 }| ApiSurfaceTokenBreakdown {
-                    surface,
-                    run_count,
-                    input_tokens,
-                    output_tokens,
-                    cache_read_tokens,
-                    cache_write_tokens,
-                    cost_usd,
-                },
-            )
-            .collect(),
-        by_model: by_model
-            .into_iter()
-            .map(
-                |ModelTokenBreakdown {
-                     provider,
-                     model,
-                     input_tokens,
-                     output_tokens,
-                     cache_read_tokens,
-                     cache_write_tokens,
-                     cost_usd,
-                     execution_count,
-                 }| ApiModelTokenBreakdown {
-                    provider,
-                    model,
-                    input_tokens,
-                    output_tokens,
-                    cache_read_tokens,
-                    cache_write_tokens,
-                    cost_usd,
-                    execution_count,
-                },
-            )
-            .collect(),
-        by_agent: by_agent
-            .into_iter()
-            .map(
-                |AgentTokenBreakdown {
-                     agent_id,
-                     agent_name,
-                     executor_type,
-                     model,
-                     input_tokens,
-                     output_tokens,
-                     cache_read_tokens,
-                     cache_write_tokens,
-                     cost_usd,
-                     execution_count,
-                     success_rate,
-                     avg_duration_ms,
-                 }| ApiAgentTokenBreakdown {
-                    agent_id,
-                    agent_name,
-                    executor_type,
-                    model,
-                    input_tokens,
-                    output_tokens,
-                    cache_read_tokens,
-                    cache_write_tokens,
-                    cost_usd,
-                    execution_count,
-                    success_rate,
-                    avg_duration_ms,
-                },
-            )
-            .collect(),
-    };
+        UsageAnalyticsRepo::get_project_usage_analytics(&*state.db, &id, from, to).await?;
 
     let review_summary =
         ProjectAnalyticsRepo::get_project_review_summary(&*state.db, &id, from, to).await?;
     let review_summary = review_summary_analytics(review_summary);
+    let released_milestones =
+        UsageAnalyticsRepo::count_project_released_milestones(&*state.db, &id, from, to).await?;
+    let outcome_economics =
+        released_milestone_outcome(&id, from, to, &token_usage.cost, released_milestones)?;
 
     Ok(Json(ProjectAnalyticsResponse {
+        window: api_types::AnalyticsWindow {
+            from: params.from,
+            to: params.to,
+        },
         ci_steps,
         token_usage,
         review_summary,
+        outcome_economics,
     }))
 }
 
@@ -674,7 +582,7 @@ async fn stage_direct_child(
         Err(error) => {
             return Err(ApiError::internal(format!(
                 "inspect {kind} before Project deletion: {error}"
-            )))
+            )));
         }
     };
     // Never follow a persisted or corrupted symlink, even when it resolves to
@@ -824,7 +732,7 @@ pub async fn update_project(
     Ok(Json(project_response(project)?))
 }
 
-async fn require_project_visible(
+pub(crate) async fn require_project_visible(
     state: &AppState,
     project_id: &str,
     user_id: &str,
@@ -1089,6 +997,150 @@ fn serialize_settings(settings: &serde_json::Value) -> ApiResult<String> {
         .map_err(|error| ApiError::bad_request(format!("invalid settings: {error}")))
 }
 
+pub(crate) fn validate_analytics_window(from: Option<&str>, to: Option<&str>) -> ApiResult<()> {
+    let parsed_from = from
+        .map(chrono::DateTime::parse_from_rfc3339)
+        .transpose()
+        .map_err(|_| ApiError::bad_request("from must be a valid RFC3339 timestamp"))?;
+    let parsed_to = to
+        .map(chrono::DateTime::parse_from_rfc3339)
+        .transpose()
+        .map_err(|_| ApiError::bad_request("to must be a valid RFC3339 timestamp"))?;
+    if let (Some(from), Some(to)) = (parsed_from, parsed_to) {
+        if from >= to {
+            return Err(ApiError::bad_request("from must be before to"));
+        }
+    }
+    Ok(())
+}
+
+fn parse_money_nanos(decimal: &str) -> Option<i128> {
+    let (whole, fraction) = decimal.split_once('.').unwrap_or((decimal, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.len() > 9
+    {
+        return None;
+    }
+    let whole = whole.parse::<i128>().ok()?.checked_mul(1_000_000_000)?;
+    let mut fractional = fraction.to_owned();
+    while fractional.len() < 9 {
+        fractional.push('0');
+    }
+    let fractional = if fractional.is_empty() {
+        0
+    } else {
+        fractional.parse::<i128>().ok()?
+    };
+    whole.checked_add(fractional)
+}
+
+fn money_from_nanos(nanos: i128) -> Option<api_types::MoneyAmount> {
+    if nanos < 0 {
+        return None;
+    }
+    let whole = nanos / 1_000_000_000;
+    let fractional = nanos % 1_000_000_000;
+    let decimal = if fractional == 0 {
+        whole.to_string()
+    } else {
+        let mut fractional = format!("{fractional:09}");
+        while fractional.ends_with('0') {
+            fractional.pop();
+        }
+        format!("{whole}.{fractional}")
+    };
+    Some(api_types::MoneyAmount {
+        currency: "USD".to_owned(),
+        decimal,
+    })
+}
+
+fn divide_money_nanos(numerator: i128, denominator: i64) -> Option<i128> {
+    let denominator = i128::from(denominator);
+    if denominator <= 0 {
+        return None;
+    }
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+    let round_up =
+        remainder > denominator / 2 || (denominator % 2 == 0 && remainder == denominator / 2);
+    quotient.checked_add(i128::from(round_up))
+}
+
+fn released_milestone_outcome(
+    project_id: &str,
+    from: Option<&str>,
+    to: Option<&str>,
+    cost: &api_types::CostSummary,
+    denominator: i64,
+) -> ApiResult<OutcomeCostMetric> {
+    let scope = OutcomeCostScope {
+        project_id: project_id.to_owned(),
+        from: from.map(str::to_owned),
+        to: to.map(str::to_owned),
+    };
+    let base = |eligibility, reason, numerator, amount_per_outcome| OutcomeCostMetric {
+        outcome_kind: OutcomeKind::ReleasedMilestone,
+        numerator,
+        denominator,
+        amount_per_outcome,
+        scope: scope.clone(),
+        eligibility,
+        ineligibility_reason: reason,
+    };
+
+    if denominator == 0 {
+        return Ok(base(
+            OutcomeEligibility::NoOutcomes,
+            Some(OutcomeIneligibilityReason::NoReleasedMilestones),
+            None,
+            None,
+        ));
+    }
+
+    let (eligibility, reason) = match cost.coverage {
+        CostCoverage::Complete => (OutcomeEligibility::Eligible, None),
+        CostCoverage::NoUsage => (
+            OutcomeEligibility::IncompleteCost,
+            Some(OutcomeIneligibilityReason::NoUsageCost),
+        ),
+        CostCoverage::Pending => (
+            OutcomeEligibility::PendingCost,
+            Some(OutcomeIneligibilityReason::CostPending),
+        ),
+        CostCoverage::Partial => (
+            OutcomeEligibility::IncompleteCost,
+            Some(OutcomeIneligibilityReason::CostPartial),
+        ),
+        CostCoverage::Unavailable => (
+            OutcomeEligibility::IncompleteCost,
+            Some(OutcomeIneligibilityReason::CostUnavailable),
+        ),
+    };
+    if eligibility != OutcomeEligibility::Eligible {
+        return Ok(base(eligibility, reason, None, None));
+    }
+
+    let total = cost
+        .complete_total
+        .as_ref()
+        .and_then(|amount| parse_money_nanos(&amount.decimal))
+        .ok_or_else(|| ApiError::internal("complete analytics cost is not a valid USD amount"))?;
+    let amount_per_outcome = divide_money_nanos(total, denominator)
+        .and_then(money_from_nanos)
+        .ok_or_else(|| ApiError::internal("analytics outcome cost overflow"))?;
+    let numerator =
+        money_from_nanos(total).ok_or_else(|| ApiError::internal("analytics cost is negative"))?;
+    Ok(base(
+        OutcomeEligibility::Eligible,
+        None,
+        Some(numerator),
+        Some(amount_per_outcome),
+    ))
+}
+
 fn review_summary_analytics(summary: ProjectReviewSummary) -> ReviewSummaryAnalytics {
     ReviewSummaryAnalytics {
         total_reviews: summary.total_reviews,
@@ -1104,16 +1156,156 @@ fn review_summary_analytics(summary: ProjectReviewSummary) -> ReviewSummaryAnaly
 mod tests {
     use std::collections::HashSet;
 
-    use super::{
-        is_legacy_manual_default_assignee, restore_staged_paths, stage_direct_child,
-        StagedPathRemoval,
+    use api_types::{
+        CostCoverage, CostKind, CostSummary, MoneyAmount, OutcomeEligibility,
+        OutcomeIneligibilityReason, TokenCounters, UsageCostCoverage,
     };
+
+    use super::{
+        is_legacy_manual_default_assignee, released_milestone_outcome, restore_staged_paths,
+        stage_direct_child, validate_analytics_window, StagedPathRemoval,
+    };
+
+    fn cost_summary(coverage: CostCoverage, complete_total: Option<&str>) -> CostSummary {
+        CostSummary {
+            kind: if complete_total.is_some() {
+                CostKind::ProviderReported
+            } else {
+                CostKind::Unknown
+            },
+            coverage,
+            provider_reported: complete_total.map(|decimal| MoneyAmount {
+                currency: "USD".to_owned(),
+                decimal: decimal.to_owned(),
+            }),
+            estimated: None,
+            known_subtotal: None,
+            complete_total: complete_total.map(|decimal| MoneyAmount {
+                currency: "USD".to_owned(),
+                decimal: decimal.to_owned(),
+            }),
+            usage_coverage: UsageCostCoverage {
+                total_runs_or_turns: 0,
+                pending_runs_or_turns: 0,
+                no_provider_call_runs_or_turns: 0,
+                fully_metered_runs_or_turns: 0,
+                fully_costed_runs_or_turns: 0,
+                partially_costed_runs_or_turns: 0,
+                unavailable_cost_runs_or_turns: 0,
+                total_provider_attempts: 0,
+                settled_provider_attempts: 0,
+                pending_provider_attempts: 0,
+                unsettled_provider_attempts: 0,
+                metered_provider_attempts: 0,
+                unmetered_provider_attempts: 0,
+                costed_provider_attempts: 0,
+                unpriced_provider_attempts: 0,
+                priced_tokens: TokenCounters {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                unpriced_tokens: TokenCounters {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                reasons: Vec::new(),
+            },
+            sources: Vec::new(),
+        }
+    }
 
     #[test]
     fn recognizes_legacy_manual_default_assignee() {
         assert!(is_legacy_manual_default_assignee(Some("human")));
         assert!(!is_legacy_manual_default_assignee(Some("user-123")));
         assert!(!is_legacy_manual_default_assignee(None));
+    }
+
+    #[test]
+    fn analytics_window_rejects_invalid_and_non_increasing_ranges() {
+        assert!(validate_analytics_window(None, None).is_ok());
+        assert!(validate_analytics_window(Some("not-a-timestamp"), None).is_err());
+        assert!(validate_analytics_window(
+            Some("2026-09-08T00:00:01Z"),
+            Some("2026-09-08T00:00:01Z")
+        )
+        .is_err());
+        assert!(validate_analytics_window(
+            Some("2026-09-08T00:00:02Z"),
+            Some("2026-09-08T00:00:01Z")
+        )
+        .is_err());
+        assert!(validate_analytics_window(
+            Some("2026-09-08T05:30:00+05:30"),
+            Some("2026-09-08T00:00:01Z")
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn released_milestone_outcome_uses_exact_coverage_eligibility() {
+        let cases = [
+            (
+                CostCoverage::NoUsage,
+                OutcomeEligibility::IncompleteCost,
+                OutcomeIneligibilityReason::NoUsageCost,
+            ),
+            (
+                CostCoverage::Pending,
+                OutcomeEligibility::PendingCost,
+                OutcomeIneligibilityReason::CostPending,
+            ),
+            (
+                CostCoverage::Partial,
+                OutcomeEligibility::IncompleteCost,
+                OutcomeIneligibilityReason::CostPartial,
+            ),
+            (
+                CostCoverage::Unavailable,
+                OutcomeEligibility::IncompleteCost,
+                OutcomeIneligibilityReason::CostUnavailable,
+            ),
+        ];
+        for (coverage, eligibility, reason) in cases {
+            let outcome =
+                released_milestone_outcome("project", None, None, &cost_summary(coverage, None), 2)
+                    .expect("ineligible outcome is representable");
+            assert_eq!(outcome.eligibility, eligibility);
+            assert_eq!(outcome.ineligibility_reason, Some(reason));
+            assert_eq!(outcome.denominator, 2);
+            assert!(outcome.numerator.is_none());
+            assert!(outcome.amount_per_outcome.is_none());
+        }
+
+        let no_outcomes = released_milestone_outcome(
+            "project",
+            None,
+            None,
+            &cost_summary(CostCoverage::Complete, Some("3")),
+            0,
+        )
+        .expect("no outcomes is representable");
+        assert_eq!(no_outcomes.eligibility, OutcomeEligibility::NoOutcomes);
+        assert_eq!(
+            no_outcomes.ineligibility_reason,
+            Some(OutcomeIneligibilityReason::NoReleasedMilestones)
+        );
+
+        let eligible = released_milestone_outcome(
+            "project",
+            None,
+            None,
+            &cost_summary(CostCoverage::Complete, Some("3")),
+            2,
+        )
+        .expect("complete outcome is representable");
+        assert_eq!(eligible.eligibility, OutcomeEligibility::Eligible);
+        assert_eq!(eligible.numerator.unwrap().decimal, "3");
+        assert_eq!(eligible.amount_per_outcome.unwrap().decimal, "1.5");
     }
 
     #[tokio::test]

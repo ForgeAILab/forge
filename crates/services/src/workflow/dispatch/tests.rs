@@ -602,3 +602,245 @@ fn read_only_task_overrides_coder_dispatch_with_a_no_write_contract() {
         .contains("Do not modify, create, delete, or commit"));
     assert!(prompt.user.contains("clean unchanged worktree"));
 }
+
+/// A failed review's feedback must come from the reviewer's own execution.
+/// `Review::execution_id` names the execution that was *reviewed*, so reading
+/// feedback from it hands the coder its own transcript and the review→fix loop
+/// can never converge on the finding.
+#[tokio::test]
+async fn review_feedback_comes_from_the_reviewer_execution_not_the_reviewed_one() {
+    use db::{
+        CreateExecution, CreateProject, CreateRepo, CreateReview, CreateTask, ExecutionRepo,
+        ExecutionStatus, ProjectRepo, RepoRepo, ReviewRepo, TaskRepo,
+    };
+
+    let pool = db::create_sqlite_pool("sqlite::memory:")
+        .await
+        .expect("pool creates");
+    db::run_migrations(&pool).await.expect("migrations run");
+    let db = std::sync::Arc::new(db::SqliteDb::new(pool));
+    let now = db::now_rfc3339();
+    let project_id = db::new_uuid_v4();
+    let repo_id = db::new_uuid_v4();
+    ProjectRepo::create(
+        &*db,
+        CreateProject {
+            id: project_id.clone(),
+            name: "Review feedback".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("project creates");
+    RepoRepo::create(
+        &*db,
+        CreateRepo {
+            id: repo_id.clone(),
+            project_id: project_id.clone(),
+            name: "repo".to_owned(),
+            remote_url: "https://example.com/repo.git".to_owned(),
+            local_path: None,
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "main".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("repo creates");
+    let task = TaskRepo::create(
+        &*db,
+        CreateTask {
+            id: db::new_uuid_v4(),
+            project_id: project_id.clone(),
+            repo_id: Some(repo_id),
+            parent_task_id: None,
+            subtask_order: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "Escape control characters".to_owned(),
+            description: None,
+            task_type: "task".to_owned(),
+            status: default_states::IN_PROGRESS.to_owned(),
+            is_automation: false,
+            priority: 0,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("task creates");
+
+    let execution = |id: String, role: &str, created_at: String, logs: &str| CreateExecution {
+        id,
+        task_id: task.id.clone(),
+        agent_id: None,
+        role: role.to_owned(),
+        status: ExecutionStatus::Completed,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: None,
+        agent_session_id: None,
+        agent_message_id: None,
+        last_activity_at: None,
+        summary: None,
+        logs_path: Some(logs.to_owned()),
+        before_sha: None,
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: Some(r#"{"executor_type":"shell","config":{}}"#.to_owned()),
+        workspace_id: None,
+        created_at: created_at.clone(),
+        updated_at: created_at,
+    };
+    let coder_id = db::new_uuid_v4();
+    let reviewer_id = db::new_uuid_v4();
+    ExecutionRepo::create(
+        &*db,
+        execution(
+            coder_id.clone(),
+            default_roles::CODER,
+            "2026-04-17T00:00:00Z".to_owned(),
+            "/logs/coder.jsonl",
+        ),
+    )
+    .await
+    .expect("coder execution creates");
+    ExecutionRepo::create(
+        &*db,
+        execution(
+            reviewer_id.clone(),
+            default_roles::REVIEWER,
+            "2026-04-17T00:02:00Z".to_owned(),
+            "/logs/reviewer.jsonl",
+        ),
+    )
+    .await
+    .expect("reviewer execution creates");
+
+    let review = ReviewRepo::create(
+        &*db,
+        CreateReview {
+            id: db::new_uuid_v4(),
+            task_id: task.id.clone(),
+            // The reviewed execution — the coder's.
+            execution_id: coder_id.clone(),
+            attempt_number: 1,
+            status: db::ReviewStatus::Running,
+            step_results_json: "{}".to_owned(),
+            started_at: "2026-04-17T00:01:00Z".to_owned(),
+            created_at: "2026-04-17T00:01:00Z".to_owned(),
+            updated_at: "2026-04-17T00:01:00Z".to_owned(),
+        },
+    )
+    .await
+    .expect("review creates");
+    ReviewRepo::update_status(
+        &*db,
+        &review.id,
+        db::ReviewStatus::Failed,
+        json!({
+            "ci_steps": [],
+            "auditor": {"verdict": "fail", "reason": "reviewer identified a violation"}
+        })
+        .to_string(),
+        Some("2026-04-17T00:03:00Z".to_owned()),
+        "2026-04-17T00:03:00Z",
+    )
+    .await
+    .expect("review fails");
+
+    let conformance = json!({
+        "status": "failed",
+        "contract": null,
+        "assessment": {
+            "contract_digest": "digest",
+            "verdict": "fail",
+            "requirements": [
+                {
+                    "requirement_id": "charter:/scope/must_have_outcomes/6",
+                    "disposition": "satisfied",
+                    "rationale": "Two-line stderr contract is implemented.",
+                    "evidence": []
+                },
+                {
+                    "requirement_id": "task:acceptance",
+                    "disposition": "violated",
+                    "rationale": "The JSON escaper leaves U+0008 unescaped.",
+                    "evidence": [{
+                        "kind": "file",
+                        "path": "tsvsort/src/main.rs",
+                        "commit_sha": "abc123",
+                        "start_line": 10,
+                        "end_line": 20
+                    }]
+                }
+            ],
+            "findings": []
+        },
+        "checks": [],
+        "reason": null
+    })
+    .to_string();
+    sqlx::query("INSERT INTO execution_review_contract VALUES (?, ?, ?, ?, ?, ?)")
+        .bind(&reviewer_id)
+        .bind(&task.id)
+        .bind("digest")
+        .bind("source-digest")
+        .bind(json!({"execution_id": reviewer_id}).to_string())
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("contract persists");
+    sqlx::query("INSERT INTO execution_review_assessment VALUES (?, ?, ?)")
+        .bind(&reviewer_id)
+        .bind(&conformance)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("assessment persists");
+
+    let context = crate::workflow::dispatch::loader::load_agent_dispatch_context(
+        db.clone(),
+        &task.id,
+        default_roles::CODER,
+        default_states::IN_PROGRESS,
+        json!({}),
+        None,
+        &crate::workflow::default_workflow::default_workflow(),
+    )
+    .await
+    .expect("dispatch context loads");
+
+    assert_eq!(
+        context.latest_review_execution_id.as_deref(),
+        Some(reviewer_id.as_str()),
+        "the coder must be pointed at the reviewer's execution"
+    );
+    assert_eq!(
+        context.latest_review_logs_path.as_deref(),
+        Some("/logs/reviewer.jsonl")
+    );
+    let feedback = context
+        .latest_review_feedback
+        .expect("the failed review supplies feedback");
+    assert!(
+        feedback.contains("The JSON escaper leaves U+0008 unescaped."),
+        "feedback must carry the violated requirement's rationale: {feedback}"
+    );
+    assert!(feedback.contains("tsvsort/src/main.rs:10-20"));
+    assert!(
+        !feedback.contains("Two-line stderr contract is implemented."),
+        "satisfied requirements are not findings"
+    );
+}

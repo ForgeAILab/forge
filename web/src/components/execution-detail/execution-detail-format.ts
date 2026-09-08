@@ -1,4 +1,4 @@
-import type { Execution, ExecutionUsage, LogEntry } from '@/types/generated'
+import type { Execution, LogEntry, UsageBreakdown } from '@/types/generated'
 
 export function formatDate(value?: string | null): string {
   if (!value) return '-'
@@ -33,21 +33,19 @@ export function executionRuntimeSeconds(execution: Execution): number {
   return Math.max(0, Math.floor((stopped - started) / 1000))
 }
 
-export function usageTotals(usage: ExecutionUsage[]) {
+export function usageTotals(usage: UsageBreakdown[]) {
   return usage.reduce(
     (totals, item) => ({
-      inputTokens: totals.inputTokens + item.input_tokens,
-      outputTokens: totals.outputTokens + item.output_tokens,
-      cacheReadTokens: totals.cacheReadTokens + item.cache_read_tokens,
-      cacheWriteTokens: totals.cacheWriteTokens + item.cache_write_tokens,
-      costUsd: totals.costUsd + (item.cost_usd ?? 0),
+      inputTokens: totals.inputTokens + (item.counters?.input_tokens ?? 0),
+      outputTokens: totals.outputTokens + (item.counters?.output_tokens ?? 0),
+      cacheReadTokens: totals.cacheReadTokens + (item.counters?.cache_read_tokens ?? 0),
+      cacheWriteTokens: totals.cacheWriteTokens + (item.counters?.cache_write_tokens ?? 0),
     }),
     {
       inputTokens: 0,
       outputTokens: 0,
       cacheReadTokens: 0,
       cacheWriteTokens: 0,
-      costUsd: 0,
     },
   )
 }

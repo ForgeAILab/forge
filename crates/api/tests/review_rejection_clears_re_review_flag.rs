@@ -191,7 +191,7 @@ impl CodingExecutorAdapter for RejectClearsFlagCodexAdapter {
                     agent_session_id: Some("auditor-session".to_owned()),
                     summary: Some("auditor passed after reviewer rejection".to_owned()),
                     error: None,
-                    usage: None,
+                    usage_reports: Vec::new(),
                     ..Default::default()
                 });
             }
@@ -211,7 +211,7 @@ impl CodingExecutorAdapter for RejectClearsFlagCodexAdapter {
                 agent_session_id: Some(format!("follow-up-session-{call_index}")),
                 summary: Some("coder follow-up completed".to_owned()),
                 error: None,
-                usage: None,
+                usage_reports: Vec::new(),
                 ..Default::default()
             })
         })

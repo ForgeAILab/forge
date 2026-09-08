@@ -599,7 +599,7 @@ fn reconciliation_action_from_wire(value: &str) -> Result<ReconciliationResoluti
         other => {
             return Err(ServiceError::invalid_operation(format!(
                 "reconciliation resolution has an unknown action '{other}'"
-            )))
+            )));
         }
     })
 }
@@ -615,7 +615,7 @@ fn reconciliation_state_from_wire(value: &str) -> Result<ReconciliationState> {
         other => {
             return Err(ServiceError::invalid_operation(format!(
                 "reconciliation record has an unknown state '{other}'"
-            )))
+            )));
         }
     })
 }

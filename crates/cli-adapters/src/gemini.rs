@@ -258,7 +258,7 @@ impl CodingExecutorAdapter for GeminiAdapter {
                         agent_session_id: stream.agent_session_id,
                         summary: stream.summary,
                         error: Some(e.to_string()),
-                        usage: None,
+                        usage_reports: Vec::new(),
                         ..Default::default()
                     });
                 }
@@ -273,7 +273,7 @@ impl CodingExecutorAdapter for GeminiAdapter {
             agent_session_id: stream.agent_session_id,
             summary: stream.summary,
             error,
-            usage: None,
+            usage_reports: Vec::new(),
             ..Default::default()
         })
     }

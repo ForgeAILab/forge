@@ -3,7 +3,7 @@ import type { AgentBindingSummary } from "./AgentBindingSummary";
 import type { AgentContinuityHealth } from "./AgentContinuityHealth";
 import type { AgentScopeSummary } from "./AgentScopeSummary";
 import type { AgentSessionSummary } from "./AgentSessionSummary";
-import type { AgentUsageSummary } from "./AgentUsageSummary";
 import type { MissionControlWorkItem } from "./MissionControlWorkItem";
+import type { UsageAggregate } from "./UsageAggregate";
 
-export type AgentDetailResponse = { identity_id: string, name: string, description: string | null, backend_kind: string | null, provider: string | null, model: string | null, identity_status: string, paused: boolean, bindings: Array<AgentBindingSummary>, scopes: Array<AgentScopeSummary>, sessions: Array<AgentSessionSummary>, current_focus: MissionControlWorkItem | null, open_commitment_count: bigint, open_inbox_count: bigint, memory_namespace_count: bigint, usage: AgentUsageSummary, continuity: AgentContinuityHealth, };
+export type AgentDetailResponse = { identity_id: string, name: string, description: string | null, backend_kind: string | null, provider: string | null, model: string | null, identity_status: string, paused: boolean, bindings: Array<AgentBindingSummary>, scopes: Array<AgentScopeSummary>, sessions: Array<AgentSessionSummary>, current_focus: MissionControlWorkItem | null, open_commitment_count: bigint, open_inbox_count: bigint, memory_namespace_count: bigint, usage: UsageAggregate, continuity: AgentContinuityHealth, };

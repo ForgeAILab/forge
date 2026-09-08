@@ -40,6 +40,7 @@ import type {
   AgentChatTurn,
   AgentHandoff,
 } from '@/features/agent-chat/types'
+import type { UsageBreakdown } from '@/types/generated/bindings/UsageBreakdown'
 import { useChatSelection } from '@/stores/chat'
 import { cn } from '@/lib/cn'
 
@@ -88,25 +89,26 @@ function formatDuration(ms: bigint | number | null | undefined): string | null {
 }
 
 /**
- * "77,535 in · 61,440 cached · 898 out": the cached share is part of the
- * input count, shown because it is what makes a long turn cheap.
+ * "77,535 in · 61,440 cached · 898 out": the disjoint cache buckets stay
+ * visible beside fresh input. A chat message can contain multiple provider
+ * attempts/events, so the typed rows are summed before display.
  */
-export function parseTokenUsage(json: Record<string, unknown> | null): string | null {
-  if (!json) return null
-  const input = json.input
-  const output = json.output
-  if (typeof input !== 'number' && typeof output !== 'number') return null
-  const cacheRead = json.cache_read
-  const cacheWrite = json.cache_write
+export function parseTokenUsage(usage: Pick<UsageBreakdown, 'counters'>[]): string | null {
+  const counters = usage.flatMap((row) => (row.counters ? [row.counters] : []))
+  if (counters.length === 0) return null
+  const input = counters.reduce((total, value) => total + value.input_tokens, 0)
+  const output = counters.reduce((total, value) => total + value.output_tokens, 0)
+  const cacheRead = counters.reduce((total, value) => total + value.cache_read_tokens, 0)
+  const cacheWrite = counters.reduce((total, value) => total + value.cache_write_tokens, 0)
   const parts: string[] = []
-  if (typeof input === 'number') parts.push(`${input.toLocaleString()} in`)
-  if (typeof cacheRead === 'number' && cacheRead > 0) {
+  parts.push(`${input.toLocaleString()} in`)
+  if (cacheRead > 0) {
     parts.push(`${cacheRead.toLocaleString()} cached`)
   }
-  if (typeof cacheWrite === 'number' && cacheWrite > 0) {
+  if (cacheWrite > 0) {
     parts.push(`${cacheWrite.toLocaleString()} cache write`)
   }
-  if (typeof output === 'number') parts.push(`${output.toLocaleString()} out`)
+  parts.push(`${output.toLocaleString()} out`)
   return parts.join(' · ')
 }
 
@@ -313,7 +315,7 @@ function AgentMessage({
   prefetchActivity?: boolean
 }) {
   const duration = formatDuration(message.duration_ms)
-  const tokens = parseTokenUsage(message.token_usage_json)
+  const tokens = parseTokenUsage(message.usage)
   const meta = [message.model, duration, tokens].filter(Boolean).join(' · ')
 
   return (

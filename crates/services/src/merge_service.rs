@@ -154,7 +154,7 @@ impl MergeService {
             Err(error) => {
                 return Ok(MergeOutcome::ReviewRequired {
                     reason: error.to_string(),
-                })
+                });
             }
         };
         let reviewed_sha = review_guard
@@ -290,7 +290,7 @@ impl MergeService {
             Err(error) => {
                 return Ok(MergeOutcome::ReviewRequired {
                     reason: error.to_string(),
-                })
+                });
             }
         };
         let candidate = if let Some(contract) = &guard.contract {
@@ -316,7 +316,7 @@ impl MergeService {
             Err(error) => {
                 return Ok(MergeOutcome::ReviewRequired {
                     reason: error.to_string(),
-                })
+                });
             }
         };
         guard.release().await?;

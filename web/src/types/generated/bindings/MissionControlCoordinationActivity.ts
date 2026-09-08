@@ -6,7 +6,7 @@
  * can see what was committed without exposing the action/command payload
  * bodies.
  */
-export type MissionControlCoordinationActivity = { id: string, 
+export type MissionControlCoordinationActivity = { id: string,
 /**
  * `direct_command` for a committed command receipt, or
  * `approval_action` for a pending/approved AgentAction.

@@ -1,12 +1,14 @@
 #![forbid(unsafe_code)]
 
 pub mod agent;
+pub mod analytics;
 pub mod auth;
 pub mod client;
 pub mod daemon;
 #[doc(hidden)]
 pub mod daemon_fs;
 pub mod daemon_link;
+pub mod daemon_persistence;
 pub mod daemon_runtime;
 pub mod embedded;
 pub mod mcp;

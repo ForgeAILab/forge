@@ -3,12 +3,15 @@ use std::{future::Future, sync::Arc};
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, Agent, AgentChatMessageListQuery,
     AgentChatMessageRepo, AgentChatRepo, AgentChatTurnJobRepo, AgentHandoffRepo, AgentRepo,
-    AgentStatus, AssigneeKind, CreateAgent, CreateAgentIdentity, CreateAgentProfile,
-    CreateExecution, CreateProject, CreateProjectMember, CreateRepo, CreateTask,
-    CreateTaskRoleAssignment, DaemonRepo, DaemonStatus, ExecutionRepo, ExecutionStatus,
-    PageRequest, ProjectAgentBindingRepo, ProjectMemberRepo, ProjectRepo, RepoRepo, SortBy,
-    SortOrder, SqliteDb, Task, TaskRepo, TaskRoleAssignmentRepo, UpdateProject, UpsertDaemon,
-    UserRepo,
+    AgentStatus, AssigneeKind, CostCoverageReasonCode, CreateAgent, CreateAgentChatMessage,
+    CreateAgentIdentity, CreateAgentProfile, CreateExecution, CreatePricingSelection,
+    CreateProject, CreateProjectMember, CreateRepo, CreateTask, CreateTaskRoleAssignment,
+    CreateUsageEvent, CreateUsageInvocation, DaemonRepo, DaemonStatus, ExecutionRepo,
+    ExecutionStatus, PageRequest, PricingAdmissionProvenanceKind, PricingDomainKind,
+    PricingSelectionStatus, ProjectAgentBindingRepo, ProjectMemberRepo, ProjectRepo, RepoRepo,
+    SortBy, SortOrder, SqliteDb, StartUsageInvocation, Task, TaskRepo, TaskRoleAssignmentRepo,
+    UpdateProject, UpsertDaemon, UsageCostKind, UsageEventProvenanceKind, UsageEventReportMode,
+    UsageLedgerRepo, UsageLedgerSettlement, UsageSurface, UsageTelemetryState, UserRepo,
 };
 use events::EventBus;
 use serde_json::{json, Value};
@@ -185,6 +188,224 @@ async fn seed_chat_project(state: &AppState, identity_id: &str) -> String {
         .await
         .expect("project binding creates");
     project_id
+}
+
+async fn append_chat_agent_message(
+    state: &AppState,
+    chat_id: &str,
+    identity_id: &str,
+    profile_id: &str,
+) -> db::AgentChatMessage {
+    let now = now_rfc3339();
+    AgentChatMessageRepo::append_agent_chat_message(
+        &*state.db,
+        CreateAgentChatMessage {
+            id: new_uuid_v4(),
+            chat_id: chat_id.to_owned(),
+            sequence: 0,
+            author_type: db::AgentChatMessageAuthorType::Agent,
+            author_id: Some(identity_id.to_owned()),
+            content: "typed usage response".to_owned(),
+            content_guard_json: "{}".to_owned(),
+            sensitivity: "public".to_owned(),
+            status: db::AgentChatMessageStatus::Complete,
+            outcome: Some("completed".to_owned()),
+            model: Some("test-model".to_owned()),
+            profile_id: Some(profile_id.to_owned()),
+            session_id: None,
+            context_manifest_id: None,
+            // This value is intentionally populated to prove the public MCP
+            // projection never forwards the retired raw field.
+            token_usage_json: Some(
+                serde_json::json!({
+                    "input_tokens": 12,
+                    "output_tokens": 3,
+                    "cache_read_tokens": 5,
+                    "cache_write_tokens": 0,
+                })
+                .to_string(),
+            ),
+            duration_ms: Some(25),
+            error: None,
+            correlation_id: new_uuid_v4(),
+            causation_id: None,
+            handoff_id: None,
+            source_type: "native".to_owned(),
+            source_id: Some(new_uuid_v4()),
+            source_message_id: None,
+            source_room_id: None,
+            source_conversation_id: None,
+            source_sequence: None,
+            source_metadata_json: "{}".to_owned(),
+            created_at: now,
+        },
+    )
+    .await
+    .expect("agent chat message creates")
+}
+
+async fn seed_chat_usage_event(
+    state: &AppState,
+    message: &db::AgentChatMessage,
+    identity_id: &str,
+    profile_id: &str,
+    owner_user_id: &str,
+) {
+    let now = now_rfc3339();
+    let selection_id = new_uuid_v4();
+    let candidate_key = "chat-test-candidate".to_owned();
+    let selection = UsageLedgerRepo::create_pricing_selection(
+        &*state.db,
+        CreatePricingSelection {
+            id: selection_id.clone(),
+            owner_user_id: Some(owner_user_id.to_owned()),
+            project_id: None,
+            domain_kind: PricingDomainKind::Chat,
+            surface: UsageSurface::MainChat,
+            source_id: message.id.clone(),
+            execution_id: None,
+            task_id: None,
+            candidate_key: Some(candidate_key.clone()),
+            attempt_ordinal: 0,
+            subject_id: None,
+            subject_revision_id: None,
+            subject_revision_digest: None,
+            binding_id: None,
+            rate_revision_id: None,
+            catalog_snapshot_id: None,
+            catalog_freshness: None,
+            runtime_model: Some("test-model".to_owned()),
+            admitted_provider_id: Some("test".to_owned()),
+            admitted_model_id: Some("test-model".to_owned()),
+            source_kind: None,
+            provenance_kind: PricingAdmissionProvenanceKind::Runtime,
+            selection_status: PricingSelectionStatus::Unpriced,
+            selection_reason: Some(CostCoverageReasonCode::MissingRate),
+            selection_digest: new_uuid_v4(),
+            selected_at: now.clone(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("chat pricing selection creates");
+    let invocation = UsageLedgerRepo::create_usage_invocation(
+        &*state.db,
+        CreateUsageInvocation {
+            id: new_uuid_v4(),
+            owner_user_id: Some(owner_user_id.to_owned()),
+            project_id: None,
+            domain_kind: PricingDomainKind::Chat,
+            surface: UsageSurface::MainChat,
+            source_id: message.id.clone(),
+            execution_id: None,
+            task_id: None,
+            domain_idempotency_key: new_uuid_v4(),
+            candidate_key: Some(candidate_key.clone()),
+            attempt_ordinal: 0,
+            pricing_selection_id: selection.id.clone(),
+            admitted_provider_id: Some("test".to_owned()),
+            admitted_model_id: Some("test-model".to_owned()),
+            admitted_runtime_model: Some("test-model".to_owned()),
+            pricing_subject_id: None,
+            pricing_subject_revision_id: None,
+            subject_revision_digest: None,
+            agent_id: Some(identity_id.to_owned()),
+            profile_id: Some(profile_id.to_owned()),
+            agent_name_snapshot: Some("MCP Chat Agent".to_owned()),
+            project_name_snapshot: None,
+            executor_type: Some("embedded".to_owned()),
+            backend_kind: Some("native".to_owned()),
+            provenance_kind: PricingAdmissionProvenanceKind::Runtime,
+            admitted_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("chat usage invocation creates");
+    let started = UsageLedgerRepo::start_usage_invocation(
+        &*state.db,
+        StartUsageInvocation {
+            id: invocation.id.clone(),
+            expected_version: invocation.version,
+            started_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("chat usage invocation starts");
+    let event = CreateUsageEvent {
+        id: new_uuid_v4(),
+        invocation_id: started.id.clone(),
+        owner_user_id: Some(owner_user_id.to_owned()),
+        project_id: None,
+        surface: UsageSurface::MainChat,
+        source_id: message.id.clone(),
+        execution_id: None,
+        task_id: None,
+        event_idempotency_key: new_uuid_v4(),
+        source_report_id: new_uuid_v4(),
+        report_sequence: 0,
+        report_mode: UsageEventReportMode::FinalSnapshot,
+        provenance_kind: UsageEventProvenanceKind::RuntimeReport,
+        legacy_source_table: None,
+        legacy_source_id: None,
+        legacy_provider_raw: None,
+        legacy_provider_sqlite_type: None,
+        legacy_provider_sql_literal: None,
+        legacy_model_raw: None,
+        legacy_model_sqlite_type: None,
+        legacy_model_sql_literal: None,
+        legacy_counter_values_json: "{}".to_owned(),
+        legacy_cost_usd_raw: None,
+        legacy_created_at_raw: None,
+        legacy_project_owner_raw: None,
+        legacy_invalid_usage: false,
+        provider_id: Some("test".to_owned()),
+        model_id: Some("test-model".to_owned()),
+        runtime_model: Some("test-model".to_owned()),
+        candidate_key: Some(candidate_key),
+        attempt_ordinal: 0,
+        agent_id: Some(identity_id.to_owned()),
+        profile_id: Some(profile_id.to_owned()),
+        agent_name_snapshot: Some("MCP Chat Agent".to_owned()),
+        project_name_snapshot: None,
+        executor_type: Some("embedded".to_owned()),
+        pricing_subject_revision_id: None,
+        subject_revision_digest: None,
+        telemetry_state: UsageTelemetryState::Metered,
+        input_tokens: Some(12),
+        output_tokens: Some(3),
+        cache_read_tokens: Some(5),
+        cache_write_tokens: Some(0),
+        context_tokens: Some(17),
+        selected_tier: None,
+        provider_reported_nano_usd: None,
+        legacy_reported_cost_usd: None,
+        estimated_nano_usd: None,
+        cost_kind: UsageCostKind::None,
+        rate_revision_id: None,
+        catalog_snapshot_id: None,
+        formula_revision: None,
+        retrospective: false,
+        coverage_reason_code: Some(CostCoverageReasonCode::MissingRate),
+        occurred_at: now.clone(),
+        created_at: now.clone(),
+    };
+    UsageLedgerRepo::settle_usage_invocations_with_events(
+        &*state.db,
+        vec![UsageLedgerSettlement {
+            invocation_id: started.id,
+            expected_version: started.version,
+            telemetry_state: UsageTelemetryState::Metered,
+            terminal_reason: None,
+            settled_at: now.clone(),
+            updated_at: now,
+            events: vec![event],
+        }],
+    )
+    .await
+    .expect("chat usage settles");
 }
 
 async fn seed_project_repo(state: &AppState) -> (String, String) {
@@ -818,6 +1039,8 @@ fn mcp_chat_send_uses_atomic_admission_and_deduplicates() {
                 .expect("MCP text result"),
         )
         .expect("MCP JSON result");
+        assert!(first_payload["message"].get("token_usage_json").is_none());
+        assert_eq!(first_payload["message"]["usage"], json!([]));
         let second = dispatch_with_context(&state, &context, "tools/call", request)
             .await
             .expect("idempotent MCP send replay");
@@ -853,6 +1076,105 @@ fn mcp_chat_send_uses_atomic_admission_and_deduplicates() {
             .expect("turn count");
         assert_eq!(messages.items.len(), 1);
         assert_eq!(turns.len(), 1);
+    });
+}
+
+#[test]
+fn mcp_chat_reads_typed_usage_without_crossing_account_or_project_scope() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (identity_id, profile_id, user_id) = seed_chat_account(&state).await;
+        let main_chat = state
+            .agent_chat_service
+            .ensure_main_chat(&user_id)
+            .await
+            .expect("main chat");
+        let message =
+            append_chat_agent_message(&state, &main_chat.id, &identity_id, &profile_id).await;
+        seed_chat_usage_event(&state, &message, &identity_id, &profile_id, &user_id).await;
+
+        let account_context = McpContext {
+            project_id: None,
+            user_id: Some(user_id.clone()),
+        };
+        let result = dispatch_with_context(
+            &state,
+            &account_context,
+            "tools/call",
+            json!({
+                "name": "forge_list_agent_chat_messages",
+                "arguments": { "chat_id": main_chat.id.clone() },
+            }),
+        )
+        .await
+        .expect("authorized account chat read");
+        let payload: Value = serde_json::from_str(
+            result["content"][0]["text"]
+                .as_str()
+                .expect("MCP text result"),
+        )
+        .expect("MCP JSON result");
+        let assistant = payload["items"]
+            .as_array()
+            .expect("message items")
+            .iter()
+            .find(|item| item["id"] == message.id)
+            .expect("seeded assistant message");
+        assert!(assistant.get("token_usage_json").is_none());
+        assert_eq!(assistant["usage"][0]["surface"], "main_chat");
+        assert_eq!(assistant["usage"][0]["counters"]["input_tokens"], 12);
+        assert_eq!(assistant["usage"][0]["counters"]["output_tokens"], 3);
+        assert!(assistant["usage"][0]["cost"].is_object());
+
+        let project_id = seed_chat_project(&state, &identity_id).await;
+        let project_chat = AgentChatRepo::get_project_chat(&*state.db, &project_id)
+            .await
+            .expect("project chat lookup")
+            .expect("project chat exists");
+        let project_context = McpContext {
+            project_id: Some(project_id.clone()),
+            user_id: Some(user_id.clone()),
+        };
+        dispatch_with_context(
+            &state,
+            &project_context,
+            "tools/call",
+            json!({
+                "name": "forge_list_agent_chat_messages",
+                "arguments": { "chat_id": project_chat.id },
+            }),
+        )
+        .await
+        .expect("authorized Project chat read");
+
+        let wrong_project_scope = dispatch_with_context(
+            &state,
+            &project_context,
+            "tools/call",
+            json!({
+                "name": "forge_list_agent_chat_messages",
+                "arguments": { "chat_id": main_chat.id.clone() },
+            }),
+        )
+        .await
+        .expect_err("Project scope cannot read account Main Chat");
+        assert_eq!(wrong_project_scope.code, -32602);
+
+        let wrong_account = dispatch_with_context(
+            &state,
+            &McpContext {
+                project_id: None,
+                user_id: Some("mcp-test-user".to_owned()),
+            },
+            "tools/call",
+            json!({
+                "name": "forge_list_agent_chat_messages",
+                "arguments": { "chat_id": main_chat.id.clone() },
+            }),
+        )
+        .await
+        .expect_err("another account cannot read Main Chat");
+        assert_eq!(wrong_account.code, -32004);
     });
 }
 

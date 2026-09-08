@@ -3645,6 +3645,7 @@ async fn execution_lease_and_terminal_cas_are_single_winner_and_preserve_deadlin
             event,
             workspace_lease_id,
             workspace_lease_status,
+            replayed: _,
         } => {
             assert_eq!(event.event_type, "execution.completed");
             assert_eq!(

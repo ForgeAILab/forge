@@ -1,6 +1,8 @@
 import { Link } from '@tanstack/react-router'
 import { cn } from '@/lib/cn'
 import { productTerm } from '@/lib/i18n'
+import { formatMoneyAmount } from '@/lib/money-format'
+import { CostSummaryView } from '@/components/analytics/CostSummary'
 import type { TaskExecutionObservability } from '@/types/generated'
 
 export function formatRuntimeSeconds(value?: number | null): string {
@@ -29,12 +31,6 @@ export function formatTokenCount(value?: number | null, compact = false): string
     }).format(value)
   }
   return Math.max(0, Math.trunc(value)).toLocaleString()
-}
-
-export function formatCostUsd(value?: number | null): string {
-  if (value == null || !Number.isFinite(value)) return '-'
-  if (value === 0) return '$0.00'
-  return value < 0.01 ? `$${value.toFixed(4)}` : `$${value.toFixed(2)}`
 }
 
 export function formatDateTime(value?: string | null): string {
@@ -90,19 +86,34 @@ export function TaskExecutionObservabilityPanel({
         runtimeSeconds: value.latest_runtime_seconds,
       }
     : null
+  const totalTokens =
+    value.tokens.input_tokens +
+    value.tokens.output_tokens +
+    value.tokens.cache_read_tokens +
+    value.tokens.cache_write_tokens
+  const costHeadline =
+    value.cost.coverage === 'complete' && value.cost.complete_total
+      ? formatMoneyAmount(value.cost.complete_total)
+      : value.cost.coverage === 'pending'
+        ? 'Pending'
+        : value.cost.coverage === 'no_usage'
+          ? 'No usage'
+          : 'Cost unknown'
 
   return (
     <section className={cn('space-y-3', className)}>
       <div className="grid grid-cols-2 gap-2">
-        <Metric label={productTerm('run', 0)} value={formatTokenCount(value.execution_count)} />
+        <Metric label={productTerm('run', 0)} value={formatTokenCount(value.counts.task_execution_count)} />
         <Metric label="Runtime" value={formatRuntimeSeconds(value.total_runtime_seconds)} />
         <Metric
           label="Tokens"
-          title={`${formatTokenCount(value.total_input_tokens)} input / ${formatTokenCount(value.total_output_tokens)} output / ${formatTokenCount(value.total_cache_read_tokens)} cache read / ${formatTokenCount(value.total_cache_write_tokens)} cache write`}
-          value={formatTokenCount(value.total_tokens, true)}
+          title={`${formatTokenCount(value.tokens.input_tokens)} input / ${formatTokenCount(value.tokens.output_tokens)} output / ${formatTokenCount(value.tokens.cache_read_tokens)} cache read / ${formatTokenCount(value.tokens.cache_write_tokens)} cache write`}
+          value={formatTokenCount(totalTokens, true)}
         />
-        <Metric label="Cost" value={formatCostUsd(value.total_cost_usd)} />
+        <Metric label="Cost" value={costHeadline} />
       </div>
+
+      <CostSummaryView summary={value.cost} compact />
 
       {active ? (
         <ExecutionLine

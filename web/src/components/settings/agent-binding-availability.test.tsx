@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import type { FederatedAgent } from '@/features/federation/types'
+import { emptyUsage } from '@/test-utils/usage'
 import { MainAgentBindingCard } from './MainAgentBindingCard'
 import { ProjectAgentTab } from './ProjectAgentTab'
 
@@ -57,15 +58,9 @@ function agent(id: string, name: string, effectiveStatus: string): FederatedAgen
     status: 'idle',
     active_task_count: 0,
     effective_status: effectiveStatus,
-    total_runs: 0,
     avg_duration_ms: null,
     success_rate: null,
-    total_input_tokens: 0,
-    total_output_tokens: 0,
-    total_cache_read_tokens: 0,
-    total_cache_write_tokens: 0,
-    total_tokens: 0,
-    total_cost_usd: null,
+    usage: emptyUsage,
     is_default: false,
     paused: false,
     owner_id: 'user-1',

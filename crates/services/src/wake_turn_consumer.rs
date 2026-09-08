@@ -718,7 +718,7 @@ impl WakeTurnConsumer {
                         responder: None,
                         parent_disposition_id: parent_id,
                     },
-                )))
+                )));
             }
         };
         let fields = match parse_wake_fields(event, &payload) {
@@ -737,7 +737,7 @@ impl WakeTurnConsumer {
                         responder: None,
                         parent_disposition_id: parent_id,
                     },
-                )))
+                )));
             }
         };
         if fields.reaction_depth < 0
@@ -824,7 +824,7 @@ impl WakeTurnConsumer {
                         responder: None,
                         parent_disposition_id: parent_id,
                     },
-                )))
+                )));
             }
             Err(_) => {
                 return Ok(self.deferred_plan(DeferredPlanSpec {
@@ -837,7 +837,7 @@ impl WakeTurnConsumer {
                     incident_digest: Some(fields.incident_digest),
                     responder: None,
                     attention_id: None,
-                }))
+                }));
             }
         };
         let scope_matches = match self.attention_matches_scope(&attention, &fields).await {
@@ -853,7 +853,7 @@ impl WakeTurnConsumer {
                     incident_digest: Some(fields.incident_digest),
                     responder: None,
                     attention_id: Some(attention.id),
-                }))
+                }));
             }
         };
         if !scope_matches || attention.dedupe_key != fields.incident_key {
@@ -935,7 +935,7 @@ impl WakeTurnConsumer {
                     incident_digest: Some(incident_digest),
                     responder: None,
                     attention_id: Some(attention.id),
-                }))
+                }));
             }
         };
         match responder.readiness {
@@ -953,7 +953,7 @@ impl WakeTurnConsumer {
                         responder: Some(&responder),
                         parent_disposition_id: parent_id,
                     },
-                )))
+                )));
             }
             AgentTurnReadiness::Unavailable => {
                 return Ok(self.deferred_plan(DeferredPlanSpec {
@@ -966,7 +966,7 @@ impl WakeTurnConsumer {
                     incident_digest: Some(incident_digest),
                     responder: Some(&responder),
                     attention_id: Some(attention.id),
-                }))
+                }));
             }
             AgentTurnReadiness::Ready => {}
         }

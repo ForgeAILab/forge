@@ -7,6 +7,7 @@ import type { FederatedAgent } from '@/features/federation/types'
 import type {
   ProviderAuthorizationOperationResponse,
   ProviderEntryResponse,
+  UsageAggregate,
 } from '@/types/generated'
 
 const createEmbeddedAgent = vi.fn().mockResolvedValue({})
@@ -22,6 +23,60 @@ const testProviderEntry = vi.fn().mockResolvedValue({
   message: null,
   checked_at: '2026-08-15T00:00:00Z',
 })
+
+const emptyUsage: UsageAggregate = {
+  counts: {
+    task_execution_count: 0,
+    chat_turn_count: 0,
+    inquiry_count: 0,
+    provider_attempt_count: 0,
+  },
+  tokens: {
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_tokens: 0,
+    cache_write_tokens: 0,
+  },
+  cost: {
+    kind: 'none',
+    coverage: 'no_usage',
+    provider_reported: null,
+    estimated: null,
+    known_subtotal: null,
+    complete_total: null,
+    usage_coverage: {
+      total_runs_or_turns: 0,
+      pending_runs_or_turns: 0,
+      no_provider_call_runs_or_turns: 0,
+      fully_metered_runs_or_turns: 0,
+      fully_costed_runs_or_turns: 0,
+      partially_costed_runs_or_turns: 0,
+      unavailable_cost_runs_or_turns: 0,
+      total_provider_attempts: 0,
+      settled_provider_attempts: 0,
+      pending_provider_attempts: 0,
+      unsettled_provider_attempts: 0,
+      metered_provider_attempts: 0,
+      unmetered_provider_attempts: 0,
+      costed_provider_attempts: 0,
+      unpriced_provider_attempts: 0,
+      priced_tokens: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+      },
+      unpriced_tokens: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+      },
+      reasons: [],
+    },
+    sources: [],
+  },
+}
 
 vi.mock('@/features/federation/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/features/federation/api')>()),
@@ -58,7 +113,12 @@ vi.mock('@/stores/auth', () => ({
 }))
 // The Projects section on the Bindings tab lists every project; keep it empty here.
 vi.mock('@/api/hooks', () => ({
-  useProjectsQuery: () => ({ data: { items: [] }, isLoading: false, isError: false, refetch: vi.fn() }),
+  useProjectsQuery: () => ({
+    data: { items: [] },
+    isLoading: false,
+    isError: false,
+    refetch: vi.fn(),
+  }),
   useUpdateAgent: () => ({ mutateAsync: updateAgent, isPending: false }),
 }))
 // The agent dialogs reuse the launch-dialog selectors, which need discovered
@@ -179,6 +239,61 @@ vi.mock('@/features/federation/hooks', () => ({
     isError: false,
     isFetching: false,
     refetch: vi.fn(),
+  }),
+  usePricingCatalogStatusQuery: () => ({
+    data: {
+      state: 'fresh',
+      active_snapshot_id: 'snapshot-1',
+      revision: 'revision-1',
+      etag: null,
+      fetched_at: '2026-08-16T00:00:00Z',
+      last_checked_at: '2026-08-16T00:00:00Z',
+      stale_after: '2026-08-23T00:00:00Z',
+      last_error_code: null,
+    },
+    isLoading: false,
+    isError: false,
+    refetch: vi.fn(),
+  }),
+  useRefreshPricingCatalogMutation: () => ({
+    mutateAsync: vi.fn().mockResolvedValue({ state: 'fresh' }),
+    isPending: false,
+  }),
+  usePricingCatalogModelsQuery: () => ({
+    data: { items: [], has_more: false, next_cursor: null },
+    isLoading: false,
+    isError: false,
+    refetch: vi.fn(),
+  }),
+  useProviderPricingQuery: () => ({
+    data: {
+      subject_id: 'credential-1',
+      subject_revision_digest: 'subject-revision-1',
+      version: 1,
+      bindings: [],
+    },
+    isLoading: false,
+    isError: false,
+    refetch: vi.fn(),
+  }),
+  useCliRuntimePricingQuery: () => ({
+    data: {
+      subject_id: 'daemon-1:codex',
+      subject_revision_digest: 'subject-revision-1',
+      version: 1,
+      bindings: [],
+    },
+    isLoading: false,
+    isError: false,
+    refetch: vi.fn(),
+  }),
+  useReplaceProviderPricingMutation: () => ({
+    mutateAsync: vi.fn(),
+    isPending: false,
+  }),
+  useReplaceCliRuntimePricingMutation: () => ({
+    mutateAsync: vi.fn(),
+    isPending: false,
   }),
   useProjectAgentBindingQuery: () => ({
     data: undefined,
@@ -314,15 +429,9 @@ const agent: FederatedAgent = {
   status: 'idle',
   active_task_count: 0,
   effective_status: 'ready',
-  total_runs: 4,
   avg_duration_ms: 500,
   success_rate: 1,
-  total_input_tokens: 400,
-  total_output_tokens: 100,
-  total_cache_read_tokens: 50,
-  total_cache_write_tokens: 20,
-  total_tokens: 570,
-  total_cost_usd: 0.05,
+  usage: emptyUsage,
   is_default: false,
   paused: false,
   owner_id: 'user-1',
@@ -352,15 +461,9 @@ const cliAgent: FederatedAgent = {
   status: 'idle',
   active_task_count: 0,
   effective_status: 'ready',
-  total_runs: 0,
   avg_duration_ms: null,
   success_rate: null,
-  total_input_tokens: 0,
-  total_output_tokens: 0,
-  total_cache_read_tokens: 0,
-  total_cache_write_tokens: 0,
-  total_tokens: 0,
-  total_cost_usd: null,
+  usage: emptyUsage,
   is_default: false,
   paused: false,
   owner_id: 'user-1',
@@ -408,16 +511,16 @@ describe('FederatedAgentsPage', () => {
     expect(screen.getByText('Forge Guide')).toBeTruthy()
     expect(screen.queryByText('Main and Project Agent bindings')).toBeNull()
     fireEvent.click(screen.getByRole('tab', { name: /bindings/i }))
-    expect(
-      screen.getByRole('tab', { name: /bindings/i }).getAttribute('aria-selected'),
-    ).toBe('true')
+    expect(screen.getByRole('tab', { name: /bindings/i }).getAttribute('aria-selected')).toBe(
+      'true',
+    )
     expect(screen.getByText('Main and Project Agent bindings')).toBeTruthy()
     expect(screen.getByText('Global · Main')).toBeTruthy()
     // The Projects section is always present on the Bindings tab, never gated on `?project=`.
     expect(screen.getByText('Project Agent bindings')).toBeTruthy()
   })
 
-  it('shows an agent\'s settings in the panel and edits a direct agent inline', async () => {
+  it("shows an agent's settings in the panel and edits a direct agent inline", async () => {
     renderPage()
     fireEvent.click(screen.getByText('Forge Guide'))
     // The panel shows the agent's settings directly — no profile list, no dialog.
@@ -442,7 +545,7 @@ describe('FederatedAgentsPage', () => {
     expect(updateAgent).not.toHaveBeenCalled()
   })
 
-  it('discards inline edits back to the agent\'s current settings', () => {
+  it("discards inline edits back to the agent's current settings", () => {
     renderPage()
     fireEvent.click(screen.getByText('Forge Guide'))
     fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'gpt-6' } })
@@ -458,7 +561,9 @@ describe('FederatedAgentsPage', () => {
     // The panel reuses the launch-dialog selectors: model and reasoning come
     // from discovery, policy from the shared PolicySelector.
     fireEvent.click(screen.getByLabelText('Model'))
-    fireEvent.click(within(screen.getByRole('listbox')).getByRole('option', { name: /GPT-5\.2 Codex/i }))
+    fireEvent.click(
+      within(screen.getByRole('listbox')).getByRole('option', { name: /GPT-5\.2 Codex/i }),
+    )
     fireEvent.click(screen.getByLabelText('Reasoning'))
     fireEvent.click(within(screen.getByRole('listbox')).getByRole('option', { name: /High/ }))
     fireEvent.click(screen.getByLabelText('Policy'))
@@ -515,9 +620,7 @@ describe('FederatedAgentsPage', () => {
     expect(await screen.findByText(/is connected\. No agent was created\./)).toBeTruthy()
     await vi.waitFor(() => expect(testProviderEntry).toHaveBeenCalledWith('credential-2'))
     expect(await screen.findByText(/Provider responding · 123 ms/)).toBeTruthy()
-    expect(
-      screen.getByRole('button', { name: /create an agent with this provider/i }),
-    ).toBeTruthy()
+    expect(screen.getByRole('button', { name: /create an agent with this provider/i })).toBeTruthy()
   })
 
   it('renders and cancels a device authorization operation without exposing tokens', async () => {
@@ -562,9 +665,7 @@ describe('FederatedAgentsPage', () => {
     const disconnectButtons = screen.getAllByRole('button', { name: /^disconnect$/i })
     fireEvent.click(disconnectButtons[0])
     expect(screen.getByText(/1 agent reference this entry \(Forge Guide\)/)).toBeTruthy()
-    const confirm = screen
-      .getByRole('alertdialog')
-      .querySelector('button') as HTMLButtonElement
+    const confirm = screen.getByRole('alertdialog').querySelector('button') as HTMLButtonElement
     fireEvent.click(confirm)
     await vi.waitFor(() =>
       expect(removeProviderEntry).toHaveBeenCalledWith({ handleId: 'credential-1', version: 1 }),

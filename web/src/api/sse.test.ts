@@ -56,6 +56,28 @@ describe('routeSsePayload', () => {
     expect(dispatch).not.toHaveBeenCalled()
   })
 
+  it('invalidates project and account analytics for a project-scoped execution event', () => {
+    const { queryClient, invalidateQueries, dispatch } = createMocks()
+    routeSsePayload(
+      {
+        event_type: 'execution.finished',
+        entity_id: 'exec-1',
+        task_id: 'task-1',
+        project_id: 'proj-1',
+        timestamp: '2026-05-05T00:00:00Z',
+      },
+      queryClient,
+      { dispatch },
+    )
+
+    expect(invalidateQueries.mock.calls).toEqual(
+      expect.arrayContaining([
+        [{ queryKey: ['projects', 'proj-1', 'analytics'] }],
+        [{ queryKey: ['analytics', 'usage'] }],
+      ]),
+    )
+  })
+
   it('invalidates task and project task list on task.status_changed', () => {
     const { queryClient, invalidateQueries, dispatch } = createMocks()
     routeSsePayload(
@@ -199,6 +221,8 @@ describe('routeSsePayload', () => {
       expect.arrayContaining([
         [{ queryKey: ['projects', 'proj-1'] }],
         [{ queryKey: ['projects'] }],
+        [{ queryKey: ['projects', 'proj-1', 'analytics'] }],
+        [{ queryKey: ['analytics', 'usage'] }],
       ]),
     )
     expect(dispatch).not.toHaveBeenCalled()
@@ -272,6 +296,8 @@ describe('routeSsePayload', () => {
       expect.arrayContaining([
         [{ queryKey: ['projects', 'proj-1'] }],
         [{ queryKey: ['projects'] }],
+        [{ queryKey: ['projects', 'proj-1', 'analytics'] }],
+        [{ queryKey: ['analytics', 'usage'] }],
       ]),
     )
     expect(dispatch).not.toHaveBeenCalled()
@@ -335,6 +361,7 @@ describe('routeSsePayload', () => {
         [{ queryKey: ['agent-chats', 'chat-1'] }],
         [{ queryKey: ['agent-chats', 'chat-1', 'messages'] }],
         [{ queryKey: ['agent-chats', 'chat-1', 'turns'] }],
+        [{ queryKey: ['analytics', 'usage'] }],
       ]),
     )
     expect(dispatch).not.toHaveBeenCalled()

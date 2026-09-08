@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
+use crate::pricing::UsageBreakdown;
+
 /// The durable binding state is intentionally separate from identity status.
 /// A connected identity is not implicitly a Main or Project Agent.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -212,8 +214,7 @@ pub struct AgentChatMessageResponse {
     pub profile_id: Option<String>,
     pub session_id: Option<String>,
     pub context_manifest_id: Option<String>,
-    #[ts(type = "Record<string, unknown> | null")]
-    pub token_usage_json: Option<Value>,
+    pub usage: Vec<UsageBreakdown>,
     pub duration_ms: Option<i64>,
     pub error: Option<String>,
     pub correlation_id: String,

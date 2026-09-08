@@ -15,7 +15,7 @@ import {
   useExecutionHookLogs,
   useExecutionLogs,
   useExecutionQuery,
-  useExecutionUsageQuery,
+  useUsageBreakdownsQuery,
   useFollowUpExecution,
   useTaskQuery,
   type ExecutionLogsParams,
@@ -212,7 +212,7 @@ export function ExecutionDetailPage({
 }) {
   const navigate = useNavigate({ from: '/tasks/$taskId/executions/$executionId' })
   const executionQuery = useExecutionQuery(executionId)
-  const executionUsageQuery = useExecutionUsageQuery(executionId)
+  const usageBreakdownsQuery = useUsageBreakdownsQuery(executionId)
   const taskQuery = useTaskQuery(taskId)
   const agentsQuery = useAgentsQuery()
   const followUpExecution = useFollowUpExecution(executionId)
@@ -312,7 +312,7 @@ export function ExecutionDetailPage({
     }
   }, [accessToken, executionId, executionQuery.data?.status])
 
-  const executionUsage = execution?.usage ?? executionUsageQuery.data ?? []
+  const usageBreakdowns = execution?.usage ?? usageBreakdownsQuery.data ?? []
   const executionAgentSessionId = execution?.agent_session_id ?? null
   const showRecoveryAction = execution?.status === 'cancelled' || execution?.status === 'failed'
   const recoveryActionLabel = executionAgentSessionId ? 'Continue Session' : 'Re-execute'
@@ -591,7 +591,7 @@ export function ExecutionDetailPage({
                 isLoading={executionQuery.isLoading}
                 execution={execution ?? null}
                 logs={logs}
-                usage={executionUsage}
+                usage={usageBreakdowns}
                 hookLogs={hookLogsQuery.data ?? []}
                 agentName={agentName}
                 taskId={taskId}

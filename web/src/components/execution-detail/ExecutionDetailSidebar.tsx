@@ -17,7 +17,7 @@ import { Tooltip } from '@/components/ui/tooltip'
 import { cn } from '@/lib/cn'
 import { isResumeExecution, roleDisplayName } from '@/lib/execution-utils'
 import { productTerm } from '@/lib/i18n'
-import type { Execution, ExecutionUsage, LogEntry } from '@/types/generated'
+import type { Execution, LogEntry, UsageBreakdown } from '@/types/generated'
 
 function CopyableId({ value, label }: { value: string; label?: string }) {
   const [copied, setCopied] = useState(false)
@@ -83,7 +83,7 @@ export function ExecutionDetailSidebar({
   isLoading: boolean
   execution: Execution | null
   logs: LogEntry[]
-  usage: ExecutionUsage[]
+  usage: UsageBreakdown[]
   hookLogs: HookLogEntry[]
   agentName: (agentId?: string | null) => string | null | undefined
   taskId: string

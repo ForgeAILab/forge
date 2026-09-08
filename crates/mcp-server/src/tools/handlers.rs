@@ -1293,8 +1293,12 @@ pub(super) async fn forge_list_agent_chat_messages(
         },
     )
     .await?;
+    let mut items = Vec::with_capacity(page.items.len());
+    for message in page.items {
+        items.push(message_response(state, message).await?);
+    }
     Ok(serialize_public(AgentChatMessageListResponse {
-        items: page.items.into_iter().map(message_response).collect(),
+        items,
         next_cursor: page.next_cursor.clone(),
         has_more: page.next_cursor.is_some(),
     }))
@@ -1333,7 +1337,7 @@ pub(super) async fn forge_send_agent_chat_message(
         })
         .await?;
     Ok(serialize_public(api_types::SendAgentChatMessageResponse {
-        message: message_response(admitted.message),
+        message: message_response(state, admitted.message).await?,
         turn_job: Some(turn_response(admitted.turn_job)),
     }))
 }
@@ -1628,8 +1632,25 @@ fn chat_response(chat: AgentChat) -> ApiAgentChatResponse {
     }
 }
 
-fn message_response(message: AgentChatMessage) -> AgentChatMessageResponse {
-    AgentChatMessageResponse {
+async fn message_response(
+    state: &AppState,
+    message: AgentChatMessage,
+) -> Result<AgentChatMessageResponse, McpToolError> {
+    // Chat usage is keyed by the immutable response message ID in both the
+    // legacy migration and the runtime ledger.  Resolve it from the ledger
+    // only after the caller has passed the chat authorization guard above;
+    // never expose the historical token JSON as a fallback.
+    let usage_source_id = message.source_id.as_deref().unwrap_or(&message.id);
+    let mut usage =
+        services::usage_projection::usage_breakdowns_for_source(&state.db, usage_source_id).await?;
+    // V135's legacy chat import keyed rows by the immutable response message
+    // ID, while live chat admissions key the turn's usage by its source/job
+    // ID. Support both immutable forms without consulting token JSON.
+    if usage.is_empty() && usage_source_id != message.id {
+        usage =
+            services::usage_projection::usage_breakdowns_for_source(&state.db, &message.id).await?;
+    }
+    Ok(AgentChatMessageResponse {
         id: message.id,
         chat_id: message.chat_id,
         author_type: match message.author_type {
@@ -1652,7 +1673,7 @@ fn message_response(message: AgentChatMessage) -> AgentChatMessageResponse {
         profile_id: message.profile_id,
         session_id: message.session_id,
         context_manifest_id: message.context_manifest_id,
-        token_usage_json: message.token_usage_json.map(|value| parse_json(&value)),
+        usage,
         duration_ms: message.duration_ms,
         error: message.error,
         correlation_id: message.correlation_id,
@@ -1662,7 +1683,7 @@ fn message_response(message: AgentChatMessage) -> AgentChatMessageResponse {
         source_message_id: message.source_message_id,
         sequence: message.sequence,
         created_at: message.created_at,
-    }
+    })
 }
 
 fn turn_response(job: AgentChatTurnJob) -> AgentChatTurnJobResponse {

@@ -4,7 +4,7 @@ use api_types::{
     parse_project_hooks_json, AgentResponse, DaemonResponse, ExecutionResponse, PaginatedResponse,
     ProjectResponse, RepoResponse, ReviewDetails, ReviewResponse, StateKind, StepResultEntry,
     StepResultResponse, Task as ApiTask, TaskAnnotation, TaskBlockingAnnotation, TaskResponse,
-    TaskRoleAssignmentResponse, TaskType, WorkspaceResponse,
+    TaskRoleAssignmentResponse, TaskType, UsageAggregate, WorkspaceResponse,
 };
 use chrono::{DateTime, Utc};
 use db::{
@@ -28,6 +28,7 @@ pub mod admin;
 pub mod agent_chats;
 pub mod agent_inquiries;
 pub mod agents;
+pub mod analytics;
 pub mod auth;
 pub mod clis;
 pub mod coordination;
@@ -47,6 +48,7 @@ pub mod mission_control;
 pub mod notifications;
 pub mod oauth;
 pub mod operations;
+pub mod pricing;
 pub mod product_genesis;
 pub mod project_agents;
 pub mod project_charters;
@@ -477,19 +479,8 @@ async fn task_execution_observability(
     let row = sqlx::query(
         "WITH task_executions AS (
              SELECT * FROM execution WHERE task_id = ?
-         ),
-         usage_totals AS (
-             SELECT
-                 COALESCE(SUM(eu.input_tokens), 0) AS total_input_tokens,
-                 COALESCE(SUM(eu.output_tokens), 0) AS total_output_tokens,
-                 COALESCE(SUM(eu.cache_read_tokens), 0) AS total_cache_read_tokens,
-                 COALESCE(SUM(eu.cache_write_tokens), 0) AS total_cache_write_tokens,
-                 SUM(eu.cost_usd) AS total_cost_usd
-             FROM execution_usage eu
-             JOIN task_executions e ON e.id = eu.execution_id
          )
          SELECT
-             (SELECT COUNT(*) FROM task_executions) AS execution_count,
              (SELECT COALESCE(SUM(max(COALESCE(
                  (CASE
                      WHEN status = 'running' THEN CAST(strftime('%s', 'now') AS INTEGER)
@@ -515,24 +506,23 @@ async fn task_execution_observability(
                      ELSE CAST(strftime('%s', COALESCE(stopped_at, updated_at)) AS INTEGER)
                   END) - CAST(strftime('%s', created_at) AS INTEGER),
                  0), 0)
-              FROM task_executions ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_runtime_seconds,
-             usage_totals.total_input_tokens,
-             usage_totals.total_output_tokens,
-             usage_totals.total_cache_read_tokens,
-             usage_totals.total_cache_write_tokens,
-             usage_totals.total_cost_usd
-         FROM usage_totals",
+              FROM task_executions ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_runtime_seconds
+        ",
     )
     .bind(task_id)
     .fetch_one(db.pool())
     .await?;
 
-    let total_input_tokens = row.try_get::<i64, _>("total_input_tokens")?;
-    let total_output_tokens = row.try_get::<i64, _>("total_output_tokens")?;
-    let total_cache_read_tokens = row.try_get::<i64, _>("total_cache_read_tokens")?;
-    let total_cache_write_tokens = row.try_get::<i64, _>("total_cache_write_tokens")?;
+    let usage = services::usage_projection::usage_aggregate_for_task(db, task_id)
+        .await
+        .map_err(|error| match error {
+            services::ServiceError::Db(error) => error,
+            _ => db::DbError::InvalidTransition,
+        })?;
     Ok(api_types::TaskExecutionObservability {
-        execution_count: row.try_get("execution_count")?,
+        counts: usage.counts,
+        tokens: usage.tokens,
+        cost: usage.cost,
         active_execution_id: row.try_get("active_execution_id")?,
         active_role: row.try_get("active_role")?,
         active_started_at: row.try_get("active_started_at")?,
@@ -548,15 +538,6 @@ async fn task_execution_observability(
             .try_get::<Option<i64>, _>("latest_runtime_seconds")?
             .map(|value| value as f64),
         total_runtime_seconds: row.try_get::<i64, _>("total_runtime_seconds")? as f64,
-        total_input_tokens,
-        total_output_tokens,
-        total_cache_read_tokens,
-        total_cache_write_tokens,
-        total_tokens: total_input_tokens
-            + total_output_tokens
-            + total_cache_read_tokens
-            + total_cache_write_tokens,
-        total_cost_usd: row.try_get("total_cost_usd")?,
     })
 }
 
@@ -625,6 +606,7 @@ pub fn agent_response(
     active_task_count: Option<i64>,
     effective_status: Option<String>,
     stats: db::AgentExecutionStats,
+    usage: UsageAggregate,
 ) -> AgentResponse {
     AgentResponse {
         id: agent.id,
@@ -646,18 +628,9 @@ pub fn agent_response(
         status: agent_status_response(agent.status),
         active_task_count,
         effective_status,
-        total_runs: stats.total_runs,
         avg_duration_ms: stats.avg_duration_ms,
         success_rate: stats.success_rate,
-        total_input_tokens: stats.total_input_tokens,
-        total_output_tokens: stats.total_output_tokens,
-        total_cache_read_tokens: stats.total_cache_read_tokens,
-        total_cache_write_tokens: stats.total_cache_write_tokens,
-        total_tokens: stats.total_input_tokens
-            + stats.total_output_tokens
-            + stats.total_cache_read_tokens
-            + stats.total_cache_write_tokens,
-        total_cost_usd: stats.total_cost_usd,
+        usage,
         is_default: agent.is_default,
         paused: agent.paused,
         owner_id: agent.owner_id,
@@ -865,12 +838,27 @@ pub async fn execution_response_with_plan(
     execution: Execution,
 ) -> ApiResult<ExecutionResponse> {
     let workspace_id = execution.workspace_id.clone();
-    let mut response = execution_response(execution);
+    let mut response = execution_response_with_usage(db, execution).await?;
     if let Some(workspace_id) = workspace_id {
         let (plan_progress, plan_artifact) = plan_artifact_response(db, &workspace_id).await?;
         response.plan_progress = plan_progress;
         response.plan_artifact = plan_artifact;
     }
+    Ok(response)
+}
+
+/// Build the public execution response with the ordered immutable usage
+/// projection.  Mutation/launch responses may use the synchronous mapper
+/// when they already have no settled ledger rows, while list/detail reads
+/// use this helper so their public contract is fully observable.
+pub async fn execution_response_with_usage(
+    db: &db::SqliteDb,
+    execution: Execution,
+) -> ApiResult<ExecutionResponse> {
+    let execution_id = execution.id.clone();
+    let mut response = execution_response(execution);
+    response.usage =
+        Some(services::usage_projection::usage_breakdowns_for_source(db, &execution_id).await?);
     Ok(response)
 }
 
@@ -895,34 +883,6 @@ async fn plan_artifact_response(
             }),
             None,
         )),
-    }
-}
-
-pub fn execution_usage_response(usage: db::ExecutionUsage) -> api_types::ExecutionUsageResponse {
-    api_types::ExecutionUsageResponse {
-        id: usage.id,
-        execution_id: usage.execution_id,
-        provider: usage.provider,
-        model: usage.model,
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cache_read_tokens: usage.cache_read_tokens,
-        cache_write_tokens: usage.cache_write_tokens,
-        cost_usd: usage.cost_usd,
-        created_at: usage.created_at,
-    }
-}
-
-pub fn task_usage_summary_response(
-    summary: db::TaskUsageSummary,
-) -> api_types::TaskUsageSummaryResponse {
-    api_types::TaskUsageSummaryResponse {
-        total_input_tokens: summary.total_input_tokens,
-        total_output_tokens: summary.total_output_tokens,
-        total_cache_read_tokens: summary.total_cache_read_tokens,
-        total_cache_write_tokens: summary.total_cache_write_tokens,
-        total_cost_usd: summary.total_cost_usd,
-        execution_count: summary.execution_count,
     }
 }
 

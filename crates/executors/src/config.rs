@@ -385,6 +385,27 @@ pub fn candidate_key(kind: &ExecutorKind, config: &Value) -> String {
     )
 }
 
+/// Candidate identity taken from a whole executor config snapshot.
+///
+/// A snapshot is mutated in flight before it reaches the runtime: role
+/// markers, the read-only worktree marker, and injected provider secrets are
+/// all written at its top level. Identity therefore comes from the `config`
+/// block alone, resolved through the executor's typed schema, so the pricing
+/// admission ledger and the runtime derive the same key for the same run.
+/// A resolution failure falls back to the raw block rather than erroring,
+/// because both sides must agree on a key even for a config that no longer
+/// normalizes.
+pub fn candidate_config_from_snapshot(kind: &ExecutorKind, snapshot: &Value) -> Value {
+    let block = snapshot.get("config").unwrap_or(snapshot);
+    resolve_config_value(kind.clone(), block, &ExecutionOverrides::default())
+        .unwrap_or_else(|_| block.clone())
+}
+
+/// [`candidate_key`] over [`candidate_config_from_snapshot`].
+pub fn candidate_key_from_snapshot(kind: &ExecutorKind, snapshot: &Value) -> String {
+    candidate_key(kind, &candidate_config_from_snapshot(kind, snapshot))
+}
+
 /// Identity of the quota pool a candidate consumes. Candidates sharing an
 /// account key share cooldowns. For Smith the pool is the provider (Smith
 /// rotates that provider's credentials natively); for Codex it is the
@@ -721,6 +742,37 @@ mod tests {
             candidate_key(&ExecutorKind::Smith, &with_session)
         );
         assert!(candidate_key(&ExecutorKind::Smith, &base).starts_with("smith:profile=acct-1#"));
+    }
+
+    #[test]
+    fn candidate_key_from_snapshot_survives_runtime_snapshot_mutation() {
+        // Shape of a stored embedded execution snapshot: identity-bearing
+        // fields sit beside the `config` block, not inside it.
+        let snapshot = serde_json::json!({
+            "executor_type": "embedded",
+            "provider": "openai",
+            "model": "gpt-5.6-terra",
+            "agent_id": "agent-1",
+            "config": {
+                "base_url": "https://example.invalid/backend",
+                "context_tokens": 128_000,
+            },
+        });
+        let admitted = candidate_key_from_snapshot(&ExecutorKind::Embedded, &snapshot);
+
+        // What the runner hands the runtime: role marker, read-only marker and
+        // an injected provider secret, all written at the top level.
+        let mut runtime = snapshot.clone();
+        runtime["_forge_task_role"] = serde_json::json!("coder");
+        runtime["_forge_read_only_worktree"] = serde_json::json!(true);
+        runtime["env"] = serde_json::json!({"OPENAI_API_KEY": "secret"});
+
+        assert_eq!(
+            admitted,
+            candidate_key_from_snapshot(&ExecutorKind::Embedded, &runtime),
+            "pricing admission and the runtime must agree on candidate identity"
+        );
+        assert!(!admitted.contains("secret"));
     }
 
     #[test]

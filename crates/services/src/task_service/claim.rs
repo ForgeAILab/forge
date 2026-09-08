@@ -269,6 +269,41 @@ impl TaskService {
         } else {
             None
         };
+        if let (Some(agent), Some(snapshot)) = (
+            agent.as_ref(),
+            claimed.execution.executor_config_snapshot_json.as_deref(),
+        ) {
+            let snapshot = match serde_json::from_str::<Value>(snapshot) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    drop(transaction);
+                    if workspace_created_by_attempt {
+                        self.cleanup_fresh_execution_workspace(&task, &workspace)
+                            .await;
+                    }
+                    return Err(ServiceError::invalid_operation(format!(
+                        "invalid executor config snapshot for usage admission: {error}"
+                    )));
+                }
+            };
+            if let Err(error) = super::execution::ledger::admit_task_execution_in_tx_with_db(
+                &self.db,
+                &mut transaction,
+                &claimed.task,
+                &claimed.execution,
+                agent,
+                &snapshot,
+            )
+            .await
+            {
+                drop(transaction);
+                if workspace_created_by_attempt {
+                    self.cleanup_fresh_execution_workspace(&task, &workspace)
+                        .await;
+                }
+                return Err(error);
+            }
+        }
         if let Err(error) = transaction.commit().await.map_err(DbError::from) {
             // The commit may have succeeded at SQLite despite a transport
             // error; revoke the lease idempotently so a crashed claimant can

@@ -11,7 +11,9 @@ use super::{
         UserInput,
     },
 };
-use executors::{ExecutionOutcome, ExecutorError, LogKind, LogStream, LogWriter, TokenUsage};
+use executors::{
+    ExecutionOutcome, ExecutorError, LogKind, LogStream, LogWriter, UsageCounters, UsageReport,
+};
 use serde_json::{Value, json};
 use std::{
     path::{Component, Path, PathBuf},
@@ -37,7 +39,7 @@ pub struct TurnRunResult {
     pub thread_id: Option<String>,
     pub summary: Option<String>,
     pub error: Option<String>,
-    pub usage: Option<TokenUsage>,
+    pub usage_reports: Vec<UsageReport>,
 }
 
 impl CodexClient {
@@ -240,12 +242,11 @@ impl CodexClient {
         raw: Value,
         result: &mut TurnRunResult,
     ) -> Result<(), ExecutorError> {
-        if let Some(usage) = extract_token_usage(&raw) {
-            // Codex emits one `thread/tokenUsage/updated` per turn carrying that
-            // turn's delta in `last`. Overwriting kept only the final turn and
-            // discarded every earlier one — a whole session's work recorded as
-            // its last exchange. The deltas sum to the `total` Codex reports.
-            result.usage = super::merge_usage(result.usage.take(), Some(usage));
+        if let Some(usage) = extract_token_usage(&raw)? {
+            // Codex emits one `thread/tokenUsage/updated` per turn carrying
+            // that turn's non-overlapping delta in `last`. Keep each provider
+            // report and merge only the anonymous deltas for this invocation.
+            append_usage_report(&mut result.usage_reports, usage);
         }
         let normalized = normalize_event(raw);
         if let Some(thread_id) = normalized.thread_id {
@@ -500,41 +501,119 @@ fn string_field<'a>(value: &'a Value, fields: &[&str]) -> Option<&'a str> {
         .find_map(|field| value.get(*field).and_then(Value::as_str))
 }
 
-fn extract_token_usage(raw: &Value) -> Option<TokenUsage> {
-    let token_usage = raw
+fn extract_token_usage(raw: &Value) -> Result<Option<UsageReport>, ExecutorError> {
+    let Some(token_usage) = raw
         .get("params")
         .and_then(|params| params.get("tokenUsage"))
-        .or_else(|| raw.get("tokenUsage"))?;
+        .or_else(|| raw.get("tokenUsage"))
+    else {
+        return Ok(None);
+    };
     // `last` is this turn's delta and the caller accumulates it. `total` is
     // Codex's running thread total, which must not be added to anything.
-    let usage = token_usage.get("last")?;
+    let Some(usage) = token_usage.get("last") else {
+        return Ok(None);
+    };
     // Codex reports `inputTokens` inclusive of `cachedInputTokens` — its own
-    // `totalTokens` equals `inputTokens + outputTokens`. `TokenUsage` keeps the
-    // three input counters disjoint, so the cached prefix comes back out.
-    let cache_read_tokens = i64_field(usage, &["cachedInputTokens", "cached_input_tokens"]);
-    Some(TokenUsage {
-        input_tokens: i64_field(usage, &["inputTokens", "input_tokens"])
-            .saturating_sub(cache_read_tokens)
-            .max(0),
-        // Reasoning output is billed output; the embedded host already folds it in.
-        output_tokens: i64_field(usage, &["outputTokens", "output_tokens"]).saturating_add(
-            i64_field(usage, &["reasoningOutputTokens", "reasoning_output_tokens"]),
-        ),
+    // `totalTokens` equals `inputTokens + outputTokens`. The report keeps the
+    // input counters disjoint, so the cached prefix comes back out.
+    let cache_read_tokens =
+        optional_u64_field(usage, &["cachedInputTokens", "cached_input_tokens"]);
+    let raw_input = optional_u64_field(usage, &["inputTokens", "input_tokens"]);
+    let input_tokens = match (raw_input, cache_read_tokens) {
+        (Some(input), Some(cached)) => Some(input.checked_sub(cached).ok_or_else(|| {
+            ExecutorError::Other(
+                "codex cached input token count exceeds total input token count".to_owned(),
+            )
+        })?),
+        (Some(input), None) => Some(input),
+        (None, _) => None,
+    };
+    // Reasoning output is billed output; the embedded host already folds it in.
+    let output_tokens = match (
+        optional_u64_field(usage, &["outputTokens", "output_tokens"]),
+        optional_u64_field(usage, &["reasoningOutputTokens", "reasoning_output_tokens"]),
+    ) {
+        (None, None) => None,
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (Some(output), Some(reasoning)) => {
+            Some(output.checked_add(reasoning).ok_or_else(|| {
+                ExecutorError::Other("codex output token counter overflow".to_owned())
+            })?)
+        }
+    };
+    let counters = UsageCounters {
+        input_tokens,
+        output_tokens,
         cache_read_tokens,
-        cache_write_tokens: i64_field(
+        cache_write_tokens: optional_u64_field(
             usage,
             &["cacheWriteInputTokens", "cache_write_input_tokens"],
         ),
-        cost_usd: None,
-        model: string_field(usage, &["model"]).map(str::to_owned),
+    };
+    if !counters.has_any() {
+        return Ok(None);
+    }
+    let mut report = UsageReport::metered(String::new(), counters);
+    report.report_id = string_field(
+        usage,
+        &["report_id", "reportId", "id", "request_id", "requestId"],
+    )
+    .or_else(|| string_field(raw, &["report_id", "reportId", "id"]))
+    .map(str::to_owned)
+    .unwrap_or_default();
+    report.request_id = string_field(usage, &["request_id", "requestId", "turn_id", "turnId"])
+        .or_else(|| string_field(raw, &["request_id", "requestId", "turn_id", "turnId"]))
+        .map(str::to_owned);
+    report.provider_id = string_field(
+        usage,
+        &["provider_id", "provider", "model_provider", "modelProvider"],
+    )
+    .or_else(|| {
+        string_field(
+            raw,
+            &["provider_id", "provider", "model_provider", "modelProvider"],
+        )
+    })
+    .map(str::to_owned);
+    report.model_id = string_field(usage, &["model_id", "model"])
+        .or_else(|| string_field(raw, &["model_id", "model"]))
+        .map(str::to_owned);
+    Ok(Some(report))
+}
+
+fn optional_u64_field(value: &Value, fields: &[&str]) -> Option<u64> {
+    fields.iter().find_map(|field| {
+        value.get(*field).and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_i64().filter(|value| *value >= 0).map(|v| v as u64))
+        })
     })
 }
 
-fn i64_field(value: &Value, fields: &[&str]) -> i64 {
-    fields
-        .iter()
-        .find_map(|field| value.get(*field).and_then(Value::as_i64))
-        .unwrap_or(0)
+/// Preserve distinct request reports, while combining the anonymous Codex
+/// turn deltas that are explicitly documented as non-overlapping.
+pub(crate) fn append_usage_report(reports: &mut Vec<UsageReport>, next: UsageReport) {
+    if let Some(existing) = reports.iter_mut().find(|existing| {
+        (next.request_id.is_some() && next.request_id == existing.request_id)
+            || (!next.report_id.is_empty()
+                && !existing.report_id.is_empty()
+                && next.report_id == existing.report_id)
+    }) {
+        *existing = next;
+        return;
+    }
+    if next.request_id.is_none()
+        && next.report_id.is_empty()
+        && let Some(existing) = reports.last_mut()
+        && existing.request_id.is_none()
+        && existing.report_id.is_empty()
+        && existing.merge_delta(&next).is_ok()
+    {
+        return;
+    }
+    reports.push(next);
 }
 
 fn collect_path_candidates(value: &Value, output: &mut Vec<String>) {
@@ -643,14 +722,16 @@ mod tests {
             }
         });
 
-        let usage = extract_token_usage(&raw).expect("usage extracted");
+        let usage = extract_token_usage(&raw)
+            .expect("usage extraction succeeds")
+            .expect("usage extracted");
 
         // 49052 reported inclusive of the 48512-token cached prefix.
-        assert_eq!(usage.input_tokens, 540);
-        assert_eq!(usage.output_tokens, 25);
-        assert_eq!(usage.cache_read_tokens, 48512);
-        assert_eq!(usage.cache_write_tokens, 0);
-        assert_eq!(usage.cost_usd, None);
+        assert_eq!(usage.counters.input_tokens, Some(540));
+        assert_eq!(usage.counters.output_tokens, Some(25));
+        assert_eq!(usage.counters.cache_read_tokens, Some(48512));
+        assert_eq!(usage.counters.cache_write_tokens, None);
+        assert_eq!(usage.reported_cost_usd, None);
     }
 
     #[test]
@@ -679,14 +760,21 @@ mod tests {
             }
         });
 
-        let usage = extract_token_usage(&raw).expect("usage extracted");
+        let usage = extract_token_usage(&raw)
+            .expect("usage extraction succeeds")
+            .expect("usage extracted");
 
         assert_eq!(
-            usage.input_tokens, 50,
+            usage.counters.input_tokens,
+            Some(50),
             "fresh input excludes the cached prefix"
         );
-        assert_eq!(usage.cache_read_tokens, 100);
-        assert_eq!(usage.output_tokens, 14, "reasoning output is billed output");
+        assert_eq!(usage.counters.cache_read_tokens, Some(100));
+        assert_eq!(
+            usage.counters.output_tokens,
+            Some(14),
+            "reasoning output is billed output"
+        );
     }
 
     #[test]
@@ -694,11 +782,11 @@ mod tests {
         // Three turns of a real session: Codex's own running `total` is the sum
         // of the deltas, so accumulating the deltas reproduces it.
         let deltas = [
-            (41290_i64, 40960_i64, 247_i64, 65_i64),
+            (41290_u64, 40960_u64, 247_u64, 65_u64),
             (12000, 9000, 300, 40),
             (5000, 1000, 90, 10),
         ];
-        let mut acc: Option<TokenUsage> = None;
+        let mut reports = Vec::new();
         for (input, cached, output, reasoning) in deltas {
             let raw = json!({
                 "method": "thread/tokenUsage/updated",
@@ -707,20 +795,36 @@ mod tests {
                     "outputTokens": output, "reasoningOutputTokens": reasoning
                 }}}
             });
-            acc = super::super::merge_usage(acc, extract_token_usage(&raw));
+            if let Some(report) = extract_token_usage(&raw).expect("usage extraction succeeds") {
+                append_usage_report(&mut reports, report);
+            }
         }
-        let usage = acc.expect("accumulated");
-        let expected_input: i64 = deltas.iter().map(|d| d.0 - d.1).sum();
-        let expected_cached: i64 = deltas.iter().map(|d| d.1).sum();
-        let expected_output: i64 = deltas.iter().map(|d| d.2 + d.3).sum();
-        assert_eq!(usage.input_tokens, expected_input);
-        assert_eq!(usage.cache_read_tokens, expected_cached);
-        assert_eq!(usage.output_tokens, expected_output);
+        let usage = reports.first().expect("accumulated");
+        let expected_input: u64 = deltas.iter().map(|d| d.0 - d.1).sum();
+        let expected_cached: u64 = deltas.iter().map(|d| d.1).sum();
+        let expected_output: u64 = deltas.iter().map(|d| d.2 + d.3).sum();
+        assert_eq!(usage.counters.input_tokens, Some(expected_input));
+        assert_eq!(usage.counters.cache_read_tokens, Some(expected_cached));
+        assert_eq!(usage.counters.output_tokens, Some(expected_output));
         // Context consumed equals what Codex reports as its cumulative input.
         assert_eq!(
-            usage.input_tokens + usage.cache_read_tokens,
-            deltas.iter().map(|d| d.0).sum::<i64>()
+            usage.counters.input_tokens.unwrap() + usage.counters.cache_read_tokens.unwrap(),
+            deltas.iter().map(|d| d.0).sum::<u64>()
         );
+    }
+
+    #[test]
+    fn codex_usage_counter_overflow_is_explicit() {
+        let raw = json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {"tokenUsage": {"last": {
+                "outputTokens": u64::MAX,
+                "reasoningOutputTokens": 1
+            }}}
+        });
+
+        let error = extract_token_usage(&raw).expect_err("overflow must not be hidden");
+        assert!(error.to_string().contains("output token counter overflow"));
     }
 
     #[tokio::test]

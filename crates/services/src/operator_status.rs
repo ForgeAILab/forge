@@ -10,11 +10,12 @@ use chrono::{DateTime, Duration, Utc};
 use db::SqliteDb;
 use executors::{LogKind, LogReader};
 use serde_json::Value;
-use sqlx::{sqlite::SqliteRow, Row};
+use sqlx::Row;
 
 use crate::{
     agent_capacity::daemon_session_cap_from_labels,
     plan_artifact::{read_plan_artifact, to_plan_progress_summary, PlanArtifactError},
+    usage_projection::{usage_aggregate_for_operations, usage_aggregate_for_source_state},
     ServiceError,
 };
 
@@ -40,7 +41,9 @@ impl OperatorStatusService {
         let agent_pressure = self.agent_pressure().await?;
         let workspace_cleanup = self.workspace_cleanup_backlog(now).await?;
         let retry_pressure = self.retry_pressure().await?;
-        let usage_summary = Some(self.usage_summary(active_executions.len() as u32).await?);
+        let active_execution_count = u32::try_from(active_executions.len())
+            .map_err(|_| ServiceError::Db(db::DbError::InvalidTransition))?;
+        let usage_summary = Some(self.usage_summary(active_execution_count).await?);
         let recent_errors = self.recent_errors(now).await?;
 
         let mut overall_severity = OperatorSeverity::Healthy;
@@ -92,18 +95,11 @@ impl OperatorStatusService {
                 e.agent_session_id,
                 e.created_at AS started_at,
                 e.logs_path,
-                e.last_activity_at,
-                eu.input_tokens,
-                eu.output_tokens,
-                eu.cache_read_tokens,
-                eu.cache_write_tokens,
-                eu.cost_usd,
                 e.executor_config_snapshot_json
              FROM execution e
              JOIN task t ON t.id = e.task_id
              LEFT JOIN agent_current a ON a.id = e.agent_id
              LEFT JOIN workspace w ON w.id = e.workspace_id
-             LEFT JOIN execution_usage eu ON eu.execution_id = e.id
              WHERE e.status = 'running'
              ORDER BY e.created_at ASC, e.id ASC",
         )
@@ -125,10 +121,15 @@ impl OperatorStatusService {
             };
             let log_snapshot =
                 execution_log_snapshot(row.try_get::<Option<String>, _>("logs_path")?).await;
-            let token_totals = token_totals_from_row(&row)?;
+            let execution_id: String = row.try_get("execution_id")?;
+            let usage = usage_aggregate_for_source_state(&self.db, &execution_id, true).await?;
+            let token_totals = Some(TokenTotalsSummary {
+                tokens: usage.tokens.clone(),
+                cost: usage.cost.clone(),
+            });
 
             active_executions.push(ActiveExecutionSummary {
-                execution_id: row.try_get("execution_id")?,
+                execution_id,
                 task_id: row.try_get("task_id")?,
                 task_title: row.try_get("task_title")?,
                 role: row.try_get("role")?,
@@ -449,33 +450,13 @@ impl OperatorStatusService {
         &self,
         active_execution_count: u32,
     ) -> Result<UsageSummary, ServiceError> {
-        let result = sqlx::query(
-            "SELECT
-                COALESCE(SUM(input_tokens), 0) AS total_input_tokens,
-                COALESCE(SUM(output_tokens), 0) AS total_output_tokens,
-                SUM(cost_usd) AS total_cost_usd
-             FROM execution_usage",
-        )
-        .fetch_one(self.db.pool())
-        .await;
-
-        match result {
-            Ok(row) => Ok(UsageSummary {
-                available: true,
-                total_input_tokens: Some(row.try_get("total_input_tokens")?),
-                total_output_tokens: Some(row.try_get("total_output_tokens")?),
-                total_cost_usd: row.try_get("total_cost_usd")?,
-                active_execution_count,
-            }),
-            Err(error) if is_missing_table(&error) => Ok(UsageSummary {
-                available: false,
-                total_input_tokens: Some(0),
-                total_output_tokens: Some(0),
-                total_cost_usd: Some(0.0),
-                active_execution_count,
-            }),
-            Err(error) => Err(error.into()),
-        }
+        let usage = usage_aggregate_for_operations(&self.db).await?;
+        Ok(UsageSummary {
+            counts: usage.counts,
+            tokens: usage.tokens,
+            cost: usage.cost,
+            active_execution_count,
+        })
     }
 
     async fn recent_errors(
@@ -574,25 +555,6 @@ async fn execution_log_snapshot(logs_path: Option<String>) -> ExecutionLogSnapsh
     }
 
     snapshot
-}
-
-fn token_totals_from_row(row: &SqliteRow) -> Result<Option<TokenTotalsSummary>, sqlx::Error> {
-    let Some(input_tokens) = row.try_get::<Option<i64>, _>("input_tokens")? else {
-        return Ok(None);
-    };
-    Ok(Some(TokenTotalsSummary {
-        input_tokens,
-        output_tokens: row
-            .try_get::<Option<i64>, _>("output_tokens")?
-            .unwrap_or_default(),
-        cache_read_tokens: row
-            .try_get::<Option<i64>, _>("cache_read_tokens")?
-            .unwrap_or_default(),
-        cache_write_tokens: row
-            .try_get::<Option<i64>, _>("cache_write_tokens")?
-            .unwrap_or_default(),
-        cost_usd: row.try_get("cost_usd")?,
-    }))
 }
 
 fn rate_limit_snapshot(snapshot_json: Option<&str>) -> Option<Value> {
@@ -737,13 +699,6 @@ fn plan_progress_blocking(
             available: false,
             warnings: vec![error.to_string()],
         })),
-    }
-}
-
-fn is_missing_table(error: &sqlx::Error) -> bool {
-    match error {
-        sqlx::Error::Database(database_error) => database_error.message().contains("no such table"),
-        _ => false,
     }
 }
 

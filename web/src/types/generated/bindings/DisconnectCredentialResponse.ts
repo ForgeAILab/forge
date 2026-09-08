@@ -2,7 +2,7 @@
 import type { ProviderEntryAgentRef } from "./ProviderEntryAgentRef";
 import type { ProviderRevocationStatus } from "./ProviderRevocationStatus";
 
-export type DisconnectCredentialResponse = { id: string, status: string, provider_revocation: ProviderRevocationStatus, 
+export type DisconnectCredentialResponse = { id: string, status: string, provider_revocation: ProviderRevocationStatus,
 /**
  * Agents that referenced the removed entry and are now visibly
  * unhealthy. They are never silently rebound or deleted.

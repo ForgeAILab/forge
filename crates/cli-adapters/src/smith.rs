@@ -3,7 +3,8 @@ use async_trait::async_trait;
 use executors::{
     AvailabilityInfo, AvailabilityStatus, CodingExecutorAdapter, DiscoverContext,
     DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    ExecutorKind, LogKind, LogStream, LogWriter, PermissionPolicy, SmithConfig, TokenUsage,
+    ExecutorKind, LogKind, LogStream, LogWriter, PermissionPolicy, SmithConfig, UsageCounters,
+    UsageReport,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -248,6 +249,10 @@ impl CodingExecutorAdapter for SmithAdapter {
         self.remove_execution(&ctx.execution_id)?;
 
         let stream = stream_result?;
+        let mut stream = stream;
+        for report in &mut stream.usage_reports {
+            report.fill_identity(config.provider.as_deref(), config.model.as_deref());
+        }
 
         if let Some(session_id) = &stream.agent_session_id {
             writer
@@ -292,7 +297,7 @@ impl CodingExecutorAdapter for SmithAdapter {
                 assistant_output: stream.assistant_output,
                 summary: stream.summary,
                 error: None,
-                usage: stream.usage,
+                usage_reports: stream.usage_reports,
                 ..Default::default()
             });
         }
@@ -309,7 +314,7 @@ impl CodingExecutorAdapter for SmithAdapter {
                 assistant_output: stream.assistant_output,
                 summary: stream.summary,
                 error: Some(error),
-                usage: stream.usage,
+                usage_reports: stream.usage_reports,
                 ..Default::default()
             });
         }
@@ -322,7 +327,7 @@ impl CodingExecutorAdapter for SmithAdapter {
                 assistant_output: stream.assistant_output,
                 summary: stream.summary,
                 error: Some(smith_run_error(status, &stream.stderr_tail)),
-                usage: stream.usage,
+                usage_reports: stream.usage_reports,
                 ..Default::default()
             });
         }
@@ -345,7 +350,7 @@ impl CodingExecutorAdapter for SmithAdapter {
             assistant_output: stream.assistant_output,
             summary: stream.summary,
             error: None,
-            usage: stream.usage,
+            usage_reports: stream.usage_reports,
             ..Default::default()
         })
     }
@@ -383,7 +388,7 @@ struct StreamResult {
     summary: Option<String>,
     error: Option<String>,
     stderr_tail: String,
-    usage: Option<TokenUsage>,
+    usage_reports: Vec<UsageReport>,
     /// Limit signal from the terminal `result` line — always classifies.
     terminal_limit: Option<LimitSignal>,
     /// Limit signal from a mid-run runtime event — classifies only when the
@@ -407,13 +412,14 @@ fn availability_error(stream: &StreamResult, exit_ok: bool) -> Option<ExecutorEr
     if let Some(signal) = limit {
         return Some(ExecutorError::UsageExhausted {
             retry_after: signal.retry_after,
-            usage: stream.usage.clone(),
+            usage_reports: stream.usage_reports.clone(),
         });
     }
     match &stream.auth_failure {
-        Some(kind) if ended_badly => Some(ExecutorError::Unavailable(format!(
-            "smith authentication failure: {kind}"
-        ))),
+        Some(kind) if ended_badly => Some(ExecutorError::Unavailable {
+            reason: format!("smith authentication failure: {kind}"),
+            usage_reports: stream.usage_reports.clone(),
+        }),
         _ => None,
     }
 }
@@ -702,26 +708,65 @@ async fn process_smith_stdout_line(
                 result.error = Some(format!("smith returned non-ok status: {status}"));
             }
 
-            if let Some(usage_json) = parsed.get("usage") {
-                let current_turn = usage_json.get("current_turn");
-                if let Some(turn) = current_turn {
-                    let input = turn
-                        .get("input_uncached")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    let output = turn.get("output").and_then(|v| v.as_i64()).unwrap_or(0);
-                    result.usage = Some(TokenUsage {
-                        input_tokens: input,
-                        output_tokens: output,
-                        cache_read_tokens: 0,
-                        cache_write_tokens: 0,
-                        cost_usd: None,
-                        model: parsed
-                            .get("model")
-                            .and_then(|v| v.as_str())
-                            .map(String::from),
+            let usage_json = parsed.get("usage");
+            let current_turn = usage_json.and_then(|usage| usage.get("current_turn"));
+            let reported_cost_usd = parsed
+                .get("total_cost_usd")
+                .or_else(|| parsed.get("cost_usd"))
+                .and_then(exact_decimal_string);
+            if current_turn.is_some() || reported_cost_usd.is_some() {
+                let counters =
+                    current_turn.map_or_else(UsageCounters::default, |turn| UsageCounters {
+                        input_tokens: nonnegative_u64(
+                            turn,
+                            &["input_uncached", "input_tokens", "input"],
+                        ),
+                        output_tokens: nonnegative_u64(turn, &["output", "output_tokens"]),
+                        cache_read_tokens: nonnegative_u64(
+                            turn,
+                            &[
+                                "input_cached",
+                                "cache_read",
+                                "cache_read_tokens",
+                                "cache_read_input_tokens",
+                            ],
+                        ),
+                        cache_write_tokens: nonnegative_u64(
+                            turn,
+                            &[
+                                "cache_write",
+                                "cache_write_tokens",
+                                "cache_creation_input_tokens",
+                            ],
+                        ),
                     });
-                }
+                let mut report = if counters.has_any() {
+                    UsageReport::metered(String::new(), counters)
+                } else {
+                    UsageReport::unmetered(String::new())
+                };
+                report.report_id = string_field(
+                    &parsed,
+                    &["report_id", "reportId", "id", "request_id", "requestId"],
+                )
+                .map(str::to_owned)
+                .unwrap_or_default();
+                report.request_id =
+                    string_field(&parsed, &["request_id", "requestId", "turn_id", "turnId"])
+                        .map(str::to_owned);
+                report.provider_id = string_field(&parsed, &["provider_id", "provider"])
+                    .or_else(|| {
+                        current_turn
+                            .and_then(|turn| string_field(turn, &["provider_id", "provider"]))
+                    })
+                    .map(str::to_owned);
+                report.model_id = string_field(&parsed, &["model_id", "model"])
+                    .or_else(|| {
+                        current_turn.and_then(|turn| string_field(turn, &["model_id", "model"]))
+                    })
+                    .map(str::to_owned);
+                report.reported_cost_usd = reported_cost_usd;
+                upsert_usage_report(&mut result.usage_reports, report);
             }
 
             writer
@@ -750,6 +795,59 @@ async fn process_smith_stdout_line(
     }
 
     Ok(())
+}
+
+fn string_field<'a>(value: &'a serde_json::Value, fields: &[&str]) -> Option<&'a str> {
+    fields
+        .iter()
+        .find_map(|field| value.get(*field).and_then(serde_json::Value::as_str))
+}
+
+fn nonnegative_u64(value: &serde_json::Value, fields: &[&str]) -> Option<u64> {
+    fields.iter().find_map(|field| {
+        value.get(*field).and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_i64().filter(|value| *value >= 0).map(|v| v as u64))
+        })
+    })
+}
+
+fn exact_decimal_string(value: &serde_json::Value) -> Option<String> {
+    let text = match value {
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::String(text) => text.trim().to_owned(),
+        _ => return None,
+    };
+    (!text.is_empty() && !text.starts_with('-')).then_some(text)
+}
+
+/// Replace a cumulative terminal snapshot for the same provider request.
+/// Distinct request/report identities remain separate reports.
+fn upsert_usage_report(reports: &mut Vec<UsageReport>, next: UsageReport) {
+    let same_identity = |existing: &UsageReport| {
+        next.request_id
+            .as_ref()
+            .zip(existing.request_id.as_ref())
+            .is_some_and(|(left, right)| left == right)
+            || (!next.report_id.is_empty()
+                && !existing.report_id.is_empty()
+                && next.report_id == existing.report_id)
+    };
+    if let Some(existing) = reports.iter_mut().find(|existing| same_identity(existing)) {
+        *existing = next;
+    } else if next.request_id.is_none()
+        && next.report_id.is_empty()
+        && reports
+            .last()
+            .is_some_and(|existing| existing.request_id.is_none() && existing.report_id.is_empty())
+    {
+        if let Some(existing) = reports.last_mut() {
+            *existing = next;
+        }
+    } else {
+        reports.push(next);
+    }
 }
 
 fn executable_in_path(name: &str) -> bool {
@@ -936,9 +1034,13 @@ mod tests {
 
         let error = availability_error(&stream, false).expect("classifies");
         match error {
-            ExecutorError::UsageExhausted { retry_after, usage } => {
+            ExecutorError::UsageExhausted {
+                retry_after,
+                usage_reports,
+            } => {
                 assert_eq!(retry_after, Some(std::time::Duration::from_millis(90_000)));
-                assert_eq!(usage.expect("partial usage carried").output_tokens, 40);
+                let usage = usage_reports.first().expect("partial usage carried");
+                assert_eq!(usage.counters.output_tokens, Some(40));
             }
             other => panic!("expected UsageExhausted, got {other}"),
         }
@@ -987,7 +1089,7 @@ mod tests {
         .await;
 
         match availability_error(&stream, false) {
-            Some(ExecutorError::Unavailable(reason)) => {
+            Some(ExecutorError::Unavailable { reason, .. }) => {
                 assert!(reason.contains("credential_expired"));
             }
             other => panic!("expected Unavailable, got {other:?}"),
@@ -1260,5 +1362,58 @@ context_tokens = 200000
         assert!(surface.providers.is_empty());
         assert!(surface.profiles.is_empty());
         assert!(surface.model_providers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn usage_report_distinguishes_explicit_zero_from_missing_buckets() {
+        let explicit = stream_fixture(&[serde_json::json!({
+            "type": "result",
+            "status": "ok",
+            "provider": "zai",
+            "model": "glm-5",
+            "usage": {"current_turn": {
+                "input_uncached": 0,
+                "output": 0,
+                "input_cached": 0,
+                "cache_write": 0
+            }}
+        })])
+        .await;
+        let explicit_report = explicit.usage_reports.first().expect("report");
+        assert_eq!(
+            explicit_report.telemetry_state,
+            executors::UsageTelemetryState::Metered
+        );
+        assert!(explicit_report.counters.is_explicit_zero());
+
+        let sparse = stream_fixture(&[serde_json::json!({
+            "type": "result",
+            "status": "ok",
+            "usage": {"current_turn": {"output": 1}}
+        })])
+        .await;
+        let sparse_report = sparse.usage_reports.first().expect("report");
+        assert_eq!(sparse_report.counters.input_tokens, None);
+        assert_eq!(sparse_report.counters.output_tokens, Some(1));
+        assert_eq!(sparse_report.counters.cache_read_tokens, None);
+    }
+
+    #[tokio::test]
+    async fn cost_only_result_keeps_reported_money_without_fabricating_tokens() {
+        let stream = stream_fixture(&[serde_json::json!({
+            "type": "result",
+            "status": "ok",
+            "provider": "zai",
+            "model": "glm-5",
+            "total_cost_usd": "0.125000"
+        })])
+        .await;
+        let report = stream.usage_reports.first().expect("cost report");
+        assert_eq!(
+            report.telemetry_state,
+            executors::UsageTelemetryState::Unmetered
+        );
+        assert!(!report.counters.has_any());
+        assert_eq!(report.reported_cost_usd.as_deref(), Some("0.125000"));
     }
 }

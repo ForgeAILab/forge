@@ -1375,6 +1375,13 @@ impl AgentChatTransactionRepo for SqliteDb {
         Ok(CompletedAgentChatTurn { response, turn })
     }
 
+    async fn complete_agent_chat_turn_with_usage(
+        &self,
+        input: CompleteAgentChatTurnWithUsage,
+    ) -> Result<CompletedAgentChatTurn> {
+        super::chat_ledger::complete_agent_chat_turn_with_usage(self, input).await
+    }
+
     async fn complete_agent_chat_control_transfer(
         &self,
         input: CompleteAgentChatControlTransfer,
@@ -1502,6 +1509,13 @@ impl AgentChatTransactionRepo for SqliteDb {
         Ok(turn)
     }
 
+    async fn complete_agent_chat_control_transfer_with_usage(
+        &self,
+        input: CompleteAgentChatControlTransferWithUsage,
+    ) -> Result<AgentChatTurnJob> {
+        super::chat_ledger::complete_agent_chat_control_transfer_with_usage(self, input).await
+    }
+
     async fn fail_agent_chat_turn(&self, input: FailAgentChatTurn) -> Result<AgentChatTurnJob> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         let error_code = bounded_event_text(&input.error_code, 128);
@@ -1538,6 +1552,13 @@ impl AgentChatTransactionRepo for SqliteDb {
         Ok(turn)
     }
 
+    async fn fail_agent_chat_turn_with_usage(
+        &self,
+        input: FailAgentChatTurnWithUsage,
+    ) -> Result<AgentChatTurnJob> {
+        super::chat_ledger::fail_agent_chat_turn_with_usage(self, input).await
+    }
+
     async fn park_agent_chat_turn(&self, input: ParkAgentChatTurn) -> Result<AgentChatTurnJob> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         let updated = sqlx::query(
@@ -1568,6 +1589,13 @@ impl AgentChatTransactionRepo for SqliteDb {
         append_agent_chat_turn_awaiting_event(self, &mut transaction, &turn).await?;
         transaction.commit().await?;
         Ok(turn)
+    }
+
+    async fn park_agent_chat_turn_with_usage(
+        &self,
+        input: ParkAgentChatTurnWithUsage,
+    ) -> Result<AgentChatTurnJob> {
+        super::chat_ledger::park_agent_chat_turn_with_usage(self, input).await
     }
 
     async fn cancel_agent_chat_turn(&self, input: CancelAgentChatTurn) -> Result<AgentChatTurnJob> {
@@ -1671,6 +1699,13 @@ impl AgentChatTransactionRepo for SqliteDb {
         DomainEventRepo::append_event_in_tx(self, &mut transaction, &event).await?;
         transaction.commit().await?;
         Ok(turn)
+    }
+
+    async fn cancel_agent_chat_turn_with_usage(
+        &self,
+        input: CancelAgentChatTurnWithUsage,
+    ) -> Result<AgentChatTurnJob> {
+        super::chat_ledger::cancel_agent_chat_turn_with_usage(self, input).await
     }
 
     async fn admit_agent_handoff(&self, input: AdmitAgentHandoff) -> Result<AdmittedAgentHandoff> {
@@ -1853,7 +1888,7 @@ impl AgentChatTransactionRepo for SqliteDb {
     }
 }
 
-async fn append_agent_chat_event(
+pub(super) async fn append_agent_chat_event(
     db: &SqliteDb,
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     event_type: &str,
@@ -1887,7 +1922,7 @@ async fn append_agent_chat_event(
     DomainEventRepo::append_event_in_tx(db, transaction, &event).await
 }
 
-async fn append_agent_chat_turn_failure_event(
+pub(super) async fn append_agent_chat_turn_failure_event(
     db: &SqliteDb,
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     turn: &AgentChatTurnJob,
@@ -1932,7 +1967,7 @@ async fn append_agent_chat_turn_failure_event(
     DomainEventRepo::append_event_in_tx(db, transaction, &event).await
 }
 
-async fn append_agent_chat_turn_awaiting_event(
+pub(super) async fn append_agent_chat_turn_awaiting_event(
     db: &SqliteDb,
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     turn: &AgentChatTurnJob,
@@ -1969,11 +2004,11 @@ async fn append_agent_chat_turn_awaiting_event(
     DomainEventRepo::append_event_in_tx(db, transaction, &event).await
 }
 
-fn bounded_event_text(value: &str, limit: usize) -> String {
+pub(super) fn bounded_event_text(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
 
-async fn allocate_chat_sequence(
+pub(super) async fn allocate_chat_sequence(
     transaction: &mut Transaction<'_, Sqlite>,
     chat_id: &str,
     timestamp: &str,
@@ -1998,7 +2033,7 @@ async fn allocate_chat_sequence(
     Ok(count - 1)
 }
 
-async fn insert_chat_message(
+pub(super) async fn insert_chat_message(
     transaction: &mut Transaction<'_, Sqlite>,
     input: &CreateAgentChatMessage,
 ) -> Result<AgentChatMessage> {
@@ -2163,7 +2198,7 @@ fn map_agent_chat_instruction(row: SqliteRow) -> Result<AgentChatInstructionRevi
     })
 }
 
-fn map_agent_chat_message(row: SqliteRow) -> Result<AgentChatMessage> {
+pub(super) fn map_agent_chat_message(row: SqliteRow) -> Result<AgentChatMessage> {
     Ok(AgentChatMessage {
         id: row.try_get("id")?,
         chat_id: row.try_get("chat_id")?,
@@ -2196,7 +2231,7 @@ fn map_agent_chat_message(row: SqliteRow) -> Result<AgentChatMessage> {
     })
 }
 
-fn map_agent_chat_turn_job(row: SqliteRow) -> Result<AgentChatTurnJob> {
+pub(super) fn map_agent_chat_turn_job(row: SqliteRow) -> Result<AgentChatTurnJob> {
     Ok(AgentChatTurnJob {
         id: row.try_get("id")?,
         chat_id: row.try_get("chat_id")?,

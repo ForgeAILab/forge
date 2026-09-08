@@ -205,7 +205,7 @@ impl CodingExecutorAdapter for FailingCodexAdapter {
                 agent_session_id: Some("failed-session".to_owned()),
                 summary: Some("executor failed intentionally".to_owned()),
                 error: Some("synthetic executor failure".to_owned()),
-                usage: None,
+                usage_reports: Vec::new(),
                 ..Default::default()
             })
         })

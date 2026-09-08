@@ -21,6 +21,9 @@ pub async fn create_sqlite_pool(database_url: &str) -> Result<SqlitePool> {
                 sqlx::query("PRAGMA foreign_keys = ON")
                     .execute(&mut *connection)
                     .await?;
+                sqlx::query("PRAGMA recursive_triggers = ON")
+                    .execute(&mut *connection)
+                    .await?;
                 sqlx::query("PRAGMA journal_mode = WAL")
                     .execute(&mut *connection)
                     .await?;

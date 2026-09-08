@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, Query, State},
     Json,
 };
-use db::{ExecutionRepo, ExecutionUsageRepo};
+use db::ExecutionRepo;
 use executors::{ExecutionOverrides, LogReader};
 use serde::Deserialize;
 use services::ServiceError;
@@ -11,11 +11,12 @@ use services::ServiceError;
 use crate::{
     errors::{ApiError, ApiResult},
     routes::{
-        execution_response, execution_response_with_plan, execution_usage_response, page_request,
-        paginated, task_response, task_usage_summary_response, workspace_response, ListParams,
+        execution_response, execution_response_with_plan, execution_response_with_usage,
+        page_request, task_response, workspace_response, ListParams,
     },
     state::AppState,
 };
+use futures_util::future::try_join_all;
 
 pub async fn list_executions(
     State(state): State<AppState>,
@@ -23,7 +24,19 @@ pub async fn list_executions(
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<PaginatedResponse<ExecutionResponse>>> {
     let page = ExecutionRepo::list_by_task(&*state.db, &task_id, page_request(&params)?).await?;
-    Ok(Json(paginated(page, execution_response)))
+    let items = try_join_all(
+        page.items
+            .into_iter()
+            .map(|execution| execution_response_with_usage(&state.db, execution)),
+    )
+    .await?;
+    let has_more = page.next_cursor.is_some();
+    Ok(Json(PaginatedResponse {
+        items,
+        next_cursor: page.next_cursor,
+        has_more,
+        total_count: page.total_count.and_then(|count| u64::try_from(count).ok()),
+    }))
 }
 
 pub async fn get_execution(
@@ -256,23 +269,21 @@ fn map_re_execute_error(error: ServiceError) -> ApiError {
     }
 }
 
-pub async fn get_execution_usage(
+pub async fn get_usage_breakdowns(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> ApiResult<Json<Vec<api_types::ExecutionUsageResponse>>> {
+) -> ApiResult<Json<Vec<api_types::UsageBreakdown>>> {
     let _ = ExecutionRepo::get_by_id(&*state.db, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("execution", id.clone()))?;
-    let usage = ExecutionUsageRepo::list_by_execution(&*state.db, &id).await?;
-    Ok(Json(
-        usage.into_iter().map(execution_usage_response).collect(),
-    ))
+    let usage = services::usage_projection::usage_breakdowns_for_source(&state.db, &id).await?;
+    Ok(Json(usage))
 }
 
 pub async fn get_task_usage(
     State(state): State<AppState>,
     Path(task_id): Path<String>,
-) -> ApiResult<Json<api_types::TaskUsageSummaryResponse>> {
-    let summary = ExecutionUsageRepo::get_task_usage_summary(&*state.db, &task_id).await?;
-    Ok(Json(task_usage_summary_response(summary)))
+) -> ApiResult<Json<api_types::UsageAggregate>> {
+    let usage = services::usage_projection::usage_aggregate_for_task(&state.db, &task_id).await?;
+    Ok(Json(usage))
 }

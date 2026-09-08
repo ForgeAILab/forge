@@ -8,6 +8,7 @@ import type {
   ProjectAgentBindingResponse,
   SetMainAgentBindingRequest,
   SetProjectAgentBindingRequest,
+  UsageAggregate,
 } from '@/types/generated'
 
 export type JsonObject = Record<string, unknown>
@@ -52,15 +53,9 @@ export interface FederatedAgent {
   status: AgentStatus
   active_task_count: number | null
   effective_status: string | null
-  total_runs: number
   avg_duration_ms: number | null
   success_rate: number | null
-  total_input_tokens: number
-  total_output_tokens: number
-  total_cache_read_tokens: number
-  total_cache_write_tokens: number
-  total_tokens: number
-  total_cost_usd: number | null
+  usage: UsageAggregate
   is_default: boolean
   paused: boolean
   owner_id: string | null

@@ -2,7 +2,62 @@ import { render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import type { AgentChatEntry } from '@/features/agent-chat/types'
 import type { FederatedAgent } from '@/features/federation/types'
+import type { UsageAggregate } from '@/types/generated'
 import { AgentActivationSummary } from './AgentActivationSummary'
+
+const emptyUsage: UsageAggregate = {
+  counts: {
+    task_execution_count: 0,
+    chat_turn_count: 0,
+    inquiry_count: 0,
+    provider_attempt_count: 0,
+  },
+  tokens: {
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_tokens: 0,
+    cache_write_tokens: 0,
+  },
+  cost: {
+    kind: 'none',
+    coverage: 'no_usage',
+    provider_reported: null,
+    estimated: null,
+    known_subtotal: null,
+    complete_total: null,
+    usage_coverage: {
+      total_runs_or_turns: 0,
+      pending_runs_or_turns: 0,
+      no_provider_call_runs_or_turns: 0,
+      fully_metered_runs_or_turns: 0,
+      fully_costed_runs_or_turns: 0,
+      partially_costed_runs_or_turns: 0,
+      unavailable_cost_runs_or_turns: 0,
+      total_provider_attempts: 0,
+      settled_provider_attempts: 0,
+      pending_provider_attempts: 0,
+      unsettled_provider_attempts: 0,
+      metered_provider_attempts: 0,
+      unmetered_provider_attempts: 0,
+      costed_provider_attempts: 0,
+      unpriced_provider_attempts: 0,
+      priced_tokens: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+      },
+      unpriced_tokens: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+      },
+      reasons: [],
+    },
+    sources: [],
+  },
+}
 
 const agent: FederatedAgent = {
   id: 'agent-1',
@@ -24,15 +79,9 @@ const agent: FederatedAgent = {
   status: 'idle',
   active_task_count: 0,
   effective_status: 'active',
-  total_runs: 0,
   avg_duration_ms: null,
   success_rate: null,
-  total_input_tokens: 0,
-  total_output_tokens: 0,
-  total_cache_read_tokens: 0,
-  total_cache_write_tokens: 0,
-  total_tokens: 0,
-  total_cost_usd: null,
+  usage: emptyUsage,
   is_default: false,
   paused: false,
   owner_id: 'user-1',

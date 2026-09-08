@@ -1,10 +1,19 @@
+import { createElement } from 'react'
+import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { getExecutionHookLogs, getExecutionLogs } from './hooks'
+import {
+  getExecutionHookLogs,
+  getExecutionLogs,
+  type ProjectMilestoneReleaseInput,
+  useReleaseProjectMilestone,
+} from './hooks'
 import { useAuthStore } from '@/stores/auth'
 
 describe('execution log API helpers', () => {
   afterEach(() => {
+    cleanup()
     vi.restoreAllMocks()
     useAuthStore.getState().clearAuth()
     localStorage.clear()
@@ -46,5 +55,47 @@ describe('execution log API helpers', () => {
     const [url, init] = fetchMock.mock.calls[0]
     expect((url as URL).pathname).toBe('/api/v1/executions/exec-1/hook-logs')
     expect((init?.headers as Headers).get('authorization')).toBe('Bearer access-token')
+  })
+
+  it('invalidates project analytics variants after releasing a milestone', async () => {
+    useAuthStore.setState({ accessToken: 'access-token', refreshToken: 'refresh-token' })
+    vi.spyOn(window, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ id: 'release-1' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false }, queries: { retry: false } },
+    })
+    const invalidateSpy = vi.spyOn(queryClient, 'invalidateQueries')
+    const { result } = renderHook(() => useReleaseProjectMilestone(), {
+      wrapper: ({ children }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children),
+    })
+    const input: ProjectMilestoneReleaseInput = {
+      projectId: 'project-1',
+      milestoneId: 'milestone-1',
+      expectedMilestoneVersion: 2,
+      readinessSnapshotId: 'readiness-1',
+      readinessDigest: 'digest-1',
+      idempotencyKey: 'idempotency-1',
+      authorization: {
+        principal: { kind: 'user', id: 'user-1', display_name: 'Test User' },
+        authorization_basis: 'user_request',
+        action: 'release_milestone',
+        event_id: 'event-1',
+        occurred_at: '2026-09-07T12:00:00Z',
+      },
+    }
+
+    act(() => result.current.mutate(input))
+    await waitFor(() => expect(result.current.isSuccess).toBe(true))
+
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: ['projects', 'project-1', 'analytics'],
+    })
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['analytics', 'usage'] })
   })
 })

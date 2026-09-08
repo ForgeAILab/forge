@@ -2,15 +2,6 @@
 import type { RemoteExecutionFailureClass } from "./RemoteExecutionFailureClass";
 import type { RemoteResolvedCandidate } from "./RemoteResolvedCandidate";
 import type { RemoteRouteAttempt } from "./RemoteRouteAttempt";
-import type { RemoteTokenUsage } from "./RemoteTokenUsage";
+import type { RemoteUsageReport } from "./RemoteUsageReport";
 
-export type ExecutionTerminalNotification = { execution_id: string, exit_code: number | null, signal: string | null, error: string | null, ts: string, status: string | null, agent_session_id: string | null, summary: string | null, after_sha: string | null, usage: RemoteTokenUsage | null, 
-/**
- * Structured failure disposition. Absent on older daemons — the server
- * then falls back to generic executor-failed handling.
- */
-failure_class: RemoteExecutionFailureClass | null, 
-/**
- * RFC3339 time when an unavailable executor route is worth retrying.
- */
-retry_at: string | null, resolved_candidate: RemoteResolvedCandidate | null, route_attempts: Array<RemoteRouteAttempt> | null, };
+export type ExecutionTerminalNotification = { terminal_report_id: string, execution_id: string, exit_code: number | null, signal: string | null, error: string | null, ts: string, status: string | null, agent_session_id: string | null, summary: string | null, after_sha: string | null, usage_reports: Array<RemoteUsageReport>, failure_class: RemoteExecutionFailureClass | null, retry_at: string | null, resolved_candidate: RemoteResolvedCandidate | null, route_attempts: Array<RemoteRouteAttempt> | null, };

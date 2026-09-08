@@ -336,7 +336,7 @@ impl CodingExecutorAdapter for CompletingShellAdapter {
                 agent_session_id: Some("interactive-follow-up-session".to_owned()),
                 summary: Some("interactive execution completed".to_owned()),
                 error: None,
-                usage: None,
+                usage_reports: Vec::new(),
                 ..Default::default()
             })
         })

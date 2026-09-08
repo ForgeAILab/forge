@@ -17,11 +17,11 @@ use async_trait::async_trait;
 use db::{AgentProfileRepo, AgentRepo, ExecutionRepo, ExecutionStatus, SqliteDb};
 use executors::{
     ExecutionContext, ExecutionFailureClass, ExecutionOutcome, ExecutionResult, ExecutorError,
-    LogKind, TaskExecutor, TokenUsage,
+    LogKind, ProviderCallAdmission, TaskExecutor, UsageCounters, UsageReport, UsageTelemetryState,
 };
 use forge_agent_host::{
-    AgentHostError, AgentSessionBackend, AgentTurnLimit, AgentTurnRequest, CanonicalScope,
-    CanonicalScopeType, NativeAgentRuntimeBackend, NativeProviderConfig,
+    AgentHostError, AgentSessionBackend, AgentTurnLimit, AgentTurnRequest, AgentTurnTelemetryState,
+    CanonicalScope, CanonicalScopeType, NativeAgentRuntimeBackend, NativeProviderConfig,
     RuntimeContextManifestLink, WorkspaceAccess,
 };
 use sha2::{Digest, Sha256};
@@ -36,8 +36,7 @@ use crate::{
 
 const EMBEDDED_EXECUTOR_TYPE: &str = "embedded";
 const TASK_ROLE_MARKER: &str = executors::TASK_ROLE_CONFIG_KEY;
-pub(crate) const UNCOMMITTED_WORKTREE_FAILURE: &str =
-    "embedded worker completed with uncommitted worktree changes while HEAD was unchanged; refusing completion because those changes were not delivered";
+pub(crate) const UNCOMMITTED_WORKTREE_FAILURE: &str = "embedded worker completed with uncommitted worktree changes while HEAD was unchanged; refusing completion because those changes were not delivered";
 
 /// Shared state for the server-owned execution lease.
 ///
@@ -230,6 +229,7 @@ pub struct EmbeddedTaskExecutor {
     embedded_agents: Arc<EmbeddedAgentService>,
     backend: Arc<NativeAgentRuntimeBackend>,
     active: Arc<RwLock<HashMap<String, ActiveTaskTurn>>>,
+    provider_admissions: Arc<StdMutex<HashMap<String, Arc<dyn ProviderCallAdmission>>>>,
 }
 
 #[derive(Clone)]
@@ -258,6 +258,7 @@ impl EmbeddedTaskExecutor {
             embedded_agents,
             backend,
             active: Arc::new(RwLock::new(HashMap::new())),
+            provider_admissions: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -373,6 +374,27 @@ impl EmbeddedTaskExecutor {
             },
         );
 
+        let provider_admission = self
+            .provider_admissions
+            .lock()
+            .expect("provider admission lock poisoned")
+            .get(&ctx.execution_id)
+            .cloned();
+        if let Some(admission) = provider_admission {
+            let candidate_key = executors::candidate_key_from_snapshot(
+                &executors::ExecutorKind::Embedded,
+                &ctx.agent_config,
+            );
+            if let Err(error) = admission.before_provider_call(ctx, &candidate_key, 0).await {
+                // The callback is the last durable boundary before the
+                // native provider call. If it fails, no provider work has
+                // started; clear the in-memory active turn as well so a
+                // failed start write cannot strand a cancellation handle.
+                self.active.write().await.remove(&ctx.execution_id);
+                return Err(ServiceError::invalid_operation(error.to_string()));
+            }
+        }
+
         let output = self
             .backend
             .run_turn(
@@ -398,7 +420,7 @@ impl EmbeddedTaskExecutor {
                                 config.max_output_tokens,
                             );
                         NativeProviderConfig {
-                            provider,
+                            provider: provider.clone(),
                             base_url: config.base_url,
                             model: model.clone(),
                             credential_handle_id: credential_ref.to_owned(),
@@ -421,21 +443,109 @@ impl EmbeddedTaskExecutor {
 
         let output = match output {
             Ok(output) => output,
-            Err(_error) if cancellation.is_cancelled() => {
+            Err(AgentHostError::RuntimeWithUsage {
+                message,
+                usage_reports,
+            }) => {
+                let status = if cancellation.is_cancelled() {
+                    ExecutionOutcome::Cancelled
+                } else {
+                    ExecutionOutcome::Failed
+                };
+                let outcome = match status {
+                    ExecutionOutcome::Cancelled => executors::RouteAttemptOutcome::Cancelled,
+                    ExecutionOutcome::Failed => executors::RouteAttemptOutcome::Failed,
+                    ExecutionOutcome::Completed => unreachable!("terminal status is not running"),
+                };
+                let candidate_key = executors::candidate_key_from_snapshot(
+                    &executors::ExecutorKind::Embedded,
+                    &ctx.agent_config,
+                );
+                return Ok(ExecutionResult {
+                    status,
+                    agent_session_id: Some(runtime_session_id),
+                    usage_reports: native_usage_reports_from_records(
+                        &ctx.execution_id,
+                        &provider,
+                        &model,
+                        &usage_reports,
+                        outcome,
+                        &candidate_key,
+                    ),
+                    error: Some(message),
+                    failure_class: Some(ExecutionFailureClass::TaskFailed),
+                    ..ExecutionResult::default()
+                });
+            }
+            Err(AgentHostError::TurnLimitReached { limit }) if cancellation.is_cancelled() => {
+                let candidate_key = executors::candidate_key_from_snapshot(
+                    &executors::ExecutorKind::Embedded,
+                    &ctx.agent_config,
+                );
                 return Ok(ExecutionResult {
                     status: ExecutionOutcome::Cancelled,
+                    agent_session_id: Some(runtime_session_id),
+                    usage_reports: native_usage_reports_from_records(
+                        &ctx.execution_id,
+                        &provider,
+                        &model,
+                        &[],
+                        executors::RouteAttemptOutcome::Cancelled,
+                        &candidate_key,
+                    ),
+                    error: Some(format!("runtime turn limit reached: {limit}")),
+                    ..ExecutionResult::default()
+                });
+            }
+            Err(_error) if cancellation.is_cancelled() => {
+                let candidate_key = executors::candidate_key_from_snapshot(
+                    &executors::ExecutorKind::Embedded,
+                    &ctx.agent_config,
+                );
+                return Ok(ExecutionResult {
+                    status: ExecutionOutcome::Cancelled,
+                    usage_reports: native_usage_reports_from_records(
+                        &ctx.execution_id,
+                        &provider,
+                        &model,
+                        &[],
+                        executors::RouteAttemptOutcome::Cancelled,
+                        &candidate_key,
+                    ),
                     ..ExecutionResult::default()
                 });
             }
             Err(AgentHostError::TurnLimitReached { limit }) => {
-                return Ok(native_turn_limit_result(runtime_session_id, limit));
+                return Ok(native_turn_limit_result(
+                    &ctx.execution_id,
+                    runtime_session_id,
+                    &provider,
+                    &model,
+                    &executors::candidate_key_from_snapshot(
+                        &executors::ExecutorKind::Embedded,
+                        &ctx.agent_config,
+                    ),
+                    limit,
+                ));
             }
             Err(error) => return Err(ServiceError::invalid_operation(error.to_string())),
         };
         if cancellation.is_cancelled() {
+            let usage_reports = native_usage_reports(
+                &ctx.execution_id,
+                &provider,
+                &model,
+                &output,
+                executors::RouteAttemptOutcome::Cancelled,
+                &executors::candidate_key_from_snapshot(
+                    &executors::ExecutorKind::Embedded,
+                    &ctx.agent_config,
+                ),
+            );
             return Ok(ExecutionResult {
                 status: ExecutionOutcome::Cancelled,
                 agent_session_id: Some(output.runtime_session_id),
+                usage_reports,
                 ..ExecutionResult::default()
             });
         }
@@ -457,14 +567,20 @@ impl EmbeddedTaskExecutor {
                 })?;
             log_sink.record_progress().await;
         }
+        let candidate_key = executors::candidate_key_from_snapshot(
+            &executors::ExecutorKind::Embedded,
+            &ctx.agent_config,
+        );
+        let mut usage_reports = native_usage_reports(
+            &ctx.execution_id,
+            &provider,
+            &model,
+            &output,
+            executors::RouteAttemptOutcome::Completed,
+            &candidate_key,
+        );
         let agent_session_id = output.runtime_session_id;
         let summary = output.text;
-        let usage = TokenUsage {
-            input_tokens: i64::try_from(output.input_tokens).unwrap_or(i64::MAX),
-            output_tokens: i64::try_from(output.output_tokens).unwrap_or(i64::MAX),
-            model: Some(model),
-            ..TokenUsage::default()
-        };
         let after_sha = if let Some(before_sha) = before_sha.as_deref() {
             match validate_write_capable_delivery(Path::new(&ctx.worktree_path), before_sha).await {
                 Ok(after_sha) => after_sha,
@@ -477,7 +593,12 @@ impl EmbeddedTaskExecutor {
                         agent_session_id: Some(agent_session_id),
                         summary: Some(summary),
                         error: Some(error.to_string()),
-                        usage: Some(usage),
+                        usage_reports: {
+                            for report in &mut usage_reports {
+                                report.outcome = Some(executors::RouteAttemptOutcome::Failed);
+                            }
+                            usage_reports
+                        },
                         ..ExecutionResult::default()
                     });
                 }
@@ -492,7 +613,7 @@ impl EmbeddedTaskExecutor {
             after_sha: Some(after_sha),
             agent_session_id: Some(agent_session_id),
             summary: Some(summary),
-            usage: Some(usage),
+            usage_reports,
             ..ExecutionResult::default()
         })
     }
@@ -745,6 +866,23 @@ fn runtime_request_fingerprint(
 
 #[async_trait]
 impl TaskExecutor for EmbeddedTaskExecutor {
+    async fn execute_with_provider_call_admission(
+        &self,
+        ctx: ExecutionContext,
+        admission: Arc<dyn ProviderCallAdmission>,
+    ) -> std::result::Result<ExecutionResult, ExecutorError> {
+        self.provider_admissions
+            .lock()
+            .expect("provider admission lock poisoned")
+            .insert(ctx.execution_id.clone(), admission);
+        let result = self.execute(ctx.clone()).await;
+        self.provider_admissions
+            .lock()
+            .expect("provider admission lock poisoned")
+            .remove(&ctx.execution_id);
+        result
+    }
+
     async fn execute(
         &self,
         ctx: ExecutionContext,
@@ -883,11 +1021,118 @@ fn default_max_output_tokens() -> u32 {
     16_000
 }
 
-fn native_turn_limit_result(runtime_session_id: String, limit: AgentTurnLimit) -> ExecutionResult {
+fn native_usage_reports(
+    execution_id: &str,
+    provider: &str,
+    model: &str,
+    output: &forge_agent_host::AgentTurnOutput,
+    outcome: executors::RouteAttemptOutcome,
+    candidate_key: &str,
+) -> Vec<UsageReport> {
+    native_usage_reports_from_records(
+        execution_id,
+        provider,
+        model,
+        &output.usage_reports,
+        outcome,
+        candidate_key,
+    )
+}
+
+fn native_usage_reports_from_records(
+    execution_id: &str,
+    provider: &str,
+    model: &str,
+    usage_records: &[forge_agent_host::AgentTurnUsageReport],
+    outcome: executors::RouteAttemptOutcome,
+    candidate_key: &str,
+) -> Vec<UsageReport> {
+    let mut reports = usage_records
+        .iter()
+        .enumerate()
+        .map(|(sequence, report)| {
+            let telemetry_state = match report.telemetry_state {
+                AgentTurnTelemetryState::Metered => UsageTelemetryState::Metered,
+                AgentTurnTelemetryState::Unmetered => UsageTelemetryState::Unmetered,
+            };
+            let mut mapped = UsageReport {
+                report_id: report.report_id.clone(),
+                request_id: report.request_id.clone(),
+                report_sequence: sequence as u32,
+                candidate_key: Some(candidate_key.to_owned()),
+                attempt_ordinal: 0,
+                provider_id: report.provider_id.clone(),
+                model_id: report.model_id.clone(),
+                counters: UsageCounters {
+                    input_tokens: report.input_tokens,
+                    output_tokens: report.output_tokens,
+                    cache_read_tokens: report.cache_read_tokens,
+                    cache_write_tokens: report.cache_write_tokens,
+                },
+                telemetry_state,
+                context_tokens: None,
+                selected_tier: None,
+                reported_cost_usd: None,
+                outcome: Some(outcome),
+                partial: report.failed,
+            };
+            mapped.fill_identity(Some(provider), Some(model));
+            if mapped.report_id.trim().is_empty() {
+                mapped.report_id =
+                    executors::stable_report_id(execution_id, candidate_key, 0, sequence as u32);
+            }
+            mapped.normalize_telemetry();
+            mapped
+        })
+        .collect::<Vec<_>>();
+
+    // The native runtime only records a provider ledger row when it has
+    // trustworthy counters. The provider call still happened when the turn
+    // completed without a row, so retain an unmetered report rather than
+    // fabricating zero counters or dropping the attempt entirely.
+    if reports.is_empty() {
+        reports.push(UsageReport::unmetered(executors::stable_report_id(
+            execution_id,
+            candidate_key,
+            0,
+            0,
+        )));
+        if let Some(report) = reports.last_mut() {
+            report.candidate_key = Some(candidate_key.to_owned());
+            report.fill_identity(Some(provider), Some(model));
+            report.outcome = Some(outcome);
+        }
+    }
+    reports
+}
+
+fn native_turn_limit_result(
+    execution_id: &str,
+    runtime_session_id: String,
+    provider: &str,
+    model: &str,
+    candidate_key: &str,
+    limit: AgentTurnLimit,
+) -> ExecutionResult {
     let provider_unavailable = limit == AgentTurnLimit::ProviderAttempts;
+    let mut usage_report = UsageReport::unmetered(executors::stable_report_id(
+        execution_id,
+        candidate_key,
+        0,
+        0,
+    ));
+    usage_report.candidate_key = Some(candidate_key.to_owned());
+    usage_report.provider_id = Some(provider.to_owned());
+    usage_report.model_id = Some(model.to_owned());
+    usage_report.outcome = Some(if provider_unavailable {
+        executors::RouteAttemptOutcome::Unavailable
+    } else {
+        executors::RouteAttemptOutcome::Failed
+    });
     ExecutionResult {
         status: ExecutionOutcome::Failed,
         agent_session_id: Some(runtime_session_id),
+        usage_reports: vec![usage_report],
         error: Some(if provider_unavailable {
             format!("provider unavailable after exhausting runtime retry attempts ({limit})")
         } else {
@@ -993,6 +1238,27 @@ impl TaskExecutorRouter {
 
 #[async_trait]
 impl TaskExecutor for TaskExecutorRouter {
+    async fn execute_with_provider_call_admission(
+        &self,
+        ctx: ExecutionContext,
+        admission: Arc<dyn ProviderCallAdmission>,
+    ) -> std::result::Result<ExecutionResult, ExecutorError> {
+        if ctx
+            .agent_config
+            .get("executor_type")
+            .and_then(serde_json::Value::as_str)
+            == Some(EMBEDDED_EXECUTOR_TYPE)
+        {
+            self.embedded
+                .execute_with_provider_call_admission(ctx, admission)
+                .await
+        } else {
+            self.cli
+                .execute_with_provider_call_admission(ctx, admission)
+                .await
+        }
+    }
+
     async fn execute(
         &self,
         ctx: ExecutionContext,
@@ -1097,7 +1363,11 @@ mod tests {
     #[test]
     fn provider_attempt_limit_is_executor_unavailability() {
         let result = native_turn_limit_result(
+            "execution",
             "runtime-session".to_owned(),
+            "anthropic",
+            "claude-sonnet",
+            "embedded:provider=anthropic",
             AgentTurnLimit::ProviderAttempts,
         );
 
@@ -1110,6 +1380,11 @@ mod tests {
             result.retry_after,
             Some(executors::DEFAULT_ACCOUNT_COOLDOWN)
         );
+        assert_eq!(result.usage_reports.len(), 1);
+        assert_eq!(
+            result.usage_reports[0].telemetry_state,
+            executors::UsageTelemetryState::Unmetered
+        );
         assert!(result
             .error
             .as_deref()
@@ -1118,8 +1393,64 @@ mod tests {
     }
 
     #[test]
+    fn native_usage_mapping_preserves_cache_buckets_and_actual_identity() {
+        let output = forge_agent_host::AgentTurnOutput {
+            runtime_session_id: "runtime-session".to_owned(),
+            text: "done".to_owned(),
+            input_tokens: 4,
+            output_tokens: 5,
+            cache_read_tokens: 6,
+            cache_write_tokens: 7,
+            usage_reports: vec![forge_agent_host::AgentTurnUsageReport {
+                report_id: "provider-report".to_owned(),
+                request_id: Some("provider-request".to_owned()),
+                attempt_id: Some("provider-attempt".to_owned()),
+                provider_id: Some("openai".to_owned()),
+                model_id: Some("gpt-5.6".to_owned()),
+                input_tokens: Some(4),
+                output_tokens: Some(5),
+                cache_read_tokens: Some(6),
+                cache_write_tokens: Some(7),
+                telemetry_state: AgentTurnTelemetryState::Metered,
+                failed: true,
+            }],
+            telemetry_state: AgentTurnTelemetryState::Metered,
+            context_manifest: None,
+            pending_interaction_id: None,
+        };
+
+        let reports = native_usage_reports(
+            "execution",
+            "configured-provider",
+            "configured-model",
+            &output,
+            executors::RouteAttemptOutcome::Failed,
+            "embedded:configured-provider",
+        );
+        assert_eq!(reports.len(), 1);
+        let report = &reports[0];
+        assert_eq!(report.report_id, "provider-report");
+        assert_eq!(report.request_id.as_deref(), Some("provider-request"));
+        assert_eq!(report.provider_id.as_deref(), Some("openai"));
+        assert_eq!(report.model_id.as_deref(), Some("gpt-5.6"));
+        assert_eq!(report.counters.input_tokens, Some(4));
+        assert_eq!(report.counters.output_tokens, Some(5));
+        assert_eq!(report.counters.cache_read_tokens, Some(6));
+        assert_eq!(report.counters.cache_write_tokens, Some(7));
+        assert_eq!(report.telemetry_state, UsageTelemetryState::Metered);
+        assert!(report.partial);
+    }
+
+    #[test]
     fn output_limit_remains_a_task_execution_failure() {
-        let result = native_turn_limit_result("runtime-session".to_owned(), AgentTurnLimit::Output);
+        let result = native_turn_limit_result(
+            "execution",
+            "runtime-session".to_owned(),
+            "anthropic",
+            "claude-sonnet",
+            "embedded:provider=anthropic",
+            AgentTurnLimit::Output,
+        );
 
         assert_eq!(result.status, ExecutionOutcome::Failed);
         assert_eq!(

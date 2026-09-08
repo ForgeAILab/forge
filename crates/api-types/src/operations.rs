@@ -5,6 +5,8 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::{ActivityCounts, CostSummary, TokenCounters};
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
@@ -171,11 +173,8 @@ pub struct RetryPressureSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct TokenTotalsSummary {
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub cache_write_tokens: i64,
-    pub cost_usd: Option<f64>,
+    pub tokens: TokenCounters,
+    pub cost: CostSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -188,10 +187,9 @@ pub struct OperationsRefreshResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct UsageSummary {
-    pub available: bool,
-    pub total_input_tokens: Option<i64>,
-    pub total_output_tokens: Option<i64>,
-    pub total_cost_usd: Option<f64>,
+    pub counts: ActivityCounts,
+    pub tokens: TokenCounters,
+    pub cost: CostSummary,
     pub active_execution_count: u32,
 }
 

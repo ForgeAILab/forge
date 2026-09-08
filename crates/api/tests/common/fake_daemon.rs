@@ -385,6 +385,7 @@ pub async fn send_execution_terminal_completed(
         socket,
         METHOD_EXECUTION_TERMINAL,
         ExecutionTerminalNotification {
+            terminal_report_id: format!("terminal-completed-{execution_id}"),
             execution_id: execution_id.to_owned(),
             exit_code: Some(0),
             signal: None,
@@ -394,7 +395,7 @@ pub async fn send_execution_terminal_completed(
             agent_session_id: None,
             summary: summary.map(str::to_owned),
             after_sha: None,
-            usage: None,
+            usage_reports: Vec::new(),
             failure_class: None,
             retry_at: None,
             resolved_candidate: None,
@@ -413,6 +414,7 @@ pub async fn send_execution_terminal_failed(
         socket,
         METHOD_EXECUTION_TERMINAL,
         ExecutionTerminalNotification {
+            terminal_report_id: format!("terminal-failed-{execution_id}"),
             execution_id: execution_id.to_owned(),
             exit_code: Some(1),
             signal: None,
@@ -422,7 +424,7 @@ pub async fn send_execution_terminal_failed(
             agent_session_id: None,
             summary: None,
             after_sha: None,
-            usage: None,
+            usage_reports: Vec::new(),
             failure_class: None,
             retry_at: None,
             resolved_candidate: None,
