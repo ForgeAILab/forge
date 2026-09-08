@@ -319,16 +319,47 @@ async fn chat_turn_fixture() -> ChatTurnFixture {
     }
 }
 
-/// Insert a Project (the schema trigger creates its chat and setup binding),
-/// promote the chat to ready, and bind the identity as the active responder.
+/// Insert a Project owned by a real account (the schema trigger creates its
+/// chat and setup binding), promote the chat to ready, and bind the identity as
+/// the active responder.
+///
+/// The account is not decoration: usage admission fails closed on a Project
+/// Chat whose Project has no owner, and on a responder the owning account does
+/// not own, so an ownerless Project plus an ownerless identity is a state no
+/// turn can ever be admitted from. The identity is created before this helper
+/// runs, so it is adopted into the same account here.
 async fn bound_project(db: &SqliteDb, identity_id: &str, profile_id: &str) -> (String, String) {
     let project_id = new_uuid_v4();
+    let account_id = new_uuid_v4();
     let now = now_rfc3339();
-    sqlx::query("INSERT INTO project (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)")
-        .bind(&project_id)
-        .bind("wake-turn-project")
-        .bind(&now)
-        .bind(&now)
+    UserRepo::create_user(
+        db,
+        &User {
+            id: account_id.clone(),
+            email: format!("{account_id}@example.test"),
+            password_hash: "test".to_owned(),
+            display_name: Some("Wake Turn Test".to_owned()),
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO project (id, name, owner_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&project_id)
+    .bind("wake-turn-project")
+    .bind(&account_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE agent_identity SET owner_id = ? WHERE id = ?")
+        .bind(&account_id)
+        .bind(identity_id)
         .execute(db.pool())
         .await
         .unwrap();
@@ -897,27 +928,14 @@ struct DeliveryMilestoneFixture {
 
 async fn seed_delivery_milestone(db: &SqliteDb, project_id: &str) -> DeliveryMilestoneFixture {
     let now = now_rfc3339();
-    let user_id = new_uuid_v4();
-    UserRepo::create_user(
-        db,
-        &User {
-            id: user_id.clone(),
-            email: format!("{user_id}@example.test"),
-            password_hash: "test".to_owned(),
-            display_name: Some("Delivery Fixture".to_owned()),
-            is_admin: false,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .unwrap();
     // The Charter's account and the Project's owner are the same principal;
-    // the schema enforces it.
-    sqlx::query("UPDATE project SET owner_id = ? WHERE id = ?")
-        .bind(&user_id)
+    // the schema enforces it. Adopt the Project's existing account rather than
+    // minting another one: re-pointing the Project at a fresh user would break
+    // the responder ownership usage admission checks, since the Project Agent
+    // identity is owned by the account that owns its Project.
+    let user_id: String = sqlx::query_scalar("SELECT owner_id FROM project WHERE id = ?")
         .bind(project_id)
-        .execute(db.pool())
+        .fetch_one(db.pool())
         .await
         .unwrap();
     let charter_id = new_uuid_v4();
