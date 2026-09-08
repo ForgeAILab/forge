@@ -6,7 +6,10 @@
 //! action executor deliberately rejects these operations, so an arbitrary
 //! result can never masquerade as a domain mutation.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use api_types::{
     CurrentVersionOrRevision, PrincipalKind, ProjectCharterContent, ProjectDocumentContent,
@@ -14,15 +17,16 @@ use api_types::{
 };
 use db::{
     new_uuid_v4, now_rfc3339, AgentAction, AgentActionExecution, AgentActionExecutionStatus,
-    AgentActionPolicyResult, AgentActionRepo, AgentActionStatus, CommandReceipt,
-    CommandReceiptRepo, CreateAgentActionExecution, ProjectOrchestrationRepo, ProjectRepo,
-    SqliteDb,
+    AgentActionPolicyResult, AgentActionRepo, AgentActionStatus, ApplyProjectReviewConfigCommand,
+    CommandReceipt, CommandReceiptRepo, CreateAgentActionExecution, CreateCommandReceipt,
+    ProjectOrchestrationRepo, ProjectRepo, ProjectReviewConfigCommandRepo, SqliteDb, TaskRepo,
 };
 use forge_agent_host::{
     is_allowed_project_direct_payload, is_project_orchestration_operation,
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
     PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
-    PROJECT_RELEASE_OPERATION, PROJECT_VALIDATION_OPERATION,
+    PROJECT_RELEASE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION, PROJECT_VALIDATION_OPERATION,
+    TASK_CANCEL_OPERATION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -119,6 +123,25 @@ impl ProjectOrchestrationActionService {
         };
 
         match operation {
+            PROJECT_REVIEW_CONFIG_OPERATION => {
+                let mut current = CurrentVersionOrRevision::new("project", project.id);
+                current.version = Some(project.version);
+                Ok(Some(current))
+            }
+            TASK_CANCEL_OPERATION => {
+                let Some(task_id) = payload.get("task_id").and_then(Value::as_str) else {
+                    return Ok(None);
+                };
+                let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, false).await? else {
+                    return Ok(None);
+                };
+                if task.project_id != project.id {
+                    return Ok(None);
+                }
+                let mut current = CurrentVersionOrRevision::new("task", task.id);
+                current.version = Some(task.version);
+                Ok(Some(current))
+            }
             PROJECT_DOCUMENT_OPERATION => {
                 let Some(document_id) = payload.get("document_id").and_then(Value::as_str) else {
                     return Ok(None);
@@ -383,6 +406,10 @@ impl ProjectOrchestrationActionService {
                     Some(&context),
                 )
                 .await?
+            }
+            PROJECT_REVIEW_CONFIG_OPERATION => {
+                self.materialize_review_config(&input.project_id, &payload, &context)
+                    .await?
             }
             _ => {
                 return Err(ServiceError::invalid_operation(
@@ -1305,6 +1332,101 @@ impl ProjectOrchestrationActionService {
             .await
     }
 
+    async fn materialize_review_config(
+        &self,
+        project_id: &str,
+        payload: &Value,
+        context: &CommandContext,
+    ) -> Result<Value> {
+        let expected_project_version = payload
+            .get("expected_project_version")
+            .and_then(Value::as_i64)
+            .filter(|version| *version > 0)
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "project.review_config requires a positive expected_project_version",
+                )
+            })?;
+        let (ci_steps, setup_steps) = validated_project_review_steps(payload)?;
+        let project = ProjectRepo::get_by_id(&*self.db, project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
+        let mut settings: Value = serde_json::from_str(&project.settings).map_err(|error| {
+            ServiceError::invalid_operation(format!("invalid Project settings: {error}"))
+        })?;
+        let settings = settings.as_object_mut().ok_or_else(|| {
+            ServiceError::invalid_operation("Project settings must be a JSON object")
+        })?;
+        let review_config = settings
+            .entry("default_review_config".to_owned())
+            .or_insert_with(|| json!({}));
+        let review_config = review_config.as_object_mut().ok_or_else(|| {
+            ServiceError::invalid_operation("Project default_review_config must be a JSON object")
+        })?;
+        review_config.insert("ci_steps".to_owned(), json!(ci_steps));
+        if let Some(setup_steps) = setup_steps {
+            review_config.insert("setup_steps".to_owned(), json!(setup_steps));
+        }
+        let effective_setup_steps = review_config
+            .get("setup_steps")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let serialized_settings = serde_json::to_string(&settings).map_err(|error| {
+            ServiceError::invalid_operation(format!("serialize Project settings: {error}"))
+        })?;
+        let outcome = json!({
+            "operation": PROJECT_REVIEW_CONFIG_OPERATION,
+            "project_id": project_id,
+            "project_version": expected_project_version + 1,
+            "ci_steps": ci_steps,
+            "setup_steps": effective_setup_steps,
+            "domain_committed": true,
+            "requires_user_authorization": false,
+        });
+        let outcome_json = serde_json::to_string(&outcome).map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "serialize Project review-config outcome: {error}"
+            ))
+        })?;
+        let receipt = CreateCommandReceipt {
+            id: new_uuid_v4(),
+            principal_type: context.principal().principal_type().to_owned(),
+            principal_id: context.principal().principal_id().to_owned(),
+            scope_type: context.canonical_scope().scope_type().as_str().to_owned(),
+            scope_id: context.canonical_scope().scope_id().to_owned(),
+            operation: context.operation().to_owned(),
+            idempotency_key: context.idempotency_key().to_owned(),
+            input_digest: context.input_digest().to_owned(),
+            policy_result: context
+                .authorization_provenance
+                .as_ref()
+                .map_or_else(|| "allowed".to_owned(), |value| value.policy_result.clone()),
+            correlation_id: context.correlation_id().to_owned(),
+            causation_id: context.causation_id.clone(),
+            causation_depth: context.causation_depth,
+            event_id: new_uuid_v4(),
+            agent_action_execution_id: None,
+            outcome_json,
+            committed_at: now_rfc3339(),
+        };
+        let applied = ProjectReviewConfigCommandRepo::apply_project_review_config_command(
+            &*self.db,
+            ApplyProjectReviewConfigCommand {
+                project_id: project_id.to_owned(),
+                expected_project_version,
+                settings: serialized_settings,
+                receipt,
+            },
+        )
+        .await?;
+        serde_json::from_str(&applied.receipt.outcome_json).map_err(|error| {
+            ServiceError::Conflict(format!(
+                "Project review-config receipt outcome is invalid: {error}"
+            ))
+        })
+    }
+
     async fn materialize_release_request(
         &self,
         action: &AgentAction,
@@ -1321,6 +1443,84 @@ impl ProjectOrchestrationActionService {
             .execute_project_agent_command(action, project_id, payload, context)
             .await
     }
+}
+
+const MAX_PROJECT_REVIEW_CI_STEPS: usize = 16;
+const MAX_PROJECT_REVIEW_CI_STEP_CHARS: usize = 2_048;
+
+fn validated_project_review_steps(payload: &Value) -> Result<(Vec<String>, Option<Vec<String>>)> {
+    let payload_object = payload.as_object().ok_or_else(|| {
+        ServiceError::invalid_operation("project.review_config payload must be an object")
+    })?;
+    const ALLOWED_FIELDS: &[&str] = &[
+        "action",
+        "expected_project_version",
+        "ci_steps",
+        "setup_steps",
+    ];
+    if let Some(field) = payload_object
+        .keys()
+        .find(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
+    {
+        return Err(ServiceError::invalid_operation(format!(
+            "project.review_config field `{field}` is not admitted"
+        )));
+    }
+    let ci_steps = validated_project_review_command_list(payload, "ci_steps")?;
+    let setup_steps = payload
+        .get("setup_steps")
+        .map(|_| validated_project_review_command_list(payload, "setup_steps"))
+        .transpose()?;
+    Ok((ci_steps, setup_steps))
+}
+
+fn validated_project_review_command_list(payload: &Value, field: &str) -> Result<Vec<String>> {
+    let values = payload
+        .get(field)
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ServiceError::invalid_operation(format!(
+                "project.review_config requires a {field} array"
+            ))
+        })?;
+    if values.len() > MAX_PROJECT_REVIEW_CI_STEPS {
+        return Err(ServiceError::invalid_operation(format!(
+            "project.review_config accepts at most {MAX_PROJECT_REVIEW_CI_STEPS} {field} commands"
+        )));
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut commands = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let command = value.as_str().ok_or_else(|| {
+            ServiceError::invalid_operation(format!("{field}[{index}] must be a string"))
+        })?;
+        if command.is_empty() || command.trim() != command {
+            return Err(ServiceError::invalid_operation(format!(
+                "{field}[{index}] must be non-empty with no surrounding whitespace"
+            )));
+        }
+        if command.chars().count() > MAX_PROJECT_REVIEW_CI_STEP_CHARS {
+            return Err(ServiceError::invalid_operation(format!(
+                "{field}[{index}] exceeds {MAX_PROJECT_REVIEW_CI_STEP_CHARS} characters"
+            )));
+        }
+        if command
+            .chars()
+            .any(|character| matches!(character, '\0' | '\r' | '\n'))
+        {
+            return Err(ServiceError::invalid_operation(format!(
+                "{field}[{index}] must be one command line"
+            )));
+        }
+        if !seen.insert(command) {
+            return Err(ServiceError::invalid_operation(format!(
+                "{field}[{index}] duplicates an earlier command"
+            )));
+        }
+        commands.push(command.to_owned());
+    }
+    Ok(commands)
 }
 
 fn validate_direct_input(input: &ExecuteDirectProjectCommandInput) -> Result<()> {

@@ -1,10 +1,10 @@
-use crate::auditor::{self, AuditorVerdict};
+use crate::auditor;
 use chrono::{Duration as ChronoDuration, Utc};
 use db::{
     new_uuid_v4, now_rfc3339, Agent, AgentRepo, AgentStatus, ClaimExecutionLease, CreateExecution,
     CreateReview, Execution, ExecutionLeaseDisposition, ExecutionLeaseMutation, ExecutionRepo,
-    ExecutionStatus, ExecutionTerminalOutcome, RenewExecutionLease, RepoRepo, Review, ReviewRepo,
-    ReviewStatus, SqliteDb, TaskRepo, TerminalizeExecution,
+    ExecutionStatus, ExecutionTerminalOutcome, RenewExecutionLease, RepoRepo, Review,
+    ReviewConformanceRepo, ReviewRepo, ReviewStatus, SqliteDb, TaskRepo, TerminalizeExecution,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{
@@ -32,6 +32,7 @@ pub struct ReviewRunner {
 pub enum ReviewOutcome {
     Passed,
     PassedCiOnly,
+    AwaitingHuman,
     AuditorFailed {
         reason: String,
     },
@@ -65,10 +66,17 @@ pub struct ReviewRequest {
     pub auditor_agent_id: Option<String>,
     pub review_prompt: Option<String>,
     pub executor_thread_id: Option<String>,
+    pub requires_user_approval: bool,
 }
 
 #[derive(Debug, Error)]
 pub enum ReviewError {
+    #[error("review assessment unavailable: {reason}")]
+    Conformance {
+        execution_id: String,
+        reason: String,
+    },
+
     #[error(transparent)]
     Db(#[from] db::DbError),
 
@@ -156,9 +164,14 @@ impl ReviewRunner {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or(db::DbError::NotFound)?;
-        let ci_only_review = task.review_passed_at.is_some();
+        let ci_only_review = task.review_passed_at.is_some() && req.auditor_agent_id.is_none();
         let state_config = read_review_state_config(task.task_state_config.as_deref())?;
-        let ci_steps = read_ci_steps(&state_config);
+        let review_source = self.db.review_source(&task_id).await?;
+        let ci_steps = if crate::contract::task_scope_is_read_only(&review_source) {
+            Vec::new()
+        } else {
+            read_ci_steps(&state_config)
+        };
         let review_prompt = read_review_prompt(&state_config);
         let workspace_id = executor_execution.workspace_id.clone().ok_or(
             ReviewError::ExecutorExecutionMissingWorkspace(req.executor_execution_id),
@@ -238,15 +251,56 @@ impl ReviewRunner {
             outcome = ReviewOutcome::PassedCiOnly;
             auditor_details = Some(AuditorDetails::pass_ci_only());
         } else if status == ReviewStatus::Passed {
-            if let Some(result) = self
+            if req.auditor_agent_id.is_some() {
+                let now = now_rfc3339();
+                ReviewRepo::update_status(
+                    &*self.db,
+                    &review.id,
+                    ReviewStatus::Running,
+                    json!({"ci_steps": step_results_value(&step_results)}).to_string(),
+                    None,
+                    &now,
+                )
+                .await?;
+            }
+            let audit = self
                 .run_auditor(
                     &req,
                     &executor_execution,
                     workspace_id,
                     review_prompt.as_deref(),
                 )
-                .await?
-            {
+                .await;
+            let audit = match audit {
+                Ok(result) => result,
+                Err(error) => {
+                    let conformance = if let ReviewError::Conformance { execution_id, .. } = &error
+                    {
+                        db::ReviewConformanceRepo::review_conformance(&*self.db, execution_id)
+                            .await?
+                    } else {
+                        None
+                    }
+                    .unwrap_or_else(|| api_types::ReviewConformance {
+                        status: api_types::ConformanceStatus::Unverified,
+                        reason: Some(error.to_string()),
+                        ..Default::default()
+                    });
+                    let details = json!({"ci_steps": step_results_value(&step_results), "conformance": conformance});
+                    let now = now_rfc3339();
+                    ReviewRepo::update_status(
+                        &*self.db,
+                        &review.id,
+                        ReviewStatus::Failed,
+                        details.to_string(),
+                        Some(now.clone()),
+                        &now,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
+            if let Some(result) = audit {
                 status = result.status;
                 outcome = result.outcome;
                 failed_step_index = None;
@@ -254,14 +308,21 @@ impl ReviewRunner {
             }
         }
 
+        if status == ReviewStatus::Passed && req.requires_user_approval {
+            status = ReviewStatus::AwaitingHuman;
+            outcome = ReviewOutcome::AwaitingHuman;
+        }
+
         let finished_at = now_rfc3339();
         let step_results_json = review_details_json(&step_results, auditor_details.as_ref())?;
+        let review_finished_at =
+            (status != ReviewStatus::AwaitingHuman).then_some(finished_at.clone());
         let review = ReviewRepo::update_status(
             &*self.db,
             &review.id,
             status,
             step_results_json,
-            Some(finished_at.clone()),
+            review_finished_at,
             &finished_at,
         )
         .await?;
@@ -448,7 +509,7 @@ impl ReviewRunner {
         };
 
         let diff_text = read_git_diff(&req.workspace_path, &repo.default_branch).await?;
-        let prompt = auditor::render_auditor_prompt(
+        let mut prompt = auditor::render_auditor_prompt(
             &task.title,
             task.description.as_deref(),
             &diff_text,
@@ -495,6 +556,36 @@ impl ReviewRunner {
             lease_claim.claim,
         )
         .await?;
+
+        prompt = match crate::contract::prepare_prompt(
+            &self.db,
+            &auditor_execution.id,
+            &task_id,
+            &req.workspace_path,
+            true,
+            auditor_agent.executor_type == "shell",
+            prompt,
+        )
+        .await
+        {
+            Ok(prompt) => prompt,
+            Err(reason) => {
+                terminalize_review_execution(
+                    &self.db,
+                    &auditor_execution,
+                    &lease_claim.owner,
+                    ExecutionStatus::Failed,
+                    None,
+                    Some(reason.clone()),
+                    ReviewTerminalPolicy::default(),
+                )
+                .await?;
+                return Err(ReviewError::Conformance {
+                    execution_id: auditor_execution.id.clone(),
+                    reason,
+                });
+            }
+        };
 
         let auditor_owner = lease_claim.owner;
         let auditor_lease = ReviewExecutionLease::start(
@@ -614,14 +705,41 @@ impl ReviewRunner {
         }
 
         let final_message = last_assistant_message(&auditor_logs_path).await?;
-        Ok(Some(match auditor::parse_verdict(&final_message) {
-            AuditorVerdict::Passed => AuditorRunResult {
+        let conformance = crate::contract::evaluate(
+            &self.db,
+            &auditor_execution.id,
+            &req.workspace_path,
+            &final_message,
+        )
+        .await
+        .map_err(|reason| ReviewError::Conformance {
+            execution_id: auditor_execution.id.clone(),
+            reason,
+        })?;
+        if conformance.status == api_types::ConformanceStatus::Unverified {
+            return Err(ReviewError::Conformance {
+                execution_id: auditor_execution.id.clone(),
+                reason: conformance
+                    .reason
+                    .unwrap_or_else(|| "unverified review".into()),
+            });
+        }
+        let mut result = if conformance.status == api_types::ConformanceStatus::Passed {
+            AuditorRunResult {
                 status: ReviewStatus::Passed,
                 outcome: ReviewOutcome::Passed,
                 details: AuditorDetails::passed(),
-            },
-            AuditorVerdict::Failed { reason } => AuditorRunResult::failed(reason),
-        }))
+            }
+        } else {
+            AuditorRunResult::failed(
+                conformance
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "review conformance failed".into()),
+            )
+        };
+        result.details.conformance = Some(conformance);
+        Ok(Some(result))
     }
 
     async fn load_auditor_agent(
@@ -644,19 +762,31 @@ impl ReviewRunner {
         outcome: ReviewOutcome,
         failed_step_index: Option<usize>,
     ) {
-        let (event_type, context) = match outcome {
+        let (event_type, entity_id, context) = match outcome {
             ReviewOutcome::Passed | ReviewOutcome::PassedCiOnly => (
                 "review.passed",
+                review.id.clone(),
                 EventContext::ReviewPassed {
                     task_id: task_id.to_owned(),
                     review_id: review.id.clone(),
                     attempt_number: review.attempt_number,
                 },
             ),
+            ReviewOutcome::AwaitingHuman => (
+                "task.awaiting_human",
+                task_id.to_owned(),
+                EventContext::TaskAwaitingHuman {
+                    task_id: task_id.to_owned(),
+                    role: "reviewer".to_owned(),
+                    assignee_id: "human".to_owned(),
+                    state: "review".to_owned(),
+                },
+            ),
             ReviewOutcome::AuditorFailed { .. }
             | ReviewOutcome::CiFailed { .. }
             | ReviewOutcome::MergeConflict { .. } => (
                 "review.failed",
+                review.id.clone(),
                 EventContext::ReviewFailed {
                     task_id: task_id.to_owned(),
                     review_id: review.id.clone(),
@@ -668,7 +798,7 @@ impl ReviewRunner {
 
         self.event_bus.publish(ForgeEvent {
             event_type: event_type.to_owned(),
-            entity_id: review.id.clone(),
+            entity_id,
             timestamp: event_timestamp(),
             context,
         });
@@ -973,6 +1103,7 @@ async fn terminalize_review_execution_with_result(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AuditorDetails {
+    conformance: Option<api_types::ReviewConformance>,
     verdict: &'static str,
     reason: Option<String>,
 }
@@ -980,6 +1111,7 @@ struct AuditorDetails {
 impl AuditorDetails {
     fn passed() -> Self {
         Self {
+            conformance: None,
             verdict: "pass",
             reason: None,
         }
@@ -987,6 +1119,7 @@ impl AuditorDetails {
 
     fn pass_ci_only() -> Self {
         Self {
+            conformance: None,
             verdict: "pass_ci_only",
             reason: Some("CI-only re-review".to_owned()),
         }
@@ -994,6 +1127,7 @@ impl AuditorDetails {
 
     fn failed(reason: impl Into<String>) -> Self {
         Self {
+            conformance: None,
             verdict: "fail",
             reason: Some(reason.into()),
         }
@@ -1094,18 +1228,29 @@ async fn build_auditor_config_snapshot(
     let normalized_config =
         resolve_config_value(kind, &merged_config, &ExecutionOverrides::default())?;
     let overrides_applied = overrides_applied.retain_config_keys(&normalized_config);
-    serde_json::to_string(&json!({
+    // The auditor execution is a Task execution like any other, so its
+    // snapshot must carry the same identity fields the runtime resolves a
+    // session from. A native backend reads the profile — and through it the
+    // provider credential — from `profile_id`, and refuses a snapshot whose
+    // claimed role does not match the execution's own role.
+    let mut snapshot = json!({
         "agent_id": agent.id,
+        "profile_id": agent.profile_id,
+        "provider": agent.provider,
         "executor_type": agent.executor_type,
         "model": agent.model,
+        "prompt_template": agent.prompt_template,
         "reasoning_effort": agent.reasoning_effort,
         "permission_policy": agent.permission_policy,
         "config": normalized_config,
         "capabilities": capabilities,
         "overrides_applied": overrides_applied.to_json(),
         "snapshotted_at": now_rfc3339(),
-    }))
-    .map_err(Into::into)
+    });
+    snapshot[executors::TASK_ROLE_CONFIG_KEY] = json!("reviewer");
+    // An auditor reads the delivered worktree and never writes to it.
+    executors::mark_worktree_read_only(&mut snapshot);
+    serde_json::to_string(&snapshot).map_err(Into::into)
 }
 
 fn auditor_resume_thread_extra_config(
@@ -1192,28 +1337,28 @@ async fn last_assistant_message(logs_path: &str) -> Result<String, ReviewError> 
         Err(error) => return Err(error.into()),
     };
     let mut message = String::new();
+    let mut stdout = String::new();
     for line in contents.lines() {
         let Ok(entry) = serde_json::from_str::<LogEntry>(line) else {
             continue;
         };
         if entry.kind == LogKind::Assistant {
-            append_assistant_log_text(&entry.payload, &mut message);
+            let mut candidate = String::new();
+            append_assistant_log_text(&entry.payload, &mut candidate);
+            if !candidate.trim().is_empty() {
+                message = candidate;
+            }
         } else if entry.kind == LogKind::Stdout {
-            // A shell auditor has no assistant channel: its verdict marker is
-            // ordinary stdout. Reading only assistant text made every shell
-            // auditor fail as "verdict marker missing" even when it printed
-            // the marker. This is the auditor's own log, so its stdout is as
-            // authoritative here as an agent's final message.
-            append_stdout_log_text(&entry.payload, &mut message);
+            append_stdout_log_text(&entry.payload, &mut stdout);
         } else if entry.kind == LogKind::SessionInfo
             && entry.payload.get("subtype").and_then(Value::as_str) == Some("success")
         {
             if let Some(result) = entry.payload.get("result").and_then(Value::as_str) {
-                message.push_str(result);
+                message = result.to_owned();
             }
         }
     }
-    Ok(message)
+    Ok(if message.is_empty() { stdout } else { message })
 }
 
 fn append_stdout_log_text(payload: &Value, message: &mut String) {
@@ -1268,6 +1413,7 @@ fn review_details_json(
         Some(auditor) => serde_json::to_string(&json!({
             "ci_steps": ci_steps,
             "auditor": auditor.to_json(),
+            "conformance": auditor.conformance.clone().unwrap_or_default(),
         })),
         None => serde_json::to_string(&ci_steps),
     }

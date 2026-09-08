@@ -163,6 +163,24 @@ pub struct AppliedProjectExecutionSetupCommand {
     pub replayed: bool,
 }
 
+/// Atomic Project review-policy mutation plus durable command receipt.
+/// The caller prepares the complete settings document so the transaction can
+/// replace it under the same Project version guard as the event and receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyProjectReviewConfigCommand {
+    pub project_id: String,
+    pub expected_project_version: i64,
+    pub settings: String,
+    pub receipt: CreateCommandReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedProjectReviewConfigCommand {
+    pub project: Project,
+    pub receipt: CommandReceipt,
+    pub replayed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectProvisioningCheckpoint {
     pub id: String,

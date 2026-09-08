@@ -1,4 +1,6 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
+mod common;
+
 use std::{
     future::Future,
     path::{Path, PathBuf},
@@ -10,7 +12,7 @@ use std::{
 use api::{build_router, AppState};
 use api_types::{
     AuthorType, CommentResponse, PaginatedResponse, ProjectResponse, RepoResponse,
-    ReviewDecisionResponse, TaskResponse,
+    ReviewDecisionResponse, TaskResponse, TransitionTaskResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -21,8 +23,8 @@ use db::{
     new_uuid_v4, now_rfc3339, AgentRepo, AgentStatus, CommentAuthorType, CreateAgent,
     CreateExecution, CreateProject, CreateRepo, CreateReview, CreateTask, CreateTaskComment,
     CreateWorkspace, DaemonRepo, DaemonStatus, ExecutionRepo, ExecutionStatus, ProjectRepo,
-    RepoRepo, ReviewRepo, ReviewStatus, TaskCommentRepo, TaskRepo, UpdateProject, UpsertDaemon,
-    WorkspaceStatus,
+    RepoRepo, ReviewRepo, ReviewStatus, TaskCommentRepo, TaskRepo, UpdateProject, UpdateTask,
+    UpsertDaemon, WorkspaceStatus,
 };
 use events::EventBus;
 use executors::{
@@ -42,6 +44,10 @@ fn review_config_serializes_without_auditor_agent_id() {
     use api_types::ReviewConfig;
 
     let config = ReviewConfig {
+        conformance_checks: Vec::new(),
+        requirement_ids: Vec::new(),
+        requirement_allocations: Default::default(),
+        setup_steps: vec!["cargo fetch".to_owned()],
         ci_steps: vec!["cargo test".to_owned()],
         review_prompt: Some("Check for correctness".to_owned()),
     };
@@ -49,6 +55,7 @@ fn review_config_serializes_without_auditor_agent_id() {
     let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("parses");
 
     assert_eq!(parsed["ci_steps"][0], "cargo test");
+    assert_eq!(parsed["setup_steps"][0], "cargo fetch");
     assert_eq!(parsed["review_prompt"], "Check for correctness");
     assert!(
         parsed.get("auditor_agent_id").is_none(),
@@ -63,6 +70,10 @@ fn review_config_serializes_without_auditor_agent_id() {
     );
 
     let empty = ReviewConfig {
+        conformance_checks: Vec::new(),
+        requirement_ids: Vec::new(),
+        requirement_allocations: Default::default(),
+        setup_steps: vec![],
         ci_steps: vec![],
         review_prompt: None,
     };
@@ -76,7 +87,7 @@ fn review_config_serializes_without_auditor_agent_id() {
 
 #[tokio::test]
 async fn reject_review_bounces_to_in_progress() {
-    let workspace_root = TestDir::new("forge-manual-review-reject");
+    let workspace_root = common::TestDir::new("forge-manual-review-reject");
     let harness = test_app(workspace_root.path()).await;
 
     let (task_id, _review_id) = seed_awaiting_human_review(
@@ -101,7 +112,7 @@ async fn reject_review_bounces_to_in_progress() {
 
 #[tokio::test]
 async fn reject_review_without_reason_uses_default() {
-    let workspace_root = TestDir::new("forge-manual-review-reject-default");
+    let workspace_root = common::TestDir::new("forge-manual-review-reject-default");
     let harness = test_app(workspace_root.path()).await;
 
     let (task_id, _review_id) = seed_awaiting_human_review(
@@ -126,7 +137,7 @@ async fn reject_review_without_reason_uses_default() {
 
 #[tokio::test]
 async fn approve_review_returns_409_when_not_awaiting_human() {
-    let workspace_root = TestDir::new("forge-manual-review-409");
+    let workspace_root = common::TestDir::new("forge-manual-review-409");
     let harness = test_app(workspace_root.path()).await;
 
     let task_id = seed_review_with_status(&harness.state.db, ReviewStatus::Passed).await;
@@ -147,7 +158,7 @@ async fn approve_review_returns_409_when_not_awaiting_human() {
 
 #[tokio::test]
 async fn comment_create_list_delete() {
-    let workspace_root = TestDir::new("forge-comments-crud");
+    let workspace_root = common::TestDir::new("forge-comments-crud");
     let harness = test_app(workspace_root.path()).await;
     let (repo_path, _) = setup_git_repo(workspace_root.path(), "comments");
 
@@ -232,7 +243,7 @@ async fn comment_create_list_delete() {
 
 #[tokio::test]
 async fn system_comments_cannot_be_deleted() {
-    let workspace_root = TestDir::new("forge-comments-system-delete");
+    let workspace_root = common::TestDir::new("forge-comments-system-delete");
     let harness = test_app(workspace_root.path()).await;
 
     let task_id = seed_task_with_system_comment(&harness.state.db).await;
@@ -261,7 +272,7 @@ async fn system_comments_cannot_be_deleted() {
 
 #[tokio::test]
 async fn reject_review_creates_system_comment_with_reason() {
-    let workspace_root = TestDir::new("forge-sys-comment-reject");
+    let workspace_root = common::TestDir::new("forge-sys-comment-reject");
     let harness = test_app(workspace_root.path()).await;
 
     let (task_id, _review_id) = seed_awaiting_human_review(
@@ -309,7 +320,7 @@ async fn reject_review_creates_system_comment_with_reason() {
 
 #[tokio::test]
 async fn approve_review_cascades_via_merge() {
-    let temp = TestDir::new("forge-approve-cascade");
+    let temp = common::TestDir::new("forge-approve-cascade");
     let repo_path = temp.path().join("repo");
     std::fs::create_dir_all(&repo_path).expect("create repo dir");
     run_git(&repo_path, &["init", "--initial-branch=main"]);
@@ -336,7 +347,7 @@ async fn approve_review_cascades_via_merge() {
     run_git(&worktree_path, &["add", "."]);
     run_git(&worktree_path, &["commit", "-m", "feature"]);
 
-    let workspace_root = TestDir::new("forge-approve-cascade-workspaces");
+    let workspace_root = common::TestDir::new("forge-approve-cascade-workspaces");
     let harness = test_app(workspace_root.path()).await;
 
     let (seeded_task_id, _review_id) = seed_awaiting_human_review_with_workspace(
@@ -394,12 +405,144 @@ async fn approve_review_cascades_via_merge() {
     );
 }
 
+#[tokio::test]
+async fn rerun_review_pass_cascades_through_merge_instead_of_parking() {
+    let temp = common::TestDir::new("forge-rerun-review-pass");
+    let repo_path = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_path).expect("create repo dir");
+    run_git(&repo_path, &["init", "--initial-branch=main"]);
+    run_git(&repo_path, &["config", "user.email", "test@test.com"]);
+    run_git(&repo_path, &["config", "user.name", "Test"]);
+    std::fs::write(repo_path.join("file.txt"), "base\n").expect("write file");
+    run_git(&repo_path, &["add", "."]);
+    run_git(&repo_path, &["commit", "-m", "initial"]);
+
+    let task_id = new_uuid_v4();
+    let worktree_path = temp.path().join("worktrees").join(&task_id).join("repo");
+    std::fs::create_dir_all(worktree_path.parent().unwrap()).expect("create worktree parent");
+    run_git(
+        &repo_path,
+        &[
+            "worktree",
+            "add",
+            worktree_path.to_str().unwrap(),
+            "-b",
+            &::workspace::task_branch_name(&task_id),
+        ],
+    );
+    std::fs::write(worktree_path.join("feature.txt"), "hello\n").expect("write feature");
+    run_git(&worktree_path, &["add", "."]);
+    run_git(&worktree_path, &["commit", "-m", "feature"]);
+
+    let workspace_root = common::TestDir::new("forge-rerun-review-pass-workspaces");
+    let harness = test_app(workspace_root.path()).await;
+    let (task_id, _) = seed_awaiting_human_review_with_workspace(
+        &harness.state.db,
+        &task_id,
+        &repo_path,
+        &worktree_path,
+    )
+    .await;
+
+    let result: TransitionTaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{task_id}/review"),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert_eq!(
+        result.review.expect("rerun review").status,
+        api_types::ReviewStatus::Passed
+    );
+    assert_eq!(result.task.status, "done");
+}
+
+#[tokio::test]
+async fn rerun_review_failure_returns_to_remediation_instead_of_parking() {
+    let temp = common::TestDir::new("forge-rerun-review-fail");
+    let repo_path = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_path).expect("create repo dir");
+    run_git(&repo_path, &["init", "--initial-branch=main"]);
+    run_git(&repo_path, &["config", "user.email", "test@test.com"]);
+    run_git(&repo_path, &["config", "user.name", "Test"]);
+    std::fs::write(repo_path.join("file.txt"), "base\n").expect("write file");
+    run_git(&repo_path, &["add", "."]);
+    run_git(&repo_path, &["commit", "-m", "initial"]);
+
+    let task_id = new_uuid_v4();
+    let worktree_path = temp.path().join("worktrees").join(&task_id).join("repo");
+    std::fs::create_dir_all(worktree_path.parent().unwrap()).expect("create worktree parent");
+    run_git(
+        &repo_path,
+        &[
+            "worktree",
+            "add",
+            worktree_path.to_str().unwrap(),
+            "-b",
+            &::workspace::task_branch_name(&task_id),
+        ],
+    );
+
+    let workspace_root = common::TestDir::new("forge-rerun-review-fail-workspaces");
+    let harness = test_app(workspace_root.path()).await;
+    let (task_id, _) = seed_awaiting_human_review_with_workspace(
+        &harness.state.db,
+        &task_id,
+        &repo_path,
+        &worktree_path,
+    )
+    .await;
+    let task = TaskRepo::get_by_id(&*harness.state.db, &task_id, false)
+        .await
+        .expect("Task lookup")
+        .expect("Task exists");
+    TaskRepo::update(
+        &*harness.state.db,
+        UpdateTask {
+            id: task.id.clone(),
+            expected_version: task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: None,
+            blocked_json: None,
+            failed_json: None,
+            task_state_config: Some(Some(json!({"review":{"ci_steps":["false"]}}).to_string())),
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("review CI config updates");
+
+    let result: TransitionTaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{task_id}/review"),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert_eq!(
+        result.review.expect("rerun review").status,
+        api_types::ReviewStatus::Failed
+    );
+    assert_eq!(result.task.status, "in_progress");
+    assert!(result.task.review_passed_at.is_none());
+}
+
 // ── Harness ──
 
 struct TestHarness {
     app: Router,
     state: Arc<AppState>,
-    _web_dist_dir: TestDir,
+    _web_dist_dir: common::TestDir,
 }
 
 async fn test_app(workspace_root: &Path) -> TestHarness {
@@ -445,7 +588,7 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
         api::state::test_bcrypt_cost(),
     ));
 
-    let web_dist_dir = TestDir::new("forge-manual-review-web");
+    let web_dist_dir = common::TestDir::new("forge-manual-review-web");
     std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>").expect("write index");
     let app = build_router((*state).clone(), web_dist_dir.path().to_path_buf());
 
@@ -1319,28 +1462,4 @@ async fn raw_request(
         )
         .await
         .expect("router response")
-}
-
-// ── TestDir ──
-
-struct TestDir {
-    path: PathBuf,
-}
-
-impl TestDir {
-    fn new(prefix: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).expect("temp dir creates");
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
 }

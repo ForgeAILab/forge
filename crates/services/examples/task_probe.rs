@@ -45,6 +45,7 @@ async fn run() {
                 "title": title,
                 "description": description,
                 "priority": (index as i64) + 1,
+                "review_requirement_ids": [],
             },
             "dedupe_key": format!("simple-todo-task-{index}-{marker}"),
             "correlation_id": format!("simple-todo-tasks-{marker}"),

@@ -35,7 +35,7 @@ use crate::{
 };
 
 const EMBEDDED_EXECUTOR_TYPE: &str = "embedded";
-const TASK_ROLE_MARKER: &str = "_forge_task_role";
+const TASK_ROLE_MARKER: &str = executors::TASK_ROLE_CONFIG_KEY;
 pub(crate) const UNCOMMITTED_WORKTREE_FAILURE: &str =
     "embedded worker completed with uncommitted worktree changes while HEAD was unchanged; refusing completion because those changes were not delivered";
 
@@ -605,7 +605,8 @@ impl EmbeddedTaskExecutor {
                 }
             }
         }
-        let manifest_id = runtime_manifest_id(&agent.id, &session.id, runtime_manifest);
+        let manifest_id =
+            runtime_manifest_id(&agent.id, &session.id, &ctx.execution_id, runtime_manifest);
         let identity_id = uuid::Uuid::parse_str(&agent.id)
             .map_err(|_| ServiceError::invalid_operation("embedded identity id is invalid"))?;
         let context_scope_id = uuid::Uuid::parse_str(&session.context_scope_id)
@@ -683,16 +684,29 @@ fn manifest_uuid(manifest: &db::ContextManifest) -> Result<uuid::Uuid> {
         .map_err(|_| ServiceError::invalid_operation("persisted context manifest id is invalid"))
 }
 
+/// Identity of one runtime turn's context manifest.
+///
+/// The execution is part of the identity because a runtime turn id is only
+/// unique within one runtime session instance, while a Forge `agent_session`
+/// row outlives several of them: a reviewer retry rebuilds the runtime session
+/// with clean context and its first turn carries the same runtime turn id as
+/// the previous attempt's. Keying on the session alone made the second review
+/// of any Task collide with the first and fail as an idempotency conflict,
+/// which is also why `runtime_request_fingerprint` already includes the
+/// execution.
 fn runtime_manifest_id(
     identity_id: &str,
     session_id: &str,
+    execution_id: &str,
     runtime_manifest: &RuntimeContextManifestLink,
 ) -> uuid::Uuid {
     let mut digest = Sha256::new();
-    digest.update(b"forge-task-context-manifest-v1\0");
+    digest.update(b"forge-task-context-manifest-v2\0");
     digest.update(identity_id.as_bytes());
     digest.update([0]);
     digest.update(session_id.as_bytes());
+    digest.update([0]);
+    digest.update(execution_id.as_bytes());
     digest.update([0]);
     digest.update(runtime_manifest.turn_id.as_bytes());
     let bytes = digest.finalize();
@@ -892,7 +906,10 @@ fn native_turn_limit_result(runtime_session_id: String, limit: AgentTurnLimit) -
 fn canonical_task_role(role: &str) -> Result<&'static str> {
     match role {
         "worker" | "coder" => Ok("worker"),
-        "reviewer" => Ok("reviewer"),
+        // The review runner spawns its conformance pass as an `auditor`
+        // execution. It is the reviewer role by every other measure: read-only
+        // worktree, reviewer role assignment, reviewer prompt.
+        "reviewer" | "auditor" => Ok("reviewer"),
         // Planner keeps its own canonical identity end-to-end: the Task role
         // assignment lookup and the workflow-state admission both match on
         // the literal `planner` role, and the native session receives the
@@ -1027,6 +1044,36 @@ mod tests {
         assert_eq!(canonical_task_role("planner").unwrap(), "planner");
         assert!(canonical_task_role("merge_fixer").is_err());
         assert!(canonical_task_role("").is_err());
+    }
+
+    #[test]
+    fn a_retry_of_the_same_turn_gets_its_own_context_manifest() {
+        // A rebuilt runtime session restarts its turn numbering, so the second
+        // review attempt on a Task presents the same runtime turn id under the
+        // same reused Forge session. Only the execution tells the two apart.
+        let manifest = RuntimeContextManifestLink {
+            turn_id: "turn-1".to_owned(),
+            schema_version: 1,
+            context_fingerprint: "ctx".to_owned(),
+            cache_plan_fingerprint: "cache".to_owned(),
+            runtime_manifest_fingerprint: "runtime".to_owned(),
+            segments: Vec::new(),
+            summaries: Vec::new(),
+            lossless_summaries: Vec::new(),
+            lcm_timeline_id: None,
+            lcm_binding_revision: None,
+            lcm_store_revision: None,
+        };
+
+        let first = runtime_manifest_id("identity", "session", "execution-1", &manifest);
+        let second = runtime_manifest_id("identity", "session", "execution-2", &manifest);
+        assert_ne!(first, second);
+
+        // The same execution re-entering the same turn must still be idempotent.
+        assert_eq!(
+            first,
+            runtime_manifest_id("identity", "session", "execution-1", &manifest)
+        );
     }
 
     #[test]

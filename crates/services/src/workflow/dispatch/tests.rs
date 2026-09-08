@@ -8,8 +8,8 @@ use crate::workflow::{
         resolve_prompt_builder, reviewer_prompt::ReviewerPromptBuilder, AgentDispatchContext,
         DispatchIntent, PromptBuilder, BUILDER_ID_CODER_IMPLEMENTATION_V2,
         BUILDER_ID_CODER_MERGE_FIX_V2, BUILDER_ID_CODER_REVIEW_FIX_V2,
-        BUILDER_ID_GENERIC_DEFAULT_V2, BUILDER_ID_PLANNER_DEFAULT_V2,
-        BUILDER_ID_REVIEWER_DEFAULT_V2, BUILDER_ID_WORKER_AUTONOMOUS_V1,
+        BUILDER_ID_GENERIC_DEFAULT_V2, BUILDER_ID_PLANNER_DEFAULT_V2, BUILDER_ID_READ_ONLY_TASK_V1,
+        BUILDER_ID_REVIEWER_CONFORMANCE_V1, BUILDER_ID_WORKER_AUTONOMOUS_V1,
         BUILDER_ID_WORKER_MERGE_FIX_V1, BUILDER_ID_WORKER_REVIEW_FIX_V1,
     },
 };
@@ -84,6 +84,7 @@ fn fake_context(role: &str) -> AgentDispatchContext {
         latest_review_feedback: None,
         latest_review_execution_id: None,
         latest_review_logs_path: None,
+        read_only_task: false,
     }
 }
 
@@ -120,7 +121,7 @@ fn default_prompt_builders_include_managed_contract_and_role_boundaries() {
             ],
         ),
         (
-            BUILDER_ID_REVIEWER_DEFAULT_V2,
+            BUILDER_ID_REVIEWER_CONFORMANCE_V1,
             default_roles::REVIEWER,
             vec![
                 "Reviewer boundary:",
@@ -264,13 +265,13 @@ fn coder_family_prompts_require_a_worklog_and_captured_proof() {
 }
 
 #[test]
-fn reviewer_prompt_requires_structured_findings_and_existing_verdict_marker() {
-    let prompt = resolve_prompt_builder(BUILDER_ID_REVIEWER_DEFAULT_V2)
+fn reviewer_base_prompt_defers_the_frozen_contract_to_launch() {
+    let prompt = resolve_prompt_builder(BUILDER_ID_REVIEWER_CONFORMANCE_V1)
         .build(&fake_context(default_roles::REVIEWER));
 
     assert!(prompt
         .system
-        .contains("Reviewer findings: Put structured findings before the verdict."));
+        .contains("Reviewer findings: Put findings in the JSON findings array."));
     assert!(prompt
         .system
         .contains("Each BLOCKING finding must include evidence"));
@@ -280,9 +281,9 @@ fn reviewer_prompt_requires_structured_findings_and_existing_verdict_marker() {
         .contains("Separate NON-BLOCKING findings from BLOCKING findings."));
     assert!(prompt
         .system
-        .contains("End your response with EXACTLY ONE verdict marker in the existing format:"));
-    assert!(prompt.system.contains("===REVIEW: PASS==="));
-    assert!(prompt.system.contains("===REVIEW: FAIL: <short reason>==="));
+        .contains("frozen contract Forge appends at launch"));
+    assert!(!prompt.system.contains("contract_digest"));
+    assert!(!prompt.user.contains("contract_digest"));
 }
 
 #[test]
@@ -452,6 +453,25 @@ fn reviewer_prompt_reads_ci_steps_from_review_config() {
 }
 
 #[test]
+fn read_only_reviewer_prompt_omits_inherited_implementation_ci_steps() {
+    let mut ctx = fake_context(default_roles::REVIEWER);
+    ctx.state_name = default_states::REVIEW.to_string();
+    ctx.read_only_task = true;
+    ctx.state_config = json!({
+        "review": {
+            "ci_steps": ["false"],
+            "review_prompt": "Assess the research evidence."
+        }
+    });
+
+    let prompt = ReviewerPromptBuilder.build(&ctx);
+
+    assert!(!prompt.user.contains("Required CI steps"));
+    assert!(!prompt.user.contains("- false"));
+    assert!(prompt.user.contains("Assess the research evidence."));
+}
+
+#[test]
 fn planner_prompt_includes_parent_task_context() {
     let mut ctx = fake_context(default_roles::PLANNER);
     ctx.parent_task = Some(fake_task(
@@ -517,7 +537,7 @@ fn builder_precedence_prefers_trigger_then_state_then_role_default() {
         prompt_config: json!({}),
     };
     let state = DispatchIntent {
-        builder_id: Some(BUILDER_ID_REVIEWER_DEFAULT_V2.to_string()),
+        builder_id: Some(BUILDER_ID_REVIEWER_CONFORMANCE_V1.to_string()),
         execution_policy: None,
         prompt_config: json!({}),
     };
@@ -525,7 +545,10 @@ fn builder_precedence_prefers_trigger_then_state_then_role_default() {
     assert_eq!(selected.builder_id, BUILDER_ID_CODER_REVIEW_FIX_V2);
 
     let selected_state = effective_prompt_selection(default_roles::CODER, None, Some(&state));
-    assert_eq!(selected_state.builder_id, BUILDER_ID_REVIEWER_DEFAULT_V2);
+    assert_eq!(
+        selected_state.builder_id,
+        BUILDER_ID_REVIEWER_CONFORMANCE_V1
+    );
 
     let selected_role_default = effective_prompt_selection(default_roles::CODER, None, None);
     assert_eq!(
@@ -545,14 +568,37 @@ fn custom_reviewer_role_can_use_explicit_reviewer_builder() {
     let mut ctx = fake_context("reviewer1");
     ctx.state_name = "security_review".to_string();
     let state_dispatch = DispatchIntent {
-        builder_id: Some(BUILDER_ID_REVIEWER_DEFAULT_V2.to_string()),
+        builder_id: Some(BUILDER_ID_REVIEWER_CONFORMANCE_V1.to_string()),
         execution_policy: None,
         prompt_config: json!({}),
     };
 
     let (prompt, selection) = build_effective_prompt(&ctx, None, Some(&state_dispatch));
 
-    assert_eq!(selection.builder_id, BUILDER_ID_REVIEWER_DEFAULT_V2);
+    assert_eq!(selection.builder_id, BUILDER_ID_REVIEWER_CONFORMANCE_V1);
     assert!(prompt.system.contains("reviewer"));
     assert!(prompt.user.contains("Review task: Add dispatch context"));
+}
+
+#[test]
+fn read_only_task_overrides_coder_dispatch_with_a_no_write_contract() {
+    let mut ctx = fake_context(default_roles::CODER);
+    ctx.task.task_type = "discovery".to_owned();
+    ctx.read_only_task = true;
+    let state_dispatch = DispatchIntent {
+        builder_id: Some(BUILDER_ID_CODER_IMPLEMENTATION_V2.to_owned()),
+        execution_policy: None,
+        prompt_config: json!({
+            "user": "Inspect the parser and write the implementation."
+        }),
+    };
+
+    let (prompt, selection) = build_effective_prompt(&ctx, None, Some(&state_dispatch));
+
+    assert_eq!(selection.builder_id, BUILDER_ID_READ_ONLY_TASK_V1);
+    assert!(prompt.system.contains("read-only investigator"));
+    assert!(prompt
+        .user
+        .contains("Do not modify, create, delete, or commit"));
+    assert!(prompt.user.contains("clean unchanged worktree"));
 }

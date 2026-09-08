@@ -42,6 +42,7 @@ pub(super) fn is_deterministic_dispatch_refusal(error: &ServiceError) -> bool {
         | ServiceError::MissingPrimaryRepo { .. }
         | ServiceError::RepoMismatch { .. }
         | ServiceError::PrProviderMissing { .. } => true,
+        ServiceError::GuardRejection { guard, .. } => guard == "dependency_gate",
         // A malformed or contract-violating request cannot fix itself, but an
         // I/O or workspace failure surfaced through the same variant can.
         ServiceError::InvalidOperation { .. } => !is_io_or_workspace_error(error),
@@ -52,6 +53,9 @@ pub(super) fn is_deterministic_dispatch_refusal(error: &ServiceError) -> bool {
 }
 
 pub(super) fn has_blocking_annotation(task: &db::Task) -> bool {
+    if task.blocked_json.is_some() || task.failed_json.is_some() {
+        return true;
+    }
     let Some(raw_annotation) = task.error_annotation.as_deref() else {
         return false;
     };
@@ -106,14 +110,29 @@ pub(super) fn execution_guard_roles(role: &str) -> Vec<&str> {
 
 pub(super) async fn reviewer_dispatch_ready(
     db: &db::SqliteDb,
-    task_id: &str,
+    task: &db::Task,
     state_config: &Value,
 ) -> Result<bool> {
+    let capability_class = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT capability_class FROM project_task_governance WHERE task_id = ?",
+    )
+    .bind(&task.id)
+    .fetch_optional(db.pool())
+    .await?
+    .flatten();
+    if crate::execution_setup::classify_task_execution(
+        &task.task_type,
+        capability_class.as_deref(),
+    )?
+    .is_read_only()
+    {
+        return Ok(true);
+    }
     if !review_ci_steps_configured(state_config) {
         return Ok(true);
     }
 
-    let latest_review = ReviewRepo::list_by_task(db, task_id)
+    let latest_review = ReviewRepo::list_by_task(db, &task.id)
         .await?
         .into_iter()
         .max_by_key(|review| review.attempt_number);

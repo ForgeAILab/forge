@@ -53,11 +53,28 @@ pub async fn preview_effective_prompt(
         &workflow,
     )
     .await?;
-    let (prompt, _selection) = build_effective_prompt(
+    let (mut prompt, selection) = build_effective_prompt(
         &dispatch_ctx,
         trigger_dispatch.as_ref(),
         state_dispatch.as_ref(),
     );
+    let context = ::review::contract::load_context(&db, task_id)
+        .await
+        .map_err(ServiceError::invalid_operation)?;
+    prompt
+        .user
+        .push_str(&::review::contract::governing_prompt(&context));
+    if role == crate::workflow::default_roles::REVIEWER
+        || selection.builder_id == crate::workflow::dispatch::BUILDER_ID_REVIEWER_CONFORMANCE_V1
+    {
+        prompt.system.push_str("\n\n");
+        prompt
+            .system
+            .push_str(::review::contract::RESPONSE_INSTRUCTION);
+        prompt.user.push_str(
+            "\nPreview note: Forge freezes the candidate commit and contract digest when the reviewer execution starts.\n",
+        );
+    }
     Ok(prompt)
 }
 

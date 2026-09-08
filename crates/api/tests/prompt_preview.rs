@@ -175,10 +175,16 @@ async fn direct_prompt_for_accept_to_planning(
     )
     .await
     .expect("dispatch context loads");
-    let (prompt, _selection) = build_effective_prompt(
+    let (mut prompt, _selection) = build_effective_prompt(
         &dispatch_ctx,
         trigger_dispatch.as_ref(),
         state_dispatch.as_ref(),
     );
+    let context = review::contract::load_context(&db, task_id)
+        .await
+        .expect("governing context loads");
+    prompt
+        .user
+        .push_str(&review::contract::governing_prompt(&context));
     prompt
 }

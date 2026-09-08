@@ -11,6 +11,7 @@ pub mod coder_prompt;
 pub mod generic_prompt;
 pub mod loader;
 pub mod planner_prompt;
+pub mod read_only_task_prompt;
 pub mod reviewer_prompt;
 pub mod worker_prompt;
 
@@ -23,8 +24,9 @@ pub const BUILDER_ID_CODER_MERGE_FIX_V2: &str = "coder.merge_fix.v2";
 pub const BUILDER_ID_WORKER_AUTONOMOUS_V1: &str = "worker.autonomous.v1";
 pub const BUILDER_ID_WORKER_REVIEW_FIX_V1: &str = "worker.review_fix.v1";
 pub const BUILDER_ID_WORKER_MERGE_FIX_V1: &str = "worker.merge_fix.v1";
-pub const BUILDER_ID_REVIEWER_DEFAULT_V2: &str = "reviewer.default.v2";
+pub const BUILDER_ID_REVIEWER_CONFORMANCE_V1: &str = "reviewer.conformance.v1";
 pub const BUILDER_ID_PLANNER_DEFAULT_V2: &str = "planner.default.v2";
+pub const BUILDER_ID_READ_ONLY_TASK_V1: &str = "task.read_only.v1";
 pub const BUILDER_ID_GENERIC_DEFAULT_V2: &str = "generic.default.v2";
 
 pub(crate) const MANAGED_EXECUTION_CONTRACT: &str = "\
@@ -57,6 +59,7 @@ pub struct AgentDispatchContext {
     pub latest_review_feedback: Option<String>,
     pub latest_review_execution_id: Option<String>,
     pub latest_review_logs_path: Option<String>,
+    pub read_only_task: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,7 +104,7 @@ static DEFAULT_ROLE_BUILDERS: OnceLock<DefaultRoleBuilderMap> = OnceLock::new();
 fn registry() -> &'static BuilderRegistry {
     PROMPT_BUILDERS.get_or_init(|| {
         let mut builders: HashMap<String, Arc<dyn PromptBuilder>> = HashMap::new();
-        let defaults: [Arc<dyn PromptBuilder>; 9] = [
+        let defaults: [Arc<dyn PromptBuilder>; 10] = [
             Arc::new(coder_prompt::CoderImplementationPromptBuilder),
             Arc::new(coder_prompt::CoderReviewFixPromptBuilder),
             Arc::new(coder_prompt::CoderMergeFixPromptBuilder),
@@ -110,6 +113,7 @@ fn registry() -> &'static BuilderRegistry {
             Arc::new(worker_prompt::WorkerMergeFixPromptBuilder),
             Arc::new(reviewer_prompt::ReviewerPromptBuilder),
             Arc::new(planner_prompt::PlannerPromptBuilder),
+            Arc::new(read_only_task_prompt::ReadOnlyTaskPromptBuilder),
             Arc::new(generic_prompt::GenericPromptBuilder),
         ];
 
@@ -130,7 +134,7 @@ fn default_role_builders() -> &'static DefaultRoleBuilderMap {
             ),
             (
                 default_roles::REVIEWER.to_string(),
-                BUILDER_ID_REVIEWER_DEFAULT_V2.to_string(),
+                BUILDER_ID_REVIEWER_CONFORMANCE_V1.to_string(),
             ),
             (
                 default_roles::PLANNER.to_string(),
@@ -225,7 +229,7 @@ pub fn prompt_builder_registry_entries() -> Vec<PromptBuilderRegistryEntry> {
                 "Same-worker prompt for resolving merge conflicts and revalidating the delivery.",
         },
         PromptBuilderRegistryEntry {
-            id: BUILDER_ID_REVIEWER_DEFAULT_V2,
+            id: BUILDER_ID_REVIEWER_CONFORMANCE_V1,
             label: "Reviewer (Default)",
             compatible_role_hints: &[default_roles::REVIEWER],
             description: "Read-only review prompt with pass/fail verdict instructions.",
@@ -235,6 +239,13 @@ pub fn prompt_builder_registry_entries() -> Vec<PromptBuilderRegistryEntry> {
             label: "Planner (Default)",
             compatible_role_hints: &[default_roles::PLANNER],
             description: "Planning prompt for structured implementation plans.",
+        },
+        PromptBuilderRegistryEntry {
+            id: BUILDER_ID_READ_ONLY_TASK_V1,
+            label: "Read-only Task",
+            compatible_role_hints: &[default_roles::CODER, default_roles::WORKER],
+            description:
+                "Discovery and planning prompt that reports findings without repository changes.",
         },
         PromptBuilderRegistryEntry {
             id: BUILDER_ID_GENERIC_DEFAULT_V2,
@@ -342,8 +353,16 @@ pub fn build_effective_prompt(
     trigger_dispatch: Option<&DispatchIntent>,
     state_dispatch: Option<&DispatchIntent>,
 ) -> (AgentPrompt, EffectivePromptSelection) {
-    let selection =
+    let mut selection =
         effective_prompt_selection(&dispatch_ctx.role, trigger_dispatch, state_dispatch);
+    let read_only_worker = dispatch_ctx.read_only_task
+        && matches!(
+            dispatch_ctx.role.as_str(),
+            default_roles::CODER | default_roles::WORKER
+        );
+    if read_only_worker {
+        selection.builder_id = BUILDER_ID_READ_ONLY_TASK_V1.to_owned();
+    }
     let base_prompt = resolve_prompt_builder(&selection.builder_id).build(dispatch_ctx);
     let prompt = apply_prompt_overrides(base_prompt, &dispatch_ctx.state_config);
     let prompt = apply_prompt_overrides(
@@ -352,12 +371,17 @@ pub fn build_effective_prompt(
             .map(|intent| &intent.prompt_config)
             .unwrap_or(&Value::Object(Default::default())),
     );
-    let prompt = apply_prompt_overrides(
+    let mut prompt = apply_prompt_overrides(
         prompt,
         trigger_dispatch
             .map(|intent| &intent.prompt_config)
             .unwrap_or(&Value::Object(Default::default())),
     );
+    if read_only_worker {
+        prompt.user.push_str(
+            "\n\nExecution authority: this is a read-only discovery/planning Task. Do not modify, create, delete, or commit repository files. Inspect the available material and report the requested findings, evidence, decisions, and remaining uncertainty. A clean unchanged worktree is the expected completion state.",
+        );
+    }
     (prompt, selection)
 }
 

@@ -31,6 +31,13 @@ use async_trait::async_trait;
 
 const READ_ONLY_WORKTREE_KEY: &str = "_forge_read_only_worktree";
 
+/// Snapshot key naming the Task role an execution claims.
+///
+/// The embedded runtime matches this against the execution's own role before
+/// it opens a native session, so every producer of an execution snapshot must
+/// use the same key.
+pub const TASK_ROLE_CONFIG_KEY: &str = "_forge_task_role";
+
 /// Mark an executor config so the runtime restores the worktree after execution.
 pub fn mark_worktree_read_only(config: &mut serde_json::Value) {
     if let Some(object) = config.as_object_mut() {

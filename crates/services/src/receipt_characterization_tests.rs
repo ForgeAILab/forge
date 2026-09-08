@@ -560,6 +560,21 @@ async fn native_genesis_start_reuses_visible_message_and_freezes_discovery_conti
     );
     assert_eq!(result.source_message_id, admitted.message.id);
     assert_ne!(result.admitted_turn_id, admitted.turn_job.id);
+    let session_binding = format!("Active Product Genesis session ID: {}", result.session.id);
+    let stored_prompt: String =
+        sqlx::query_scalar("SELECT prompt_body FROM product_genesis_session WHERE id = ?")
+            .bind(&result.session.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("Genesis prompt loads");
+    assert!(stored_prompt.contains(&session_binding));
+    let stored_instruction: String =
+        sqlx::query_scalar("SELECT body FROM agent_chat_instruction_revision WHERE source_id = ?")
+            .bind(&result.session.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("Genesis instruction loads");
+    assert!(stored_instruction.contains(&session_binding));
     assert_eq!(
         count(
             &db,
@@ -602,6 +617,72 @@ async fn native_genesis_start_reuses_visible_message_and_freezes_discovery_conti
         discovery_revision
     );
     assert_eq!(continuation.get::<String, _>("status"), "queued");
+}
+
+#[tokio::test]
+async fn native_genesis_start_rejects_a_stray_tool_call_without_user_intent() {
+    let (db, main_chat_id, main_agent_id) = main_start_fixture().await;
+    let admitted = AgentChatService::new(Arc::clone(&db))
+        .send_message(SendAgentChatMessageInput {
+            actor_user_id: USER_ID.to_owned(),
+            chat_id: main_chat_id.clone(),
+            content: "Reply with exactly: READY".to_owned(),
+            dedupe_key: Some("characterization-non-genesis-message".to_owned()),
+        })
+        .await
+        .expect("ordinary Main turn admits");
+    sqlx::query(
+        "UPDATE agent_chat_turn_job
+         SET status = 'leased', lease_owner = 'characterization-native-owner',
+             leased_until = '2099-01-01T00:00:00Z', attempt_count = 1,
+             version = version + 1
+         WHERE id = ? AND status = 'queued'",
+    )
+    .bind(&admitted.turn_job.id)
+    .execute(db.pool())
+    .await
+    .expect("source turn leases");
+
+    let error = MainGenesisCommandService::new(Arc::clone(&db))
+        .start(MainGenesisStartCommandInput {
+            principal: MainGenesisStartPrincipal::MainAgent {
+                identity_id: main_agent_id,
+                scope: CanonicalScope {
+                    scope_type: CanonicalScopeType::AgentChat,
+                    scope_id: main_chat_id,
+                    workspace_access: WorkspaceAccess::Deny,
+                },
+            },
+            request: MainGenesisStartRequest {
+                maturity: None,
+                initial_idea: None,
+                preferred_project_agent_identity_id: None,
+            },
+            idempotency_key: "characterization-stray-genesis-call".to_owned(),
+            correlation_id: "characterization-stray-genesis-correlation".to_owned(),
+            causation_id: Some(admitted.turn_job.correlation_id),
+            causation_depth: 1,
+            policy_result: "allowed".to_owned(),
+            requested_permission: "propose_discovery".to_owned(),
+        })
+        .await
+        .expect_err("unrelated user message cannot authorize Genesis");
+    assert!(error
+        .to_string()
+        .contains("requires an explicit user request"));
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM product_genesis_session", None,).await,
+        0
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM command_receipt WHERE operation = 'genesis.start'",
+            None,
+        )
+        .await,
+        0
+    );
 }
 
 #[tokio::test]
@@ -1323,7 +1404,8 @@ async fn task_proposal_failure_rolls_back_and_retry_replays_exact_receipt() {
     let payload = json!({
         "title": "Characterize task receipt seam",
         "description": "The Task commits before the action receipt.",
-        "task_type": "planning_task"
+        "task_type": "planning_task",
+        "review_requirement_ids": []
     });
     let action = create_action(
         &fixture.db,

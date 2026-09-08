@@ -410,6 +410,20 @@ pub enum HumanDecision {
 #[ts(export)]
 pub struct ReviewConfig {
     #[serde(default)]
+    pub conformance_checks: Vec<crate::ConformanceCheck>,
+    /// Non-universal Charter requirement IDs owned by this Task. Universal
+    /// Project exclusions/non-claims, linked-Document acceptance, and
+    /// `task:acceptance` are included automatically.
+    #[serde(default)]
+    pub requirement_ids: Vec<String>,
+    #[serde(default)]
+    pub requirement_allocations: std::collections::BTreeMap<String, String>,
+    /// Commands that prepare a clean review checkout before `ci_steps` run,
+    /// such as dependency installation. They do not themselves satisfy a
+    /// review requirement, but their result is retained with the review.
+    #[serde(default)]
+    pub setup_steps: Vec<String>,
+    #[serde(default)]
     pub ci_steps: Vec<String>,
     #[serde(default)]
     pub review_prompt: Option<String>,

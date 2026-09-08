@@ -39,10 +39,10 @@ const AUDITOR_SESSION_ID: &str = "55555555-5555-4555-8555-555555555555";
 
 #[tokio::test]
 async fn merge_fix_budget_exhaustion_blocks_after_second_conflict() {
-    let repo_dir = TestDir::new("forge-merge-fix-exhaustion-repo");
+    let repo_dir = common::TestDir::new("forge-merge-fix-exhaustion-repo");
     let repo_path = setup_git_repo(repo_dir.path());
 
-    let workspaces_root = TestDir::new("forge-merge-fix-exhaustion-workspaces");
+    let workspaces_root = common::TestDir::new("forge-merge-fix-exhaustion-workspaces");
     let harness = test_app(
         workspaces_root.path(),
         MergeConflictCodexAdapter::new(repo_path.clone(), false),
@@ -169,8 +169,8 @@ async fn merge_fix_budget_exhaustion_blocks_after_second_conflict() {
         "merge-fix exhaustion should block at the merge gate"
     );
     assert!(
-        blocked.review_passed_at.is_some(),
-        "review_passed_at remains set after merge-fix exhaustion"
+        blocked.review_passed_at.is_none(),
+        "merge-fix exhaustion must not retain a pass for an unintegrated commit"
     );
 
     let final_executions = executions_for_task(&harness.app, &created_task.id).await;
@@ -194,8 +194,8 @@ async fn merge_fix_budget_exhaustion_blocks_after_second_conflict() {
                     && review_auditor_verdict(review) != Some("pass_ci_only".to_owned())
             })
             .count(),
-        1,
-        "exactly one reviewer-backed pass review row should exist"
+        2,
+        "each candidate presented to the merge gate must have its own reviewer-backed pass"
     );
     assert_eq!(
         reviews
@@ -205,8 +205,8 @@ async fn merge_fix_budget_exhaustion_blocks_after_second_conflict() {
                     && review_auditor_verdict(review) == Some("pass_ci_only".to_owned())
             })
             .count(),
-        1,
-        "merge-fix re-review should record one CI-only pass row"
+        0,
+        "merge retry cannot reuse a pass after the merge gate invalidates it"
     );
 
     let transition_logs = db::TransitionLogRepo::list_by_task(&*harness.state.db, &created_task.id)
@@ -274,7 +274,7 @@ impl CodingExecutorAdapter for MergeConflictCodexAdapter {
         let resolve_follow_up = self.resolve_follow_up;
         let conflict_prepared = Arc::clone(&self.conflict_prepared);
         Box::pin(async move {
-            if ctx.description.contains("===REVIEW: PASS===") {
+            if common::is_conformance_review_prompt(&ctx.description) {
                 write_auditor_pass(&ctx).await?;
                 return Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
@@ -348,7 +348,12 @@ async fn write_auditor_pass(ctx: &ExecutionContext) -> Result<(), ExecutorError>
         .write(
             LogKind::Assistant,
             LogStream::Main,
-            json!({ "text": "Looks good.\n===REVIEW: PASS===" }),
+            json!({
+                "text": common::passing_review_assessment(
+                    &ctx.description,
+                    Path::new(&ctx.worktree_path),
+                )
+            }),
         )
         .await?;
     Ok(())
@@ -456,7 +461,7 @@ struct TestHarness {
     app: Router,
     state: Arc<AppState>,
     event_bus: Arc<EventBus>,
-    _web_dist_dir: TestDir,
+    _web_dist_dir: common::TestDir,
 }
 
 async fn test_app(
@@ -505,7 +510,7 @@ async fn test_app(
         api::state::test_bcrypt_cost(),
     ));
 
-    let web_dist_dir = TestDir::new("forge-merge-conflict-web");
+    let web_dist_dir = common::TestDir::new("forge-merge-conflict-web");
     std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>").expect("write index");
     let app = build_router((*state).clone(), web_dist_dir.path().to_path_buf());
 
@@ -936,26 +941,4 @@ fn run_git(path: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
-}
-
-struct TestDir {
-    path: PathBuf,
-}
-
-impl TestDir {
-    fn new(prefix: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).expect("temp dir creates");
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
 }

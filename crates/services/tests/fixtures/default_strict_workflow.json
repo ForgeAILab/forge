@@ -278,7 +278,7 @@
         "optional_when_unassigned": false
       },
       "dispatch": {
-        "builder": "reviewer.default.v2",
+        "builder": "reviewer.conformance.v1",
         "execution_policy": null,
         "prompt": null
       },

@@ -8,8 +8,9 @@
 //! composes the tools.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt,
+    io::ErrorKind,
     path::{Component, Path},
     process::Stdio,
     sync::Arc,
@@ -60,6 +61,8 @@ pub const FORGE_SCOPE_READ_PERMISSION: &str = "forge.scope.read";
 pub const FORGE_SCOPE_PROPOSE_PERMISSION: &str = "forge.scope.propose";
 /// Stable native tool name for bounded public web research.
 pub const FORGE_PUBLIC_WEB_SEARCH_TOOL: &str = "forge_public_web_search";
+/// Stable native tool name for bounded Task Workspace enumeration.
+pub const FORGE_TASK_LIST_TOOL: &str = "forge_task_list";
 
 /// Stable native tool name for Main Agent orchestration reads.
 pub const FORGE_MAIN_ORCHESTRATION_READ_TOOL: &str = "forge_main_orchestration_read";
@@ -72,6 +75,8 @@ pub const FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL: &str = "forge_project_orches
 
 const MAX_FILE_READ_BYTES: usize = 128 * 1024;
 const MAX_FILE_WRITE_BYTES: usize = 1024 * 1024;
+const MAX_DIRECTORY_ENTRIES: usize = 256;
+const MAX_DIRECTORY_GLOB_CHARS: usize = 256;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 128 * 1024;
 const MAX_PUBLIC_SEARCH_QUERY_CHARS: usize = 512;
 const MAX_PUBLIC_SEARCH_RESULTS: u64 = 10;
@@ -383,6 +388,7 @@ impl ScopeToolComposition {
                 let task_write_allowed = allowed_permissions.contains("task_write");
                 if task_read_allowed {
                     tools.push(Arc::new(TaskReadTool));
+                    tools.push(Arc::new(TaskListTool));
                     coverage_set.insert(Permission::FsRead);
                 }
                 match role {
@@ -448,6 +454,7 @@ impl ScopeToolComposition {
                 if project_verification {
                     let root = workspace_root.expect("validated verification checkout");
                     tools.push(Arc::new(TaskReadTool));
+                    tools.push(Arc::new(TaskListTool));
                     tools.push(Arc::new(TaskCommandTool {
                         observer: provider.clone().map(|provider| CommandObserver {
                             actor_identity_id: actor_identity_id.clone(),
@@ -468,6 +475,7 @@ impl ScopeToolComposition {
                 if account_scratch {
                     let root = workspace_root.expect("validated account scratch directory");
                     tools.push(Arc::new(TaskReadTool));
+                    tools.push(Arc::new(TaskListTool));
                     tools.push(Arc::new(TaskWriteTool));
                     tools.push(Arc::new(TaskCommandTool {
                         observer: None,
@@ -841,6 +849,10 @@ fn non_task_operations(
             ];
             let mut operations = Vec::new();
             if project_agent_chat {
+                // A Project Agent proposes this Project's Tasks, so it must be
+                // able to enumerate them. Without this read it saw only
+                // aggregate counts and re-created work it had already created.
+                reads.push("work.read".to_owned());
                 if project_charter_setup_required {
                     operations.push("message.send".to_owned());
                 } else {
@@ -1700,7 +1712,33 @@ impl Tool for TaskReadTool {
     ) -> Result<ToolOutcome, RuntimeError> {
         let path = required_string(prepared.arguments(), "path")?;
         let path = bounded_workspace_path(ctx.workspace.as_ref(), path)?;
-        let bytes = std::fs::read(&path).map_err(|error| RuntimeError::tool(error.to_string()))?;
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Ok(tool_error_outcome(json!({
+                    "code": "not_found",
+                    "message": "Task Workspace path was not found",
+                    "path": workspace_relative_path(ctx.workspace.root(), &path)?,
+                })));
+            }
+            Err(_) if Path::new(&path).is_dir() => {
+                let (entries, truncated) = directory_entries(ctx.workspace.root(), &path, None)?;
+                return Ok(tool_error_outcome(json!({
+                    "code": "is_directory",
+                    "message": "Task Workspace path is a directory; use forge_task_list to enumerate it",
+                    "path": workspace_relative_path(ctx.workspace.root(), &path)?,
+                    "entries": entries,
+                    "truncated": truncated,
+                })));
+            }
+            Err(error) => {
+                return Err(RuntimeError::tool(format!(
+                    "Task Workspace file could not be read ({:?})",
+                    error.kind()
+                )));
+            }
+        };
+        let truncated = bytes.len() > MAX_FILE_READ_BYTES;
         let bounded = bytes
             .into_iter()
             .take(MAX_FILE_READ_BYTES)
@@ -1709,7 +1747,89 @@ impl Tool for TaskReadTool {
         Ok(ToolOutcome::json(json!({
             "path": path,
             "content": text,
-            "truncated": bounded.len() == MAX_FILE_READ_BYTES
+            "truncated": truncated
+        })))
+    }
+}
+
+#[derive(Debug)]
+struct TaskListTool;
+
+#[async_trait]
+impl Tool for TaskListTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::new(
+            FORGE_TASK_LIST_TOOL,
+            "List direct children of a directory inside the admitted Task Workspace. An optional glob filters entry names with * and ? wildcards.",
+            json!({
+                "type":"object",
+                "required":["path"],
+                "properties":{
+                    "path":{"type":"string","minLength":1},
+                    "glob":{"type":"string","minLength":1,"maxLength":MAX_DIRECTORY_GLOB_CHARS}
+                },
+                "additionalProperties":false
+            }),
+            ToolEffects::read_only(),
+        )
+    }
+
+    async fn prepare(
+        &self,
+        arguments: Value,
+        ctx: &PreparationContext,
+    ) -> Result<PreparedToolCall, RuntimeError> {
+        let path =
+            bounded_workspace_path(ctx.workspace.as_ref(), required_string(&arguments, "path")?)?;
+        let glob = directory_glob(&arguments)?;
+        let resource = filesystem_resource(ctx.workspace.root(), &path)?;
+        let mut prepared_arguments = json!({"path": path});
+        if let Some(glob) = glob {
+            prepared_arguments["glob"] = Value::String(glob.to_owned());
+        }
+        Ok(PreparedToolCall::new(
+            ctx.call_id.clone(),
+            FORGE_TASK_LIST_TOOL,
+            prepared_arguments,
+            PermissionSet::single(Permission::FsRead),
+            resource,
+            ToolEffects::read_only(),
+            ToolCallDisplay::new("List Task Workspace directory"),
+        ))
+    }
+
+    async fn invoke(
+        &self,
+        prepared: PreparedToolCall,
+        ctx: &InvocationContext,
+    ) -> Result<ToolOutcome, RuntimeError> {
+        let path = required_string(prepared.arguments(), "path")?;
+        let path = bounded_workspace_path(ctx.workspace.as_ref(), path)?;
+        let glob = directory_glob(prepared.arguments())?;
+        let (entries, truncated) = match directory_entries(ctx.workspace.root(), &path, glob) {
+            Ok(listing) => listing,
+            Err(error) if error.kind == agent_runtime::core::error::ErrorKind::NotFound => {
+                return Ok(tool_error_outcome(json!({
+                    "code": "not_found",
+                    "message": "Task Workspace directory was not found",
+                    "path": workspace_relative_path(ctx.workspace.root(), &path)?,
+                })));
+            }
+            Err(_error) if !Path::new(&path).is_dir() => {
+                return Ok(tool_error_outcome(json!({
+                    "code": "not_a_directory",
+                    "message": "Task Workspace list path must be a directory",
+                    "path": workspace_relative_path(ctx.workspace.root(), &path)?,
+                })));
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(ToolOutcome::json(json!({
+            "path": workspace_relative_path(ctx.workspace.root(), &path)?,
+            "glob": glob,
+            "entries": entries,
+            "truncated": truncated,
+            "limit": MAX_DIRECTORY_ENTRIES,
         })))
     }
 }
@@ -2231,6 +2351,143 @@ fn string_array(arguments: &Value, field: &str) -> Result<Vec<String>, RuntimeEr
         .collect()
 }
 
+fn directory_glob(arguments: &Value) -> Result<Option<&str>, RuntimeError> {
+    let Some(value) = arguments.get("glob") else {
+        return Ok(None);
+    };
+    let glob = value
+        .as_str()
+        .ok_or_else(|| RuntimeError::tool("Task Workspace glob must be a string"))?;
+    if glob.is_empty() || glob.chars().count() > MAX_DIRECTORY_GLOB_CHARS {
+        return Err(RuntimeError::tool(format!(
+            "Task Workspace glob must contain 1 to {MAX_DIRECTORY_GLOB_CHARS} characters"
+        )));
+    }
+    if glob.contains('/') || glob.contains('\\') {
+        return Err(RuntimeError::tool(
+            "Task Workspace glob filters direct entry names and cannot contain path separators",
+        ));
+    }
+    Ok(Some(glob))
+}
+
+fn directory_entries(
+    workspace_root: &str,
+    directory: &str,
+    glob: Option<&str>,
+) -> Result<(Vec<Value>, bool), RuntimeError> {
+    let read_dir = std::fs::read_dir(directory).map_err(|error| match error.kind() {
+        ErrorKind::NotFound => RuntimeError::not_found(format!(
+            "Task Workspace directory not found: {}",
+            workspace_relative_path(workspace_root, directory)
+                .unwrap_or_else(|_| directory.to_owned())
+        )),
+        _ => RuntimeError::tool(format!(
+            "Task Workspace directory could not be listed ({:?})",
+            error.kind()
+        )),
+    })?;
+    let mut entries = BTreeMap::new();
+    let mut truncated = false;
+    for entry in read_dir {
+        let entry = entry.map_err(|error| {
+            RuntimeError::tool(format!(
+                "Task Workspace directory entry could not be read ({:?})",
+                error.kind()
+            ))
+        })?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| RuntimeError::workspace("Task Workspace entry is not valid UTF-8"))?;
+        if glob.is_some_and(|pattern| !glob_matches(pattern, &name)) {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|error| {
+            RuntimeError::tool(format!(
+                "Task Workspace entry type could not be read ({:?})",
+                error.kind()
+            ))
+        })?;
+        let kind = if file_type.is_dir() {
+            "directory"
+        } else if file_type.is_file() {
+            "file"
+        } else if file_type.is_symlink() {
+            "symlink"
+        } else {
+            "other"
+        };
+        let entry_path = entry.path();
+        let entry_path = entry_path
+            .to_str()
+            .ok_or_else(|| RuntimeError::workspace("Task Workspace entry is not valid UTF-8"))?;
+        entries.insert(
+            name.clone(),
+            json!({
+                "name": name,
+                "path": workspace_relative_path(workspace_root, entry_path)?,
+                "kind": kind,
+            }),
+        );
+        if entries.len() > MAX_DIRECTORY_ENTRIES {
+            entries.pop_last();
+            truncated = true;
+        }
+    }
+    Ok((entries.into_values().collect(), truncated))
+}
+
+fn glob_matches(pattern: &str, value: &str) -> bool {
+    let value = value.chars().collect::<Vec<_>>();
+    let mut previous = vec![false; value.len() + 1];
+    previous[0] = true;
+    for token in pattern.chars() {
+        let mut current = vec![false; value.len() + 1];
+        if token == '*' {
+            current[0] = previous[0];
+        }
+        for (index, character) in value.iter().enumerate() {
+            current[index + 1] = if token == '*' {
+                previous[index + 1] || current[index]
+            } else {
+                previous[index] && (token == '?' || token == *character)
+            };
+        }
+        previous = current;
+    }
+    previous[value.len()]
+}
+
+fn workspace_relative_path(root: &str, path: &str) -> Result<String, RuntimeError> {
+    let relative = Path::new(path)
+        .strip_prefix(Path::new(root))
+        .map_err(|_| RuntimeError::workspace("Task Workspace path is outside its root"))?;
+    if relative.as_os_str().is_empty() {
+        return Ok(".".to_owned());
+    }
+    let segments = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(segment) => segment.to_str(),
+            Component::CurDir => None,
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        return Err(RuntimeError::workspace(
+            "Task Workspace path is not valid UTF-8",
+        ));
+    }
+    Ok(segments.join("/"))
+}
+
+fn tool_error_outcome(value: Value) -> ToolOutcome {
+    let mut outcome = ToolOutcome::json(value);
+    outcome.is_error = true;
+    outcome
+}
+
 fn bounded_workspace_path(workspace: &dyn Workspace, raw: &str) -> Result<String, RuntimeError> {
     if raw.trim().is_empty() {
         return Err(RuntimeError::workspace(
@@ -2399,6 +2656,31 @@ fn host_error_to_runtime(error: AgentHostError) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
+
+    /// A Project Agent proposes this Project's Tasks from its Chat scope, so
+    /// it has to be able to list them. Without this read it saw only aggregate
+    /// counts, could not tell its own Tasks apart, and duplicated the set it
+    /// had already created.
+    #[test]
+    fn a_project_agent_chat_can_read_the_projects_work() {
+        let (reads, _) = super::non_task_operations(CanonicalScopeType::AgentChat, true, false);
+        assert!(
+            reads.contains(&"work.read".to_owned()),
+            "project agent chat reads: {reads:?}"
+        );
+        assert_eq!(
+            crate::operation_catalog::descriptor(CanonicalScopeType::AgentChat, "work.read", None)
+                .required_permission,
+            Some("read_agent_chat")
+        );
+
+        // A Main Chat is not bound to one Project, so it keeps the portfolio
+        // surface instead.
+        let (main_reads, _) =
+            super::non_task_operations(CanonicalScopeType::AgentChat, false, false);
+        assert!(!main_reads.contains(&"work.read".to_owned()));
+    }
+
     use super::*;
     use crate::operation_catalog::{
         MAIN_PROJECT_CREATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
@@ -2638,6 +2920,46 @@ mod tests {
             .await
             .expect_err("conflicting flat and nested fields are ambiguous");
         assert!(conflict.to_string().contains("conflicts"), "{conflict}");
+    }
+
+    #[tokio::test]
+    async fn generic_cancellation_lifts_the_versioned_payload_fields() {
+        let operation = crate::operation_catalog::TASK_CANCEL_OPERATION;
+        let tool = ForgeScopeProposeTool::new(
+            "agent-1".to_owned(),
+            CanonicalScope {
+                scope_type: CanonicalScopeType::Project,
+                scope_id: "project-1".to_owned(),
+                workspace_access: WorkspaceAccess::Deny,
+            },
+            vec![operation.to_owned()],
+            Arc::new(TestProvider::default()),
+        );
+        let flat = json!({
+            "operation": operation,
+            "action": "cancel",
+            "task_id": "task-1",
+            "expected_task_version": 7,
+            "reason": "Duplicate Task",
+            "dedupe_key": "cancel-task-1",
+            "correlation_id": "cancel-task-1"
+        });
+        let validator = jsonschema::validator_for(&tool.spec().input_schema).expect("schema");
+        assert!(
+            validator.validate(&flat).is_ok(),
+            "provider-facing schema admits flat cancellation fields"
+        );
+        let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
+            root: "<none>".to_owned(),
+        });
+        let prepared = tool
+            .prepare(flat, &command_preparation_context(workspace))
+            .await
+            .expect("flat cancellation call prepares");
+        assert_eq!(prepared.arguments()["payload"]["action"], "cancel");
+        assert_eq!(prepared.arguments()["payload"]["task_id"], "task-1");
+        assert_eq!(prepared.arguments()["payload"]["expected_task_version"], 7);
+        assert_eq!(prepared.arguments()["payload"]["reason"], "Duplicate Task");
     }
 
     #[tokio::test]
@@ -3452,6 +3774,7 @@ mod tests {
         .expect("worker composition");
         let names = composition.tool_names();
         assert!(names.contains(&"forge_task_read".to_owned()));
+        assert!(names.contains(&FORGE_TASK_LIST_TOOL.to_owned()));
         assert!(!names.contains(&"forge_task_write".to_owned()));
         assert!(!names.contains(&"forge_task_command".to_owned()));
         assert!(composition.coverage().contains(&Permission::FsRead));
@@ -3482,10 +3805,12 @@ mod tests {
         let worker_names = worker.tool_names();
         let reviewer_names = reviewer.tool_names();
         assert!(worker_names.contains(&"forge_task_read".to_owned()));
+        assert!(worker_names.contains(&FORGE_TASK_LIST_TOOL.to_owned()));
         assert!(worker_names.contains(&"forge_task_write".to_owned()));
         assert!(worker_names.contains(&"forge_task_command".to_owned()));
         assert!(!worker_names.contains(&"forge_task_validate".to_owned()));
         assert!(reviewer_names.contains(&"forge_task_read".to_owned()));
+        assert!(reviewer_names.contains(&FORGE_TASK_LIST_TOOL.to_owned()));
         assert!(reviewer_names.contains(&"forge_task_validate".to_owned()));
         assert!(!reviewer_names.contains(&"forge_task_write".to_owned()));
         assert!(!reviewer_names.contains(&"forge_task_command".to_owned()));
@@ -3506,6 +3831,7 @@ mod tests {
         .expect("planner composition");
         let names = planner.tool_names();
         assert!(names.contains(&"forge_task_read".to_owned()));
+        assert!(names.contains(&FORGE_TASK_LIST_TOOL.to_owned()));
         assert!(!names.contains(&"forge_task_write".to_owned()));
         assert!(!names.contains(&"forge_task_command".to_owned()));
         assert!(!names.contains(&"forge_task_validate".to_owned()));
@@ -3591,6 +3917,113 @@ mod tests {
             .prepare(json!({"path":"../task-2/file"}), &context)
             .await;
         assert!(parent.is_err());
+    }
+
+    #[tokio::test]
+    async fn task_list_discovers_real_files_with_a_bounded_globbed_result() {
+        let root = tempfile::tempdir().expect("temporary Task Workspace");
+        let tests = root.path().join("src/test");
+        std::fs::create_dir_all(&tests).expect("test directory");
+        std::fs::write(tests.join("profile.test.ts"), "profile\n").expect("profile test");
+        std::fs::write(tests.join("cli.test.ts"), "cli\n").expect("cli test");
+        std::fs::write(tests.join("fixture.csv"), "a,b\n").expect("fixture");
+        let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
+            root: root.path().to_string_lossy().into_owned(),
+        });
+        let tool = TaskListTool;
+        let prepared = tool
+            .prepare(
+                json!({"path":"src/test","glob":"*.test.ts"}),
+                &command_preparation_context(workspace.clone()),
+            )
+            .await
+            .expect("list prepares");
+        let outcome = tool
+            .invoke(prepared, &command_invocation_context(workspace))
+            .await
+            .expect("list runs");
+
+        assert!(!outcome.is_error);
+        assert_eq!(outcome.value["path"], "src/test");
+        assert_eq!(outcome.value["truncated"], false);
+        assert_eq!(
+            outcome.value["entries"],
+            json!([
+                {"name":"cli.test.ts","path":"src/test/cli.test.ts","kind":"file"},
+                {"name":"profile.test.ts","path":"src/test/profile.test.ts","kind":"file"}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn task_list_caps_entries_and_task_read_explains_directory_and_missing_paths() {
+        let root = tempfile::tempdir().expect("temporary Task Workspace");
+        let many = root.path().join("many");
+        std::fs::create_dir(&many).expect("many directory");
+        std::fs::create_dir_all(root.path().join("src/test")).expect("nested directory");
+        for index in 0..(MAX_DIRECTORY_ENTRIES + 2) {
+            std::fs::write(many.join(format!("{index:03}.txt")), "x").expect("bounded fixture");
+        }
+        let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
+            root: root.path().to_string_lossy().into_owned(),
+        });
+
+        let list = TaskListTool;
+        let prepared = list
+            .prepare(
+                json!({"path":"many"}),
+                &command_preparation_context(workspace.clone()),
+            )
+            .await
+            .expect("list prepares");
+        let outcome = list
+            .invoke(prepared, &command_invocation_context(workspace.clone()))
+            .await
+            .expect("list runs");
+        assert_eq!(
+            outcome.value["entries"].as_array().map(Vec::len),
+            Some(MAX_DIRECTORY_ENTRIES)
+        );
+        assert_eq!(outcome.value["truncated"], true);
+
+        let read = TaskReadTool;
+        let directory = read
+            .prepare(
+                json!({"path":"src"}),
+                &command_preparation_context(workspace.clone()),
+            )
+            .await
+            .expect("directory read prepares");
+        let directory_outcome = read
+            .invoke(directory, &command_invocation_context(workspace.clone()))
+            .await
+            .expect("directory read stays in-band");
+        assert!(directory_outcome.is_error);
+        assert_eq!(directory_outcome.value["code"], "is_directory");
+        assert_eq!(directory_outcome.value["entries"][0]["path"], "src/test");
+
+        let missing = read
+            .prepare(
+                json!({"path":"src/test/missing.test.ts"}),
+                &command_preparation_context(workspace.clone()),
+            )
+            .await
+            .expect("missing read prepares");
+        let missing_outcome = read
+            .invoke(missing, &command_invocation_context(workspace))
+            .await
+            .expect("missing read stays in-band");
+        assert!(missing_outcome.is_error);
+        assert_eq!(missing_outcome.value["code"], "not_found");
+        assert_eq!(missing_outcome.value["path"], "src/test/missing.test.ts");
+    }
+
+    #[test]
+    fn task_list_glob_matches_only_direct_entry_names() {
+        assert!(glob_matches("*.test.ts", "profile.test.ts"));
+        assert!(glob_matches("cl?.test.ts", "cli.test.ts"));
+        assert!(!glob_matches("*.test.ts", "fixture.csv"));
+        assert!(!glob_matches("src/*.ts", "profile.test.ts"));
     }
 
     #[tokio::test]

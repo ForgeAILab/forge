@@ -475,52 +475,89 @@ pub async fn delete_project(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    let staged_repositories = stage_managed_project_repositories(&state, &id).await?;
+    ProjectRepo::get_by_id(&*state.db, &id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("project", id.clone()))?;
+    let staged_paths = stage_project_owned_paths(&state, &id).await?;
     if let Err(error) = ProjectRepo::delete(&*state.db, &id).await {
-        restore_staged_repositories(&staged_repositories).await;
+        restore_staged_paths(&staged_paths).await;
         return Err(error.into());
     }
-    for staged in &staged_repositories {
+    let mut cleanup_failed = false;
+    for staged in &staged_paths {
         if let Err(error) = tokio::fs::remove_dir_all(&staged.staged).await {
+            cleanup_failed = true;
             tracing::error!(
                 project_id = %id,
                 path = %staged.staged.display(),
                 error = %error,
-                "Project database teardown committed but its staged managed repository could not be removed"
+                "Project database teardown committed but a staged Project-owned path could not be removed"
             );
-            return Err(ApiError::internal(
-                "Project was deleted, but its staged managed repository cleanup failed",
-            ));
         }
     }
     state.event_bus.publish(ForgeEvent {
         event_type: "project.deleted".to_owned(),
-        entity_id: id,
+        entity_id: id.clone(),
         timestamp: event_timestamp(),
         context: EventContext::ProjectDeleted {},
     });
+    if cleanup_failed {
+        return Err(ApiError::internal(
+            "Project was deleted, but staged Project-owned filesystem cleanup failed",
+        ));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug)]
-struct StagedRepositoryRemoval {
+struct StagedPathRemoval {
     original: PathBuf,
     staged: PathBuf,
+}
+
+async fn stage_project_owned_paths(
+    state: &AppState,
+    project_id: &str,
+) -> ApiResult<Vec<StagedPathRemoval>> {
+    let mut staged = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Err(error) =
+        stage_managed_project_repositories(state, project_id, &mut staged, &mut seen).await
+    {
+        restore_staged_paths(&staged).await;
+        return Err(error);
+    }
+    if let Err(error) = stage_task_workspaces(state, project_id, &mut staged, &mut seen).await {
+        restore_staged_paths(&staged).await;
+        return Err(error);
+    }
+    if let Err(error) =
+        stage_project_agent_workspace(state, project_id, &mut staged, &mut seen).await
+    {
+        restore_staged_paths(&staged).await;
+        return Err(error);
+    }
+
+    Ok(staged)
 }
 
 async fn stage_managed_project_repositories(
     state: &AppState,
     project_id: &str,
-) -> ApiResult<Vec<StagedRepositoryRemoval>> {
+    staged: &mut Vec<StagedPathRemoval>,
+    seen: &mut HashSet<PathBuf>,
+) -> ApiResult<()> {
     let managed_root = state.effective_config.workspace.root.join("repos");
-    let Ok(canonical_root) = tokio::fs::canonicalize(&managed_root).await else {
-        return Ok(Vec::new());
-    };
-    let mut seen = HashSet::new();
-    let mut staged = Vec::new();
+    let cache_root = state.effective_config.workspace.root.join(".repos");
+    let canonical_managed_root = canonicalize_optional(&managed_root).await?;
+    let canonical_cache_root = canonicalize_optional(&cache_root).await?;
+    if canonical_managed_root.is_none() && canonical_cache_root.is_none() {
+        return Ok(());
+    }
     let mut cursor = None;
     loop {
-        let repos = match RepoRepo::list_by_project(
+        let repos = RepoRepo::list_by_project(
             &*state.db,
             project_id,
             PageRequest {
@@ -531,59 +568,147 @@ async fn stage_managed_project_repositories(
                 sort_order: SortOrder::Asc,
             },
         )
-        .await
-        {
-            Ok(repos) => repos,
-            Err(error) => {
-                restore_staged_repositories(&staged).await;
-                return Err(error.into());
+        .await?;
+        for repo in repos.items {
+            if let (Some(canonical_root), Some(local_path)) = (
+                canonical_managed_root.as_deref(),
+                repo.local_path.as_deref(),
+            ) {
+                stage_direct_child(
+                    canonical_root,
+                    &PathBuf::from(local_path),
+                    staged,
+                    seen,
+                    "managed Project repository",
+                )
+                .await?;
             }
-        };
-        for local_path in repos.items.into_iter().filter_map(|repo| repo.local_path) {
-            let original = PathBuf::from(local_path);
-            let Ok(canonical) = tokio::fs::canonicalize(&original).await else {
-                continue;
-            };
-            // Only repositories provisioned as direct children of Forge's managed
-            // repos root are Project-owned filesystem state. Explicitly linked
-            // repositories elsewhere on disk are never removed.
-            if canonical.parent() != Some(canonical_root.as_path())
-                || !seen.insert(canonical.clone())
-            {
-                continue;
+            if let Some(canonical_root) = canonical_cache_root.as_deref() {
+                stage_direct_child(
+                    canonical_root,
+                    &canonical_root.join(&repo.id),
+                    staged,
+                    seen,
+                    "managed repository cache",
+                )
+                .await?;
             }
-            let tombstone = canonical_root.join(format!(
-                ".forge-project-delete-{}-{}",
-                project_id,
-                new_uuid_v4()
-            ));
-            if let Err(error) = tokio::fs::rename(&canonical, &tombstone).await {
-                restore_staged_repositories(&staged).await;
-                return Err(ApiError::internal(format!(
-                    "stage managed Project repository for deletion: {error}"
-                )));
-            }
-            staged.push(StagedRepositoryRemoval {
-                original: canonical,
-                staged: tombstone,
-            });
         }
         let Some(next_cursor) = repos.next_cursor else {
             break;
         };
         cursor = Some(next_cursor);
     }
-    Ok(staged)
+    Ok(())
 }
 
-async fn restore_staged_repositories(staged: &[StagedRepositoryRemoval]) {
-    for repository in staged.iter().rev() {
-        if let Err(error) = tokio::fs::rename(&repository.staged, &repository.original).await {
+async fn stage_task_workspaces(
+    state: &AppState,
+    project_id: &str,
+    staged: &mut Vec<StagedPathRemoval>,
+    seen: &mut HashSet<PathBuf>,
+) -> ApiResult<()> {
+    let Some(canonical_root) =
+        canonicalize_optional(&state.effective_config.workspace.root).await?
+    else {
+        return Ok(());
+    };
+    let task_ids = sqlx::query_scalar::<_, String>("SELECT id FROM task WHERE project_id = ?")
+        .bind(project_id)
+        .fetch_all(state.db.pool())
+        .await
+        .map_err(db::DbError::from)?;
+    for task_id in task_ids {
+        stage_direct_child(
+            &canonical_root,
+            &canonical_root.join(task_id),
+            staged,
+            seen,
+            "Task workspace",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn stage_project_agent_workspace(
+    state: &AppState,
+    project_id: &str,
+    staged: &mut Vec<StagedPathRemoval>,
+    seen: &mut HashSet<PathBuf>,
+) -> ApiResult<()> {
+    let projects_root = state.effective_config.forge.data_dir.join("projects");
+    let Some(canonical_root) = canonicalize_optional(&projects_root).await? else {
+        return Ok(());
+    };
+    stage_direct_child(
+        &canonical_root,
+        &canonical_root.join(project_id),
+        staged,
+        seen,
+        "Project Agent workspace",
+    )
+    .await
+}
+
+async fn canonicalize_optional(path: &std::path::Path) -> ApiResult<Option<PathBuf>> {
+    match tokio::fs::canonicalize(path).await {
+        Ok(path) => Ok(Some(path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ApiError::internal(format!(
+            "resolve Project-owned filesystem root: {error}"
+        ))),
+    }
+}
+
+async fn stage_direct_child(
+    canonical_root: &std::path::Path,
+    candidate: &std::path::Path,
+    staged: &mut Vec<StagedPathRemoval>,
+    seen: &mut HashSet<PathBuf>,
+    kind: &str,
+) -> ApiResult<()> {
+    let candidate_metadata = match tokio::fs::symlink_metadata(candidate).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(ApiError::internal(format!(
+                "inspect {kind} before Project deletion: {error}"
+            )))
+        }
+    };
+    // Never follow a persisted or corrupted symlink, even when it resolves to
+    // another direct child of a Forge-controlled root.
+    if candidate_metadata.file_type().is_symlink() || !candidate_metadata.is_dir() {
+        return Ok(());
+    }
+    let Some(canonical) = canonicalize_optional(candidate).await? else {
+        return Ok(());
+    };
+    // Project deletion owns only direct children of Forge-controlled roots.
+    // A linked repository elsewhere on disk is never followed.
+    if canonical.parent() != Some(canonical_root) || !seen.insert(canonical.clone()) {
+        return Ok(());
+    }
+    let tombstone = canonical_root.join(format!(".forge-project-delete-{}", new_uuid_v4()));
+    tokio::fs::rename(&canonical, &tombstone)
+        .await
+        .map_err(|error| ApiError::internal(format!("stage {kind} for deletion: {error}")))?;
+    staged.push(StagedPathRemoval {
+        original: canonical,
+        staged: tombstone,
+    });
+    Ok(())
+}
+
+async fn restore_staged_paths(staged: &[StagedPathRemoval]) {
+    for path in staged.iter().rev() {
+        if let Err(error) = tokio::fs::rename(&path.staged, &path.original).await {
             tracing::error!(
-                path = %repository.staged.display(),
-                restore_path = %repository.original.display(),
+                path = %path.staged.display(),
+                restore_path = %path.original.display(),
                 error = %error,
-                "failed to restore a managed repository after Project teardown rolled back"
+                "failed to restore a Project-owned path after Project teardown rolled back"
             );
         }
     }
@@ -977,8 +1102,11 @@ fn review_summary_analytics(summary: ProjectReviewSummary) -> ReviewSummaryAnaly
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::{
-        is_legacy_manual_default_assignee, restore_staged_repositories, StagedRepositoryRemoval,
+        is_legacy_manual_default_assignee, restore_staged_paths, stage_direct_child,
+        StagedPathRemoval,
     };
 
     #[test]
@@ -989,7 +1117,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn staged_repository_restore_reverses_each_rename() {
+    async fn staged_path_restore_reverses_each_rename() {
         let root = std::env::temp_dir().join(format!(
             "forge-project-delete-restore-test-{}",
             uuid::Uuid::new_v4()
@@ -1003,7 +1131,7 @@ mod tests {
             .await
             .expect("repository content");
 
-        restore_staged_repositories(&[StagedRepositoryRemoval {
+        restore_staged_paths(&[StagedPathRemoval {
             original: original.clone(),
             staged: staged.clone(),
         }])
@@ -1014,5 +1142,51 @@ mod tests {
         tokio::fs::remove_dir_all(&root)
             .await
             .expect("remove temporary managed repo root");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn staged_path_never_follows_a_symlink_to_a_sibling() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "forge-project-delete-symlink-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let other_project = root.join("other-project-workspace");
+        let candidate = root.join("task-owned-by-deleted-project");
+        tokio::fs::create_dir_all(&other_project)
+            .await
+            .expect("sibling workspace fixture");
+        tokio::fs::write(other_project.join("tracked"), b"preserved")
+            .await
+            .expect("sibling workspace content");
+        symlink(&other_project, &candidate).expect("symlink fixture");
+        let canonical_root = tokio::fs::canonicalize(&root)
+            .await
+            .expect("canonical workspace root");
+        let mut staged = Vec::new();
+        let mut seen = HashSet::new();
+
+        stage_direct_child(
+            &canonical_root,
+            &candidate,
+            &mut staged,
+            &mut seen,
+            "Task workspace",
+        )
+        .await
+        .expect("symlink candidate is safely ignored");
+
+        assert!(staged.is_empty());
+        assert!(candidate
+            .symlink_metadata()
+            .expect("candidate symlink remains")
+            .file_type()
+            .is_symlink());
+        assert!(other_project.join("tracked").is_file());
+        tokio::fs::remove_dir_all(&root)
+            .await
+            .expect("remove temporary workspace root");
     }
 }

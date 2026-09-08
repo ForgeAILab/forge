@@ -194,7 +194,7 @@ impl ProviderAuthorizationService {
                     AgentProviderId::Gemini,
                     "Google Gemini",
                     Some("https://generativelanguage.googleapis.com/v1beta"),
-                    Some("gemini-2.5-pro"),
+                    Some("gemini-3.1-pro-preview"),
                     true,
                     vec![
                         method(AgentProviderId::Gemini, ProviderCredentialMethod::ApiKey, "Use Gemini API key", ProviderSupportLevel::Stable, true, None, None),
@@ -1764,6 +1764,15 @@ mod tests {
             method.method == ProviderCredentialMethod::DeviceOauth
                 && method.support_level == ProviderSupportLevel::Experimental
         }));
+        let gemini = registry
+            .items
+            .iter()
+            .find(|item| item.provider == AgentProviderId::Gemini)
+            .expect("Gemini capability exists");
+        assert_eq!(
+            gemini.default_model.as_deref(),
+            Some("gemini-3.1-pro-preview")
+        );
         assert_eq!(
             service
                 .validate_redirect_origin("http://localhost:5173", true, None)

@@ -32,6 +32,36 @@ async fn create_task_rejects_unknown_task_type_before_persistence() {
 }
 
 #[tokio::test]
+async fn create_task_rejects_charter_requirements_on_discovery_before_persistence() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+
+    let error = service
+        .create_task(
+            project_id,
+            "Discovery with implementation scope",
+            None,
+            None,
+            None,
+            Some("discovery".to_owned()),
+            Some(
+                r#"{"review":{"requirement_ids":["charter-r1:/scope/required_deliverables/0"]}}"#
+                    .to_owned(),
+            ),
+            None,
+            None,
+        )
+        .await
+        .expect_err("discovery requirements must be rejected by the service boundary");
+
+    assert!(error
+        .to_string()
+        .contains("discovery Tasks cannot own Charter review requirements"));
+}
+
+#[tokio::test]
 async fn transition_allows_user_move_for_root_managed_subtask() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));

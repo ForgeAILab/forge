@@ -62,6 +62,11 @@ The `db` crate defines async traits (`TaskRepo`, `AgentRepo`, …) in
 
 ### AppState wiring
 
+The server builds a multi-thread Tokio runtime with 16 MiB thread stacks to
+provide headroom for deeply nested Agent tool and recovery calls in debug
+builds. The recovery-to-re-execution future is boxed so it is stored on the
+heap rather than inline in the coordination-tool recovery future.
+
 `forge-cli/main.rs` passes
 `Arc<SqliteDb>`, `Arc<EventBus>`, the Forge agent host/backends, and background
 workers to `AppState`. The revised `AppState` constructs the Task,
@@ -313,6 +318,14 @@ deny-all filesystem access. Project Agent Task actions go through the existing
 `TaskService` and workflow; repository mutation remains limited to admitted
 Task Worker/reviewer executions in their Task Workspaces.
 
+Every native Task scope admitted for `task_read` receives both bounded UTF-8
+file reads and `forge_task_list`. The list tool enumerates at most 256 sorted
+direct children and may filter entry names with `*` and `?`; returned paths are
+workspace-relative and identify files, directories, symlinks, or other entries.
+A missing read is classified as `not_found`. Reading a directory returns a
+structured `is_directory` result with its bounded children, so path discovery
+does not depend on guessing filenames or interpreting an opaque I/O failure.
+
 Main Agent tools cover discovery, configured web search, Project lifecycle,
 bounded portfolio summaries, and explicit handoff. Main Agent sessions cannot
 create, edit, assign, transition, review, merge, or deliver Tasks. A Project
@@ -530,6 +543,11 @@ single visible user message and freezes `forge.main.project-discovery/v2` only
 after commit. Exact replay returns the committed receipt, while setup, active
 session, altered-key input, and internal failures stay structured for the
 baseline turn to handle.
+The immutable discovery instruction includes the server-generated active
+Genesis session ID. It never asks the model to infer the current session from
+Main Chat history, and it leaves the mutable optimistic version to typed reads
+so the frozen instruction cannot advertise a stale version. The turn loader
+adds the same binding to historical active instructions that do not contain it.
 
 Product Genesis uses the server-owned `forge.main.project-discovery/v2` skill
 only while its Genesis session is `discovering` or `ready_for_project`. It asks
@@ -690,7 +708,13 @@ from the Project's current approved Charter. The approved Charter makes a reposi
 Task runnable; optional plan-item, milestone, and Document references add
 immutable traceability only. `planning_task` and
 `discovery` use a read-only repository capability, while implementation Tasks
-use the write capability selected by their workflow and assignment.
+use the write capability selected by their workflow and assignment. Prompt
+selection uses that same execution classification: a discovery/planning Task
+dispatched through a workflow role named coder or worker receives the read-only
+investigation contract, which asks for findings and an unchanged worktree rather
+than implementation and a commit. That classification also suppresses inherited
+implementation `ci_steps` during review. A read-only Task can still carry an
+explicit requirement-linked conformance check designed for its research output.
 
 #### Milestones, readiness, and immutable releases
 
@@ -953,6 +977,16 @@ adapter calls `TaskService` directly, so no `AgentAction` or
 receipt/event identity, source and affected Task ids, board revision, and
 `replayed`; receipt-first exact replay bypasses mutable governance checks,
 while a new command is authorized and validated inside the shared transaction.
+A ReadyOnly Project Agent may also invoke `task.cancel` for any non-terminal
+Task in its bound Project, including healthy queued or running work. The closed
+payload carries `action: "cancel"`, the Task id, its exact version, and a
+reason. The adapter derives Project and actor authority, TaskService verifies
+the current Project Agent binding and Project ownership, then the ordinary
+cancellation path stops active executions and transitions to the workflow's
+cancellation state. Agent actors may traverse a system-triggered edge only
+when its target is that declared cancellation state; all other system-only
+edges remain unavailable. An already-cancelled retry is an outcome-idempotent
+success, while a changed non-terminal Task returns its current version.
 A Project's coordination/chat state, repository setup, and execution projection remain
 independent projections. Each setup response carries per-dimension freshness;
 an unavailable source is returned with a bounded retry action and never
@@ -972,11 +1006,16 @@ Project-owned immutable graph in dependency order — including Project/Task/
 Project-Chat LCM timelines, entries, operations, and nodes — and then the
 Project itself; the database permits those deletes only while the exact Project
 deletion guard is active. The API first stages Forge-managed repositories that
-are direct children of `<workspace_root>/repos`, restores them if the database
-transaction fails, and removes them after commit. Arbitrary linked repositories
-outside that root are never removed. Direct attempts to mutate or delete an
+are direct children of `<workspace_root>/repos`, each repository's managed
+cache under `<workspace_root>/.repos/<repo_id>`, each Project Task's
+direct-child worktree directory, and the Project Agent directory at
+`<data_dir>/projects/<project_id>`. It restores all staged paths if the database
+transaction fails and removes them after commit. Arbitrary linked repositories
+outside Forge-controlled roots are never removed. Direct attempts to mutate or delete an
 individual immutable Charter, milestone, readiness, release, decision,
-lease, or evidence record remain rejected.
+lease, evidence, review-contract, or review-assessment record remain rejected.
+V134 rebuilds the V132 conformance foreign keys and delete guards without losing
+rows, allowing those review records to cascade only during parent teardown.
 
 ### Direct Agent Runtime host and LCM
 
@@ -1640,6 +1679,9 @@ only when a role/agent is assigned. Override transitions are audited as
 `triggered_by = "user:override:<source>"` (e.g. `user:override:api`). This is
 separate from `manual_override_transition`, a system-triggered primitive with
 `skip_before_exit=true` used by `TaskService::advance_to_next_state`.
+An authenticated Project Agent cancellation is narrower: `task.cancel` may
+cross a system-triggered edge only when the destination is the workflow's
+declared cancellation state. It receives no general routing override.
 
 Hook audience filtering is uniform across phases. `HookAudience::All` always
 runs. `AgentOnly` runs when `triggered_by` starts with `"agent:"` or equals
@@ -1659,6 +1701,12 @@ retains role assignments but does not launch an executor from the move itself
 later reaches a dispatchable state. AI execution remains gated separately:
 initial role dispatch and interactive launch both run dependency checks before
 creating an execution.
+
+Dependency cancellation is a durable state, not a transient guard result. When
+a prerequisite reaches the workflow's cancellation state, Forge projects a
+typed blocker onto every unfinished dependent. New links to cancelled Tasks are
+rejected, and removing the last cancelled prerequisite clears the matching
+blocker so scheduling can resume.
 
 Cancellation is implicit from any non-terminal state to
 `workflow.cancellation_state` (or terminal `"cancelled"` if unset), even
@@ -1715,6 +1763,18 @@ Audit-log derived. Gate states may set `gate_config.max_rejections`;
 `rejection = true`, then cascades to `blocked` when exhausted. Generic
 user-triggered gate-to-active bounces are logged with `rejection = false` and
 do not consume budget.
+
+When a reviewer execution fails, Forge first schedules the next bounded execution
+retry and keeps the Review running. Once retries are exhausted or disabled it
+records the same durable task blocker and recovery annotation used for worker
+execution failures. Startup recovery, daemon disconnect, heartbeat expiry, and
+workspace-lease reaping all enter this settlement path. The periodic dispatcher
+also reconciles a terminal reviewer execution when its completion event was lost,
+including the narrow crash window where the Review row was finalized before the
+Task cascade committed. The Task remains in review with explicit recovery actions;
+an execution failure does not count as a reviewer verdict rejecting the work.
+`resume_session` is exposed only when the stopped execution has a session/config
+snapshot and its agent still owns the exact Task role.
 
 ### Crash recovery
 
@@ -1896,8 +1956,14 @@ React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses
   lease/deadline expiry plus separate semantic-progress warnings),
   `DaemonMonitor`, Agent Chat turn workers, durable event consumers, Attention
   projection, and `WorkspaceCleanupScheduler`.
-- **review** — `ReviewRunner` runs `task.review_config.ci_steps` as `bash -lc`
-  commands in the worktree; empty steps auto-pass. Creates a `reviewer`-role
+- **review** — `ReviewRunner` prepares a detached clean checkout by running
+  `task.review_config.setup_steps`, then runs `ci_steps` as `bash -lc` commands.
+  Task configuration overrides the Project's `default_review_config`; otherwise
+  the Project defaults are inherited. A ready Project Agent can replace both
+  default lists through the versioned, receipt-atomic `project.review_config`
+  command and reads them from `project.current_state`. Discovery, planning, and
+  explicitly read-only Tasks suppress both implementation lists. Empty steps
+  auto-pass; setup failure stops checks and is retained separately. Creates a `reviewer`-role
   execution sharing the executor's workspace, with the same owner heartbeat,
   semantic-progress, hard-deadline, and terminal-CAS contract as Task
   execution. Depends only on `db`, `events`, `executors` — not on `api` or
@@ -1966,3 +2032,104 @@ candidate route instead of a single adapter:
 - **config** — `ForgeConfig` with precedence: CLI flags > env vars > config
   file > defaults. Default bind uses loopback with an OS-selected port, then
   persists the selected port under the Forge data directory.
+
+### Charter conformance at review
+
+The shared `review::contract` resolver reads the exact approved Project-owned
+Charter, its digest, Task governance reference, Task acceptance/plan, linked
+Document revisions, workflow, review assignment, and effective check policy.
+Missing, mismatched, or oversized governing context fails admission visibly.
+Workers, merge-fix workers, previews, and reviewer dispatch receive this context
+outside configurable prompt overrides. Native and CLI launches use the same final
+assembly. A model reviewer receives the response instruction and frozen contract
+exactly once, and admission rejects a final prompt above 192 KiB. Shell commands
+receive JSON as safely quoted `FORGE_GOVERNING_CONTEXT` and
+`FORGE_REVIEW_CONTRACT` exports, so context prose is never executed as shell.
+Review admission requires server access to the candidate git objects; an
+inaccessible remote worktree fails admission rather than receiving an unverifiable
+contract.
+
+Before an agent review launches, Forge freezes an execution-specific contract
+with Task-scoped requirement IDs, checks, completed pre-review CI results,
+candidate commit and target commit. A result includes its `ci:N` check ID,
+exact command, exit code, and bounded output, so the reviewer can use the
+already-recorded outcome as check evidence instead of inferring success from a
+configured command. Missing required pre-review CI results fail admission.
+Migration V132 adds immutable contracts/assessments without rewriting historical
+outcomes. Every Task review includes `task:acceptance`, acceptance material from
+its linked Documents, and the Charter's explicit non-goals/non-claims as
+universal Project boundaries. Other Charter requirements enter the Task scope
+only when `ReviewConfig.requirement_ids`, a
+requirement-linked conformance check, or an authoritative allocation selects them.
+Every Project Agent/REST Task proposal must make that ownership decision
+explicitly through `review_requirement_ids`, including `[]` for no owned
+non-universal requirement. A versioned Task update may replace the list with the
+same current-Charter validation and invalidates any prior review acceptance.
+The contract records the count and digest of the other Project requirements as
+deferred. Those requirements remain integrated milestone-readiness obligations;
+an early Task is never failed merely because later Project work does not exist yet.
+
+Policy `forge.review-conformance/2` requires one JSON assessment. Unknown or
+duplicate IDs, contradictory verdicts, old verdict markers, and unsupported PASS
+evidence cannot grant acceptance. Structurally valid partial assessments are
+retained and omissions make conformance `unverified`, so the report cannot pass
+but useful findings survive. Universal Project boundaries cannot be allocated
+away. A violated requirement or blocking finding may have no positive
+file citation when it describes an absence; its rationale must state what was
+inspected. `unverified` represents insufficient proof and can never support PASS.
+
+Forge separates protocol failure from review failure. A response that cannot be
+bound structurally to its frozen contract uses the bounded execution retry budget
+and eventually creates a durable execution blocker. Once a structurally bound
+assessment is available, Forge preserves it even when it is partial or contains
+violations, unverified requirements, or invalid citations. That result becomes a
+normal failed review and follows the
+review-remediation budget instead of re-running the reviewer as though its process
+had failed. Each native reviewer attempt starts with an empty conversation and no
+Task LCM/checkpoint persistence, so a retry cannot accumulate the previous full
+contract and report. Worker and planner Task continuity remains persistent.
+
+Configured `setup_steps` run first in a detached clean checkout of the frozen
+candidate, followed by required checks, with a 120-second timeout and bounded
+output per command. Setup prepares dependencies but never satisfies a requirement;
+failure is recorded separately and stops the checks. Forge records actual exit
+codes independently of model output and reruns required checks before accepting
+the assessment, even when the reviewer cited a frozen pre-review result. Changed
+tracked content, a citation whose
+start line does not exist, and stale Charter/Task/check inputs make conformance
+unverified while retaining a structurally valid assessment. A citation end line
+may overshoot EOF because its existing start line still identifies real content.
+A real file citation is not proof that the reviewer interpreted its contents
+correctly. Natural-language Charter text never becomes an executable command;
+product-specific deterministic checks must be configured explicitly.
+
+The frozen Task source includes bounded worklog comments and active attached
+media metadata, giving read-only discovery Tasks a reviewable deliverable sink.
+Such Tasks own no implementation requirement IDs. Execution setup counts an
+implementation commit only when a non-reviewer execution changes `before_sha` to
+a different `after_sha`; the repository's unchanged base commit is not evidence
+of implementation.
+
+Acceptance rechecks source provenance inside the SQLite write transaction.
+Direct integration holds the authority write lock during the local git operation,
+compares source and target commits, fast-forwards only the immutable reviewed
+object, and checks the resulting head. Divergence enters bounded merge repair;
+changed content must receive a new semantic review, regardless of
+`review_passed_at`. PR publication pushes the immutable reviewed object and
+rechecks authority; the external provider's final merge remains a human/provider
+operation. Explicit human and no-agent-review workflows remain separate and
+cannot manufacture an automated Charter assessment.
+
+The manual review-rerun endpoint consumes the same result categories as automatic
+review completion. Passed reruns cascade into merging, failed reruns use the
+review-remediation budget and target, and human-required passes remain in review
+as `awaiting_human`; the endpoint returns the Task after that workflow work has
+settled.
+
+Review outcome and conformance are separate projections. Old PASS/done records
+are retained with `not_assessed`; CI-only and manual reviews also lack automated
+Charter evidence. New in-flight executions without a contract cannot grant
+conformance acceptance, and old unmerged agent-review PASS requires a fresh
+review before integration. A stored pass under an obsolete conformance policy also
+requires a fresh review. Task workflow states and historical release records are
+unchanged.

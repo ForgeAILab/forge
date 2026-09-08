@@ -722,15 +722,19 @@ fn compute_blocker_digest(
 }
 
 /// Canonical attempt/execution/commit evidence for one Task (D17, F12).
-/// `has_commit` follows the same `after_sha.is_some()` convention used
-/// elsewhere in this codebase to detect committed execution results.
+/// A checkout reports its starting SHA even when it makes no repository
+/// change. Count implementation evidence only when a non-review execution
+/// actually advanced that SHA.
 async fn task_execution_evidence(db: &SqliteDb, task_id: &str) -> Result<ExecutionEvidenceSummary> {
     let row = sqlx::query(
         "SELECT
              COUNT(*) AS execution_count,
              SUM(CASE WHEN role != 'reviewer' THEN 1 ELSE 0 END) AS attempt_count,
              (SELECT after_sha FROM execution
-                WHERE task_id = ? AND after_sha IS NOT NULL
+                WHERE task_id = ?
+                  AND role != 'reviewer'
+                  AND after_sha IS NOT NULL
+                  AND COALESCE(before_sha, '') != after_sha
                 ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_commit_sha
          FROM execution WHERE task_id = ?",
     )

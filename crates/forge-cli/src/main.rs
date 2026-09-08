@@ -12,6 +12,9 @@ use tracing_subscriber::EnvFilter;
 
 const DEFAULT_LOG_FILTER: &str = "forge=info,forge_cli=info,api=info,services=info,review=info,cli_adapters=info,executors=info,db=warn,tower_http=info,sqlx=warn";
 const SERVER_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+// Agent tools can synchronously poll deep recovery/workspace futures, especially
+// in debug builds. Give runtime threads headroom beyond Tokio's default stack.
+const RUNTIME_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 #[derive(Parser)]
 #[command(
@@ -32,8 +35,16 @@ struct Cli {
     data_dir: Option<PathBuf>,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(RUNTIME_THREAD_STACK_SIZE)
+        .enable_all()
+        .build()
+        .expect("Failed to build Forge runtime")
+        .block_on(run());
+}
+
+async fn run() {
     let cli = Cli::parse();
     let config = ForgeConfig::load(
         None,

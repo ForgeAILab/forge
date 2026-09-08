@@ -161,6 +161,14 @@ impl TaskService {
             return Ok(());
         }
 
+        let cancelled = self
+            .cancelled_dependency_ids(task, &unsatisfied_dependencies)
+            .await?;
+        if !cancelled.is_empty() {
+            self.block_cancelled_dependencies(task, &cancelled).await?;
+            return Err(ServiceError::DependencyGate);
+        }
+
         for depends_on_id in &unsatisfied_dependencies {
             let page = ExecutionRepo::list_by_task(
                 &*self.db,

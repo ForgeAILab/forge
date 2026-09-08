@@ -41,8 +41,9 @@ use forge_agent_host::{
     PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
     PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_OBSERVATIONS_OPERATION,
     PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION, PROJECT_SKILL_SECTION_OPERATION,
-    PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_EVIDENCE_OPERATION,
-    TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION,
+    PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION, TASK_CANCEL_OPERATION,
+    TASK_EVIDENCE_OPERATION, TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION,
+    TASK_WORKLOG_OPERATION,
 };
 use reqwest::header::ACCEPT;
 use serde::Deserialize;
@@ -120,6 +121,28 @@ struct TaskReviewPayload {
 enum TaskReviewDecision {
     Accept,
     Reject,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum TaskCancelPayload {
+    Cancel {
+        task_id: String,
+        expected_task_version: i64,
+        reason: String,
+    },
+}
+
+impl TaskCancelPayload {
+    fn into_parts(self) -> (String, i64, String) {
+        match self {
+            Self::Cancel {
+                task_id,
+                expected_task_version,
+                reason,
+            } => (task_id, expected_task_version, reason),
+        }
+    }
 }
 
 impl AdaptiveTaskPayload {
@@ -451,7 +474,7 @@ impl CoordinationToolProvider {
             .unwrap_or(20)
             .clamp(1, 50) as i64;
         match operation {
-            "work.read" => self.read_work(scope, limit).await,
+            "work.read" => self.read_work(actor_identity_id, scope, limit).await,
             "events.read" => self.read_events(scope, limit).await,
             "inbox.read" => self.read_inbox(actor_identity_id, scope, limit).await,
             "commitments.read" => self.read_commitments(actor_identity_id, scope, limit).await,
@@ -1272,7 +1295,7 @@ impl CoordinationToolProvider {
         let row = sqlx::query(
             "SELECT c.id AS charter_id, c.project_mode, c.version AS charter_version,
                     r.id AS revision_id, r.revision, r.content_digest, r.rendered_digest,
-                    r.rendered_view
+                    r.rendered_view, r.content_json
              FROM project_charter AS c
              JOIN project_charter_revision AS r
                ON r.id = c.current_approved_revision_id AND r.lifecycle = 'approved'
@@ -1285,16 +1308,41 @@ impl CoordinationToolProvider {
         .ok_or_else(|| {
             AgentHostError::Authority("the bound Project has no approved Charter".to_owned())
         })?;
+        let revision_id = row.try_get::<String, _>("revision_id").unwrap_or_default();
+        // The rendered Charter is prose; `review_requirement_ids` on a Task
+        // proposal are exact `<revision_id>:<JSON Pointer>` strings. Without
+        // the catalog the Agent has to guess array indices, and every guess is
+        // rejected as an unknown requirement ID — which blocks Task creation
+        // outright now that the field is required. Universal requirements are
+        // omitted: they already apply to every Task and naming one is an error.
+        let selectable_requirements = row
+            .try_get::<String, _>("content_json")
+            .ok()
+            .and_then(|content| {
+                serde_json::from_str::<api_types::ProjectCharterContent>(&content).ok()
+            })
+            .and_then(|charter| {
+                ::review::contract::charter_requirements(&revision_id, &charter).ok()
+            })
+            .map(|requirements| {
+                requirements
+                    .into_iter()
+                    .filter(|requirement| !requirement.universal)
+                    .map(|requirement| json!({"id": requirement.id, "text": requirement.text}))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         Ok(json!({
             "scope": {"type": "project", "id": project_id},
             "charter_id": row.try_get::<String, _>("charter_id").unwrap_or_default(),
-            "revision_id": row.try_get::<String, _>("revision_id").unwrap_or_default(),
+            "revision_id": revision_id,
             "revision": row.try_get::<i64, _>("revision").unwrap_or_default(),
             "charter_version": row.try_get::<i64, _>("charter_version").unwrap_or_default(),
             "project_mode": row.try_get::<String, _>("project_mode").unwrap_or_default(),
             "content_digest": row.try_get::<String, _>("content_digest").unwrap_or_default(),
             "render_digest": row.try_get::<String, _>("rendered_digest").unwrap_or_default(),
             "rendered_markdown": row.try_get::<String, _>("rendered_view").unwrap_or_default(),
+            "selectable_review_requirements": selectable_requirements,
         }))
     }
 
@@ -1402,19 +1450,39 @@ impl CoordinationToolProvider {
         }))
     }
 
-    async fn read_work(&self, scope: &CanonicalScope, limit: i64) -> Result<Value, AgentHostError> {
-        let rows = match scope.scope_type {
-            CanonicalScopeType::Project => sqlx::query(
-                "SELECT id, title, status, priority, assignee_type, assignee_id
+    async fn read_work(
+        &self,
+        actor_identity_id: &str,
+        scope: &CanonicalScope,
+        limit: i64,
+    ) -> Result<Value, AgentHostError> {
+        // A Project Agent works from its Chat scope, so resolve that binding to
+        // the Project whose Tasks it proposes; reading them is how it avoids
+        // proposing the same work twice.
+        let project_scope_id = match scope.scope_type {
+            CanonicalScopeType::Project => Some(scope.scope_id.clone()),
+            CanonicalScopeType::AgentChat => Some(
+                self.authorization
+                    .project_orchestration_target(actor_identity_id, scope)
+                    .await
+                    .map_err(native_scope_error)?,
+            ),
+            _ => None,
+        };
+        let rows = match (scope.scope_type, project_scope_id.as_deref()) {
+            (CanonicalScopeType::Project | CanonicalScopeType::AgentChat, Some(project_id)) => {
+                sqlx::query(
+                    "SELECT id, title, status, priority, assignee_type, assignee_id
                      FROM task WHERE project_id = ? AND deleted_at IS NULL
                      ORDER BY updated_at DESC, id DESC LIMIT ?",
-            )
-            .bind(&scope.scope_id)
-            .bind(limit)
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(|_| AgentHostError::ProtectedPersistence)?,
-            CanonicalScopeType::Task => sqlx::query(
+                )
+                .bind(project_id)
+                .bind(limit)
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(|_| AgentHostError::ProtectedPersistence)?
+            }
+            (CanonicalScopeType::Task, _) => sqlx::query(
                 "SELECT id, title, status, priority, assignee_type, assignee_id
                      FROM task WHERE id = ? AND deleted_at IS NULL LIMIT 1",
             )
@@ -1428,16 +1496,47 @@ impl CoordinationToolProvider {
                 ));
             }
         };
+        let ids = rows
+            .iter()
+            .filter_map(|row| row.try_get::<String, _>("id").ok())
+            .collect::<Vec<_>>();
+        // Dependencies are what distinguish a wired chain from stray Tasks, so
+        // the reader that reconciles work has to see the edges, not just rows.
+        let mut dependencies: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        if !ids.is_empty() {
+            let placeholders = vec!["?"; ids.len()].join(", ");
+            let sql = format!(
+                "SELECT task_id, depends_on_id FROM task_dependency
+                 WHERE task_id IN ({placeholders}) ORDER BY task_id, depends_on_id"
+            );
+            let mut query = sqlx::query(&sql);
+            for id in &ids {
+                query = query.bind(id);
+            }
+            for row in query
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(|_| AgentHostError::ProtectedPersistence)?
+            {
+                let task_id: String = row.try_get("task_id").unwrap_or_default();
+                let depends_on: String = row.try_get("depends_on_id").unwrap_or_default();
+                dependencies.entry(task_id).or_default().push(depends_on);
+            }
+        }
         let items = rows
             .into_iter()
             .map(|row| {
+                let id = row.try_get::<String, _>("id").unwrap_or_default();
+                let depends_on = dependencies.remove(&id).unwrap_or_default();
                 json!({
-                    "id": row.try_get::<String, _>("id").unwrap_or_default(),
+                    "id": id,
                     "title": row.try_get::<String, _>("title").unwrap_or_default(),
                     "status": row.try_get::<String, _>("status").unwrap_or_default(),
                     "priority": row.try_get::<i64, _>("priority").unwrap_or_default(),
                     "assignee_type": row.try_get::<Option<String>, _>("assignee_type").ok().flatten(),
                     "assignee_id": row.try_get::<Option<String>, _>("assignee_id").ok().flatten(),
+                    "depends_on": depends_on,
                 })
             })
             .collect::<Vec<_>>();
@@ -1703,6 +1802,7 @@ impl CoordinationToolProvider {
             let target_id = if operation == TASK_PROPOSE_OPERATION
                 || operation == TASK_ADAPTIVE_OPERATION
                 || operation == TASK_REVIEW_OPERATION
+                || operation == TASK_CANCEL_OPERATION
                 || operation == TASK_RECOVER_OPERATION
                 || forge_agent_host::is_project_orchestration_operation(operation)
             {
@@ -2061,7 +2161,13 @@ impl CoordinationToolProvider {
             .await
             .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
             if owns_task.is_none() {
-                return Err(AgentHostError::Authority(
+                // A task_id that resolves to nothing in this Project is a
+                // mistyped or stale argument, not a refused authority. Raising
+                // it as Authority rendered a non-retryable `policy_denied`
+                // telling the Agent to seek reauthorization, so a single
+                // transposed character in a UUID read as "recovery is denied
+                // to your scope" and stalled the Project on a false blocker.
+                return Err(invalid_arguments(
                     "task_id must name a Task in this Project".to_owned(),
                 ));
             }
@@ -2103,6 +2209,66 @@ impl CoordinationToolProvider {
                 "correlation_id": correlation_id,
                 "task_id": task.id,
                 "task_status": task.status,
+                "requires_user_authorization": false,
+            }));
+        }
+
+        if operation == TASK_CANCEL_OPERATION {
+            let Some(task_service) = self.task_service_handle() else {
+                return Err(AgentHostError::Configuration(
+                    "Task cancellation execution is not wired to a TaskService".to_owned(),
+                ));
+            };
+            let project_id = target_id.ok_or_else(|| {
+                AgentHostError::Authority(
+                    "Task cancellation command has no server-derived Project target".to_owned(),
+                )
+            })?;
+            let payload: TaskCancelPayload =
+                typed_command_payload(operation, scope, &correlation_id, payload)?;
+            let (task_id, expected_task_version, reason) = payload.into_parts();
+            let (policy_result, policy_reason) = self
+                .actions
+                .evaluate_direct_command_policy(
+                    actor_identity_id,
+                    scope_type_name(scope.scope_type),
+                    &scope.scope_id,
+                    requested_permission,
+                    operation,
+                    None,
+                )
+                .await
+                .map_err(service_error)?;
+            if !matches!(policy_result, AgentActionPolicyResult::Allowed) {
+                tracing::warn!(
+                    operation,
+                    diagnostic = policy_reason.as_deref().unwrap_or("no reason recorded"),
+                    "Task cancellation command policy denied"
+                );
+                return Err(AgentHostError::Authority(
+                    "Task cancellation command policy did not admit execution".to_owned(),
+                ));
+            }
+            let result = task_service
+                .perform_project_agent_cancel(
+                    &project_id,
+                    task_id,
+                    reason,
+                    expected_task_version,
+                    actor_identity_id,
+                )
+                .await
+                .map_err(service_error)?;
+            return Ok(json!({
+                "operation": operation,
+                "status": "succeeded",
+                "replayed": false,
+                "materialized": true,
+                "domain_committed": true,
+                "correlation_id": correlation_id,
+                "task_id": result.task.id,
+                "task_status": result.task.status,
+                "task_version": result.task.version,
                 "requires_user_authorization": false,
             }));
         }
@@ -3399,6 +3565,7 @@ fn retry_for_current(operation: &str, current: &CurrentVersionOrRevision) -> Ret
     if let Some(version) = current.version {
         let field = match operation {
             _ if current.resource_type == "project" => "expected_project_version",
+            TASK_CANCEL_OPERATION => "expected_task_version",
             PROJECT_DOCUMENT_OPERATION => "expected_document_version",
             PROJECT_MILESTONE_OPERATION
             | PROJECT_EVIDENCE_OPERATION
@@ -3675,6 +3842,14 @@ fn validate_proposal_payload(operation: &str, payload: &Value) -> Result<(), Age
         serde_json::from_value::<TaskReviewPayload>(payload.clone()).map_err(|_| {
             AgentHostError::Authority(
                 "Task review payload must contain an exact task, version, and accept/reject decision"
+                    .to_owned(),
+            )
+        })?;
+    }
+    if operation == TASK_CANCEL_OPERATION {
+        serde_json::from_value::<TaskCancelPayload>(payload.clone()).map_err(|_| {
+            AgentHostError::Authority(
+                "Task cancellation payload must contain cancel, an exact Task version, and a non-empty reason"
                     .to_owned(),
             )
         })?;
@@ -4111,6 +4286,22 @@ mod tests {
                 );
             }
             other => panic!("argument rejections must be structured, got {other:?}"),
+        }
+
+        // A task_id naming no Task in this Project is the same class of
+        // mistake. Raising it as an authority refusal told the Agent its
+        // scope had been denied recovery, so one transposed character in a
+        // UUID stalled a Project behind a blocker that did not exist.
+        let unresolved = invalid_arguments("task_id must name a Task in this Project".to_owned());
+        match unresolved {
+            AgentHostError::StructuredOutcome(outcome) => {
+                assert_eq!(outcome.code, OutcomeCode::ValidationError);
+                assert_eq!(
+                    outcome.retry.as_ref().map(|retry| retry.action),
+                    Some(RetryAction::CorrectInput)
+                );
+            }
+            other => panic!("an unresolved task_id must be correctable, got {other:?}"),
         }
     }
 

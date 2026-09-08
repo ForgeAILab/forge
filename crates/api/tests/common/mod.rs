@@ -111,6 +111,103 @@ pub fn setup_git_repo(root: &Path) -> PathBuf {
     repo_path
 }
 
+const FROZEN_REVIEW_CONTRACT_PREFIX: &str = "Frozen review contract:\n";
+
+pub fn is_conformance_review_prompt(description: &str) -> bool {
+    description.contains(FROZEN_REVIEW_CONTRACT_PREFIX)
+}
+
+fn review_contract_from_prompt(description: &str) -> api_types::ReviewContract {
+    let (_, contract) = description
+        .rsplit_once(FROZEN_REVIEW_CONTRACT_PREFIX)
+        .expect("review prompt carries a frozen contract");
+    serde_json::from_str(contract.trim()).expect("frozen review contract JSON")
+}
+
+pub fn passing_review_assessment(description: &str, worktree_path: &Path) -> String {
+    let contract = review_contract_from_prompt(description);
+    passing_review_assessment_for_contract(contract, worktree_path)
+}
+
+pub fn passing_review_assessment_for_contract(
+    contract: api_types::ReviewContract,
+    worktree_path: &Path,
+) -> String {
+    let evidence_path = first_text_file_at_commit(worktree_path, &contract.commit_sha);
+    let evidence = api_types::ReviewEvidenceRef::File {
+        path: evidence_path,
+        commit_sha: contract.commit_sha.clone(),
+        start_line: 1,
+        end_line: 1,
+    };
+    serde_json::to_string(&api_types::ReviewAssessment {
+        contract_digest: contract.digest,
+        verdict: api_types::ConformanceVerdict::Pass,
+        requirements: contract
+            .context
+            .requirements
+            .into_iter()
+            .map(|requirement| api_types::RequirementAssessment {
+                requirement_id: requirement.id,
+                disposition: api_types::RequirementDisposition::Satisfied,
+                rationale:
+                    "The test fixture verified the scoped implementation at the reviewed commit"
+                        .to_owned(),
+                evidence: vec![evidence.clone()],
+            })
+            .collect(),
+        findings: Vec::new(),
+    })
+    .expect("passing review assessment JSON")
+}
+
+pub fn failing_review_assessment(description: &str, reason: &str) -> String {
+    let contract = review_contract_from_prompt(description);
+    serde_json::to_string(&api_types::ReviewAssessment {
+        contract_digest: contract.digest,
+        verdict: api_types::ConformanceVerdict::Fail,
+        requirements: contract
+            .context
+            .requirements
+            .into_iter()
+            .map(|requirement| api_types::RequirementAssessment {
+                requirement_id: requirement.id,
+                disposition: api_types::RequirementDisposition::Violated,
+                rationale: reason.to_owned(),
+                evidence: Vec::new(),
+            })
+            .collect(),
+        findings: vec![api_types::ConformanceFinding {
+            blocking: true,
+            expected: "The Task-scoped review requirements are satisfied".to_owned(),
+            actual: reason.to_owned(),
+            evidence: Vec::new(),
+        }],
+    })
+    .expect("failing review assessment JSON")
+}
+
+fn first_text_file_at_commit(worktree_path: &Path, commit_sha: &str) -> String {
+    let files = run_git(worktree_path, &["ls-tree", "-r", "--name-only", commit_sha]);
+    for relative in files.lines().filter(|path| !path.contains(':')) {
+        let spec = format!("{commit_sha}:{relative}");
+        let output = Command::new("git")
+            .args(["show", &spec])
+            .current_dir(worktree_path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .expect("read review evidence candidate");
+        if output.status.success()
+            && String::from_utf8(output.stdout).is_ok_and(|text| text.lines().next().is_some())
+        {
+            return relative.to_owned();
+        }
+    }
+    panic!("reviewed commit {commit_sha} has no nonempty UTF-8 file evidence")
+}
+
 pub async fn create_project_and_repo(
     app: &Router,
     name: &str,

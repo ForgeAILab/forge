@@ -288,6 +288,11 @@ fn forge_lcm_pressure_policy(request: &AgentTurnRequest) -> agent_runtime::lcm::
     }
 }
 
+fn persistent_runtime_for_turn(scope: &CanonicalScope, task_role: Option<&str>) -> bool {
+    !scope.is_ephemeral_inquiry()
+        && !(scope.scope_type == CanonicalScopeType::Task && task_role == Some("reviewer"))
+}
+
 impl fmt::Debug for NativeAgentRuntimeBackend {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -394,7 +399,12 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
         ));
         let provider = self.provider(&request)?;
         let model_id = ModelId::new(&request.provider.model);
-        let persistent = !binding.scope.is_ephemeral_inquiry();
+        // A reviewer attempt is a self-contained audit of one frozen contract.
+        // Reusing the Task's conversational LCM feeds the previous full
+        // contract and report back into each retry and can make the retry
+        // larger than the model context. Worker/planner continuity remains
+        // Task-scoped; reviewer attempts deliberately start clean.
+        let persistent = persistent_runtime_for_turn(&binding.scope, binding.task_role.as_deref());
         let mut lcm_link = None;
         let lcm = if persistent {
             let lcm_store = self
@@ -870,6 +880,18 @@ mod workspace_tests {
     use super::*;
     use crate::WorkspaceAccess;
     use agent_runtime::core::workspace::Workspace;
+
+    #[test]
+    fn reviewer_attempts_do_not_reuse_task_lcm_history() {
+        let task_scope = CanonicalScope {
+            scope_type: CanonicalScopeType::Task,
+            scope_id: "task-1".to_owned(),
+            workspace_access: WorkspaceAccess::TaskRead,
+        };
+        assert!(!persistent_runtime_for_turn(&task_scope, Some("reviewer")));
+        assert!(persistent_runtime_for_turn(&task_scope, Some("planner")));
+        assert!(persistent_runtime_for_turn(&task_scope, Some("worker")));
+    }
 
     #[test]
     fn task_workspace_is_component_bounded() {

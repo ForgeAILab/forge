@@ -364,6 +364,7 @@ fn task_arguments(key: &str) -> Value {
             "description": "A safe Project coordination task.",
             "task_type": "planning_task",
             "priority": 3,
+            "review_requirement_ids": [],
             "merge_config": null,
             "role_assignments": null,
             "governance": null

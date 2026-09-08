@@ -1,5 +1,7 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
-use std::{path::Path, sync::Arc};
+mod common;
+
+use std::sync::Arc;
 
 use api::{build_router, AppState};
 use api_types::{ProjectResponse, RepoResponse, TaskResponse};
@@ -29,19 +31,10 @@ async fn tasks_can_be_created_without_task_type() {
     assert_eq!(task.parent_task_id, None);
 }
 
-#[tokio::test]
-#[ignore = "CreateTaskRequest does not expose parent_task_id yet, so an API-level sub-task create assertion would fabricate a field the server currently ignores."]
-async fn subtasks_use_parent_task_id_field() {
-    assert!(
-        true,
-        "sub-task creation is ignored until parent_task_id is added to CreateTaskRequest"
-    );
-}
-
 struct Harness {
     app: Router,
     _state: Arc<AppState>,
-    _web_dist_dir: TestDir,
+    _web_dist_dir: common::TestDir,
 }
 
 async fn test_app() -> Harness {
@@ -61,7 +54,7 @@ async fn test_app() -> Harness {
         true,
         adapter_registry,
     ));
-    let web_dist_dir = TestDir::new("forge-task-type-web");
+    let web_dist_dir = common::TestDir::new("forge-task-type-web");
     std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>").expect("write index");
     let app = build_router((*state).clone(), web_dist_dir.path().to_path_buf());
     Harness {
@@ -146,19 +139,4 @@ fn test_jwt() -> String {
         &EncodingKey::from_secret(b"test-jwt-secret-for-development"),
     )
     .expect("encode test jwt")
-}
-
-struct TestDir {
-    path: std::path::PathBuf,
-}
-
-impl TestDir {
-    fn new(prefix: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).expect("temp dir creates");
-        Self { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
 }

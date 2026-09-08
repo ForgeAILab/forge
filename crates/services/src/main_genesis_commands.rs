@@ -305,6 +305,18 @@ impl MainGenesisCommandService {
             )
             .await?;
         let guarded = guard_agent_chat_content(&source.content)?;
+        if existing_receipt.is_none()
+            && matches!(
+                &input.principal,
+                MainGenesisStartPrincipal::MainAgent { .. }
+            )
+            && !has_explicit_genesis_intent(&guarded.content)
+        {
+            return Err(ServiceError::AuthorizationDenied {
+                message: "genesis.start requires an explicit user request to create or start a new Project"
+                    .to_owned(),
+            });
+        }
         // The guarded, server-derived source is canonical for both adapters.
         // Native payload text can therefore never replace the visible user
         // message that caused the control transfer.
@@ -408,6 +420,7 @@ impl MainGenesisCommandService {
         let prompt = render_product_genesis_prompt(
             maturity,
             &GenesisPromptContext {
+                genesis_session_id: Some(session_id.clone()),
                 initial_idea: Some(guarded.content.clone()),
                 ..GenesisPromptContext::default()
             },
@@ -1880,4 +1893,77 @@ fn required_value(field: &'static str, value: &str) -> Result<String> {
         )));
     }
     Ok(value.to_owned())
+}
+
+/// A native tool call is only a proposal; the leased user message remains the
+/// authority source. Require plain creation language so an accidental or
+/// hallucinated call during an unrelated Main turn cannot create a Genesis
+/// session that monopolizes later discovery.
+fn has_explicit_genesis_intent(content: &str) -> bool {
+    let normalized = content.to_lowercase();
+    if normalized.contains("product genesis") || normalized.contains("start genesis") {
+        return true;
+    }
+    let words = normalized
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    let has_creation = [
+        "build", "create", "launch", "make", "new", "scaffold", "start", "turn",
+    ]
+    .iter()
+    .any(|word| words.contains(word));
+    let has_product = [
+        "agent",
+        "api",
+        "app",
+        "application",
+        "bot",
+        "dashboard",
+        "extension",
+        "game",
+        "plugin",
+        "product",
+        "project",
+        "repo",
+        "repository",
+        "service",
+        "site",
+        "tool",
+        "website",
+    ]
+    .iter()
+    .any(|word| words.contains(word));
+    (has_creation && has_product)
+        || ((normalized.contains("创建")
+            || normalized.contains("新建")
+            || normalized.contains("启动"))
+            && (normalized.contains("项目")
+                || normalized.contains("產品")
+                || normalized.contains("产品")
+                || normalized.contains("应用")))
+}
+
+#[cfg(test)]
+mod genesis_intent_tests {
+    use super::has_explicit_genesis_intent;
+
+    #[test]
+    fn requires_creation_language_and_a_product_subject() {
+        for explicit in [
+            "Help me start a Project for calm incident reviews",
+            "Build a small app that tracks pantry stock",
+            "Turn this idea into a new product",
+            "开始创建一个新项目",
+        ] {
+            assert!(has_explicit_genesis_intent(explicit), "{explicit}");
+        }
+        for unrelated in [
+            "Reply with exactly: READY",
+            "What projects already exist?",
+            "Review the repository status",
+        ] {
+            assert!(!has_explicit_genesis_intent(unrelated), "{unrelated}");
+        }
+    }
 }

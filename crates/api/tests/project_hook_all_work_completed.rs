@@ -1,11 +1,7 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
+mod common;
 
-use std::{
-    collections::HashSet,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use api::{build_router, AppState};
 use api_types::{
@@ -164,7 +160,7 @@ struct Harness {
     app: Router,
     state: Arc<AppState>,
     hook_service_handle: tokio::task::JoinHandle<()>,
-    _web_dist_dir: TestDir,
+    _web_dist_dir: common::TestDir,
 }
 
 impl Drop for Harness {
@@ -193,7 +189,7 @@ async fn test_app() -> Harness {
     let hook_service_handle = Arc::clone(&state.project_hook_service).start();
     tokio::task::yield_now().await;
 
-    let web_dist_dir = TestDir::new("forge-project-hooks-web");
+    let web_dist_dir = common::TestDir::new("forge-project-hooks-web");
     std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>").expect("write index");
     let app = build_router((*state).clone(), web_dist_dir.path().to_path_buf());
 
@@ -546,26 +542,4 @@ fn test_jwt() -> String {
         &EncodingKey::from_secret(b"test-jwt-secret-for-development"),
     )
     .expect("encode test jwt")
-}
-
-struct TestDir {
-    path: PathBuf,
-}
-
-impl TestDir {
-    fn new(prefix: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).expect("temp dir creates");
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
 }

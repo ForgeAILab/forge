@@ -129,6 +129,96 @@ fn milestone_revision(
 }
 
 #[tokio::test]
+async fn the_first_milestone_becomes_the_projects_primary_outcome() {
+    // A `standard` Project's Agent creates the milestone itself. Leaving the
+    // pointer null left the Project with an active milestone and no primary,
+    // which turn admission rejects — before the Agent can run and fix it.
+    let db = database().await;
+    project(&db).await;
+
+    let before = ProjectRepo::get_by_id(&db, PROJECT_ID)
+        .await
+        .expect("project reads")
+        .expect("project exists");
+    assert_eq!(before.primary_milestone_id, None);
+
+    let create = CreateProjectMilestoneCommand {
+        milestone: CreateProjectMilestone {
+            id: "milestone-primary".to_owned(),
+            project_id: PROJECT_ID.to_owned(),
+            expected_project_version: before.version,
+            milestone_sequence: 1,
+            milestone_key: "M001".to_owned(),
+            display_label: Some("First milestone".to_owned()),
+            created_at: NOW.to_owned(),
+            updated_at: NOW.to_owned(),
+        },
+        revision: milestone_revision(
+            "milestone-primary-r1",
+            "milestone-primary",
+            1,
+            0,
+            None,
+            "draft",
+        ),
+        allocate_project_sequence: false,
+        check_definitions: Vec::new(),
+        command_receipt: None,
+        action_execution: None,
+    };
+    ProjectOrchestrationRepo::create_project_milestone_command(&db, create)
+        .await
+        .expect("milestone create command");
+
+    let adopted = ProjectRepo::get_by_id(&db, PROJECT_ID)
+        .await
+        .expect("project reads")
+        .expect("project exists");
+    assert_eq!(
+        adopted.primary_milestone_id.as_deref(),
+        Some("milestone-primary")
+    );
+
+    // A second milestone must not steal the pointer.
+    let second = CreateProjectMilestoneCommand {
+        milestone: CreateProjectMilestone {
+            id: "milestone-second".to_owned(),
+            project_id: PROJECT_ID.to_owned(),
+            expected_project_version: adopted.version,
+            milestone_sequence: 2,
+            milestone_key: "M002".to_owned(),
+            display_label: Some("Second milestone".to_owned()),
+            created_at: NOW.to_owned(),
+            updated_at: NOW.to_owned(),
+        },
+        revision: milestone_revision(
+            "milestone-second-r1",
+            "milestone-second",
+            1,
+            0,
+            None,
+            "draft",
+        ),
+        allocate_project_sequence: false,
+        check_definitions: Vec::new(),
+        command_receipt: None,
+        action_execution: None,
+    };
+    ProjectOrchestrationRepo::create_project_milestone_command(&db, second)
+        .await
+        .expect("second milestone create command");
+
+    let kept = ProjectRepo::get_by_id(&db, PROJECT_ID)
+        .await
+        .expect("project reads")
+        .expect("project exists");
+    assert_eq!(
+        kept.primary_milestone_id.as_deref(),
+        Some("milestone-primary")
+    );
+}
+
+#[tokio::test]
 async fn milestone_commands_commit_event_receipt_and_replay_exactly() {
     let db = database().await;
     project(&db).await;

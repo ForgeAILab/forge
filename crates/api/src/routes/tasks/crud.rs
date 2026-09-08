@@ -170,29 +170,7 @@ pub async fn update_task(
     Path(id): Path<String>,
     Json(request): Json<UpdateTaskRequest>,
 ) -> ApiResult<Json<TaskResponse>> {
-    TaskRepo::update(
-        &*state.db,
-        UpdateTask {
-            id: id.clone(),
-            expected_version: request.version,
-            title: request.title,
-            description: request.description.map(Some),
-            priority: request.priority,
-            merge_config: serialize_json(request.merge_config)?.map(Some),
-            plan: request.plan.map(Some),
-            error_annotation: None,
-            blocked_json: None,
-            failed_json: None,
-            task_state_config: serialize_json(request.task_state_config)?.map(Some),
-            parent_task_id: request.parent_task_id,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await?;
-
-    let task = TaskRepo::get_by_id(&*state.db, &id, false)
-        .await?
-        .ok_or_else(|| ApiError::not_found("task", id.clone()))?;
+    let task = state.task_service.update_task(id, request).await?;
     Ok(Json(task_response(&state.db, task).await?))
 }
 

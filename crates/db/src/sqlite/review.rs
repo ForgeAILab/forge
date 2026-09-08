@@ -37,6 +37,42 @@ impl ReviewRepo for SqliteDb {
             .map(map_review)
             .transpose()?
             .ok_or(DbError::NotFound)?;
+        let details: serde_json::Value =
+            serde_json::from_str(&step_results_json).map_err(|e| DbError::Check(e.to_string()))?;
+        if matches!(status, ReviewStatus::Passed | ReviewStatus::AwaitingHuman) {
+            if let Some(value) = details.get("conformance").filter(|v| !v.is_null()) {
+                let conformance: api_types::ReviewConformance =
+                    serde_json::from_value(value.clone())
+                        .map_err(|e| DbError::Check(e.to_string()))?;
+                if conformance.status == api_types::ConformanceStatus::Passed {
+                    let contract = conformance
+                        .contract
+                        .as_ref()
+                        .ok_or_else(|| DbError::Check("accepted review has no contract".into()))?;
+                    if contract.context.task_id != review.task_id {
+                        return Err(DbError::Check(
+                            "review contract belongs to another Task".into(),
+                        ));
+                    }
+                    crate::review_conformance::verify_review_source(&mut transaction, contract)
+                        .await?;
+                    let frozen: Option<String> = sqlx::query_scalar("SELECT conformance_json FROM execution_review_assessment WHERE execution_id = ?")
+                        .bind(&contract.execution_id).fetch_optional(&mut *transaction).await?;
+                    if frozen
+                        .as_deref()
+                        .map(serde_json::from_str::<api_types::ReviewConformance>)
+                        .transpose()
+                        .map_err(|e| DbError::Check(e.to_string()))?
+                        .as_ref()
+                        != Some(&conformance)
+                    {
+                        return Err(DbError::Check(
+                            "review conformance has no matching immutable assessment".into(),
+                        ));
+                    }
+                }
+            }
+        }
         if !review_transition_allowed(&review.status, &status) {
             return Err(DbError::InvalidTransition);
         }

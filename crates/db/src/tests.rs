@@ -6905,7 +6905,7 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
             ),
             (
                 "forge.project.orchestration/v1".to_owned(),
-                "forge.project.orchestration/v1@14".to_owned(),
+                "forge.project.orchestration/v1@15".to_owned(),
             ),
         ],
         "a seeded operating-skill revision must be repointed in the same release (V081 regression)"
@@ -6913,7 +6913,7 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
     let (body, digest): (String, String) = sqlx::query_as(
         "SELECT canonical_body, content_digest
          FROM operating_skill_revision
-         WHERE id = 'forge.project.orchestration/v1@14'",
+         WHERE id = 'forge.project.orchestration/v1@15'",
     )
     .fetch_one(db.pool())
     .await
@@ -6927,6 +6927,7 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
     assert!(body.contains("OPERATING DOCTRINE (on-demand skill sections)"));
     assert!(body.contains("skill.section"));
     assert!(body.contains("read `project.charter` and `project.current_state`"));
+    assert!(body.contains("cancel a non-terminal Task only through versioned `task.cancel`"));
     assert!(!body.contains("Evidence is mandatory proof, not optional decoration"));
     assert!(!body.contains("MILESTONES AND EVIDENCE"));
     assert_eq!(hex::encode(Sha256::digest(body.as_bytes())), digest);

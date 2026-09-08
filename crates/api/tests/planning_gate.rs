@@ -1,4 +1,6 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
+mod common;
+
 use std::{path::Path, sync::Arc, time::Duration};
 
 use api::{build_router, AppState};
@@ -41,7 +43,7 @@ async fn entering_planning_dispatches_assigned_planner_role() {
         StatusCode::OK,
     )
     .await;
-    let workspace_root = TestDir::new("forge-planning-workspaces");
+    let workspace_root = common::TestDir::new("forge-planning-workspaces");
     let planner_agent_id = create_shell_agent(&harness.app, workspace_root.path()).await;
     let _: Value = json_request_with_bearer(
         &harness.app,
@@ -153,15 +155,6 @@ async fn planning_gate_approval_conflicts_while_planner_execution_is_running() {
     .await;
 }
 
-#[tokio::test]
-#[ignore = "Planner execution spawning/completion is not wired to the role dispatch event yet; this documents the expected future cascade to in_progress."]
-async fn planner_completion_cascades_to_in_progress() {
-    assert!(
-        true,
-        "cascade portion intentionally ignored until role execution is wired"
-    );
-}
-
 fn planning_workflow() -> Value {
     json!({
         "roles": [{ "name": "planner", "display_name": "Planner", "description": "Plans" }],
@@ -208,7 +201,7 @@ struct Harness {
     app: Router,
     event_bus: Arc<EventBus>,
     _state: Arc<AppState>,
-    _web_dist_dir: TestDir,
+    _web_dist_dir: common::TestDir,
 }
 
 async fn test_app() -> Harness {
@@ -228,7 +221,7 @@ async fn test_app() -> Harness {
         true,
         adapter_registry,
     ));
-    let web_dist_dir = TestDir::new("forge-planning-gate-web");
+    let web_dist_dir = common::TestDir::new("forge-planning-gate-web");
     std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>").expect("write index");
     let app = build_router((*state).clone(), web_dist_dir.path().to_path_buf());
     Harness {
@@ -422,19 +415,4 @@ where
         String::from_utf8_lossy(&bytes)
     );
     serde_json::from_slice(&bytes).expect("parse JSON")
-}
-
-struct TestDir {
-    path: std::path::PathBuf,
-}
-
-impl TestDir {
-    fn new(prefix: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).expect("temp dir creates");
-        Self { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
 }

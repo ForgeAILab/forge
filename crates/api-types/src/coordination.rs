@@ -257,6 +257,7 @@ pub struct TaskProposalRequest {
     pub priority: Option<i64>,
     pub task_type: Option<TaskType>,
     pub task_state_config: Option<String>,
+    pub review_requirement_ids: Vec<String>,
     #[ts(type = "Record<string, unknown> | null")]
     pub merge_config: Option<Value>,
     pub role_assignments: Option<Vec<InitialRoleAssignment>>,

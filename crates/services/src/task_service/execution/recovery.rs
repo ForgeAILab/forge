@@ -546,9 +546,11 @@ impl TaskService {
     ) -> Result<Task> {
         let recovered =
             if let Some(blocked_execution_id) = annotation.blocked_execution_id.as_deref() {
-                let result = self
-                    .re_execute_execution_for_recovery(blocked_execution_id, context)
-                    .await?;
+                // Keep the large re-execution future out of the enclosing
+                // coordination-tool recovery future.
+                let result =
+                    Box::pin(self.re_execute_execution_for_recovery(blocked_execution_id, context))
+                        .await?;
                 self.spawn_recovery_execution(
                     result.task.id.clone(),
                     result.execution.id.clone(),

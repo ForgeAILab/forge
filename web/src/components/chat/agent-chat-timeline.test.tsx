@@ -132,6 +132,8 @@ const queuedTurn: AgentChatTurn = {
   lease_expires_at: null,
   next_attempt_at: null,
   response_message_id: null,
+  error_code: null,
+  error_message: null,
   error: null,
   correlation_id: 'correlation-1',
   version: 1n,

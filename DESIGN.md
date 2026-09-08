@@ -498,6 +498,23 @@ retaining text/state meaning without relying on spinners or pulse animation.
 - **States:** apply the shared state contract. `empty` explains that no release exists yet and points to readiness; `loading` preserves the history timeline; `error` offers retry; `stale` marks live data as newer than the selected snapshot without changing snapshot text; `conflict` shows the candidate/source digest mismatch and blocks release; `setup-required` explains that Charter adoption is required before release; `permission-denied` hides snapshot bodies/digests and any protected evidence metadata while preserving only the safe route.
 - **Responsive/accessibility:** at 1280px, keep current outcome and history side by side; at 768px, stack them with current state first; at 375px, stack metadata, summary, known issues, and inspect action, wrap all IDs/digests, and keep the history list contained. Each snapshot has a named heading, release number, actor/time, and immutable warning in accessible text.
 
+### Review conformance
+
+The review detail surface separates attempt outcome from Task conformance to the
+Charter. Display `not assessed`, `passed`, `failed`, or `unverified` as text beside
+the assessment. Historical and CI-only results retain their outcome and show a muted
+“Not assessed” explanation. A passed legacy review must never imply Charter
+verification. When a frozen contract exists, show the number of Task-scoped
+requirements reviewed and the number of Project requirements that remain for
+milestone readiness before the expandable details; this distinction is visible at
+every breakpoint and never depends on opening the disclosure. Requirements,
+expected/actual findings, check results, Charter revision, and reviewed commit live
+in the expandable detail list. Use existing card, badge, muted, destructive, and
+success tokens, native keyboard-accessible disclosure controls, and wrapping
+identifiers at 375/768/1280px. Loading uses the existing Skeleton; empty results name
+the absence of assessment. Failed and unverified results keep their reason visible
+when collapsed.
+
 ## 6. Motion & Interaction
 
 | Token     |  Duration | Easing                          | Usage                                        |

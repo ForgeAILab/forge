@@ -50,6 +50,7 @@ mod common;
 pub(crate) mod config;
 mod create;
 mod create_subtasks;
+mod dependencies;
 mod execution;
 mod governance;
 mod lifecycle_test;
@@ -62,6 +63,7 @@ mod review_config;
 mod roles;
 mod subtask;
 mod transition;
+mod update;
 mod validation;
 pub(crate) mod workspace;
 

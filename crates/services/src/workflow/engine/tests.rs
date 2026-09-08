@@ -919,65 +919,6 @@ async fn successful_dispatch_clears_stale_dispatch_failure_annotation() {
     );
 }
 
-#[tokio::test]
-#[ignore = "Blocked: engine tests cannot register a configurable test-only Cascade action without changing the production registry; built-in cascade actions target fixed default states, so they cannot drive s1 -> s2 -> s3 -> s4."]
-async fn cascade_depth_limiting() {
-    let workflow = WorkflowDefinition {
-        roles: Vec::new(),
-        states: vec![
-            with_trigger(
-                state("s0", StateKind::Initial, None, StateHooks::default()),
-                WorkflowTrigger::Accept,
-                "s1",
-            ),
-            with_trigger(
-                state(
-                    "s1",
-                    StateKind::Active,
-                    None,
-                    StateHooks {
-                        after_enter: vec![hook("test_cascade_to_s2", FailurePolicy::Log)],
-                        ..StateHooks::default()
-                    },
-                ),
-                WorkflowTrigger::Accept,
-                "s2",
-            ),
-            with_trigger(
-                state(
-                    "s2",
-                    StateKind::Active,
-                    None,
-                    StateHooks {
-                        after_enter: vec![hook("test_cascade_to_s3", FailurePolicy::Log)],
-                        ..StateHooks::default()
-                    },
-                ),
-                WorkflowTrigger::Accept,
-                "s3",
-            ),
-            with_trigger(
-                state(
-                    "s3",
-                    StateKind::Active,
-                    None,
-                    StateHooks {
-                        after_enter: vec![hook("test_cascade_to_s4", FailurePolicy::Log)],
-                        ..StateHooks::default()
-                    },
-                ),
-                WorkflowTrigger::Accept,
-                "s4",
-            ),
-            state("s4", StateKind::Active, None, StateHooks::default()),
-        ],
-        configuration: Vec::new(),
-        cancellation_state: None,
-    };
-
-    assert_eq!(workflow.states.len(), 5);
-}
-
 #[test]
 fn validate_claimable_backlog_rejection() {
     let workflow = default_workflow::default_workflow();
@@ -2164,6 +2105,41 @@ async fn user_override_succeeds_along_system_only_edge() {
         Ok(_) => panic!("expected system-only rejection for agent, got Ok"),
         Err(other) => panic!("expected system-only rejection for agent, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn agent_can_use_a_system_trigger_only_for_the_cancellation_target() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let task_id = new_uuid_v4();
+    let mut workflow = system_only_fail_edge_workflow();
+    workflow.cancellation_state = Some("failed".to_owned());
+    workflow.states[1].kind = StateKind::Terminal;
+    seed_custom_workflow_task(&db, &task_id, "working", &workflow).await;
+    let eng = engine(Arc::clone(&db), event_bus);
+
+    let result = eng
+        .transition(
+            &task_id,
+            "failed",
+            1,
+            &workflow,
+            &api_types::Actor::agent("project-agent"),
+            "cancelled through the scoped Task command",
+            false,
+        )
+        .await
+        .expect("an authorized Agent cancellation can reach the cancellation target");
+
+    assert_eq!(result.task.status, "failed");
+    let triggered_by: String = sqlx::query_scalar(
+        "SELECT triggered_by FROM transition_log WHERE task_id = ? ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(&task_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("transition audit row");
+    assert_eq!(triggered_by, "agent:project-agent");
 }
 
 #[tokio::test]

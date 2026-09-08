@@ -66,6 +66,15 @@ pub struct ProjectIdentityProjection {
     pub paused: bool,
     pub charter_status: String,
     pub charter_setup_required: bool,
+    /// Independent commands inherited by a Task when it next enters review.
+    /// The Project Agent can replace this list through
+    /// `project.review_config` without receiving the rest of settings.
+    #[serde(default)]
+    pub default_review_ci_steps: Vec<String>,
+    /// Commands that prepare the detached clean checkout before the default
+    /// review CI commands run.
+    #[serde(default)]
+    pub default_review_setup_steps: Vec<String>,
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -280,7 +289,7 @@ pub async fn load_effective_project_state(
 ) -> Result<ProjectEffectiveStateProjection> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let project = sqlx::query(
-        "SELECT id, name, paused_at, charter_status, charter_setup_required,
+        "SELECT id, name, settings, paused_at, charter_status, charter_setup_required,
                 version, created_at, updated_at, project_work_epoch,
                 primary_milestone_id
          FROM project WHERE id = ?",
@@ -293,12 +302,16 @@ pub async fn load_effective_project_state(
     let project_version: i64 = project.try_get("version")?;
     let project_work_epoch: i64 = project.try_get("project_work_epoch")?;
     let primary_milestone_id: Option<String> = project.try_get("primary_milestone_id")?;
+    let (default_review_ci_steps, default_review_setup_steps) =
+        default_review_steps(project.try_get("settings")?)?;
     let identity = ProjectIdentityProjection {
         id: project.try_get("id")?,
         name: project.try_get("name")?,
         paused: project.try_get::<Option<String>, _>("paused_at")?.is_some(),
         charter_status: project.try_get("charter_status")?,
         charter_setup_required: project.try_get::<i64, _>("charter_setup_required")? != 0,
+        default_review_ci_steps,
+        default_review_setup_steps,
         version: project_version,
         created_at: project.try_get("created_at")?,
         updated_at: project.try_get("updated_at")?,
@@ -1057,20 +1070,29 @@ fn validate_effective_state(projection: &ProjectEffectiveStateProjection) -> Res
         ] {
             require_nonempty(field, value)?;
         }
-        let definition_revision_id =
-            milestone.definition_revision_id.as_deref().ok_or_else(|| {
-                ServiceError::conflict(
-                    "Active Project milestone has no current definition revision",
-                )
-            })?;
-        let definition_digest = milestone.definition_digest.as_deref().ok_or_else(|| {
-            ServiceError::conflict("Active Project milestone has no definition digest")
-        })?;
-        require_nonempty(
-            "Project milestone definition revision",
-            definition_revision_id,
-        )?;
-        require_nonempty("Project milestone definition digest", definition_digest)?;
+        // A milestone the Project Agent has just created carries only a draft
+        // definition until that definition is proposed and approved, so an
+        // absent current revision is a legal state the Project must be able to
+        // report on rather than a projection failure. A present revision still
+        // has to carry its digest.
+        match (
+            milestone.definition_revision_id.as_deref(),
+            milestone.definition_digest.as_deref(),
+        ) {
+            (Some(definition_revision_id), Some(definition_digest)) => {
+                require_nonempty(
+                    "Project milestone definition revision",
+                    definition_revision_id,
+                )?;
+                require_nonempty("Project milestone definition digest", definition_digest)?;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(ServiceError::conflict(
+                    "Project milestone definition revision and digest must be recorded together",
+                ))
+            }
+        }
         if milestone.version < 1 {
             return Err(ServiceError::invalid_operation(
                 "Project effective state has an invalid milestone version",
@@ -1200,6 +1222,36 @@ fn json_string_array(value: String) -> Result<Vec<String>> {
     })
 }
 
+fn default_review_steps(settings: String) -> Result<(Vec<String>, Vec<String>)> {
+    let settings = serde_json::from_str::<Value>(&settings).map_err(|error| {
+        ServiceError::invalid_operation(format!(
+            "Project runtime state contains invalid Project settings: {error}"
+        ))
+    })?;
+    let Some(review_config) = settings.get("default_review_config") else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let review_config = review_config.as_object().ok_or_else(|| {
+        ServiceError::invalid_operation(
+            "Project runtime state contains a non-object default_review_config",
+        )
+    })?;
+    let read = |field: &str| {
+        review_config
+            .get(field)
+            .map(|value| {
+                serde_json::from_value::<Vec<String>>(value.clone()).map_err(|error| {
+                    ServiceError::invalid_operation(format!(
+                        "Project runtime state contains invalid default review {field}: {error}"
+                    ))
+                })
+            })
+            .transpose()
+            .map(|value| value.unwrap_or_default())
+    };
+    Ok((read("ci_steps")?, read("setup_steps")?))
+}
+
 fn validate_primary_milestone_pointer(
     milestones: &[MilestoneProjection],
     primary_milestone_id: Option<&str>,
@@ -1312,6 +1364,85 @@ mod tests {
         .is_err());
     }
 
+    /// A minimal projection that validates, so a test can vary one domain.
+    fn minimal_projection() -> ProjectEffectiveStateProjection {
+        ProjectEffectiveStateProjection {
+            project: ProjectIdentityProjection {
+                id: "p".to_owned(),
+                name: "P".to_owned(),
+                paused: false,
+                charter_status: "legacy_unverified".to_owned(),
+                charter_setup_required: true,
+                default_review_ci_steps: Vec::new(),
+                default_review_setup_steps: Vec::new(),
+                version: 3,
+                created_at: "now".to_owned(),
+                updated_at: "now".to_owned(),
+            },
+            governing_charter: None,
+            approved_documents: Vec::new(),
+            active_decisions: Vec::new(),
+            invalidated_decisions: Vec::new(),
+            reconciliation_required: Vec::new(),
+            canonical_conflicts: Vec::new(),
+            task_summary: TaskSummaryProjection {
+                total: 0,
+                by_status: Vec::new(),
+            },
+            validation_summary: ValidationSummaryProjection {
+                total: 0,
+                by_outcome: Vec::new(),
+            },
+            commitments: Vec::new(),
+            inbox: Vec::new(),
+            active_milestones: Vec::new(),
+            primary_milestone_id: None,
+            readiness: ReadinessProjection {
+                latest: None,
+                by_milestone: Vec::new(),
+            },
+            releases: Vec::new(),
+            unreleased_changes: UnreleasedChangesProjection {
+                document_ids: Vec::new(),
+                decision_candidate_ids: Vec::new(),
+                active_milestone_ids: Vec::new(),
+                reconciliation_ids: Vec::new(),
+            },
+            source_event_watermark: "event".to_owned(),
+            source_event_sequence: 4,
+            source_project_version: 3,
+            source_project_work_epoch: 1,
+        }
+    }
+
+    /// A milestone the Project Agent just created has only a draft definition,
+    /// so its current revision is absent until that draft is approved. Failing
+    /// the projection there wedged every Project Agent turn: the Agent could
+    /// not take the turn that would have proposed the definition.
+    #[test]
+    fn a_milestone_whose_definition_is_still_a_draft_projects_without_failing() {
+        let mut pending = minimal_projection();
+        pending.active_milestones = vec![milestone("m1", "planned")];
+        pending.primary_milestone_id = Some("m1".to_owned());
+        let validation = validate_effective_state(&pending);
+        assert!(validation.is_ok(), "validation error: {validation:?}");
+
+        let mut approved = minimal_projection();
+        let mut defined = milestone("m1", "planned");
+        defined.definition_revision_id = Some("rev-1".to_owned());
+        defined.definition_digest = Some("digest-1".to_owned());
+        approved.active_milestones = vec![defined];
+        approved.primary_milestone_id = Some("m1".to_owned());
+        assert!(validate_effective_state(&approved).is_ok());
+
+        let mut half_recorded = minimal_projection();
+        let mut partial = milestone("m1", "planned");
+        partial.definition_revision_id = Some("rev-1".to_owned());
+        half_recorded.active_milestones = vec![partial];
+        half_recorded.primary_milestone_id = Some("m1".to_owned());
+        assert!(validate_effective_state(&half_recorded).is_err());
+    }
+
     #[test]
     fn projection_is_closed_and_has_all_authority_domains() {
         let projection = ProjectEffectiveStateProjection {
@@ -1321,6 +1452,8 @@ mod tests {
                 paused: false,
                 charter_status: "legacy_unverified".to_owned(),
                 charter_setup_required: true,
+                default_review_ci_steps: Vec::new(),
+                default_review_setup_steps: Vec::new(),
                 version: 3,
                 created_at: "now".to_owned(),
                 updated_at: "now".to_owned(),
@@ -1387,6 +1520,8 @@ mod tests {
                 paused: false,
                 charter_status: "legacy_unverified".to_owned(),
                 charter_setup_required: true,
+                default_review_ci_steps: Vec::new(),
+                default_review_setup_steps: Vec::new(),
                 version: 1,
                 created_at: "now".to_owned(),
                 updated_at: "now".to_owned(),
@@ -1456,6 +1591,8 @@ mod tests {
                 paused: false,
                 charter_status: "legacy_unverified".to_owned(),
                 charter_setup_required: true,
+                default_review_ci_steps: Vec::new(),
+                default_review_setup_steps: Vec::new(),
                 version: 1,
                 created_at: "now".to_owned(),
                 updated_at: "now".to_owned(),

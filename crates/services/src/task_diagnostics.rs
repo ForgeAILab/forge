@@ -219,6 +219,7 @@ pub fn derive_workflow_health(
 pub fn derive_workflow_exception(
     task: &Task,
     workflow: &WorkflowDefinition,
+    role_assignments: &[TaskRoleAssignment],
     latest_review: Option<&Review>,
     latest_execution: Option<&Execution>,
     remaining_retries: &HashMap<String, i64>,
@@ -295,7 +296,13 @@ pub fn derive_workflow_exception(
     }
 
     if let Some(annotation) = active_blocking_annotation(task) {
-        let actions = annotation_actions(&annotation, workflow, task, latest_execution);
+        let actions = annotation_actions(
+            &annotation,
+            workflow,
+            task,
+            role_assignments,
+            latest_execution,
+        );
         let actions = if actions.is_empty() && is_retry_budget_exhausted(&annotation) {
             retry_budget_exhausted_annotation_actions(
                 task,
@@ -896,6 +903,7 @@ fn annotation_actions(
     annotation: &TaskBlockingAnnotation,
     workflow: &WorkflowDefinition,
     task: &Task,
+    role_assignments: &[TaskRoleAssignment],
     latest_execution: Option<&Execution>,
 ) -> Vec<WorkflowExceptionAction> {
     annotation
@@ -903,6 +911,40 @@ fn annotation_actions(
         .iter()
         .copied()
         .map(|kind| {
+            let terminal = task_is_terminal(workflow, task);
+            let resume_unavailable = matches!(kind, RecoveryAction::ResumeSession)
+                && !latest_execution.is_some_and(|execution| {
+                    annotation
+                        .blocked_execution_id
+                        .as_deref()
+                        .is_none_or(|id| id == execution.id)
+                        && execution.agent_id.is_some()
+                        && execution.agent_session_id.is_some()
+                        && execution.executor_config_snapshot_json.is_some()
+                        && execution.agent_id.as_deref().is_some_and(|agent_id| {
+                            role_assignments
+                                .iter()
+                                .find(|assignment| assignment.role_name == execution.role)
+                                .map_or_else(
+                                    || {
+                                        task.assignee_type.as_deref() == Some("agent")
+                                            && task.assignee_id.as_deref() == Some(agent_id)
+                                    },
+                                    |assignment| {
+                                        assignment.assignee_type == Some(AssigneeKind::Agent)
+                                            && assignment.assignee_id.as_deref() == Some(agent_id)
+                                    },
+                                )
+                        })
+                });
+            let enabled = !terminal && !resume_unavailable;
+            let disabled_reason = if terminal {
+                Some("Task is in terminal state".to_owned())
+            } else if resume_unavailable {
+                Some("The stopped execution has no resumable assigned session".to_owned())
+            } else {
+                None
+            };
             let resume_target = matches!(kind, RecoveryAction::ResumeProcess)
                 .then(|| gate_reject_target(workflow, task))
                 .flatten();
@@ -925,11 +967,8 @@ fn annotation_actions(
             action(
                 kind,
                 recovery_label(kind),
-                !task_is_terminal(workflow, task),
-                disabled_unless(
-                    !task_is_terminal(workflow, task),
-                    "Task is in terminal state",
-                ),
+                enabled,
+                disabled_reason,
                 matches!(kind, RecoveryAction::ProceedOnce),
                 matches!(kind, RecoveryAction::ProceedOnce),
                 matches!(

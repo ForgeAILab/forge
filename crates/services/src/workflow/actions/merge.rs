@@ -36,6 +36,38 @@ impl HookAction for RunMerge {
         };
 
         match merge_service.merge(ctx.task_id.clone()).await {
+            Ok(MergeOutcome::ReviewRequired { reason }) => {
+                if let Err(error) =
+                    db::TaskRepo::set_review_passed_at(&*ctx.db, &task.id, None, &db::now_rfc3339())
+                        .await
+                {
+                    return HookResult::Failed {
+                        reason: error.to_string(),
+                    };
+                }
+                let current = match super::common::task(ctx).await {
+                    Ok(task) => task,
+                    Err(reason) => return HookResult::Failed { reason },
+                };
+                if let Err(error) = persist_merge_error(
+                    ctx,
+                    &current,
+                    api_types::FailureKind::ReviewGateFailed,
+                    &reason,
+                )
+                .await
+                {
+                    return HookResult::Failed {
+                        reason: error.to_string(),
+                    };
+                }
+                merge_failure_result(
+                    ctx,
+                    &current,
+                    format!("conformance review required: {reason}"),
+                )
+                .await
+            }
             Ok(MergeOutcome::Done {
                 after_sha, branch, ..
             }) => {

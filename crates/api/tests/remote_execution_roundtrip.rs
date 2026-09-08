@@ -2,7 +2,7 @@
 
 mod common;
 
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use api_types::{AgentResponse, TaskResponse, METHOD_EXECUTION_START};
 use axum::http::{Method, StatusCode};
@@ -158,10 +158,6 @@ async fn setup_remote_roundtrip(prefix: &str) -> RemoteRoundtripFixture {
             "name": format!("{prefix}-shell-reviewer"),
             "executor_type": "shell",
             "daemon_id": registration.daemon_id,
-            "config_json": {
-                "command": "printf",
-                "args": ["Looks good.\\n===REVIEW: PASS===\\n"]
-            },
         }),
         StatusCode::OK,
     )
@@ -265,7 +261,10 @@ async fn claim_task_with_accepted_start(
     (task_id, execution_id)
 }
 
-async fn complete_remote_reviewer(daemon_socket: &mut common::fake_daemon::ClientSocket) {
+async fn complete_remote_reviewer(
+    daemon_socket: &mut common::fake_daemon::ClientSocket,
+    database: &db::SqliteDb,
+) {
     let (start_id, start_params) = next_daemon_request(daemon_socket, METHOD_EXECUTION_START).await;
     let review_execution_id = start_params["execution_id"]
         .as_str()
@@ -280,12 +279,16 @@ async fn complete_remote_reviewer(daemon_socket: &mut common::fake_daemon::Clien
         },
     )
     .await;
-    send_execution_terminal_completed(
-        daemon_socket,
-        &review_execution_id,
-        Some("Looks good.\n===REVIEW: PASS===\n"),
-    )
-    .await;
+    let workspace_path = start_params["workspace_path"]
+        .as_str()
+        .expect("review workspace path in start params");
+    let contract = db::ReviewConformanceRepo::review_contract(database, &review_execution_id)
+        .await
+        .expect("review contract loads")
+        .expect("remote reviewer has a frozen contract");
+    let assessment =
+        common::passing_review_assessment_for_contract(contract, Path::new(workspace_path));
+    send_execution_terminal_completed(daemon_socket, &review_execution_id, Some(&assessment)).await;
 }
 
 #[tokio::test]
@@ -349,7 +352,7 @@ async fn remote_execution_completes_and_transitions_task() {
     // The configured independent reviewer is also remote. Complete its
     // daemon-owned execution so the normal review-to-merge cascade remains
     // part of this round-trip instead of leaving the task at the review gate.
-    complete_remote_reviewer(&mut fixture.daemon_socket).await;
+    complete_remote_reviewer(&mut fixture.daemon_socket, &fixture.harness.state.db).await;
 
     let reviewed =
         poll_task_status_after_execution(&fixture.harness.state.db, &task_id, "done").await;

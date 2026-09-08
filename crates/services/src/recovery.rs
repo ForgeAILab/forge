@@ -576,17 +576,20 @@ impl HeartbeatMonitor {
                 },
             });
 
-            if stalled_execution_should_block_task(&updated) {
-                if let Some(task_service) = self.task_service.as_ref() {
-                    if let Err(error) = task_service.annotate_executor_failure_block(&updated).await
-                    {
-                        tracing::warn!(
-                            execution_id = %updated.id,
-                            task_id = %updated.task_id,
-                            %error,
-                            "failed to cascade expired execution"
-                        );
-                    }
+            if let Some(task_service) = self.task_service.as_ref() {
+                if let Err(error) = cascade_recovered_execution(
+                    task_service,
+                    &updated,
+                    stalled_execution_should_block_task(&updated),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        execution_id = %updated.id,
+                        task_id = %updated.task_id,
+                        %error,
+                        "failed to cascade expired execution"
+                    );
                 }
             }
             expired += 1;
@@ -905,7 +908,7 @@ async fn expire_workspace_leases(
             },
         });
         if let Some(task_service) = task_service {
-            if let Err(error) = task_service.annotate_executor_failure_block(&updated).await {
+            if let Err(error) = cascade_recovered_execution(task_service, &updated, true).await {
                 tracing::warn!(
                     execution_id = %updated.id,
                     task_id = %updated.task_id,
@@ -1372,6 +1375,27 @@ fn stalled_execution_should_block_task(execution: &db::Execution) -> bool {
     )
 }
 
+/// Reviewers have their own settlement/retry state machine.  Any monitor that
+/// wins a terminal execution CAS must enter that cascade; sending a reviewer
+/// through the generic worker blocker leaves its `review` row running forever.
+async fn cascade_recovered_execution(
+    task_service: &TaskService,
+    execution: &Execution,
+    block_non_reviewer: bool,
+) -> Result<()> {
+    if execution.role == crate::workflow::default_roles::REVIEWER {
+        task_service
+            .maybe_cascade_executor_completion(&execution.id)
+            .await
+    } else if block_non_reviewer {
+        task_service
+            .annotate_executor_failure_block(execution)
+            .await
+    } else {
+        Ok(())
+    }
+}
+
 pub(crate) async fn resolve_execution_daemon(
     db: &SqliteDb,
     execution: &Execution,
@@ -1486,16 +1510,20 @@ pub(crate) async fn fail_execution_daemon_disconnected(
         },
     });
 
-    if stalled_execution_should_block_task(&updated) {
-        if let Some(task_service) = task_service {
-            if let Err(error) = task_service.annotate_executor_failure_block(&updated).await {
-                tracing::warn!(
-                    execution_id = %updated.id,
-                    task_id = %updated.task_id,
-                    %error,
-                    "failed to cascade daemon-disconnected execution"
-                );
-            }
+    if let Some(task_service) = task_service {
+        if let Err(error) = cascade_recovered_execution(
+            task_service,
+            &updated,
+            stalled_execution_should_block_task(&updated),
+        )
+        .await
+        {
+            tracing::warn!(
+                execution_id = %updated.id,
+                task_id = %updated.task_id,
+                %error,
+                "failed to cascade daemon-disconnected execution"
+            );
         }
     }
 
@@ -1637,15 +1665,16 @@ mod tests {
     use crate::{
         daemon_service::{DaemonReportInput, DaemonService, DetectedCliInput},
         daemon_transport::{DaemonConnection, DaemonConnectionRegistry},
-        workflow::default_roles,
+        workflow::{default_roles, default_states},
         TaskService,
     };
     use db::{
         create_sqlite_pool, new_uuid_v4, run_migrations, AgentContextScopeRepo, AgentProfileRepo,
         AgentSession, CreateAgent, CreateAgentContextScope, CreateAgentProfile, CreateAgentSession,
-        CreateExecution, CreateProject, CreateRepo, CreateTask, CreateTaskRoleAssignment,
-        CreateWorkspaceLease, DaemonRepo, DaemonStatus, DomainEventRepo, RepoRepo,
-        TaskRoleAssignmentRepo, TaskStatus, UpdateProject, UpsertDaemon,
+        CreateExecution, CreateProject, CreateRepo, CreateReview, CreateTask,
+        CreateTaskRoleAssignment, CreateWorkspaceLease, DaemonRepo, DaemonStatus, DomainEventRepo,
+        RepoRepo, ReviewRepo, ReviewStatus, TaskRoleAssignmentRepo, TaskStatus, UpdateProject,
+        UpsertDaemon,
     };
     use executors::{ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError};
     use serde_json::Value;
@@ -2478,6 +2507,105 @@ mod tests {
         assert!(event_types
             .iter()
             .any(|event| event == "task.execution_retry"));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_monitor_routes_expired_reviewer_through_review_retry() {
+        let db = Arc::new(sqlite_db().await);
+        let event_bus = Arc::new(EventBus::new(32));
+        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (agent_id, _) = seed_agent_with_daemon(
+            &db,
+            &crate::embedded_daemon::embedded_machine_id(),
+            AgentStatus::Idle,
+        )
+        .await;
+        let task = seed_task(
+            &db,
+            project_id,
+            repo_id,
+            default_states::REVIEW.to_owned(),
+            Some(agent_id.clone()),
+        )
+        .await;
+        sqlx::query("UPDATE task SET task_state_config = ?, metadata_json = ? WHERE id = ?")
+            .bind(r#"{"retry_budgets":{"execution":3}}"#)
+            .bind(r#"{"execution_retry_count":0}"#)
+            .bind(&task.id)
+            .execute(db.pool())
+            .await
+            .expect("retry policy updates");
+
+        let execution = seed_running_execution(&db, task.id.clone(), agent_id, None).await;
+        sqlx::query("UPDATE execution SET role = ? WHERE id = ?")
+            .bind(default_roles::REVIEWER)
+            .bind(&execution.id)
+            .execute(db.pool())
+            .await
+            .expect("reviewer role updates");
+        let now = now_rfc3339();
+        ReviewRepo::create(
+            &*db,
+            CreateReview {
+                id: new_uuid_v4(),
+                task_id: task.id.clone(),
+                execution_id: execution.id.clone(),
+                attempt_number: 1,
+                status: ReviewStatus::Running,
+                step_results_json: json!({ "ci_steps": [] }).to_string(),
+                started_at: now.clone(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("running review creates");
+
+        let current = ExecutionRepo::get_by_id(&*db, &execution.id)
+            .await
+            .expect("execution reloads")
+            .expect("execution exists");
+        assert!(matches!(
+            ExecutionRepo::claim_lease(
+                &*db,
+                db::ClaimExecutionLease {
+                    execution_id: current.id.clone(),
+                    expected_version: current.execution_version,
+                    owner: "expired-review-owner".to_owned(),
+                    lease_expires_at: "1970-01-01T00:00:00+00:00".to_owned(),
+                    hard_deadline_at: (Utc::now() + ChronoDuration::hours(1)).to_rfc3339(),
+                    now,
+                },
+            )
+            .await
+            .expect("execution lease claims"),
+            db::ExecutionLeaseMutation::Updated(_)
+        ));
+
+        let task_service = Arc::new(TaskService::new(Arc::clone(&db), Arc::clone(&event_bus)));
+        let monitor = HeartbeatMonitor::new(Arc::clone(&db), event_bus)
+            .with_task_service(task_service)
+            .with_execution_stall_timeout(Duration::from_secs(1));
+        assert_eq!(monitor.check_once().await.expect("monitor checks"), 1);
+
+        let reviews = ReviewRepo::list_by_task(&*db, &task.id)
+            .await
+            .expect("reviews load");
+        assert_eq!(reviews[0].status, ReviewStatus::Running);
+        assert!(reviews[0].finished_at.is_none());
+        let details: Value =
+            serde_json::from_str(&reviews[0].step_results_json).expect("review details parse");
+        assert_eq!(details["execution_retry"]["execution_id"], execution.id);
+        let current_task = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .expect("task reloads")
+            .expect("task exists");
+        assert!(current_task.blocked_json.is_none());
+        let metadata: Value =
+            serde_json::from_str(current_task.metadata_json.as_deref().unwrap_or("{}"))
+                .expect("metadata parses");
+        assert_eq!(metadata["execution_retry_count"], 1);
+        assert!(metadata.get("deferred_dispatch").is_some());
     }
 
     #[tokio::test]

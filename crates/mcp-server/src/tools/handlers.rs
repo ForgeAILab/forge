@@ -1010,13 +1010,10 @@ pub(super) async fn forge_add_task_dependency(
     params: Value,
 ) -> Result<Value, McpToolError> {
     let params: AddTaskDependencyParams = parse_params(params)?;
-    TaskDependencyRepo::add_dependency(
-        &*state.db,
-        &params.task_id,
-        &params.depends_on_id,
-        &now_rfc3339(),
-    )
-    .await?;
+    state
+        .task_service
+        .add_task_dependency(&params.task_id, &params.depends_on_id)
+        .await?;
     Ok(json!({ "task_id": params.task_id, "depends_on_id": params.depends_on_id }))
 }
 
@@ -1025,7 +1022,9 @@ pub(super) async fn forge_remove_task_dependency(
     params: Value,
 ) -> Result<Value, McpToolError> {
     let params: RemoveTaskDependencyParams = parse_params(params)?;
-    TaskDependencyRepo::remove_dependency(&*state.db, &params.task_id, &params.depends_on_id)
+    state
+        .task_service
+        .remove_task_dependency(&params.task_id, &params.depends_on_id)
         .await?;
     Ok(json!({ "task_id": params.task_id, "depends_on_id": params.depends_on_id }))
 }
@@ -1667,6 +1666,7 @@ fn message_response(message: AgentChatMessage) -> AgentChatMessageResponse {
 }
 
 fn turn_response(job: AgentChatTurnJob) -> AgentChatTurnJobResponse {
+    let error = job.error_message.clone().or_else(|| job.error_code.clone());
     AgentChatTurnJobResponse {
         id: job.id,
         chat_id: job.chat_id,
@@ -1688,7 +1688,9 @@ fn turn_response(job: AgentChatTurnJob) -> AgentChatTurnJobResponse {
         lease_expires_at: job.leased_until,
         next_attempt_at: job.next_attempt_at,
         response_message_id: job.response_message_id,
-        error: job.error_message.or(job.error_code),
+        error_code: job.error_code,
+        error_message: job.error_message,
+        error,
         correlation_id: job.correlation_id,
         version: job.version,
         created_at: job.created_at,

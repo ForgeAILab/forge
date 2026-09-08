@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use db::{
-    TaskDependencyRepo, TaskRoleAssignmentRepo, TransitionLog, TransitionLogRepo, WorkspaceRepo,
+    TaskDependencyRepo, TaskRepo, TaskRoleAssignmentRepo, TransitionLog, TransitionLogRepo,
+    WorkspaceRepo,
 };
 
 use crate::workflow::{
@@ -310,6 +311,48 @@ impl HookAction for DependencyGate {
             };
         if unsatisfied.is_empty() {
             return HookResult::Ok;
+        }
+        let cancellation_state = ctx
+            .workflow
+            .cancellation_state
+            .as_deref()
+            .unwrap_or(default_states::CANCELLED);
+        let mut cancelled = Vec::new();
+        for dependency_id in &unsatisfied {
+            match TaskRepo::get_by_id(&*ctx.db, dependency_id, false).await {
+                Ok(Some(dependency)) if dependency.status == cancellation_state => {
+                    cancelled.push(dependency_id.clone());
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return HookResult::Failed {
+                        reason: format!("dependency check failed: {error}"),
+                    };
+                }
+            }
+        }
+        if !cancelled.is_empty() {
+            let current = match task(ctx).await {
+                Ok(task) => task,
+                Err(reason) => return HookResult::Failed { reason },
+            };
+            let reason = format!("required dependency cancelled: {}", cancelled.join(", "));
+            if current.blocked_json.is_none() {
+                if let Err(error) = block_task(
+                    ctx,
+                    &current,
+                    &reason,
+                    api_types::FailureKind::WorkflowGuardRejected,
+                    Some("dependency_gate"),
+                )
+                .await
+                {
+                    return HookResult::Failed {
+                        reason: error.to_string(),
+                    };
+                }
+            }
+            return HookResult::Failed { reason };
         }
         HookResult::Failed {
             reason: format!(

@@ -33,9 +33,9 @@ use forge_agent_host::{
     PROJECT_CHARTER_READ_OPERATION, PROJECT_CURRENT_STATE_OPERATION, PROJECT_DECISION_OPERATION,
     PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
     PROJECT_OBSERVATIONS_OPERATION, PROJECT_READINESS_OPERATION, PROJECT_RELEASE_OPERATION,
-    PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION, TASK_ADAPTIVE_OPERATION,
-    TASK_EVIDENCE_OPERATION, TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION,
-    TASK_WORKLOG_OPERATION,
+    PROJECT_REVIEW_CONFIG_OPERATION, PROJECT_SKILL_SECTION_OPERATION, PROJECT_VALIDATION_OPERATION,
+    TASK_ADAPTIVE_OPERATION, TASK_CANCEL_OPERATION, TASK_EVIDENCE_OPERATION,
+    TASK_PROPOSE_OPERATION, TASK_RECOVER_OPERATION, TASK_REVIEW_OPERATION, TASK_WORKLOG_OPERATION,
 };
 use serde_json::{json, Value};
 use services::{CoordinationToolProvider, TaskService};
@@ -521,10 +521,24 @@ fn task_arguments(key: &str) -> Value {
             "title": "Scope composition task",
             "description": "A native Task proposal exercised through Project scope.",
             "task_type": "planning_task",
+            "review_requirement_ids": [],
             "priority": 3,
             "merge_config": null,
             "role_assignments": null,
             "governance": null
+        },
+        "dedupe_key": key,
+        "correlation_id": format!("correlation-{key}")
+    })
+}
+
+fn review_config_arguments(key: &str, expected_project_version: i64, ci_steps: &[&str]) -> Value {
+    json!({
+        "operation": PROJECT_REVIEW_CONFIG_OPERATION,
+        "payload": {
+            "action": "set_ci_steps",
+            "expected_project_version": expected_project_version,
+            "ci_steps": ci_steps,
         },
         "dedupe_key": key,
         "correlation_id": format!("correlation-{key}")
@@ -549,6 +563,20 @@ fn adaptive_task_arguments(
                 "title": "Scope composition adaptive child",
                 "description": "A bounded child created through the native composition."
             }]
+        },
+        "dedupe_key": key,
+        "correlation_id": format!("correlation-{key}")
+    })
+}
+
+fn cancel_task_arguments(key: &str, task_id: &str, expected_task_version: i64) -> Value {
+    json!({
+        "operation": TASK_CANCEL_OPERATION,
+        "payload": {
+            "action": "cancel",
+            "task_id": task_id,
+            "expected_task_version": expected_task_version,
+            "reason": "This Task is no longer needed."
         },
         "dedupe_key": key,
         "correlation_id": format!("correlation-{key}")
@@ -826,6 +854,14 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
 
     let project_proposals = [
         (
+            PROJECT_REVIEW_CONFIG_OPERATION,
+            project_proposal_arguments(
+                PROJECT_REVIEW_CONFIG_OPERATION,
+                "set_ci_steps",
+                "matrix-review-config",
+            ),
+        ),
+        (
             PROJECT_DOCUMENT_OPERATION,
             document_arguments(
                 "matrix-document",
@@ -924,6 +960,48 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
         adaptive.value
     );
     covered_operations.insert(TASK_ADAPTIVE_OPERATION.to_owned());
+
+    let cancellable = invoke_tool(
+        &project,
+        "forge_scope_propose",
+        task_arguments("matrix-cancellable-task"),
+        TASK_PROPOSE_OPERATION,
+    )
+    .await
+    .expect("cancellable Task proposal");
+    assert!(
+        !cancellable.is_error,
+        "Task proposal: {}",
+        cancellable.value
+    );
+    let cancellable_task_id = cancellable.value["result"]["domain_result"]["task_id"]
+        .as_str()
+        .expect("cancellable Task id");
+    let cancellable_task_version: i64 = sqlx::query_scalar("SELECT version FROM task WHERE id = ?")
+        .bind(cancellable_task_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("cancellable Task version");
+    let cancelled = invoke_tool(
+        &project,
+        "forge_scope_propose",
+        cancel_task_arguments(
+            "matrix-task-cancel",
+            cancellable_task_id,
+            cancellable_task_version,
+        ),
+        TASK_CANCEL_OPERATION,
+    )
+    .await
+    .expect("task.cancel composition call");
+    assert_outcome_operation(&cancelled, TASK_CANCEL_OPERATION);
+    assert!(
+        !cancelled.is_error,
+        "healthy Task cancellation should commit: {}",
+        cancelled.value
+    );
+    assert_eq!(cancelled.value["result"]["task_status"], "cancelled");
+    covered_operations.insert(TASK_CANCEL_OPERATION.to_owned());
 
     let mut human_review_workflow = services::workflow::default_workflow::default_workflow();
     let review_state = human_review_workflow
@@ -1169,6 +1247,348 @@ async fn scope_composition_drives_every_migrated_main_project_and_task_operation
         .map(|contract| contract.operation.to_owned())
         .collect::<BTreeSet<_>>();
     assert_eq!(covered_operations, expected_operations);
+}
+
+#[tokio::test]
+async fn project_agent_sets_replay_safe_default_ci_steps_without_erasing_review_policy() {
+    let fixture = fixture(false).await;
+    let project = ProjectRepo::get_by_id(&*fixture.db, PROJECT_ID)
+        .await
+        .expect("Project lookup")
+        .expect("Project exists");
+    let project = ProjectRepo::update_at_version(
+        &*fixture.db,
+        UpdateProject {
+            id: PROJECT_ID.to_owned(),
+            name: None,
+            settings: Some(
+                json!({
+                    "retry_budgets": {"review": 5},
+                    "default_review_config": {
+                        "review_prompt": "Preserve this reviewer instruction.",
+                        "requirement_ids": ["project-requirement"]
+                    }
+                })
+                .to_string(),
+            ),
+            primary_repo_id: None,
+            paused_at: None,
+            updated_at: db::now_rfc3339(),
+        },
+        project.version,
+        None,
+    )
+    .await
+    .expect("seed existing Project review policy");
+    let expected_project_version = project.version;
+    let composition = ScopeToolComposition::for_scope_with_permissions(
+        AGENT_ID,
+        fixture.project_scope.clone(),
+        None,
+        None,
+        &broad_permissions(),
+        Some(Arc::new(fixture.provider.clone())),
+    )
+    .expect("Project composition");
+    let mut arguments = review_config_arguments(
+        "project-review-config",
+        expected_project_version,
+        &[
+            "cargo test --workspace",
+            "cargo clippy --workspace --all-targets -- -D warnings",
+        ],
+    );
+    arguments["payload"]["setup_steps"] = json!(["cargo fetch --locked"]);
+
+    let first = invoke_tool(
+        &composition,
+        FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL,
+        arguments.clone(),
+        "project-review-config-first",
+    )
+    .await
+    .expect("Project review config command");
+    assert!(!first.is_error, "review config outcome: {}", first.value);
+    assert_eq!(
+        first.value["result"]["domain_result"]["project_version"],
+        expected_project_version + 1
+    );
+    assert_eq!(
+        first.value["result"]["domain_result"]["ci_steps"],
+        json!([
+            "cargo test --workspace",
+            "cargo clippy --workspace --all-targets -- -D warnings"
+        ])
+    );
+    assert_eq!(
+        first.value["result"]["domain_result"]["setup_steps"],
+        json!(["cargo fetch --locked"])
+    );
+
+    let updated = ProjectRepo::get_by_id(&*fixture.db, PROJECT_ID)
+        .await
+        .expect("updated Project lookup")
+        .expect("updated Project exists");
+    assert_eq!(updated.version, expected_project_version + 1);
+    let settings: Value = serde_json::from_str(&updated.settings).expect("Project settings JSON");
+    assert_eq!(settings["retry_budgets"]["review"], 5);
+    assert_eq!(
+        settings["default_review_config"]["review_prompt"],
+        "Preserve this reviewer instruction."
+    );
+    assert_eq!(
+        settings["default_review_config"]["requirement_ids"],
+        json!(["project-requirement"])
+    );
+    assert_eq!(
+        settings["default_review_config"]["ci_steps"],
+        json!([
+            "cargo test --workspace",
+            "cargo clippy --workspace --all-targets -- -D warnings"
+        ])
+    );
+    assert_eq!(
+        settings["default_review_config"]["setup_steps"],
+        json!(["cargo fetch --locked"])
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM agent_action WHERE operation = 'project.review_config'"
+        )
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("AgentAction count"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM command_receipt WHERE operation = 'project.review_config'"
+        )
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("command receipt count"),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT event_type FROM domain_event
+             WHERE entity_id = ? AND event_type = 'project.review_config.updated'"
+        )
+        .bind(PROJECT_ID)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("review config event"),
+        "project.review_config.updated"
+    );
+
+    let replay = invoke_tool(
+        &composition,
+        FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL,
+        arguments.clone(),
+        "project-review-config-replay",
+    )
+    .await
+    .expect("Project review config replay");
+    assert!(!replay.is_error, "replay outcome: {}", replay.value);
+    assert_eq!(replay.value["result"]["replayed"], true);
+    assert_eq!(
+        replay.value["result"]["receipt_id"],
+        first.value["result"]["receipt_id"]
+    );
+    assert_eq!(
+        ProjectRepo::get_by_id(&*fixture.db, PROJECT_ID)
+            .await
+            .expect("replayed Project lookup")
+            .expect("replayed Project exists")
+            .version,
+        expected_project_version + 1
+    );
+
+    let stale = invoke_tool(
+        &composition,
+        FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL,
+        review_config_arguments(
+            "project-review-config-stale",
+            expected_project_version,
+            &["cargo test --workspace"],
+        ),
+        "project-review-config-stale",
+    )
+    .await
+    .expect("stale Project review config outcome");
+    assert_structured_error(&stale, PROJECT_REVIEW_CONFIG_OPERATION, "version_conflict");
+    assert_eq!(
+        stale.value["retry"]["arguments"]["expected_project_version"],
+        expected_project_version + 1
+    );
+
+    let mismatch = invoke_tool(
+        &composition,
+        FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL,
+        review_config_arguments(
+            "project-review-config",
+            expected_project_version,
+            &["cargo test -p services"],
+        ),
+        "project-review-config-mismatch",
+    )
+    .await
+    .expect("Project review config idempotency outcome");
+    assert_structured_error(
+        &mismatch,
+        PROJECT_REVIEW_CONFIG_OPERATION,
+        "idempotency_conflict",
+    );
+
+    let current = invoke_tool(
+        &composition,
+        FORGE_PROJECT_ORCHESTRATION_READ_TOOL,
+        json!({"operation": PROJECT_CURRENT_STATE_OPERATION, "arguments": {"limit": 10}}),
+        "project-review-config-current-state",
+    )
+    .await
+    .expect("Project current state");
+    assert!(
+        !current.is_error,
+        "current-state outcome: {}",
+        current.value
+    );
+    assert_eq!(
+        current.value["result"]["effective_state"]["project"]["default_review_ci_steps"],
+        json!([
+            "cargo test --workspace",
+            "cargo clippy --workspace --all-targets -- -D warnings"
+        ])
+    );
+    assert_eq!(
+        current.value["result"]["effective_state"]["project"]["default_review_setup_steps"],
+        json!(["cargo fetch --locked"])
+    );
+}
+
+#[tokio::test]
+async fn project_task_cancel_is_scoped_versioned_and_outcome_idempotent() {
+    let fixture = fixture(true).await;
+    let project = ScopeToolComposition::for_scope_with_permissions(
+        AGENT_ID,
+        fixture.project_scope.clone(),
+        None,
+        None,
+        &broad_permissions(),
+        Some(Arc::new(fixture.provider.clone())),
+    )
+    .expect("Project composition");
+    let proposed = invoke_tool(
+        &project,
+        "forge_scope_propose",
+        task_arguments("cancel-versioned-task"),
+        TASK_PROPOSE_OPERATION,
+    )
+    .await
+    .expect("Task proposal");
+    assert!(!proposed.is_error, "Task proposal: {}", proposed.value);
+    let task_id = proposed.value["result"]["domain_result"]["task_id"]
+        .as_str()
+        .expect("Task id")
+        .to_owned();
+    let original_version: i64 = sqlx::query_scalar("SELECT version FROM task WHERE id = ?")
+        .bind(&task_id)
+        .fetch_one(fixture.db.pool())
+        .await
+        .expect("Task version");
+    sqlx::query(
+        "UPDATE task SET priority = priority + 1, version = version + 1, updated_at = ? WHERE id = ?",
+    )
+    .bind(db::now_rfc3339())
+    .bind(&task_id)
+    .execute(fixture.db.pool())
+    .await
+    .expect("concurrent Task update");
+    let current_version = original_version + 1;
+
+    let stale = invoke_tool(
+        &project,
+        "forge_scope_propose",
+        cancel_task_arguments("cancel-stale", &task_id, original_version),
+        TASK_CANCEL_OPERATION,
+    )
+    .await
+    .expect("stale cancellation is structured");
+    assert_structured_error(&stale, TASK_CANCEL_OPERATION, "version_conflict");
+    assert_eq!(
+        stale.value["current_version_or_revision"]["resource_type"],
+        "task"
+    );
+    assert_eq!(
+        stale.value["current_version_or_revision"]["version"],
+        current_version
+    );
+    assert_eq!(
+        stale.value["retry"]["arguments"]["expected_task_version"],
+        current_version
+    );
+
+    let other_project_id = "scope-composition-other-project";
+    ProjectRepo::create(
+        &*fixture.db,
+        CreateProject {
+            id: other_project_id.to_owned(),
+            name: "Other Project".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some(USER_ID.to_owned()),
+            created_at: NOW.to_owned(),
+            updated_at: NOW.to_owned(),
+        },
+    )
+    .await
+    .expect("other Project");
+    let other_task = TaskService::new(Arc::clone(&fixture.db), Arc::new(EventBus::new(16)))
+        .create_task(
+            other_project_id,
+            "Other Project Task",
+            None,
+            None,
+            None,
+            Some("planning_task".to_owned()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("other Project Task");
+    let cross_project = invoke_tool(
+        &project,
+        "forge_scope_propose",
+        cancel_task_arguments("cancel-cross-project", &other_task.id, other_task.version),
+        TASK_CANCEL_OPERATION,
+    )
+    .await
+    .expect("cross-Project cancellation is structured");
+    assert_structured_error(&cross_project, TASK_CANCEL_OPERATION, "not_found");
+
+    let cancelled = invoke_tool(
+        &project,
+        "forge_scope_propose",
+        cancel_task_arguments("cancel-current", &task_id, current_version),
+        TASK_CANCEL_OPERATION,
+    )
+    .await
+    .expect("current cancellation");
+    assert!(!cancelled.is_error, "cancellation: {}", cancelled.value);
+    assert_eq!(cancelled.value["result"]["task_status"], "cancelled");
+
+    let retry = invoke_tool(
+        &project,
+        "forge_scope_propose",
+        cancel_task_arguments("cancel-current", &task_id, current_version),
+        TASK_CANCEL_OPERATION,
+    )
+    .await
+    .expect("response-loss retry");
+    assert!(!retry.is_error, "cancellation retry: {}", retry.value);
+    assert_eq!(retry.value["result"]["task_status"], "cancelled");
 }
 
 #[tokio::test]

@@ -833,6 +833,37 @@ async fn run_ci_steps_skips_when_ci_steps_empty() {
 }
 
 #[tokio::test]
+async fn run_ci_steps_skips_project_implementation_checks_for_discovery_tasks() {
+    let mut ctx = build_test_ctx(
+        "task-run-review-read-only",
+        default_states::IN_PROGRESS,
+        default_states::REVIEW,
+        None,
+    )
+    .await;
+    sqlx::query("UPDATE task SET task_type = 'discovery' WHERE id = ?")
+        .bind(&ctx.task_id)
+        .execute(ctx.db.pool())
+        .await
+        .expect("Task kind updates");
+    ctx.state_config = json!({ "ci_steps": ["false"] });
+
+    let result = RunCiSteps.execute(&ctx).await;
+
+    match result {
+        HookResult::Skipped { reason } => assert!(reason.contains("read-only Task")),
+        other => panic!("expected read-only skip, got {other:?}"),
+    }
+    assert!(
+        ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
+            .await
+            .expect("reviews load")
+            .is_empty(),
+        "a read-only Task must not create an implementation CI review attempt"
+    );
+}
+
+#[tokio::test]
 async fn run_ci_steps_skips_when_workspace_missing() {
     let mut ctx = build_test_ctx(
         "task-run-review-no-workspace",
@@ -932,7 +963,8 @@ async fn run_ci_steps_pass_then_dispatches_reviewer() {
         .expect("reviewer executor spawned in time")
         .expect("reviewer execution context received");
     assert_eq!(execution_ctx.task_id, ctx.task_id);
-    assert!(execution_ctx.description.contains("===REVIEW: PASS==="));
+    // The shell reviewer receives the frozen contract instead of a canned verdict.
+    assert!(execution_ctx.description.contains("FORGE_REVIEW_CONTRACT"));
     assert_eq!(
         ExecutionRepo::count_by_task_and_role(&*ctx.db, &ctx.task_id, default_roles::REVIEWER)
             .await
@@ -942,7 +974,7 @@ async fn run_ci_steps_pass_then_dispatches_reviewer() {
 }
 
 #[tokio::test]
-async fn merge_fix_re_review_runs_ci_only_and_skips_reviewer() {
+async fn merge_fix_re_review_still_requires_an_assigned_reviewer() {
     let agent_id = "agent-reviewer-ci-only";
     let mut harness = build_role_dispatch_harness(
         "task-run-ci-reviewer-ci-only",
@@ -967,25 +999,27 @@ async fn merge_fix_re_review_runs_ci_only_and_skips_reviewer() {
     let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
         .await
         .expect("reviews load");
+    // Content changed under the merge fix, so a passing CI run no longer
+    // substitutes for the assigned reviewer's conformance assessment.
     assert_eq!(reviews.len(), 1);
-    assert_eq!(reviews[0].status, ReviewStatus::Passed);
-    assert!(reviews[0].step_results_json.contains("pass_ci_only"));
+    assert_eq!(reviews[0].status, ReviewStatus::Running);
+    assert!(!reviews[0].step_results_json.contains("pass_ci_only"));
 
     let dispatch_result = DispatchRoleAgent.execute(&ctx).await;
-    match dispatch_result {
-        HookResult::Skipped { reason } => assert_eq!(reason, "review already passed CI-only"),
-        other => panic!("expected skipped dispatch, got {other:?}"),
-    }
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(100), harness.rx.recv())
-            .await
-            .is_err()
+        matches!(dispatch_result, HookResult::Ok),
+        "{dispatch_result:?}"
     );
+    let execution_ctx = tokio::time::timeout(std::time::Duration::from_secs(1), harness.rx.recv())
+        .await
+        .expect("reviewer executor spawned in time")
+        .expect("reviewer execution context received");
+    assert_eq!(execution_ctx.task_id, ctx.task_id);
     assert_eq!(
         ExecutionRepo::count_by_task_and_role(&*ctx.db, &ctx.task_id, default_roles::REVIEWER)
             .await
             .expect("reviewer execution count loads"),
-        0
+        1
     );
 }
 
@@ -2057,6 +2091,34 @@ async fn no_reviewer_assigned_auto_cascade_to_merging() {
 
     let cascade_result = super::AutoCascadeOnUnconfiguredReview.execute(&ctx).await;
     match cascade_result {
+        HookResult::Cascade { to, reason } => {
+            assert_eq!(to, default_states::MERGING);
+            assert!(reason.contains("no checks or reviewer"));
+        }
+        other => panic!("expected cascade to merging, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn read_only_task_without_reviewer_ignores_implementation_checks_and_cascades() {
+    let task_id = new_uuid_v4();
+    let mut ctx = build_test_ctx(
+        &task_id,
+        default_states::IN_PROGRESS,
+        default_states::REVIEW,
+        None,
+    )
+    .await;
+    sqlx::query("UPDATE task SET task_type = 'planning_task' WHERE id = ?")
+        .bind(&ctx.task_id)
+        .execute(ctx.db.pool())
+        .await
+        .expect("Task kind updates");
+    ctx.state_config = json!({"ci_steps":["false"]});
+
+    let cascade = super::AutoCascadeOnUnconfiguredReview.execute(&ctx).await;
+
+    match cascade {
         HookResult::Cascade { to, reason } => {
             assert_eq!(to, default_states::MERGING);
             assert!(reason.contains("no checks or reviewer"));

@@ -1,7 +1,7 @@
 use crate::{Result, ServiceError};
 use db::{
-    now_rfc3339, Execution, ExecutionRepo, PageRequest, RepoRepo, SortBy, SortOrder, SqliteDb,
-    TaskRepo, WorkMode, WorkspaceRepo,
+    now_rfc3339, Execution, ExecutionRepo, PageRequest, RepoRepo, ReviewConformanceRepo, SortBy,
+    SortOrder, SqliteDb, TaskRepo, WorkMode, WorkspaceRepo,
 };
 use events::EventBus;
 use serde::{Deserialize, Serialize};
@@ -16,10 +16,14 @@ pub struct MergeService {
     db: Arc<SqliteDb>,
     event_bus: Arc<EventBus>,
     workspace_root: PathBuf,
+    integration_locks: workspace::RepoCacheLockManager,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeOutcome {
+    ReviewRequired {
+        reason: String,
+    },
     Done {
         before_sha: String,
         after_sha: String,
@@ -57,6 +61,7 @@ impl MergeService {
             db,
             event_bus,
             workspace_root,
+            integration_locks: workspace::RepoCacheLockManager::new(),
         }
     }
 
@@ -106,6 +111,8 @@ impl MergeService {
         let repo_path = Path::new(&repo_source);
         let worktree_path = Path::new(&workspace.worktree_path);
 
+        let _integration_lock = self.integration_locks.acquire(repo_id).await;
+
         if !git::is_worktree_clean(worktree_path).await? {
             return Ok(MergeOutcome::Dirty {
                 files: git::status_porcelain(worktree_path).await?,
@@ -142,9 +149,58 @@ impl MergeService {
         )
         .await?;
 
+        let review_guard = match self.db.lock_review_integration(&task_id).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return Ok(MergeOutcome::ReviewRequired {
+                    reason: error.to_string(),
+                })
+            }
+        };
+        let reviewed_sha = review_guard
+            .contract
+            .as_ref()
+            .map(|contract| contract.commit_sha.clone());
+        if let Some(contract) = &review_guard.contract {
+            let target_sha = ::review::contract::git_read(
+                repo_path,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    &format!("refs/heads/{target_branch}"),
+                ],
+            )
+            .await
+            .map_err(ServiceError::invalid_operation)?;
+            let current_sha = git::get_current_sha(worktree_path).await?;
+            if contract.commit_sha != current_sha || contract.base_sha != target_sha.trim() {
+                return Ok(MergeOutcome::ReviewRequired {
+                    reason: "reviewed commit or integration target changed; fresh review required"
+                        .into(),
+                });
+            }
+        }
         git::checkout_branch(repo_path, &target_branch).await?;
         let task_branch = workspace::task_branch_name(&task_id);
-        match git::merge_branch_into(repo_path, &task_branch).await {
+        let merged = if let Some(sha) = reviewed_sha {
+            // Integrate the immutable reviewed object. Fast-forward refuses to
+            // synthesize an unreviewed merge tree if target ancestry changed.
+            let result =
+                ::review::contract::git_read(repo_path, &["merge", "--ff-only", &sha]).await;
+            if result.is_ok() && git::get_current_sha(repo_path).await? != sha {
+                return Ok(MergeOutcome::ReviewRequired { reason: "integration target changed during merge; reviewed content was not integrated".into() });
+            }
+            review_guard.release().await?;
+            match result {
+                Ok(_) => Ok(()),
+                Err(reason) => return Ok(MergeOutcome::ReviewRequired { reason }),
+            }
+        } else {
+            let result = git::merge_branch_into(repo_path, &task_branch).await;
+            review_guard.release().await?;
+            result
+        };
+        match merged {
             Ok(()) => {
                 let after_sha = git::get_current_sha(repo_path).await?;
                 ExecutionRepo::update(
@@ -228,7 +284,42 @@ impl MergeService {
             });
         }
 
-        push_branch(worktree_path, &source_branch).await?;
+        let _integration_lock = self.integration_locks.acquire(repo_id).await;
+        let guard = match self.db.lock_review_integration(&task_id).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return Ok(MergeOutcome::ReviewRequired {
+                    reason: error.to_string(),
+                })
+            }
+        };
+        let candidate = if let Some(contract) = &guard.contract {
+            let head = git::get_current_sha(worktree_path).await?;
+            if head != contract.commit_sha {
+                return Ok(MergeOutcome::ReviewRequired {
+                    reason: "PR candidate changed since review".into(),
+                });
+            }
+            Some(contract.commit_sha.clone())
+        } else {
+            None
+        };
+        // Remote publication is not local integration. Push the exact accepted
+        // object, then recheck authority before recording the PR publication.
+        guard.release().await?;
+        let refspec = candidate
+            .as_ref()
+            .map(|sha| format!("{sha}:refs/heads/{source_branch}"));
+        push_branch(worktree_path, refspec.as_deref().unwrap_or(&source_branch)).await?;
+        let guard = match self.db.lock_review_integration(&task_id).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return Ok(MergeOutcome::ReviewRequired {
+                    reason: error.to_string(),
+                })
+            }
+        };
+        guard.release().await?;
         let pr_service = crate::pr_service::PrService::new(Arc::clone(&self.db));
         let published = pr_service
             .publish_pr(&task, &repo, &source_branch, &target_branch)
@@ -628,6 +719,114 @@ mod tests {
             .expect("execution exists");
         assert_eq!(execution.before_sha, Some(worktree_sha.clone()));
         assert_eq!(execution.after_sha, Some(worktree_sha));
+    }
+
+    #[tokio::test]
+    async fn conformance_merge_refuses_changed_candidate_target_policy_and_legacy_pass() {
+        for changed in ["none", "candidate", "target", "policy", "legacy"] {
+            let db = sqlite_db().await;
+            let temp = TempDir::new().unwrap();
+            let repo = setup_repo(&temp).await;
+            let task_id = new_uuid_v4();
+            let worktree = temp.path().join("worktree");
+            git::create_worktree(&repo, &workspace::task_branch_name(&task_id), &worktree)
+                .await
+                .unwrap();
+            std::fs::write(worktree.join("feature.txt"), "reviewed\n").unwrap();
+            let accepted_sha = git::commit_all(&worktree, "candidate").await.unwrap();
+            let execution_id = seed_merge_rows(&db, &repo, &worktree, &task_id).await;
+            sqlx::query("INSERT INTO task_role_assignment(id,task_id,role_name,assignee_type,assignee_id,created_at,updated_at) VALUES ('reviewer-role',?,'reviewer','agent','reviewer','now','now')")
+                .bind(&task_id).execute(db.pool()).await.unwrap();
+            let conformance = if changed == "legacy" {
+                api_types::ReviewConformance::default()
+            } else {
+                sqlx::query("UPDATE execution SET status='running' WHERE id=?")
+                    .bind(&execution_id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                let contract = ::review::contract::admit(&db, &execution_id, &task_id, &worktree)
+                    .await
+                    .unwrap();
+                let report = serde_json::json!({"contract_digest":contract.digest,"verdict":"pass","findings":[],
+                    "requirements":contract.context.requirements.iter().map(|r|serde_json::json!({"requirement_id":r.id,"disposition":"satisfied","rationale":"Feature exists", "evidence":[{"kind":"file","path":"feature.txt","commit_sha":accepted_sha,"start_line":1,"end_line":1}]})).collect::<Vec<_>>()});
+                let result = ::review::contract::evaluate(
+                    &db,
+                    &execution_id,
+                    &worktree,
+                    &report.to_string(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.status, api_types::ConformanceStatus::Passed);
+                sqlx::query("UPDATE execution SET status='completed' WHERE id=?")
+                    .bind(&execution_id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                result
+            };
+            let now = now_rfc3339();
+            let review = db::ReviewRepo::create(
+                &*db,
+                db::CreateReview {
+                    id: new_uuid_v4(),
+                    task_id: task_id.clone(),
+                    execution_id,
+                    attempt_number: 1,
+                    status: db::ReviewStatus::Running,
+                    step_results_json: "{}".into(),
+                    started_at: now.clone(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            db::ReviewRepo::update_status(
+                &*db,
+                &review.id,
+                db::ReviewStatus::Passed,
+                serde_json::json!({"ci_steps":[],"conformance":conformance}).to_string(),
+                Some(now.clone()),
+                &now,
+            )
+            .await
+            .unwrap();
+            match changed {
+                "candidate" => {
+                    std::fs::write(worktree.join("feature.txt"), "unreviewed\n").unwrap();
+                    git::commit_all(&worktree, "repair").await.unwrap();
+                }
+                "target" => {
+                    std::fs::write(repo.join("target.txt"), "new target\n").unwrap();
+                    git::commit_all(&repo, "target moved").await.unwrap();
+                }
+                "policy" => {
+                    sqlx::query("UPDATE task SET task_state_config=? WHERE id=?")
+                        .bind(r#"{"review":{"ci_steps":["false"]}}"#)
+                        .bind(&task_id)
+                        .execute(db.pool())
+                        .await
+                        .unwrap();
+                }
+                _ => {}
+            }
+            let before = git::get_current_sha(&repo).await.unwrap();
+            let service =
+                MergeService::new(db.clone(), Arc::new(EventBus::new(16)), temp.path().into());
+            let outcome = service.merge(task_id).await.unwrap();
+            if changed == "none" {
+                assert!(matches!(outcome, MergeOutcome::Done { .. }), "{outcome:?}");
+                assert_eq!(git::get_current_sha(&repo).await.unwrap(), accepted_sha);
+            } else {
+                assert!(
+                    matches!(outcome, MergeOutcome::ReviewRequired { .. }),
+                    "{changed}: {outcome:?}"
+                );
+                assert_eq!(git::get_current_sha(&repo).await.unwrap(), before);
+            }
+        }
     }
 
     #[tokio::test]

@@ -3,4 +3,4 @@ import type { InitialRoleAssignment } from "./InitialRoleAssignment";
 import type { TaskGovernanceRequest } from "./TaskGovernanceRequest";
 import type { TaskType } from "./TaskType";
 
-export type TaskProposalRequest = { project_id: string, title: string, description: string | null, parent_task_id: string | null, priority: bigint | null, task_type: TaskType | null, task_state_config: string | null, merge_config: Record<string, unknown> | null, role_assignments: Array<InitialRoleAssignment> | null, governance: TaskGovernanceRequest | null, dedupe_key: string, correlation_id: string, causation_id: string | null, causation_depth: bigint | null, };
+export type TaskProposalRequest = { project_id: string, title: string, description: string | null, parent_task_id: string | null, priority: bigint | null, task_type: TaskType | null, task_state_config: string | null, review_requirement_ids: Array<string>, merge_config: Record<string, unknown> | null, role_assignments: Array<InitialRoleAssignment> | null, governance: TaskGovernanceRequest | null, dedupe_key: string, correlation_id: string, causation_id: string | null, causation_depth: bigint | null, };

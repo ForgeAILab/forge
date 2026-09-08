@@ -1,11 +1,7 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
 mod common;
 
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use api::{build_router, AppState};
 use api_types::{
@@ -27,11 +23,11 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn forge_happy_path_end_to_end() {
-    let repo_dir = TestDir::new("forge-happy-repo");
+    let repo_dir = common::TestDir::new("forge-happy-repo");
     let repo_path = setup_git_repo(repo_dir.path()).await;
     let default_branch = run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"]);
 
-    let workspaces_root = TestDir::new("forge-happy-workspaces");
+    let workspaces_root = common::TestDir::new("forge-happy-workspaces");
     let harness = test_app(workspaces_root.path()).await;
     let mut events_rx = harness.event_bus.subscribe();
 
@@ -102,7 +98,15 @@ async fn forge_happy_path_end_to_end() {
         &format!("/api/v1/projects/{project_id}/tasks"),
         json!({ "title": "Happy path task",
             "description": "echo hello > greeting.txt && git add . && git commit -m 'hi'",
-            "review_config": { "ci_steps": ["test -f greeting.txt"] }
+            "review_config": { "ci_steps": ["test -f greeting.txt"], "review_prompt": r#"python3 - <<'PY'
+import json, os
+c = json.loads(os.environ['FORGE_REVIEW_CONTRACT'])
+print(json.dumps({'contract_digest': c['digest'], 'verdict': 'pass',
+  'requirements': [{'requirement_id': r['id'], 'disposition': 'satisfied',
+    'rationale': 'The configured check verifies the greeting deliverable',
+    'evidence': [{'kind': 'check', 'check_id': 'ci:0'}]} for r in c['context']['requirements']],
+  'findings': []}))
+PY"# }
         }),
         StatusCode::OK,
     )
@@ -213,10 +217,10 @@ async fn forge_happy_path_end_to_end() {
 
 #[tokio::test]
 async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject() {
-    let repo_dir = TestDir::new("forge-autonomous-repo");
+    let repo_dir = common::TestDir::new("forge-autonomous-repo");
     let repo_path = setup_git_repo(repo_dir.path()).await;
     let default_branch = run_git(&repo_path, &["symbolic-ref", "--short", "HEAD"]);
-    let workspaces_root = TestDir::new("forge-autonomous-workspaces");
+    let workspaces_root = common::TestDir::new("forge-autonomous-workspaces");
     let harness = test_app(workspaces_root.path()).await;
     harness
         .state
@@ -455,7 +459,7 @@ struct TestHarness {
     app: Router,
     state: Arc<AppState>,
     event_bus: Arc<EventBus>,
-    _web_dist_dir: TestDir,
+    _web_dist_dir: common::TestDir,
 }
 
 async fn test_app(workspace_root: &Path) -> TestHarness {
@@ -518,7 +522,7 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
     state = state.with_effective_config(config);
     let state = Arc::new(state);
 
-    let web_dist_dir = TestDir::new("forge-happy-web");
+    let web_dist_dir = common::TestDir::new("forge-happy-web");
     std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>").expect("write index");
     let app = build_router((*state).clone(), web_dist_dir.path().to_path_buf());
 
@@ -733,8 +737,8 @@ async fn poll_until_execution_completed(db: &Arc<db::SqliteDb>, execution_id: &s
             }
             if execution.status != db::ExecutionStatus::Running {
                 panic!(
-                    "execution ended in unexpected status: {:?}",
-                    execution.status
+                    "execution ended in unexpected status: {:?}; error: {:?}",
+                    execution.status, execution.error
                 );
             }
         }
@@ -1011,26 +1015,4 @@ fn run_git(path: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
-}
-
-struct TestDir {
-    path: PathBuf,
-}
-
-impl TestDir {
-    fn new(prefix: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&path).expect("temp dir creates");
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
 }

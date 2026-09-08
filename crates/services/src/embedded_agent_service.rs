@@ -1821,14 +1821,7 @@ impl EmbeddedAgentService {
                 .any(|execution| {
                     execution.status == ExecutionStatus::Running
                         && execution.agent_id.as_deref() == Some(identity.id.as_str())
-                        && match role.as_str() {
-                            "reviewer" => execution.role == default_roles::REVIEWER,
-                            "planner" => execution.role == default_roles::PLANNER,
-                            _ => matches!(
-                                execution.role.as_str(),
-                                default_roles::WORKER | default_roles::CODER
-                            ),
-                        }
+                        && execution_role_serves_task_role(&execution.role, role.as_str())
                 });
                 // The durable claim marker is either the Task-level assignee
                 // (interactive claim path) or the role-table assignment the
@@ -2638,6 +2631,21 @@ fn redacted_host_error(error: forge_agent_host::AgentHostError) -> ServiceError 
     }
 }
 
+/// Whether an execution row can back a native session claiming `task_role`.
+///
+/// The reviewer role covers both the review runner's own `reviewer` execution
+/// and the `auditor` child execution it spawns for the conformance pass.
+fn execution_role_serves_task_role(execution_role: &str, task_role: &str) -> bool {
+    match task_role {
+        "reviewer" => matches!(
+            execution_role,
+            default_roles::REVIEWER | default_roles::AUDITOR
+        ),
+        "planner" => execution_role == default_roles::PLANNER,
+        _ => matches!(execution_role, default_roles::WORKER | default_roles::CODER),
+    }
+}
+
 fn task_role_admitted_by_workflow(active_role: Option<&str>, requested_role: &str) -> bool {
     match requested_role {
         "reviewer" => active_role == Some(default_roles::REVIEWER),
@@ -2933,6 +2941,37 @@ mod tests {
         let scope = BTreeSet::from(["read_project".to_owned()]);
         assert!(intersect_non_empty_layers(&[account.clone(), malformed, scope]).is_empty());
         assert!(intersect_non_empty_layers(&[account, BTreeSet::new()]).is_empty());
+    }
+
+    #[test]
+    fn the_reviewer_role_is_served_by_its_auditor_execution() {
+        // The review runner's conformance pass runs as an `auditor` execution
+        // under the reviewer role assignment; refusing it stranded every
+        // native reviewer at session authorization.
+        assert!(execution_role_serves_task_role(
+            default_roles::AUDITOR,
+            "reviewer"
+        ));
+        assert!(execution_role_serves_task_role(
+            default_roles::REVIEWER,
+            "reviewer"
+        ));
+        assert!(!execution_role_serves_task_role(
+            default_roles::AUDITOR,
+            "worker"
+        ));
+        assert!(!execution_role_serves_task_role(
+            default_roles::CODER,
+            "reviewer"
+        ));
+        assert!(execution_role_serves_task_role(
+            default_roles::CODER,
+            "worker"
+        ));
+        assert!(execution_role_serves_task_role(
+            default_roles::PLANNER,
+            "planner"
+        ));
     }
 
     #[test]

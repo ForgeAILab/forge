@@ -60,6 +60,18 @@ pub async fn load_agent_dispatch_context(
         .and_then(|execution| execution.logs_path.clone());
     let latest_review_context = latest_failed_review_context(db.as_ref(), &prior_reviews).await?;
     let plan = task.plan.clone();
+    let capability_class = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT capability_class FROM project_task_governance WHERE task_id = ?",
+    )
+    .bind(&task.id)
+    .fetch_optional(db.pool())
+    .await?
+    .flatten();
+    let read_only_task = crate::execution_setup::classify_task_execution(
+        &task.task_type,
+        capability_class.as_deref(),
+    )?
+    .is_read_only();
 
     Ok(AgentDispatchContext {
         task,
@@ -78,6 +90,7 @@ pub async fn load_agent_dispatch_context(
         latest_review_feedback: latest_review_context.feedback,
         latest_review_execution_id: latest_review_context.execution_id,
         latest_review_logs_path: latest_review_context.logs_path,
+        read_only_task,
     })
 }
 
@@ -225,14 +238,18 @@ async fn reviewer_final_message(execution: &db::Execution) -> Result<Option<Stri
             continue;
         };
         match entry.kind {
-            LogKind::Assistant | LogKind::AssistantDelta => {
-                append_log_text(&entry.payload, &mut message);
+            LogKind::Assistant => {
+                let mut candidate = String::new();
+                append_log_text(&entry.payload, &mut candidate);
+                if !candidate.trim().is_empty() {
+                    message = candidate;
+                }
             }
             LogKind::SessionInfo
                 if entry.payload.get("subtype").and_then(Value::as_str) == Some("success") =>
             {
                 if let Some(result) = entry.payload.get("result").and_then(Value::as_str) {
-                    message.push_str(result);
+                    message = result.to_owned();
                 }
             }
             LogKind::Stdout => {

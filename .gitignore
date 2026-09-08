@@ -60,3 +60,8 @@ crates/api-types/bindings/ProjectHook*.ts
 
 # Local sibling override for coordinated Agent Runtime development.
 /.cargo/
+
+# Local verification output and test-data backups (never committed)
+/artifacts/
+/test-archives/
+/test-backup-*/
