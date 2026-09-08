@@ -372,6 +372,7 @@ async fn connected_remote_daemon_lists_via_command_socket() {
     state
         .daemon_connections
         .register(registration.daemon_id.clone(), connection);
+    common::fake_daemon::accept_daemon_protocol_handshake(&state, &registration.daemon_id);
     assert!(state
         .daemon_connections
         .is_connected(&registration.daemon_id));
@@ -501,6 +502,7 @@ async fn connected_remote_daemon_receives_execution_start_request() {
     state
         .daemon_connections
         .register(registration.daemon_id.clone(), connection);
+    common::fake_daemon::accept_daemon_protocol_handshake(&state, &registration.daemon_id);
 
     let fixture =
         seed_startable_execution_for_daemon(&state, &registration.daemon_id, "echo remote").await;
@@ -566,6 +568,7 @@ async fn remote_execution_start_error_marks_execution_failed() {
     state
         .daemon_connections
         .register(registration.daemon_id.clone(), connection);
+    common::fake_daemon::accept_daemon_protocol_handshake(&state, &registration.daemon_id);
 
     let fixture =
         seed_startable_execution_for_daemon(&state, &registration.daemon_id, "echo remote").await;
