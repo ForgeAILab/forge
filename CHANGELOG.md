@@ -6,6 +6,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-08
+
 ### Breaking
 
 - Usage and cost reporting now uses the append-only provider-attempt ledger and
