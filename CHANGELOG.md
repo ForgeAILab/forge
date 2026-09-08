@@ -52,6 +52,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- A user cancel and the recovery reaper can stop an execution whose owner lease
+  has expired. The ledger terminal CAS demanded a live `lease_expires_at` from
+  every caller rather than only from a remote owner proving it still holds the
+  execution, so the one state those two callers exist to clear was the one they
+  could never win: `POST /api/v1/executions/{id}/cancel` answered `200` with the
+  execution still running, and the expiry monitor skipped the reap. Liveness is
+  now proven only by a remote owner reporting its own terminal outcome, and a
+  stop that never reaches the row returns `409 version_conflict` instead of a
+  no-op that looks like success.
 - Pricing admission and the runtime now derive one candidate identity. Admission
   hashed the snapshot's resolved `config` block while the embedded runtime hashed
   the whole in-flight snapshot — which carries the Task role marker, the

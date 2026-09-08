@@ -1942,6 +1942,15 @@ pub struct TerminalizeExecutionWithLedger {
     /// terminal report after this domain transition. Keep started/pending
     /// invocations pending instead of closing them as an unmetered result.
     pub preserve_pending_settlement: bool,
+    /// True only for a remote owner reporting its own terminal outcome. Such a
+    /// caller must prove a live lease and hard deadline at the same CAS
+    /// boundary, so a daemon cannot terminalize an execution it no longer owns.
+    ///
+    /// Local callers — a user cancel, the recovery reaper, the in-process
+    /// runner — are the authority that revokes a lease rather than a holder
+    /// proving one, and an expired lease is the state they exist to clear.
+    /// They must not be held to the owner's liveness proof.
+    pub require_live_owner_lease: bool,
 }
 
 /// Durable identity for a remote terminal report. The report id is globally

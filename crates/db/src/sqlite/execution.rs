@@ -977,29 +977,25 @@ impl ExecutionRepo for SqliteDb {
         query.push_bind(terminal.expected_version);
         if let Some(owner) = terminal.lease_owner.as_deref() {
             query.push(" AND lease_owner = ").push_bind(owner);
-            query.push(
-                " AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) > julianday(",
-            );
-            query.push_bind(&terminal.updated_at);
-            query.push(")");
-            // Remote terminal callers are identified by the server-owned
-            // daemon lease token. They must prove both bounded lease fields at
-            // the same CAS boundary; accepting a missing hard deadline would
-            // let a malformed/legacy row terminalize after its owner proof
-            // has expired. Local/recovery callers retain the historical
-            // nullable hard-deadline semantics.
-            if owner.starts_with("daemon:") {
+            // Only a remote owner reporting its own outcome proves liveness
+            // here; see `require_live_owner_lease`. The lease token alone
+            // cannot stand in for that intent, because a local caller carries
+            // whatever owner the row already holds — including a daemon token.
+            // Gating on the token instead left every expired lease
+            // un-terminalizable by the two callers that exist to clear one: a
+            // user cancel and the recovery reaper both lost the CAS forever,
+            // and reported the untouched running row as success.
+            if input.require_live_owner_lease {
+                query.push(
+                    " AND lease_expires_at IS NOT NULL AND julianday(lease_expires_at) > julianday(",
+                );
+                query.push_bind(&terminal.updated_at);
+                query.push(")");
                 query.push(
                     " AND hard_deadline_at IS NOT NULL AND julianday(hard_deadline_at) > julianday(",
                 );
                 query.push_bind(&terminal.updated_at);
                 query.push(")");
-            } else {
-                query.push(
-                    " AND (hard_deadline_at IS NULL OR julianday(hard_deadline_at) > julianday(",
-                );
-                query.push_bind(&terminal.updated_at);
-                query.push("))");
             }
         }
 

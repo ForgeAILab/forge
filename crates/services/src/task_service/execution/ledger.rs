@@ -1802,6 +1802,7 @@ pub(crate) fn terminal_with_ledger(
         mark_unreplayable_pending_unsettled: false,
         allow_late_settlement: false,
         preserve_pending_settlement: false,
+        require_live_owner_lease: false,
     }
 }
 
@@ -1818,6 +1819,9 @@ pub(crate) fn terminal_with_late_ledger(
         terminal_report_digest,
     );
     input.allow_late_settlement = true;
+    // The remote owner is reporting its own terminal outcome, so it proves a
+    // live lease and hard deadline in the same CAS.
+    input.require_live_owner_lease = true;
     input
 }
 

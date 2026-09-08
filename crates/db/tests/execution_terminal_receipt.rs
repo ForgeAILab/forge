@@ -307,6 +307,7 @@ fn terminal_input(
         mark_unreplayable_pending_unsettled: false,
         allow_late_settlement: false,
         preserve_pending_settlement: false,
+        require_live_owner_lease: false,
     }
 }
 
@@ -409,6 +410,7 @@ async fn expired_remote_lease_cannot_terminalize_or_create_ledger_rows() {
         &"e".repeat(64),
     );
     terminal.terminal.lease_owner = Some("daemon:expired-daemon:connection:7".to_owned());
+    terminal.require_live_owner_lease = true;
     terminal.terminal.updated_at = "2026-09-08T00:00:01Z".to_owned();
     terminal.terminal_report_id = None;
     terminal.terminal_report_digest = None;
@@ -442,6 +444,59 @@ async fn expired_remote_lease_cannot_terminalize_or_create_ledger_rows() {
     .await
     .expect("receipt rows count");
     assert_eq!(receipt_rows, 0);
+}
+
+#[tokio::test]
+async fn expired_local_lease_still_terminalizes() {
+    // The mirror of the remote case above. A local caller — a user cancel, or
+    // the recovery reaper — is not a lease holder proving ownership; it is the
+    // authority that revokes one, and an expired lease is exactly the state it
+    // exists to clear. Holding it to the daemon's liveness proof made a
+    // stranded execution impossible to stop.
+    let db = db().await;
+    seed_base(&db).await;
+    seed_execution(&db, "expired-local-execution").await;
+    sqlx::query(
+        "UPDATE execution
+         SET lease_owner = ?, lease_expires_at = ?, hard_deadline_at = ?
+         WHERE id = ?",
+    )
+    .bind("daemon:abandoned-daemon:connection:3")
+    .bind("2026-09-08T00:00:00Z")
+    .bind("2026-09-08T00:00:00Z")
+    .bind("expired-local-execution")
+    .execute(db.pool())
+    .await
+    .expect("expired lease seeds");
+
+    let mut terminal = terminal_input(
+        "expired-local-execution",
+        "expired-local-report",
+        &"f".repeat(64),
+    );
+    // A daemon-owned row on purpose: the recovery reaper carries whatever owner
+    // the execution already holds, so gating liveness on the token would strand
+    // exactly the abandoned daemon executions it exists to reap.
+    terminal.terminal.lease_owner = Some("daemon:abandoned-daemon:connection:3".to_owned());
+    terminal.terminal.status = ExecutionStatus::Cancelled;
+    terminal.terminal.updated_at = "2026-09-08T00:00:01Z".to_owned();
+    terminal.terminal_report_id = None;
+    terminal.terminal_report_digest = None;
+    let outcome = ExecutionRepo::terminalize_with_ledger(&db, terminal)
+        .await
+        .expect("local cancellation terminalizes");
+    assert!(matches!(
+        outcome,
+        ExecutionTerminalOutcome::Committed { .. }
+    ));
+    assert_eq!(
+        ExecutionRepo::get_by_id(&db, "expired-local-execution")
+            .await
+            .expect("execution reads")
+            .expect("execution exists")
+            .status,
+        ExecutionStatus::Cancelled
+    );
 }
 
 #[tokio::test]
