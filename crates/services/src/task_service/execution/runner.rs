@@ -1562,13 +1562,40 @@ mod tests {
         (db, execution_id, lease)
     }
 
+    /// Wait for a heartbeat renewal to be durable instead of assuming a fixed
+    /// number of scheduler yields is enough for the write to land. The whole
+    /// budget is only ever spent on a failure.
+    async fn wait_for_renewed_heartbeat(
+        db: &db::SqliteDb,
+        execution_id: &str,
+        expected: &str,
+    ) -> db::Execution {
+        for _ in 0..200 {
+            let execution = ExecutionRepo::get_by_id(db, execution_id)
+                .await
+                .expect("execution reads")
+                .expect("execution exists");
+            if execution.last_heartbeat_at.as_deref() == Some(expected) {
+                return execution;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("heartbeat never renewed to {expected}");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn embedded_heartbeat_renews_without_semantic_progress_then_stops_at_deadline() {
-        // sqlx's pool acquisition timeout uses Tokio time; create the fixture
-        // on the real clock, then pause the scheduler for heartbeat cadence.
+        // Renewal writes to the database, and sqlx's pool acquire is a Tokio
+        // timer: under a paused scheduler it expires instantly whenever no
+        // connection is already idle, which downgrades the renewal to a logged
+        // transient failure and leaves `last_heartbeat_at` at T0. So run this
+        // phase on the real clock and wait for the durable write rather than
+        // yielding a fixed number of times and hoping the write got there —
+        // that is a coin flip on a saturated runner. `interval` ticks
+        // immediately and then waits a full 20s cadence, so exactly one
+        // renewal lands inside this window.
         tokio::time::resume();
         let (db, execution_id, lease) = heartbeat_fixture().await;
-        tokio::time::pause();
         let first_stop = CancellationToken::new();
         let (first_signal_tx, _first_signal_rx) = mpsc::unbounded_channel();
         let first_task = tokio::spawn(embedded_execution_heartbeat_with_clock(
@@ -1578,29 +1605,18 @@ mod tests {
             first_signal_tx,
             Arc::new(|| T1.to_owned()),
         ));
-
-        // `interval` ticks immediately, then follows the fixed server cadence.
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(20)).await;
-        tokio::task::yield_now().await;
+        let renewed = wait_for_renewed_heartbeat(&db, &execution_id, T1).await;
         first_stop.cancel();
         first_task.await.expect("heartbeat task joins");
-
-        // Read on the real clock for the same reason the fixture is built on
-        // it: a paused scheduler makes sqlx's pool-acquire deadline expire
-        // instantly whenever a connection is not already idle.
-        tokio::time::resume();
-        let renewed = ExecutionRepo::get_by_id(&*db, &execution_id)
-            .await
-            .expect("execution reads")
-            .expect("execution exists");
-        tokio::time::pause();
         assert_eq!(renewed.last_heartbeat_at.as_deref(), Some(T1));
         assert_eq!(renewed.last_progress_at, None);
         let renewed_version = renewed.execution_version;
 
         // Move the paused scheduler to the immutable hard deadline. The next
         // server tick must report the typed deadline without another renewal.
+        // This phase never touches the database before it breaks, so a paused
+        // clock is safe here.
+        tokio::time::pause();
         tokio::time::advance(Duration::from_secs(20)).await;
         let stop = CancellationToken::new();
         let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
