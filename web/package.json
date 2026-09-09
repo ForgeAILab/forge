@@ -83,7 +83,7 @@
     "globals": "^17.6.0",
     "jsdom": "^29.1.1",
     "lighthouse": "^13.4.1",
-    "postcss": "^8.5.14",
+    "postcss": "^8.5.23",
     "prettier": "^3.6.2",
     "react-doctor": "^0.8.3",
     "react-grab": "^0.1.48",
