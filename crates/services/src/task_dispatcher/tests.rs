@@ -47,6 +47,13 @@ async fn sqlite_db() -> db::SqliteDb {
 
 fn setup_git_repo(path: &Path) -> String {
     run_git(path, &["init"]);
+    // Pin the initial branch the way `git::init` does. Repository readiness
+    // requires the registered default branch to be `main` and to exist on
+    // disk, so inheriting the host's `init.defaultBranch` makes an
+    // implementation Task park on "execution setup required" wherever git
+    // still creates `master` — which is every CI runner, and no machine with
+    // an ambient `init.defaultBranch=main`.
+    run_git(path, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     run_git(path, &["config", "user.email", "test@forge.dev"]);
     run_git(path, &["config", "user.name", "Forge Test"]);
     std::fs::write(path.join("README.md"), "# Forge\n").expect("README writes");
