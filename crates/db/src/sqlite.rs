@@ -10,53 +10,57 @@ use crate::{
     AgentCommitmentTransfer, AgentHandoff, AgentHandoffRepo, AgentInboxItem, AgentInboxListQuery,
     AgentInboxRepo, AgentInquiry, AgentInquiryRepo, AgentListQuery, AgentProfile, AgentProfileRepo,
     AgentQuestion, AgentQuestionListQuery, AgentRepo, AgentStatus, AgentTaskListQuery,
-    AgentTokenBreakdown, AgentWakeDisposition, AgentWakeDispositionKind, AgentWakeDispositionRepo,
-    AnswerAgentQuestion, AppliedProjectExecutionSetupCommand, ApplyProjectExecutionSetupCommand,
+    AgentWakeDisposition, AgentWakeDispositionKind, AgentWakeDispositionRepo, AnswerAgentQuestion,
+    AppliedProjectExecutionSetupCommand, ApplyProjectExecutionSetupCommand,
     AttentionConsumerHealth, AttentionListQuery, AttentionProjection, AttentionRepo,
-    CancelAgentChatTurn, CiStepStats, ClaimDomainEvents, ClaimExecutionLease, ClaimTask,
-    ClaimedTask, CommandReceiptRepo, CompleteAgentChatControlTransfer, CompleteAgentChatTurn,
-    CompleteAgentCommitment, CompleteAgentInquiry, CompleteClaimedWake, CompleteDomainEvent,
-    CompletedAgentChatTurn, CreateAccountMainAgentBinding, CreateAgent, CreateAgentAction,
-    CreateAgentActionApproval, CreateAgentActionExecution, CreateAgentChat, CreateAgentChatMessage,
-    CreateAgentChatTurnJob, CreateAgentCommitment, CreateAgentCommitmentEvidence,
-    CreateAgentHandoff, CreateAgentIdentity, CreateAgentInboxItem, CreateAgentInquiry,
-    CreateAgentProfile, CreateAgentQuestion, CreateAgentWakeDisposition, CreateAttentionProjection,
-    CreateDomainEvent, CreateExecution, CreateNotification, CreatePrMetadata,
-    CreatePrProviderConfig, CreateProject, CreateProjectAdmissionReceipt,
+    CancelAgentChatTurn, CancelAgentChatTurnWithUsage, CancelAgentInquiryWithUsage, CiStepStats,
+    ClaimDomainEvents, ClaimExecutionLease, ClaimTask, ClaimedTask, CommandReceiptRepo,
+    CompleteAgentChatControlTransfer, CompleteAgentChatControlTransferWithUsage,
+    CompleteAgentChatTurn, CompleteAgentChatTurnWithUsage, CompleteAgentCommitment,
+    CompleteAgentInquiry, CompleteAgentInquiryWithUsage, CompleteClaimedWake, CompleteDomainEvent,
+    CompletedAgentChatTurn, CostCoverageReasonCode, CreateAccountMainAgentBinding, CreateAgent,
+    CreateAgentAction, CreateAgentActionApproval, CreateAgentActionExecution, CreateAgentChat,
+    CreateAgentChatMessage, CreateAgentChatTurnJob, CreateAgentCommitment,
+    CreateAgentCommitmentEvidence, CreateAgentHandoff, CreateAgentIdentity, CreateAgentInboxItem,
+    CreateAgentInquiry, CreateAgentProfile, CreateAgentQuestion, CreateAgentWakeDisposition,
+    CreateAttentionProjection, CreateDomainEvent, CreateExecution, CreateNotification,
+    CreatePrMetadata, CreatePrProviderConfig, CreateProject, CreateProjectAdmissionReceipt,
     CreateProjectAgentBinding, CreateProjectHookRun, CreateProjectIntegration,
     CreateProjectMediaAsset, CreateProjectMediaAttachment, CreateProjectMediaAttachmentMutation,
     CreateProjectProvisioningError, CreateProjectProvisioningOperation,
     CreateProjectReleaseMediaPin, CreateRepo, CreateReview, CreateRuntime, CreateSkill, CreateTask,
     CreateTaskComment, CreateTaskExternalLink, CreateTaskMedia, CreateTerminalSession,
-    CreateWorkspace, CreateWorkspaceLease, CurrentProjectBindingAuthority, Daemon, DaemonRepo,
-    DbError, DomainEvent, DomainEventRepo, EventConsumerCursor, EventConsumerCutover, Execution,
-    ExecutionLeaseDisposition, ExecutionLeaseMutation, ExecutionProgressWarningOutcome,
-    ExecutionRepo, ExecutionStatus, ExecutionTerminalOutcome, ExecutionUsage, ExecutionUsageRepo,
-    ExpectedAttentionSnapshot, ExternalLinkRepo, FailAgentChatTurn, IntegrationRepo, MediaAsset,
-    ModelTokenBreakdown, Notification, NotificationListQuery, NotificationRepo, Page, PageRequest,
-    ParkAgentChatTurn, PrMetadata, PrMetadataRepo, PrProviderConfig, PrProviderConfigRepo, Project,
-    ProjectAdmissionReceipt, ProjectAdmissionReceiptRepo, ProjectAgentBinding,
+    CreateUsageInvocation, CreateWorkspace, CreateWorkspaceLease, CurrentProjectBindingAuthority,
+    Daemon, DaemonRepo, DbError, DomainEvent, DomainEventRepo, EventConsumerCursor,
+    EventConsumerCutover, Execution, ExecutionLeaseDisposition, ExecutionLeaseMutation,
+    ExecutionProgressWarningOutcome, ExecutionRepo, ExecutionStatus, ExecutionTerminalOutcome,
+    ExecutionTerminalReceipt, ExpectedAttentionSnapshot, ExternalLinkRepo, FailAgentChatTurn,
+    FailAgentChatTurnWithUsage, IntegrationRepo, MarkUsageInvocationPendingSettlement, MediaAsset,
+    Notification, NotificationListQuery, NotificationRepo, Page, PageRequest, ParkAgentChatTurn,
+    ParkAgentChatTurnWithUsage, PrMetadata, PrMetadataRepo, PrProviderConfig, PrProviderConfigRepo,
+    Project, ProjectAdmissionReceipt, ProjectAdmissionReceiptRepo, ProjectAgentBinding,
     ProjectAgentBindingRepo, ProjectAnalyticsRepo, ProjectBindingCommandRepo,
     ProjectExecutionSetupCommandRepo, ProjectHookRun, ProjectHookRunRepo, ProjectHookRunStatus,
     ProjectIntegration, ProjectMediaAttachment, ProjectMediaTombstone,
     ProjectProvisioningCheckpoint, ProjectProvisioningError, ProjectProvisioningOperation,
     ProjectProvisioningRepo, ProjectReleaseMediaPin, ProjectRepo, ProjectReviewSummary,
-    ProjectTokenStats, RecordExecutionProgress, RecordExecutionProgressWarning,
-    RenewExecutionLease, ReplaceAccountMainAgentBinding, ReplaceProjectAgentBinding, Repo,
-    RepoRepo, Result, RetryAgentWakeDisposition, Review, ReviewRepo, ReviewStatus, Runtime,
-    RuntimeListQuery, RuntimeRepo, SelectAgentProfile, SetProjectAgentBindingCommand,
+    RecordExecutionProgress, RecordExecutionProgressWarning, RenewExecutionLease,
+    ReplaceAccountMainAgentBinding, ReplaceProjectAgentBinding, Repo, RepoRepo, Result,
+    RetryAgentWakeDisposition, Review, ReviewRepo, ReviewStatus, Runtime, RuntimeListQuery,
+    RuntimeRepo, SelectAgentProfile, SetProjectAgentBindingCommand, SettleUsageInvocation,
     SharedMediaRepo, Skill, SkillRepo, SoftDeleteProjectMediaAttachmentMutation, SortBy, SortOrder,
-    SurfaceTokenBreakdown, Task, TaskComment, TaskCommentRepo, TaskDependencyRepo,
-    TaskExternalLink, TaskListQuery, TaskMedia, TaskMediaRepo, TaskRepo, TaskUsageSummary,
-    TerminalSession, TerminalSessionRepo, TerminalSessionStatus, TerminalizeExecution,
+    Task, TaskComment, TaskCommentRepo, TaskDependencyRepo, TaskExternalLink, TaskListQuery,
+    TaskMedia, TaskMediaRepo, TaskRepo, TerminalSession, TerminalSessionRepo,
+    TerminalSessionStatus, TerminalizeExecution, TerminalizeExecutionWithLedger,
     TransferAgentCommitment, UpdateAgent, UpdateAgentAction, UpdateAgentChat,
     UpdateAgentChatTurnJob, UpdateAgentCommitment, UpdateAgentInboxItem, UpdateAttentionLifecycle,
     UpdateDaemonReport, UpdateExecution, UpdatePrMetadata, UpdatePrProviderConfig, UpdateProject,
     UpdateProjectHookRun, UpdateProjectIntegration, UpdateProjectProvisioningOperation, UpdateRepo,
     UpdateSkill, UpdateTask, UpdateTaskStatus, UpdateTerminalSessionStatus,
-    UpsertAttentionConsumerHealth, UpsertDaemon, UpsertExecutionUsage,
-    UpsertProjectProvisioningCheckpoint, Workspace, WorkspaceLease, WorkspaceLeaseRepo,
-    WorkspaceRepo, WorkspaceStatus,
+    UpsertAttentionConsumerHealth, UpsertDaemon, UpsertProjectProvisioningCheckpoint,
+    UsageAnalyticsRepo, UsageCostKind, UsageEventProvenanceKind, UsageInvocationLifecycle,
+    UsageLedgerRepo, UsageLedgerSettlement, UsageSurface, UsageTelemetryState, Workspace,
+    WorkspaceLease, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use crate::{
     AppliedProjectReviewConfigCommand, ApplyProjectReviewConfigCommand,
@@ -71,6 +75,7 @@ use std::str::FromStr;
 mod action;
 mod agent;
 mod agent_chat;
+mod chat_ledger;
 pub use agent_chat::supported_main_baseline_revision;
 mod agent_chat_topic;
 mod agent_inquiry;
@@ -84,7 +89,6 @@ mod daemon;
 mod domain_event;
 mod embedded_agent;
 mod execution;
-mod execution_usage;
 mod external_link;
 mod inbox;
 mod integration;
@@ -98,6 +102,7 @@ mod orchestration;
 mod personal_access_token;
 mod pr_metadata;
 mod pr_provider_config;
+mod pricing;
 mod project;
 mod project_execution_setup;
 mod project_hook_run;
@@ -501,21 +506,6 @@ fn map_execution(row: SqliteRow) -> Result<Execution> {
         last_progress_at: row.try_get("last_progress_at")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
-    })
-}
-
-fn map_execution_usage(row: SqliteRow) -> Result<ExecutionUsage> {
-    Ok(ExecutionUsage {
-        id: row.try_get("id")?,
-        execution_id: row.try_get("execution_id")?,
-        provider: row.try_get("provider")?,
-        model: row.try_get("model")?,
-        input_tokens: row.try_get("input_tokens")?,
-        output_tokens: row.try_get("output_tokens")?,
-        cache_read_tokens: row.try_get("cache_read_tokens")?,
-        cache_write_tokens: row.try_get("cache_write_tokens")?,
-        cost_usd: row.try_get("cost_usd")?,
-        created_at: row.try_get("created_at")?,
     })
 }
 

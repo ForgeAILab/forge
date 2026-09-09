@@ -220,42 +220,48 @@ impl TaskService {
         let mut outcome = None;
         for _ in 0..3 {
             let terminalized_at = now_rfc3339();
-            let attempt = ExecutionRepo::terminalize(
+            let attempt = ExecutionRepo::terminalize_with_ledger(
                 &*self.db,
-                TerminalizeExecution {
-                    execution_id: terminal_candidate.id.clone(),
-                    expected_version: terminal_candidate.execution_version,
-                    // Pre-dispatch failures are authorized by the freshly
-                    // read execution version. If a scheduler has already
-                    // claimed an owner, include it as an additional
-                    // predicate; legacy rows with no owner intentionally use
-                    // version-only cancellation.
-                    lease_owner: terminal_candidate.lease_owner.clone(),
-                    status: ExecutionStatus::Failed,
-                    stop_reason: Some(Some(db::StopReason::ExecutorFailed)),
-                    stopped_by: Some(Some(
-                        api_types::Actor::system(api_types::SystemComponent::Dispatch).display(),
-                    )),
-                    stopped_at: Some(Some(terminalized_at.clone())),
-                    resume_policy: Some(Some(resume_policy.clone())),
-                    agent_session_id: None,
-                    agent_message_id: None,
-                    last_activity_at: None,
-                    last_progress_at: None,
-                    summary: None,
-                    logs_path: None,
-                    before_sha: None,
-                    after_sha: None,
-                    error: Some(Some(error.clone())),
-                    executor_config_snapshot_json: None,
-                    updated_at: terminalized_at,
-                    actor_type: "system".to_owned(),
-                    actor_id: Some("dispatch".to_owned()),
-                    correlation_id: Some(terminal_candidate.id.clone()),
-                    causation_id: None,
-                    causation_depth: 0,
-                    lease_disposition: ExecutionLeaseDisposition::Revoke,
-                },
+                super::ledger::terminal_with_ledger(
+                    TerminalizeExecution {
+                        execution_id: terminal_candidate.id.clone(),
+                        expected_version: terminal_candidate.execution_version,
+                        // Pre-dispatch failures are authorized by the freshly
+                        // read execution version. If a scheduler has already
+                        // claimed an owner, include it as an additional
+                        // predicate; legacy rows with no owner intentionally use
+                        // version-only cancellation.
+                        lease_owner: terminal_candidate.lease_owner.clone(),
+                        status: ExecutionStatus::Failed,
+                        stop_reason: Some(Some(db::StopReason::ExecutorFailed)),
+                        stopped_by: Some(Some(
+                            api_types::Actor::system(api_types::SystemComponent::Dispatch)
+                                .display(),
+                        )),
+                        stopped_at: Some(Some(terminalized_at.clone())),
+                        resume_policy: Some(Some(resume_policy.clone())),
+                        agent_session_id: None,
+                        agent_message_id: None,
+                        last_activity_at: None,
+                        last_progress_at: None,
+                        summary: None,
+                        logs_path: None,
+                        before_sha: None,
+                        after_sha: None,
+                        error: Some(Some(error.clone())),
+                        executor_config_snapshot_json: None,
+                        updated_at: terminalized_at,
+                        actor_type: "system".to_owned(),
+                        actor_id: Some("dispatch".to_owned()),
+                        correlation_id: Some(terminal_candidate.id.clone()),
+                        causation_id: None,
+                        causation_depth: 0,
+                        lease_disposition: ExecutionLeaseDisposition::Revoke,
+                    },
+                    Vec::new(),
+                    None,
+                    None,
+                ),
             )
             .await
             .map_err(ServiceError::from)?;

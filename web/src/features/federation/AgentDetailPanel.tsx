@@ -21,13 +21,14 @@ import {
 } from '@/features/federation/hooks'
 import type { FederatedAgent } from '@/features/federation/types'
 import type { ProviderEntryResponse } from '@/types/generated'
+import { CostSummaryView } from '@/components/analytics/CostSummary'
 import { StateBadge, StatusDot } from '@/features/federation/components'
 import {
-  formatCost,
   formatDuration,
   formatRate,
   formatTokens,
 } from '@/components/settings/project-settings-utils'
+import { formatMoneyAmount } from '@/lib/money-format'
 import { DEFAULT_CEILING, humanize, isDirectAgent, runtimeDisplayNames } from './format'
 import { AgentActivationSummary } from './AgentActivationSummary'
 
@@ -175,18 +176,33 @@ export function AgentDetailPanel({
                   : '—',
             },
             {
-              label: 'Total runs',
-              value: agent.total_runs,
-              detail: agent.success_rate != null ? `${formatRate(agent.success_rate)} success` : undefined,
+              label: 'Task executions',
+              value: formatTokens(agent.usage.counts.task_execution_count),
+              detail:
+                agent.success_rate != null ? `${formatRate(agent.success_rate)} success` : undefined,
             },
             {
               label: 'Tokens used',
-              value: formatTokens(agent.total_tokens ?? 0),
-              detail: `${formatTokens(agent.total_input_tokens ?? 0)} in / ${formatTokens(agent.total_output_tokens ?? 0)} out`,
+              value: formatTokens(
+                agent.usage.tokens.input_tokens +
+                  agent.usage.tokens.output_tokens +
+                  agent.usage.tokens.cache_read_tokens +
+                  agent.usage.tokens.cache_write_tokens,
+              ),
+              detail: `${formatTokens(agent.usage.tokens.input_tokens)} in / ${formatTokens(agent.usage.tokens.output_tokens)} out`,
             },
             {
-              label: 'Est. cost',
-              value: formatCost(agent.total_cost_usd ?? null),
+              label: 'Cost',
+              value:
+                agent.usage.cost.coverage === 'complete' && agent.usage.cost.complete_total
+                  ? formatMoneyAmount(agent.usage.cost.complete_total)
+                  : agent.usage.cost.coverage === 'pending'
+                    ? 'Pending'
+                    : agent.usage.cost.coverage === 'no_usage'
+                      ? 'No usage'
+                      : agent.usage.cost.known_subtotal
+                        ? `${formatMoneyAmount(agent.usage.cost.known_subtotal)} known`
+                        : 'Cost unknown',
             },
             {
               label: 'Success rate',
@@ -212,6 +228,8 @@ export function AgentDetailPanel({
             </div>
           ))}
         </div>
+
+        <CostSummaryView summary={agent.usage.cost} compact />
 
         <AgentSettingsForm agent={agent} entries={entries} />
 

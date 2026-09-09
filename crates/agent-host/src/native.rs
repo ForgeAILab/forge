@@ -17,7 +17,7 @@ use agent_runtime::{
         provider_credential::ProviderCredentialTarget,
         security::SecuritySubject,
         tool::ToolOutcome,
-        usage::CounterKind,
+        usage::{CounterKind, UsageSource},
         workspace::DenyAllWorkspace,
     },
     harness::{LcmCoordinator, LcmCoordinatorPolicy, StaticLcmTimelineResolver},
@@ -33,9 +33,10 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 
 use crate::{
-    AgentHostError, AgentSessionBackend, AgentTurnOutput, AgentTurnRequest, BackendCapabilities,
-    CanonicalScope, CanonicalScopeType, DeterministicLcmSummaryModel, FORGE_LCM_STORE_REVISION,
-    ForgeToolProvider, InteractionBrokerHandle, ProjectChatToolContext, RuntimeContextManifestLink,
+    AgentHostError, AgentSessionBackend, AgentTurnLimit, AgentTurnOutput, AgentTurnRequest,
+    AgentTurnTelemetryState, AgentTurnUsageReport, BackendCapabilities, CanonicalScope,
+    CanonicalScopeType, DeterministicLcmSummaryModel, FORGE_LCM_STORE_REVISION, ForgeToolProvider,
+    InteractionBrokerHandle, ProjectChatToolContext, RuntimeContextManifestLink,
     ScopeToolComposition, TurnEventSink, WorkspaceAccess,
     protected_store::SqliteProtectedRuntimeStore, transport::ReqwestTransport,
 };
@@ -593,20 +594,9 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
 
         let pending_interaction_id = match finish {
             TurnFinish::Completed => None,
-            TurnFinish::NeedsInput { request } => Some(request.to_string()),
-            TurnFinish::Cancelled { .. } => {
-                return Err(AgentHostError::Runtime("turn cancelled".to_owned()));
-            }
-            TurnFinish::LimitReached { limit } => {
-                return Err(AgentHostError::TurnLimitReached {
-                    limit: limit.into(),
-                });
-            }
-            TurnFinish::Failed => {
-                return Err(AgentHostError::Runtime(match last_turn_error {
-                    Some(detail) => format!("turn failed: {detail}"),
-                    None => "turn failed".to_owned(),
-                }));
+            TurnFinish::NeedsInput { ref request } => Some(request.to_string()),
+            TurnFinish::Cancelled { .. } | TurnFinish::LimitReached { .. } | TurnFinish::Failed => {
+                None
             }
         };
         let history = session.history();
@@ -634,22 +624,116 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
                 None => manifest,
             });
         let usage = snapshot.usage.total();
-        Ok(AgentTurnOutput {
+        let output_tokens = usage
+            .get(CounterKind::Output)
+            .checked_add(usage.get(CounterKind::Reasoning))
+            .ok_or_else(|| AgentHostError::Runtime("usage counter overflow".to_owned()))?;
+        let usage_reports = snapshot
+            .usage
+            .records()
+            .iter()
+            .filter(|record| record.source == UsageSource::ProviderAttempt)
+            .enumerate()
+            .map(|(index, record)| {
+                let output_tokens = match (
+                    sparse_counter(&record.delta, CounterKind::Output),
+                    sparse_counter(&record.delta, CounterKind::Reasoning),
+                ) {
+                    (Some(output), Some(reasoning)) => {
+                        Some(output.checked_add(reasoning).ok_or_else(|| {
+                            AgentHostError::Runtime("usage counter overflow".to_owned())
+                        })?)
+                    }
+                    (Some(output), None) => Some(output),
+                    (None, Some(reasoning)) => Some(reasoning),
+                    (None, None) => None,
+                };
+                let request_id = record.provenance.request.as_ref().map(ToString::to_string);
+                let attempt_id = record.provenance.attempt.as_ref().map(ToString::to_string);
+                let report_id = format!(
+                    "native:{}:{}:{}",
+                    request.runtime_session_id,
+                    request_id
+                        .as_deref()
+                        .or(attempt_id.as_deref())
+                        .unwrap_or(turn_id.as_str()),
+                    index
+                );
+                let has_counters = sparse_counter(&record.delta, CounterKind::InputUncached)
+                    .is_some()
+                    || output_tokens.is_some()
+                    || sparse_counter(&record.delta, CounterKind::InputCached).is_some()
+                    || sparse_counter(&record.delta, CounterKind::CacheWrite).is_some();
+                Ok(AgentTurnUsageReport {
+                    report_id,
+                    request_id,
+                    attempt_id,
+                    provider_id: Some(request.provider.provider.clone()),
+                    model_id: Some(request.provider.model.clone()),
+                    input_tokens: sparse_counter(&record.delta, CounterKind::InputUncached),
+                    output_tokens,
+                    cache_read_tokens: sparse_counter(&record.delta, CounterKind::InputCached),
+                    cache_write_tokens: sparse_counter(&record.delta, CounterKind::CacheWrite),
+                    telemetry_state: if has_counters {
+                        AgentTurnTelemetryState::Metered
+                    } else {
+                        AgentTurnTelemetryState::Unmetered
+                    },
+                    failed: record.provenance.failed,
+                })
+            })
+            .collect::<Result<Vec<_>, AgentHostError>>()?;
+        let output = AgentTurnOutput {
             runtime_session_id: request.runtime_session_id,
             text,
             // Disjoint by contract (see `AgentTurnOutput::input_tokens`): the
             // runtime's `input_tokens()` folds the cached and cache-write
             // prefixes back in, which would double-count them against the
-            // two counters below once they reach `execution_usage`.
+            // disjoint counters below once they reach the usage ledger.
             input_tokens: usage.get(CounterKind::InputUncached),
-            output_tokens: usage
-                .get(CounterKind::Output)
-                .saturating_add(usage.get(CounterKind::Reasoning)),
+            output_tokens,
             cache_read_tokens: usage.get(CounterKind::InputCached),
             cache_write_tokens: usage.get(CounterKind::CacheWrite),
+            telemetry_state: if usage_reports
+                .iter()
+                .any(|report| report.telemetry_state == AgentTurnTelemetryState::Metered)
+            {
+                AgentTurnTelemetryState::Metered
+            } else {
+                AgentTurnTelemetryState::Unmetered
+            },
+            usage_reports,
             context_manifest,
             pending_interaction_id,
-        })
+        };
+
+        // Preserve the reports observed before a failed/cancelled provider
+        // turn leaves the runtime.  The caller owns the domain terminal CAS,
+        // so returning them alongside the failure lets it settle only after
+        // that CAS wins (or mark the invocation pending when cancellation
+        // won first).  Reports are deliberately absent from the compact
+        // error variants used before a provider attempt starts.
+        match finish {
+            TurnFinish::Completed | TurnFinish::NeedsInput { .. } => Ok(output),
+            TurnFinish::Cancelled { .. } => Err(AgentHostError::RuntimeWithUsage {
+                message: "turn cancelled".to_owned(),
+                usage_reports: output.usage_reports,
+            }),
+            TurnFinish::LimitReached { limit } => Err(AgentHostError::RuntimeWithUsage {
+                message: format!(
+                    "runtime turn limit reached: {}",
+                    AgentTurnLimit::from(limit)
+                ),
+                usage_reports: output.usage_reports,
+            }),
+            TurnFinish::Failed => Err(AgentHostError::RuntimeWithUsage {
+                message: match last_turn_error {
+                    Some(detail) => format!("turn failed: {detail}"),
+                    None => "turn failed".to_owned(),
+                },
+                usage_reports: output.usage_reports,
+            }),
+        }
     }
 
     async fn cancel(&self, runtime_session_id: &str) -> Result<(), AgentHostError> {
@@ -679,6 +763,15 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             .map_err(|error| AgentHostError::Runtime(error.to_string()))?;
         Ok(())
     }
+}
+
+fn sparse_counter(
+    delta: &agent_runtime::core::usage::UsageDelta,
+    kind: CounterKind,
+) -> Option<u64> {
+    delta
+        .iter()
+        .find_map(|(counter_kind, value)| (counter_kind == kind).then_some(value))
 }
 
 /// Builds the bounded `ToolResultSummary` this turn attaches to a completed

@@ -97,7 +97,7 @@ const userMessage: AgentChatMessage = {
   profile_id: null,
   session_id: null,
   context_manifest_id: null,
-  token_usage_json: null,
+  usage: [],
   duration_ms: null,
   error: null,
   correlation_id: 'correlation-1',
@@ -547,17 +547,51 @@ describe('AgentChatTimeline wake prompts', () => {
 
 describe('parseTokenUsage', () => {
   it('shows the cached share of the input next to the totals', () => {
-    expect(parseTokenUsage({ input: 77535, output: 898, cache_read: 61440, cache_write: 0 })).toBe(
+    expect(
+      parseTokenUsage([
+        {
+          counters: {
+            input_tokens: 77535,
+            output_tokens: 898,
+            cache_read_tokens: 61440,
+            cache_write_tokens: 0,
+          },
+        },
+      ]),
+    ).toBe(
       '77,535 in · 61,440 cached · 898 out',
     )
-    expect(parseTokenUsage({ input: 100, output: 5, cache_read: 0, cache_write: 90 })).toBe(
+    expect(
+      parseTokenUsage([
+        {
+          counters: {
+            input_tokens: 100,
+            output_tokens: 5,
+            cache_read_tokens: 0,
+            cache_write_tokens: 90,
+          },
+        },
+      ]),
+    ).toBe(
       '100 in · 90 cache write · 5 out',
     )
   })
 
-  it('still reads usage recorded before cache counts existed', () => {
-    expect(parseTokenUsage({ input: 725218, output: 11942 })).toBe('725,218 in · 11,942 out')
-    expect(parseTokenUsage({})).toBeNull()
+  it('sums typed rows and ignores reported-only rows without counters', () => {
+    expect(
+      parseTokenUsage([
+        {
+          counters: {
+            input_tokens: 725218,
+            output_tokens: 11942,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+          },
+        },
+        { counters: null },
+      ]),
+    ).toBe('725,218 in · 11,942 out')
+    expect(parseTokenUsage([])).toBeNull()
   })
 })
 

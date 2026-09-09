@@ -13,6 +13,7 @@ pub mod agent_service;
 pub mod agent_turn_admission;
 pub mod attention_service;
 pub mod auth_service;
+pub(crate) mod chat_usage;
 pub mod command_boundary;
 pub mod context_manifest;
 pub mod coordination_consumer;
@@ -52,6 +53,8 @@ pub mod operator_status_emitter;
 pub mod orchestration_authorization;
 pub mod plan_artifact;
 pub mod pr_service;
+pub mod pricing;
+pub mod pricing_db;
 pub mod product_genesis;
 pub mod project_agent_actions;
 pub mod project_agent_selection;
@@ -80,6 +83,7 @@ pub mod task_service;
 pub mod terminal_service;
 pub mod turn_log_sink;
 pub mod types;
+pub mod usage_projection;
 pub mod wake_turn_consumer;
 pub mod workflow;
 pub mod workspace_cleanup;
@@ -314,6 +318,11 @@ pub use task_service::{
 };
 pub use terminal_service::{TerminalActivityTracker, TerminalService};
 pub use types::Assignee;
+pub use usage_projection::{
+    aggregate_usage, usage_aggregate_for_agent, usage_aggregate_for_operations,
+    usage_aggregate_for_source, usage_aggregate_for_source_state, usage_aggregate_for_task,
+    usage_breakdowns_for_invocation, usage_breakdowns_for_source, UsageDomainRun,
+};
 pub use wake_turn_consumer::{
     wake_turn_consumer_lease_owner, wake_turn_consumer_name, WakeTurnConsumer, WakeTurnRun,
 };

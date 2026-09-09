@@ -311,12 +311,11 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
 
     let review_task = poll_until_task_awaiting_human(&harness.app, &task.id).await;
 
-    let approved: TaskResponse = json_request(
+    let approved: TaskResponse = versioned_task_request(
         &harness.app,
-        Method::POST,
         &format!("/api/v1/tasks/{}/gates/review/approve", task.id),
+        &task.id,
         json!({ "version": review_task.version, "reason": "human approval" }),
-        StatusCode::OK,
     )
     .await;
     assert!(matches!(approved.status.as_str(), "merging" | "done"));
@@ -373,26 +372,24 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
         .execute(harness.state.db.pool())
         .await
         .expect("passing review config updates");
-    let _: Value = json_request(
+    let _: Value = versioned_task_request(
         &harness.app,
-        Method::POST,
         &format!("/api/v1/tasks/{}/transition", ci_failure_task.id),
+        &ci_failure_task.id,
         json!({
             "status": "review",
             "version": after_ci_failure.version,
             "reason": "retry validation after CI configuration was corrected"
         }),
-        StatusCode::OK,
     )
     .await;
 
     let ci_review = poll_until_task_awaiting_human(&harness.app, &ci_failure_task.id).await;
-    let ci_approved: TaskResponse = json_request(
+    let ci_approved: TaskResponse = versioned_task_request(
         &harness.app,
-        Method::POST,
         &format!("/api/v1/tasks/{}/gates/review/approve", ci_failure_task.id),
+        &ci_failure_task.id,
         json!({ "version": ci_review.version, "reason": "human approval" }),
-        StatusCode::OK,
     )
     .await;
     assert!(matches!(ci_approved.status.as_str(), "merging" | "done"));
@@ -433,15 +430,14 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
     let second_execution = single_execution_for_task(&harness.app, &second_task.id).await;
     let second_review = poll_until_task_awaiting_human(&harness.app, &second_task.id).await;
 
-    let rejected: TaskResponse = json_request(
+    let rejected: TaskResponse = versioned_task_request(
         &harness.app,
-        Method::POST,
         &format!("/api/v1/tasks/{}/gates/review/reject", second_task.id),
+        &second_task.id,
         json!({
             "version": second_review.version,
             "reason": "Please add evidence for the requested behavior"
         }),
-        StatusCode::OK,
     )
     .await;
     assert_eq!(rejected.status, "working".to_owned());
@@ -916,6 +912,32 @@ where
         .await
         .expect("router response");
     parse_response(response, expected_status).await
+}
+
+/// Posts a versioned Task mutation, refetching the version when a background
+/// writer wins the race. Task writes are optimistically concurrent, so a 409
+/// here means the snapshot this call was built from went stale — exactly what a
+/// real client refetches and resubmits — rather than a product failure.
+async fn versioned_task_request<T>(app: &Router, uri: &str, task_id: &str, mut body: Value) -> T
+where
+    T: DeserializeOwned,
+{
+    for _ in 0..40 {
+        let response = raw_json_request(app, Method::POST, uri, body.clone()).await;
+        if response.status() != StatusCode::CONFLICT {
+            return parse_response(response, StatusCode::OK).await;
+        }
+        let current: TaskResponse = empty_request(
+            app,
+            Method::GET,
+            &format!("/api/v1/tasks/{task_id}"),
+            StatusCode::OK,
+        )
+        .await;
+        body["version"] = json!(current.version);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("versioned request to {uri} never won the version race");
 }
 
 async fn empty_request<T>(app: &Router, method: Method, uri: &str, expected_status: StatusCode) -> T

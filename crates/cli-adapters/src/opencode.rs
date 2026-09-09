@@ -228,7 +228,7 @@ impl CodingExecutorAdapter for OpencodeAdapter {
                 assistant_output,
                 summary,
                 error: None,
-                usage: None,
+                usage_reports: Vec::new(),
                 ..Default::default()
             });
         }
@@ -241,7 +241,7 @@ impl CodingExecutorAdapter for OpencodeAdapter {
                 assistant_output,
                 summary,
                 error: Some(error),
-                usage: None,
+                usage_reports: Vec::new(),
                 ..Default::default()
             });
         }
@@ -254,7 +254,7 @@ impl CodingExecutorAdapter for OpencodeAdapter {
                 assistant_output,
                 summary,
                 error: Some(opencode_run_error(status, &stream.stderr_tail)),
-                usage: None,
+                usage_reports: Vec::new(),
                 ..Default::default()
             });
         }
@@ -267,7 +267,7 @@ impl CodingExecutorAdapter for OpencodeAdapter {
                 assistant_output: None,
                 summary: None,
                 error: Some("opencode run completed without assistant text".to_owned()),
-                usage: None,
+                usage_reports: Vec::new(),
                 ..Default::default()
             });
         }
@@ -294,7 +294,7 @@ impl CodingExecutorAdapter for OpencodeAdapter {
             assistant_output,
             summary,
             error: None,
-            usage: None,
+            usage_reports: Vec::new(),
             ..Default::default()
         })
     }

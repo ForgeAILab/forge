@@ -248,6 +248,28 @@ impl TaskService {
                 .execution_provider_for_agent(agent.as_ref(), &execution.id)
                 .await?;
             let params = self.execution_start_params(&execution).await?;
+            // Remote daemon execution has no in-process executor hook, so
+            // freeze the complete candidate pricing selection before sending
+            // the start command. The daemon-side provider boundary will use
+            // the same candidate identity when it reports terminal usage.
+            if provider.execution_lease_owner().is_some() {
+                let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
+                let snapshot = execution
+                    .executor_config_snapshot_json
+                    .as_deref()
+                    .ok_or_else(|| {
+                        ServiceError::invalid_operation(
+                            "execution missing executor config snapshot",
+                        )
+                    })?;
+                let snapshot = parse_json_value("executor config snapshot", snapshot)?;
+                super::ledger::ensure_task_execution_admission(
+                    &self.db, &task, &execution, &snapshot,
+                )
+                .await?;
+            }
             if let Some(lease_owner) = provider.execution_lease_owner() {
                 let now = Utc::now();
                 let preclaimed = execution.lease_owner.as_deref() == Some(lease_owner.as_str())
@@ -508,6 +530,25 @@ impl TaskService {
             return Err(error);
         }
 
+        // Freeze one pricing selection for every candidate before handing
+        // control to an executor. The neutral executor hook below starts an
+        // invocation only at the exact provider-call boundary.
+        let snapshot_value = parse_json_value("executor config snapshot", snapshot)?;
+        let ledger_admitted = super::ledger::ensure_task_execution_admission(
+            &self.db,
+            &task,
+            &execution_before_launch,
+            &snapshot_value,
+        )
+        .await?;
+        let provider_admission = ledger_admitted.then(|| {
+            Arc::new(super::ledger::TaskProviderCallAdmission::new(
+                Arc::clone(&self.db),
+                &snapshot_value,
+                &execution_before_launch,
+            )) as Arc<dyn executors::ProviderCallAdmission>
+        });
+
         let description = match ::review::contract::prepare_prompt(
             &self.db,
             &execution.id,
@@ -599,9 +640,6 @@ impl TaskService {
         let (log_tx, mut log_rx) = tokio::sync::mpsc::unbounded_channel::<executors::LogEntry>();
         let max_turns_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let assistant_turn_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let usage_provider = super::usage_provider_from_agent_config(&agent_config);
-        let usage_model_fallback = usage_model_fallback(&agent_config);
-
         // Spawn a task that forwards log entries to the event bus
         let event_bus = self.event_bus.clone();
         let progress_lease = Arc::clone(&lease);
@@ -764,7 +802,7 @@ impl TaskService {
             heartbeat_stop.clone(),
             heartbeat_signal_tx,
         ));
-        let execution_future = executor.execute(ExecutionContext {
+        let execution_context = ExecutionContext {
             task_id: task.id.clone(),
             execution_id: execution_id.clone(),
             worktree_path: workspace.worktree_path.clone(),
@@ -774,7 +812,13 @@ impl TaskService {
             heartbeat_interval_seconds: 30,
             max_turns,
             log_sender: Some(log_tx),
-        });
+        };
+        let execution_future = match provider_admission {
+            Some(admission) => {
+                executor.execute_with_provider_call_admission(execution_context, admission)
+            }
+            None => executor.execute(execution_context),
+        };
         tokio::pin!(execution_future);
         let mut hard_deadline_exceeded = false;
         let mut lease_owner_lost = false;
@@ -1012,6 +1056,18 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", execution_id.clone()))?;
         if current_execution.status != ExecutionStatus::Running {
+            if current_execution.status == ExecutionStatus::Cancelled {
+                let late_reports = result.usage_reports.clone();
+                if !late_reports.is_empty() {
+                    super::ledger::settle_late_task_usage(
+                        &self.db,
+                        &execution_id,
+                        &late_reports,
+                        &now_rfc3339(),
+                    )
+                    .await?;
+                }
+            }
             let attempted_status = match &result.status {
                 ExecutionOutcome::Completed => ExecutionStatus::Completed,
                 ExecutionOutcome::Failed => ExecutionStatus::Failed,
@@ -1100,6 +1156,14 @@ impl TaskService {
             "execution dispatch completed"
         );
 
+        let usage_settlements = super::ledger::build_task_usage_settlements(
+            &self.db,
+            &execution_id,
+            &result.usage_reports,
+            &now,
+        )
+        .await?;
+
         let (lease_owner, mut expected_version) = lease.owner_and_version().await;
         // Renewal and semantic-progress tasks are stopped above.  A progress
         // write can still have won the last CAS immediately before the stop,
@@ -1107,38 +1171,59 @@ impl TaskService {
         // under this same owner.  A terminal row is a definitive late-result
         // rejection and must never be overwritten.
         let mut terminal_attempt = 0;
+        let mut persistence_retries = 0;
         let terminal = loop {
-            let terminal = ExecutionRepo::terminalize(
+            let terminal_result = ExecutionRepo::terminalize_with_ledger(
                 &*self.db,
-                db::TerminalizeExecution {
-                    execution_id: execution_id.clone(),
-                    expected_version,
-                    lease_owner: Some(lease_owner.clone()),
-                    status: status.clone(),
-                    stop_reason: stop_reason.clone().map(Some),
-                    stopped_by: stopped_by.clone().map(Some),
-                    stopped_at: stopped_at.clone().map(Some),
-                    resume_policy: resume_policy.clone().map(Some),
-                    agent_session_id: Some(result.agent_session_id.clone()),
-                    agent_message_id: None,
-                    last_activity_at: Some(Some(now.clone())),
-                    last_progress_at: None,
-                    summary: Some(result.summary.clone()),
-                    logs_path: Some(Some(logs_path.clone())),
-                    before_sha: None,
-                    after_sha: Some(result.after_sha.clone()),
-                    error: Some(result.error.clone()),
-                    executor_config_snapshot_json: snapshot_update.clone().map(Some),
-                    updated_at: now.clone(),
-                    actor_type: "system".to_owned(),
-                    actor_id: None,
-                    correlation_id: None,
-                    causation_id: None,
-                    causation_depth: 0,
-                    lease_disposition: db::ExecutionLeaseDisposition::Revoke,
-                },
+                super::ledger::terminal_with_ledger(
+                    db::TerminalizeExecution {
+                        execution_id: execution_id.clone(),
+                        expected_version,
+                        lease_owner: Some(lease_owner.clone()),
+                        status: status.clone(),
+                        stop_reason: stop_reason.clone().map(Some),
+                        stopped_by: stopped_by.clone().map(Some),
+                        stopped_at: stopped_at.clone().map(Some),
+                        resume_policy: resume_policy.clone().map(Some),
+                        agent_session_id: Some(result.agent_session_id.clone()),
+                        agent_message_id: None,
+                        last_activity_at: Some(Some(now.clone())),
+                        last_progress_at: None,
+                        summary: Some(result.summary.clone()),
+                        logs_path: Some(Some(logs_path.clone())),
+                        before_sha: None,
+                        after_sha: Some(result.after_sha.clone()),
+                        error: Some(result.error.clone()),
+                        executor_config_snapshot_json: snapshot_update.clone().map(Some),
+                        updated_at: now.clone(),
+                        actor_type: "system".to_owned(),
+                        actor_id: None,
+                        correlation_id: None,
+                        causation_id: None,
+                        causation_depth: 0,
+                        lease_disposition: db::ExecutionLeaseDisposition::Revoke,
+                    },
+                    usage_settlements.clone(),
+                    None,
+                    None,
+                ),
             )
-            .await?;
+            .await;
+            let terminal = match terminal_result {
+                Ok(terminal) => terminal,
+                Err(error)
+                    if persistence_retries < 2
+                        && matches!(&error, DbError::Sqlx(_) | DbError::VersionConflict) =>
+                {
+                    // The provider result and every ledger payload were
+                    // materialized before this loop. Retry only the durable
+                    // boundary; never invoke the provider a second time.
+                    persistence_retries += 1;
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Err(error) => return Err(ServiceError::from(error)),
+            };
             match terminal {
                 db::ExecutionTerminalOutcome::Concurrent {
                     current: Some(current),
@@ -1176,34 +1261,6 @@ impl TaskService {
                 return Ok(current);
             }
         };
-
-        if let Some(token_usage) = result.usage {
-            let model = token_usage
-                .model
-                .or_else(|| usage_model_fallback.clone())
-                .unwrap_or_else(|| "default".to_owned());
-            if let Err(error) = ExecutionUsageRepo::upsert(
-                &*self.db,
-                db::UpsertExecutionUsage {
-                    execution_id: updated.id.clone(),
-                    provider: usage_provider,
-                    model,
-                    input_tokens: token_usage.input_tokens,
-                    output_tokens: token_usage.output_tokens,
-                    cache_read_tokens: token_usage.cache_read_tokens,
-                    cache_write_tokens: token_usage.cache_write_tokens,
-                    cost_usd: token_usage.cost_usd,
-                },
-            )
-            .await
-            {
-                tracing::warn!(
-                    execution_id = %updated.id,
-                    %error,
-                    "failed to record execution token usage"
-                );
-            }
-        }
 
         super::publish_terminal_execution_event(self, &updated);
 
@@ -1337,6 +1394,7 @@ impl TaskService {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use db::{
@@ -1504,13 +1562,40 @@ mod tests {
         (db, execution_id, lease)
     }
 
+    /// Wait for a heartbeat renewal to be durable instead of assuming a fixed
+    /// number of scheduler yields is enough for the write to land. The whole
+    /// budget is only ever spent on a failure.
+    async fn wait_for_renewed_heartbeat(
+        db: &db::SqliteDb,
+        execution_id: &str,
+        expected: &str,
+    ) -> db::Execution {
+        for _ in 0..200 {
+            let execution = ExecutionRepo::get_by_id(db, execution_id)
+                .await
+                .expect("execution reads")
+                .expect("execution exists");
+            if execution.last_heartbeat_at.as_deref() == Some(expected) {
+                return execution;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("heartbeat never renewed to {expected}");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn embedded_heartbeat_renews_without_semantic_progress_then_stops_at_deadline() {
-        // sqlx's pool acquisition timeout uses Tokio time; create the fixture
-        // on the real clock, then pause the scheduler for heartbeat cadence.
+        // Renewal writes to the database, and sqlx's pool acquire is a Tokio
+        // timer: under a paused scheduler it expires instantly whenever no
+        // connection is already idle, which downgrades the renewal to a logged
+        // transient failure and leaves `last_heartbeat_at` at T0. So run this
+        // phase on the real clock and wait for the durable write rather than
+        // yielding a fixed number of times and hoping the write got there —
+        // that is a coin flip on a saturated runner. `interval` ticks
+        // immediately and then waits a full 20s cadence, so exactly one
+        // renewal lands inside this window.
         tokio::time::resume();
         let (db, execution_id, lease) = heartbeat_fixture().await;
-        tokio::time::pause();
         let first_stop = CancellationToken::new();
         let (first_signal_tx, _first_signal_rx) = mpsc::unbounded_channel();
         let first_task = tokio::spawn(embedded_execution_heartbeat_with_clock(
@@ -1520,29 +1605,18 @@ mod tests {
             first_signal_tx,
             Arc::new(|| T1.to_owned()),
         ));
-
-        // `interval` ticks immediately, then follows the fixed server cadence.
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(20)).await;
-        tokio::task::yield_now().await;
+        let renewed = wait_for_renewed_heartbeat(&db, &execution_id, T1).await;
         first_stop.cancel();
         first_task.await.expect("heartbeat task joins");
-
-        // Read on the real clock for the same reason the fixture is built on
-        // it: a paused scheduler makes sqlx's pool-acquire deadline expire
-        // instantly whenever a connection is not already idle.
-        tokio::time::resume();
-        let renewed = ExecutionRepo::get_by_id(&*db, &execution_id)
-            .await
-            .expect("execution reads")
-            .expect("execution exists");
-        tokio::time::pause();
         assert_eq!(renewed.last_heartbeat_at.as_deref(), Some(T1));
         assert_eq!(renewed.last_progress_at, None);
         let renewed_version = renewed.execution_version;
 
         // Move the paused scheduler to the immutable hard deadline. The next
         // server tick must report the typed deadline without another renewal.
+        // This phase never touches the database before it breaks, so a paused
+        // clock is safe here.
+        tokio::time::pause();
         tokio::time::advance(Duration::from_secs(20)).await;
         let stop = CancellationToken::new();
         let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
@@ -1775,16 +1849,6 @@ fn execution_description(execution: &Execution, task: &Task, agent_config: &Valu
     }
 }
 
-fn usage_model_fallback(agent_config: &Value) -> Option<String> {
-    agent_config
-        .get("config")
-        .and_then(|config| config.get("model"))
-        .and_then(Value::as_str)
-        .or_else(|| agent_config.get("model").and_then(Value::as_str))
-        .filter(|model| !model.trim().is_empty())
-        .map(str::to_owned)
-}
-
 fn max_turns_from_value(value: &Value) -> Option<u32> {
     value
         .get("max_turns")
@@ -1952,52 +2016,5 @@ impl TaskService {
         }
 
         Ok(durable_path)
-    }
-}
-
-#[cfg(test)]
-mod usage_tests {
-    use super::*;
-
-    #[test]
-    fn usage_provider_and_model_come_from_execution_snapshot() {
-        let snapshot = json!({
-            "executor_type": "codex",
-            "model": "agent-model",
-            "config": {
-                "model": "gpt-5.5"
-            }
-        });
-
-        assert_eq!(super::usage_provider_from_agent_config(&snapshot), "openai");
-        assert_eq!(usage_model_fallback(&snapshot).as_deref(), Some("gpt-5.5"));
-    }
-
-    #[test]
-    fn usage_model_falls_back_to_top_level_model() {
-        let snapshot = json!({
-            "executor_type": "claude_code",
-            "model": "claude-haiku-4-5",
-            "config": {}
-        });
-
-        assert_eq!(
-            super::usage_provider_from_agent_config(&snapshot),
-            "anthropic"
-        );
-        assert_eq!(
-            usage_model_fallback(&snapshot).as_deref(),
-            Some("claude-haiku-4-5")
-        );
-    }
-
-    #[test]
-    fn cursor_usage_provider_maps_to_cursor() {
-        let snapshot = json!({
-            "executor_type": "cursor",
-            "config": {}
-        });
-
-        assert_eq!(super::usage_provider_from_agent_config(&snapshot), "cursor");
     }
 }

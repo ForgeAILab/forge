@@ -278,6 +278,30 @@ pub struct AgentTurnRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentTurnTelemetryState {
+    Metered,
+    Unmetered,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentTurnUsageReport {
+    /// Stable host-side identity for one provider request/attempt report.
+    pub report_id: String,
+    pub request_id: Option<String>,
+    pub attempt_id: Option<String>,
+    pub provider_id: Option<String>,
+    pub model_id: Option<String>,
+    /// Sparse disjoint counters. `None` means the provider did not expose that
+    /// bucket; `Some(0)` is an explicit zero when the source supplied it.
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub telemetry_state: AgentTurnTelemetryState,
+    pub failed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentTurnOutput {
     pub runtime_session_id: String,
     pub text: String,
@@ -293,6 +317,11 @@ pub struct AgentTurnOutput {
     /// Input tokens the provider wrote to its prompt cache. Disjoint from
     /// `input_tokens`.
     pub cache_write_tokens: u64,
+    /// Per-provider-attempt records from the runtime ledger. This is the
+    /// authoritative usage shape; aggregate fields above remain useful for
+    /// existing host-local consumers until their projections migrate.
+    pub usage_reports: Vec<AgentTurnUsageReport>,
+    pub telemetry_state: AgentTurnTelemetryState,
     /// Final Agent Runtime context/LCM metadata. Bodies and protected state
     /// are intentionally absent; Forge links this to its domain manifest.
     pub context_manifest: Option<RuntimeContextManifestLink>,
@@ -381,6 +410,16 @@ pub enum AgentHostError {
     TurnLimitReached { limit: AgentTurnLimit },
     #[error("runtime failed: {0}")]
     Runtime(String),
+    /// The runtime reached a terminal failure after one or more provider
+    /// attempts had already emitted usage telemetry.  The normal `Runtime`
+    /// variant intentionally remains the compact error used by callers that
+    /// do not need accounting; chat and Task adapters can drain these reports
+    /// without reconstructing them from the mutable session snapshot.
+    #[error("runtime failed: {message}")]
+    RuntimeWithUsage {
+        message: String,
+        usage_reports: Vec<AgentTurnUsageReport>,
+    },
     #[error("protected persistence failed")]
     ProtectedPersistence,
 }

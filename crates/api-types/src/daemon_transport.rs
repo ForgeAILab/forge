@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::FsEntry;
+use crate::{FsEntry, UsageTelemetryState};
 
 pub const METHOD_FS_LIST: &str = "fs.list";
 pub const METHOD_FS_BRANCHES: &str = "fs.branches";
@@ -9,6 +9,8 @@ pub const METHOD_EXECUTION_START: &str = "execution.start";
 pub const METHOD_EXECUTION_CANCEL: &str = "execution.cancel";
 pub const METHOD_EXECUTION_LOG: &str = "execution.log";
 pub const METHOD_EXECUTION_TERMINAL: &str = "execution.terminal";
+pub const METHOD_EXECUTION_TERMINAL_ACK: &str = "execution.terminal.ack";
+pub const METHOD_DAEMON_HANDSHAKE: &str = "daemon.handshake";
 pub const METHOD_TERMINAL_START: &str = "terminal.start";
 pub const METHOD_TERMINAL_INPUT: &str = "terminal.input";
 pub const METHOD_TERMINAL_RESIZE: &str = "terminal.resize";
@@ -23,6 +25,29 @@ pub const INVALID_FRAME: &str = "invalid_frame";
 pub const INVALID_INPUT: &str = "invalid_input";
 pub const PATH_GUARDRAIL: &str = "path_guardrail";
 pub const EXECUTION_NOT_FOUND: &str = "execution_not_found";
+pub const DAEMON_PROTOCOL_INCOMPATIBLE: &str = "daemon_protocol_incompatible";
+pub const TERMINAL_REPORT_CONFLICT: &str = "terminal_report_conflict";
+
+/// The minimum daemon command protocol understood by this server/client pair.
+/// Revision 2 is the first revision that carries per-attempt reports and
+/// acknowledgement-gated terminal delivery.
+pub const DAEMON_PROTOCOL_REVISION: u32 = 2;
+pub const DAEMON_CAPABILITY_USAGE_REPORTS: &str = "execution.terminal.usage_reports";
+pub const DAEMON_CAPABILITY_TERMINAL_ACK: &str = "execution.terminal.ack";
+pub const DAEMON_REQUIRED_CAPABILITIES: &[&str] = &[
+    DAEMON_CAPABILITY_USAGE_REPORTS,
+    DAEMON_CAPABILITY_TERMINAL_ACK,
+];
+
+/// Whether a daemon handshake advertises the minimum terminal accounting
+/// contract. Newer revisions remain wire-compatible as long as they retain
+/// the required capabilities.
+pub fn daemon_protocol_is_compatible(revision: u32, capabilities: &[String]) -> bool {
+    revision >= DAEMON_PROTOCOL_REVISION
+        && DAEMON_REQUIRED_CAPABILITIES
+            .iter()
+            .all(|required| capabilities.iter().any(|capability| capability == required))
+}
 
 pub const DEFAULT_DAEMON_COMMAND_TIMEOUT_SECS: u64 = 30;
 pub const DAEMON_HEARTBEAT_INTERVAL_SECS: u64 = 20;
@@ -137,9 +162,13 @@ pub struct ExecutionLogNotification {
     pub truncated: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
 #[ts(export)]
 pub struct ExecutionTerminalNotification {
+    // Stable identity for the complete terminal result. The daemon persists
+    // this record and retains it until the authenticated server acknowledges
+    // this exact report.
+    pub terminal_report_id: String,
     pub execution_id: String,
     pub exit_code: Option<i32>,
     pub signal: Option<String>,
@@ -153,19 +182,49 @@ pub struct ExecutionTerminalNotification {
     pub summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_sha: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage: Option<RemoteTokenUsage>,
-    /// Structured failure disposition. Absent on older daemons — the server
-    /// then falls back to generic executor-failed handling.
+    // One report for every provider request/candidate attempt. This is
+    // intentionally a vector: the server must not flatten fallback hops or
+    // infer provider identity from executor family.
+    pub usage_reports: Vec<RemoteUsageReport>,
+    // Structured failure disposition. Absent on older daemons — the server
+    // then falls back to generic executor-failed handling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_class: Option<RemoteExecutionFailureClass>,
-    /// RFC3339 time when an unavailable executor route is worth retrying.
+    // RFC3339 time when an unavailable executor route is worth retrying.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_candidate: Option<RemoteResolvedCandidate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_attempts: Option<Vec<RemoteRouteAttempt>>,
+}
+
+/// The command-stream handshake sent by a daemon immediately after an
+/// authenticated connection is established. A server may dispatch work only
+/// after the advertised revision and required capabilities are accepted.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DaemonHandshakeNotification {
+    pub protocol_revision: u32,
+    pub capabilities: Vec<String>,
+}
+
+/// A server acknowledgement for a durable terminal notification. The
+/// acknowledgement is a request because the daemon must return a response so
+/// transport failures cannot be mistaken for a durable delete.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ExecutionTerminalAckParams {
+    pub terminal_report_id: String,
+    pub execution_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ExecutionTerminalAckResult {
+    pub terminal_report_id: String,
+    pub execution_id: String,
+    pub acknowledged: bool,
 }
 
 /// Structured failure class carried across the daemon protocol.
@@ -178,7 +237,7 @@ pub enum RemoteExecutionFailureClass {
 }
 
 /// The executor candidate that actually ran a remote execution.
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
 #[ts(export)]
 pub struct RemoteResolvedCandidate {
     pub candidate_key: String,
@@ -188,22 +247,53 @@ pub struct RemoteResolvedCandidate {
 }
 
 /// One candidate attempt outcome from a remote execution's fallback route.
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
 #[ts(export)]
 pub struct RemoteRouteAttempt {
     pub candidate_key: String,
     pub outcome: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+/// Per-attempt usage transported over the daemon command stream.
+///
+/// Counters are nullable independently: a reported-money-only event, a
+/// partially observed stream, and a producer with no telemetry are all
+/// materially different from an explicit metered zero. `reported_cost_usd`
+/// remains exact decimal text on the wire; clients must not parse it through a
+/// binary floating-point number.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
 #[ts(export)]
-pub struct RemoteTokenUsage {
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub cache_write_tokens: i64,
-    pub cost_usd: Option<f64>,
-    pub model: Option<String>,
+pub struct RemoteUsageReport {
+    pub report_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub report_sequence: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_key: Option<String>,
+    #[serde(default)]
+    pub attempt_ordinal: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_write_tokens: Option<u64>,
+    pub telemetry_state: UsageTelemetryState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_cost_usd: Option<String>,
+    #[serde(default)]
+    pub partial: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -299,7 +389,12 @@ pub struct DaemonErrorPayload {
 
 #[cfg(test)]
 mod tests {
-    use super::{DaemonErrorPayload, DaemonFrame, TerminalOutputNotification};
+    use super::{
+        daemon_protocol_is_compatible, DaemonErrorPayload, DaemonFrame,
+        ExecutionTerminalNotification, RemoteUsageReport, TerminalOutputNotification,
+        DAEMON_PROTOCOL_REVISION, DAEMON_REQUIRED_CAPABILITIES,
+    };
+    use crate::UsageTelemetryState;
 
     #[test]
     fn request_frame_round_trips() {
@@ -390,5 +485,91 @@ mod tests {
         assert_eq!(decoded.session_id, "term-1");
         assert_eq!(decoded.data, "hello\r\n");
         assert_eq!(decoded.ts, "2026-05-20T00:00:00Z");
+    }
+
+    #[test]
+    fn terminal_usage_reports_preserve_nullable_counters_and_decimal_cost() {
+        let notification = ExecutionTerminalNotification {
+            terminal_report_id: "terminal-report-1".to_owned(),
+            execution_id: "execution-1".to_owned(),
+            exit_code: Some(0),
+            signal: None,
+            error: None,
+            ts: "2026-05-20T00:00:00Z".to_owned(),
+            status: Some("completed".to_owned()),
+            agent_session_id: None,
+            summary: None,
+            after_sha: None,
+            usage_reports: vec![RemoteUsageReport {
+                report_id: "report-1".to_owned(),
+                request_id: Some("request-1".to_owned()),
+                report_sequence: 0,
+                candidate_key: Some("candidate-a".to_owned()),
+                attempt_ordinal: 1,
+                provider_id: Some("openai".to_owned()),
+                model_id: Some("gpt-5".to_owned()),
+                input_tokens: None,
+                output_tokens: Some(12),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: None,
+                telemetry_state: UsageTelemetryState::Metered,
+                context_tokens: Some(20),
+                selected_tier: Some("short".to_owned()),
+                reported_cost_usd: Some("0.000000001".to_owned()),
+                partial: true,
+            }],
+            failure_class: None,
+            retry_at: None,
+            resolved_candidate: None,
+            route_attempts: None,
+        };
+
+        let value = serde_json::to_value(&notification).expect("terminal serializes");
+        assert_eq!(value["terminal_report_id"], "terminal-report-1");
+        assert_eq!(
+            value["usage_reports"][0]["input_tokens"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            value["usage_reports"][0]["reported_cost_usd"],
+            "0.000000001"
+        );
+
+        let decoded: ExecutionTerminalNotification =
+            serde_json::from_value(value).expect("terminal deserializes");
+        assert_eq!(decoded.usage_reports, notification.usage_reports);
+    }
+
+    #[test]
+    fn terminal_notification_without_report_vector_is_rejected() {
+        let value = serde_json::json!({
+            "terminal_report_id": "terminal-report-1",
+            "execution_id": "execution-1",
+            "exit_code": 0,
+            "signal": null,
+            "error": null,
+            "ts": "2026-05-20T00:00:00Z"
+        });
+        assert!(serde_json::from_value::<ExecutionTerminalNotification>(value).is_err());
+    }
+
+    #[test]
+    fn daemon_protocol_gate_requires_revision_and_capabilities() {
+        let capabilities = DAEMON_REQUIRED_CAPABILITIES
+            .iter()
+            .map(|capability| (*capability).to_owned())
+            .collect::<Vec<_>>();
+        assert!(daemon_protocol_is_compatible(
+            DAEMON_PROTOCOL_REVISION,
+            &capabilities
+        ));
+        assert!(!daemon_protocol_is_compatible(
+            DAEMON_PROTOCOL_REVISION - 1,
+            &capabilities
+        ));
+        assert!(!daemon_protocol_is_compatible(
+            DAEMON_PROTOCOL_REVISION,
+            &capabilities[..1]
+        ));
     }
 }

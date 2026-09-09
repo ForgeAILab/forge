@@ -181,13 +181,23 @@ async fn latest_failed_review_context(
         return Ok(LatestReviewContext::default());
     };
 
-    let execution = ExecutionRepo::get_by_id(db, &review.execution_id).await?;
-    let logs_path = execution
+    // `review.execution_id` names the execution that was *reviewed* — the
+    // coder's — not the one that produced the verdict. Resolve the reviewer's
+    // own execution, or the coder is handed its own log as "review feedback"
+    // and can never see the finding it is being asked to fix.
+    let reviewer_execution = reviewer_execution_for_review(db, review).await?;
+    let logs_path = reviewer_execution
         .as_ref()
         .and_then(|execution| execution.logs_path.clone());
     let feedback = if review_has_auditor_feedback(&review.step_results_json) {
-        match execution.as_ref() {
-            Some(execution) => reviewer_final_message(execution).await?,
+        match reviewer_execution.as_ref() {
+            // The frozen assessment states each violated requirement and why,
+            // which is what the coder has to act on; the reviewer's closing
+            // message is the fallback when no assessment was persisted.
+            Some(execution) => match conformance_feedback(db, &execution.id).await? {
+                Some(feedback) => Some(feedback),
+                None => reviewer_final_message(execution).await?,
+            },
             None => None,
         }
     } else {
@@ -196,9 +206,88 @@ async fn latest_failed_review_context(
 
     Ok(LatestReviewContext {
         feedback,
-        execution_id: Some(review.execution_id.clone()),
+        execution_id: reviewer_execution.map(|execution| execution.id),
         logs_path,
     })
+}
+
+/// The reviewer execution that produced one review attempt's verdict.
+///
+/// A review attempt row is written when the attempt starts and its reviewer
+/// execution is dispatched immediately after, so the attempt owns the first
+/// reviewing execution created at or after its start.
+async fn reviewer_execution_for_review(
+    db: &db::SqliteDb,
+    review: &db::Review,
+) -> Result<Option<db::Execution>> {
+    let mut candidates: Vec<db::Execution> = Vec::new();
+    for role in [crate::workflow::default_roles::REVIEWER, "auditor"] {
+        let page = ExecutionRepo::list_by_task_and_role(
+            db,
+            &review.task_id,
+            role,
+            PageRequest {
+                cursor: None,
+                limit: 50,
+                include_total: false,
+                sort_by: SortBy::CreatedAt,
+                sort_order: SortOrder::Asc,
+            },
+        )
+        .await?;
+        candidates.extend(page.items);
+    }
+    candidates.retain(|execution| execution.created_at >= review.started_at);
+    candidates.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    Ok(candidates.into_iter().next())
+}
+
+/// Renders the frozen conformance assessment as coder-actionable feedback:
+/// every requirement the reviewer did not find satisfied, with its rationale
+/// and cited evidence, plus any blocking finding.
+async fn conformance_feedback(db: &db::SqliteDb, execution_id: &str) -> Result<Option<String>> {
+    let Some(conformance) = db::ReviewConformanceRepo::review_conformance(db, execution_id).await?
+    else {
+        return Ok(None);
+    };
+    let Some(assessment) = conformance.assessment else {
+        return Ok(conformance.reason);
+    };
+    let mut rendered = String::new();
+    for requirement in assessment.requirements.iter().filter(|requirement| {
+        requirement.disposition != api_types::RequirementDisposition::Satisfied
+    }) {
+        rendered.push_str(&format!(
+            "- [{:?}] {}\n  {}\n",
+            requirement.disposition, requirement.requirement_id, requirement.rationale
+        ));
+        for evidence in &requirement.evidence {
+            if let api_types::ReviewEvidenceRef::File {
+                path,
+                start_line,
+                end_line,
+                ..
+            } = evidence
+            {
+                rendered.push_str(&format!("  evidence: {path}:{start_line}-{end_line}\n"));
+            }
+        }
+    }
+    for finding in assessment
+        .findings
+        .iter()
+        .filter(|finding| finding.blocking)
+    {
+        rendered.push_str(&format!(
+            "- [blocking finding] expected: {}\n  actual: {}\n",
+            finding.expected, finding.actual
+        ));
+    }
+    if rendered.trim().is_empty() {
+        return Ok(conformance.reason);
+    }
+    rendered.truncate(REVIEW_FEEDBACK_LIMIT);
+    Ok(Some(rendered))
 }
 
 fn review_has_auditor_feedback(step_results_json: &str) -> bool {

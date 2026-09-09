@@ -23,6 +23,7 @@ under the Forge data directory.
 | `logout`  | Remove stored CLI credentials |
 | `whoami`  | Show stored CLI login state |
 | `project` | Create / list / show projects |
+| `analytics` | Inspect account-wide usage, cost coverage, and pricing provenance |
 | `repo`    | Add / list repos under a project |
 | `memory`  | Search and retrieve project-scoped memory |
 | `task`    | Create, list, show, transition, cancel, archive tasks, preview prompts |
@@ -89,6 +90,29 @@ forge-ctl task cancel <TASK_ID>
 `task prompt-preview` is read-only. Add `--trigger accept|reject|fail|retry`
 to preview the prompt for a transition target instead of the task's current
 state.
+
+### Usage and cost analytics
+
+Project and account analytics preserve provider-reported and Forge-estimated
+money as decimal strings. Table output labels complete, partial, pending, and
+unavailable coverage; JSON output returns the full typed `CostSummary` and
+source provenance. Optional RFC3339 windows are half-open `[from, to)`, and
+offsets containing `+` are URL-encoded by the client.
+
+```bash
+forge-ctl project analytics <PROJECT_ID>
+forge-ctl project analytics <PROJECT_ID> \
+  --from '2026-09-01T00:00:00-04:00' \
+  --to '2026-10-01T00:00:00-04:00'
+
+forge-ctl analytics usage
+forge-ctl --output json analytics usage \
+  --from '2026-09-01T00:00:00Z' --to '2026-10-01T00:00:00Z'
+```
+
+An unknown or incomplete cost is never printed as zero. `Cost unknown` means
+settled activity could not be priced; `$0.00` is reserved for complete,
+explicitly known zero.
 
 ### Linking an external daemon
 

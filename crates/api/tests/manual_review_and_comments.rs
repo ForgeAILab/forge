@@ -641,7 +641,6 @@ impl CodingExecutorAdapter for DelayedCodexAdapter {
                 agent_session_id: Some("manual-review-follow-up-session".to_owned()),
                 summary: Some("follow-up deferred".to_owned()),
                 error: None,
-                usage: None,
                 ..Default::default()
             })
         })

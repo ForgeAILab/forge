@@ -11,6 +11,7 @@ import {
   workflowTriggerTargets,
 } from './workflow-utils'
 import type { StateDefinition, StateKind, Task, WorkflowDefinition } from '@/types/generated'
+import { emptyUsage } from '@/test-utils/usage'
 
 const emptyHooks = {
   before_exit: [],
@@ -136,7 +137,14 @@ describe('task interruption annotations', () => {
         recovery_actions: ['reexecute'],
       },
       execution_observability: {
-        execution_count: 2,
+        counts: {
+          task_execution_count: 2,
+          chat_turn_count: 0,
+          inquiry_count: 0,
+          provider_attempt_count: 0,
+        },
+        tokens: emptyUsage.tokens,
+        cost: emptyUsage.cost,
         active_execution_id: null,
         active_role: null,
         active_started_at: null,
@@ -148,12 +156,6 @@ describe('task interruption annotations', () => {
         latest_stopped_at: null,
         latest_runtime_seconds: 1,
         total_runtime_seconds: 1,
-        total_input_tokens: 0,
-        total_output_tokens: 0,
-        total_cache_read_tokens: 0,
-        total_cache_write_tokens: 0,
-        total_tokens: 0,
-        total_cost_usd: null,
       },
       plan_progress: null,
       version: 1,

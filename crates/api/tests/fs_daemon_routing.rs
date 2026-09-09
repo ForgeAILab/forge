@@ -372,6 +372,7 @@ async fn connected_remote_daemon_lists_via_command_socket() {
     state
         .daemon_connections
         .register(registration.daemon_id.clone(), connection);
+    common::fake_daemon::accept_daemon_protocol_handshake(&state, &registration.daemon_id);
     assert!(state
         .daemon_connections
         .is_connected(&registration.daemon_id));
@@ -501,6 +502,7 @@ async fn connected_remote_daemon_receives_execution_start_request() {
     state
         .daemon_connections
         .register(registration.daemon_id.clone(), connection);
+    common::fake_daemon::accept_daemon_protocol_handshake(&state, &registration.daemon_id);
 
     let fixture =
         seed_startable_execution_for_daemon(&state, &registration.daemon_id, "echo remote").await;
@@ -566,6 +568,7 @@ async fn remote_execution_start_error_marks_execution_failed() {
     state
         .daemon_connections
         .register(registration.daemon_id.clone(), connection);
+    common::fake_daemon::accept_daemon_protocol_handshake(&state, &registration.daemon_id);
 
     let fixture =
         seed_startable_execution_for_daemon(&state, &registration.daemon_id, "echo remote").await;
@@ -674,6 +677,7 @@ async fn execution_terminal_notification_from_non_owner_daemon_is_rejected() {
     let terminal = DaemonFrame::Notification {
         method: METHOD_EXECUTION_TERMINAL.to_owned(),
         params: serde_json::to_value(ExecutionTerminalNotification {
+            terminal_report_id: format!("non-owner-terminal-{}", execution.id),
             execution_id: execution.id.clone(),
             exit_code: Some(0),
             signal: None,
@@ -683,7 +687,7 @@ async fn execution_terminal_notification_from_non_owner_daemon_is_rejected() {
             agent_session_id: None,
             summary: None,
             after_sha: None,
-            usage: None,
+            usage_reports: Vec::new(),
             failure_class: None,
             retry_at: None,
             resolved_candidate: None,
@@ -753,6 +757,7 @@ async fn remote_terminal_preserves_existing_metadata_when_fields_are_absent() {
         &mut daemon_socket,
         METHOD_EXECUTION_TERMINAL,
         ExecutionTerminalNotification {
+            terminal_report_id: format!("partial-terminal-{}", execution.id),
             execution_id: execution.id.clone(),
             exit_code: Some(1),
             signal: None,
@@ -762,7 +767,7 @@ async fn remote_terminal_preserves_existing_metadata_when_fields_are_absent() {
             agent_session_id: None,
             summary: None,
             after_sha: None,
-            usage: None,
+            usage_reports: Vec::new(),
             failure_class: None,
             retry_at: None,
             resolved_candidate: None,

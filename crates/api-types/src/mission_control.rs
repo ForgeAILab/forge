@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
+use crate::UsageAggregate;
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
@@ -215,7 +217,7 @@ pub struct AgentDetailResponse {
     pub open_commitment_count: i64,
     pub open_inbox_count: i64,
     pub memory_namespace_count: i64,
-    pub usage: AgentUsageSummary,
+    pub usage: UsageAggregate,
     pub continuity: AgentContinuityHealth,
 }
 
@@ -229,17 +231,6 @@ pub struct AgentBindingSummary {
     pub state: String,
     pub subscription_count: i64,
     pub wake_budget: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
-#[ts(export)]
-pub struct AgentUsageSummary {
-    pub execution_count: i64,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub cache_write_tokens: i64,
-    pub cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]

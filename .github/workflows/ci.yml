@@ -68,19 +68,26 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # `if: !cancelled()` on every check below: a failing step no longer skips
+      # the rest, so one red web job reports lint, types, unit tests, build and
+      # the Playwright smoke together instead of one failure per push.
       - name: Lint
         run: pnpm lint
 
       - name: Typecheck
+        if: ${{ !cancelled() }}
         run: pnpm typecheck
 
       - name: Unit tests
+        if: ${{ !cancelled() }}
         run: pnpm test
 
       - name: Build
+        if: ${{ !cancelled() }}
         run: pnpm build
 
       - name: Playwright smoke
+        if: ${{ !cancelled() }}
         run: pnpm run e2e
 
   npm-bootstrapper:

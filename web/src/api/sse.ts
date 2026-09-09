@@ -1,5 +1,6 @@
 import { useEffect } from 'react'
 import type { QueryClient } from '@tanstack/react-query'
+import { invalidateAnalyticsQueries } from '@/api/analytics-query-invalidation'
 import { qk } from '@/api/query-keys'
 import { useAuthStore } from '@/stores/auth'
 import { useChatSelection } from '@/stores/chat'
@@ -153,6 +154,7 @@ function routeDomainEventCommitted(payload: SsePayload, queryClient: QueryClient
   if (scopeType === 'project' && scopeId) {
     void queryClient.invalidateQueries({ queryKey: qk.project(scopeId) })
     void queryClient.invalidateQueries({ queryKey: qk.projects })
+    invalidateAnalyticsQueries(queryClient, scopeId)
     if (entityType === 'milestone') {
       void queryClient.invalidateQueries({ queryKey: qk.projectOverview(scopeId) })
     }
@@ -169,6 +171,7 @@ function routeDomainEventCommitted(payload: SsePayload, queryClient: QueryClient
     void queryClient.invalidateQueries({ queryKey: ['agent-chats', scopeId] })
     void queryClient.invalidateQueries({ queryKey: ['agent-chats', scopeId, 'messages'] })
     void queryClient.invalidateQueries({ queryKey: ['agent-chats', scopeId, 'turns'] })
+    invalidateAnalyticsQueries(queryClient)
     return
   }
 
@@ -180,6 +183,7 @@ function routeDomainEventCommitted(payload: SsePayload, queryClient: QueryClient
       void queryClient.invalidateQueries({ queryKey: qk.reviews(scopeId) })
     }
     invalidateMissionControl(queryClient)
+    invalidateAnalyticsQueries(queryClient)
     return
   }
 
@@ -264,6 +268,7 @@ export function routeSsePayload(
       void queryClient.invalidateQueries({ queryKey: qk.transitions(taskId) })
     }
     invalidateMissionControl(queryClient)
+    invalidateAnalyticsQueries(queryClient, payload.project_id)
   }
 
   if (eventType.startsWith('agent.')) {
@@ -298,6 +303,7 @@ export function routeSsePayload(
     }
     void queryClient.invalidateQueries({ queryKey: qk.execution(payload.entity_id) })
     invalidateMissionControl(queryClient)
+    invalidateAnalyticsQueries(queryClient, payload.project_id)
   }
 
   if (eventType.startsWith('agent_chat.')) {
@@ -309,6 +315,7 @@ export function routeSsePayload(
     if (payload.project_id) {
       void queryClient.invalidateQueries({ queryKey: ['agent-handoffs', payload.project_id] })
     }
+    invalidateAnalyticsQueries(queryClient, payload.project_id)
   }
 
   if (eventType.startsWith('agent_handoff.')) {
@@ -320,11 +327,13 @@ export function routeSsePayload(
       void queryClient.invalidateQueries({ queryKey: ['agent-chats', payload.chat_id, 'messages'] })
       void queryClient.invalidateQueries({ queryKey: ['agent-chats', payload.chat_id, 'turns'] })
     }
+    invalidateAnalyticsQueries(queryClient, payload.project_id)
   }
 
   if (eventType.startsWith('project.')) {
     void queryClient.invalidateQueries({ queryKey: qk.project(payload.entity_id) })
     void queryClient.invalidateQueries({ queryKey: qk.projects })
+    invalidateAnalyticsQueries(queryClient, payload.entity_id)
     if (eventType === 'project.deleted') {
       // 8.4.4 / F17: an external deletion while a deleted route is open
       // must converge the same way an explicit delete does. `app-shell.tsx`

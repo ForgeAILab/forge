@@ -6,10 +6,10 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use db::{
     now_rfc3339, Agent, AgentListQuery, AgentRepo, AgentSessionRepo, AgentStatus, Daemon,
     DaemonRepo, Execution, ExecutionLeaseDisposition, ExecutionProgressWarningOutcome,
-    ExecutionRepo, ExecutionStatus, ExecutionTerminalOutcome, PageRequest, Project, ProjectRepo,
-    RecordExecutionProgressWarning, ResumePolicy, SortBy, SortOrder, SqliteDb, StopReason, Task,
-    TaskListQuery, TaskRepo, TerminalizeExecution, UpdateAgent, UpdateExecution, UpdateTaskStatus,
-    WorkspaceLeaseRepo,
+    ExecutionRepo, ExecutionStatus, ExecutionTerminalOutcome, MarkUsageInvocationUnsettled,
+    PageRequest, Project, ProjectRepo, RecordExecutionProgressWarning, ResumePolicy, SortBy,
+    SortOrder, SqliteDb, StopReason, Task, TaskListQuery, TaskRepo, TerminalizeExecution,
+    UpdateAgent, UpdateExecution, UpdateTaskStatus, UsageLedgerRepo, WorkspaceLeaseRepo,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::TaskExecutor;
@@ -46,6 +46,20 @@ impl CrashRecovery {
         // pass below then sees the still-running attempt and requeues/blocks
         // it through the normal crash-recovery state machine.
         expire_workspace_leases(&self.db, &self.event_bus, None, None, false).await?;
+
+        // A user cancellation can commit the execution terminal CAS and move
+        // still-running local provider calls to pending settlement immediately
+        // before the process exits. There is no daemon to replay those calls
+        // after restart, so repair that durable ambiguity before recovering
+        // Tasks. Daemon-owned invocations remain pending: their terminal
+        // report is replayable across a reconnect.
+        let unsettled = reconcile_unreplayable_local_usage_invocations(&self.db).await?;
+        if unsettled > 0 {
+            tracing::info!(
+                unsettled,
+                "marked unreplayable local usage invocations unsettled during crash recovery"
+            );
+        }
 
         // Native (in-process) runtime sessions cannot survive a restart, so
         // any 'starting'/'ready'/'running'/'degraded' native session left by
@@ -175,6 +189,66 @@ impl CrashRecovery {
     fn publish(&self, event: ForgeEvent) {
         self.event_bus.publish(event);
     }
+}
+
+async fn reconcile_unreplayable_local_usage_invocations(db: &SqliteDb) -> Result<u64> {
+    let invocations = UsageLedgerRepo::list_usage_invocations_needing_settlement(db, 5000).await?;
+    let mut marked = 0_u64;
+    for invocation in invocations {
+        let Some(execution_id) = invocation.execution_id.as_deref() else {
+            continue;
+        };
+        let Some(execution) = ExecutionRepo::get_by_id(db, execution_id).await? else {
+            continue;
+        };
+        if execution.status == ExecutionStatus::Running {
+            continue;
+        }
+        let previous_owner = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT json_extract(payload_json, '$.previous_lease_owner')
+             FROM domain_event
+             WHERE entity_type = 'task'
+               AND entity_id = ?
+               AND event_type IN (
+                   'execution.completed', 'execution.failed',
+                   'execution.cancelled', 'execution.terminal_report.received'
+               )
+               AND json_extract(payload_json, '$.execution_id') = ?
+             ORDER BY sequence DESC
+             LIMIT 1",
+        )
+        .bind(&execution.task_id)
+        .bind(&execution.id)
+        .fetch_optional(db.pool())
+        .await?
+        .flatten();
+        if previous_owner
+            .as_deref()
+            .is_some_and(|owner| owner.starts_with("daemon:"))
+        {
+            continue;
+        }
+        match UsageLedgerRepo::mark_usage_invocation_unsettled(
+            db,
+            MarkUsageInvocationUnsettled {
+                id: invocation.id,
+                expected_version: invocation.version,
+                terminal_reason: "recovery_no_replayable_result".to_owned(),
+                settled_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        {
+            Ok(_) => marked += 1,
+            Err(db::DbError::VersionConflict | db::DbError::IdempotencyConflict) => {
+                // A late result may have settled the invocation while this
+                // repair sweep was reading it. The newer lifecycle wins.
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(marked)
 }
 
 pub struct HeartbeatMonitor {
@@ -485,8 +559,7 @@ impl HeartbeatMonitor {
             };
             let stopped_by =
                 api_types::Actor::system(api_types::SystemComponent::HeartbeatMonitor).display();
-            let outcome = ExecutionRepo::terminalize(
-                &*self.db,
+            let mut terminal_input = crate::task_service::execution::ledger::terminal_with_ledger(
                 TerminalizeExecution {
                     execution_id: execution.id.clone(),
                     expected_version: execution.execution_version,
@@ -514,8 +587,19 @@ impl HeartbeatMonitor {
                     causation_depth: 0,
                     lease_disposition: ExecutionLeaseDisposition::Expire,
                 },
-            )
-            .await?;
+                Vec::new(),
+                None,
+                None,
+            );
+            terminal_input.mark_unreplayable_pending_unsettled = execution
+                .lease_owner
+                .as_deref()
+                .is_none_or(|owner| !owner.starts_with("daemon:"));
+            terminal_input.preserve_pending_settlement = execution
+                .lease_owner
+                .as_deref()
+                .is_some_and(|owner| owner.starts_with("daemon:"));
+            let outcome = ExecutionRepo::terminalize_with_ledger(&*self.db, terminal_input).await?;
 
             let ExecutionTerminalOutcome::Committed {
                 execution: updated, ..
@@ -814,8 +898,7 @@ async fn expire_workspace_leases(
         }
 
         let now = now_rfc3339();
-        let outcome = match ExecutionRepo::terminalize(
-            db,
+        let mut terminal_input = crate::task_service::execution::ledger::terminal_with_ledger(
             TerminalizeExecution {
                 execution_id: execution.id.clone(),
                 expected_version: execution.execution_version,
@@ -846,9 +929,19 @@ async fn expire_workspace_leases(
                 causation_depth: 0,
                 lease_disposition: ExecutionLeaseDisposition::Expire,
             },
-        )
-        .await
-        {
+            Vec::new(),
+            None,
+            None,
+        );
+        terminal_input.mark_unreplayable_pending_unsettled = execution
+            .lease_owner
+            .as_deref()
+            .is_none_or(|owner| !owner.starts_with("daemon:"));
+        terminal_input.preserve_pending_settlement = execution
+            .lease_owner
+            .as_deref()
+            .is_some_and(|owner| owner.starts_with("daemon:"));
+        let outcome = match ExecutionRepo::terminalize_with_ledger(db, terminal_input).await {
             Ok(outcome) => outcome,
             Err(error) => {
                 tracing::warn!(
@@ -1267,8 +1360,7 @@ async fn cancel_running_executions_for_recovery(
             // expiry/deadline monitor remains responsible for this execution.
             continue;
         }
-        let outcome = ExecutionRepo::terminalize(
-            db,
+        let mut terminal_input = crate::task_service::execution::ledger::terminal_with_ledger(
             TerminalizeExecution {
                 execution_id: execution.id.clone(),
                 expected_version: execution.execution_version,
@@ -1302,8 +1394,20 @@ async fn cancel_running_executions_for_recovery(
                 causation_depth: 0,
                 lease_disposition: ExecutionLeaseDisposition::Revoke,
             },
-        )
-        .await?;
+            Vec::new(),
+            None,
+            None,
+        );
+        // Local provider calls cannot survive a process crash with a
+        // replayable result.  Ask the composite boundary to move their
+        // pending invocations to `unsettled` before committing the terminal
+        // CAS. Daemon-owned calls retain their pending state because the
+        // daemon keeps its terminal report until it is acknowledged.
+        terminal_input.mark_unreplayable_pending_unsettled = execution
+            .lease_owner
+            .as_deref()
+            .is_none_or(|owner| !owner.starts_with("daemon:"));
+        let outcome = ExecutionRepo::terminalize_with_ledger(db, terminal_input).await?;
         if let ExecutionTerminalOutcome::Committed {
             execution: cancelled_execution,
             ..
@@ -1447,8 +1551,7 @@ pub(crate) async fn fail_execution_daemon_disconnected(
         reconciliation_reason,
     } = input;
     let now = now_rfc3339();
-    let outcome = ExecutionRepo::terminalize(
-        db,
+    let mut terminal_input = crate::task_service::execution::ledger::terminal_with_ledger(
         TerminalizeExecution {
             execution_id: execution.id.clone(),
             expected_version: execution.execution_version,
@@ -1476,8 +1579,12 @@ pub(crate) async fn fail_execution_daemon_disconnected(
             causation_depth: 0,
             lease_disposition: ExecutionLeaseDisposition::Expire,
         },
-    )
-    .await?;
+        Vec::new(),
+        None,
+        None,
+    );
+    terminal_input.preserve_pending_settlement = true;
+    let outcome = ExecutionRepo::terminalize_with_ledger(db, terminal_input).await?;
 
     let ExecutionTerminalOutcome::Committed {
         execution: updated, ..
@@ -1696,7 +1803,7 @@ mod tests {
                 agent_session_id: None,
                 summary: None,
                 error: None,
-                usage: None,
+                usage_reports: Vec::new(),
                 ..Default::default()
             })
         }

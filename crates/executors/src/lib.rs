@@ -16,11 +16,12 @@ pub use adapter::{
 };
 pub use command::{build_shell_command_plan, ShellCommandPlan};
 pub use config::{
-    account_key, build_ordered_fallback_routing, candidate_key, deserialize_config,
-    merge_overrides, resolve_config_value, ClaudeCodeConfig, CodexConfig, CommandOverrides,
-    CursorConfig, EmbeddedConfig, ExecutorCandidate, ExecutorRouting, GeminiConfig, NullConfig,
-    OpencodeConfig, PermissionPolicy, RouteAttempt, RouteAttemptOutcome, ShellConfig, SmithConfig,
-    FALLBACKS_CONFIG_KEY, ROUTING_POLICY_ORDERED_FALLBACK_V1, ROUTING_SNAPSHOT_KEY,
+    account_key, build_ordered_fallback_routing, candidate_config_from_snapshot, candidate_key,
+    candidate_key_from_snapshot, deserialize_config, merge_overrides, resolve_config_value,
+    ClaudeCodeConfig, CodexConfig, CommandOverrides, CursorConfig, EmbeddedConfig,
+    ExecutorCandidate, ExecutorRouting, GeminiConfig, NullConfig, OpencodeConfig, PermissionPolicy,
+    RouteAttempt, RouteAttemptOutcome, ShellConfig, SmithConfig, FALLBACKS_CONFIG_KEY,
+    ROUTING_POLICY_ORDERED_FALLBACK_V1, ROUTING_SNAPSHOT_KEY,
 };
 pub use log_reader::{LogReadResult, LogReader};
 pub use log_schema::{LogEntry, LogKind, LogStream};
@@ -28,6 +29,8 @@ pub use log_writer::LogWriter;
 pub use shell::{is_pid_alive, ShellExecutor};
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 const READ_ONLY_WORKTREE_KEY: &str = "_forge_read_only_worktree";
 
@@ -70,6 +73,20 @@ pub struct ExecutionContext {
     pub log_sender: Option<tokio::sync::mpsc::UnboundedSender<LogEntry>>,
 }
 
+/// Durable admission callback invoked immediately before an executor crosses
+/// the external-provider boundary.  The callback lives in this neutral crate
+/// so adapters and services can agree on the lifecycle without coupling the
+/// executor layer to SQLite or pricing.
+#[async_trait]
+pub trait ProviderCallAdmission: Send + Sync {
+    async fn before_provider_call(
+        &self,
+        ctx: &ExecutionContext,
+        candidate_key: &str,
+        attempt_ordinal: u32,
+    ) -> Result<(), ExecutorError>;
+}
+
 #[cfg(test)]
 mod worktree_policy_tests {
     use super::*;
@@ -86,43 +103,305 @@ mod worktree_policy_tests {
     }
 }
 
-/// Accumulated token usage from an executor run.
+/// Telemetry disposition for one provider attempt.
 ///
-/// The three input counters are **disjoint**, whatever the upstream provider's
-/// own convention: `input_tokens` excludes both cache reads and cache writes,
-/// so context size is their sum and a total never double-counts a cached
-/// prefix. Adapters normalize to this on the way in — Anthropic already
-/// reports it, Codex and the embedded runtime report input inclusive of the
-/// cached prefix and have it subtracted back out.
-#[derive(Debug, Clone, Default)]
-pub struct TokenUsage {
-    /// Input tokens read fresh, excluding cache reads and cache writes.
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    /// Input tokens served from the provider's prompt cache.
-    pub cache_read_tokens: i64,
-    /// Input tokens written to the provider's prompt cache.
-    pub cache_write_tokens: i64,
-    pub cost_usd: Option<f64>,
-    pub model: Option<String>,
+/// `Metered` is deliberately independent from the values in [`UsageCounters`]:
+/// a producer that authoritatively reports four zero counters sets every field
+/// to `Some(0)`, while a producer that supplies no trustworthy counters uses
+/// `Unmetered` with every field set to `None`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageTelemetryState {
+    Metered,
+    #[default]
+    Unmetered,
+    Pending,
+    Unsettled,
 }
 
-impl TokenUsage {
-    /// Fold another candidate's usage into this one (fallback chains aggregate
-    /// usage across every candidate that consumed billable tokens).
-    pub fn absorb(&mut self, other: &TokenUsage) {
-        self.input_tokens += other.input_tokens;
-        self.output_tokens += other.output_tokens;
-        self.cache_read_tokens += other.cache_read_tokens;
-        self.cache_write_tokens += other.cache_write_tokens;
-        self.cost_usd = match (self.cost_usd, other.cost_usd) {
-            (Some(a), Some(b)) => Some(a + b),
-            (a, b) => a.or(b),
-        };
-        if self.model.is_none() {
-            self.model = other.model.clone();
+/// Four disjoint token counters observed for one provider report.
+///
+/// A missing field is unknown; it is never silently converted to zero. The
+/// native runtime and adapters that define all four fields can therefore
+/// preserve explicit zeros without making a no-telemetry result look free.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageCounters {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+}
+
+impl UsageCounters {
+    /// Counters for an authoritative all-zero report.
+    pub const fn explicit_zero() -> Self {
+        Self {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
         }
     }
+
+    /// Whether at least one counter was authoritatively supplied.
+    pub const fn has_any(&self) -> bool {
+        self.input_tokens.is_some()
+            || self.output_tokens.is_some()
+            || self.cache_read_tokens.is_some()
+            || self.cache_write_tokens.is_some()
+    }
+
+    /// Whether all supplied counters are zero and all four counters are known.
+    pub const fn is_explicit_zero(&self) -> bool {
+        matches!(
+            (
+                self.input_tokens,
+                self.output_tokens,
+                self.cache_read_tokens,
+                self.cache_write_tokens
+            ),
+            (Some(0), Some(0), Some(0), Some(0))
+        )
+    }
+
+    /// Add a documented non-overlapping delta without turning an omitted
+    /// bucket into a fabricated zero. Overflow is returned explicitly so a
+    /// caller can preserve the reports separately instead of silently
+    /// truncating a provider's usage.
+    pub fn checked_add_delta(&mut self, other: &Self) -> Result<(), UsageCounterMergeError> {
+        fn add(
+            left: Option<u64>,
+            right: Option<u64>,
+        ) -> Result<Option<u64>, UsageCounterMergeError> {
+            match (left, right) {
+                (None, None) => Ok(None),
+                (Some(_), None) | (None, Some(_)) => Err(UsageCounterMergeError::MissingBucket),
+                (Some(left), Some(right)) => left
+                    .checked_add(right)
+                    .map(Some)
+                    .ok_or(UsageCounterMergeError::Overflow),
+            }
+        }
+
+        let input_tokens = add(self.input_tokens, other.input_tokens)?;
+        let output_tokens = add(self.output_tokens, other.output_tokens)?;
+        let cache_read_tokens = add(self.cache_read_tokens, other.cache_read_tokens)?;
+        let cache_write_tokens = add(self.cache_write_tokens, other.cache_write_tokens)?;
+        self.input_tokens = input_tokens;
+        self.output_tokens = output_tokens;
+        self.cache_read_tokens = cache_read_tokens;
+        self.cache_write_tokens = cache_write_tokens;
+        Ok(())
+    }
+}
+
+/// A checked token-counter merge could not produce one truthful aggregate.
+/// Keeping overflow and missing buckets explicit prevents either condition
+/// from being reported as a valid, wrapped, saturated, or synthetic count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageCounterMergeError {
+    Overflow,
+    MissingBucket,
+}
+
+impl std::fmt::Display for UsageCounterMergeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Overflow => "usage counter overflow",
+            Self::MissingBucket => "usage counter bucket is missing",
+        })
+    }
+}
+
+impl std::error::Error for UsageCounterMergeError {}
+
+/// One adapter/provider report. A fallback execution carries one or more of
+/// these records rather than a flattened logical total.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageReport {
+    /// Stable producer identity. Fallback fills a deterministic value when an
+    /// adapter has no provider request identifier.
+    pub report_id: String,
+    /// Optional provider request identity when the producer exposes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Ordered report identity within a candidate invocation.
+    #[serde(default)]
+    pub report_sequence: u32,
+    /// Immutable route candidate identity, assigned by the fallback layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_key: Option<String>,
+    /// Route attempt ordinal. Skipped candidates do not receive reports.
+    #[serde(default)]
+    pub attempt_ordinal: u32,
+    /// Actual provider identity, never inferred from [`ExecutorKind`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    /// Actual provider model identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    pub counters: UsageCounters,
+    pub telemetry_state: UsageTelemetryState,
+    /// Optional request context evidence used by exact pricing tiers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_tier: Option<String>,
+    /// Provider/runtime-reported amount. It is kept separate from estimates;
+    /// the services/ledger layer must never add an estimate for this report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_cost_usd: Option<String>,
+    /// Route outcome, when the fallback layer has classified it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<config::RouteAttemptOutcome>,
+    /// True when this report came from an adapter failure after observing a
+    /// partial provider response.
+    #[serde(default)]
+    pub partial: bool,
+}
+
+impl Default for UsageReport {
+    fn default() -> Self {
+        Self::unmetered(String::new())
+    }
+}
+
+impl UsageReport {
+    /// Build a metered report. `Some(0)` values are preserved as explicit
+    /// telemetry, including an all-zero report.
+    pub fn metered(report_id: impl Into<String>, counters: UsageCounters) -> Self {
+        let telemetry_state = if counters.has_any() {
+            UsageTelemetryState::Metered
+        } else {
+            UsageTelemetryState::Unmetered
+        };
+        Self {
+            report_id: report_id.into(),
+            counters,
+            telemetry_state,
+            ..Self::empty()
+        }
+    }
+
+    /// Build an unmetered report without synthetic zero counters.
+    pub fn unmetered(report_id: impl Into<String>) -> Self {
+        Self {
+            report_id: report_id.into(),
+            ..Self::empty()
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            report_id: String::new(),
+            request_id: None,
+            report_sequence: 0,
+            candidate_key: None,
+            attempt_ordinal: 0,
+            provider_id: None,
+            model_id: None,
+            counters: UsageCounters::default(),
+            telemetry_state: UsageTelemetryState::Unmetered,
+            context_tokens: None,
+            selected_tier: None,
+            reported_cost_usd: None,
+            outcome: None,
+            partial: false,
+        }
+    }
+
+    /// Assign route identity while preserving a provider-supplied report ID.
+    pub fn for_candidate(
+        mut self,
+        execution_id: &str,
+        candidate_key: &str,
+        attempt_ordinal: u32,
+        report_sequence: u32,
+    ) -> Self {
+        if self.report_id.trim().is_empty() {
+            self.report_id = stable_report_id(
+                execution_id,
+                candidate_key,
+                attempt_ordinal,
+                report_sequence,
+            );
+        }
+        self.candidate_key = Some(candidate_key.to_owned());
+        self.attempt_ordinal = attempt_ordinal;
+        self.report_sequence = report_sequence;
+        self.normalize_telemetry();
+        self
+    }
+
+    /// Set configured identity only when the provider did not report an
+    /// actual identity. This never substitutes the executor family.
+    pub fn fill_identity(&mut self, provider_id: Option<&str>, model_id: Option<&str>) {
+        if self.provider_id.is_none() {
+            self.provider_id = provider_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+        }
+        if self.model_id.is_none() {
+            self.model_id = model_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+        }
+    }
+
+    /// Keep telemetry state consistent with sparse counters.
+    pub fn normalize_telemetry(&mut self) {
+        if self.telemetry_state == UsageTelemetryState::Metered && !self.counters.has_any() {
+            self.telemetry_state = UsageTelemetryState::Unmetered;
+        }
+        if self.telemetry_state != UsageTelemetryState::Metered {
+            self.counters = UsageCounters::default();
+        }
+    }
+
+    /// Add a documented non-overlapping delta into this report.
+    pub fn merge_delta(&mut self, other: &Self) -> Result<(), UsageCounterMergeError> {
+        self.counters.checked_add_delta(&other.counters)?;
+        if self.request_id.is_none() {
+            self.request_id = other.request_id.clone();
+        }
+        if self.provider_id.is_none() {
+            self.provider_id = other.provider_id.clone();
+        }
+        if self.model_id.is_none() {
+            self.model_id = other.model_id.clone();
+        }
+        if self.context_tokens.is_none() {
+            self.context_tokens = other.context_tokens;
+        }
+        if self.selected_tier.is_none() {
+            self.selected_tier = other.selected_tier.clone();
+        }
+        if self.reported_cost_usd.is_none() {
+            self.reported_cost_usd = other.reported_cost_usd.clone();
+        }
+        self.partial |= other.partial;
+        if other.outcome.is_some() {
+            self.outcome = other.outcome;
+        }
+        self.telemetry_state = if self.counters.has_any() {
+            UsageTelemetryState::Metered
+        } else {
+            UsageTelemetryState::Unmetered
+        };
+        Ok(())
+    }
+}
+
+/// Stable fallback report identity for adapters that expose no request ID.
+pub fn stable_report_id(
+    execution_id: &str,
+    candidate_key: &str,
+    attempt_ordinal: u32,
+    report_sequence: u32,
+) -> String {
+    format!("forge:{execution_id}:{candidate_key}:{attempt_ordinal}:{report_sequence}")
 }
 
 /// Structured disposition of a failed execution. `TaskFailed` keeps the
@@ -156,7 +435,9 @@ pub struct ExecutionResult {
     pub assistant_output: Option<String>,
     pub summary: Option<String>,
     pub error: Option<String>,
-    pub usage: Option<TokenUsage>,
+    /// One report per provider request/candidate attempt. This vector is
+    /// intentionally empty only when no adapter/provider call was made.
+    pub usage_reports: Vec<UsageReport>,
     pub failure_class: Option<ExecutionFailureClass>,
     pub retry_after: Option<std::time::Duration>,
     pub resolved_candidate: Option<ResolvedExecutorCandidate>,
@@ -177,6 +458,20 @@ pub enum ExecutionOutcome {
 #[async_trait]
 pub trait TaskExecutor: Send + Sync {
     async fn execute(&self, ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError>;
+
+    /// Execute with an optional lifecycle callback. Implementations that do
+    /// not expose a candidate-level provider boundary may use the default;
+    /// routed executors override this to invoke the callback for each actual
+    /// candidate call. Keeping this default preserves existing third-party
+    /// TaskExecutor implementations and test doubles.
+    async fn execute_with_provider_call_admission(
+        &self,
+        ctx: ExecutionContext,
+        _admission: Arc<dyn ProviderCallAdmission>,
+    ) -> Result<ExecutionResult, ExecutorError> {
+        self.execute(ctx).await
+    }
+
     async fn cancel(&self, execution_id: &str) -> Result<(), ExecutorError>;
 }
 
@@ -187,18 +482,21 @@ pub enum ExecutorError {
 
     /// The candidate's quota or rate limit is exhausted. Candidate-level
     /// control flow for the fallback layer only — never the terminal channel.
-    /// Carries any usage the candidate accumulated before hitting the cap so
+    /// Carries any reports the candidate accumulated before hitting the cap so
     /// fallback chains keep accounting truthful.
     #[error("usage exhausted")]
     UsageExhausted {
         retry_after: Option<std::time::Duration>,
-        usage: Option<TokenUsage>,
+        usage_reports: Vec<UsageReport>,
     },
 
     /// The candidate's CLI is missing or unauthenticated. Candidate-level
     /// control flow for the fallback layer only — never the terminal channel.
-    #[error("executor unavailable: {0}")]
-    Unavailable(String),
+    #[error("executor unavailable: {reason}")]
+    Unavailable {
+        reason: String,
+        usage_reports: Vec<UsageReport>,
+    },
 
     #[error("executor error: {0}")]
     Other(String),
@@ -208,7 +506,24 @@ impl ExecutorError {
     /// Availability failures are the only errors that may advance a
     /// fallback chain.
     pub fn is_availability(&self) -> bool {
-        matches!(self, Self::UsageExhausted { .. } | Self::Unavailable(_))
+        matches!(self, Self::UsageExhausted { .. } | Self::Unavailable { .. })
+    }
+
+    /// Reports observed before an availability error, if any.
+    pub fn usage_reports(&self) -> &[UsageReport] {
+        match self {
+            Self::UsageExhausted { usage_reports, .. }
+            | Self::Unavailable { usage_reports, .. } => usage_reports,
+            _ => &[],
+        }
+    }
+
+    /// Construct an unavailable candidate error with no usage report.
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self::Unavailable {
+            reason: reason.into(),
+            usage_reports: Vec::new(),
+        }
     }
 }
 
@@ -374,5 +689,53 @@ mod tests {
             .map(|entry| entry.sequence)
             .collect::<Vec<_>>();
         assert_eq!(sequences, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn explicit_zero_is_metered_but_missing_telemetry_is_unmetered() {
+        let explicit_zero = UsageReport::metered("provider-report", UsageCounters::explicit_zero());
+        assert_eq!(explicit_zero.telemetry_state, UsageTelemetryState::Metered);
+        assert!(explicit_zero.counters.is_explicit_zero());
+
+        let missing = UsageReport::unmetered("no-provider-report");
+        assert_eq!(missing.telemetry_state, UsageTelemetryState::Unmetered);
+        assert!(!missing.counters.has_any());
+    }
+
+    #[test]
+    fn checked_usage_addition_reports_overflow_without_mutating_counters() {
+        let mut counters = UsageCounters {
+            output_tokens: Some(u64::MAX),
+            ..Default::default()
+        };
+        let delta = UsageCounters {
+            output_tokens: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            counters.checked_add_delta(&delta),
+            Err(UsageCounterMergeError::Overflow)
+        );
+        assert_eq!(counters.output_tokens, Some(u64::MAX));
+    }
+
+    #[test]
+    fn candidate_identity_is_stable_and_reports_keep_route_provenance() {
+        let report = UsageReport::unmetered(String::new()).for_candidate(
+            "execution-1",
+            "smith:provider=one#1234abcd",
+            2,
+            1,
+        );
+        assert_eq!(
+            report.report_id,
+            "forge:execution-1:smith:provider=one#1234abcd:2:1"
+        );
+        assert_eq!(
+            report.candidate_key.as_deref(),
+            Some("smith:provider=one#1234abcd")
+        );
+        assert_eq!(report.attempt_ordinal, 2);
+        assert_eq!(report.report_sequence, 1);
     }
 }

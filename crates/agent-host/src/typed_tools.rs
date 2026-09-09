@@ -2640,6 +2640,9 @@ fn host_error_to_runtime(error: AgentHostError) -> RuntimeError {
         AgentHostError::Runtime(message) => {
             RuntimeError::tool(format!("Forge tool provider failed: {message}"))
         }
+        AgentHostError::RuntimeWithUsage { message, .. } => {
+            RuntimeError::tool(format!("Forge tool provider failed: {message}"))
+        }
         AgentHostError::TurnLimitReached { limit } => RuntimeError::tool(format!(
             "Forge tool provider reached its runtime {limit} limit"
         )),

@@ -479,12 +479,13 @@ impl EmbeddedAgentService {
         owner_user_id: &str,
         credential_id: &str,
     ) -> Result<CredentialHandle> {
-        let handle = CredentialHandleRepo::get_credential_handle(&*self.db, credential_id)
-            .await?
-            .filter(|handle| handle.owner_user_id == owner_user_id)
-            .ok_or_else(|| {
-                ServiceError::not_found("credential_handle", credential_id.to_owned())
-            })?;
+        let handle = CredentialHandleRepo::get_credential_handle_for_owner(
+            &*self.db,
+            credential_id,
+            owner_user_id,
+        )
+        .await?
+        .ok_or_else(|| ServiceError::not_found("credential_handle", credential_id.to_owned()))?;
         if handle.status != "configured" {
             return Err(ServiceError::invalid_operation(
                 "provider entry is disconnected",
@@ -720,6 +721,9 @@ impl EmbeddedAgentService {
             .require_owned_entry(&input.owner_user_id, &input.credential_id)
             .await?;
         let base_url = entry_base_url(&entry)?;
+        provider_url_addresses(&base_url)
+            .await
+            .map_err(ServiceError::invalid_operation)?;
         let system_prompt = validate_public_runtime_text(input.system_prompt.as_deref())?;
         validate_public_runtime_json(&input.account_permission_ceiling)?;
         validate_public_runtime_json(&input.tool_policy)?;
@@ -814,6 +818,9 @@ impl EmbeddedAgentService {
             .require_owned_entry(&input.owner_user_id, &input.credential_id)
             .await?;
         let base_url = entry_base_url(&entry)?;
+        provider_url_addresses(&base_url)
+            .await
+            .map_err(ServiceError::invalid_operation)?;
         let system_prompt = validate_public_runtime_text(input.system_prompt.as_deref())?;
         let account_permission_ceiling = sqlx::query_scalar::<_, String>(
             "SELECT account_permission_ceiling FROM agent_identity WHERE id = ?",
@@ -2037,16 +2044,20 @@ pub fn entry_base_url(entry: &CredentialHandle) -> Result<String> {
                 .map(str::to_owned)
         });
     if let Some(base_url) = stored {
-        return Ok(base_url);
+        let base_url = base_url.trim();
+        validate_provider_url_shape(base_url).map_err(ServiceError::invalid_operation)?;
+        return Ok(base_url.to_owned());
     }
     let fallback = if entry.credential_method == "oauth_bundle" {
         default_oauth_base_url(&entry.provider)
     } else {
         default_api_key_base_url(&entry.provider)
     };
-    fallback
-        .map(str::to_owned)
-        .ok_or_else(|| ServiceError::invalid_operation("provider entry has no usable API endpoint"))
+    let fallback = fallback.ok_or_else(|| {
+        ServiceError::invalid_operation("provider entry has no usable API endpoint")
+    })?;
+    validate_provider_url_shape(fallback).map_err(ServiceError::invalid_operation)?;
+    Ok(fallback.to_owned())
 }
 
 /// The provider-side account id recorded on an entry during OAuth login.
@@ -2141,13 +2152,7 @@ fn now_unix_seconds() -> i64 {
 async fn provider_url_addresses(
     base_url: &str,
 ) -> std::result::Result<(url::Url, Vec<SocketAddr>), &'static str> {
-    let parsed = url::Url::parse(base_url).map_err(|_| "base_url must be an absolute URL")?;
-    if parsed.username() != "" || parsed.password().is_some() || parsed.fragment().is_some() {
-        return Err("base_url must not contain userinfo or a fragment");
-    }
-    if parsed.scheme() != "https" {
-        return Err("base_url must use https");
-    }
+    let parsed = validate_provider_url_shape(base_url)?;
     let host = parsed.host().ok_or("base_url must include a host")?;
     let port = parsed
         .port_or_known_default()
@@ -2155,15 +2160,10 @@ async fn provider_url_addresses(
     let addresses = match host {
         url::Host::Ipv4(address) => vec![SocketAddr::new(IpAddr::V4(address), port)],
         url::Host::Ipv6(address) => vec![SocketAddr::new(IpAddr::V6(address), port)],
-        url::Host::Domain(domain) => {
-            if restricted_provider_hostname(domain) {
-                return Err("base_url must not target a local or private hostname");
-            }
-            tokio::net::lookup_host((domain, port))
-                .await
-                .map_err(|_| "base_url hostname could not be resolved")?
-                .collect::<Vec<_>>()
-        }
+        url::Host::Domain(domain) => tokio::net::lookup_host((domain, port))
+            .await
+            .map_err(|_| "base_url hostname could not be resolved")?
+            .collect::<Vec<_>>(),
     };
     if addresses.is_empty()
         || addresses
@@ -2173,6 +2173,41 @@ async fn provider_url_addresses(
         return Err("base_url must not target a private or local address");
     }
     Ok((parsed, addresses))
+}
+
+/// Validate the URL properties that do not require DNS resolution. This is
+/// shared by metadata/profile persistence and the full async provider probe,
+/// so a legacy or tampered metadata value cannot bypass the endpoint policy
+/// simply because it was read from storage instead of submitted by a caller.
+fn validate_provider_url_shape(base_url: &str) -> std::result::Result<url::Url, &'static str> {
+    let parsed = url::Url::parse(base_url).map_err(|_| "base_url must be an absolute URL")?;
+    if parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("base_url must not contain userinfo, a query, or a fragment");
+    }
+    if parsed.scheme() != "https" {
+        return Err("base_url must use https");
+    }
+    let host = parsed.host().ok_or("base_url must include a host")?;
+    let _port = parsed
+        .port_or_known_default()
+        .ok_or("base_url has no known port")?;
+    match host {
+        url::Host::Ipv4(address) if restricted_provider_ip(IpAddr::V4(address)) => {
+            return Err("base_url must not target a private or local address");
+        }
+        url::Host::Ipv6(address) if restricted_provider_ip(IpAddr::V6(address)) => {
+            return Err("base_url must not target a private or local address");
+        }
+        url::Host::Domain(domain) if restricted_provider_hostname(domain) => {
+            return Err("base_url must not target a local or private hostname");
+        }
+        _ => {}
+    }
+    Ok(parsed)
 }
 
 fn restricted_provider_hostname(host: &str) -> bool {
@@ -2616,6 +2651,9 @@ fn redacted_host_error(error: forge_agent_host::AgentHostError) -> ServiceError 
         forge_agent_host::AgentHostError::Runtime(_) => {
             ServiceError::Domain("embedded runtime failed".to_owned())
         }
+        forge_agent_host::AgentHostError::RuntimeWithUsage { .. } => {
+            ServiceError::Domain("embedded runtime failed".to_owned())
+        }
         forge_agent_host::AgentHostError::TurnLimitReached { limit } => {
             ServiceError::Domain(format!("embedded runtime {limit} limit reached"))
         }
@@ -2703,6 +2741,17 @@ mod tests {
         );
     }
     use super::*;
+
+    #[tokio::test]
+    async fn provider_base_url_rejects_credential_bearing_query_before_resolution() {
+        let error = provider_url_addresses("https://example.invalid/v1?api_key=SENTINEL")
+            .await
+            .expect_err("query parameters are not safe provider endpoint identity");
+        assert_eq!(
+            error,
+            "base_url must not contain userinfo, a query, or a fragment"
+        );
+    }
 
     #[tokio::test]
     async fn frozen_chat_session_rotates_after_a_new_profile_is_admitted() {
@@ -3038,6 +3087,17 @@ mod tests {
             entry_base_url(&handle("oauth_bundle", "{}")).expect("oauth default"),
             "https://chatgpt.com/backend-api/codex"
         );
+        let malformed = handle(
+            "api_key",
+            r#"{"base_url":"https://proxy.example/v1?api_key=SENTINEL"}"#,
+        );
+        let error = entry_base_url(&malformed).expect_err("stored query must be rejected");
+        assert!(matches!(
+            error,
+            ServiceError::InvalidOperation { ref message }
+                if message == "base_url must not contain userinfo, a query, or a fragment"
+        ));
+        assert!(!error.to_string().contains("SENTINEL"));
         let mut compatible = handle("api_key", "{}");
         compatible.provider = "openai_compatible".to_owned();
         assert!(entry_base_url(&compatible).is_err());
@@ -3191,6 +3251,100 @@ mod tests {
         .expect("agents list");
         assert!(agents.items.is_empty(), "connecting must not create agents");
         assert!(!entry.metadata_json.contains("provider-secret-value"));
+    }
+
+    #[tokio::test]
+    async fn malformed_legacy_entry_metadata_never_enters_profile_config() {
+        let (service, owner) = test_service_with_owner().await;
+        let entry = service
+            .protected_store()
+            .create_credential(
+                &new_uuid_v4(),
+                &owner,
+                "openai",
+                "legacy entry",
+                Secret::new("provider-secret-value".to_owned()),
+                &now_rfc3339(),
+            )
+            .await
+            .expect("legacy entry creates");
+        let sentinel = "https://proxy.example/v1?api_key=SENTINEL";
+        sqlx::query("UPDATE credential_handle SET metadata_json = ? WHERE id = ?")
+            .bind(json!({ "base_url": sentinel }).to_string())
+            .bind(&entry.id)
+            .execute(service.db.pool())
+            .await
+            .expect("legacy metadata tampers for test");
+
+        let error = service
+            .create_agent_from_entry(CreateEmbeddedAgent {
+                owner_user_id: owner,
+                name: "legacy agent".to_owned(),
+                description: None,
+                credential_id: entry.id.clone(),
+                model: "gpt-4o".to_owned(),
+                system_prompt: None,
+                account_permission_ceiling: json!({}),
+                tool_policy: json!({}),
+                context_tokens: None,
+                max_input_tokens: None,
+                max_output_tokens: None,
+            })
+            .await
+            .expect_err("malformed legacy endpoint must be rejected before persistence");
+        assert!(!error.to_string().contains("SENTINEL"));
+        let profile_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM agent_profile WHERE credential_ref = ?",
+        )
+        .bind(&entry.id)
+        .fetch_one(service.db.pool())
+        .await
+        .expect("profile count reads");
+        assert_eq!(profile_count, 0);
+    }
+
+    #[tokio::test]
+    async fn provider_entry_lookup_is_owner_scoped() {
+        let (service, owner) = test_service_with_owner().await;
+        let other_owner = new_uuid_v4();
+        let now = now_rfc3339();
+        db::UserRepo::create_user(
+            &*service.db,
+            &db::User {
+                id: other_owner.clone(),
+                email: "other-owner@example.com".to_owned(),
+                password_hash: "test".to_owned(),
+                display_name: Some("Other Owner".to_owned()),
+                is_admin: false,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("second owner creates");
+        let entry = service
+            .protected_store()
+            .create_credential(
+                &new_uuid_v4(),
+                &other_owner,
+                "openai",
+                "other entry",
+                Secret::new("provider-secret-value".to_owned()),
+                &now,
+            )
+            .await
+            .expect("other owner's entry creates");
+
+        let denied = service.require_owned_entry(&owner, &entry.id).await;
+        assert!(matches!(denied, Err(ServiceError::NotFound { .. })));
+        assert_eq!(
+            service
+                .require_owned_entry(&other_owner, &entry.id)
+                .await
+                .expect("entry remains visible to its owner")
+                .id,
+            entry.id
+        );
     }
 
     #[tokio::test]

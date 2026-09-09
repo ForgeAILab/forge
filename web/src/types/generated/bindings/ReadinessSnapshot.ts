@@ -7,13 +7,13 @@ import type { ReadinessReason } from "./ReadinessReason";
 import type { ReadinessResult } from "./ReadinessResult";
 import type { ValidationResult } from "./ValidationResult";
 
-export type ReadinessSnapshot = { id: string, project_id: string, milestone_id: string, 
+export type ReadinessSnapshot = { id: string, project_id: string, milestone_id: string,
 /**
  * The immutable milestone CAS version used to compute this candidate.
  * A readiness request is bound to this exact version; it is not inferred
  * from the mutable milestone returned later.
  */
-expected_milestone_version: bigint, milestone_definition_revision_id: string, input_manifest: Array<ReadinessInput>, source_event_watermark: string, result: ReadinessResult, reasons: Array<ReadinessReason>, check_results: Array<ValidationResult>, waiver_ids: Array<string>, evidence_attachment_ids: Array<string>, evidence_digests: Array<string>, evidence_availability: Array<EvidenceAvailability>, commit_build_check_context: Array<string>, computing_policy_revision: string, readiness_digest: string, computed_at: string, 
+expected_milestone_version: bigint, milestone_definition_revision_id: string, input_manifest: Array<ReadinessInput>, source_event_watermark: string, result: ReadinessResult, reasons: Array<ReadinessReason>, check_results: Array<ValidationResult>, waiver_ids: Array<string>, evidence_attachment_ids: Array<string>, evidence_digests: Array<string>, evidence_availability: Array<EvidenceAvailability>, commit_build_check_context: Array<string>, computing_policy_revision: string, readiness_digest: string, computed_at: string,
 /**
  * The complete authority receipt for the readiness computation.  This
  * is persisted and replay-compared; it is never reconstructed from the

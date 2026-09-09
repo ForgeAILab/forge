@@ -6,8 +6,8 @@ use crate::{
     AgentStatus, CanonicalPhase, ExecutionAction, ExecutionBehavior, ExecutionBlockerProjection,
     ExecutionEvidenceSummary, ExecutionRole, ExecutionStatus, InterruptionMetadata,
     PlanArtifactDetail, PlanProgressSummary, ResumePolicy, StopReason, TaskAnnotation,
-    TaskRoleAssignmentResponse, TaskStatus, TaskType, WorkflowExceptionSummary,
-    WorkflowHealthSummary, WorkspaceResponse,
+    TaskRoleAssignmentResponse, TaskStatus, TaskType, UsageAggregate, UsageBreakdown,
+    WorkflowExceptionSummary, WorkflowHealthSummary, WorkspaceResponse,
 };
 
 /// Public owner state for a running execution.  This is deliberately
@@ -114,7 +114,9 @@ pub struct TaskResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct TaskExecutionObservability {
-    pub execution_count: i64,
+    pub counts: crate::ActivityCounts,
+    pub tokens: crate::TokenCounters,
+    pub cost: crate::CostSummary,
     pub active_execution_id: Option<String>,
     pub active_role: Option<String>,
     pub active_started_at: Option<String>,
@@ -126,12 +128,6 @@ pub struct TaskExecutionObservability {
     pub latest_stopped_at: Option<String>,
     pub latest_runtime_seconds: Option<f64>,
     pub total_runtime_seconds: f64,
-    pub total_input_tokens: i64,
-    pub total_output_tokens: i64,
-    pub total_cache_read_tokens: i64,
-    pub total_cache_write_tokens: i64,
-    pub total_tokens: i64,
-    pub total_cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -157,15 +153,9 @@ pub struct AgentResponse {
     pub status: AgentStatus,
     pub active_task_count: Option<i64>,
     pub effective_status: Option<String>,
-    pub total_runs: i64,
     pub avg_duration_ms: Option<i64>,
     pub success_rate: Option<f64>,
-    pub total_input_tokens: i64,
-    pub total_output_tokens: i64,
-    pub total_cache_read_tokens: i64,
-    pub total_cache_write_tokens: i64,
-    pub total_tokens: i64,
-    pub total_cost_usd: Option<f64>,
+    pub usage: UsageAggregate,
     pub is_default: bool,
     pub paused: bool,
     pub owner_id: Option<String>,
@@ -263,32 +253,6 @@ pub struct CliProjectionResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
-pub struct ExecutionUsageResponse {
-    pub id: String,
-    pub execution_id: String,
-    pub provider: String,
-    pub model: String,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub cache_write_tokens: i64,
-    pub cost_usd: Option<f64>,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct TaskUsageSummaryResponse {
-    pub total_input_tokens: i64,
-    pub total_output_tokens: i64,
-    pub total_cache_read_tokens: i64,
-    pub total_cache_write_tokens: i64,
-    pub total_cost_usd: Option<f64>,
-    pub execution_count: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
 pub struct ExecutionResponse {
     pub id: String,
     pub task_id: String,
@@ -312,7 +276,7 @@ pub struct ExecutionResponse {
     pub workspace_id: Option<String>,
     pub plan_progress: Option<PlanProgressSummary>,
     pub plan_artifact: Option<PlanArtifactDetail>,
-    pub usage: Option<Vec<ExecutionUsageResponse>>,
+    pub usage: Option<Vec<UsageBreakdown>>,
     /// Optimistic version used by owner renewal and terminal CAS operations.
     pub execution_version: i64,
     /// Stable server-owned reference for the current owner, never a secret.

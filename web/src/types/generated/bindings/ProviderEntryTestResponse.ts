@@ -5,7 +5,7 @@
  * `message` is always redacted server-side; it never carries credential
  * material or provider response bodies.
  */
-export type ProviderEntryTestResponse = { 
+export type ProviderEntryTestResponse = {
 /**
  * `ok` when the provider answered and accepted the credential; `failed`
  * otherwise (see `message` for the redacted reason).

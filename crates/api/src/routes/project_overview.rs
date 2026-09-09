@@ -11,7 +11,6 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use db::{ProjectMemberRepo, ProjectRepo};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -19,7 +18,7 @@ use std::collections::HashMap;
 
 use crate::{
     errors::{ApiError, ApiResult},
-    routes::auth::AuthenticatedUser,
+    routes::{auth::AuthenticatedUser, projects::require_project_visible},
     state::AppState,
 };
 
@@ -40,20 +39,7 @@ pub async fn get_project_overview(
     // Authorization is intentionally before every orchestration-table query.
     // A non-member receives the same not-found response as an unknown Project
     // and cannot probe Charter, milestone, media, or release identifiers.
-    let project = ProjectRepo::get_by_id(&*state.db, &project_id)
-        .await
-        .map_err(db_error)?
-        .ok_or_else(|| ApiError::not_found("project", project_id.clone()))?;
-    let is_owner = project.owner_id.as_deref() == Some(user.user_id.as_str());
-    if project.owner_id.is_some()
-        && !is_owner
-        && ProjectMemberRepo::get_member(&*state.db, &project.id, &user.user_id)
-            .await
-            .map_err(db_error)?
-            .is_none()
-    {
-        return Err(ApiError::not_found("project", project_id));
-    }
+    let project = require_project_visible(&state, &project_id, &user.user_id).await?;
 
     let mut stale = false;
     let (current_charter, vision, charter_stale) = load_current_charter(&state, &project).await?;
@@ -1663,6 +1649,22 @@ fn next_action(context: NextActionContext<'_>) -> Option<ProjectNextAction> {
         reconciliation_required,
         stale,
     } = context;
+    // A released milestone has no outstanding work. It stays in the overview's
+    // milestone list — it can still be the Project's primary milestone, which
+    // is how it reaches this projection at all — but it must never produce a
+    // blocking next action.
+    let unreleased: Vec<Value> = milestones
+        .iter()
+        .filter(|milestone| {
+            milestone
+                .get("milestone")
+                .and_then(|milestone| milestone.get("lifecycle"))
+                .and_then(Value::as_str)
+                != Some("released")
+        })
+        .cloned()
+        .collect();
+    let milestones: &[Value] = &unreleased;
     // This order is part of the public projection contract. More specific
     // blockers must never be hidden behind a generic stale banner.
     if charter_setup_required {
@@ -2391,11 +2393,6 @@ fn sql_error(error: sqlx::Error) -> ApiError {
     ApiError::internal("Project Overview is temporarily unavailable")
 }
 
-fn db_error(error: db::DbError) -> ApiError {
-    tracing::error!(error = ?error, "Project Overview repository query failed");
-    ApiError::internal("Project Overview is temporarily unavailable")
-}
-
 /// Parity between `next_action()` and a real service/route/UI target
 /// (task 8.1.8, finding F10).
 ///
@@ -2604,6 +2601,25 @@ mod next_action_parity_tests {
             })
             .expect("fixture is constructed to always trigger exactly one next action")
         }
+
+        fn maybe_action(&self) -> Option<ProjectNextAction> {
+            next_action(NextActionContext {
+                project_id: "project-1",
+                project_version: 7,
+                charter_setup_required: self.charter_setup_required,
+                no_milestones: self.no_milestones,
+                execution_setup: &self.execution_setup,
+                milestones: &self.milestones,
+                documents: &self.documents,
+                releases: &self.releases,
+                pending_decision_ids: &self.pending_decision_ids,
+                task_counts: &self.task_counts,
+                failed_task_count: self.failed_task_count,
+                checks: &self.checks,
+                reconciliation_required: self.reconciliation_required,
+                stale: self.stale,
+            })
+        }
     }
 
     fn default_milestone(id: &str, version: i64) -> Value {
@@ -2615,6 +2631,37 @@ mod next_action_parity_tests {
             "latest_readiness": null,
             "readiness_freshness": {"status": "current"},
         })
+    }
+
+    /// A released milestone still reaches this projection through the
+    /// Project's primary-milestone clause. Its finished evidence and check
+    /// work must not be re-advertised as a blocking next action.
+    #[test]
+    fn released_milestones_project_no_blocking_next_action() {
+        let mut fixture = Fixture::base();
+        let mut milestone = default_milestone("milestone-released", 1);
+        milestone["milestone"]["lifecycle"] = json!("released");
+        milestone["definition"]["content"]["evidence_requirements"] =
+            json!([{"id": "evidence-1", "required": true}]);
+        milestone["evidence"] = json!([]);
+        milestone["latest_readiness"] = json!({"result": "ready", "reasons": []});
+        fixture.milestones = vec![milestone.clone()];
+        assert!(
+            fixture.maybe_action().is_none(),
+            "a released milestone must not produce a next action"
+        );
+
+        // The same milestone still blocks while it is active.
+        milestone["milestone"]["lifecycle"] = json!("active");
+        let mut fixture = Fixture::base();
+        fixture.milestones = vec![milestone];
+        assert_eq!(
+            fixture
+                .maybe_action()
+                .expect("active milestone blocks")
+                .code,
+            "evidence_required"
+        );
     }
 
     /// Exercise every branch of `next_action()`, and assert its operation

@@ -2,8 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use config::{data_dir_from_env, read_server_state, server_state_path};
 use forge_client::{
-    agent, auth, client::ForgeClient, daemon, embedded, mcp, memory, project, repo, run, task,
-    OutputFormat,
+    agent, analytics, auth, client::ForgeClient, daemon, embedded, mcp, memory, project, repo, run,
+    task, OutputFormat,
 };
 
 #[derive(Parser)]
@@ -30,6 +30,7 @@ enum Commands {
     Agent(agent::AgentArgs),
     Daemon(daemon::DaemonArgs),
     Project(project::ProjectArgs),
+    Analytics(analytics::AnalyticsArgs),
     Memory(memory::MemoryArgs),
     Repo(repo::RepoArgs),
     Run(run::RunArgs),
@@ -64,6 +65,10 @@ async fn main() -> Result<()> {
             args.run(&client, &cli.output).await
         }
         Commands::Project(args) => {
+            let client = client_for(cli.server.as_deref())?;
+            args.run(&client, &cli.output).await
+        }
+        Commands::Analytics(args) => {
             let client = client_for(cli.server.as_deref())?;
             args.run(&client, &cli.output).await
         }

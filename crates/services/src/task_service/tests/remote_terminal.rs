@@ -1,5 +1,5 @@
 use super::super::{
-    bounded_redacted_remote_diagnostic, remote_execution_is_live_for_terminal,
+    bounded_redacted_remote_diagnostic, remote_execution_lease_is_active,
     remote_terminal_error_message, stable_remote_owner_ref, REMOTE_TERMINAL_DIAGNOSTIC_MAX_CHARS,
     REMOTE_TERMINAL_DIAGNOSTIC_REDACTED,
 };
@@ -76,7 +76,7 @@ fn running_execution(owner: &str, lease_expires_at: String, hard_deadline_at: St
 }
 
 #[test]
-fn remote_terminal_retry_live_check_rejects_expired_or_other_owner() {
+fn remote_terminal_fixture_preserves_owner_and_deadline_for_terminal_cas() {
     let owner = "daemon:opaque-daemon-id:connection:42";
     let now = Utc::now();
     let live = running_execution(
@@ -84,23 +84,74 @@ fn remote_terminal_retry_live_check_rejects_expired_or_other_owner() {
         (now + Duration::minutes(1)).to_rfc3339(),
         (now + Duration::minutes(5)).to_rfc3339(),
     );
-    assert!(remote_execution_is_live_for_terminal(&live, owner, now));
+    assert_eq!(live.status, ExecutionStatus::Running);
+    assert_eq!(live.lease_owner.as_deref(), Some(owner));
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(live.lease_expires_at.as_deref().unwrap())
+            .unwrap()
+            .with_timezone(&Utc)
+            > now
+    );
 
     let expired = running_execution(
         owner,
         (now - Duration::seconds(1)).to_rfc3339(),
         (now + Duration::minutes(5)).to_rfc3339(),
     );
-    assert!(!remote_execution_is_live_for_terminal(&expired, owner, now));
+    assert_eq!(expired.lease_owner.as_deref(), Some(owner));
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(expired.lease_expires_at.as_deref().unwrap())
+            .unwrap()
+            .with_timezone(&Utc)
+            <= now
+    );
 
     let wrong_owner = running_execution(
         "daemon:other-daemon:connection:9",
         (now + Duration::minutes(1)).to_rfc3339(),
         (now + Duration::minutes(5)).to_rfc3339(),
     );
-    assert!(!remote_execution_is_live_for_terminal(
-        &wrong_owner,
+    assert_ne!(wrong_owner.lease_owner.as_deref(), Some(owner));
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(wrong_owner.lease_expires_at.as_deref().unwrap())
+            .unwrap()
+            .with_timezone(&Utc)
+            > now
+    );
+}
+
+#[test]
+fn remote_terminal_authorization_requires_both_live_lease_and_hard_deadline() {
+    let owner = "daemon:opaque-daemon-id:connection:42";
+    let now = Utc::now();
+    let live_lease = (now + Duration::minutes(1)).to_rfc3339();
+    let live_deadline = (now + Duration::minutes(5)).to_rfc3339();
+    assert!(remote_execution_lease_is_active(
+        Some(owner),
+        Some(&live_lease),
+        Some(&live_deadline),
         owner,
-        now
+        now,
+    ));
+    assert!(!remote_execution_lease_is_active(
+        Some(owner),
+        Some(&(now - Duration::seconds(1)).to_rfc3339()),
+        Some(&live_deadline),
+        owner,
+        now,
+    ));
+    assert!(!remote_execution_lease_is_active(
+        Some(owner),
+        Some(&live_lease),
+        None,
+        owner,
+        now,
+    ));
+    assert!(!remote_execution_lease_is_active(
+        Some(owner),
+        Some(&live_lease),
+        Some(&(now - Duration::seconds(1)).to_rfc3339()),
+        owner,
+        now,
     ));
 }

@@ -30,7 +30,10 @@ database for historical provenance.
 | GET    | `/api/v1/projects/{id}` | Get project |
 | PATCH  | `/api/v1/projects/{id}` | Update project |
 | DELETE | `/api/v1/projects/{id}` | Delete a Project through the guarded, transactional teardown of its Project-owned records |
-| GET    | `/api/v1/projects/{id}/analytics` | Read Project analytics (CI steps, review summary, token and cost breakdown by surface, model and agent) |
+| GET    | `/api/v1/projects/{id}/analytics` | Read authorized Project analytics for a half-open window (CI steps, review summary, typed usage/cost breakdown, and released-milestone outcome economics) |
+| POST   | `/api/v1/projects/{id}/cost-estimation-previews` | Preview exact retrospective estimates for eligible legacy Project usage against one immutable catalog snapshot |
+| POST   | `/api/v1/projects/{id}/cost-estimation-runs` | Commit one preview's retrospective estimates idempotently |
+| GET    | `/api/v1/projects/{id}/cost-estimation-runs/{run_id}` | Read one immutable retrospective-estimation result and its provenance |
 | GET    | `/api/v1/mission-control` | Read authorized attention, work, health, and bounded coordination activity projections; optional `project_id` restricts the feed to that Project |
 | GET    | `/api/v1/account/main-agent/product-genesis/{session_id}/charter` | Read the active Genesis Charter and revision/approval state |
 | POST   | `/api/v1/account/main-agent/product-genesis/{session_id}/charter/revisions` | Append an immutable Genesis Charter draft revision |
@@ -149,11 +152,18 @@ database for historical provenance.
 | GET    | `/api/v1/executor-types/{type}/discovered-options` | Get adapter options before creating an agent |
 | POST   | `/api/v1/embedded-agents` | Create a direct (embedded-runtime) agent referencing an existing provider entry (`credential_id`); returns identity, profile, health, and initial account session |
 | GET    | `/api/v1/providers/catalog` | Return the authoritative provider capability catalog: methods, support levels, and the runtime-compatibility matrix per credential method |
+| GET    | `/api/v1/providers/pricing-catalog/status` | Read the active models.dev pricing snapshot, revision, last check, freshness, and bounded refresh error state |
+| POST   | `/api/v1/providers/pricing-catalog/refresh` | Explicitly refresh and conditionally activate a validated models.dev pricing snapshot |
+| GET    | `/api/v1/providers/pricing-catalog/models` | List exact provider/model catalog rates with opaque-cursor pagination and optional exact filters |
 | GET    | `/api/v1/providers` | List the account's configured provider entries with usage (referencing agents, last used) plus CLI runtimes discovered on connected daemons |
-| POST   | `/api/v1/providers` | Create an API-key provider entry (`provider`, `label`, `credential`, optional `base_url`; required for `openai_compatible`); never creates an agent |
+| POST   | `/api/v1/providers` | Create an API-key provider entry (`provider`, `label`, `credential`, optional `base_url`; required for `openai_compatible`); custom base URLs must be HTTPS and cannot contain userinfo, query parameters, or fragments; never creates an agent |
 | PATCH  | `/api/v1/providers/{id}` | Rename a provider entry with optimistic concurrency |
 | PATCH  | `/api/v1/providers/{id}/availability` | Disable or re-enable this exact provider entry with `expected_version`; every dependent Agent becomes unavailable/eligible accordingly |
 | PATCH  | `/api/v1/providers/cli-runtimes/{daemon_id}/{executor_type}/availability` | Disable or re-enable one exact daemon + CLI executor runtime with optimistic concurrency |
+| GET    | `/api/v1/providers/{id}/pricing` | Read exact model pricing bindings and immutable rate provenance for one provider entry |
+| PUT    | `/api/v1/providers/{id}/pricing` | Replace one provider entry's complete exact pricing binding set with optimistic concurrency and idempotency |
+| GET    | `/api/v1/providers/cli-runtimes/{daemon_id}/{executor_type}/pricing` | Read exact model pricing bindings for one discovered CLI runtime |
+| PUT    | `/api/v1/providers/cli-runtimes/{daemon_id}/{executor_type}/pricing` | Replace one discovered CLI runtime's complete exact pricing binding set with optimistic concurrency and idempotency |
 | POST   | `/api/v1/providers/{id}/test` | Live connection test: one minimal authenticated request against the entry's API; returns `status` (`ok`/`failed`), `latency_ms`, a redacted `message`, and `checked_at` |
 | GET    | `/api/v1/providers/{id}/usage` | Account usage (rate-limit windows) for the entry, e.g. ChatGPT's 5h/weekly windows; `source` is `probe` when live data was fetched, `unknown` (empty `windows`, a `detail` message) otherwise — only ChatGPT-OAuth (Codex backend) entries are probeable today |
 | DELETE | `/api/v1/providers/{id}?version={version}` | Disconnect a provider entry; returns redacted provider-revocation status plus the affected agents, which become visibly unhealthy |
@@ -191,6 +201,7 @@ database for historical provenance.
 | GET    | `/api/v1/agent-chats/{chat_id}/turns` | `V071+` — List finite turn state (`queued`, `leased`, `awaiting_input`, `retry_wait`, `succeeded`, `failed`, `cancelled`) |
 | GET    | `/api/v1/agent-chats/{chat_id}/turns/{turn_id}/logs` | One keyset page of the turn's durable activity log (reasoning, tool calls with bounded results, reply deltas) in the `/executions/{id}/logs` shape; a turn that has not started reads as an empty page |
 | POST   | `/api/v1/agent-chats/{chat_id}/turns/{turn_id}/cancel` | `V071+` — Cancel an owned non-terminal turn with `expected_version` and an idempotency key |
+| GET    | `/api/v1/analytics/usage` | Read account-scoped typed usage/cost analytics across Task, Project/Main/Genesis Chat, and Main inquiry surfaces |
 | GET    | `/api/v1/agent-chats/{chat_id}/topics` | `V103+` — List the chat's immutable topic epochs, newest first, with the current one marked |
 | POST   | `/api/v1/agent-chats/{chat_id}/topics` | `V103+` — Start a new topic epoch in the same chat; denied while a turn is live or a Genesis session/approval needs an explicit decision |
 | GET    | `/api/v1/agent-chats/{chat_id}/inquiries` | `V130+` — List the chat's Main Agent inquiry runs with opaque keyset pagination |
@@ -1011,33 +1022,27 @@ its current optimistic version plus an idempotency key; stale or terminal
 requests return a conflict instead of rewriting the durable outcome.
 CLI-backed assistant output is bounded to 500 Unicode characters before it is
 admitted to the immutable message, semantic-memory, FTS, and subsequent prompt
-history surfaces. An Agent reply's `token_usage_json` carries `input`,
-`output`, `cache_read`, and `cache_write`. The three input counters are
-disjoint: `input` counts only tokens read fresh, and the context a turn
-consumed is `input + cache_read + cache_write`. The same convention holds for
-`execution_usage` and every usage figure derived from it, whichever executor
-produced the row — adapters normalize on the way in, so a total never
-double-counts a cached prefix. Cache counters read zero on a session's first
-turn, which has no cache to read.
+history surfaces. Since the provider-rate-card cutover, an Agent Chat message
+does not expose the raw `token_usage_json` field. When usage is returned on the
+chat response it is the typed `usage: UsageBreakdown[]` projection described in
+[Usage and cost contracts](#usage-and-cost-contracts); per-message monetary
+display remains out of scope.
 
-Chat-turn usage carries no cost figure: the embedded runtime reports token
-counters only. `cost_usd` is populated for task executions whose executor
-reports it (the Claude Code adapter does; Codex, Smith, and the embedded
-runtime do not).
+The four token counters are disjoint: `input_tokens` counts tokens read fresh,
+while the context a turn consumed is
+`input_tokens + cache_read_tokens + cache_write_tokens`; `output_tokens` is not
+part of context size. Task, chat, and inquiry producers now feed the same
+append-only usage ledger. The old flattened `execution_usage` authority and
+nullable `cost_usd` interpretation are removed; an execution can have one
+typed usage item per provider attempt, including partial usage from an
+exhausted fallback candidate.
 
-`GET /api/v1/projects/{id}/analytics` counts **both** recording surfaces, so a
-Project total means everything spent on that Project. `token_usage.by_surface`
-splits it into `task_execution`, `project_chat`, and `genesis_chat`, each with
-its own `run_count` (task executions for the first, Agent Chat turns for the
-other two). `genesis_chat` is the Main-chat discovery that produced this
-Project, bounded by its Genesis session's own lifetime, so a shared Main chat
-never bills one Project for another's discovery. `execution_count` still counts
-task executions alone and `chat_turn_count` counts the chat turns beside it;
-`by_model` and `by_agent` include both surfaces, which is how an Agent that
-only ever spoke in chat (a Main or Project Agent) appears at all — with
-`success_rate` and `avg_duration_ms` null, since those are execution concepts.
-`forge-ctl project analytics <project-id>` renders the same figures, with
-`--from` / `--to` to bound the window.
+Project totals and account totals are described by the typed analytics contract
+below. In particular, `execution_count` is not a public field: use the separate
+`ActivityCounts` dimensions and the explicit coverage counts. Use
+`forge-ctl project analytics <project-id>` or
+`forge-ctl analytics usage`; both preserve decimal money strings and accept
+URL-encoded `--from` / `--to` RFC3339 filters.
 
 Main Agent tools are limited to discovery, configured web search, Project
 lifecycle/organization, bounded portfolio summaries, and explicit handoff. A
@@ -1164,7 +1169,549 @@ caller's cancellation token.
 `cache_read_tokens`, `cache_write_tokens`) mirror `agent_host::AgentTurnOutput`
 and are **disjoint** — the context size a turn consumed is
 `input_tokens + cache_read_tokens + cache_write_tokens`. Never sum all four
-into one "input" number; `output_tokens` is not part of context size.
+into one "input" number; `output_tokens` is not part of context size. The
+inquiry response's counters are telemetry only; account-level cost and coverage
+are reported by `GET /api/v1/analytics/usage`.
+
+## Pricing, usage, and cost analytics
+
+Provider pricing is a non-secret estimate configuration. It is separate from
+`GET /api/v1/providers/{id}/usage`, which remains the provider entry's
+rate-limit/quota-window telemetry (`probe`/`unknown`) and is not a monetary
+report. Pricing catalog, provider/runtime pricing, retrospective-estimation,
+Project analytics, and account analytics routes require an authenticated
+account. Project routes apply the same visibility guard as Project Overview
+before reading any usage: a caller who cannot view the Project receives the
+same `404` not-found behavior and learns no counts or cost. Account analytics
+is restricted to the authenticated account and never returns another account's
+events.
+
+### Catalog status and refresh
+
+Forge uses only the fixed server-side source
+[`https://models.dev/api.json`](https://models.dev/api.json). Ordinary startup,
+execution, chat, and inquiry admission do not perform a network fetch. An
+authorized caller explicitly refreshes with:
+
+```http
+POST /api/v1/providers/pricing-catalog/refresh
+Content-Type: application/json
+
+{"idempotency_key":"pricing-refresh-1"}
+```
+
+`GET /api/v1/providers/pricing-catalog/status` returns the active snapshot and
+today's catalog state:
+
+```json
+{
+  "state": "fresh",
+  "active_snapshot_id": "snapshot-uuid",
+  "revision": "sha256:.../parser-1",
+  "etag": "\"models-dev-etag\"",
+  "fetched_at": "2026-09-07T12:00:00Z",
+  "last_checked_at": "2026-09-07T12:00:00Z",
+  "stale_after": "2026-09-14T12:00:00Z",
+  "last_error_code": null
+}
+```
+
+`state` is `absent`, `fresh`, `stale`, or `refresh_failed`. Freshness is based
+on the last successful conditional check, not models.dev's per-model
+`last_updated`; the initial stale interval is seven days. Refresh sends
+`If-None-Match` when an ETag is available, validates bounded response size,
+timeout, content type, numeric ranges, provider/model map completeness, and
+duplicate keys, then activates the complete snapshot and its SHA-256 payload
+digest atomically. Empty/truncated provider maps, providers with no models, and
+provider/model key-to-ID mismatches are rejected. Redirects and arbitrary
+user-supplied URLs are not allowed.
+`304 Not Modified` updates the successful check time without creating a new
+source-payload revision; a changed parser revision reparses the retained body
+and creates a new local normalized revision.
+The HTTP `ETag` is only a cache validator; Forge's semantic `revision` is based
+on the decoded payload SHA-256 plus parser revision.
+
+A transport, HTTP, size, parse, or validation failure leaves the active
+last-known-good snapshot in place, records a bounded/redacted error, and does
+not block execution. A stale or `refresh_failed` snapshot remains eligible for
+estimation, and each affected historical estimate retains its selected
+freshness (`fresh`, `stale`, or `refresh_failed`). Concurrent refreshes are
+single-flight: an exact idempotency-key replay returns its original result and
+other callers receive the one activated/check result.
+That historical freshness is frozen when the estimate is admitted or selected
+retrospectively; it does not change merely because the catalog becomes older.
+`PricingCatalogStatus` separately describes today's active snapshot.
+
+`GET /api/v1/providers/pricing-catalog/models` lists the exact normalized rows
+with the standard opaque-cursor response:
+
+```json
+{
+  "items": [
+    {
+      "snapshot_id": "snapshot-uuid",
+      "rate_revision_id": "rate-revision-uuid",
+      "provider_id": "openai",
+      "model_id": "gpt-5.6-terra",
+      "rates": {
+        "input": {"currency":"USD","decimal_per_million":"1.25"},
+        "output": {"currency":"USD","decimal_per_million":"10"},
+        "cache_read": null,
+        "cache_write": null
+      },
+      "tiers": {},
+      "source_last_updated": null,
+      "source_kind": "models_dev_catalog"
+    }
+  ],
+  "has_more": false,
+  "next_cursor": null
+}
+```
+
+The query accepts `limit`, opaque `cursor`, exact `provider_id`, and literal
+`query`. `provider_id` is the top-level `/api.json` map key and must equal
+`provider.id`; `model_id` is the nested provider-scoped map key and must equal
+`model.id`. The pair is the rate key. Forge preserves those identifiers as
+given — including relay namespaces such as `qwen/` — and does not join against
+the different `/models.json` identifier space. A model with no optional `cost`
+block is a valid but unpriced row. Absent buckets are unknown; an explicit
+numeric zero is a valid free rate. Exact context tiers are retained, while the
+legacy-only `context_over_200k` field is provenance with an unknown threshold
+and is not silently applied to a context-sensitive estimate. Each row also
+includes its immutable `rate_revision_id`; this identifies the exact rate
+revision and is intentionally distinct from the containing `snapshot_id`.
+
+### Exact provider and CLI-runtime pricing
+
+`GET`/`PUT /api/v1/providers/{id}/pricing` and
+`GET`/`PUT /api/v1/providers/cli-runtimes/{daemon_id}/{executor_type}/pricing`
+configure one exact pricing subject. A subject is a provider entry or one discovered
+daemon/runtime revision; disconnecting or deleting it cannot erase bindings or
+usage history. Its non-secret `subject_revision_digest` covers provider/runtime
+kind, credential method, endpoint class, daemon/runtime fingerprint where
+applicable, and schema revision. A label-only rename does not change the digest;
+changing one of those identity inputs creates a new subject revision. `GET`
+returns:
+
+```json
+{
+  "subject_id": "provider-uuid",
+  "subject_revision_digest": "sha256:...",
+  "version": 3,
+  "bindings": [
+    {
+      "id": "binding-uuid",
+      "runtime_model": "gpt-5.6-terra",
+      "subject_revision_digest": "sha256:...",
+      "source_kind": "models_dev_catalog",
+      "catalog_provider_id": "openai",
+      "catalog_model_id": "gpt-5.6-terra",
+      "catalog_rate_revision_id": "rate-revision-uuid",
+      "manual_rates": null,
+      "effective_at": "2026-09-07T12:05:00Z",
+      "retired_at": null,
+      "version": 1
+    }
+  ]
+}
+```
+
+`PUT` replaces the complete desired binding set and carries
+`expected_version`, a stable `idempotency_key`,
+`subject_revision_digest`, and each binding's `runtime_model`, `source_kind`,
+catalog identifiers, or manual `RateBuckets`. The four manual/catalog buckets
+are input, output, cache-read, and cache-write USD rates per one million
+tokens. Money and rates use decimal strings, never client-side floating-point
+arithmetic. Every manual edit creates an immutable rate revision; retirement
+affects future admissions only, and stale writes return `409` without merging.
+Model identifiers are request-body/query fields rather than path segments, so
+valid provider-scoped IDs containing `/` remain addressable.
+
+Resolution is exact and ordered: an active manual override for the exact
+subject revision and runtime model wins, then an exact active models.dev
+binding, otherwise the event is unpriced. Forge does not fuzzy-match names,
+infer a model-family price, strip prefixes, or use prefix heuristics. The
+reviewed built-in mappings cover only direct OpenAI Platform (`openai`), xAI
+(`xai`), Gemini API (`google`), and canonical OpenRouter (`openrouter`) subjects.
+ChatGPT subscription OAuth, `openai_compatible`, custom base URLs, Smith, and
+every discovered CLI runtime have no automatic mapping and require an explicit
+exact binding. Public API list rates are estimates and may not describe a
+subscription plan, private contract, credits, discounts, or other provider
+billing terms.
+
+The measurable rate contract has one cache-write bucket. Providers may bill
+cache writes differently by TTL or service mode; Forge does not infer a
+TTL-specific rate when the runtime supplies no such evidence. Configure a
+manual exact binding when the selected catalog row does not match the runtime's
+billing mode.
+
+### Retrospective estimation
+
+Catalog refresh never silently prices old usage. An authenticated principal
+authorized for the Project may preview exact legacy events against one chosen
+immutable snapshot:
+
+```http
+POST /api/v1/projects/{id}/cost-estimation-previews
+Content-Type: application/json
+
+{
+  "snapshot_id":"snapshot-uuid",
+  "from":"2026-01-01T00:00:00-05:00",
+  "to":"2026-02-01T00:00:00-05:00",
+  "idempotency_key":"estimate-preview-1"
+}
+```
+
+The `CostEstimationPreview` response contains `id`, `project_id`,
+`snapshot_id`, `usage_set_digest`, `eligible_event_count`,
+`unmatched_event_count`, `already_reported_event_count`, a projected
+`CostSummary`, and `expires_at`. Only exact provider/model matches are
+eligible. Events with provider-reported money are counted separately and are
+never overwritten or estimated again.
+
+Commit requires the exact preview digest and is idempotent:
+
+```http
+POST /api/v1/projects/{id}/cost-estimation-runs
+Content-Type: application/json
+
+{
+  "preview_id":"preview-uuid",
+  "usage_set_digest":"sha256:...",
+  "idempotency_key":"estimate-commit-1"
+}
+```
+
+`GET /api/v1/projects/{id}/cost-estimation-runs/{run_id}` returns the immutable
+`CostEstimationRun` (`id`, Project/preview/snapshot IDs, usage-set digest,
+`status`, applied and unmatched counts, `cost`, and `created_at`). A changed
+source set returns `409` and requires a new preview. Later catalog refreshes or
+overrides do not mutate a committed result; a user can create a new explicitly
+versioned retrospective revision with full provenance.
+
+### Usage and cost contracts
+
+The same typed projection is used by Project analytics, account analytics,
+execution observability, and typed chat usage. Decimal strings are canonical
+non-negative values with no exponent and at most nine fractional digits:
+
+```text
+MoneyAmount = {
+  currency: "USD",
+  decimal: string
+}
+
+RateAmount = {
+  currency: "USD",
+  decimal_per_million: string
+}
+
+RateBuckets = {
+  input: RateAmount | null,
+  output: RateAmount | null,
+  cache_read: RateAmount | null,
+  cache_write: RateAmount | null
+}
+
+TokenCounters = {
+  input_tokens: integer,
+  output_tokens: integer,
+  cache_read_tokens: integer,
+  cache_write_tokens: integer
+}
+```
+
+Counters are non-negative and disjoint. Missing telemetry is not stored as
+all-zero metered usage; a producer reports `metered` only when it has
+authoritative counters (including explicit all-zero), otherwise `unmetered`.
+An invocation with only a reported amount may have null counters and is
+monetarily costed while remaining unmetered in the independent token
+dimension. A settled invocation with neither counters nor reported money has
+no usage event but remains visible in coverage.
+
+`CostSummary` is:
+
+```text
+CostKind = provider_reported | estimated | mixed | unknown | none
+CostCoverage = complete | partial | unavailable | pending | no_usage
+
+CostSummary = {
+  kind: CostKind,
+  coverage: CostCoverage,
+  provider_reported: MoneyAmount | null,
+  estimated: MoneyAmount | null,
+  known_subtotal: MoneyAmount | null,
+  complete_total: MoneyAmount | null,
+  usage_coverage: UsageCostCoverage,
+  sources: CostSourceRef[]
+}
+
+CostSourceRef = {
+  source_kind: provider_reported | legacy_provider_reported |
+               models_dev_catalog | manual_override,
+  rate_revision_id: string | null,
+  catalog_snapshot_id: string | null,
+  catalog_digest: string | null,
+  effective_at: timestamp | null,
+  fetched_at: timestamp | null,
+  freshness: fresh | stale | refresh_failed | not_applicable,
+  retrospective: boolean,
+  formula_revision: string | null
+}
+```
+
+`complete_total` is non-null only with `coverage = complete`; it can be
+`{"currency":"USD","decimal":"0"}` (and therefore render `$0.00`) only
+when every contributing event is covered and explicitly zero. `known_subtotal`
+contains only whole events with one complete contributing amount; a partially
+priced event does not contribute its priced buckets to that subtotal. For
+`no_usage`, `pending`, `partial`, or `unavailable`, `complete_total` is null.
+All-null money never becomes `$0.00`: it is unknown for active/settled usage,
+while an explicit no-invocation state is `kind = none`/`coverage = no_usage`.
+
+Provider-reported and estimated subtotals are retained separately. Forge never
+adds an estimate to an event that already has provider-reported money. An
+aggregate containing both has `kind = mixed`; it can still be complete when
+every event has one usable amount. The coverage state distinguishes no
+invocation (`none`/`no_usage`), active or pending settlement (`pending`), all
+settled but unpriced (`unknown`/`unavailable`), covered and uncovered events
+(`partial`), and all settled covered events (`complete`). A terminal
+`unsettled` attempt remains unavailable; if another attempt is costed, the
+logical run is partial and exposes the unsettled reason.
+
+Forge calculates estimates from the four buckets with fixed-point arithmetic;
+it does not infer tokens or fold reasoning/audio/tool-schema/context-waste
+classes into input or output. With integer nano-USD rates per million, one
+usage event uses:
+
+```text
+estimated_nano_usd = round_half_away_from_zero(
+    (input_tokens       * input_rate_nano_usd_per_million
+   + output_tokens      * output_rate_nano_usd_per_million
+   + cache_read_tokens  * cache_read_rate_nano_usd_per_million
+   + cache_write_tokens * cache_write_rate_nano_usd_per_million) / 1_000_000
+)
+```
+
+Rounding happens once per event; aggregates add stored amounts. A positive
+counter with no usable bucket rate is partial/unpriced. A context-tier rate is
+used only when the event supplies enough request-level context evidence to
+select the tier safely; aggregate counters alone do not justify a tier.
+
+`UsageBreakdown` is the per-invocation/per-event observability shape:
+
+```text
+UsageBreakdown = {
+  invocation_id: string,
+  usage_event_id: string | null,
+  surface: task_execution | project_chat | main_chat | genesis_chat | main_inquiry,
+  telemetry_state: metered | unmetered | pending | unsettled,
+  attribution: {
+    pricing_subject_revision: string | null,
+    agent_id: string | null,
+    profile_id: string | null,
+    executor_type: string | null,
+    provider_id: string | null,
+    model_id: string | null,
+    candidate_key: string | null,
+    attempt_ordinal: integer
+  },
+  counters: TokenCounters | null,
+  context_tokens: integer | null,
+  selected_tier: string | null,
+  occurred_at: timestamp,
+  cost: CostSummary
+}
+```
+
+`UsageCostCoverage` retains every denominator explicitly:
+
+```text
+UsageCostCoverage = {
+  total_runs_or_turns: integer,
+  pending_runs_or_turns: integer,
+  no_provider_call_runs_or_turns: integer,
+  fully_metered_runs_or_turns: integer,
+  fully_costed_runs_or_turns: integer,
+  partially_costed_runs_or_turns: integer,
+  unavailable_cost_runs_or_turns: integer,
+  total_provider_attempts: integer,
+  settled_provider_attempts: integer,
+  pending_provider_attempts: integer,
+  unsettled_provider_attempts: integer,
+  metered_provider_attempts: integer,
+  unmetered_provider_attempts: integer,
+  costed_provider_attempts: integer,
+  unpriced_provider_attempts: integer,
+  priced_tokens: TokenCounters,
+  unpriced_tokens: TokenCounters,
+  reasons: [{
+    code: pending | unsettled | unmetered | missing_provider |
+          missing_model | missing_binding | missing_rate |
+          unresolved_tier | identity_mismatch | invalid_legacy_usage,
+    run_or_turn_count: integer,
+    provider_attempt_count: integer,
+    tokens: TokenCounters
+  }]
+}
+```
+
+`ActivityCounts` is likewise explicit:
+`{task_execution_count, chat_turn_count, inquiry_count,
+provider_attempt_count}`. These counts are separate dimensions, not aliases:
+all domain runs/turns remain in `total_runs_or_turns`, including runs stopped
+before a provider call; provider-attempt counts cover only actual calls; and
+metered/costed/unmetered/unpriced/pending/unsettled counts are never inferred
+from one merged execution count.
+
+Every aggregate row uses the same shape:
+
+```text
+UsageAggregate = {
+  counts: ActivityCounts,
+  tokens: TokenCounters,
+  cost: CostSummary
+}
+
+UsageAnalytics = UsageAggregate & {
+  by_surface: SurfaceUsageBreakdown[],
+  by_model: ModelUsageBreakdown[],
+  by_agent: AgentUsageBreakdown[]
+}
+
+SurfaceUsageBreakdown = UsageAggregate & {surface}
+ModelUsageBreakdown = UsageAggregate & {
+  provider_id: string | null,
+  model_id: string | null
+}
+AgentUsageBreakdown = UsageAggregate & {
+  agent_id: string | null,
+  agent_name_snapshot: string | null,
+  profile_id: string | null,
+  executor_type: string | null
+}
+ProjectUsageBreakdown = UsageAggregate & {
+  project_id: string | null,
+  project_name_snapshot: string | null
+}
+```
+
+### Analytics scope, windows, and outcomes
+
+`GET /api/v1/projects/{id}/analytics` returns the exact wrapper:
+
+```text
+AnalyticsWindow = {from: timestamp | null, to: timestamp | null}
+
+ProjectAnalyticsResponse = {
+  window: AnalyticsWindow,
+  ci_steps: CiStepAnalytics[],
+  token_usage: UsageAnalytics,
+  review_summary: ReviewSummaryAnalytics,
+  outcome_economics: OutcomeCostMetric
+}
+```
+
+`GET /api/v1/analytics/usage` returns account-wide usage:
+
+```text
+AccountUsageAnalyticsResponse = {
+  window: AnalyticsWindow,
+  token_usage: UsageAnalytics,
+  by_project: ProjectUsageBreakdown[]
+}
+```
+
+Both analytics routes accept optional `from` and `to` RFC3339 query
+parameters. They use the same `[from, to)` interpretation; omit either bound
+for an open-ended window.
+
+Every top-level and by-surface/by-model/by-agent/by-Project row carries the
+same `CostSummary`. Project analytics groups `task_execution`, `project_chat`,
+and `genesis_chat`. Account analytics groups
+`task_execution`, `project_chat`, `main_chat`, `genesis_chat`, and
+`main_inquiry`. Ordinary Main Chat and Main inquiries are account-scoped and
+never become Project usage through a later handoff or mutable relationship. A
+Main turn in a Genesis session is classified once as `genesis_chat`, not also
+as `main_chat`. Account `by_project` includes only events that already carry
+an immutable Project ID. Historical agent, provider, model, and profile labels
+come from the ledger's admission/usage snapshots, not mutable current Agent or
+provider state. Genesis usage reaches a Project only through its immutable
+handoff/completion boundary, never through a mutable Genesis session
+`updated_at`.
+
+All windows are half-open `[from, to)`. The `from`/`to` values are RFC3339
+timestamps: Task attempts use terminal/usage occurrence time, Chat uses
+assistant-turn completion time, inquiries use inquiry completion time, and a
+retrospective estimate uses the original event occurrence time rather than the
+backfill time. CLI date filters must preserve and URL-encode offsets such as
+`+00:00`; clients do not decode opaque pagination cursors or compute money
+locally.
+
+`outcome_economics` defines only `released_milestone`: the denominator is the
+number of successful immutable Release Snapshot records released in the same
+Project and exact window, and the numerator requires complete cost coverage
+for that same scope/window. Review, readiness, acceptance, or a Project Agent
+recommendation alone is not a release. The response retains denominator,
+Project/window scope, nullable numerator and amount-per-outcome, eligibility,
+and a reason such as `no_released_milestones`, `no_usage_cost`, `cost_pending`,
+`cost_partial`, or `cost_unavailable` when the metric is not eligible.
+
+The outcome metric is shaped as:
+
+```text
+OutcomeCostMetric = {
+  outcome_kind: "released_milestone",
+  numerator: MoneyAmount | null,
+  denominator: integer,
+  amount_per_outcome: MoneyAmount | null,
+  scope: {project_id: string, from: timestamp | null, to: timestamp | null},
+  eligibility: eligible | no_outcomes | incomplete_cost | pending_cost,
+  ineligibility_reason: no_released_milestones | no_usage_cost |
+                        cost_pending | cost_partial | cost_unavailable | null
+}
+```
+
+### Execution, daemon, CLI, and MCP cutover
+
+Execution list/detail responses now expose ordered `UsageBreakdown` items at
+the provider-attempt grain. Every fallback candidate that consumes usage has
+its own stable invocation/report identity, actual provider/model attribution,
+disjoint counters, settlement state, and frozen price provenance. A candidate
+skipped before a provider call has no usage invocation. Adapters with no
+reliable telemetry report `unmetered`; Forge does not synthesize zero tokens.
+Forge resolves and freezes the effective rate revision when a Task route is
+admitted, and before a chat/inquiry provider call. A catalog refresh or manual
+override while work is running cannot rewrite that admission. If actual
+provider/model identity differs from the admitted candidate, Forge retains the
+actual identity but leaves the event unpriced until an exact retrospective
+operation is requested.
+
+For a legacy Project whose stored owner no longer resolves to a current account
+principal, Forge does not guess an owner or mint an ownerless runtime ledger
+row. Its Task attempt still contributes to the domain-run denominator and is
+reported as no-provider/no-usage coverage.
+
+The daemon terminal contract transports the complete per-candidate usage
+vector and stable report IDs. A daemon retains its terminal notification until
+the server acknowledges the composite terminal/accounting transaction; a
+duplicate report is an idempotent no-op and a conflicting report is a
+conflict. The daemon protocol minimum is bumped, so an older daemon is rejected
+before dispatch rather than silently degrading to missing or flattened
+accounting. The server uses the actual reported provider/model and never
+infers it from the executor family.
+
+This is a public-beta breaking cutover. The old nullable `cost_usd` field,
+flattened execution-usage authority, merged `execution_count` meaning, and
+raw `AgentChatMessageResponse.token_usage_json` field are removed from the
+REST, daemon, CLI, MCP-chat, and generated TypeScript surfaces. There is no
+compatibility alias, dual-write shim, parallel `_v2` response, or client-side
+float conversion. `AgentChatMessageResponse` uses typed `usage:
+UsageBreakdown[]` when usage is exposed; the MCP chat timeline uses that same
+typed response. MCP adds no pricing-refresh, binding/override, or
+retrospective mutation tool in this change.
 
 ## Projects
 
@@ -2506,6 +3053,12 @@ overwriting newer settings or hooks; refresh the Project before retrying.
 | `forge_list_agent_handoffs` | List immutable Main-to-Project handoffs |
 | `forge_get_agent_handoff` | Inspect one handoff and its delivery outcome |
 | `forge_create_agent_handoff` | Publish a bounded, deduplicated Main-to-Project handoff |
+
+Agent Chat message results use the shared typed `AgentChatMessageResponse`.
+Usage is exposed as `usage: UsageBreakdown[]` (including typed counters and
+`CostSummary` provenance); the retired `token_usage_json` field is never
+returned. These reads remain account/Project-authorized, and MCP exposes no
+pricing mutation tool.
 
 Disable the endpoint with `forge --no-mcp` if you don't want it.
 

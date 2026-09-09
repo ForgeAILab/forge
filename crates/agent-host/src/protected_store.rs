@@ -926,6 +926,7 @@ impl SqliteProtectedRuntimeStore {
         if result.rows_affected() == 0 {
             return Err(crate::AgentHostError::CredentialNotFound);
         }
+        retire_provider_pricing_subject(&mut transaction, owner_user_id, handle_id, now).await?;
         sqlx::query("DELETE FROM protected_credential_secret WHERE handle_id = ?")
             .bind(handle_id)
             .execute(&mut *transaction)
@@ -967,6 +968,7 @@ impl SqliteProtectedRuntimeStore {
         if result.rows_affected() == 0 {
             return Err(crate::AgentHostError::VersionConflict);
         }
+        retire_provider_pricing_subject(&mut transaction, owner_user_id, handle_id, now).await?;
         sqlx::query("DELETE FROM protected_credential_secret WHERE handle_id = ?")
             .bind(handle_id)
             .execute(&mut *transaction)
@@ -1014,6 +1016,33 @@ impl SqliteProtectedRuntimeStore {
             _ => CredentialRevocationOutcome::Failed,
         }
     }
+}
+
+/// Revoking a provider entry is a terminal source lifecycle transition. Keep
+/// the matching pricing subject terminal in the same local transaction while
+/// leaving its immutable revisions, bindings, and usage provenance intact.
+/// A provider can be disconnected before it has ever been priced, so the
+/// update intentionally treats a missing (or already-retired) subject as a
+/// no-op.
+async fn retire_provider_pricing_subject(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    owner_user_id: &str,
+    provider_entry_id: &str,
+    now: &str,
+) -> Result<(), crate::AgentHostError> {
+    sqlx::query(
+        "UPDATE pricing_subject
+         SET state = 'retired', version = version + 1, updated_at = ?
+         WHERE owner_user_id = ? AND subject_kind = 'provider_entry'
+           AND provider_entry_id = ? AND state = 'active'",
+    )
+    .bind(now)
+    .bind(owner_user_id)
+    .bind(provider_entry_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
+    Ok(())
 }
 
 async fn mark_credential_dependents_unavailable(
@@ -1530,6 +1559,15 @@ impl CheckpointStore for SqliteProtectedRuntimeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use db::{
+        CreatePricingRateRevision, CreatePricingSelection, CreatePricingSubject,
+        CreatePricingSubjectBinding, CreatePricingSubjectRevision, CreateUsageEvent,
+        CreateUsageInvocation, PricingAdmissionProvenanceKind, PricingCatalogRepo,
+        PricingDomainKind, PricingRateSourceKind, PricingSelectionStatus, PricingSubjectKind,
+        PricingSubjectRepo, PricingSubjectState, RateBuckets, SettleUsageInvocation,
+        StartUsageInvocation, UsageCostKind, UsageEventProvenanceKind, UsageEventReportMode,
+        UsageLedgerRepo, UsageSurface, UsageTelemetryState,
+    };
 
     async fn test_store() -> (SqliteProtectedRuntimeStore, Arc<SqliteDb>) {
         use db::{User, UserRepo};
@@ -1558,6 +1596,437 @@ mod tests {
             SqliteProtectedRuntimeStore::new(Arc::clone(&db), [7_u8; 32], 1),
             db,
         )
+    }
+
+    async fn seed_provider_pricing_history(db: &SqliteDb, provider_entry_id: &str) {
+        let subject = PricingSubjectRepo::create_pricing_subject(
+            db,
+            CreatePricingSubject {
+                id: "disconnect-pricing-subject".to_owned(),
+                owner_user_id: "credential-owner".to_owned(),
+                subject_kind: PricingSubjectKind::ProviderEntry,
+                provider_entry_id: Some(provider_entry_id.to_owned()),
+                daemon_id: None,
+                executor_type: None,
+                current_revision_id: None,
+                state: PricingSubjectState::Active,
+                last_idempotency_key: None,
+                last_update_digest: None,
+                created_at: "2026-09-08T00:00:00Z".to_owned(),
+                updated_at: "2026-09-08T00:00:00Z".to_owned(),
+            },
+        )
+        .await
+        .expect("pricing subject creates");
+        let revision = PricingSubjectRepo::create_pricing_subject_revision(
+            db,
+            CreatePricingSubjectRevision {
+                id: "disconnect-pricing-revision".to_owned(),
+                subject_id: subject.id.clone(),
+                owner_user_id: "credential-owner".to_owned(),
+                revision: 1,
+                revision_digest: "disconnect-pricing-revision-digest".to_owned(),
+                subject_kind: PricingSubjectKind::ProviderEntry,
+                provider_entry_id: Some(provider_entry_id.to_owned()),
+                daemon_id: None,
+                executor_type: None,
+                provider_kind: "xai".to_owned(),
+                credential_method: "oauth_bundle".to_owned(),
+                endpoint_class: "https://api.x.ai/v1".to_owned(),
+                runtime_fingerprint: None,
+                schema_revision: "pricing-subject-v1".to_owned(),
+                non_secret_identity_json: "{}".to_owned(),
+                created_at: "2026-09-08T00:00:00Z".to_owned(),
+            },
+        )
+        .await
+        .expect("pricing subject revision creates");
+        PricingSubjectRepo::update_pricing_subject(
+            db,
+            db::UpdatePricingSubject {
+                id: subject.id.clone(),
+                expected_version: subject.version,
+                current_revision_id: Some(Some(revision.id.clone())),
+                state: None,
+                last_idempotency_key: None,
+                last_update_digest: None,
+                updated_at: "2026-09-08T00:00:01Z".to_owned(),
+            },
+        )
+        .await
+        .expect("pricing subject revision selects");
+        let rate = PricingCatalogRepo::create_pricing_rate_revision(
+            db,
+            CreatePricingRateRevision {
+                id: "disconnect-pricing-rate".to_owned(),
+                source_kind: PricingRateSourceKind::ManualOverride,
+                owner_user_id: Some("credential-owner".to_owned()),
+                catalog_snapshot_id: None,
+                catalog_provider_id: None,
+                catalog_model_id: None,
+                pricing_subject_revision_id: Some(revision.id.clone()),
+                pricing_subject_revision_digest: Some(revision.revision_digest.clone()),
+                runtime_model: Some("grok-test".to_owned()),
+                source_model_key: Some("grok-test".to_owned()),
+                source_last_updated: None,
+                currency: "USD".to_owned(),
+                rates: RateBuckets::new(Some(10), Some(20), None, None),
+                tiers_json: "[]".to_owned(),
+                legacy_context_over_200k_json: None,
+                context_tier_state: "none".to_owned(),
+                received_rates_json: "{}".to_owned(),
+                rate_digest: "disconnect-pricing-rate-digest".to_owned(),
+                effective_at: "2026-09-08T00:00:01Z".to_owned(),
+                created_at: "2026-09-08T00:00:01Z".to_owned(),
+            },
+        )
+        .await
+        .expect("pricing rate creates");
+        let binding = PricingSubjectRepo::create_pricing_subject_binding(
+            db,
+            CreatePricingSubjectBinding {
+                id: "disconnect-pricing-binding".to_owned(),
+                owner_user_id: "credential-owner".to_owned(),
+                subject_id: subject.id.clone(),
+                subject_revision_id: revision.id.clone(),
+                subject_revision_digest: revision.revision_digest.clone(),
+                runtime_model: "grok-test".to_owned(),
+                source_kind: PricingRateSourceKind::ManualOverride,
+                catalog_provider_id: None,
+                catalog_model_id: None,
+                rate_revision_id: rate.id.clone(),
+                binding_digest: "disconnect-pricing-binding-digest".to_owned(),
+                effective_at: "2026-09-08T00:00:01Z".to_owned(),
+                created_at: "2026-09-08T00:00:01Z".to_owned(),
+                updated_at: "2026-09-08T00:00:01Z".to_owned(),
+            },
+        )
+        .await
+        .expect("pricing binding creates");
+        let selection = UsageLedgerRepo::create_pricing_selection(
+            db,
+            CreatePricingSelection {
+                id: "disconnect-pricing-selection".to_owned(),
+                owner_user_id: Some("credential-owner".to_owned()),
+                project_id: None,
+                domain_kind: PricingDomainKind::Chat,
+                surface: UsageSurface::MainChat,
+                source_id: "disconnect-chat".to_owned(),
+                execution_id: None,
+                task_id: None,
+                candidate_key: Some("disconnect-candidate".to_owned()),
+                attempt_ordinal: 0,
+                subject_id: Some(subject.id.clone()),
+                subject_revision_id: Some(revision.id.clone()),
+                subject_revision_digest: Some(revision.revision_digest.clone()),
+                binding_id: Some(binding.id.clone()),
+                rate_revision_id: Some(rate.id.clone()),
+                catalog_snapshot_id: None,
+                catalog_freshness: Some("not_applicable".to_owned()),
+                runtime_model: Some("grok-test".to_owned()),
+                admitted_provider_id: Some("xai".to_owned()),
+                admitted_model_id: Some("grok-test".to_owned()),
+                source_kind: Some(PricingRateSourceKind::ManualOverride),
+                provenance_kind: PricingAdmissionProvenanceKind::Runtime,
+                selection_status: PricingSelectionStatus::Priced,
+                selection_reason: None,
+                selection_digest: "disconnect-pricing-selection-digest".to_owned(),
+                selected_at: "2026-09-08T00:00:02Z".to_owned(),
+                created_at: "2026-09-08T00:00:02Z".to_owned(),
+            },
+        )
+        .await
+        .expect("pricing selection creates");
+        let invocation = UsageLedgerRepo::create_usage_invocation(
+            db,
+            CreateUsageInvocation {
+                id: "disconnect-pricing-invocation".to_owned(),
+                owner_user_id: Some("credential-owner".to_owned()),
+                project_id: None,
+                domain_kind: PricingDomainKind::Chat,
+                surface: UsageSurface::MainChat,
+                source_id: "disconnect-chat".to_owned(),
+                execution_id: None,
+                task_id: None,
+                domain_idempotency_key: "disconnect-pricing-invocation-key".to_owned(),
+                candidate_key: Some("disconnect-candidate".to_owned()),
+                attempt_ordinal: 0,
+                pricing_selection_id: selection.id,
+                admitted_provider_id: Some("xai".to_owned()),
+                admitted_model_id: Some("grok-test".to_owned()),
+                admitted_runtime_model: Some("grok-test".to_owned()),
+                pricing_subject_id: Some(subject.id),
+                pricing_subject_revision_id: Some(revision.id.clone()),
+                subject_revision_digest: Some(revision.revision_digest.clone()),
+                agent_id: None,
+                profile_id: None,
+                agent_name_snapshot: None,
+                project_name_snapshot: None,
+                executor_type: Some("api".to_owned()),
+                backend_kind: Some("provider".to_owned()),
+                provenance_kind: PricingAdmissionProvenanceKind::Runtime,
+                admitted_at: "2026-09-08T00:00:02Z".to_owned(),
+                created_at: "2026-09-08T00:00:02Z".to_owned(),
+                updated_at: "2026-09-08T00:00:02Z".to_owned(),
+            },
+        )
+        .await
+        .expect("usage invocation creates");
+        let started = UsageLedgerRepo::start_usage_invocation(
+            db,
+            StartUsageInvocation {
+                id: invocation.id.clone(),
+                expected_version: invocation.version,
+                started_at: "2026-09-08T00:00:03Z".to_owned(),
+                updated_at: "2026-09-08T00:00:03Z".to_owned(),
+            },
+        )
+        .await
+        .expect("usage invocation starts");
+        let settled = UsageLedgerRepo::settle_usage_invocation(
+            db,
+            SettleUsageInvocation {
+                id: started.id,
+                expected_version: started.version,
+                telemetry_state: UsageTelemetryState::Metered,
+                terminal_reason: None,
+                settled_at: "2026-09-08T00:00:04Z".to_owned(),
+                updated_at: "2026-09-08T00:00:04Z".to_owned(),
+            },
+        )
+        .await
+        .expect("usage invocation settles");
+        UsageLedgerRepo::append_usage_event(
+            db,
+            CreateUsageEvent {
+                id: "disconnect-pricing-event".to_owned(),
+                invocation_id: settled.id,
+                owner_user_id: Some("credential-owner".to_owned()),
+                project_id: None,
+                surface: UsageSurface::MainChat,
+                source_id: "disconnect-chat".to_owned(),
+                execution_id: None,
+                task_id: None,
+                event_idempotency_key: "disconnect-pricing-event-key".to_owned(),
+                source_report_id: "disconnect-pricing-report".to_owned(),
+                report_sequence: 0,
+                report_mode: UsageEventReportMode::FinalSnapshot,
+                provenance_kind: UsageEventProvenanceKind::RuntimeReport,
+                legacy_source_table: None,
+                legacy_source_id: None,
+                legacy_provider_raw: None,
+                legacy_provider_sqlite_type: None,
+                legacy_provider_sql_literal: None,
+                legacy_model_raw: None,
+                legacy_model_sqlite_type: None,
+                legacy_model_sql_literal: None,
+                legacy_counter_values_json: "{}".to_owned(),
+                legacy_cost_usd_raw: None,
+                legacy_created_at_raw: None,
+                legacy_project_owner_raw: None,
+                legacy_invalid_usage: false,
+                provider_id: Some("xai".to_owned()),
+                model_id: Some("grok-test".to_owned()),
+                runtime_model: Some("grok-test".to_owned()),
+                candidate_key: Some("disconnect-candidate".to_owned()),
+                attempt_ordinal: 0,
+                agent_id: None,
+                profile_id: None,
+                agent_name_snapshot: None,
+                project_name_snapshot: None,
+                executor_type: Some("api".to_owned()),
+                pricing_subject_revision_id: Some(revision.id),
+                subject_revision_digest: Some(revision.revision_digest),
+                telemetry_state: UsageTelemetryState::Metered,
+                input_tokens: Some(3),
+                output_tokens: Some(2),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                context_tokens: None,
+                selected_tier: None,
+                provider_reported_nano_usd: Some(25),
+                legacy_reported_cost_usd: None,
+                estimated_nano_usd: None,
+                cost_kind: UsageCostKind::ProviderReported,
+                rate_revision_id: Some(rate.id),
+                catalog_snapshot_id: None,
+                formula_revision: None,
+                retrospective: false,
+                coverage_reason_code: None,
+                occurred_at: "2026-09-08T00:00:04Z".to_owned(),
+                created_at: "2026-09-08T00:00:04Z".to_owned(),
+            },
+        )
+        .await
+        .expect("usage event appends");
+    }
+
+    #[tokio::test]
+    async fn disconnect_retires_provider_subject_and_preserves_pricing_history() {
+        let (store, db) = test_store().await;
+        let created_at = "2026-09-08T00:00:00Z";
+        store
+            .create_oauth_credential(CreateOAuthCredential {
+                id: "disconnect-pricing-handle",
+                owner_user_id: "credential-owner",
+                provider: "xai",
+                label: "xAI login",
+                bundle: &OAuthCredentialBundle {
+                    schema_version: 1,
+                    access_token: "access".to_owned(),
+                    refresh_token: "refresh".to_owned(),
+                    expires_at_ms: SystemClock.now().as_millis().saturating_add(60_000),
+                    token_endpoint: "https://auth.x.ai/token".to_owned(),
+                    client_id: "client".to_owned(),
+                    client_secret: None,
+                    scopes: vec![],
+                    provider_account_id: None,
+                },
+                metadata_json: "{}",
+                now: created_at,
+            })
+            .await
+            .expect("bundle stores");
+        seed_provider_pricing_history(&db, "disconnect-pricing-handle").await;
+
+        let before_counts: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT COUNT(*) FROM pricing_subject_revision),
+                (SELECT COUNT(*) FROM pricing_rate_revision),
+                (SELECT COUNT(*) FROM pricing_subject_binding),
+                (SELECT COUNT(*) FROM pricing_selection),
+                (SELECT COUNT(*) FROM usage_event)",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("pricing history counts before disconnect");
+        assert_eq!(before_counts, (1, 1, 1, 1, 1));
+
+        let disconnected_at = "2026-09-08T00:00:05Z";
+        assert_eq!(
+            store
+                .revoke_credential_at_version(
+                    "disconnect-pricing-handle",
+                    "credential-owner",
+                    1,
+                    disconnected_at,
+                )
+                .await
+                .expect("disconnect commits"),
+            CredentialRevocationOutcome::NotSupported
+        );
+
+        let (credential_status, credential_version): (String, i64) = sqlx::query_as(
+            "SELECT status, version FROM credential_handle
+             WHERE id = 'disconnect-pricing-handle'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("credential metadata remains");
+        assert_eq!(credential_status, "revoked");
+        assert_eq!(credential_version, 2);
+
+        let (subject_state, subject_version, subject_updated_at): (String, i64, String) =
+            sqlx::query_as(
+                "SELECT state, version, updated_at FROM pricing_subject
+                 WHERE id = 'disconnect-pricing-subject'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .expect("provider pricing subject remains");
+        assert_eq!(subject_state, "retired");
+        assert_eq!(subject_version, 3);
+        assert_eq!(subject_updated_at, disconnected_at);
+
+        let after_counts: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT COUNT(*) FROM pricing_subject_revision),
+                (SELECT COUNT(*) FROM pricing_rate_revision),
+                (SELECT COUNT(*) FROM pricing_subject_binding),
+                (SELECT COUNT(*) FROM pricing_selection),
+                (SELECT COUNT(*) FROM usage_event)",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("pricing history counts after disconnect");
+        assert_eq!(after_counts, before_counts);
+
+        let mut transaction = db::begin_immediate(db.pool())
+            .await
+            .expect("resolver transaction starts");
+        let resolved = PricingSubjectRepo::resolve_active_pricing_subject_binding_in_tx(
+            &*db,
+            &mut transaction,
+            "credential-owner",
+            Some("disconnect-pricing-handle"),
+            None,
+            None,
+            "grok-test",
+        )
+        .await
+        .expect("retired subject resolves safely");
+        transaction
+            .rollback()
+            .await
+            .expect("resolver transaction rolls back");
+        assert!(resolved.is_none());
+    }
+
+    #[tokio::test]
+    async fn disconnect_without_pricing_subject_is_a_noop_for_pricing() {
+        let (store, db) = test_store().await;
+        store
+            .create_oauth_credential(CreateOAuthCredential {
+                id: "disconnect-without-pricing",
+                owner_user_id: "credential-owner",
+                provider: "xai",
+                label: "xAI login",
+                bundle: &OAuthCredentialBundle {
+                    schema_version: 1,
+                    access_token: "access".to_owned(),
+                    refresh_token: "refresh".to_owned(),
+                    expires_at_ms: SystemClock.now().as_millis().saturating_add(60_000),
+                    token_endpoint: "https://auth.x.ai/token".to_owned(),
+                    client_id: "client".to_owned(),
+                    client_secret: None,
+                    scopes: vec![],
+                    provider_account_id: None,
+                },
+                metadata_json: "{}",
+                now: "2026-09-08T00:00:00Z",
+            })
+            .await
+            .expect("bundle stores");
+
+        assert_eq!(
+            store
+                .revoke_credential_at_version(
+                    "disconnect-without-pricing",
+                    "credential-owner",
+                    1,
+                    "2026-09-08T00:00:01Z",
+                )
+                .await
+                .expect("disconnect without pricing subject commits"),
+            CredentialRevocationOutcome::NotSupported
+        );
+        let subject_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pricing_subject
+             WHERE owner_user_id = 'credential-owner'
+               AND subject_kind = 'provider_entry'
+               AND provider_entry_id = 'disconnect-without-pricing'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("pricing subject count reads");
+        assert_eq!(subject_count, 0);
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM credential_handle WHERE id = 'disconnect-without-pricing'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("credential status reads");
+        assert_eq!(status, "revoked");
     }
 
     #[test]

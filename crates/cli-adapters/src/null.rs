@@ -51,7 +51,7 @@ impl CodingExecutorAdapter for NullAdapter {
             agent_session_id: None,
             summary: Some("Null executor completed successfully.".to_owned()),
             error: None,
-            usage: None,
+            usage_reports: Vec::new(),
             ..Default::default()
         })
     }

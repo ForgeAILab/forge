@@ -9,12 +9,15 @@ use ::time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use anyhow::Result;
 use api_types::{
     DaemonErrorPayload, DaemonFrame, ExecutionCancelParams, ExecutionCancelResult,
-    ExecutionStartParams, ExecutionStartResult, ExecutionTerminalNotification, FsBranchesParams,
-    FsListParams, RemoteExecutionFailureClass, RemoteResolvedCandidate, RemoteRouteAttempt,
-    RemoteTokenUsage, INVALID_FRAME, METHOD_EXECUTION_CANCEL, METHOD_EXECUTION_LOG,
-    METHOD_EXECUTION_START, METHOD_EXECUTION_TERMINAL, METHOD_FS_BRANCHES, METHOD_FS_LIST,
-    METHOD_TERMINAL_INPUT, METHOD_TERMINAL_RESIZE, METHOD_TERMINAL_START,
-    METHOD_TERMINAL_TERMINATE, UNSUPPORTED_METHOD,
+    ExecutionStartParams, ExecutionStartResult, ExecutionTerminalAckParams,
+    ExecutionTerminalAckResult, ExecutionTerminalNotification, FsBranchesParams, FsListParams,
+    RemoteExecutionFailureClass, RemoteResolvedCandidate, RemoteRouteAttempt, RemoteUsageReport,
+    UsageTelemetryState, DAEMON_CAPABILITY_TERMINAL_ACK, DAEMON_CAPABILITY_USAGE_REPORTS,
+    DAEMON_PROTOCOL_REVISION, INVALID_FRAME, METHOD_DAEMON_HANDSHAKE, METHOD_EXECUTION_CANCEL,
+    METHOD_EXECUTION_LOG, METHOD_EXECUTION_START, METHOD_EXECUTION_TERMINAL,
+    METHOD_EXECUTION_TERMINAL_ACK, METHOD_FS_BRANCHES, METHOD_FS_LIST, METHOD_TERMINAL_INPUT,
+    METHOD_TERMINAL_RESIZE, METHOD_TERMINAL_START, METHOD_TERMINAL_TERMINATE,
+    TERMINAL_REPORT_CONFLICT, UNSUPPORTED_METHOD,
 };
 use executors::{
     ExecutionContext, ExecutionFailureClass, ExecutionOutcome, ExecutionResult, ExecutorError,
@@ -27,6 +30,11 @@ use tokio::sync::{mpsc, watch};
 use crate::{
     daemon_fs,
     daemon_link::{run_dispatch_loop, run_with_reconnect, DaemonClient},
+};
+
+pub use crate::daemon_persistence::{
+    DaemonTerminalStore, MAX_TERMINAL_REPORTS, MAX_TERMINAL_REPORT_BYTES, MAX_TERMINAL_REPORT_SIZE,
+    TERMINAL_REPORT_DIRECTORY,
 };
 
 const TERMINAL_UNAVAILABLE: &str = "terminal_unavailable";
@@ -154,6 +162,7 @@ pub struct DaemonRuntime {
     outbound: mpsc::UnboundedSender<DaemonFrame>,
     executor: Arc<FallbackExecutor>,
     active_executions: ActiveExecutionTracker,
+    terminal_store: Arc<DaemonTerminalStore>,
 }
 
 impl DaemonRuntime {
@@ -167,16 +176,56 @@ impl DaemonRuntime {
         active_executions: ActiveExecutionTracker,
     ) -> Arc<Self> {
         let registry = Arc::new(cli_adapters::default_registry());
-        Arc::new(Self {
+        let terminal_store = Arc::new(DaemonTerminalStore::new(&workspace_root));
+        let runtime = Arc::new(Self {
             workspace_root,
             outbound,
             executor: Arc::new(FallbackExecutor::new(registry)),
             active_executions,
-        })
+            terminal_store,
+        });
+        runtime.announce_protocol();
+        runtime.replay_pending_terminals();
+        runtime
     }
 
     pub fn active_execution_ids(&self) -> Vec<String> {
         self.active_executions.active_ids()
+    }
+
+    /// The durable queue is shared by every runtime created during command
+    /// stream reconnects. Keeping this accessor public gives the daemon host a
+    /// narrow inspection point for diagnostics without exposing raw payload
+    /// files or credentials.
+    pub fn terminal_store(&self) -> &DaemonTerminalStore {
+        &self.terminal_store
+    }
+
+    fn announce_protocol(&self) {
+        let handshake = api_types::DaemonHandshakeNotification {
+            protocol_revision: DAEMON_PROTOCOL_REVISION,
+            capabilities: vec![
+                DAEMON_CAPABILITY_USAGE_REPORTS.to_owned(),
+                DAEMON_CAPABILITY_TERMINAL_ACK.to_owned(),
+            ],
+        };
+        emit_notification(&self.outbound, METHOD_DAEMON_HANDSHAKE, handshake);
+    }
+
+    fn replay_pending_terminals(&self) {
+        match self.terminal_store.pending() {
+            Ok(notifications) => {
+                for notification in notifications {
+                    emit_notification(&self.outbound, METHOD_EXECUTION_TERMINAL, notification);
+                }
+            }
+            Err(error) => {
+                // A malformed or unreadable durable record must not be
+                // silently deleted. Keep the daemon connected for ordinary
+                // work, but surface the replay failure for operator recovery.
+                tracing::error!(%error, "failed to replay retained daemon terminal reports");
+            }
+        }
     }
 
     pub async fn handle_request(self: &Arc<Self>, frame: DaemonFrame) -> DaemonFrame {
@@ -230,6 +279,18 @@ impl DaemonRuntime {
                 },
                 Err(frame) => frame,
             },
+            METHOD_EXECUTION_TERMINAL_ACK => {
+                match decode_params::<ExecutionTerminalAckParams>(&id, params) {
+                    Ok(params) => match self.acknowledge_terminal(params).await {
+                        Ok(result) => response_frame(id, result),
+                        Err(error) => DaemonFrame::Error {
+                            id: Some(id),
+                            error,
+                        },
+                    },
+                    Err(frame) => frame,
+                }
+            }
             METHOD_TERMINAL_START
             | METHOD_TERMINAL_INPUT
             | METHOD_TERMINAL_RESIZE
@@ -269,8 +330,9 @@ impl DaemonRuntime {
         let executor = Arc::clone(&self.executor);
         let outbound = self.outbound.clone();
         let active_executions = self.active_executions.clone();
+        let terminal_store = Arc::clone(&self.terminal_store);
         tokio::spawn(async move {
-            run_execution_task(executor, outbound, ctx, active_executions).await;
+            run_execution_task(executor, outbound, ctx, active_executions, terminal_store).await;
         });
 
         Ok(ExecutionStartResult {
@@ -292,6 +354,25 @@ impl DaemonRuntime {
             cancelled: true,
         })
     }
+
+    pub async fn acknowledge_terminal(
+        &self,
+        params: ExecutionTerminalAckParams,
+    ) -> CommandResult<ExecutionTerminalAckResult> {
+        self.terminal_store.acknowledge(&params).map_err(|error| {
+            let message = error.to_string();
+            let code = if message.contains(TERMINAL_REPORT_CONFLICT) {
+                TERMINAL_REPORT_CONFLICT
+            } else {
+                EXECUTION_ERROR
+            };
+            DaemonErrorPayload {
+                code: code.to_owned(),
+                message,
+                details: None,
+            }
+        })
+    }
 }
 
 async fn run_execution_task(
@@ -299,6 +380,7 @@ async fn run_execution_task(
     outbound: mpsc::UnboundedSender<DaemonFrame>,
     mut ctx: ExecutionContext,
     active_executions: ActiveExecutionTracker,
+    terminal_store: Arc<DaemonTerminalStore>,
 ) {
     let _active_guard = active_executions.track(ctx.execution_id.clone());
     let (log_tx, mut log_rx) = mpsc::unbounded_channel::<LogEntry>();
@@ -367,6 +449,7 @@ async fn run_execution_task(
     let notification = match result {
         Ok(result) => terminal_notification_from_result(execution_id, result),
         Err(error) => ExecutionTerminalNotification {
+            terminal_report_id: terminal_report_id_for_execution(&execution_id),
             execution_id,
             exit_code: Some(1),
             signal: None,
@@ -376,14 +459,22 @@ async fn run_execution_task(
             agent_session_id: None,
             summary: None,
             after_sha: None,
-            usage: None,
+            usage_reports: Vec::new(),
             failure_class: None,
             retry_at: None,
             resolved_candidate: None,
             route_attempts: None,
         },
     };
-    emit_notification(&outbound, METHOD_EXECUTION_TERMINAL, notification);
+    match terminal_store.retain(&notification) {
+        Ok(()) => emit_notification(&outbound, METHOD_EXECUTION_TERMINAL, notification),
+        Err(error) => tracing::error!(
+            %error,
+            execution_id = %notification.execution_id,
+            terminal_report_id = %notification.terminal_report_id,
+            "failed to durably retain daemon terminal report"
+        ),
+    }
 }
 
 fn terminal_notification_from_result(
@@ -396,6 +487,7 @@ fn terminal_notification_from_result(
         ExecutionOutcome::Cancelled => ("cancelled", None, Some("cancelled".to_owned()), None),
     };
     ExecutionTerminalNotification {
+        terminal_report_id: terminal_report_id_for_execution(&execution_id),
         execution_id,
         exit_code,
         signal,
@@ -405,14 +497,11 @@ fn terminal_notification_from_result(
         agent_session_id: result.agent_session_id,
         summary: result.summary,
         after_sha: result.after_sha,
-        usage: result.usage.map(|usage| RemoteTokenUsage {
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            cache_read_tokens: usage.cache_read_tokens,
-            cache_write_tokens: usage.cache_write_tokens,
-            cost_usd: usage.cost_usd,
-            model: usage.model,
-        }),
+        usage_reports: result
+            .usage_reports
+            .into_iter()
+            .map(remote_usage_report_from_executor)
+            .collect(),
         failure_class: result.failure_class.map(|class| match class {
             ExecutionFailureClass::TaskFailed => RemoteExecutionFailureClass::TaskFailed,
             ExecutionFailureClass::ExecutorUnavailable => {
@@ -446,6 +535,36 @@ fn terminal_notification_from_result(
             )
         },
     }
+}
+
+fn remote_usage_report_from_executor(report: executors::UsageReport) -> RemoteUsageReport {
+    RemoteUsageReport {
+        report_id: report.report_id,
+        request_id: report.request_id,
+        report_sequence: report.report_sequence,
+        candidate_key: report.candidate_key,
+        attempt_ordinal: report.attempt_ordinal,
+        provider_id: report.provider_id,
+        model_id: report.model_id,
+        input_tokens: report.counters.input_tokens,
+        output_tokens: report.counters.output_tokens,
+        cache_read_tokens: report.counters.cache_read_tokens,
+        cache_write_tokens: report.counters.cache_write_tokens,
+        telemetry_state: match report.telemetry_state {
+            executors::UsageTelemetryState::Metered => UsageTelemetryState::Metered,
+            executors::UsageTelemetryState::Unmetered => UsageTelemetryState::Unmetered,
+            executors::UsageTelemetryState::Pending => UsageTelemetryState::Pending,
+            executors::UsageTelemetryState::Unsettled => UsageTelemetryState::Unsettled,
+        },
+        context_tokens: report.context_tokens,
+        selected_tier: report.selected_tier,
+        reported_cost_usd: report.reported_cost_usd,
+        partial: report.partial,
+    }
+}
+
+fn terminal_report_id_for_execution(execution_id: &str) -> String {
+    format!("forge:terminal:{execution_id}")
 }
 
 fn daemon_system_log(execution_id: &str, line: &str) -> LogEntry {
@@ -673,6 +792,59 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn terminal_report_is_retained_until_acknowledged() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let runtime = DaemonRuntime::new(tx, dir.path().to_path_buf());
+        let execution_id = "exec-shell-retained".to_owned();
+
+        runtime
+            .start(ExecutionStartParams {
+                task_id: "task-1".to_owned(),
+                execution_id: execution_id.clone(),
+                workspace_path: dir.path().to_string_lossy().into_owned(),
+                executor_type: "shell".to_owned(),
+                executor_config: serde_json::json!({
+                    "executor_type": "shell",
+                    "config": {}
+                }),
+                prompt: serde_json::json!({ "description": "printf retained" }),
+                max_turns: None,
+            })
+            .await
+            .expect("execution starts");
+
+        let notification = next_terminal_notification(&mut rx, &execution_id).await;
+        assert_eq!(
+            runtime.terminal_store().pending().expect("pending reports"),
+            vec![notification.clone()]
+        );
+
+        let response = runtime
+            .handle_request(DaemonFrame::Request {
+                id: "terminal-ack-1".to_owned(),
+                method: METHOD_EXECUTION_TERMINAL_ACK.to_owned(),
+                params: serde_json::to_value(ExecutionTerminalAckParams {
+                    terminal_report_id: notification.terminal_report_id.clone(),
+                    execution_id: notification.execution_id.clone(),
+                })
+                .expect("ack params serialize"),
+            })
+            .await;
+        let DaemonFrame::Response { result, .. } = response else {
+            panic!("expected ack response");
+        };
+        let result: ExecutionTerminalAckResult =
+            serde_json::from_value(result).expect("ack result parses");
+        assert!(result.acknowledged);
+        assert!(runtime
+            .terminal_store()
+            .pending()
+            .expect("empty reports")
+            .is_empty());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn shell_execution_can_be_cancelled() {
@@ -787,5 +959,51 @@ mod tests {
         drop(first);
         let _second = tracker.track("exec-1".to_owned());
         assert_eq!(tracker.active_ids(), ["exec-1"]);
+    }
+
+    #[test]
+    fn terminal_mapping_preserves_each_usage_report_without_flattening() {
+        let mut report = executors::UsageReport::metered(
+            "provider-report-1",
+            executors::UsageCounters {
+                input_tokens: Some(10),
+                output_tokens: Some(4),
+                cache_read_tokens: None,
+                cache_write_tokens: Some(2),
+            },
+        );
+        report.request_id = Some("provider-request-1".to_owned());
+        report.candidate_key = Some("codex#primary".to_owned());
+        report.attempt_ordinal = 1;
+        report.provider_id = Some("openai".to_owned());
+        report.model_id = Some("gpt-5".to_owned());
+        report.context_tokens = Some(128);
+        report.selected_tier = Some("long".to_owned());
+        report.reported_cost_usd = Some("0.000000123".to_owned());
+        report.partial = true;
+
+        let notification = terminal_notification_from_result(
+            "execution-1".to_owned(),
+            ExecutionResult {
+                status: ExecutionOutcome::Completed,
+                usage_reports: vec![report],
+                ..ExecutionResult::default()
+            },
+        );
+
+        assert_eq!(
+            notification.terminal_report_id,
+            "forge:terminal:execution-1"
+        );
+        assert_eq!(notification.usage_reports.len(), 1);
+        let remote = &notification.usage_reports[0];
+        assert_eq!(remote.report_id, "provider-report-1");
+        assert_eq!(remote.request_id.as_deref(), Some("provider-request-1"));
+        assert_eq!(remote.input_tokens, Some(10));
+        assert_eq!(remote.output_tokens, Some(4));
+        assert_eq!(remote.cache_read_tokens, None);
+        assert_eq!(remote.cache_write_tokens, Some(2));
+        assert_eq!(remote.reported_cost_usd.as_deref(), Some("0.000000123"));
+        assert!(remote.partial);
     }
 }

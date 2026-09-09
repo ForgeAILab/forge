@@ -10,17 +10,22 @@ import {
   createProviderEntry,
   getEffectivePermissions,
   getContextManifest,
+  getCliRuntimePricing,
   getMainAgentBinding,
   getMissionControl,
   getProviderAuthorization,
+  getPricingCatalogStatus,
+  getProviderPricing,
   listContextManifests,
   listAgentSessions,
   listFederatedAgents,
   listAgentProviderCapabilities,
+  listPricingCatalogModels,
   listProviders,
   getProjectAgentBinding,
   getProviderUsage,
   registerHarnessAgent,
+  refreshPricingCatalog,
   removeProviderEntry,
   renameProviderEntry,
   rotateAgentSession,
@@ -31,6 +36,8 @@ import {
   setAgentSessionStatus,
   startProviderAuthorization,
   steerAgentSessionTurn,
+  replaceCliRuntimePricing,
+  replaceProviderPricing,
 } from './api'
 import type {
   ConnectEmbeddedProfileInput,
@@ -46,6 +53,9 @@ import type {
   SetCliRuntimeAvailabilityRequest,
   SetProviderEntryAvailabilityRequest,
   StartProviderAuthorizationRequest,
+  PricingCatalogModelsQuery,
+  PricingCatalogRefreshRequest,
+  ReplaceProviderPricingRequest,
 } from '@/types/generated'
 
 export const federationQueryKeys = {
@@ -62,6 +72,12 @@ export const federationQueryKeys = {
   projectAgent: (projectId: string) => ['projects', projectId, 'project-agent'] as const,
   providers: ['agent-providers'] as const,
   providerUsage: (id: string) => ['agent-providers', id, 'usage'] as const,
+  pricingCatalogStatus: ['agent-providers', 'pricing-catalog', 'status'] as const,
+  pricingCatalogModels: (query: PricingCatalogModelsQuery) =>
+    ['agent-providers', 'pricing-catalog', 'models', query] as const,
+  providerPricing: (id: string) => ['agent-providers', id, 'pricing'] as const,
+  cliRuntimePricing: (daemonId: string, executorType: string) =>
+    ['agent-providers', 'cli-runtime', daemonId, executorType, 'pricing'] as const,
   providerAuthorization: (id: string) => ['provider-authorizations', id] as const,
 } as const
 
@@ -287,6 +303,126 @@ export function useProviderUsageQuery(entryId: string | undefined) {
     enabled: Boolean(entryId),
     staleTime: 3 * 60_000,
     retry: false,
+  })
+}
+
+export type PricingCatalogModelsQueryInput = {
+  limit?: number
+  cursor?: string
+  provider_id?: string
+  query?: string
+}
+
+function normalizePricingCatalogModelsQuery(
+  query: PricingCatalogModelsQueryInput = {},
+): PricingCatalogModelsQuery {
+  return {
+    limit: query.limit ?? 50,
+    cursor: query.cursor ?? null,
+    provider_id: query.provider_id ?? null,
+    query: query.query ?? null,
+  }
+}
+
+export function usePricingCatalogStatusQuery(options?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: federationQueryKeys.pricingCatalogStatus,
+    queryFn: getPricingCatalogStatus,
+    enabled: options?.enabled ?? true,
+    staleTime: 30_000,
+    retry: false,
+  })
+}
+
+export function usePricingCatalogModelsQuery(
+  query: PricingCatalogModelsQueryInput = {},
+  options?: { enabled?: boolean },
+) {
+  const normalized = normalizePricingCatalogModelsQuery(query)
+  return useQuery({
+    queryKey: federationQueryKeys.pricingCatalogModels(normalized),
+    queryFn: () => listPricingCatalogModels(normalized),
+    enabled: options?.enabled ?? true,
+    staleTime: 60_000,
+    retry: false,
+  })
+}
+
+export function useRefreshPricingCatalogMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (input: PricingCatalogRefreshRequest) => refreshPricingCatalog(input),
+    onSuccess: (status) => {
+      queryClient.setQueryData(federationQueryKeys.pricingCatalogStatus, status)
+      void queryClient.invalidateQueries({
+        queryKey: ['agent-providers', 'pricing-catalog', 'models'],
+      })
+    },
+    onError: () => {
+      // A failed refresh is itself represented by the status projection. Pull
+      // it again so a retained last-known-good snapshot becomes visible.
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.pricingCatalogStatus })
+    },
+  })
+}
+
+export function useProviderPricingQuery(subjectId: string | undefined) {
+  return useQuery({
+    queryKey: federationQueryKeys.providerPricing(subjectId ?? 'none'),
+    queryFn: () => getProviderPricing(subjectId!),
+    enabled: Boolean(subjectId),
+    staleTime: 30_000,
+    retry: false,
+  })
+}
+
+export function useCliRuntimePricingQuery(
+  daemonId: string | undefined,
+  executorType: string | undefined,
+) {
+  return useQuery({
+    queryKey: federationQueryKeys.cliRuntimePricing(daemonId ?? 'none', executorType ?? 'none'),
+    queryFn: () => getCliRuntimePricing(daemonId!, executorType!),
+    enabled: Boolean(daemonId && executorType),
+    staleTime: 30_000,
+    retry: false,
+  })
+}
+
+export function useReplaceProviderPricingMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      subjectId,
+      input,
+    }: {
+      subjectId: string
+      input: ReplaceProviderPricingRequest
+    }) => replaceProviderPricing(subjectId, input),
+    onSuccess: (pricing, variables) => {
+      queryClient.setQueryData(federationQueryKeys.providerPricing(variables.subjectId), pricing)
+    },
+  })
+}
+
+export function useReplaceCliRuntimePricingMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      daemonId,
+      executorType,
+      input,
+    }: {
+      daemonId: string
+      executorType: string
+      input: ReplaceProviderPricingRequest
+    }) => replaceCliRuntimePricing(daemonId, executorType, input),
+    onSuccess: (pricing, variables) => {
+      queryClient.setQueryData(
+        federationQueryKeys.cliRuntimePricing(variables.daemonId, variables.executorType),
+        pricing,
+      )
+    },
   })
 }
 

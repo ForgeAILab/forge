@@ -62,6 +62,12 @@ impl Default for ShutdownSignal {
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<SqliteDb>,
+    /// Shared pricing persistence boundary for catalog, subject bindings,
+    /// and retrospective estimate routes.
+    pub pricing_repository: Arc<services::pricing_db::SqlitePricingRepository>,
+    /// One process-wide models.dev client per AppState. Clones share the
+    /// client's single-flight refresh gate and its fixed endpoint transport.
+    pub models_dev_client: Arc<services::pricing::ModelsDevClient>,
     pub task_service: Arc<TaskService>,
     pub agent_service: Arc<AgentService>,
     pub embedded_agent_service: Arc<EmbeddedAgentService>,
@@ -179,6 +185,15 @@ impl AppState {
     ) -> Self {
         let workspace_root = cleanup_scheduler.workspace_root().to_path_buf();
         let effective_config = effective_config_for_workspace(workspace_root.clone());
+        let pricing_repository = Arc::new(services::pricing_db::SqlitePricingRepository::new(
+            Arc::clone(&db),
+        ));
+        let catalog_repository: Arc<dyn services::pricing::PricingCatalogRepository> =
+            pricing_repository.clone();
+        let models_dev_client = Arc::new(
+            services::pricing::ModelsDevClient::new(catalog_repository)
+                .expect("models.dev pricing client must initialize"),
+        );
         let embedded_agent_service =
             Arc::new(EmbeddedAgentService::new(Arc::clone(&db), &jwt_secret));
         let agent_chat_service = Arc::new(services::AgentChatService::new(Arc::clone(&db)));
@@ -335,6 +350,8 @@ impl AppState {
 
         Self {
             db,
+            pricing_repository,
+            models_dev_client,
             task_service,
             agent_service,
             embedded_agent_service,
@@ -428,6 +445,17 @@ impl AppState {
 
     pub fn with_task_dispatcher(mut self, task_dispatcher: Arc<services::TaskDispatcher>) -> Self {
         self.task_dispatcher = Some(task_dispatcher);
+        self
+    }
+
+    /// Overrides the production catalog client for deterministic API tests.
+    /// The normal constructor still creates exactly one client and transport
+    /// for each AppState instance.
+    pub fn with_models_dev_client(
+        mut self,
+        client: Arc<services::pricing::ModelsDevClient>,
+    ) -> Self {
+        self.models_dev_client = client;
         self
     }
 }

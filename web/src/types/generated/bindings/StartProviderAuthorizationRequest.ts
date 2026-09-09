@@ -3,11 +3,11 @@ import type { AgentProviderId } from "./AgentProviderId";
 import type { LoopbackOwner } from "./LoopbackOwner";
 import type { ProviderCredentialMethod } from "./ProviderCredentialMethod";
 
-export type StartProviderAuthorizationRequest = { provider: AgentProviderId, method: ProviderCredentialMethod, redirect_origin: string, credential_label: string, 
+export type StartProviderAuthorizationRequest = { provider: AgentProviderId, method: ProviderCredentialMethod, redirect_origin: string, credential_label: string,
 /**
  * Browser OAuth only; ignored by API-key and device flows.
  */
-loopback_owner: LoopbackOwner, 
+loopback_owner: LoopbackOwner,
 /**
  * Required when `loopback_owner` is `client`: the already-bound port, which
  * must be one the provider's OAuth client whitelists.

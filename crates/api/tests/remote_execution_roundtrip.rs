@@ -582,6 +582,7 @@ async fn remote_executor_unavailable_defers_and_persists_route() {
         &mut fixture.daemon_socket,
         api_types::METHOD_EXECUTION_TERMINAL,
         api_types::ExecutionTerminalNotification {
+            terminal_report_id: format!("exhausted-terminal-{execution_id}"),
             execution_id: execution_id.clone(),
             exit_code: Some(1),
             signal: None,
@@ -591,7 +592,7 @@ async fn remote_executor_unavailable_defers_and_persists_route() {
             agent_session_id: None,
             summary: None,
             after_sha: None,
-            usage: None,
+            usage_reports: Vec::new(),
             failure_class: Some(api_types::RemoteExecutionFailureClass::ExecutorUnavailable),
             retry_at: Some(retry_at),
             resolved_candidate: None,

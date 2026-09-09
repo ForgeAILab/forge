@@ -316,7 +316,7 @@ impl ShellExecutor {
                 agent_session_id: None,
                 summary: None,
                 error: None,
-                usage: None,
+                usage_reports: Vec::new(),
                 ..Default::default()
             });
         }
@@ -328,7 +328,7 @@ impl ShellExecutor {
                 agent_session_id: None,
                 summary: None,
                 error: None,
-                usage: None,
+                usage_reports: Vec::new(),
                 ..Default::default()
             })
         } else {
@@ -338,7 +338,7 @@ impl ShellExecutor {
                 agent_session_id: None,
                 summary: None,
                 error: Some(format!("shell command exited with status {status}")),
-                usage: None,
+                usage_reports: Vec::new(),
                 ..Default::default()
             })
         }

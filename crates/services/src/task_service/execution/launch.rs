@@ -722,9 +722,17 @@ impl TaskService {
         // second manual-stop annotation or recovery transition from this
         // stale cancellation request.
         if !cancellation_committed {
-            return ExecutionRepo::get_by_id(&*self.db, &execution_id)
+            let current = ExecutionRepo::get_by_id(&*self.db, &execution_id)
                 .await?
-                .ok_or_else(|| ServiceError::not_found("execution", execution_id));
+                .ok_or_else(|| ServiceError::not_found("execution", execution_id))?;
+            if current.status == ExecutionStatus::Running {
+                // Nothing won the terminal CAS, so this stop never reached the
+                // row. Returning it as an ordinary concurrent loss would answer
+                // a stop request with 200 and a still-running execution; the
+                // caller retries against the version it reads back instead.
+                return Err(ServiceError::Db(DbError::VersionConflict));
+            }
+            return Ok(current);
         }
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?

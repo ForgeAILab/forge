@@ -563,14 +563,17 @@ where
                 "Agent Chat turn is already terminal".to_owned(),
             ));
         }
-        AgentChatTransactionRepo::cancel_agent_chat_turn(
+        AgentChatTransactionRepo::cancel_agent_chat_turn_with_usage(
             &*self.db,
-            CancelAgentChatTurn {
-                turn_job_id: job.id,
-                expected_version: input.expected_version,
-                actor_user_id: input.actor_user_id,
-                idempotency_key: idempotency_key.to_owned(),
-                updated_at: now_rfc3339(),
+            db::CancelAgentChatTurnWithUsage {
+                terminal: CancelAgentChatTurn {
+                    turn_job_id: job.id,
+                    expected_version: input.expected_version,
+                    actor_user_id: input.actor_user_id,
+                    idempotency_key: idempotency_key.to_owned(),
+                    updated_at: now_rfc3339(),
+                },
+                settlements: Vec::new(),
             },
         )
         .await
@@ -752,6 +755,82 @@ where
         })
     }
 
+    /// Commit a response and the observed provider-attempt reports in one
+    /// SQLite composite. The legacy JSON field is intentionally left empty on
+    /// this typed path; ledger events are the accounting authority.
+    pub async fn append_success_with_usage(
+        &self,
+        job: &AgentChatTurnJob,
+        lease_owner: &str,
+        response: AppendAgentChatSuccessInput,
+        settlements: Vec<db::UsageLedgerSettlement>,
+    ) -> Result<CommittedAgentChatResponse> {
+        if job.status != AgentChatTurnState::Leased
+            || job.lease_owner.as_deref() != Some(lease_owner)
+        {
+            return Err(ServiceError::Conflict(
+                "Agent Chat turn lease is no longer active".to_owned(),
+            ));
+        }
+        let AppendAgentChatSuccessInput {
+            content,
+            model,
+            session_id,
+            context_manifest_id,
+            duration_ms,
+            ..
+        } = response;
+        let guarded = guard_agent_chat_content(&content)?;
+        let now = now_rfc3339();
+        let completed = AgentChatTransactionRepo::complete_agent_chat_turn_with_usage(
+            &*self.db,
+            db::CompleteAgentChatTurnWithUsage {
+                terminal: CompleteAgentChatTurn {
+                    turn_job_id: job.id.clone(),
+                    expected_version: job.version,
+                    lease_owner: lease_owner.to_owned(),
+                    response: CreateAgentChatMessage {
+                        id: new_uuid_v4(),
+                        chat_id: job.chat_id.clone(),
+                        sequence: 0,
+                        author_type: AgentChatMessageAuthorType::Agent,
+                        author_id: job.responder_identity_id.clone(),
+                        content: guarded.content,
+                        content_guard_json: guarded.guard_json,
+                        sensitivity: guarded.sensitivity,
+                        status: AgentChatMessageStatus::Complete,
+                        outcome: Some("completed".to_owned()),
+                        model,
+                        profile_id: job.profile_id.clone(),
+                        session_id,
+                        context_manifest_id,
+                        token_usage_json: None,
+                        duration_ms,
+                        error: None,
+                        correlation_id: job.correlation_id.clone(),
+                        causation_id: job.causation_id.clone(),
+                        handoff_id: None,
+                        source_type: "native".to_owned(),
+                        source_id: Some(job.id.clone()),
+                        source_message_id: Some(job.triggering_message_id.clone()),
+                        source_room_id: None,
+                        source_conversation_id: None,
+                        source_sequence: None,
+                        source_metadata_json: "{}".to_owned(),
+                        created_at: now.clone(),
+                    },
+                    updated_at: now,
+                },
+                settlements,
+            },
+        )
+        .await?;
+        Ok(CommittedAgentChatResponse {
+            message: completed.response,
+            turn_job: completed.turn,
+        })
+    }
+
     pub async fn append_awaiting_input(
         &self,
         job: &AgentChatTurnJob,
@@ -774,6 +853,37 @@ where
                 lease_owner: lease_owner.to_owned(),
                 pending_interaction_id: pending_interaction_id.to_owned(),
                 updated_at: now,
+            },
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn append_awaiting_input_with_usage(
+        &self,
+        job: &AgentChatTurnJob,
+        lease_owner: &str,
+        pending_interaction_id: &str,
+        settlements: Vec<db::UsageLedgerSettlement>,
+    ) -> Result<AgentChatTurnJob> {
+        if job.status != AgentChatTurnState::Leased
+            || job.lease_owner.as_deref() != Some(lease_owner)
+        {
+            return Err(ServiceError::Conflict(
+                "Agent Chat turn lease is no longer active".to_owned(),
+            ));
+        }
+        AgentChatTransactionRepo::park_agent_chat_turn_with_usage(
+            &*self.db,
+            db::ParkAgentChatTurnWithUsage {
+                terminal: db::ParkAgentChatTurn {
+                    turn_job_id: job.id.clone(),
+                    expected_version: job.version,
+                    lease_owner: lease_owner.to_owned(),
+                    pending_interaction_id: pending_interaction_id.to_owned(),
+                    updated_at: now_rfc3339(),
+                },
+                settlements,
             },
         )
         .await
@@ -812,6 +922,48 @@ where
                 error_code: bounded_error(error_code),
                 error_message: decision.error,
                 updated_at: now.to_rfc3339(),
+            },
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn append_failure_with_usage(
+        &self,
+        job: &AgentChatTurnJob,
+        lease_owner: &str,
+        error_code: &str,
+        error_message: &str,
+        settlements: Vec<db::UsageLedgerSettlement>,
+    ) -> Result<AgentChatTurnJob> {
+        if job.status != AgentChatTurnState::Leased
+            || job.lease_owner.as_deref() != Some(lease_owner)
+        {
+            return Err(ServiceError::Conflict(
+                "Agent Chat turn lease is no longer active".to_owned(),
+            ));
+        }
+        let now = chrono::Utc::now();
+        let decision = failure_after_claim(job.attempt_count, job.max_attempts, now, error_message);
+        AgentChatTransactionRepo::fail_agent_chat_turn_with_usage(
+            &*self.db,
+            db::FailAgentChatTurnWithUsage {
+                terminal: FailAgentChatTurn {
+                    turn_job_id: job.id.clone(),
+                    expected_version: job.version,
+                    lease_owner: lease_owner.to_owned(),
+                    status: match decision.status {
+                        api_types::AgentChatTurnStatus::RetryWait => AgentChatTurnState::RetryWait,
+                        api_types::AgentChatTurnStatus::Failed => AgentChatTurnState::Failed,
+                        _ => AgentChatTurnState::Failed,
+                    },
+                    attempt_count: decision.attempt_count,
+                    next_attempt_at: decision.next_attempt_at.map(|at| at.to_rfc3339()),
+                    error_code: bounded_error(error_code),
+                    error_message: decision.error,
+                    updated_at: now.to_rfc3339(),
+                },
+                settlements,
             },
         )
         .await

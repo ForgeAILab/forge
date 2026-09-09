@@ -1,5 +1,6 @@
 use crate::{
-    config::resolve_config_value, ExecutionContext, ExecutionResult, ExecutorError, TaskExecutor,
+    config::resolve_config_value, ExecutionContext, ExecutionResult, ExecutorError,
+    ProviderCallAdmission, TaskExecutor, UsageReport,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -157,16 +158,84 @@ impl Default for AdapterRegistry {
 /// Supervisor-facing executor that dispatches to a typed CLI adapter.
 pub struct AdapterExecutor {
     registry: Arc<AdapterRegistry>,
+    provider_admissions: std::sync::Mutex<HashMap<String, Arc<dyn ProviderCallAdmission>>>,
 }
 
 impl AdapterExecutor {
     pub fn new(registry: Arc<AdapterRegistry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            provider_admissions: std::sync::Mutex::new(HashMap::new()),
+        }
     }
+}
+
+/// Resolve only identity fields that the candidate actually configured. The
+/// executor family is intentionally not a provider fallback: `codex`,
+/// `embedded`, and `smith` are runtimes, not billable provider identities.
+fn configured_provider_model(config: &serde_json::Value) -> (Option<&str>, Option<&str>) {
+    let provider = config
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    let model = config
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    (provider, model)
+}
+
+/// Add deterministic route identity and configured identity to adapter
+/// reports. An adapter that made a provider call but has no telemetry receives
+/// one unmetered disposition; no zero counters are fabricated.
+fn normalize_candidate_reports(
+    execution_id: &str,
+    candidate: &RouteCandidate,
+    attempt_ordinal: u32,
+    reports: Vec<UsageReport>,
+    outcome: crate::config::RouteAttemptOutcome,
+    add_unmetered_when_empty: bool,
+) -> Vec<UsageReport> {
+    let (configured_provider, configured_model) = configured_provider_model(&candidate.config);
+    let mut reports = reports;
+    if reports.is_empty() && add_unmetered_when_empty {
+        reports.push(UsageReport::unmetered(String::new()));
+    }
+    reports
+        .into_iter()
+        .enumerate()
+        .map(|(sequence, mut report)| {
+            report.fill_identity(configured_provider, configured_model);
+            report.outcome = Some(outcome);
+            report.for_candidate(
+                execution_id,
+                &candidate.candidate_key,
+                attempt_ordinal,
+                sequence as u32,
+            )
+        })
+        .collect()
 }
 
 #[async_trait]
 impl TaskExecutor for AdapterExecutor {
+    async fn execute_with_provider_call_admission(
+        &self,
+        ctx: ExecutionContext,
+        admission: Arc<dyn ProviderCallAdmission>,
+    ) -> Result<ExecutionResult, ExecutorError> {
+        self.provider_admissions
+            .lock()
+            .expect("provider admission lock poisoned")
+            .insert(ctx.execution_id.clone(), admission);
+        let result = self.execute(ctx.clone()).await;
+        self.provider_admissions
+            .lock()
+            .expect("provider admission lock poisoned")
+            .remove(&ctx.execution_id);
+        result
+    }
+
     async fn execute(&self, mut ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
         let (kind, config) = resolve_context_config(&ctx.agent_config)?;
         let adapter = self.registry.get(&kind).ok_or_else(|| {
@@ -174,7 +243,72 @@ impl TaskExecutor for AdapterExecutor {
         })?;
 
         ctx.agent_config = config;
-        adapter.execute(ctx).await
+        let candidate = RouteCandidate {
+            candidate_key: crate::config::candidate_key(&kind, &ctx.agent_config),
+            account_key: crate::config::account_key(&kind, &ctx.agent_config),
+            kind,
+            config: ctx.agent_config.clone(),
+        };
+        let admission = self
+            .provider_admissions
+            .lock()
+            .expect("provider admission lock poisoned")
+            .get(&ctx.execution_id)
+            .cloned();
+        if let Some(admission) = admission {
+            admission
+                .before_provider_call(&ctx, &candidate.candidate_key, 0)
+                .await?;
+        }
+        match adapter.execute(ctx.clone()).await {
+            Ok(mut result) => {
+                let outcome = if result.status == crate::ExecutionOutcome::Cancelled {
+                    crate::config::RouteAttemptOutcome::Cancelled
+                } else if result.status == crate::ExecutionOutcome::Completed {
+                    crate::config::RouteAttemptOutcome::Completed
+                } else {
+                    crate::config::RouteAttemptOutcome::Failed
+                };
+                result.usage_reports = normalize_candidate_reports(
+                    &ctx.execution_id,
+                    &candidate,
+                    0,
+                    result.usage_reports,
+                    outcome,
+                    true,
+                );
+                Ok(result)
+            }
+            Err(ExecutorError::UsageExhausted {
+                retry_after,
+                usage_reports,
+            }) => Err(ExecutorError::UsageExhausted {
+                retry_after,
+                usage_reports: normalize_candidate_reports(
+                    &ctx.execution_id,
+                    &candidate,
+                    0,
+                    usage_reports,
+                    crate::config::RouteAttemptOutcome::UsageExhausted,
+                    true,
+                ),
+            }),
+            Err(ExecutorError::Unavailable {
+                reason,
+                usage_reports,
+            }) => Err(ExecutorError::Unavailable {
+                reason,
+                usage_reports: normalize_candidate_reports(
+                    &ctx.execution_id,
+                    &candidate,
+                    0,
+                    usage_reports,
+                    crate::config::RouteAttemptOutcome::Unavailable,
+                    false,
+                ),
+            }),
+            Err(error) => Err(error),
+        }
     }
 
     async fn cancel(&self, execution_id: &str) -> Result<(), ExecutorError> {
@@ -198,6 +332,7 @@ pub struct FallbackExecutor {
     registry: Arc<AdapterRegistry>,
     cooldowns: std::sync::Mutex<HashMap<String, std::time::Instant>>,
     cancellations: std::sync::Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    provider_admissions: std::sync::Mutex<HashMap<String, Arc<dyn ProviderCallAdmission>>>,
 }
 
 struct RouteCandidate {
@@ -213,6 +348,7 @@ impl FallbackExecutor {
             registry,
             cooldowns: std::sync::Mutex::new(HashMap::new()),
             cancellations: std::sync::Mutex::new(HashMap::new()),
+            provider_admissions: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -326,14 +462,14 @@ impl FallbackExecutor {
 
     fn unavailable_result(
         attempts: Vec<crate::config::RouteAttempt>,
-        usage: Option<crate::TokenUsage>,
+        usage_reports: Vec<UsageReport>,
         retry_after: Option<std::time::Duration>,
         summary: String,
     ) -> ExecutionResult {
         ExecutionResult {
             status: crate::ExecutionOutcome::Failed,
             error: Some(summary),
-            usage,
+            usage_reports,
             failure_class: Some(crate::ExecutionFailureClass::ExecutorUnavailable),
             retry_after,
             route_attempts: attempts,
@@ -344,6 +480,23 @@ impl FallbackExecutor {
 
 #[async_trait]
 impl TaskExecutor for FallbackExecutor {
+    async fn execute_with_provider_call_admission(
+        &self,
+        ctx: ExecutionContext,
+        admission: Arc<dyn ProviderCallAdmission>,
+    ) -> Result<ExecutionResult, ExecutorError> {
+        self.provider_admissions
+            .lock()
+            .expect("provider admission lock poisoned")
+            .insert(ctx.execution_id.clone(), admission);
+        let result = self.execute(ctx.clone()).await;
+        self.provider_admissions
+            .lock()
+            .expect("provider admission lock poisoned")
+            .remove(&ctx.execution_id);
+        result
+    }
+
     async fn execute(&self, ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
         let candidates = Self::route(&ctx.agent_config)?;
         let cancelled = self.cancellation_flag(&ctx.execution_id);
@@ -359,25 +512,16 @@ impl TaskExecutor for FallbackExecutor {
         }
 
         let mut attempts: Vec<crate::config::RouteAttempt> = Vec::new();
-        let mut aggregated_usage: Option<crate::TokenUsage> = None;
+        let mut usage_reports: Vec<UsageReport> = Vec::new();
         let mut earliest_retry: Option<std::time::Duration> = None;
         let mut skip_reasons: Vec<String> = Vec::new();
 
-        let absorb = |aggregated: &mut Option<crate::TokenUsage>,
-                      usage: &Option<crate::TokenUsage>| {
-            if let Some(usage) = usage {
-                aggregated
-                    .get_or_insert_with(crate::TokenUsage::default)
-                    .absorb(usage);
-            }
-        };
-
         let outcome = 'chain: {
-            for candidate in &candidates {
+            for (attempt_ordinal, candidate) in candidates.iter().enumerate() {
                 if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
                     break 'chain Some(ExecutionResult {
                         status: crate::ExecutionOutcome::Cancelled,
-                        usage: aggregated_usage.take(),
+                        usage_reports: std::mem::take(&mut usage_reports),
                         route_attempts: std::mem::take(&mut attempts),
                         ..Default::default()
                     });
@@ -441,29 +585,53 @@ impl TaskExecutor for FallbackExecutor {
 
                 let mut candidate_ctx = ctx.clone();
                 candidate_ctx.agent_config = candidate.config.clone();
+                let admission = self
+                    .provider_admissions
+                    .lock()
+                    .expect("provider admission lock poisoned")
+                    .get(&ctx.execution_id)
+                    .cloned();
+                if let Some(admission) = admission {
+                    admission
+                        .before_provider_call(
+                            &candidate_ctx,
+                            &candidate.candidate_key,
+                            attempt_ordinal as u32,
+                        )
+                        .await?;
+                }
                 let attempt = adapter.execute(candidate_ctx).await;
 
                 match attempt {
                     Ok(mut result) => {
-                        absorb(&mut aggregated_usage, &result.usage);
                         let was_cancelled = cancelled.load(std::sync::atomic::Ordering::SeqCst)
                             || result.status == crate::ExecutionOutcome::Cancelled;
+                        let route_outcome = if was_cancelled {
+                            crate::config::RouteAttemptOutcome::Cancelled
+                        } else if result.status == crate::ExecutionOutcome::Completed {
+                            crate::config::RouteAttemptOutcome::Completed
+                        } else {
+                            crate::config::RouteAttemptOutcome::Failed
+                        };
                         attempts.push(crate::config::RouteAttempt {
                             candidate_key: candidate.candidate_key.clone(),
-                            outcome: if was_cancelled {
-                                crate::config::RouteAttemptOutcome::Cancelled
-                            } else if result.status == crate::ExecutionOutcome::Completed {
-                                crate::config::RouteAttemptOutcome::Completed
-                            } else {
-                                crate::config::RouteAttemptOutcome::Failed
-                            },
+                            outcome: route_outcome,
                         });
                         if was_cancelled {
                             result.status = crate::ExecutionOutcome::Cancelled;
                         } else if result.status == crate::ExecutionOutcome::Failed {
                             result.failure_class = Some(crate::ExecutionFailureClass::TaskFailed);
                         }
-                        result.usage = aggregated_usage.take();
+                        let reports = normalize_candidate_reports(
+                            &ctx.execution_id,
+                            candidate,
+                            attempt_ordinal as u32,
+                            result.usage_reports,
+                            route_outcome,
+                            true,
+                        );
+                        usage_reports.extend(reports.iter().cloned());
+                        result.usage_reports = std::mem::take(&mut usage_reports);
                         result.resolved_candidate = Some(crate::ResolvedExecutorCandidate {
                             candidate_key: candidate.candidate_key.clone(),
                             executor_type: candidate.kind.clone(),
@@ -474,20 +642,45 @@ impl TaskExecutor for FallbackExecutor {
                     }
                     Err(error) if error.is_availability() => {
                         let (outcome, retry_after, reason) = match &error {
-                            ExecutorError::UsageExhausted { retry_after, usage } => {
+                            ExecutorError::UsageExhausted {
+                                retry_after,
+                                usage_reports: candidate_reports,
+                            } => {
                                 self.note_exhausted(&candidate.account_key, *retry_after);
-                                absorb(&mut aggregated_usage, usage);
+                                let reports = normalize_candidate_reports(
+                                    &ctx.execution_id,
+                                    candidate,
+                                    attempt_ordinal as u32,
+                                    candidate_reports.clone(),
+                                    crate::config::RouteAttemptOutcome::UsageExhausted,
+                                    true,
+                                );
+                                usage_reports.extend(reports);
                                 (
                                     crate::config::RouteAttemptOutcome::UsageExhausted,
                                     retry_after.unwrap_or(DEFAULT_ACCOUNT_COOLDOWN),
                                     "usage exhausted".to_owned(),
                                 )
                             }
-                            ExecutorError::Unavailable(reason) => (
-                                crate::config::RouteAttemptOutcome::Unavailable,
-                                DEFAULT_ACCOUNT_COOLDOWN,
-                                reason.clone(),
-                            ),
+                            ExecutorError::Unavailable {
+                                reason,
+                                usage_reports: candidate_reports,
+                            } => {
+                                let reports = normalize_candidate_reports(
+                                    &ctx.execution_id,
+                                    candidate,
+                                    attempt_ordinal as u32,
+                                    candidate_reports.clone(),
+                                    crate::config::RouteAttemptOutcome::Unavailable,
+                                    false,
+                                );
+                                usage_reports.extend(reports);
+                                (
+                                    crate::config::RouteAttemptOutcome::Unavailable,
+                                    DEFAULT_ACCOUNT_COOLDOWN,
+                                    reason.clone(),
+                                )
+                            }
                             _ => unreachable!("is_availability covers both variants"),
                         };
                         attempts.push(crate::config::RouteAttempt {
@@ -538,7 +731,7 @@ impl TaskExecutor for FallbackExecutor {
         );
         Ok(Self::unavailable_result(
             attempts,
-            aggregated_usage,
+            usage_reports,
             earliest_retry,
             summary,
         ))
@@ -626,7 +819,7 @@ mod tests {
                 agent_session_id: None,
                 summary: None,
                 error: None,
-                usage: None,
+                usage_reports: Vec::new(),
                 ..Default::default()
             })
         }
@@ -638,6 +831,23 @@ mod tests {
 
     struct CancelTrackingAdapter {
         cancel_calls: Arc<AtomicUsize>,
+    }
+
+    struct RejectingAdmission {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ProviderCallAdmission for RejectingAdmission {
+        async fn before_provider_call(
+            &self,
+            _ctx: &ExecutionContext,
+            _candidate_key: &str,
+            _attempt_ordinal: u32,
+        ) -> Result<(), ExecutorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ExecutorError::Other("durable start failed".to_owned()))
+        }
     }
 
     #[async_trait]
@@ -668,7 +878,7 @@ mod tests {
                 agent_session_id: None,
                 summary: None,
                 error: None,
-                usage: None,
+                usage_reports: Vec::new(),
                 ..Default::default()
             })
         }
@@ -830,16 +1040,21 @@ mod tests {
                 .expect("scripted config has profile")
                 .to_owned();
             self.calls.lock().unwrap().push(profile.clone());
-            let usage = |output_tokens: i64| crate::TokenUsage {
-                output_tokens,
-                ..Default::default()
+            let usage = |output_tokens: i64| {
+                UsageReport::metered(
+                    String::new(),
+                    crate::UsageCounters {
+                        output_tokens: Some(u64::try_from(output_tokens).unwrap()),
+                        ..Default::default()
+                    },
+                )
             };
             match self.behaviors.get(&profile).expect("scripted behavior") {
                 ScriptedBehavior::Complete {
                     usage_output_tokens,
                 } => Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
-                    usage: Some(usage(*usage_output_tokens)),
+                    usage_reports: vec![usage(*usage_output_tokens)],
                     ..Default::default()
                 }),
                 ScriptedBehavior::FailTask => Ok(ExecutionResult {
@@ -852,7 +1067,7 @@ mod tests {
                     usage_output_tokens,
                 } => Err(ExecutorError::UsageExhausted {
                     retry_after: Some(std::time::Duration::from_millis(*retry_after_ms)),
-                    usage: Some(usage(*usage_output_tokens)),
+                    usage_reports: vec![usage(*usage_output_tokens)],
                 }),
                 ScriptedBehavior::AwaitCancel => {
                     self.started.notify_one();
@@ -881,12 +1096,24 @@ mod tests {
             description: "do it".to_owned(),
             agent_config: serde_json::json!({
                 "executor_type": "smith",
-                "config": {"profile": "acct-1"},
+                "config": {
+                    "profile": "acct-1",
+                    "provider": "zai",
+                    "model": "glm-5"
+                },
                 "routing": {
                     "policy": "ordered_fallback_v1",
                     "candidates": [
-                        {"executor_type": "smith", "config": {"profile": "acct-1"}},
-                        {"executor_type": "smith", "config": {"profile": "acct-2"}}
+                        {"executor_type": "smith", "config": {
+                            "profile": "acct-1",
+                            "provider": "zai",
+                            "model": "glm-5"
+                        }},
+                        {"executor_type": "smith", "config": {
+                            "profile": "acct-2",
+                            "provider": "google",
+                            "model": "gemini-3.6-flash"
+                        }}
                     ]
                 }
             }),
@@ -911,7 +1138,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fallback_advances_on_usage_exhaustion_and_aggregates_usage() {
+    async fn fallback_advances_on_usage_exhaustion_and_retains_each_report() {
         let dir = tempfile::tempdir().unwrap();
         let (executor, calls) = fallback_executor(&[
             (
@@ -936,7 +1163,31 @@ mod tests {
 
         assert_eq!(result.status, ExecutionOutcome::Completed);
         assert_eq!(*calls.lock().unwrap(), vec!["acct-1", "acct-2"]);
-        assert_eq!(result.usage.expect("usage aggregated").output_tokens, 15);
+        assert_eq!(result.usage_reports.len(), 2);
+        assert_eq!(result.usage_reports[0].counters.output_tokens, Some(10));
+        assert_eq!(result.usage_reports[1].counters.output_tokens, Some(5));
+        assert_eq!(result.usage_reports[0].provider_id.as_deref(), Some("zai"));
+        assert_eq!(result.usage_reports[0].model_id.as_deref(), Some("glm-5"));
+        assert_eq!(
+            result.usage_reports[1].provider_id.as_deref(),
+            Some("google")
+        );
+        assert_eq!(
+            result.usage_reports[1].model_id.as_deref(),
+            Some("gemini-3.6-flash")
+        );
+        assert_eq!(
+            result.usage_reports[0].outcome,
+            Some(crate::config::RouteAttemptOutcome::UsageExhausted)
+        );
+        assert_eq!(
+            result.usage_reports[1].outcome,
+            Some(crate::config::RouteAttemptOutcome::Completed)
+        );
+        assert_ne!(
+            result.usage_reports[0].candidate_key,
+            result.usage_reports[1].candidate_key
+        );
         let resolved = result.resolved_candidate.expect("winner recorded");
         assert!(resolved.candidate_key.contains("profile=acct-2"));
         let outcomes: Vec<_> = result.route_attempts.iter().map(|a| a.outcome).collect();
@@ -947,6 +1198,30 @@ mod tests {
                 crate::config::RouteAttemptOutcome::Completed
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn failed_provider_call_admission_prevents_adapter_invocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (executor, calls) = fallback_executor(&[(
+            "acct-1",
+            ScriptedBehavior::Complete {
+                usage_output_tokens: 1,
+            },
+        )]);
+        let admission_calls = Arc::new(AtomicUsize::new(0));
+        let result = executor
+            .execute_with_provider_call_admission(
+                routed_ctx("exec-admission-failure", dir.path()),
+                Arc::new(RejectingAdmission {
+                    calls: Arc::clone(&admission_calls),
+                }),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(admission_calls.load(Ordering::SeqCst), 1);
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

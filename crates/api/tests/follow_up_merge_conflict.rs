@@ -265,7 +265,6 @@ impl CodingExecutorAdapter for CompletingCodexAdapter {
                 agent_session_id: Some("merge-follow-up-session".to_owned()),
                 summary: Some("executor completed".to_owned()),
                 error: None,
-                usage: None,
                 ..Default::default()
             })
         })

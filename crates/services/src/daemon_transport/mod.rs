@@ -1,11 +1,15 @@
-use api_types::DAEMON_UNAVAILABLE;
+use api_types::{
+    daemon_protocol_is_compatible, DaemonHandshakeNotification, ExecutionTerminalAckParams,
+    DAEMON_PROTOCOL_INCOMPATIBLE, DAEMON_UNAVAILABLE, METHOD_DAEMON_HANDSHAKE,
+    METHOD_EXECUTION_TERMINAL_ACK,
+};
 use async_trait::async_trait;
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicU8, Ordering},
     Arc, Mutex, MutexGuard, Weak,
 };
 use std::time::Duration;
@@ -34,6 +38,10 @@ pub use router::{select_execution_provider, select_filesystem_provider};
 pub const DAEMON_OUTBOUND_BUFFER: usize = 256;
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
+const PROTOCOL_UNKNOWN: u8 = 0;
+const PROTOCOL_COMPATIBLE: u8 = 1;
+const PROTOCOL_INCOMPATIBLE: u8 = 2;
+
 /// Stable owner token for one authenticated daemon socket incarnation.  The
 /// durable daemon id identifies the registered machine; the connection id
 /// prevents a delayed frame from an old socket from renewing or terminalizing
@@ -44,6 +52,16 @@ pub fn execution_lease_owner(daemon_id: &str, connection_id: u64) -> String {
 
 pub type PendingResponse = oneshot::Sender<Result<Value, api_types::DaemonErrorPayload>>;
 pub type PendingRequests = HashMap<String, PendingResponse>;
+
+/// Result of handling a terminal notification. The registry sends the daemon
+/// acknowledgement only for a durable success; conflicts deliberately leave
+/// the daemon's retained record in place for operator/recovery handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonTerminalDisposition {
+    Acknowledge,
+    Conflict,
+    Ignore,
+}
 
 #[async_trait]
 pub trait DaemonExecutionEventHandler: Send + Sync {
@@ -72,6 +90,30 @@ pub trait DaemonExecutionEventHandler: Send + Sync {
         connection_id: u64,
         notification: api_types::ExecutionTerminalNotification,
     ) -> Result<(), ServiceError>;
+
+    /// Handle a terminal notification and report whether the registry may
+    /// delete the daemon's durable copy. A durable sink must return
+    /// `Acknowledge` only after the terminal state, invocation settlement,
+    /// usage reports, and its `(terminal_report_id, payload_digest)` receipt
+    /// are committed together. It must return `Acknowledge` for an exact
+    /// replay found in that durable receipt (including after a server restart),
+    /// `Conflict` for a reused identity with a different payload, and
+    /// `Ignore` only for an unknown late report that has no durable receipt.
+    /// Existing handlers keep the narrower method above; durable sinks
+    /// override this contract to distinguish these outcomes.
+    async fn handle_terminal_with_ack(
+        &self,
+        daemon_id: &str,
+        connection_id: u64,
+        notification: api_types::ExecutionTerminalNotification,
+    ) -> Result<DaemonTerminalDisposition, ServiceError> {
+        self.handle_terminal(daemon_id, connection_id, notification)
+            .await?;
+        // A legacy handler that only implements `handle_terminal` has not
+        // demonstrated a durable terminal receipt, so the daemon must retain
+        // its report for a later durable sink/recovery pass.
+        Ok(DaemonTerminalDisposition::Ignore)
+    }
 }
 
 #[async_trait]
@@ -110,6 +152,7 @@ pub struct DaemonConnection {
     pub pending: Arc<Mutex<PendingRequests>>,
     stale_tx: watch::Sender<bool>,
     stale_rx: watch::Receiver<bool>,
+    protocol_state: Arc<AtomicU8>,
 }
 
 impl DaemonConnection {
@@ -124,6 +167,7 @@ impl DaemonConnection {
                 pending: Arc::new(Mutex::new(HashMap::new())),
                 stale_tx,
                 stale_rx,
+                protocol_state: Arc::new(AtomicU8::new(PROTOCOL_UNKNOWN)),
             },
             receiver,
         )
@@ -143,6 +187,29 @@ impl DaemonConnection {
 
     pub fn is_stale(&self) -> bool {
         *self.stale_rx.borrow()
+    }
+
+    pub fn protocol_known(&self) -> bool {
+        self.protocol_state.load(Ordering::Acquire) != PROTOCOL_UNKNOWN
+    }
+
+    pub fn protocol_compatible(&self) -> bool {
+        self.protocol_state.load(Ordering::Acquire) == PROTOCOL_COMPATIBLE
+    }
+
+    pub fn protocol_allows_dispatch(&self) -> bool {
+        self.protocol_compatible()
+    }
+
+    fn set_protocol_compatibility(&self, compatible: bool) {
+        self.protocol_state.store(
+            if compatible {
+                PROTOCOL_COMPATIBLE
+            } else {
+                PROTOCOL_INCOMPATIBLE
+            },
+            Ordering::Release,
+        );
     }
 }
 
@@ -277,6 +344,19 @@ impl DaemonConnectionRegistry {
             .is_some_and(|connection| connection.id() == connection_id && !connection.is_stale())
     }
 
+    fn ensure_protocol_dispatchable(
+        &self,
+        daemon_id: &str,
+        connection: &DaemonConnection,
+    ) -> Result<(), ServiceError> {
+        if connection.protocol_allows_dispatch() {
+            return Ok(());
+        }
+        Err(ServiceError::invalid_operation(format!(
+            "{DAEMON_PROTOCOL_INCOMPATIBLE}: daemon {daemon_id} does not support the required command protocol"
+        )))
+    }
+
     pub async fn send_request<P, R>(
         &self,
         daemon_id: &str,
@@ -337,12 +417,20 @@ impl DaemonConnectionRegistry {
             .ok_or_else(|| ServiceError::DaemonUnavailable {
                 daemon_id: daemon_id.to_owned(),
             })?;
+        self.ensure_protocol_dispatchable(daemon_id, &connection)?;
         let request_id = Uuid::new_v4().to_string();
         let params = serde_json::to_value(params).map_err(|error| {
             ServiceError::invalid_operation(format!("invalid daemon request params: {error}"))
         })?;
         let (sender, receiver) = oneshot::channel();
         lock(&connection.pending).insert(request_id.clone(), sender);
+
+        if !connection.protocol_allows_dispatch() {
+            lock(&connection.pending).remove(&request_id);
+            return Err(ServiceError::invalid_operation(format!(
+                "{DAEMON_PROTOCOL_INCOMPATIBLE}: daemon {daemon_id} does not support the required command protocol"
+            )));
+        }
 
         let frame = api_types::DaemonFrame::Request {
             id: request_id.clone(),
@@ -401,6 +489,7 @@ impl DaemonConnectionRegistry {
             .ok_or_else(|| ServiceError::DaemonUnavailable {
                 daemon_id: daemon_id.to_owned(),
             })?;
+        self.ensure_protocol_dispatchable(daemon_id, &connection)?;
         let request_id = Uuid::new_v4().to_string();
         let params = serde_json::to_value(params).map_err(|error| {
             ServiceError::invalid_operation(format!("invalid daemon request params: {error}"))
@@ -411,8 +500,13 @@ impl DaemonConnectionRegistry {
         // The connection can be replaced after the lookup above.  Do not
         // leave a request registered on a stale incarnation, and never route
         // it through a replacement socket.
-        if !self.is_current(daemon_id, connection_id) {
+        if !self.is_current(daemon_id, connection_id) || !connection.protocol_allows_dispatch() {
             lock(&connection.pending).remove(&request_id);
+            if !connection.protocol_allows_dispatch() {
+                return Err(ServiceError::invalid_operation(format!(
+                    "{DAEMON_PROTOCOL_INCOMPATIBLE}: daemon {daemon_id} does not support the required command protocol"
+                )));
+            }
             return Err(ServiceError::DaemonUnavailable {
                 daemon_id: daemon_id.to_owned(),
             });
@@ -562,6 +656,11 @@ impl DaemonConnectionRegistry {
         method: String,
         params: Value,
     ) {
+        if method == METHOD_DAEMON_HANDSHAKE {
+            self.dispatch_handshake(daemon_id, connection_id, params);
+            return;
+        }
+
         match method.as_str() {
             api_types::METHOD_EXECUTION_LOG => {
                 let Some(handler) = lock(&self.inner.execution_events).clone() else {
@@ -604,16 +703,61 @@ impl DaemonConnectionRegistry {
                 };
                 match serde_json::from_value::<api_types::ExecutionTerminalNotification>(params) {
                     Ok(notification) => {
+                        let registry = self.clone();
                         let daemon_id = daemon_id.to_owned();
                         tokio::spawn(async move {
-                            if let Err(error) = handler
-                                .handle_terminal(&daemon_id, connection_id, notification)
+                            match handler
+                                .handle_terminal_with_ack(
+                                    &daemon_id,
+                                    connection_id,
+                                    notification.clone(),
+                                )
                                 .await
                             {
-                                tracing::warn!(
-                                    %error,
-                                    "failed to handle daemon execution terminal notification"
-                                );
+                                Ok(DaemonTerminalDisposition::Acknowledge) => {
+                                    let params = ExecutionTerminalAckParams {
+                                        terminal_report_id: notification.terminal_report_id,
+                                        execution_id: notification.execution_id,
+                                    };
+                                    if let Err(error) = registry
+                                        .send_request_with_timeout_for_connection::<
+                                            _,
+                                            api_types::ExecutionTerminalAckResult,
+                                        >(
+                                            &daemon_id,
+                                            connection_id,
+                                            METHOD_EXECUTION_TERMINAL_ACK,
+                                            params,
+                                            Duration::from_secs(
+                                                api_types::DEFAULT_DAEMON_COMMAND_TIMEOUT_SECS,
+                                            ),
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            %error,
+                                            daemon_id = %daemon_id,
+                                            connection_id,
+                                            "failed to acknowledge daemon execution terminal notification"
+                                        );
+                                    }
+                                }
+                                Ok(DaemonTerminalDisposition::Conflict) => {
+                                    tracing::warn!(
+                                        daemon_id = %daemon_id,
+                                        connection_id,
+                                        "daemon execution terminal notification conflicts with a durable report"
+                                    );
+                                }
+                                Ok(DaemonTerminalDisposition::Ignore) => {}
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %error,
+                                        daemon_id = %daemon_id,
+                                        connection_id,
+                                        "failed to handle daemon execution terminal notification"
+                                    );
+                                }
                             }
                         });
                     }
@@ -700,6 +844,72 @@ impl DaemonConnectionRegistry {
                 );
             }
         }
+    }
+
+    fn dispatch_handshake(&self, daemon_id: &str, connection_id: u64, params: Value) {
+        let Some(connection) = self
+            .get(daemon_id)
+            .filter(|connection| connection.id() == connection_id)
+        else {
+            tracing::debug!(
+                daemon_id,
+                connection_id,
+                "dropping handshake from stale daemon"
+            );
+            return;
+        };
+
+        match serde_json::from_value::<DaemonHandshakeNotification>(params) {
+            Ok(handshake) => {
+                let compatible = daemon_protocol_is_compatible(
+                    handshake.protocol_revision,
+                    &handshake.capabilities,
+                );
+                connection.set_protocol_compatibility(compatible);
+                if compatible {
+                    tracing::debug!(
+                        daemon_id,
+                        connection_id,
+                        protocol_revision = handshake.protocol_revision,
+                        "accepted daemon command protocol"
+                    );
+                } else {
+                    self.reject_incompatible_protocol(&connection, daemon_id, connection_id);
+                }
+            }
+            Err(error) => {
+                connection.set_protocol_compatibility(false);
+                tracing::warn!(
+                    daemon_id,
+                    connection_id,
+                    %error,
+                    "rejecting malformed daemon protocol handshake"
+                );
+                self.reject_incompatible_protocol(&connection, daemon_id, connection_id);
+            }
+        }
+    }
+
+    fn reject_incompatible_protocol(
+        &self,
+        connection: &DaemonConnection,
+        daemon_id: &str,
+        connection_id: u64,
+    ) {
+        let _ = connection.outbound.try_send(api_types::DaemonFrame::Error {
+            id: None,
+            error: api_types::DaemonErrorPayload {
+                code: DAEMON_PROTOCOL_INCOMPATIBLE.to_owned(),
+                message: "daemon does not advertise the required command protocol".to_owned(),
+                details: None,
+            },
+        });
+        connection.mark_stale();
+        tracing::warn!(
+            daemon_id,
+            connection_id,
+            "daemon command connection rejected for incompatible protocol"
+        );
     }
 }
 

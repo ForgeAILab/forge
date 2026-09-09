@@ -288,6 +288,123 @@ from the `Agents` tab. Re-enable the same row to restore it; configuration,
 credentials, bindings, and history are preserved. Forge considers only enabled,
 healthy sources when selecting Main, Project, Worker, or reviewer Agents.
 
+## Configuring provider pricing and usage estimates
+
+Connecting a provider does not imply a price. Forge keeps pricing separate from
+the provider entry's quota/rate-limit `Usage` view and uses the fixed public
+models.dev catalog only as an estimate input. Catalog refresh is explicit and
+server-side; startup, execution, chat, and inquiry admission do not require
+network access.
+
+Check the active catalog before configuring a rate:
+
+```bash
+curl -sS "$FORGE_URL/api/v1/providers/pricing-catalog/status" | jq
+```
+
+An authorized refresh is conditional and idempotent:
+
+```bash
+curl -sS -X POST "$FORGE_URL/api/v1/providers/pricing-catalog/refresh" \
+  -H 'content-type: application/json' \
+  -d '{"idempotency_key":"pricing-refresh-1"}'
+```
+
+The status is `absent`, `fresh`, `stale`, or `refresh_failed`. Freshness is
+based on the last successful check and the initial stale interval is seven
+days. A failed refresh keeps the last-known-good snapshot active and eligible
+for estimates, while exposing the stale/failed state and bounded error. It
+does not block agent execution. The catalog rows preserve exact
+models.dev `provider_id`/`model_id` keys; use
+`GET /api/v1/providers/pricing-catalog/models` with its opaque `cursor`,
+`limit`, exact `provider_id`, and literal `query` filters when inspecting them.
+
+Configure pricing for a provider entry with
+`GET`/`PUT /api/v1/providers/{id}/pricing`. A `PUT` replaces the complete
+desired binding set and must include the current `expected_version`, a stable
+`idempotency_key`, and the subject revision digest. For example, an exact
+catalog binding looks like:
+
+```json
+{
+  "expected_version": 0,
+  "idempotency_key": "pricing-openai-1",
+  "subject_revision_digest": "sha256:provider-entry-revision",
+  "bindings": [
+    {
+      "runtime_model": "gpt-5.6-terra",
+      "source_kind": "models_dev_catalog",
+      "catalog_provider_id": "openai",
+      "catalog_model_id": "gpt-5.6-terra",
+      "catalog_rate_revision_id": "rate-revision-uuid",
+      "manual_rates": null
+    }
+  ]
+}
+```
+
+For a manual override, set `source_kind` to `manual_override`, leave the
+catalog identifiers null, and provide non-negative USD `manual_rates` for the
+input, output, cache-read, and cache-write buckets (each per one million
+tokens). Money and rates are decimal strings, not floating-point numbers. A
+manual override wins over an exact catalog binding. Every edit creates an
+immutable rate revision; removing an override affects future admissions only.
+Stale writes return `409` rather than merging drafts.
+
+Bindings are exact. Forge does not fuzzy-match a custom model name, infer a
+family price, strip a relay prefix, or guess a relationship from an endpoint.
+Only reviewed direct mappings for OpenAI Platform (`openai`), xAI (`xai`), the
+Gemini API (`google`), and canonical OpenRouter (`openrouter`) are automatic.
+ChatGPT subscription OAuth, `openai_compatible`, custom base URLs, Smith, and
+all discovered CLI runtimes require an explicit exact binding. Public API list
+prices may not match a subscription plan or private provider contract, and
+Forge does not present them as an invoice or billed amount.
+
+Some providers also charge different cache-write prices for different cache
+TTLs or service modes. This revision records the four token buckets Forge can
+measure independently, but it does not infer a TTL-specific price that the
+runtime did not report. Use a manual exact binding when the public catalog row
+does not describe the runtime's billing mode, and continue to treat the result
+as an estimate rather than an invoice.
+
+Discovered CLI runtimes use the equivalent exact routes
+`GET`/`PUT /api/v1/providers/cli-runtimes/{daemon_id}/{executor_type}/pricing`.
+The runtime model identifier is sent in the request body, so model IDs that
+contain `/` remain valid. A provider/model identity mismatch reported by a
+runtime is recorded as unpriced rather than charged against the wrong rate.
+
+Usage and cost reports distinguish provider-reported amounts from Forge
+estimates and show `complete`, `partial`, `pending`, `unavailable`, or
+`no_usage` coverage. Missing telemetry or a missing rate is unknown, not free;
+all-null money never renders as `$0.00`. Only an explicit complete zero is
+known `$0.00`. Per-message and per-inquiry monetary display is not part of this
+revision.
+
+Use the CLI projections for the same account/Project views:
+
+```bash
+forge-ctl project analytics <project-id> \
+  --from '2026-09-01T00:00:00-04:00' \
+  --to '2026-10-01T00:00:00-04:00'
+forge-ctl analytics usage \
+  --from '2026-09-01T00:00:00-04:00' \
+  --to '2026-10-01T00:00:00-04:00'
+```
+
+Windows are half-open `[from, to)` and use immutable occurrence timestamps.
+Task attempts use their terminal/usage occurrence, Chat uses assistant-turn
+completion, inquiries use inquiry completion, and retrospective estimates use
+the original event time rather than the backfill time. The CLI URL-encodes
+RFC3339 offsets; it does not calculate money locally.
+
+For historical legacy usage, use the authorized Project
+`cost-estimation-previews` route to inspect exact eligible/unmatched events for
+one immutable snapshot, then commit that preview through
+`cost-estimation-runs`. Catalog refresh never backfills history, only exact
+provider/model matches are eligible, and provider-reported rows are never
+overwritten. The preview digest must still match at commit; otherwise create a
+new preview.
+
 ## Main Chat and the Project Agent Workspace
 
 The approved product model has one global Main Agent binding/chat per account
@@ -657,6 +774,15 @@ remain in place; migration does not move or duplicate files or claim an on-disk
 layout break. If a migration or server restart fails, old media references and
 bytes remain usable and physical cleanup is retried separately after checking
 attachments and release pins.
+
+The provider-rate-card cutover is also data-preserving. V135 copies each legacy
+execution-usage row into a `legacy_execution_aggregate` event without trying to
+decompose historical fallback hops. Structurally valid legacy Project/Main/
+Genesis chat counters and account-scoped inquiry counters retain their original
+occurrence timestamps; unverifiable provider, model, profile, or rate fields
+remain unknown. Catalog refresh never rewrites these rows. Use the explicit
+Project retrospective preview/commit flow above when an exact immutable
+snapshot can price eligible legacy events.
 
 ## Using `forge-ctl`
 

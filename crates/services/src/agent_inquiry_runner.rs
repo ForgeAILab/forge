@@ -19,8 +19,9 @@ use std::{
 
 use async_trait::async_trait;
 use db::{
-    new_uuid_v4, AgentInquiry, AgentInquiryRepo, AgentInquiryStatus, AgentProfileRepo,
-    CompleteAgentInquiry, CreateAgentInquiry, CredentialHandleRepo, SqliteDb,
+    new_uuid_v4, AgentInquiry, AgentInquiryRepo, AgentInquiryStatus, AgentProfile,
+    AgentProfileRepo, AgentSession, CompleteAgentInquiry, CreateAgentInquiry, CredentialHandleRepo,
+    SqliteDb,
 };
 use forge_agent_host::{
     AgentSessionBackend, AgentTurnRequest, CanonicalScope, CanonicalScopeType,
@@ -119,6 +120,10 @@ pub struct EmbeddedInquiryRunner {
     /// Live runs, so a cancel from the REST surface can reach the turn that
     /// is actually talking to the provider.
     active: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    /// Provider reports observed by this process, including reports carried
+    /// by a runtime failure. The terminal CAS drains this side channel only
+    /// after it has won the race with cancellation.
+    observed_usage: Arc<Mutex<HashMap<String, Vec<executors::UsageReport>>>>,
     /// Inquiries write the same Forge JSONL activity log an Agent Chat turn
     /// writes, keyed by inquiry id, so one log reader and one renderer serve
     /// both and a sub-agent's work is watchable while it runs.
@@ -144,6 +149,7 @@ impl EmbeddedInquiryRunner {
             embedded_agents,
             account_locks: Arc::new(Mutex::new(HashMap::new())),
             active: Arc::new(Mutex::new(HashMap::new())),
+            observed_usage: Arc::new(Mutex::new(HashMap::new())),
             turn_logs,
         }
     }
@@ -161,6 +167,26 @@ impl EmbeddedInquiryRunner {
                 .entry(account_id.to_owned())
                 .or_insert_with(|| Arc::new(Mutex::new(()))),
         )
+    }
+
+    async fn remember_usage(&self, inquiry_id: &str, reports: Vec<executors::UsageReport>) {
+        if reports.is_empty() {
+            return;
+        }
+        self.observed_usage
+            .lock()
+            .await
+            .entry(inquiry_id.to_owned())
+            .or_default()
+            .extend(reports);
+    }
+
+    async fn take_usage(&self, inquiry_id: &str) -> Vec<executors::UsageReport> {
+        self.observed_usage
+            .lock()
+            .await
+            .remove(inquiry_id)
+            .unwrap_or_default()
     }
 
     /// The sub-agent's entire brief. It does not see the calling
@@ -206,6 +232,7 @@ Your inquiry id is {inquiry_id}."
 
     /// Run the nested turn. Split out so every failure path can still close
     /// the visible run record rather than leaving it stuck on `running`.
+    #[allow(clippy::too_many_arguments)]
     async fn run_turn(
         &self,
         request: &InquiryRequest,
@@ -213,6 +240,8 @@ Your inquiry id is {inquiry_id}."
         findings_relative_path: &str,
         cancellation: CancellationToken,
         sink: Arc<TurnLogSink>,
+        session: AgentSession,
+        profile: AgentProfile,
     ) -> Result<forge_agent_host::AgentTurnOutput> {
         if cancellation.is_cancelled() {
             return Err(ServiceError::invalid_operation(
@@ -220,16 +249,21 @@ Your inquiry id is {inquiry_id}."
             ));
         }
         let embedded_agents = self.embedded_agents()?;
-        let session = embedded_agents
-            .create_inquiry_session(&request.account_id, &request.identity_id)
-            .await?;
         let runtime_session_id = session
             .runtime_session_id
             .clone()
             .ok_or_else(|| ServiceError::invalid_operation("inquiry session has no runtime id"))?;
-        let profile = AgentProfileRepo::get_profile(&*self.db, &session.profile_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("agent_profile", session.profile_id.clone()))?;
+        if session.identity_id != request.identity_id || profile.identity_id != request.identity_id
+        {
+            return Err(ServiceError::invalid_operation(
+                "inquiry session/profile does not match its identity",
+            ));
+        }
+        if session.profile_id != profile.id {
+            return Err(ServiceError::invalid_operation(
+                "inquiry session/profile snapshot disagrees",
+            ));
+        }
         let credential_ref = profile
             .credential_ref
             .as_deref()
@@ -258,6 +292,8 @@ Your inquiry id is {inquiry_id}."
             );
 
         let turn_cancellation = cancellation.child_token();
+        let provider_id = provider.clone();
+        let model_id = model.clone();
         let turn = AgentTurnRequest {
             forge_session_id: session.id.clone(),
             runtime_session_id,
@@ -301,12 +337,93 @@ Your inquiry id is {inquiry_id}."
         };
 
         let backend = embedded_agents.native_backend();
-        await_inquiry_turn(
-            backend.run_turn(turn, sink),
+        let observed_usage = Arc::clone(&self.observed_usage);
+        let inquiry_id_for_reports = inquiry_id.to_owned();
+        let output = await_inquiry_turn(
+            async move {
+                match backend.run_turn(turn, sink).await {
+                    Ok(output) => Ok(output),
+                    Err(forge_agent_host::AgentHostError::RuntimeWithUsage {
+                        message,
+                        usage_reports,
+                    }) => {
+                        let mapped = usage_reports
+                            .iter()
+                            .enumerate()
+                            .map(|(sequence, report)| {
+                                let sequence = u32::try_from(sequence).map_err(|_| {
+                                    ServiceError::invalid_operation(
+                                        "usage report sequence overflows",
+                                    )
+                                });
+                                sequence.and_then(|sequence| {
+                                    crate::chat_usage::usage_report_from_host(
+                                        report, "chat", 0, sequence,
+                                    )
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>();
+                        if let Ok(mapped) = mapped {
+                            if !mapped.is_empty() {
+                                observed_usage
+                                    .lock()
+                                    .await
+                                    .entry(inquiry_id_for_reports)
+                                    .or_default()
+                                    .extend(mapped);
+                            }
+                        }
+                        Err(forge_agent_host::AgentHostError::Runtime(message))
+                    }
+                    Err(error) => Err(error),
+                }
+            },
             turn_cancellation,
             INQUIRY_TIMEOUT,
         )
-        .await
+        .await?;
+        let mut reports = output
+            .usage_reports
+            .iter()
+            .enumerate()
+            .map(|(sequence, report)| {
+                crate::chat_usage::usage_report_from_host(
+                    report,
+                    "chat",
+                    0,
+                    u32::try_from(sequence).map_err(|_| {
+                        ServiceError::invalid_operation("usage report sequence overflows")
+                    })?,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if reports.is_empty()
+            && output.telemetry_state == forge_agent_host::AgentTurnTelemetryState::Metered
+        {
+            reports.push(executors::UsageReport {
+                report_id: format!("{inquiry_id}:native"),
+                request_id: None,
+                report_sequence: 0,
+                candidate_key: Some("chat".to_owned()),
+                attempt_ordinal: 0,
+                provider_id: Some(provider_id),
+                model_id: Some(model_id),
+                counters: executors::UsageCounters {
+                    input_tokens: Some(output.input_tokens),
+                    output_tokens: Some(output.output_tokens),
+                    cache_read_tokens: Some(output.cache_read_tokens),
+                    cache_write_tokens: Some(output.cache_write_tokens),
+                },
+                telemetry_state: executors::UsageTelemetryState::Metered,
+                context_tokens: None,
+                selected_tier: None,
+                reported_cost_usd: None,
+                outcome: None,
+                partial: false,
+            });
+        }
+        self.remember_usage(inquiry_id, reports).await;
+        Ok(output)
     }
 }
 
@@ -414,17 +531,110 @@ impl EmbeddedInquiryRunner {
             None,
         ));
 
+        // Freeze the pricing subject/selection and durably start the one
+        // inquiry invocation before the backend can make a provider call.
+        // Admission failures never reach the provider and are terminalized
+        // through the same transaction boundary with an empty settlement.
         let started = std::time::Instant::now();
-        let result = self
-            .run_turn(
-                &request,
-                &inquiry_id,
-                &findings_relative_path,
-                run_token.clone(),
-                sink,
-            )
-            .await;
-        let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+        let admission: Result<(db::UsageInvocation, AgentSession, AgentProfile)> = if run_token
+            .is_cancelled()
+        {
+            Err(ServiceError::invalid_operation(
+                "inquiry cancelled before provider admission",
+            ))
+        } else {
+            let embedded_agents = self.embedded_agents();
+            match embedded_agents {
+                Err(error) => Err(error),
+                Ok(embedded_agents) => {
+                    let session = embedded_agents
+                        .create_inquiry_session(&request.account_id, &request.identity_id)
+                        .await;
+                    match session {
+                        Err(error) => Err(error),
+                        Ok(session) => {
+                            let profile =
+                                match AgentProfileRepo::get_profile(&*self.db, &session.profile_id)
+                                    .await
+                                {
+                                    Ok(Some(profile)) => Ok(profile),
+                                    Ok(None) => Err(ServiceError::not_found(
+                                        "agent_profile",
+                                        session.profile_id.clone(),
+                                    )),
+                                    Err(error) => Err(error.into()),
+                                };
+                            match profile {
+                                Err(error) => Err(error),
+                                Ok(profile) => {
+                                    if profile.identity_id != request.identity_id {
+                                        Err(ServiceError::invalid_operation(
+                                            "inquiry profile does not match its identity",
+                                        ))
+                                    } else {
+                                        crate::chat_usage::admit_inquiry_usage(
+                                            &self.db, &record, &profile,
+                                        )
+                                        .await
+                                        .map(|invocation| (invocation, session, profile))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        let (result, observed_reports) = match admission {
+            Ok((_, session, profile)) => {
+                let result = self
+                    .run_turn(
+                        &request,
+                        &inquiry_id,
+                        &findings_relative_path,
+                        run_token.clone(),
+                        sink,
+                        session,
+                        profile,
+                    )
+                    .await;
+                let observed_reports = self.take_usage(&inquiry_id).await;
+                (result, observed_reports)
+            }
+            Err(error) => (Err(error), Vec::new()),
+        };
+        let duration_ms = i64::try_from(started.elapsed().as_millis()).map_err(|_| {
+            ServiceError::invalid_operation("inquiry duration overflows the persisted range")
+        })?;
+        let settlement_now = db::now_rfc3339();
+        let settlements = match crate::chat_usage::build_chat_usage_settlements(
+            &self.db,
+            &record.id,
+            &observed_reports,
+            &settlement_now,
+        )
+        .await
+        {
+            Ok(settlements) => settlements,
+            Err(error) => {
+                let cancelled = AgentInquiryRepo::get_agent_inquiry(&*self.db, &record.id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.status == AgentInquiryStatus::Cancelled);
+                if cancelled && !observed_reports.is_empty() {
+                    let _ = crate::chat_usage::settle_late_chat_usage(
+                        &self.db,
+                        &record.id,
+                        &observed_reports,
+                        &settlement_now,
+                    )
+                    .await;
+                }
+                self.active.lock().await.remove(&inquiry_id);
+                return Err(error);
+            }
+        };
         let outcome = async {
             match result {
                 Ok(output) => {
@@ -436,7 +646,7 @@ impl EmbeddedInquiryRunner {
                         .join(FINDINGS_FILENAME)
                         .is_file()
                         .then(|| findings_relative_path.clone());
-                    let completed = complete(
+                    let completed = complete_with_usage(
                         &self.db,
                         &record,
                         AgentInquiryStatus::Succeeded,
@@ -445,6 +655,8 @@ impl EmbeddedInquiryRunner {
                         None,
                         &output,
                         duration_ms,
+                        settlements.clone(),
+                        &observed_reports,
                     )
                     .await?;
                     Ok(inquiry_outcome(completed))
@@ -458,7 +670,7 @@ impl EmbeddedInquiryRunner {
                     let message = error.to_string();
                     // Close the visible record even on the failure path, so a
                     // run never sits on `running` forever.
-                    let completed = complete_or_cancelled(
+                    let completed = complete_or_cancelled_with_usage(
                         &self.db,
                         CompleteAgentInquiry {
                             id: record.id.clone(),
@@ -473,6 +685,8 @@ impl EmbeddedInquiryRunner {
                             cache_write_tokens: 0,
                             duration_ms: Some(duration_ms),
                         },
+                        settlements.clone(),
+                        &observed_reports,
                     )
                     .await?;
                     Ok(inquiry_outcome(completed))
@@ -525,7 +739,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn complete(
+async fn complete_with_usage(
     db: &SqliteDb,
     record: &AgentInquiry,
     status: AgentInquiryStatus,
@@ -534,8 +748,10 @@ async fn complete(
     error: Option<String>,
     output: &forge_agent_host::AgentTurnOutput,
     duration_ms: i64,
+    settlements: Vec<db::UsageLedgerSettlement>,
+    reports: &[executors::UsageReport],
 ) -> Result<AgentInquiry> {
-    complete_or_cancelled(
+    complete_or_cancelled_with_usage(
         db,
         CompleteAgentInquiry {
             id: record.id.clone(),
@@ -544,27 +760,78 @@ async fn complete(
             findings,
             findings_path,
             error,
-            // The four counters stay disjoint all the way through: context
-            // size is input + cache_read + cache_write, and collapsing them
-            // here would silently under-report what an inquiry cost.
-            input_tokens: i64::try_from(output.input_tokens).unwrap_or(i64::MAX),
-            output_tokens: i64::try_from(output.output_tokens).unwrap_or(i64::MAX),
-            cache_read_tokens: i64::try_from(output.cache_read_tokens).unwrap_or(i64::MAX),
-            cache_write_tokens: i64::try_from(output.cache_write_tokens).unwrap_or(i64::MAX),
+            input_tokens: i64::try_from(output.input_tokens).map_err(|_| {
+                ServiceError::invalid_operation(
+                    "inquiry input token count overflows the persisted range",
+                )
+            })?,
+            output_tokens: i64::try_from(output.output_tokens).map_err(|_| {
+                ServiceError::invalid_operation(
+                    "inquiry output token count overflows the persisted range",
+                )
+            })?,
+            cache_read_tokens: i64::try_from(output.cache_read_tokens).map_err(|_| {
+                ServiceError::invalid_operation(
+                    "inquiry cache-read token count overflows the persisted range",
+                )
+            })?,
+            cache_write_tokens: i64::try_from(output.cache_write_tokens).map_err(|_| {
+                ServiceError::invalid_operation(
+                    "inquiry cache-write token count overflows the persisted range",
+                )
+            })?,
             duration_ms: Some(duration_ms),
         },
+        settlements,
+        reports,
     )
     .await
 }
 
-async fn complete_or_cancelled(db: &SqliteDb, input: CompleteAgentInquiry) -> Result<AgentInquiry> {
+async fn complete_or_cancelled_with_usage(
+    db: &SqliteDb,
+    input: CompleteAgentInquiry,
+    settlements: Vec<db::UsageLedgerSettlement>,
+    reports: &[executors::UsageReport],
+) -> Result<AgentInquiry> {
     let id = input.id.clone();
-    match AgentInquiryRepo::complete_agent_inquiry(db, input).await {
-        Ok(record) => Ok(record),
+    match AgentInquiryRepo::complete_agent_inquiry_with_usage(
+        db,
+        db::CompleteAgentInquiryWithUsage {
+            terminal: input,
+            settlements,
+        },
+    )
+    .await
+    {
+        Ok(record) => {
+            // Cancellation is the visible-state authority.  The SQLite
+            // composite deliberately leaves a provider invocation in
+            // `pending_settlement` when that state has already won; drain
+            // reports only after the domain CAS, including the branch where
+            // this completion arrived with an already-cancelled terminal
+            // payload rather than a VersionConflict.
+            if record.status == AgentInquiryStatus::Cancelled && !reports.is_empty() {
+                crate::chat_usage::settle_late_chat_usage(db, &id, reports, &db::now_rfc3339())
+                    .await?;
+            }
+            Ok(record)
+        }
         Err(db::DbError::VersionConflict) => {
             let current = AgentInquiryRepo::get_agent_inquiry(db, &id).await?;
             match current {
-                Some(record) if record.status == AgentInquiryStatus::Cancelled => Ok(record),
+                Some(record) if record.status == AgentInquiryStatus::Cancelled => {
+                    if !reports.is_empty() {
+                        crate::chat_usage::settle_late_chat_usage(
+                            db,
+                            &id,
+                            reports,
+                            &db::now_rfc3339(),
+                        )
+                        .await?;
+                    }
+                    Ok(record)
+                }
                 _ => Err(db::DbError::VersionConflict.into()),
             }
         }
@@ -659,6 +926,138 @@ mod tests {
         (db, record)
     }
 
+    #[tokio::test]
+    async fn forged_cross_account_inquiry_fails_before_provider_and_usage_admission() {
+        let pool = db::create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("in-memory pool");
+        db::run_migrations(&pool).await.expect("migrations apply");
+        let db = Arc::new(SqliteDb::new(pool));
+        let now = db::now_rfc3339();
+        for (id, email) in [
+            ("inquiry-owner", "inquiry-owner@example.test"),
+            ("agent-owner", "agent-owner@example.test"),
+        ] {
+            db::UserRepo::create_user(
+                &*db,
+                &db::User {
+                    id: id.to_owned(),
+                    email: email.to_owned(),
+                    password_hash: "test".to_owned(),
+                    display_name: None,
+                    is_admin: false,
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .await
+            .expect("test user");
+        }
+
+        db::AgentRepo::create_identity_with_profile(
+            &*db,
+            db::CreateAgentIdentity {
+                id: "forged-inquiry-agent".to_owned(),
+                name: "Forged Inquiry Agent".to_owned(),
+                description: None,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: db::AgentStatus::Idle,
+                last_heartbeat_at: None,
+                is_default: false,
+                paused: false,
+                owner_id: Some("agent-owner".to_owned()),
+                visibility: "account".to_owned(),
+                account_permission_ceiling: "{}".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            db::CreateAgentProfile {
+                id: "forged-inquiry-profile".to_owned(),
+                identity_id: "forged-inquiry-agent".to_owned(),
+                backend_kind: "native".to_owned(),
+                executor_type: "embedded".to_owned(),
+                provider: Some("openai".to_owned()),
+                model: Some("test-model".to_owned()),
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "[]".to_owned(),
+                tool_policy_json: "{}".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: None,
+                daemon_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("test agent");
+
+        let chat = db::AgentChatRepo::get_main_chat(&*db, "inquiry-owner")
+            .await
+            .expect("test chat lookup")
+            .expect("test Main Chat");
+        let workspace_root = std::env::temp_dir().join(format!("forge-inquiry-{}", new_uuid_v4()));
+        let embedded_agents = Arc::new(EmbeddedAgentService::new(Arc::clone(&db), b"test-key"));
+        embedded_agents.set_workspace_root(workspace_root.clone(), workspace_root.clone());
+        let runner = EmbeddedInquiryRunner::new(
+            Arc::clone(&db),
+            Arc::downgrade(&embedded_agents),
+            AgentChatTurnLogRoot::new(workspace_root.join("logs")),
+        );
+
+        let outcome = runner
+            .dispatch(
+                InquiryRequest {
+                    chat_id: chat.id,
+                    turn_job_id: None,
+                    identity_id: "forged-inquiry-agent".to_owned(),
+                    account_id: "inquiry-owner".to_owned(),
+                    title: "Cross-account inquiry".to_owned(),
+                    question: "This must never reach the provider".to_owned(),
+                    context: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("admission failure is terminalized as an inquiry outcome");
+
+        assert_eq!(outcome.status, AgentInquiryStatus::Failed);
+        assert!(
+            outcome.findings.to_ascii_lowercase().contains("agent"),
+            "the outcome should preserve the authority failure: {}",
+            outcome.findings
+        );
+
+        let provider_session_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_session WHERE identity_id = ?")
+                .bind("forged-inquiry-agent")
+                .fetch_one(db.pool())
+                .await
+                .expect("provider session count");
+        assert_eq!(
+            provider_session_rows, 0,
+            "authority must fail before an inquiry session can reach the provider"
+        );
+
+        let usage_rows: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM pricing_selection)
+                  + (SELECT COUNT(*) FROM usage_invocation)
+                  + (SELECT COUNT(*) FROM usage_event)",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("usage rows count");
+        assert_eq!(
+            usage_rows, 0,
+            "forged authority must not write pricing or usage rows"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace_root);
+    }
+
     fn completion(record: &AgentInquiry) -> CompleteAgentInquiry {
         CompleteAgentInquiry {
             id: record.id.clone(),
@@ -680,9 +1079,11 @@ mod tests {
         let (db, record) = running_record().await;
         sqlx::query("CREATE TRIGGER reject_inquiry_completion BEFORE UPDATE ON agent_inquiry BEGIN SELECT RAISE(ABORT, 'storage fault'); END")
             .execute(db.pool()).await.unwrap();
-        assert!(complete_or_cancelled(&db, completion(&record))
-            .await
-            .is_err());
+        assert!(
+            complete_or_cancelled_with_usage(&db, completion(&record), Vec::new(), &[])
+                .await
+                .is_err()
+        );
         let current = AgentInquiryRepo::get_agent_inquiry(&*db, &record.id)
             .await
             .unwrap()
@@ -695,11 +1096,15 @@ mod tests {
         let (db, record) = running_record().await;
         let mut stale = completion(&record);
         stale.expected_version += 1;
-        assert!(complete_or_cancelled(&db, stale).await.is_err());
+        assert!(
+            complete_or_cancelled_with_usage(&db, stale, Vec::new(), &[])
+                .await
+                .is_err()
+        );
         AgentInquiryRepo::cancel_agent_inquiry(&*db, &record.id, record.version)
             .await
             .unwrap();
-        let result = complete_or_cancelled(&db, completion(&record))
+        let result = complete_or_cancelled_with_usage(&db, completion(&record), Vec::new(), &[])
             .await
             .unwrap();
         assert_eq!(result.status, AgentInquiryStatus::Cancelled);
@@ -707,6 +1112,42 @@ mod tests {
             inquiry_outcome(result).status,
             AgentInquiryStatus::Cancelled
         );
+    }
+
+    #[tokio::test]
+    async fn inquiry_terminalization_rejects_counter_overflow_without_clamping() {
+        let (db, record) = running_record().await;
+        let output = forge_agent_host::AgentTurnOutput {
+            runtime_session_id: "runtime-session".to_owned(),
+            text: "Answer".to_owned(),
+            input_tokens: u64::MAX,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            usage_reports: Vec::new(),
+            telemetry_state: forge_agent_host::AgentTurnTelemetryState::Metered,
+            context_manifest: None,
+            pending_interaction_id: None,
+        };
+        assert!(complete_with_usage(
+            &db,
+            &record,
+            AgentInquiryStatus::Succeeded,
+            Some("Answer".to_owned()),
+            None,
+            None,
+            &output,
+            10,
+            Vec::new(),
+            &[],
+        )
+        .await
+        .is_err());
+        let current = AgentInquiryRepo::get_agent_inquiry(&*db, &record.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, AgentInquiryStatus::Running);
     }
 
     /// Cancelling must reach the token the turn is actually running under.

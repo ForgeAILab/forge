@@ -8,6 +8,7 @@ import {
 } from '@tanstack/react-query'
 import {
   ApiError,
+  getAccountUsageAnalytics,
   apiFetch,
   addDependency,
   addMember,
@@ -40,6 +41,7 @@ import {
   updateMemberRole,
   updateSettings,
 } from '@/api/client'
+import { invalidateAnalyticsQueries } from '@/api/analytics-query-invalidation'
 import {
   cancelAgentInquiry,
   listAgentInquiries,
@@ -66,7 +68,7 @@ import type {
   CreateTaskRequest,
   Daemon,
   Execution,
-  ExecutionUsage,
+  UsageBreakdown,
   ExecutorType,
   FollowUpRequest,
   LaunchExecutionRequest,
@@ -98,7 +100,7 @@ import type {
   UpdateProjectRequest,
   UpdateProjectWorkflowRequest,
   UpdateTaskRequest,
-  TaskUsageSummary,
+  UsageAggregate,
   TestLifecycleHookRequest,
   LifecycleHookTestResponse,
   SettingsResponse,
@@ -328,6 +330,7 @@ export function useReleaseProjectMilestone() {
     onSuccess: (release, input) => {
       void queryClient.invalidateQueries({ queryKey: qk.projectOverview(input.projectId) })
       void queryClient.invalidateQueries({ queryKey: qk.project(input.projectId) })
+      invalidateAnalyticsQueries(queryClient, input.projectId)
       queryClient.setQueryData(qk.projectRelease(input.projectId, release.id), release)
     },
   })
@@ -383,6 +386,13 @@ export function useProjectAnalytics(projectId: string, from?: string, to?: strin
   return useQuery({
     queryKey: qk.projectAnalytics(projectId, from, to),
     queryFn: () => getProjectAnalytics(projectId, from, to),
+  })
+}
+
+export function useAccountUsageAnalytics(from?: string, to?: string) {
+  return useQuery({
+    queryKey: qk.accountUsageAnalytics(from, to),
+    queryFn: () => getAccountUsageAnalytics(from, to),
   })
 }
 
@@ -1355,17 +1365,17 @@ export function useExecutionQuery(executionId: string) {
   })
 }
 
-export function useExecutionUsageQuery(executionId: string) {
+export function useUsageBreakdownsQuery(executionId: string) {
   return useQuery({
-    queryKey: qk.executionUsage(executionId),
-    queryFn: () => apiFetch<ExecutionUsage[]>(`/executions/${executionId}/usage`),
+    queryKey: qk.usageBreakdowns(executionId),
+    queryFn: () => apiFetch<UsageBreakdown[]>(`/executions/${executionId}/usage`),
   })
 }
 
 export function useTaskUsageQuery(taskId: string) {
   return useQuery({
     queryKey: qk.taskUsage(taskId),
-    queryFn: () => apiFetch<TaskUsageSummary>(`/tasks/${taskId}/usage`),
+    queryFn: () => apiFetch<UsageAggregate>(`/tasks/${taskId}/usage`),
   })
 }
 
@@ -1973,7 +1983,10 @@ export function useAgentInquiryLogsQuery(
   })
 }
 
-export function useAgentInquiriesQuery(chatId: string | undefined, limit = AGENT_INQUIRY_LIST_LIMIT) {
+export function useAgentInquiriesQuery(
+  chatId: string | undefined,
+  limit = AGENT_INQUIRY_LIST_LIMIT,
+) {
   return useInfiniteQuery({
     queryKey: qk.agentInquiryPages(chatId ?? 'none', limit),
     queryFn: ({ pageParam }) => listAgentInquiries(chatId!, { cursor: pageParam, limit }),

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { expect, test, type APIRequestContext, type APIResponse, type Page } from './fixtures'
+import { emptyUsage } from '../src/test-utils/usage'
 
 const execFileAsync = promisify(execFile)
 const PROJECT_ID = 'proj-exception-recovery'
@@ -302,7 +303,7 @@ function taskDefaults() {
     plan_artifact: null,
     execution_actions: [],
     execution_observability: {
-      execution_count: 0,
+      ...emptyUsage,
       active_execution_id: null,
       active_role: null,
       active_started_at: null,
@@ -314,12 +315,6 @@ function taskDefaults() {
       latest_stopped_at: null,
       latest_runtime_seconds: null,
       total_runtime_seconds: 0,
-      total_input_tokens: 0,
-      total_output_tokens: 0,
-      total_cache_read_tokens: 0,
-      total_cache_write_tokens: 0,
-      total_tokens: 0,
-      total_cost_usd: null,
     },
     external_issue_number: null,
     external_issue_url: null,

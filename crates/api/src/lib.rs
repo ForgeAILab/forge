@@ -204,6 +204,22 @@ pub fn api_router(state: AppState) -> Router {
             get(routes::projects::get_project_analytics),
         )
         .route(
+            "/api/v1/projects/{id}/cost-estimation-previews",
+            post(routes::pricing::create_cost_estimation_preview),
+        )
+        .route(
+            "/api/v1/projects/{id}/cost-estimation-runs",
+            post(routes::pricing::create_cost_estimation_run),
+        )
+        .route(
+            "/api/v1/projects/{id}/cost-estimation-runs/{run_id}",
+            get(routes::pricing::get_cost_estimation_run),
+        )
+        .route(
+            "/api/v1/analytics/usage",
+            get(routes::analytics::get_usage_analytics),
+        )
+        .route(
             "/api/v1/projects/{id}/overview",
             get(routes::project_overview::get_project_overview),
         )
@@ -824,6 +840,28 @@ pub fn api_router(state: AppState) -> Router {
             get(routes::providers::provider_catalog),
         )
         .route(
+            "/api/v1/providers/pricing-catalog/status",
+            get(routes::pricing::get_pricing_catalog_status),
+        )
+        .route(
+            "/api/v1/providers/pricing-catalog/refresh",
+            post(routes::pricing::refresh_pricing_catalog),
+        )
+        .route(
+            "/api/v1/providers/pricing-catalog/models",
+            get(routes::pricing::list_pricing_catalog_models),
+        )
+        .route(
+            "/api/v1/providers/cli-runtimes/{daemon_id}/{executor_type}/pricing",
+            get(routes::pricing::get_cli_runtime_pricing)
+                .put(routes::pricing::replace_cli_runtime_pricing),
+        )
+        .route(
+            "/api/v1/providers/{id}/pricing",
+            get(routes::pricing::get_provider_pricing)
+                .put(routes::pricing::replace_provider_pricing),
+        )
+        .route(
             "/api/v1/providers",
             get(routes::providers::list_providers).post(routes::providers::create_provider_entry),
         )
@@ -1019,7 +1057,7 @@ pub fn api_router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/executions/{id}/usage",
-            get(routes::executions::get_execution_usage),
+            get(routes::executions::get_usage_breakdowns),
         )
         .route(
             "/api/v1/tasks/{id}/usage",

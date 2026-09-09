@@ -4,10 +4,11 @@ use std::{sync::Arc, time::Duration};
 
 use api::{serve_with_listener, AppState};
 use api_types::{
-    DaemonFrame, DaemonRegisterResponse, DaemonResponse, ExecutionLogNotification,
-    ExecutionStartResult, ExecutionTerminalNotification, FsEntry, FsListResult,
-    TerminalClientFrame, TerminalServerFrame, METHOD_EXECUTION_LOG, METHOD_EXECUTION_START,
-    METHOD_EXECUTION_TERMINAL, METHOD_FS_LIST,
+    DaemonFrame, DaemonHandshakeNotification, DaemonRegisterResponse, DaemonResponse,
+    ExecutionLogNotification, ExecutionStartResult, ExecutionTerminalNotification, FsEntry,
+    FsListResult, TerminalClientFrame, TerminalServerFrame, DAEMON_CAPABILITY_TERMINAL_ACK,
+    DAEMON_CAPABILITY_USAGE_REPORTS, DAEMON_PROTOCOL_REVISION, METHOD_DAEMON_HANDSHAKE,
+    METHOD_EXECUTION_LOG, METHOD_EXECUTION_START, METHOD_EXECUTION_TERMINAL, METHOD_FS_LIST,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -156,7 +157,40 @@ pub async fn connect_daemon(
         url.into_client_request()?
     };
 
-    connect_async(request).await.map(|(socket, _)| socket)
+    let mut socket = connect_async(request).await.map(|(socket, _)| socket)?;
+    announce_daemon_protocol(&mut socket).await;
+    Ok(socket)
+}
+
+/// The handshake a directly-registered `DaemonConnection` never receives. A
+/// test that builds one instead of connecting a socket still has to announce
+/// the protocol, because the registry refuses to dispatch to a connection whose
+/// contract it does not know.
+pub fn accept_daemon_protocol_handshake(state: &AppState, daemon_id: &str) {
+    state.daemon_connections.dispatch_incoming(
+        daemon_id,
+        DaemonFrame::Notification {
+            method: METHOD_DAEMON_HANDSHAKE.to_owned(),
+            params: serde_json::to_value(daemon_handshake()).expect("daemon handshake serializes"),
+        },
+    );
+}
+
+fn daemon_handshake() -> DaemonHandshakeNotification {
+    DaemonHandshakeNotification {
+        protocol_revision: DAEMON_PROTOCOL_REVISION,
+        capabilities: vec![
+            DAEMON_CAPABILITY_USAGE_REPORTS.to_owned(),
+            DAEMON_CAPABILITY_TERMINAL_ACK.to_owned(),
+        ],
+    }
+}
+
+/// A real daemon's first frame after connecting. The server refuses to dispatch
+/// to a connection that has not advertised the terminal-accounting contract, so
+/// a fake daemon that stays silent is not a stand-in for one.
+pub async fn announce_daemon_protocol(socket: &mut ClientSocket) {
+    send_daemon_notification(socket, METHOD_DAEMON_HANDSHAKE, daemon_handshake()).await;
 }
 
 pub async fn connect_terminal(
@@ -255,15 +289,22 @@ pub async fn next_terminal_server_frame(socket: &mut ClientSocket) -> TerminalSe
     }
 }
 
+/// Waits for a connection the server will actually dispatch to. Registration
+/// alone is not enough: the handshake is a separate frame, so a test that only
+/// waited for `is_connected` could race it and be refused as incompatible.
 pub async fn wait_until_connected(state: &AppState, daemon_id: &str) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
-        if state.daemon_connections.is_connected(daemon_id) {
+        if state
+            .daemon_connections
+            .get(daemon_id)
+            .is_some_and(|connection| connection.protocol_allows_dispatch())
+        {
             return;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "daemon connection was not registered"
+            "daemon connection was not registered with a dispatchable protocol"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -385,6 +426,7 @@ pub async fn send_execution_terminal_completed(
         socket,
         METHOD_EXECUTION_TERMINAL,
         ExecutionTerminalNotification {
+            terminal_report_id: format!("terminal-completed-{execution_id}"),
             execution_id: execution_id.to_owned(),
             exit_code: Some(0),
             signal: None,
@@ -394,7 +436,7 @@ pub async fn send_execution_terminal_completed(
             agent_session_id: None,
             summary: summary.map(str::to_owned),
             after_sha: None,
-            usage: None,
+            usage_reports: Vec::new(),
             failure_class: None,
             retry_at: None,
             resolved_candidate: None,
@@ -413,6 +455,7 @@ pub async fn send_execution_terminal_failed(
         socket,
         METHOD_EXECUTION_TERMINAL,
         ExecutionTerminalNotification {
+            terminal_report_id: format!("terminal-failed-{execution_id}"),
             execution_id: execution_id.to_owned(),
             exit_code: Some(1),
             signal: None,
@@ -422,7 +465,7 @@ pub async fn send_execution_terminal_failed(
             agent_session_id: None,
             summary: None,
             after_sha: None,
-            usage: None,
+            usage_reports: Vec::new(),
             failure_class: None,
             retry_at: None,
             resolved_candidate: None,

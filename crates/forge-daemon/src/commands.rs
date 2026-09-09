@@ -1,9 +1,10 @@
 use std::{path::Path, sync::Arc};
 
 use api_types::{
-    DaemonErrorPayload, DaemonFrame, ExecutionCancelParams, ExecutionStartParams, FsBranchesParams,
-    FsListParams, TerminalInputParams, TerminalResizeParams, TerminalStartParams,
-    TerminalTerminateParams, INVALID_FRAME, METHOD_EXECUTION_CANCEL, METHOD_EXECUTION_START,
+    DaemonErrorPayload, DaemonFrame, ExecutionCancelParams, ExecutionStartParams,
+    ExecutionTerminalAckParams, FsBranchesParams, FsListParams, TerminalInputParams,
+    TerminalResizeParams, TerminalStartParams, TerminalTerminateParams, INVALID_FRAME,
+    METHOD_EXECUTION_CANCEL, METHOD_EXECUTION_START, METHOD_EXECUTION_TERMINAL_ACK,
     METHOD_FS_BRANCHES, METHOD_FS_LIST, METHOD_TERMINAL_INPUT, METHOD_TERMINAL_RESIZE,
     METHOD_TERMINAL_START, METHOD_TERMINAL_TERMINATE, UNSUPPORTED_METHOD,
 };
@@ -143,6 +144,26 @@ pub async fn handle_request_with_terminal(
             },
             Err(frame) => frame,
         },
+        METHOD_EXECUTION_TERMINAL_ACK => {
+            match decode_params::<ExecutionTerminalAckParams>(&id, params) {
+                Ok(params) => match daemon_runtime {
+                    Some(runtime) => match runtime.acknowledge_terminal(params).await {
+                        Ok(result) => response_frame(id, result),
+                        Err(error) => DaemonFrame::Error {
+                            id: Some(id),
+                            error,
+                        },
+                    },
+                    None => error_frame(
+                        Some(id),
+                        UNSUPPORTED_METHOD,
+                        "execution.terminal.ack is not available in this daemon command context",
+                        None,
+                    ),
+                },
+                Err(frame) => frame,
+            }
+        }
         _ => error_frame(
             Some(id),
             UNSUPPORTED_METHOD,
@@ -217,7 +238,7 @@ mod tests {
     };
     use serde_json::json;
 
-    use super::handle_request;
+    use super::{handle_request, handle_request_with_terminal};
 
     #[tokio::test]
     async fn test_fs_list_basic() {
@@ -357,6 +378,29 @@ mod tests {
         };
         assert_eq!(id.as_deref(), Some("cmd-unknown"));
         assert_eq!(error.code, UNSUPPORTED_METHOD);
+
+        remove_dir(&dir);
+    }
+
+    #[tokio::test]
+    async fn terminal_ack_is_routed_to_runtime_store() {
+        let dir = create_test_root("terminal-ack");
+        let (responses_tx, _responses_rx) = tokio::sync::mpsc::unbounded_channel();
+        let runtime = forge_client::daemon_runtime::DaemonRuntime::new(responses_tx, dir.clone());
+        let frame = DaemonFrame::Request {
+            id: "cmd-terminal-ack".to_owned(),
+            method: api_types::METHOD_EXECUTION_TERMINAL_ACK.to_owned(),
+            params: json!({
+                "terminal_report_id": "missing-report",
+                "execution_id": "execution-1"
+            }),
+        };
+
+        let response = handle_request_with_terminal(frame, &dir, None, Some(&runtime)).await;
+        let DaemonFrame::Response { result, .. } = response else {
+            panic!("expected terminal ack response");
+        };
+        assert_eq!(result["acknowledged"], false);
 
         remove_dir(&dir);
     }

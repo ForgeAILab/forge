@@ -4,13 +4,14 @@ use crate::workflow::dispatch::{
     build_effective_prompt, dispatch_intent_from_workflow_dispatch, effective_prompt_selection,
     loader::load_agent_dispatch_context,
 };
-use db::{CreateReview, ExecutionUsageRepo, UpdateTask, UpdateTaskStatus};
+use db::{CreateReview, UpdateTask, UpdateTaskStatus};
 
 mod cascade;
 mod follow_up;
 mod guards;
 mod hooks;
 mod launch;
+pub(crate) mod ledger;
 mod recovery;
 mod runner;
 pub(in crate::task_service) mod subtasks;
@@ -88,34 +89,6 @@ async fn clear_execution_retry_metadata_inner(
         TaskRepo::set_metadata_json(db, &task.id, metadata.to_json(), &now_rfc3339()).await?;
     }
     Ok(())
-}
-
-pub(super) fn usage_provider_from_agent_config(agent_config: &Value) -> String {
-    usage_provider_for_executor_type(agent_config.get("executor_type").and_then(Value::as_str))
-}
-
-pub(super) fn usage_provider_from_snapshot(snapshot_json: Option<&str>) -> String {
-    let executor_type = snapshot_json
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        .and_then(|value| {
-            value
-                .get("executor_type")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        });
-    usage_provider_for_executor_type(executor_type.as_deref())
-}
-
-fn usage_provider_for_executor_type(executor_type: Option<&str>) -> String {
-    match executor_type.unwrap_or_default() {
-        "codex" => "openai",
-        "claude_code" => "anthropic",
-        "cursor" => "cursor",
-        "opencode" => "opencode",
-        other if !other.is_empty() => other,
-        _ => "unknown",
-    }
-    .to_owned()
 }
 
 pub(super) async fn set_planning_awaiting_review_metadata(

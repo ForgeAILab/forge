@@ -31,7 +31,7 @@ impl TaskExecutor for NoDiffExecutor {
             agent_session_id: None,
             summary: None,
             error: None,
-            usage: None,
+            usage_reports: Vec::new(),
             ..Default::default()
         })
     }
@@ -127,7 +127,7 @@ impl TaskExecutor for BurstLogExecutor {
             agent_session_id: None,
             summary: None,
             error: None,
-            usage: None,
+            usage_reports: Vec::new(),
             ..Default::default()
         })
     }
@@ -180,7 +180,7 @@ impl TaskExecutor for CountingExecutor {
             agent_session_id: None,
             summary: None,
             error: None,
-            usage: None,
+            usage_reports: Vec::new(),
             ..Default::default()
         })
     }

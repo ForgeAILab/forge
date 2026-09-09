@@ -3,7 +3,7 @@ mod common;
 
 use api_types::{ErrorResponse, ExecutionResponse, LaunchExecutionResponse, TaskResponse};
 use axum::http::{Method, StatusCode};
-use db::{ExecutionRepo, ExecutionStatus, ExecutionUsageRepo, TaskRepo};
+use db::{ExecutionRepo, ExecutionStatus, TaskRepo};
 use serde_json::{json, Value};
 
 #[tokio::test]
@@ -138,22 +138,6 @@ async fn task_response_includes_execution_observability() {
     )
     .await
     .expect("execution creates");
-    ExecutionUsageRepo::upsert(
-        &*harness.state.db,
-        db::UpsertExecutionUsage {
-            execution_id: execution_id.clone(),
-            provider: "anthropic".to_owned(),
-            model: "claude-test".to_owned(),
-            input_tokens: 100,
-            output_tokens: 50,
-            cache_read_tokens: 10,
-            cache_write_tokens: 5,
-            cost_usd: Some(0.12),
-        },
-    )
-    .await
-    .expect("usage records");
-
     let task: Value = common::empty_request(
         &harness.app,
         Method::GET,
@@ -165,14 +149,15 @@ async fn task_response_includes_execution_observability() {
         .get("execution_observability")
         .expect("task includes execution_observability");
 
-    assert_eq!(observability["execution_count"], json!(1));
+    assert_eq!(observability["counts"]["task_execution_count"], json!(1));
+    assert_eq!(observability["counts"]["provider_attempt_count"], json!(0));
     assert_eq!(observability["latest_execution_id"], json!(execution_id));
     assert_eq!(observability["latest_execution_status"], json!("completed"));
     assert_eq!(observability["total_runtime_seconds"], json!(10.0));
-    assert_eq!(observability["total_input_tokens"], json!(100));
-    assert_eq!(observability["total_output_tokens"], json!(50));
-    assert_eq!(observability["total_tokens"], json!(165));
-    assert_eq!(observability["total_cost_usd"], json!(0.12));
+    assert_eq!(observability["tokens"]["input_tokens"], json!(0));
+    assert_eq!(observability["tokens"]["output_tokens"], json!(0));
+    assert_eq!(observability["cost"]["coverage"], json!("no_usage"));
+    assert_eq!(observability["cost"]["complete_total"], Value::Null);
 }
 
 #[tokio::test]

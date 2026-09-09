@@ -54,7 +54,7 @@ export const qk = {
   execution: (id: string) => ['executions', id] as const,
   executionLogs: (id: string) => ['executions', id, 'logs'] as const,
   executionHookLogs: (id: string) => ['executions', id, 'hook-logs'] as const,
-  executionUsage: (id: string) => ['executions', id, 'usage'] as const,
+  usageBreakdowns: (id: string) => ['executions', id, 'usage'] as const,
   taskUsage: (taskId: string) => ['tasks', taskId, 'usage'] as const,
   agentDiscoveredOptions: (id: string) => ['agents', id, 'discovered-options'] as const,
   executorDiscoveredOptions: (executorType: string) =>
@@ -73,6 +73,8 @@ export const qk = {
   workflowTemplate: (name: string) => ['workflow-templates', name] as const,
   projectAnalytics: (projectId: string, from?: string, to?: string) =>
     ['projects', projectId, 'analytics', from ?? 'all', to ?? 'all'] as const,
+  accountUsageAnalytics: (from?: string, to?: string) =>
+    ['analytics', 'usage', from ?? 'all', to ?? 'all'] as const,
   notifications: (projectId?: string, read?: boolean) =>
     ['notifications', projectId ?? 'all', read ?? 'all'] as const,
   notificationUnreadCount: (projectId?: string) =>

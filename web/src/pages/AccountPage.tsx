@@ -1,16 +1,18 @@
 import type { Icon } from '@phosphor-icons/react'
-import { Key, User } from '@phosphor-icons/react'
+import { ChartBar, Key, User } from '@phosphor-icons/react'
 import { Link } from '@tanstack/react-router'
+import { AccountAnalyticsTab } from '@/components/settings/AccountAnalyticsTab'
 import { AccessTokensTab } from '@/components/settings/AccessTokensTab'
 import { ProfileTab } from '@/components/settings/ProfileTab'
 import { cn } from '@/lib/cn'
 import { useAuthStore } from '@/stores/auth'
 
-export type AccountTab = 'profile' | 'tokens'
+export type AccountTab = 'profile' | 'tokens' | 'analytics'
 
 const TABS: Array<{ id: AccountTab; label: string; icon: Icon }> = [
   { id: 'profile', label: 'Profile', icon: User },
   { id: 'tokens', label: 'Access Tokens', icon: Key },
+  { id: 'analytics', label: 'Usage analytics', icon: ChartBar },
 ]
 
 export function isAccountTab(value: string | undefined): value is AccountTab {
@@ -22,9 +24,9 @@ export function AccountPage({ initialTab = 'profile' }: { initialTab?: AccountTa
   const label = user?.display_name ?? user?.email ?? 'Account'
 
   return (
-    <div className="flex h-[calc(100vh-7rem)] gap-0 overflow-hidden rounded-xl border border-border-subtle bg-card shadow-card">
+    <div className="flex min-h-[calc(100dvh-7rem)] max-h-[calc(100dvh-7rem)] min-w-0 flex-col gap-0 overflow-hidden rounded-xl border border-border-subtle bg-card shadow-card lg:flex-row">
       {/* Sidebar */}
-      <aside className="flex w-56 shrink-0 flex-col border-r bg-background">
+      <aside className="flex w-full shrink-0 flex-col border-b bg-background lg:w-56 lg:border-b-0 lg:border-r">
         <div className="border-b px-4 py-3">
           <p className="font-mono text-micro font-semibold uppercase tracking-[1px] text-muted-foreground">
             Account
@@ -38,7 +40,7 @@ export function AccountPage({ initialTab = 'profile' }: { initialTab?: AccountTa
             </p>
           </div>
         </div>
-        <nav className="flex flex-1 flex-col gap-0.5 p-2">
+        <nav className="flex flex-1 gap-0.5 overflow-x-auto p-2 lg:flex-col">
           {TABS.map((t) => {
             const TabIcon = t.icon
             return (
@@ -47,7 +49,7 @@ export function AccountPage({ initialTab = 'profile' }: { initialTab?: AccountTa
                 to={t.id === 'profile' ? '/account' : '/account/$tab'}
                 params={{ tab: t.id }}
                 className={cn(
-                  'relative flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-[7px] text-left text-[13px] leading-none font-medium transition-colors',
+                  'relative flex w-auto shrink-0 cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-[7px] text-left text-[13px] leading-none font-medium transition-colors lg:w-full',
                   initialTab === t.id
                     ? 'bg-[var(--ember-surface)] text-sidebar-active-foreground before:absolute before:left-0 before:top-1/2 before:-translate-y-1/2 before:h-4 before:w-[3px] before:rounded-r-full before:bg-primary'
                     : 'text-sidebar-foreground hover:bg-accent/50 hover:text-foreground',
@@ -62,10 +64,11 @@ export function AccountPage({ initialTab = 'profile' }: { initialTab?: AccountTa
       </aside>
 
       {/* Content */}
-      <div className="flex-1 overflow-y-auto px-8 py-6">
-        <div className="max-w-[760px]">
+      <div className="min-w-0 flex-1 overflow-y-auto px-4 py-5 sm:px-6 lg:px-8 lg:py-6">
+        <div className="min-w-0 max-w-[760px]">
           {initialTab === 'profile' && <ProfileTab />}
           {initialTab === 'tokens' && <AccessTokensTab />}
+          {initialTab === 'analytics' && <AccountAnalyticsTab />}
         </div>
       </div>
     </div>

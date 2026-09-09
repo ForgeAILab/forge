@@ -311,6 +311,7 @@ async fn set_session_status(
 
 async fn response_for_agent(state: &AppState, agent: Agent) -> ApiResult<api_types::AgentResponse> {
     let stats = ExecutionRepo::stats_by_agent(&*state.db, &agent.id).await?;
+    let usage = services::usage_projection::usage_aggregate_for_agent(&state.db, &agent.id).await?;
     let active_task_count = AgentRepo::count_active_tasks(&*state.db, &agent.id).await?;
     let effective_status = compute_effective_status(&state.db, &agent)
         .await?
@@ -321,6 +322,7 @@ async fn response_for_agent(state: &AppState, agent: Agent) -> ApiResult<api_typ
         Some(active_task_count),
         Some(effective_status),
         stats,
+        usage,
     ))
 }
 
@@ -426,6 +428,7 @@ fn protected_interaction_error(error: AgentHostError) -> ApiError {
         }
         AgentHostError::CredentialNotFound
         | AgentHostError::Runtime(_)
+        | AgentHostError::RuntimeWithUsage { .. }
         | AgentHostError::TurnLimitReached { .. }
         | AgentHostError::StructuredOutcome(_) => {
             ApiError::internal("protected interaction is unavailable")

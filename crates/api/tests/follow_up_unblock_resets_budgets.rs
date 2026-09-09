@@ -238,7 +238,7 @@ impl CodingExecutorAdapter for ReviewFailCodexAdapter {
                     agent_session_id: Some("auditor-session".to_owned()),
                     summary: Some("auditor failed the implementation".to_owned()),
                     error: None,
-                    usage: None,
+                    usage_reports: Vec::new(),
                     ..Default::default()
                 });
             }
@@ -258,7 +258,7 @@ impl CodingExecutorAdapter for ReviewFailCodexAdapter {
                 agent_session_id: Some(session_id),
                 summary: Some("executor completed".to_owned()),
                 error: None,
-                usage: None,
+                usage_reports: Vec::new(),
                 ..Default::default()
             })
         })

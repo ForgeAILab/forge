@@ -3,7 +3,8 @@ import type { ReactNode } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useOperationsStatusQuery, useRefreshOperationsMutation } from '@/api/hooks'
 import { OperationsPage } from '@/pages/OperationsPage'
-import type { OperatorStatusResponse } from '@/types/generated'
+import { emptyUsage } from '@/test-utils/usage'
+import type { CostSummary, OperatorStatusResponse, UsageAggregate } from '@/types/generated'
 
 type LinkProps = {
   to: string
@@ -30,6 +31,44 @@ vi.mock('@/api/hooks', () => ({
   useRefreshOperationsMutation: vi.fn(),
 }))
 
+const pendingCost: CostSummary = {
+  ...emptyUsage.cost,
+  kind: 'none',
+  coverage: 'pending',
+  usage_coverage: {
+    ...emptyUsage.cost.usage_coverage,
+    total_runs_or_turns: 1,
+    pending_runs_or_turns: 1,
+    total_provider_attempts: 1,
+    pending_provider_attempts: 1,
+    unpriced_provider_attempts: 1,
+    reasons: [
+      {
+        code: 'pending',
+        run_or_turn_count: 1,
+        provider_attempt_count: 1,
+        tokens: emptyUsage.tokens,
+      },
+    ],
+  },
+}
+
+const usageSummary: UsageAggregate = {
+  counts: {
+    task_execution_count: 1,
+    chat_turn_count: 0,
+    inquiry_count: 0,
+    provider_attempt_count: 1,
+  },
+  tokens: {
+    input_tokens: 1200,
+    output_tokens: 450,
+    cache_read_tokens: 0,
+    cache_write_tokens: 0,
+  },
+  cost: pendingCost,
+}
+
 const degradedStatus: OperatorStatusResponse = {
   overall_severity: 'error',
   computed_at: '2026-04-29T12:00:00Z',
@@ -53,11 +92,8 @@ const degradedStatus: OperatorStatusResponse = {
       last_event_time: '2026-04-29T11:59:00Z',
       turn_count: 3,
       token_totals: {
-        input_tokens: 1200,
-        output_tokens: 450,
-        cache_read_tokens: 0,
-        cache_write_tokens: 0,
-        cost_usd: 0.1234,
+        tokens: usageSummary.tokens,
+        cost: pendingCost,
       },
       rate_limit_snapshot: { requests_remaining: 10 },
       effective_policy: {
@@ -126,10 +162,7 @@ const degradedStatus: OperatorStatusResponse = {
   ],
   retry_pressure: [],
   usage_summary: {
-    available: true,
-    total_input_tokens: 1200,
-    total_output_tokens: 450,
-    total_cost_usd: 0.1234,
+    ...usageSummary,
     active_execution_count: 1,
   },
   recent_errors: [

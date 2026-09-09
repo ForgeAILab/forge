@@ -12,17 +12,18 @@ use crate::{
 use ::review::{ReviewRequest, ReviewRunner};
 use ::workspace::{RepoCacheLockManager, WorkspaceManager};
 use api_types::{Actor, ProjectSettings, UserActionSource};
+use chrono::{DateTime, Utc};
 use cli_adapters::codex::protocol::RESUME_THREAD_ID_CONFIG_KEY;
 use db::{
     new_uuid_v4, now_rfc3339, Agent, AgentRepo, ArchiveTask, AssigneeKind, ClaimExecutionLease,
     ClaimTask, ClaimedTask, CommentAuthorType, CreateDomainEvent, CreateExecution, CreateTask,
     CreateTaskComment, CreateTaskRoleAssignment, CreateWorkspace, CreateWorkspaceLease, DbError,
     DomainEventRepo, Execution, ExecutionLeaseDisposition, ExecutionRepo, ExecutionStatus,
-    ExecutionTerminalOutcome, ExecutionUsageRepo, PageRequest, ProjectRepo, RepoRepo, Review,
-    ReviewRepo, ReviewStatus, SoftDeleteTask, SortBy, SortOrder, SqliteDb, Task, TaskBoardRepo,
-    TaskComment, TaskCommentRepo, TaskDependencyRepo, TaskMetadata, TaskRepo, TaskRoleAssignment,
-    TaskRoleAssignmentRepo, TaskStatus, TerminalizeExecution, TransitionLogRepo,
-    UpsertExecutionUsage, Workspace, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
+    ExecutionTerminalOutcome, PageRequest, ProjectRepo, RepoRepo, Review, ReviewRepo, ReviewStatus,
+    SoftDeleteTask, SortBy, SortOrder, SqliteDb, Task, TaskBoardRepo, TaskComment, TaskCommentRepo,
+    TaskDependencyRepo, TaskMetadata, TaskRepo, TaskRoleAssignment, TaskRoleAssignmentRepo,
+    TaskStatus, TerminalizeExecution, TransitionLogRepo, Workspace, WorkspaceLeaseRepo,
+    WorkspaceRepo, WorkspaceStatus,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{
@@ -30,6 +31,7 @@ use executors::{
     ExecutorKind, TaskExecutor,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::{
     collections::{HashMap, HashSet},
@@ -51,7 +53,7 @@ pub(crate) mod config;
 mod create;
 mod create_subtasks;
 mod dependencies;
-mod execution;
+pub(crate) mod execution;
 mod governance;
 mod lifecycle_test;
 pub(crate) mod logs;
@@ -161,23 +163,76 @@ fn stable_remote_owner_ref(owner: &str) -> String {
     owner.to_owned()
 }
 
-fn remote_execution_is_live_for_terminal(
-    execution: &Execution,
-    lease_owner: &str,
-    now: chrono::DateTime<chrono::Utc>,
+fn remote_owner_belongs_to_daemon(owner: &str, daemon_id: &str) -> bool {
+    owner.starts_with(&format!("daemon:{daemon_id}:connection:"))
+}
+
+fn remote_execution_lease_is_active(
+    lease_owner: Option<&str>,
+    lease_expires_at: Option<&str>,
+    hard_deadline_at: Option<&str>,
+    expected_owner: &str,
+    now: DateTime<Utc>,
 ) -> bool {
-    execution.status == ExecutionStatus::Running
-        && execution.lease_owner.as_deref() == Some(lease_owner)
-        && execution
-            .lease_expires_at
-            .as_deref()
-            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-            .is_some_and(|expires_at| expires_at > now)
-        && execution
-            .hard_deadline_at
-            .as_deref()
-            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-            .is_some_and(|deadline| deadline > now)
+    if lease_owner != Some(expected_owner) {
+        return false;
+    }
+    let lease_is_live = lease_expires_at
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|expires_at| expires_at.with_timezone(&Utc) > now);
+    let hard_deadline_is_live = hard_deadline_at
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|deadline| deadline.with_timezone(&Utc) > now);
+    lease_is_live && hard_deadline_is_live
+}
+
+fn remote_terminal_report_digest(
+    notification: &api_types::ExecutionTerminalNotification,
+) -> Result<String> {
+    let payload = serde_json::to_vec(notification).map_err(|error| {
+        ServiceError::invalid_operation(format!(
+            "failed to fingerprint remote terminal notification: {error}"
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn remote_usage_reports(reports: &[api_types::RemoteUsageReport]) -> Vec<executors::UsageReport> {
+    reports
+        .iter()
+        .map(|report| executors::UsageReport {
+            report_id: report.report_id.clone(),
+            request_id: report.request_id.clone(),
+            report_sequence: report.report_sequence,
+            candidate_key: report.candidate_key.clone(),
+            attempt_ordinal: report.attempt_ordinal,
+            provider_id: report.provider_id.clone(),
+            model_id: report.model_id.clone(),
+            counters: executors::UsageCounters {
+                input_tokens: report.input_tokens,
+                output_tokens: report.output_tokens,
+                cache_read_tokens: report.cache_read_tokens,
+                cache_write_tokens: report.cache_write_tokens,
+            },
+            telemetry_state: match report.telemetry_state {
+                api_types::UsageTelemetryState::Metered => executors::UsageTelemetryState::Metered,
+                api_types::UsageTelemetryState::Unmetered => {
+                    executors::UsageTelemetryState::Unmetered
+                }
+                api_types::UsageTelemetryState::Pending => executors::UsageTelemetryState::Pending,
+                api_types::UsageTelemetryState::Unsettled => {
+                    executors::UsageTelemetryState::Unsettled
+                }
+            },
+            context_tokens: report.context_tokens,
+            selected_tier: report.selected_tier.clone(),
+            reported_cost_usd: report.reported_cost_usd.clone(),
+            outcome: None,
+            partial: report.partial,
+        })
+        .collect()
 }
 
 pub(super) fn is_transient_error_annotation(raw_annotation: &str) -> bool {
@@ -668,6 +723,112 @@ impl TaskService {
         Ok(())
     }
 
+    /// Authorize a terminal report at the service boundary before reading any
+    /// task/pricing state or materializing a usage invocation.  The transport
+    /// sink also performs this check for ordinary output, but terminal frames
+    /// must remain safe when they arrive through a stale or reordered sink.
+    ///
+    /// A running execution requires the exact current socket lease owner.  A
+    /// terminal execution may accept a late report only when its committed
+    /// terminal event proves that the same daemon (possibly after reconnect)
+    /// owned the lease that was displaced.  Connection identity is strict
+    /// while running; daemon identity is the durable proof after terminal CAS.
+    async fn authorize_remote_terminal_execution(
+        &self,
+        daemon_id: &str,
+        connection_id: u64,
+        execution: &Execution,
+    ) -> Result<bool> {
+        let lease_owner = crate::daemon_transport::execution_lease_owner(daemon_id, connection_id);
+        if execution.status == ExecutionStatus::Running {
+            return Ok(remote_execution_lease_is_active(
+                execution.lease_owner.as_deref(),
+                execution.lease_expires_at.as_deref(),
+                execution.hard_deadline_at.as_deref(),
+                &lease_owner,
+                Utc::now(),
+            ));
+        }
+
+        let previous_owner = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT json_extract(payload_json, '$.previous_lease_owner')
+             FROM domain_event
+             WHERE entity_type = 'task'
+               AND entity_id = ?
+               AND event_type IN ('execution.completed', 'execution.failed', 'execution.cancelled')
+               AND json_extract(payload_json, '$.execution_id') = ?
+             ORDER BY sequence DESC
+             LIMIT 1",
+        )
+        .bind(&execution.task_id)
+        .bind(&execution.id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .flatten();
+        Ok(previous_owner
+            .as_deref()
+            .is_some_and(|owner| remote_owner_belongs_to_daemon(owner, daemon_id)))
+    }
+
+    /// A durable receipt is the only replay authority after a server restart.
+    /// Its domain event stores the lease owner that produced the terminal
+    /// outcome; require that proof before acknowledging an exact payload from
+    /// a daemon which did not own the execution.
+    async fn terminal_receipt_owned_by_daemon(
+        &self,
+        receipt: &db::ExecutionTerminalReceipt,
+        daemon_id: &str,
+    ) -> Result<bool> {
+        let previous_owner = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT json_extract(payload_json, '$.previous_lease_owner')
+             FROM domain_event
+             WHERE id = ?",
+        )
+        .bind(&receipt.event_id)
+        .fetch_optional(self.db.pool())
+        .await?
+        .flatten();
+        Ok(previous_owner
+            .as_deref()
+            .is_some_and(|owner| remote_owner_belongs_to_daemon(owner, daemon_id)))
+    }
+
+    async fn terminal_outcome_from_receipt(
+        &self,
+        receipt: &db::ExecutionTerminalReceipt,
+        execution: Execution,
+    ) -> Result<ExecutionTerminalOutcome> {
+        let event = DomainEventRepo::get_event(&*self.db, &receipt.event_id)
+            .await?
+            .ok_or(ServiceError::Db(DbError::IdempotencyConflict))?;
+        let payload = serde_json::from_str::<Value>(&event.payload_json)
+            .map_err(|_| ServiceError::Db(DbError::IdempotencyConflict))?;
+        if payload.get("terminal_report_id").and_then(Value::as_str)
+            != Some(receipt.terminal_report_id.as_str())
+            || payload
+                .get("terminal_report_digest")
+                .and_then(Value::as_str)
+                != Some(receipt.payload_digest.as_str())
+        {
+            return Err(ServiceError::Db(DbError::IdempotencyConflict));
+        }
+        let workspace_lease_id = payload
+            .get("workspace_lease_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let workspace_lease_status = payload
+            .get("workspace_lease_status")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        Ok(ExecutionTerminalOutcome::Committed {
+            execution,
+            event: Box::new(event),
+            workspace_lease_id,
+            workspace_lease_status,
+            replayed: true,
+        })
+    }
+
     pub(crate) async fn complete_remote_execution(
         &self,
         daemon_id: &str,
@@ -675,6 +836,7 @@ impl TaskService {
         notification: api_types::ExecutionTerminalNotification,
     ) -> Result<ExecutionTerminalOutcome> {
         validate_required("execution_id", &notification.execution_id)?;
+        validate_required("terminal_report_id", &notification.terminal_report_id)?;
         if !self
             .daemon_connections
             .as_ref()
@@ -683,23 +845,68 @@ impl TaskService {
             return Ok(ExecutionTerminalOutcome::Concurrent { current: None });
         }
         let lease_owner = crate::daemon_transport::execution_lease_owner(daemon_id, connection_id);
+        // The terminal report identity is durable, not an in-memory transport
+        // concern.  The composite DB boundary below decides whether this is
+        // an exact replay (including after restart) or a conflicting/stale
+        // notification.  Do not reject a terminal row before giving that
+        // receipt lookup a chance to acknowledge it.
+        let terminal_report_digest = remote_terminal_report_digest(&notification)?;
         let current_execution = ExecutionRepo::get_by_id(&*self.db, &notification.execution_id)
             .await?
             .ok_or_else(|| {
                 ServiceError::not_found("execution", notification.execution_id.clone())
             })?;
-        if !remote_execution_is_live_for_terminal(
-            &current_execution,
-            &lease_owner,
-            chrono::Utc::now(),
-        ) {
-            // A monitor/cancellation/connection replacement may already have
-            // won the execution CAS. Return a typed concurrent outcome so the
-            // caller cannot cascade Task state or publish a second terminal
-            // result from this stale remote notification.
+
+        // This authorization gate intentionally precedes every receipt,
+        // pricing-selection, and usage-ledger read/write. A stale/non-owner
+        // daemon therefore leaves no usage rows, events, or settlement
+        // evidence behind, including when the target is already terminal and
+        // would otherwise enter the late-drain path. Terminal reconnects are
+        // authorized from the terminal event's preserved previous owner.
+        if !self
+            .authorize_remote_terminal_execution(daemon_id, connection_id, &current_execution)
+            .await?
+        {
             return Ok(ExecutionTerminalOutcome::Concurrent {
                 current: Some(current_execution),
             });
+        }
+
+        // Reject a conflicting report before materializing any remote
+        // invocations. The invocation-admission helper is intentionally
+        // idempotent, but it may still create a newly observed candidate; a
+        // report-id conflict must not leave that side effect behind. An exact
+        // receipt replay can skip materialization entirely because the
+        // composite terminal boundary will return the durable outcome.
+        let durable_receipt = if let Some(receipt) = ExecutionRepo::get_execution_terminal_receipt(
+            &*self.db,
+            &notification.terminal_report_id,
+        )
+        .await?
+        {
+            if receipt.execution_id != notification.execution_id
+                || receipt.payload_digest != terminal_report_digest
+            {
+                return Err(ServiceError::Db(DbError::IdempotencyConflict));
+            }
+            if !self
+                .terminal_receipt_owned_by_daemon(&receipt, daemon_id)
+                .await?
+            {
+                return Err(ServiceError::Db(DbError::IdempotencyConflict));
+            }
+            Some(receipt)
+        } else {
+            None
+        };
+        if let Some(receipt) = durable_receipt {
+            // The receipt and its event were committed by the previous
+            // terminal attempt. Return that stored outcome immediately: no
+            // mutable route metadata, pricing reads, invocation materializa-
+            // tion, or post-commit cascade should run on an exact replay.
+            return self
+                .terminal_outcome_from_receipt(&receipt, current_execution)
+                .await;
         }
 
         let task = TaskRepo::get_by_id(&*self.db, &current_execution.task_id, false)
@@ -770,6 +977,99 @@ impl TaskService {
             None => None,
         };
 
+        let remote_reports = remote_usage_reports(&notification.usage_reports);
+        let snapshot_value = current_execution
+            .executor_config_snapshot_json
+            .as_deref()
+            .map(|snapshot| parse_json_value("executor config snapshot", snapshot))
+            .transpose()?;
+
+        // Hold the SQLite writer lock across the remote pricing/usage reads.
+        // This is an authority guard, not a second best-effort liveness read:
+        // a lease takeover cannot commit while the immutable selection,
+        // invocation, rate, and replay-event payloads are being prepared.
+        // The terminal CAS below reacquires the same lock and still verifies
+        // the owner/version, so a takeover in the short hand-off gap produces
+        // a side-effect-free concurrent result.
+        let (remote_invocations, usage_settlements) = {
+            let mut preparation_tx = db::begin_immediate(self.db.pool()).await?;
+            let authority = sqlx::query(
+                "SELECT status, lease_owner, lease_expires_at, hard_deadline_at
+                 FROM execution WHERE id = ?",
+            )
+            .bind(&notification.execution_id)
+            .fetch_optional(&mut *preparation_tx)
+            .await?;
+            let Some(authority) = authority else {
+                preparation_tx.rollback().await?;
+                return Ok(ExecutionTerminalOutcome::Concurrent { current: None });
+            };
+            let authority_status: String = authority.try_get("status")?;
+            let authority_owner: Option<String> = authority.try_get("lease_owner")?;
+            let authority_lease_expires_at: Option<String> =
+                authority.try_get("lease_expires_at")?;
+            let authority_hard_deadline_at: Option<String> =
+                authority.try_get("hard_deadline_at")?;
+            let authority_ok = if authority_status == ExecutionStatus::Running.to_string() {
+                remote_execution_lease_is_active(
+                    authority_owner.as_deref(),
+                    authority_lease_expires_at.as_deref(),
+                    authority_hard_deadline_at.as_deref(),
+                    &lease_owner,
+                    Utc::now(),
+                )
+            } else {
+                let previous_owner = sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT json_extract(payload_json, '$.previous_lease_owner')
+                     FROM domain_event
+                     WHERE entity_type = 'task'
+                       AND entity_id = ?
+                       AND event_type IN (
+                           'execution.completed', 'execution.failed',
+                           'execution.cancelled', 'execution.terminal_report.received'
+                       )
+                       AND json_extract(payload_json, '$.execution_id') = ?
+                     ORDER BY sequence DESC
+                     LIMIT 1",
+                )
+                .bind(&current_execution.task_id)
+                .bind(&current_execution.id)
+                .fetch_optional(&mut *preparation_tx)
+                .await?
+                .flatten();
+                previous_owner
+                    .as_deref()
+                    .is_some_and(|owner| remote_owner_belongs_to_daemon(owner, daemon_id))
+            };
+            if !authority_ok {
+                preparation_tx.rollback().await?;
+                let current =
+                    ExecutionRepo::get_by_id(&*self.db, &notification.execution_id).await?;
+                return Ok(ExecutionTerminalOutcome::Concurrent { current });
+            }
+            let remote_invocations = execution::ledger::ensure_remote_task_usage_invocations_in_tx(
+                &self.db,
+                &mut preparation_tx,
+                &current_execution,
+                &remote_reports,
+                snapshot_value.as_ref(),
+                &notification.ts,
+            )
+            .await?;
+            let usage_settlements =
+                execution::ledger::build_task_usage_settlements_with_prepared_invocations_in_tx(
+                    &self.db,
+                    &mut preparation_tx,
+                    &notification.execution_id,
+                    &remote_reports,
+                    &notification.ts,
+                    &remote_invocations,
+                )
+                .await?;
+            preparation_tx.commit().await?;
+            (remote_invocations, usage_settlements)
+        };
+
         // Heartbeats advance execution_version.  A terminal notification that
         // raced one of those renewals must retry against the same owner rather
         // than being mistaken for a competing terminal winner.  The owner
@@ -784,6 +1084,7 @@ impl TaskService {
         };
         let mut terminal_candidate = current_execution.clone();
         let mut terminal_retries = 0u8;
+        let terminal_updated_at = now_rfc3339();
         let terminal_outcome = loop {
             if !self
                 .daemon_connections
@@ -794,45 +1095,44 @@ impl TaskService {
                     current: Some(terminal_candidate),
                 };
             }
-            if !remote_execution_is_live_for_terminal(
-                &terminal_candidate,
-                &lease_owner,
-                chrono::Utc::now(),
-            ) {
-                break ExecutionTerminalOutcome::Concurrent {
-                    current: Some(terminal_candidate),
-                };
-            }
-            let updated_at = now_rfc3339();
-            let attempt = ExecutionRepo::terminalize(
+            let attempt = ExecutionRepo::terminalize_with_ledger_and_invocations(
                 &*self.db,
-                TerminalizeExecution {
-                    execution_id: notification.execution_id.clone(),
-                    expected_version: terminal_candidate.execution_version,
-                    lease_owner: Some(lease_owner.clone()),
-                    status: status.clone(),
-                    stop_reason: stop_reason.clone().map(Some),
-                    stopped_by: stopped_by.clone().map(Some),
-                    stopped_at: stopped_at.clone().map(Some),
-                    resume_policy: terminal_resume_policy.clone(),
-                    agent_session_id: notification.agent_session_id.clone().map(Some),
-                    agent_message_id: None,
-                    last_activity_at: None,
-                    last_progress_at: None,
-                    summary: notification.summary.clone().map(Some),
-                    logs_path: None,
-                    before_sha: None,
-                    after_sha: notification.after_sha.clone().map(Some),
-                    error: terminal_error.clone().map(Some),
-                    executor_config_snapshot_json: snapshot_update.clone().map(Some),
-                    updated_at: updated_at.clone(),
-                    actor_type: "daemon".to_owned(),
-                    actor_id: Some(lease_owner.clone()),
-                    correlation_id: Some(format!("remote-execution:{}", notification.execution_id)),
-                    causation_id: None,
-                    causation_depth: 0,
-                    lease_disposition: ExecutionLeaseDisposition::Revoke,
-                },
+                execution::ledger::terminal_with_late_ledger(
+                    TerminalizeExecution {
+                        execution_id: notification.execution_id.clone(),
+                        expected_version: terminal_candidate.execution_version,
+                        lease_owner: Some(lease_owner.clone()),
+                        status: status.clone(),
+                        stop_reason: stop_reason.clone().map(Some),
+                        stopped_by: stopped_by.clone().map(Some),
+                        stopped_at: stopped_at.clone().map(Some),
+                        resume_policy: terminal_resume_policy.clone(),
+                        agent_session_id: notification.agent_session_id.clone().map(Some),
+                        agent_message_id: None,
+                        last_activity_at: None,
+                        last_progress_at: None,
+                        summary: notification.summary.clone().map(Some),
+                        logs_path: None,
+                        before_sha: None,
+                        after_sha: notification.after_sha.clone().map(Some),
+                        error: terminal_error.clone().map(Some),
+                        executor_config_snapshot_json: snapshot_update.clone().map(Some),
+                        updated_at: terminal_updated_at.clone(),
+                        actor_type: "daemon".to_owned(),
+                        actor_id: Some(lease_owner.clone()),
+                        correlation_id: Some(format!(
+                            "remote-execution:{}",
+                            notification.execution_id
+                        )),
+                        causation_id: None,
+                        causation_depth: 0,
+                        lease_disposition: ExecutionLeaseDisposition::Revoke,
+                    },
+                    usage_settlements.clone(),
+                    Some(notification.terminal_report_id.clone()),
+                    Some(terminal_report_digest.clone()),
+                ),
+                remote_invocations.clone(),
             )
             .await?;
 
@@ -847,11 +1147,6 @@ impl TaskService {
                         .is_none_or(|registry| registry.is_current(daemon_id, connection_id))
                     && current.status == ExecutionStatus::Running
                     && current.lease_owner.as_deref() == Some(lease_owner.as_str())
-                    && remote_execution_is_live_for_terminal(
-                        &current,
-                        &lease_owner,
-                        chrono::Utc::now(),
-                    )
                     && terminal_candidate.execution_version < current.execution_version =>
                 {
                     // The bounded retry handles self-heartbeat version churn;
@@ -864,38 +1159,21 @@ impl TaskService {
                 outcome => break outcome,
             }
         };
-        let committed_outcome = terminal_outcome.clone();
-        let updated = match terminal_outcome {
-            ExecutionTerminalOutcome::Committed { execution, .. } => execution,
-            concurrent @ ExecutionTerminalOutcome::Concurrent { .. } => return Ok(concurrent),
+        let updated = match &terminal_outcome {
+            ExecutionTerminalOutcome::Committed { execution, .. } => execution.clone(),
+            ExecutionTerminalOutcome::Concurrent { .. } => return Ok(terminal_outcome),
         };
 
-        if let Some(usage) = notification.usage {
-            let provider = execution::usage_provider_from_snapshot(
-                current_execution.executor_config_snapshot_json.as_deref(),
-            );
-            let model = usage.model.unwrap_or_else(|| "default".to_owned());
-            if let Err(error) = ExecutionUsageRepo::upsert(
-                &*self.db,
-                UpsertExecutionUsage {
-                    execution_id: updated.id.clone(),
-                    provider,
-                    model,
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                    cache_read_tokens: usage.cache_read_tokens,
-                    cache_write_tokens: usage.cache_write_tokens,
-                    cost_usd: usage.cost_usd,
-                },
-            )
-            .await
-            {
-                tracing::warn!(
-                    execution_id = %updated.id,
-                    %error,
-                    "failed to record remote execution token usage"
-                );
-            }
+        // The composite boundary may observe a receipt committed by a
+        // concurrent delivery after the read-side lookup above.  Its durable
+        // replay marker is authoritative: return the stored outcome without
+        // publishing a second SSE event or rerunning memory/retry/block
+        // cascades.
+        if matches!(
+            terminal_outcome,
+            ExecutionTerminalOutcome::Committed { replayed: true, .. }
+        ) {
+            return Ok(terminal_outcome);
         }
 
         execution::publish_terminal_execution_event(self, &updated);
@@ -977,7 +1255,7 @@ impl TaskService {
             }
         }
 
-        Ok(committed_outcome)
+        Ok(terminal_outcome)
     }
 }
 

@@ -6,6 +6,86 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-08
+
+### Breaking
+
+- Usage and cost reporting now uses the append-only provider-attempt ledger and
+  typed provenance/coverage projections. The nullable `cost_usd` field, the
+  flattened `execution_usage` authority, and the merged `execution_count`
+  interpretation are removed from REST, daemon, CLI, MCP-chat, and generated
+  TypeScript surfaces. There is no compatibility alias, dual-write shim, or
+  parallel `_v2` response; clients must use the separate task/chat/inquiry and
+  provider-attempt counts plus `CostSummary`.
+- `AgentChatMessageResponse.token_usage_json` is removed in favor of typed
+  `usage: UsageBreakdown[]`, and daemon terminal reports carry a complete
+  per-candidate usage vector with stable report identity. The daemon protocol
+  minimum is bumped: an older daemon is rejected before dispatch, and a daemon
+  retains terminal usage until the server acknowledges its atomic accounting
+  transaction.
+- Project and account analytics now enforce their own visibility scopes and
+  half-open `[from, to)` occurrence windows. Project analytics excludes
+  ordinary Main Chat and Main inquiries; account analytics includes them, and
+  `execution_count` is not a replacement alias for the explicit count fields.
+- Provider-entry custom base URLs now reject userinfo, query parameters, and
+  fragments so credential-bearing endpoint metadata cannot be persisted.
+
+### Added
+
+- Server-owned models.dev pricing catalog status, explicit conditional refresh,
+  opaque-cursor model rates, exact provider-entry/CLI-runtime bindings, and
+  immutable manual per-million-token overrides. Refresh failures retain the
+  last-known-good snapshot; stale/failed freshness remains visible and never
+  blocks execution. Matching is exact, with no fuzzy model aliases, and
+  subscription/private-contract runtimes require explicit configuration.
+- Shared decimal-string `MoneyAmount`/`RateAmount`, disjoint token counters,
+  `UsageBreakdown`, `CostSummary`, coverage reason/denominator dimensions, and
+  fixed-point four-bucket estimation. Provider-reported money and Forge
+  estimates remain separate; unknown or incomplete data is not rendered as
+  `$0.00`.
+- Account usage analytics at `GET /api/v1/analytics/usage`, Project usage and
+  outcome economics, and explicit retrospective estimation preview,
+  idempotent commit, and immutable read resources. Retrospective estimation
+  prices exact legacy provider/model matches against one selected snapshot and
+  never overwrites provider-reported history or silently backfills on catalog
+  refresh.
+
+### Fixed
+
+- A user cancel and the recovery reaper can stop an execution whose owner lease
+  has expired. The ledger terminal CAS demanded a live `lease_expires_at` from
+  every caller rather than only from a remote owner proving it still holds the
+  execution, so the one state those two callers exist to clear was the one they
+  could never win: `POST /api/v1/executions/{id}/cancel` answered `200` with the
+  execution still running, and the expiry monitor skipped the reap. Liveness is
+  now proven only by a remote owner reporting its own terminal outcome, and a
+  stop that never reaches the row returns `409 version_conflict` instead of a
+  no-op that looks like success.
+- Pricing admission and the runtime now derive one candidate identity. Admission
+  hashed the snapshot's resolved `config` block while the embedded runtime hashed
+  the whole in-flight snapshot — which carries the Task role marker, the
+  read-only worktree marker, and an injected provider secret — so the keys never
+  matched and every embedded Task execution failed at the provider-call boundary
+  with `no immutable pricing selection for candidate`. Both sides now call
+  `executors::candidate_key_from_snapshot`, so a mutated snapshot cannot change
+  a candidate's identity mid-run.
+- A usage report that omits a token bucket is priced when that bucket carries no
+  rate. Requiring all four buckets left every OpenAI event unpriced, because the
+  provider never reports a cache write, so cost coverage could never leave
+  `unknown` in normal operation. An omitted bucket now blocks the estimate only
+  when the frozen rate actually prices it; an unpriced selection keeps the strict
+  rule and its sparse-report reason.
+- Review feedback now comes from the reviewer's execution instead of the
+  reviewed one. `Review::execution_id` names the execution under review — the
+  coder's — so a failed review handed the coder its own transcript, log path,
+  and execution ID as "reviewer findings", and the review/fix loop could not
+  converge on any finding that was not a CI failure. The coder now receives the
+  frozen conformance assessment: every requirement the reviewer did not find
+  satisfied, with its rationale and cited evidence.
+- A released milestone no longer projects a blocking `next_action`. It reaches
+  the Project overview through the primary-milestone clause, where its finished
+  evidence and check work was re-advertised as outstanding.
+
 ## [0.10.0] - 2026-09-07
 
 ### Breaking

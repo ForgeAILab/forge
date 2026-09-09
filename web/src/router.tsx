@@ -83,7 +83,7 @@ const TaskListPage = lazy(() =>
   import('@/pages/TaskListPage').then((module) => ({ default: module.TaskListPage })),
 )
 
-const accountTabs = new Set<AccountTab>(['profile', 'tokens'])
+const accountTabs = new Set<AccountTab>(['profile', 'tokens', 'analytics'])
 const forgeSettingsTabs = new Set<ForgeSettingsTab>(['server', 'agent', 'paths'])
 const projectSettingsTabs = new Set<ProjectSettingsTab>([
   'general',

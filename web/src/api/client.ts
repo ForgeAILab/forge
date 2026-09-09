@@ -1,5 +1,6 @@
 import type {
   Agent,
+  AccountUsageAnalyticsResponse,
   BranchListResponse,
   FsListResponse,
   NotificationResponse,
@@ -275,6 +276,17 @@ export async function getProjectAnalytics(
   return apiFetch<ProjectAnalyticsResponse>(
     `/projects/${projectId}/analytics${query ? `?${query}` : ''}`,
   )
+}
+
+export async function getAccountUsageAnalytics(
+  from?: string,
+  to?: string,
+): Promise<AccountUsageAnalyticsResponse> {
+  const params = new URLSearchParams()
+  if (from) params.set('from', from)
+  if (to) params.set('to', to)
+  const query = params.toString()
+  return apiFetch<AccountUsageAnalyticsResponse>(`/analytics/usage${query ? `?${query}` : ''}`)
 }
 
 export function listProjectHookRuns(

@@ -5,7 +5,7 @@ use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use executors::{
     AvailabilityInfo, AvailabilityStatus, ClaudeCodeConfig, CodingExecutorAdapter, DiscoverContext,
     DiscoveredOptions, ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError,
-    ExecutorKind, LogKind, LogStream, LogWriter, PermissionPolicy,
+    ExecutorKind, LogKind, LogStream, LogWriter, PermissionPolicy, UsageCounters, UsageReport,
 };
 use normalize::NormalizedEntry;
 use std::collections::HashMap;
@@ -41,7 +41,7 @@ struct StreamResult {
     cancelled: bool,
     agent_session_id: Option<String>,
     summary: Option<String>,
-    usage: Option<executors::TokenUsage>,
+    usage_reports: Vec<UsageReport>,
     availability: AvailabilitySignals,
 }
 
@@ -135,16 +135,20 @@ impl AvailabilitySignals {
     fn into_availability_error(
         self,
         exit_ok: bool,
-        usage: Option<executors::TokenUsage>,
+        usage_reports: Vec<UsageReport>,
     ) -> Option<ExecutorError> {
         if exit_ok && !self.saw_error_result {
             return None;
         }
         if let Some(retry_after) = self.limit_retry_after {
-            return Some(ExecutorError::UsageExhausted { retry_after, usage });
+            return Some(ExecutorError::UsageExhausted {
+                retry_after,
+                usage_reports,
+            });
         }
-        self.auth_failure.map(|reason| {
-            ExecutorError::Unavailable(format!("claude-code authentication failure: {reason}"))
+        self.auth_failure.map(|reason| ExecutorError::Unavailable {
+            reason: format!("claude-code authentication failure: {reason}"),
+            usage_reports,
         })
     }
 }
@@ -320,10 +324,18 @@ impl ClaudeCodeAdapter {
         if !stream.cancelled {
             let availability = stream
                 .availability
-                .into_availability_error(status.success(), stream.usage.clone());
+                .into_availability_error(status.success(), stream.usage_reports.clone());
             if let Some(availability) = availability {
                 return Err(availability);
             }
+        }
+
+        let mut usage_reports = stream.usage_reports;
+        for report in &mut usage_reports {
+            // Claude's provider is the configured backend unless the result
+            // event reports a more specific provider identity. Never infer it
+            // from the executor family.
+            report.fill_identity(None, config.model.as_deref());
         }
 
         let (status, error) = if stream.cancelled {
@@ -361,7 +373,7 @@ impl ClaudeCodeAdapter {
                         agent_session_id: agent_session_id.clone(),
                         summary: stream.summary,
                         error: Some(error.to_string()),
-                        usage: stream.usage,
+                        usage_reports,
                         ..Default::default()
                     });
                 }
@@ -376,7 +388,7 @@ impl ClaudeCodeAdapter {
             agent_session_id,
             summary: stream.summary,
             error,
-            usage: stream.usage,
+            usage_reports,
             ..Default::default()
         })
     }
@@ -550,7 +562,7 @@ async fn stream_child_output(
     let mut stderr_done = false;
     let mut agent_session_id = None;
     let mut summary = None;
-    let mut usage: Option<executors::TokenUsage> = None;
+    let mut usage_reports = Vec::new();
     let mut availability = AvailabilitySignals::default();
     let mut cancelled = false;
     let mut saw_child_output = false;
@@ -597,7 +609,7 @@ async fn stream_child_output(
                                 entry,
                                 &mut agent_session_id,
                                 &mut summary,
-                                &mut usage,
+                                &mut usage_reports,
                             ).await?;
                         }
                     }
@@ -647,7 +659,7 @@ async fn stream_child_output(
         cancelled,
         agent_session_id,
         summary,
-        usage,
+        usage_reports,
         availability,
     })
 }
@@ -657,7 +669,7 @@ async fn write_normalized_entry(
     entry: NormalizedEntry,
     agent_session_id: &mut Option<String>,
     summary: &mut Option<String>,
-    usage: &mut Option<executors::TokenUsage>,
+    usage_reports: &mut Vec<UsageReport>,
 ) -> Result<(), ExecutorError> {
     match entry {
         NormalizedEntry::Assistant {
@@ -696,8 +708,10 @@ async fn write_normalized_entry(
             session_id,
         } => {
             set_first_session_id(writer, agent_session_id, session_id).await?;
-            if payload.get("type").and_then(|v| v.as_str()) == Some("result") {
-                *usage = extract_usage_from_result(&payload);
+            if payload.get("type").and_then(|v| v.as_str()) == Some("result")
+                && let Some(report) = extract_usage_from_result(&payload)
+            {
+                upsert_usage_report(usage_reports, report);
             }
             writer
                 .write(LogKind::SessionInfo, LogStream::Main, payload)
@@ -713,34 +727,99 @@ async fn write_normalized_entry(
     Ok(())
 }
 
-fn extract_usage_from_result(payload: &serde_json::Value) -> Option<executors::TokenUsage> {
-    let usage_obj = payload.get("usage")?;
-    Some(executors::TokenUsage {
-        input_tokens: usage_obj
-            .get("input_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0),
-        output_tokens: usage_obj
-            .get("output_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0),
-        cache_read_tokens: usage_obj
-            .get("cache_read_input_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0),
-        cache_write_tokens: usage_obj
-            .get("cache_creation_input_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0),
-        cost_usd: payload
-            .get("total_cost_usd")
-            .or_else(|| payload.get("cost_usd"))
-            .and_then(|v| v.as_f64()),
-        model: payload
-            .get("model")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned),
+fn extract_usage_from_result(payload: &serde_json::Value) -> Option<UsageReport> {
+    let usage_obj = payload.get("usage");
+    let reported_cost_usd = payload
+        .get("total_cost_usd")
+        .or_else(|| payload.get("cost_usd"))
+        .and_then(exact_decimal_string);
+    if usage_obj.is_none() && reported_cost_usd.is_none() {
+        return None;
+    }
+
+    let counters = usage_obj.map_or_else(UsageCounters::default, |usage| UsageCounters {
+        input_tokens: nonnegative_u64(usage, &["input_tokens"]),
+        output_tokens: nonnegative_u64(usage, &["output_tokens"]),
+        cache_read_tokens: nonnegative_u64(
+            usage,
+            &["cache_read_input_tokens", "cache_read_tokens"],
+        ),
+        cache_write_tokens: nonnegative_u64(
+            usage,
+            &["cache_creation_input_tokens", "cache_write_tokens"],
+        ),
+    });
+    let mut report = if counters.has_any() {
+        UsageReport::metered(String::new(), counters)
+    } else {
+        UsageReport::unmetered(String::new())
+    };
+    report.report_id = string_field(
+        payload,
+        &["report_id", "reportId", "id", "request_id", "requestId"],
+    )
+    .map(str::to_owned)
+    .unwrap_or_default();
+    report.request_id =
+        string_field(payload, &["request_id", "requestId", "turn_id", "turnId"]).map(str::to_owned);
+    report.provider_id = string_field(payload, &["provider_id", "provider"]).map(str::to_owned);
+    report.model_id = string_field(payload, &["model_id", "model"]).map(str::to_owned);
+    report.reported_cost_usd = reported_cost_usd;
+    Some(report)
+}
+
+fn exact_decimal_string(value: &serde_json::Value) -> Option<String> {
+    let text = match value {
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::String(text) => text.trim().to_owned(),
+        _ => return None,
+    };
+    (!text.is_empty() && !text.starts_with('-')).then_some(text)
+}
+
+fn string_field<'a>(value: &'a serde_json::Value, fields: &[&str]) -> Option<&'a str> {
+    fields
+        .iter()
+        .find_map(|field| value.get(*field).and_then(serde_json::Value::as_str))
+}
+
+fn nonnegative_u64(value: &serde_json::Value, fields: &[&str]) -> Option<u64> {
+    fields.iter().find_map(|field| {
+        value.get(*field).and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_i64().filter(|value| *value >= 0).map(|v| v as u64))
+        })
     })
+}
+
+/// Claude emits one terminal cumulative result for a request. Replacing a
+/// prior snapshot avoids double-counting while retaining separately-identified
+/// provider reports if the CLI ever emits more than one result.
+fn upsert_usage_report(reports: &mut Vec<UsageReport>, next: UsageReport) {
+    let same_identity = |existing: &UsageReport| {
+        next.request_id
+            .as_ref()
+            .zip(existing.request_id.as_ref())
+            .is_some_and(|(left, right)| left == right)
+            || (!next.report_id.is_empty()
+                && !existing.report_id.is_empty()
+                && next.report_id == existing.report_id)
+    };
+    if let Some(existing) = reports.iter_mut().find(|existing| same_identity(existing)) {
+        *existing = next;
+    } else if next.request_id.is_none()
+        && next.report_id.is_empty()
+        && reports
+            .last()
+            .is_some_and(|existing| existing.request_id.is_none() && existing.report_id.is_empty())
+    {
+        if let Some(existing) = reports.last_mut() {
+            *existing = next;
+        }
+    } else {
+        reports.push(next);
+    }
 }
 
 async fn set_first_session_id(
@@ -971,7 +1050,7 @@ mod tests {
         let mut signals = AvailabilitySignals::default();
         signals.classify_error_channel_line(&format!("Claude AI usage limit reached|{epoch}"));
 
-        match signals.into_availability_error(false, None) {
+        match signals.into_availability_error(false, Vec::new()) {
             Some(ExecutorError::UsageExhausted { retry_after, .. }) => {
                 let retry = retry_after.expect("epoch converts to relative retry");
                 assert!(retry <= Duration::from_secs(3600));
@@ -988,7 +1067,7 @@ mod tests {
             r#"{"type":"error","error":{"type":"rate_limit_error","message":"Number of requests has exceeded your per-minute rate limit"}}"#,
         );
         assert!(matches!(
-            signals.into_availability_error(false, None),
+            signals.into_availability_error(false, Vec::new()),
             Some(ExecutorError::UsageExhausted {
                 retry_after: None,
                 ..
@@ -1000,8 +1079,8 @@ mod tests {
     fn auth_failure_classifies_as_unavailable() {
         let mut signals = AvailabilitySignals::default();
         signals.classify_error_channel_line("Invalid API key · Please run /login");
-        match signals.into_availability_error(false, None) {
-            Some(ExecutorError::Unavailable(reason)) => {
+        match signals.into_availability_error(false, Vec::new()) {
+            Some(ExecutorError::Unavailable { reason, .. }) => {
                 assert!(reason.to_ascii_lowercase().contains("invalid api key"));
             }
             other => panic!("expected Unavailable, got {other:?}"),
@@ -1016,7 +1095,7 @@ mod tests {
         );
         // Error result marks the run bad even when the exit code is 0.
         assert!(matches!(
-            signals.into_availability_error(true, None),
+            signals.into_availability_error(true, Vec::new()),
             Some(ExecutorError::UsageExhausted { .. })
         ));
     }
@@ -1032,13 +1111,17 @@ mod tests {
         signals.classify_stdout_event(
             r#"{"type":"result","subtype":"success","is_error":false,"result":"documented the usage limit reached error path"}"#,
         );
-        assert!(signals.into_availability_error(true, None).is_none());
+        assert!(signals.into_availability_error(true, Vec::new()).is_none());
 
         // A stray stderr limit line on a run that still exited 0 with no
         // error result does not classify.
         let mut recovered = AvailabilitySignals::default();
         recovered.classify_error_channel_line("usage limit reached");
-        assert!(recovered.into_availability_error(true, None).is_none());
+        assert!(
+            recovered
+                .into_availability_error(true, Vec::new())
+                .is_none()
+        );
     }
 
     #[test]
@@ -1250,6 +1333,44 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .ends_with(".claude")
+        );
+    }
+
+    #[test]
+    fn result_usage_preserves_explicit_zero_and_exact_reported_cost() {
+        let report = extract_usage_from_result(&serde_json::json!({
+            "type": "result",
+            "request_id": "request-1",
+            "provider": "anthropic",
+            "model": "claude-sonnet",
+            "total_cost_usd": "0.000000",
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+            }
+        }))
+        .expect("usage report extracted");
+
+        assert_eq!(
+            report.telemetry_state,
+            executors::UsageTelemetryState::Metered
+        );
+        assert!(report.counters.is_explicit_zero());
+        assert_eq!(report.reported_cost_usd.as_deref(), Some("0.000000"));
+        assert_eq!(report.provider_id.as_deref(), Some("anthropic"));
+        assert_eq!(report.model_id.as_deref(), Some("claude-sonnet"));
+    }
+
+    #[test]
+    fn result_without_usage_or_cost_has_no_synthetic_report() {
+        assert!(
+            extract_usage_from_result(&serde_json::json!({
+                "type": "result",
+                "status": "ok"
+            }))
+            .is_none()
         );
     }
 }

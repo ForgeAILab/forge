@@ -7,6 +7,11 @@ import type { ProjectHookRule } from './bindings/ProjectHookRule'
 import type { ProjectExecutionSetupResponse } from './bindings/ProjectExecutionSetupResponse'
 import type { ExecutionBlockerProjection } from './bindings/ExecutionBlockerProjection'
 import type { ExecutionEvidenceSummary } from './bindings/ExecutionEvidenceSummary'
+import type { ActivityCounts } from './bindings/ActivityCounts'
+import type { CostSummary } from './bindings/CostSummary'
+import type { TokenCounters } from './bindings/TokenCounters'
+import type { UsageAggregate } from './bindings/UsageAggregate'
+import type { UsageBreakdown } from './bindings/UsageBreakdown'
 
 export type TaskStatus = string
 
@@ -360,7 +365,9 @@ export interface PrProviderStatus {
 }
 
 export interface TaskExecutionObservability {
-  execution_count: number
+  counts: ActivityCounts
+  tokens: TokenCounters
+  cost: CostSummary
   active_execution_id?: string | null
   active_role?: string | null
   active_started_at?: string | null
@@ -372,12 +379,6 @@ export interface TaskExecutionObservability {
   latest_stopped_at?: string | null
   latest_runtime_seconds?: number | null
   total_runtime_seconds: number
-  total_input_tokens: number
-  total_output_tokens: number
-  total_cache_read_tokens: number
-  total_cache_write_tokens: number
-  total_tokens: number
-  total_cost_usd?: number | null
 }
 
 export interface PromptPreviewResponse {
@@ -618,7 +619,7 @@ export interface Execution {
   workspace_id?: string | null
   plan_progress?: PlanProgressSummary | null
   plan_artifact?: PlanArtifactDetail | null
-  usage?: ExecutionUsage[] | null
+  usage?: UsageBreakdown[] | null
   execution_version?: number
   /** Stable server-owned owner reference; never a credential or bearer token. */
   lease_owner?: string | null
@@ -665,15 +666,9 @@ export interface Agent {
   status: AgentStatus
   active_task_count?: number | null
   effective_status?: string | null
-  total_runs: number
   avg_duration_ms: number | null
   success_rate: number | null
-  total_input_tokens: number
-  total_output_tokens: number
-  total_cache_read_tokens: number
-  total_cache_write_tokens: number
-  total_tokens: number
-  total_cost_usd: number | null
+  usage: UsageAggregate
   is_default: boolean
   paused: boolean
   owner_id: string | null
@@ -1453,115 +1448,6 @@ export interface McpConfigActionRequest {
   action: 'install' | 'uninstall'
 }
 
-// --- Execution Usage (matches api_types::ExecutionUsageResponse) ---
-
-export interface ExecutionUsage {
-  id: string
-  execution_id: string
-  provider: string
-  model: string
-  input_tokens: number
-  output_tokens: number
-  cache_read_tokens: number
-  cache_write_tokens: number
-  cost_usd?: number | null
-  created_at: string
-}
-
-export interface TaskUsageSummary {
-  total_input_tokens: number
-  total_output_tokens: number
-  total_cache_read_tokens: number
-  total_cache_write_tokens: number
-  total_cost_usd?: number | null
-  execution_count: number
-}
-
-export interface ProjectAnalyticsResponse {
-  ci_steps: CiStepAnalytics[]
-  token_usage: TokenUsageAnalytics
-  review_summary: ReviewSummaryAnalytics
-}
-
-export interface CiStepAnalytics {
-  command: string
-  total_runs: number
-  pass_count: number
-  fail_count: number
-  success_rate: number
-  avg_duration_ms: number | null
-  p50_duration_ms: number | null
-  p95_duration_ms: number | null
-  last_run_at: string | null
-}
-
-export interface TokenUsageAnalytics {
-  total_input_tokens: number
-  total_output_tokens: number
-  total_cache_read_tokens: number
-  total_cache_write_tokens: number
-  total_cost_usd: number | null
-  execution_count: number
-  /** Agent Chat turns counted in the totals, across both chat surfaces. */
-  chat_turn_count: number
-  by_model: ModelTokenBreakdown[]
-  by_agent: AgentTokenBreakdown[]
-  by_surface: SurfaceTokenBreakdown[]
-}
-
-/**
- * Where a Project's tokens were spent. Task executions are only part of the
- * bill: the Genesis discovery that produced the Project and the Project
- * Agent's own orchestration turns are recorded on chat messages, and for a
- * small Project they routinely outweigh the code work.
- */
-export interface SurfaceTokenBreakdown {
-  /** `task_execution`, `project_chat`, or `genesis_chat`. */
-  surface: string
-  /** Task executions for `task_execution`, Agent Chat turns otherwise. */
-  run_count: number
-  input_tokens: number
-  output_tokens: number
-  cache_read_tokens: number
-  cache_write_tokens: number
-  cost_usd: number | null
-}
-
-export interface ModelTokenBreakdown {
-  provider: string
-  model: string
-  input_tokens: number
-  output_tokens: number
-  cache_read_tokens: number
-  cache_write_tokens: number
-  cost_usd: number | null
-  execution_count: number
-}
-
-export interface AgentTokenBreakdown {
-  agent_id: string
-  agent_name: string
-  executor_type: string
-  model: string | null
-  input_tokens: number
-  output_tokens: number
-  cache_read_tokens: number
-  cache_write_tokens: number
-  cost_usd: number | null
-  execution_count: number
-  success_rate: number | null
-  avg_duration_ms: number | null
-}
-
-export interface ReviewSummaryAnalytics {
-  total_reviews: number
-  passed: number
-  failed: number
-  cancelled: number
-  avg_duration_ms: number | null
-  pass_rate: number
-}
-
 export type OperatorSeverity = 'healthy' | 'attention' | 'blocked' | 'error'
 
 export interface OperatorStatusResponse {
@@ -1620,11 +1506,8 @@ export interface AgentPressureSummary {
 }
 
 export interface TokenTotalsSummary {
-  input_tokens: number
-  output_tokens: number
-  cache_read_tokens: number
-  cache_write_tokens: number
-  cost_usd: number | null
+  tokens: TokenCounters
+  cost: CostSummary
 }
 
 export interface BlockedTaskSummary {
@@ -1661,10 +1544,9 @@ export interface RetryPressureSummary {
 }
 
 export interface UsageSummary {
-  available: boolean
-  total_input_tokens: number | null
-  total_output_tokens: number | null
-  total_cost_usd: number | null
+  counts: ActivityCounts
+  tokens: TokenCounters
+  cost: CostSummary
   active_execution_count: number
 }
 

@@ -167,6 +167,13 @@ impl AgentInquiryRepo for SqliteDb {
         }
     }
 
+    async fn complete_agent_inquiry_with_usage(
+        &self,
+        input: CompleteAgentInquiryWithUsage,
+    ) -> Result<AgentInquiry> {
+        super::chat_ledger::complete_agent_inquiry_with_usage(self, input).await
+    }
+
     async fn cancel_agent_inquiry(&self, id: &str, expected_version: i64) -> Result<AgentInquiry> {
         let now = now_rfc3339();
         let sql = format!(
@@ -199,9 +206,16 @@ impl AgentInquiryRepo for SqliteDb {
             },
         }
     }
+
+    async fn cancel_agent_inquiry_with_usage(
+        &self,
+        input: CancelAgentInquiryWithUsage,
+    ) -> Result<AgentInquiry> {
+        super::chat_ledger::cancel_agent_inquiry_with_usage(self, input).await
+    }
 }
 
-fn map_agent_inquiry(row: SqliteRow) -> Result<AgentInquiry> {
+pub(super) fn map_agent_inquiry(row: SqliteRow) -> Result<AgentInquiry> {
     Ok(AgentInquiry {
         id: row.try_get("id")?,
         chat_id: row.try_get("chat_id")?,

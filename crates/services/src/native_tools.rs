@@ -3026,6 +3026,7 @@ impl CoordinationToolProvider {
             AgentHostError::VersionConflict => "version_conflict",
             AgentHostError::Unsupported(_) => "unsupported",
             AgentHostError::Runtime(_) => "runtime",
+            AgentHostError::RuntimeWithUsage { .. } => "runtime",
             AgentHostError::TurnLimitReached { .. } => "turn_limit_reached",
             AgentHostError::ProtectedPersistence => "protected_persistence",
         };
@@ -3120,6 +3121,13 @@ impl CoordinationToolProvider {
                 outcome
             }
             AgentHostError::Runtime(_) => OrchestrationOutcome::failed(
+                OutcomeCode::InternalFailure,
+                operation,
+                outcome_scope(scope),
+                &correlation_id,
+                "the Forge operation could not complete",
+            ),
+            AgentHostError::RuntimeWithUsage { .. } => OrchestrationOutcome::failed(
                 OutcomeCode::InternalFailure,
                 operation,
                 outcome_scope(scope),

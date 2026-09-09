@@ -1,99 +1,62 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+use crate::{AnalyticsWindow, OutcomeCostMetric, ProjectUsageBreakdown, UsageAnalytics};
+
+/// Project analytics for one immutable half-open accounting window.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
 #[ts(export)]
 pub struct ProjectAnalyticsResponse {
+    pub window: AnalyticsWindow,
     pub ci_steps: Vec<CiStepAnalytics>,
-    pub token_usage: TokenUsageAnalytics,
+    pub token_usage: UsageAnalytics,
     pub review_summary: ReviewSummaryAnalytics,
+    pub outcome_economics: OutcomeCostMetric,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+/// CI-step execution counts and timing analytics.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
 #[ts(export)]
 pub struct CiStepAnalytics {
     pub command: String,
+    #[ts(type = "number")]
     pub total_runs: i64,
+    #[ts(type = "number")]
     pub pass_count: i64,
+    #[ts(type = "number")]
     pub fail_count: i64,
     pub success_rate: f64,
+    #[ts(type = "number | null")]
     pub avg_duration_ms: Option<i64>,
+    #[ts(type = "number | null")]
     pub p50_duration_ms: Option<i64>,
+    #[ts(type = "number | null")]
     pub p95_duration_ms: Option<i64>,
     pub last_run_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+/// Account-scoped usage analytics across every product surface.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
-pub struct TokenUsageAnalytics {
-    pub total_input_tokens: i64,
-    pub total_output_tokens: i64,
-    pub total_cache_read_tokens: i64,
-    pub total_cache_write_tokens: i64,
-    pub total_cost_usd: Option<f64>,
-    pub execution_count: i64,
-    /// Agent Chat turns counted in the totals, across both chat surfaces.
-    pub chat_turn_count: i64,
-    pub by_model: Vec<ModelTokenBreakdown>,
-    pub by_agent: Vec<AgentTokenBreakdown>,
-    pub by_surface: Vec<SurfaceTokenBreakdown>,
+pub struct AccountUsageAnalyticsResponse {
+    pub window: AnalyticsWindow,
+    pub token_usage: UsageAnalytics,
+    pub by_project: Vec<ProjectUsageBreakdown>,
 }
 
-/// Where a Project's tokens were spent. Task executions are only part of the
-/// bill: the Genesis discovery that produced the Project and the Project
-/// Agent's own orchestration turns are recorded on chat messages, and for a
-/// small Project they routinely outweigh the code work.
+/// Review counts remain separate from token/cost analytics.
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
-#[ts(export)]
-pub struct SurfaceTokenBreakdown {
-    /// `task_execution`, `project_chat`, or `genesis_chat`.
-    pub surface: String,
-    /// Task executions for `task_execution`, Agent Chat turns otherwise.
-    pub run_count: i64,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub cache_write_tokens: i64,
-    pub cost_usd: Option<f64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct ModelTokenBreakdown {
-    pub provider: String,
-    pub model: String,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub cache_write_tokens: i64,
-    pub cost_usd: Option<f64>,
-    pub execution_count: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
-#[ts(export)]
-pub struct AgentTokenBreakdown {
-    pub agent_id: String,
-    pub agent_name: String,
-    pub executor_type: String,
-    pub model: Option<String>,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub cache_write_tokens: i64,
-    pub cost_usd: Option<f64>,
-    pub execution_count: i64,
-    pub success_rate: Option<f64>,
-    pub avg_duration_ms: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct ReviewSummaryAnalytics {
+    #[ts(type = "number")]
     pub total_reviews: i64,
+    #[ts(type = "number")]
     pub passed: i64,
+    #[ts(type = "number")]
     pub failed: i64,
+    #[ts(type = "number")]
     pub cancelled: i64,
+    #[ts(type = "number | null")]
     pub avg_duration_ms: Option<i64>,
     pub pass_rate: f64,
 }

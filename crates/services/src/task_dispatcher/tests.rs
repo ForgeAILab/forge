@@ -47,6 +47,13 @@ async fn sqlite_db() -> db::SqliteDb {
 
 fn setup_git_repo(path: &Path) -> String {
     run_git(path, &["init"]);
+    // Pin the initial branch the way `git::init` does. Repository readiness
+    // requires the registered default branch to be `main` and to exist on
+    // disk, so inheriting the host's `init.defaultBranch` makes an
+    // implementation Task park on "execution setup required" wherever git
+    // still creates `master` — which is every CI runner, and no machine with
+    // an ambient `init.defaultBranch=main`.
+    run_git(path, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     run_git(path, &["config", "user.email", "test@forge.dev"]);
     run_git(path, &["config", "user.name", "Forge Test"]);
     std::fs::write(path.join("README.md"), "# Forge\n").expect("README writes");
@@ -504,6 +511,31 @@ async fn seed_cancelled_execution(
     )
     .await
     .expect("execution creates")
+}
+
+/// Budget for "a dispatch should arrive". The waiting loops break on the first
+/// execution, so the whole budget is only ever spent on a failure — it is sized
+/// for a saturated CI runner, not for the expected path.
+const DISPATCH_WAIT_ATTEMPTS: usize = 40;
+const DISPATCH_WAIT_STEP: Duration = Duration::from_millis(250);
+
+/// Why a dispatch never arrived, in the dispatcher's own terms. A parked Task
+/// and a starved one look identical from a bare timeout, and only the first is
+/// a product failure.
+async fn describe_stalled_dispatch(db: &db::SqliteDb, task_id: &str) -> String {
+    let Ok(Some(task)) = TaskRepo::get_by_id(db, task_id, false).await else {
+        return format!("task {task_id} no longer loads");
+    };
+    match deferred_dispatch::dispatch_disposition_for_test(&task) {
+        Some(disposition) => format!(
+            "task is {} and parked at version {} on capability {}: {}",
+            task.status, disposition.task_version, disposition.capability, disposition.safe_message
+        ),
+        None => format!(
+            "task is {} with no recorded dispatch disposition",
+            task.status
+        ),
+    }
 }
 
 async fn build_dispatcher(
@@ -2058,9 +2090,13 @@ async fn dispatcher_starts_charter_backed_work_without_a_baseline_gate() {
 
     let mut total_progress = 0;
     let mut execution_received = false;
-    for _ in 0..5 {
+    // The loop exits on the first dispatch, so the budget only matters on a
+    // runner slow enough to starve the spawned executor. Keep it generous: a
+    // dispatch that never lands is a real refusal, and the report below says
+    // which one rather than leaving a bare timeout.
+    for _ in 0..DISPATCH_WAIT_ATTEMPTS {
         total_progress += dispatcher.check_once().await.expect("dispatcher runs");
-        if tokio::time::timeout(Duration::from_millis(250), rx.recv())
+        if tokio::time::timeout(DISPATCH_WAIT_STEP, rx.recv())
             .await
             .is_ok()
         {
@@ -2068,10 +2104,12 @@ async fn dispatcher_starts_charter_backed_work_without_a_baseline_gate() {
             break;
         }
     }
-    assert!(
-        total_progress > 0,
-        "Charter-backed work leaves its initial state"
-    );
+    if total_progress == 0 {
+        panic!(
+            "Charter-backed work leaves its initial state: {}",
+            describe_stalled_dispatch(&db, &task.id).await
+        );
+    }
     assert!(
         execution_received,
         "the workflow reaches its configured worker"
@@ -2115,9 +2153,9 @@ async fn wake_does_not_duplicate_already_dispatched_charter_work() {
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
     let mut execution_received = false;
-    for _ in 0..5 {
+    for _ in 0..DISPATCH_WAIT_ATTEMPTS {
         dispatcher.check_once().await.expect("dispatcher runs");
-        if tokio::time::timeout(Duration::from_millis(250), rx.recv())
+        if tokio::time::timeout(DISPATCH_WAIT_STEP, rx.recv())
             .await
             .is_ok()
         {
@@ -2125,7 +2163,12 @@ async fn wake_does_not_duplicate_already_dispatched_charter_work() {
             break;
         }
     }
-    assert!(execution_received, "executor receives initial dispatch");
+    if !execution_received {
+        panic!(
+            "executor receives initial dispatch: {}",
+            describe_stalled_dispatch(&db, &task.id).await
+        );
+    }
     deferred_dispatch::wake_task_dispatch(&db, &task.id, "test: redundant wake")
         .await
         .expect("wake succeeds");

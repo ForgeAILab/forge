@@ -118,9 +118,15 @@ where
                 "Agent Inquiry is already terminal and cannot be cancelled",
             ));
         }
-        let cancelled =
-            AgentInquiryRepo::cancel_agent_inquiry(&*self.db, &inquiry.id, expected_version)
-                .await?;
+        let cancelled = AgentInquiryRepo::cancel_agent_inquiry_with_usage(
+            &*self.db,
+            db::CancelAgentInquiryWithUsage {
+                id: inquiry.id.clone(),
+                expected_version,
+                settlements: Vec::new(),
+            },
+        )
+        .await?;
         // Stop the provider call itself. The record is already terminal, so a
         // runner that has nothing to signal (the run finished in between, or
         // this process did not host it) is a normal outcome, not a failure.
