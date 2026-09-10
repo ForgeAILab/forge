@@ -6,6 +6,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Fixed
+
+- Let Agent Settings edit an agent's maximum concurrent task executions and
+  delete an agent from the roster with an explicit confirmation while
+  preserving its run history.
+
 ## [0.11.0] - 2026-09-08
 
 ### Breaking

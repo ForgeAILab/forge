@@ -17,6 +17,7 @@ const createProviderEntry = vi.fn()
 const removeProviderEntry = vi.fn().mockResolvedValue({ provider_revocation: 'succeeded' })
 const cancelAuthorization = vi.fn().mockResolvedValue({})
 const updateAgent = vi.fn().mockResolvedValue({})
+const deleteAgent = vi.fn().mockResolvedValue(undefined)
 const testProviderEntry = vi.fn().mockResolvedValue({
   status: 'ok',
   latency_ms: 123,
@@ -120,6 +121,7 @@ vi.mock('@/api/hooks', () => ({
     refetch: vi.fn(),
   }),
   useUpdateAgent: () => ({ mutateAsync: updateAgent, isPending: false }),
+  useDeleteAgent: () => ({ mutateAsync: deleteAgent, isPending: false }),
 }))
 // The agent dialogs reuse the launch-dialog selectors, which need discovered
 // options to offer models and reasoning efforts.
@@ -503,6 +505,7 @@ describe('FederatedAgentsPage', () => {
     startAuthorization.mockClear()
     cancelAuthorization.mockClear()
     updateAgent.mockClear()
+    deleteAgent.mockClear()
   })
 
   it('defaults to the agents roster and keeps bindings on their own tab', () => {
@@ -554,6 +557,40 @@ describe('FederatedAgentsPage', () => {
     expect(connectProfile).not.toHaveBeenCalled()
   })
 
+  it("updates an agent's maximum concurrent task executions", async () => {
+    updateAgent.mockResolvedValueOnce({ ...agent, max_concurrent_tasks: 4, version: 2 })
+    renderPage()
+    fireEvent.click(screen.getByText('Forge Guide'))
+
+    fireEvent.change(screen.getByLabelText('Max concurrent tasks'), { target: { value: '4' } })
+    fireEvent.click(screen.getByRole('button', { name: /save settings/i }))
+
+    await vi.waitFor(() =>
+      expect(updateAgent).toHaveBeenCalledWith({
+        agentId: 'agent-1',
+        body: {
+          name: 'Forge Guide',
+          description: 'A bounded account assistant.',
+          max_concurrent_tasks: 4,
+          version: 1,
+        },
+      }),
+    )
+    expect(connectProfile).not.toHaveBeenCalled()
+  })
+
+  it('deletes an agent after confirmation and clears the detail selection', async () => {
+    renderPage()
+    fireEvent.click(screen.getByText('Forge Guide'))
+
+    fireEvent.click(screen.getByRole('button', { name: /^delete agent$/i }))
+    const confirmation = screen.getByRole('dialog', { name: /delete Forge Guide/i })
+    fireEvent.click(within(confirmation).getByRole('button', { name: /delete Forge Guide/i }))
+
+    await vi.waitFor(() => expect(deleteAgent).toHaveBeenCalledWith('agent-1'))
+    expect(await screen.findByText('Select an agent')).toBeTruthy()
+  })
+
   it('edits a CLI-harness agent inline through the core agent PATCH', async () => {
     renderPage()
     fireEvent.click(screen.getByText('Codex Runner'))
@@ -576,6 +613,7 @@ describe('FederatedAgentsPage', () => {
         body: {
           name: 'Codex Runner',
           description: 'A CLI-harness worker.',
+          max_concurrent_tasks: 1,
           model: 'gpt-5.2-codex',
           reasoning_effort: 'high',
           permission_policy: 'supervised',

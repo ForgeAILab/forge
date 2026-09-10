@@ -593,6 +593,7 @@ export function AgentsTab({
                 agent={selectedAgent}
                 entries={entries}
                 chatEntries={chatEntries}
+                onDeleted={() => onSelect(null)}
               />
             ) : (
               <EmptyDetailPanel />

@@ -1,9 +1,17 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { Robot, ShieldCheck } from '@phosphor-icons/react'
-import { useUpdateAgent } from '@/api/hooks'
+import { Robot, ShieldCheck, Trash } from '@phosphor-icons/react'
+import { useDeleteAgent, useUpdateAgent } from '@/api/hooks'
 import { Button } from '@/components/ui/button'
 import { CollapsibleSection } from '@/components/ui/collapsible-section'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
@@ -36,14 +44,20 @@ export function AgentDetailPanel({
   agent,
   entries,
   chatEntries,
+  onDeleted,
 }: {
   agent: FederatedAgent
   entries: ProviderEntryResponse[]
   chatEntries: AgentChatEntry[]
+  onDeleted: () => void
 }) {
+  const queryClient = useQueryClient()
   const updateAvailability = useUpdateAgent()
+  const deleteAgent = useDeleteAgent()
   const [confirmingDisable, setConfirmingDisable] = useState(false)
+  const [confirmingDelete, setConfirmingDelete] = useState(false)
   const [availabilityError, setAvailabilityError] = useState<string>()
+  const [deleteError, setDeleteError] = useState<string>()
   const credentialEntry = entries.find((entry) => entry.id === agent.credential_handle_id)
   const requiresRecovery =
     credentialEntry != null &&
@@ -265,6 +279,90 @@ export function AgentDetailPanel({
             </div>
           </dl>
         </CollapsibleSection>
+
+        <section
+          className="rounded-md border border-destructive/30 bg-destructive/5 p-3"
+          aria-labelledby="agent-delete-heading"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="min-w-0">
+              <h3 id="agent-delete-heading" className="text-sm font-medium text-foreground">
+                Delete agent
+              </h3>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                Removes this agent from the roster. Run history stays available, and any Main or
+                Project Agent assignment will need a replacement.
+              </p>
+            </div>
+            <Button
+              size="sm"
+              variant="destructive"
+              disabled={deleteAgent.isPending}
+              onClick={() => {
+                setDeleteError(undefined)
+                setConfirmingDelete(true)
+              }}
+            >
+              <Trash size={14} aria-hidden />
+              Delete agent
+            </Button>
+          </div>
+        </section>
+        <Dialog
+          open={confirmingDelete}
+          onOpenChange={(open) => {
+            if (deleteAgent.isPending) return
+            setConfirmingDelete(open)
+            if (!open) setDeleteError(undefined)
+          }}
+        >
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Delete {agent.name}?</DialogTitle>
+              <DialogDescription>
+                This removes the agent from the roster and stops it from accepting new work.
+                Existing run history is preserved, and any Main or Project Agent assignment will
+                need a replacement.
+              </DialogDescription>
+            </DialogHeader>
+            {deleteError ? (
+              <p className="mt-4 text-xs text-destructive" role="alert">
+                {deleteError}
+              </p>
+            ) : null}
+            <DialogFooter>
+              <Button
+                variant="ghost"
+                disabled={deleteAgent.isPending}
+                onClick={() => setConfirmingDelete(false)}
+              >
+                Keep agent
+              </Button>
+              <Button
+                variant="destructive"
+                disabled={deleteAgent.isPending}
+                onClick={() => {
+                  setDeleteError(undefined)
+                  void deleteAgent
+                    .mutateAsync(agent.id)
+                    .then(() => {
+                      onDeleted()
+                      void queryClient.invalidateQueries({
+                        queryKey: federationQueryKeys.agents,
+                      })
+                    })
+                    .catch((cause: unknown) =>
+                      setDeleteError(
+                        cause instanceof Error ? cause.message : 'Agent could not be deleted.',
+                      ),
+                    )
+                }}
+              >
+                {deleteAgent.isPending ? 'Deleting…' : `Delete ${agent.name}`}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </div>
     </div>
   )
@@ -289,6 +387,7 @@ function AgentSettingsForm({
   const credentialEntry = entries.find((entry) => entry.id === agent.credential_handle_id)
   const [name, setName] = useState(agent.name)
   const [description, setDescription] = useState(agent.description ?? '')
+  const [maxConcurrentTasks, setMaxConcurrentTasks] = useState(String(agent.max_concurrent_tasks))
   const [entryId, setEntryId] = useState(agent.credential_handle_id ?? '')
   const [model, setModel] = useState(agent.model ?? '')
   const [reasoningEffort, setReasoningEffort] = useState(agent.reasoning_effort ?? '')
@@ -308,6 +407,7 @@ function AgentSettingsForm({
   function syncFromAgent() {
     setName(agent.name)
     setDescription(agent.description ?? '')
+    setMaxConcurrentTasks(String(agent.max_concurrent_tasks))
     setEntryId(agent.credential_handle_id ?? '')
     setModel(agent.model ?? '')
     setReasoningEffort(agent.reasoning_effort ?? '')
@@ -322,15 +422,18 @@ function AgentSettingsForm({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agent.id, agent.version])
 
-  const dirty =
+  const identityDirty =
     name !== agent.name ||
     description !== (agent.description ?? '') ||
+    maxConcurrentTasks !== String(agent.max_concurrent_tasks)
+  const profileDirty =
     model !== (agent.model ?? '') ||
     systemPrompt !== (agent.prompt_template ?? '') ||
     (direct
       ? entryId !== (agent.credential_handle_id ?? '')
       : reasoningEffort !== (agent.reasoning_effort ?? '') ||
         permissionPolicy !== (agent.permission_policy ?? null))
+  const dirty = identityDirty || profileDirty
 
   const selectedEntryCapability = useMemo(() => {
     const entry = activeEntries.find((candidate) => candidate.id === entryId)
@@ -356,6 +459,11 @@ function AgentSettingsForm({
       setError('A model is required.')
       return
     }
+    const parsedMaxConcurrentTasks = Number(maxConcurrentTasks)
+    if (!Number.isSafeInteger(parsedMaxConcurrentTasks) || parsedMaxConcurrentTasks < 1) {
+      setError('Max concurrent tasks must be a whole number greater than zero.')
+      return
+    }
     setError(undefined)
     try {
       if (direct) {
@@ -366,34 +474,38 @@ function AgentSettingsForm({
         // Name and description live on the identity; the runtime settings
         // publish internally as the agent's next settings revision.
         let version = agent.version
-        if (name.trim() !== agent.name || description.trim() !== (agent.description ?? '')) {
+        if (identityDirty) {
           const updated = await updateAgent.mutateAsync({
             agentId: agent.id,
             body: {
               name: name.trim(),
               description: description.trim() ? description.trim() : null,
+              max_concurrent_tasks: parsedMaxConcurrentTasks,
               version,
             },
           })
           version = updated.version
         }
-        await connectProfile.mutateAsync({
-          identityId: agent.id,
-          input: {
-            version,
-            credential_id: entryId,
-            model: model.trim(),
-            system_prompt: systemPrompt.trim() ? systemPrompt.trim() : null,
-            permission_policy: agent.permission_policy ?? 'scoped_proposals',
-            tool_policy: DEFAULT_CEILING,
-          },
-        })
+        if (profileDirty) {
+          await connectProfile.mutateAsync({
+            identityId: agent.id,
+            input: {
+              version,
+              credential_id: entryId,
+              model: model.trim(),
+              system_prompt: systemPrompt.trim() ? systemPrompt.trim() : null,
+              permission_policy: agent.permission_policy ?? 'scoped_proposals',
+              tool_policy: DEFAULT_CEILING,
+            },
+          })
+        }
       } else {
         await updateAgent.mutateAsync({
           agentId: agent.id,
           body: {
             name: name.trim(),
             description: description.trim() ? description.trim() : null,
+            max_concurrent_tasks: parsedMaxConcurrentTasks,
             model: model.trim(),
             reasoning_effort: reasoningEffort.trim() ? reasoningEffort.trim() : null,
             permission_policy: permissionPolicy,
@@ -462,6 +574,26 @@ function AgentSettingsForm({
               onChange={(event) => setDescription(event.target.value)}
               placeholder="What this agent is for"
             />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="agent-settings-max-concurrent-tasks">Max concurrent tasks</Label>
+            <Input
+              id="agent-settings-max-concurrent-tasks"
+              type="number"
+              min={1}
+              step={1}
+              inputMode="numeric"
+              value={maxConcurrentTasks}
+              onChange={(event) => setMaxConcurrentTasks(event.target.value)}
+              aria-describedby="agent-settings-max-concurrent-tasks-help"
+              required
+            />
+            <p
+              id="agent-settings-max-concurrent-tasks-help"
+              className="text-micro leading-4 text-muted-foreground"
+            >
+              Maximum task executions this agent may run at the same time.
+            </p>
           </div>
 
           {direct ? (
