@@ -7,18 +7,25 @@ use std::time::Duration;
 use events::{
     event_timestamp, EventBus, EventContext, ForgeEvent, OPERATIONS_STATUS_CHANGED_EVENT,
 };
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
 pub struct OperatorStatusEmitter {
-    _event_bus: Arc<EventBus>,
-    handle: JoinHandle<()>,
+    event_bus: Arc<EventBus>,
 }
 
 impl OperatorStatusEmitter {
-    pub fn start(event_bus: Arc<EventBus>) -> Self {
-        let task_event_bus = Arc::clone(&event_bus);
-        let handle = tokio::spawn(async move {
+    pub fn new(event_bus: Arc<EventBus>) -> Self {
+        Self { event_bus }
+    }
+
+    pub fn start(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
+        let task_event_bus = Arc::clone(&self.event_bus);
+        tokio::spawn(async move {
+            if *shutdown.borrow_and_update() {
+                return;
+            }
+
             let mut rx = task_event_bus.subscribe();
             let dirty = AtomicBool::new(false);
             let mut last_event_type: Option<String> = None;
@@ -53,18 +60,14 @@ impl OperatorStatusEmitter {
                             });
                         }
                     }
+                    result = shutdown.changed() => {
+                        if result.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                    }
                 }
             }
-        });
-
-        Self {
-            _event_bus: event_bus,
-            handle,
-        }
-    }
-
-    pub fn stop(&self) {
-        self.handle.abort();
+        })
     }
 }
 
@@ -108,7 +111,9 @@ mod tests {
         tokio::time::pause();
 
         let event_bus = Arc::new(EventBus::new(64));
-        let emitter = OperatorStatusEmitter::start(Arc::clone(&event_bus));
+        let emitter = Arc::new(OperatorStatusEmitter::new(Arc::clone(&event_bus)));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let emitter_handle = Arc::clone(&emitter).start(shutdown_rx);
         let mut rx = event_bus.subscribe();
 
         tokio::task::yield_now().await;
@@ -145,7 +150,8 @@ mod tests {
             }
         }
 
-        emitter.stop();
+        shutdown_tx.send(true).expect("shutdown sends");
+        emitter_handle.await.expect("emitter stops");
 
         assert_eq!(operations_status_changed_count, 1);
     }

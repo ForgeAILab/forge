@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/forge-solo",
     "crates/forge-cli",
     "crates/forge-client",
     "crates/forge-daemon",

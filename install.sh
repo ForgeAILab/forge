@@ -69,7 +69,7 @@ fi
 
 tar -xzf "${TMP_DIR}/${ARTIFACT}.tar.gz" -C "$TMP_DIR"
 
-echo "==> Installing forge and forge-ctl to ${BINARY_DIR}"
+echo "==> Installing forge, forge-ctl, and forge-solo to ${BINARY_DIR}"
 
 install_mode=""
 if ! can_write_target "$BINARY_DIR" || ! can_write_target "$SHARE_DIR"; then
@@ -80,6 +80,7 @@ fi
 $install_mode mkdir -p "$BINARY_DIR"
 $install_mode install -m 755 "${TMP_DIR}/forge" "${BINARY_DIR}/forge"
 $install_mode install -m 755 "${TMP_DIR}/forge-ctl" "${BINARY_DIR}/forge-ctl"
+$install_mode install -m 755 "${TMP_DIR}/forge-solo" "${BINARY_DIR}/forge-solo"
 
 if [ -d "${TMP_DIR}/web/dist" ]; then
     echo "==> Installing web UI assets to ${SHARE_DIR}/web/dist"
@@ -93,6 +94,7 @@ fi
 echo "==> Installed:"
 echo "    forge     -> ${BINARY_DIR}/forge"
 echo "    forge-ctl -> ${BINARY_DIR}/forge-ctl"
+echo "    forge-solo -> ${BINARY_DIR}/forge-solo"
 echo "    web UI    -> ${SHARE_DIR}/web/dist"
 echo ""
-echo "Run 'forge --help' to get started."
+echo "Run 'forge --help' for the server or 'forge-solo --help' for the interactive Git-repository TUI."

@@ -1,63 +1,25 @@
 use std::{path::PathBuf, sync::Arc};
 
-use config::{default_config_path, ForgeConfig};
+use config::ForgeConfig;
 use db::SqliteDb;
 use events::EventBus;
-use executors::{AdapterRegistry, FallbackExecutor, TaskExecutor};
+use executors::{AdapterRegistry, TaskExecutor};
 use services::{
     AgentActionService, AgentChatTurnLogRoot, AgentChatTurnWorker, AgentInboxService, AgentService,
-    AuthService, CommitmentService, DaemonService, EmbeddedAgentService, EmbeddedInquiryRunner,
-    MemoryService, MergeService, NotificationService, OperatorStatusEmitter, OperatorStatusService,
-    ProjectHookService, ProviderAuthorizationService, TaskService, TerminalActivityTracker,
-    TerminalService, WorkspaceCleanupScheduler, WorkspaceExecutionLockManager,
+    AuthService, CommitmentService, DaemonService, EmbeddedAgentService, MemoryService,
+    MergeService, NotificationService, OperatorStatusEmitter, OperatorStatusService,
+    ProjectHookService, ProviderAuthorizationService, TaskService, TerminalService,
+    WorkspaceCleanupScheduler, WorkspaceExecutionLockManager,
 };
-use tokio::sync::watch;
 use uuid::Uuid;
 use workspace::RepoCacheLockManager;
 
 const TEST_JWT_SECRET: &[u8] = b"test-jwt-secret-for-development";
 const TEST_BCRYPT_COST: u32 = 4;
 
-#[derive(Clone)]
-pub struct ShutdownSignal {
-    sender: Arc<watch::Sender<bool>>,
-}
-
-impl ShutdownSignal {
-    pub fn new() -> Self {
-        let (sender, _) = watch::channel(false);
-        Self {
-            sender: Arc::new(sender),
-        }
-    }
-
-    pub fn request(&self) {
-        let _ = self.sender.send(true);
-    }
-
-    pub fn subscribe(&self) -> watch::Receiver<bool> {
-        self.sender.subscribe()
-    }
-
-    pub async fn wait(&self) {
-        let mut receiver = self.subscribe();
-        if *receiver.borrow_and_update() {
-            return;
-        }
-
-        while receiver.changed().await.is_ok() {
-            if *receiver.borrow_and_update() {
-                return;
-            }
-        }
-    }
-}
-
-impl Default for ShutdownSignal {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// Kept at the API module path for existing route/test constructors while the
+/// signal itself now belongs to the transport-neutral services runtime.
+pub type ShutdownSignal = services::ShutdownSignal;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -108,6 +70,9 @@ pub struct AppState {
     pub mcp_enabled: bool,
     pub config_path: Arc<PathBuf>,
     pub effective_config: Arc<ForgeConfig>,
+    /// Keeps compatibility notification startup abortable when no runtime
+    /// supervisor is present (for example in API-only test harnesses).
+    _notification_worker: Arc<services::RuntimeTaskHandle>,
 }
 
 impl AppState {
@@ -184,210 +149,72 @@ impl AppState {
         bcrypt_cost: u32,
     ) -> Self {
         let workspace_root = cleanup_scheduler.workspace_root().to_path_buf();
-        let effective_config = effective_config_for_workspace(workspace_root.clone());
-        let pricing_repository = Arc::new(services::pricing_db::SqlitePricingRepository::new(
-            Arc::clone(&db),
-        ));
-        let catalog_repository: Arc<dyn services::pricing::PricingCatalogRepository> =
-            pricing_repository.clone();
-        let models_dev_client = Arc::new(
-            services::pricing::ModelsDevClient::new(catalog_repository)
-                .expect("models.dev pricing client must initialize"),
-        );
-        let embedded_agent_service =
-            Arc::new(EmbeddedAgentService::new(Arc::clone(&db), &jwt_secret));
-        let agent_chat_service = Arc::new(services::AgentChatService::new(Arc::clone(&db)));
-        let main_chat_topic_service = Arc::new(services::MainChatTopicService::new(
-            Arc::clone(&db),
-            Arc::clone(&agent_chat_service),
-            services::ProductGenesisService::for_sqlite(Arc::clone(&db)),
-        ));
-        // Shared by the inquiry runner and the Agent Chat turn worker (which
-        // write) and the two logs routes (which read), so they can never
-        // disagree on a path.
-        let agent_chat_turn_logs =
-            AgentChatTurnLogRoot::new(agent_chat_turn_log_root(&effective_config));
-        let agent_inquiry_service =
-            Arc::new(services::agent_inquiry_service::AgentInquiryService::new(
-                Arc::clone(&db),
-                Arc::clone(&agent_chat_service),
-            ));
-        let commitment_service = Arc::new(CommitmentService::new(Arc::clone(&db)));
-        let agent_inbox_service = Arc::new(AgentInboxService::new(Arc::clone(&db)));
-        let agent_action_service = Arc::new(AgentActionService::new(Arc::clone(&db)));
-        let cli_task_executor: Arc<dyn TaskExecutor> =
-            Arc::new(FallbackExecutor::new(Arc::clone(&adapter_registry)));
-        let embedded_task_executor = Arc::new(services::EmbeddedTaskExecutor::new(
-            Arc::clone(&db),
-            Arc::clone(&embedded_agent_service),
-        ));
-        let task_executor: Arc<dyn TaskExecutor> = Arc::new(services::TaskExecutorRouter::new(
-            cli_task_executor,
-            embedded_task_executor,
-        ));
-        // Reviews dispatch the auditor the same way Tasks dispatch a Worker.
-        // The caller can only build a CLI-adapter runner, because the embedded
-        // runtime is constructed here; upgrade it to the routed executor so an
-        // embedded identity can serve as reviewer.
-        let review_runner = Arc::new(review_runner.with_task_executor(Arc::clone(&task_executor)));
-        let workspace_exec_locks = Arc::new(WorkspaceExecutionLockManager::default());
-        let repo_cache_locks = Arc::new(RepoCacheLockManager::default());
-        let terminal_activity = Arc::new(TerminalActivityTracker::default());
-        let memory_service = Arc::new(MemoryService::new(Arc::clone(&db)));
-        let workflow_template_service = Arc::new(
-            services::workflow::template_service::WorkflowTemplateService::new(workflows_dir),
-        );
-        let execution_events = Arc::new(services::daemon_transport::ServerExecutionEventSink::new(
-            Arc::clone(&db),
-            Arc::clone(&event_bus),
-            workspace_root.clone(),
-        ));
-        let execution_event_handler: Arc<
-            dyn services::daemon_transport::DaemonExecutionEventHandler,
-        > = execution_events.clone();
-        let daemon_connections =
-            Arc::new(services::daemon_transport::DaemonConnectionRegistry::new(
-                Arc::clone(&event_bus),
-                execution_event_handler,
-            ));
-        execution_events.set_connection_registry(Arc::downgrade(&daemon_connections));
-        let terminal_service = Arc::new(TerminalService::new_with_activity_tracker(
-            Arc::clone(&db),
-            Arc::clone(&event_bus),
-            Arc::clone(&daemon_connections),
-            Arc::clone(&workspace_exec_locks),
-            effective_config.terminal.clone(),
-            workspace_root.clone(),
-            Arc::clone(&terminal_activity),
-        ));
-        // Use the same root for workspace creation and cleanup so done tasks remove what claim made.
-        let task_service = Arc::new(
-            TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
-                .with_merge_service(Arc::clone(&merge_service))
-                .with_cleanup_scheduler(Arc::clone(&cleanup_scheduler))
-                .with_review_runner(Arc::clone(&review_runner))
-                .with_task_executor(Arc::clone(&task_executor))
-                .with_daemon_connections(Arc::clone(&daemon_connections))
-                .with_workspace_exec_locks(Arc::clone(&workspace_exec_locks))
-                .with_terminal_activity_tracker(Arc::clone(&terminal_activity))
-                .with_repo_cache_locks(Arc::clone(&repo_cache_locks))
-                .with_memory_service(Arc::clone(&memory_service))
-                .with_provider_credential_env(Arc::clone(&embedded_agent_service))
-                .with_workspace_root(workspace_root.clone()),
-        );
-        execution_events.set_task_service(Arc::downgrade(&task_service));
-        embedded_agent_service.set_task_service(Arc::clone(&task_service));
-        // Lets a Main Chat dispatch ephemeral read-only inquiry sub-agents.
-        // The handle back to the service is weak, so this does not keep the
-        // runtime graph alive past shutdown.
-        let inquiry_runner = Arc::new(EmbeddedInquiryRunner::new(
-            Arc::clone(&db),
-            Arc::downgrade(&embedded_agent_service),
-            agent_chat_turn_logs.clone(),
-        ));
-        embedded_agent_service.set_inquiry_runner(inquiry_runner.clone());
-        // The REST cancel route reaches the same runner, so stopping an
-        // inquiry stops the provider call and not just the record.
-        agent_inquiry_service.set_runner(inquiry_runner);
-        // Task sessions capture evidence into the same media store the user
-        // upload routes write to, so a captured artifact and an uploaded one
-        // are the same kind of asset to everything downstream.
-        embedded_agent_service.set_media_root(effective_config.forge.data_dir.join("media"));
-        // Provisions the Project Agent's disposable verification checkout, so
-        // it can exercise the delivered software instead of reasoning about it.
-        embedded_agent_service.set_workspace_root(
-            workspace_root.clone(),
-            effective_config.forge.data_dir.join("projects"),
-        );
-        daemon_connections.set_embedded_execution_context(
-            Arc::downgrade(&task_service),
-            Arc::clone(&task_executor),
-        );
-        let agent_service = Arc::new(AgentService::new(Arc::clone(&db), Arc::clone(&event_bus)));
-        let daemon_service = Arc::new(
-            DaemonService::new(Arc::clone(&db), Arc::clone(&event_bus))
-                .with_task_service(Arc::clone(&task_service)),
-        );
-        let terminal_cleanup_handler: Arc<
-            dyn services::workspace_cleanup::WorkspaceCleanupObserver,
-        > = terminal_service.clone();
-        cleanup_scheduler.set_terminal_cleanup_handler(terminal_cleanup_handler);
-        let terminal_event_handler: Arc<
-            dyn services::daemon_transport::DaemonTerminalEventHandler,
-        > = terminal_service.clone();
-        daemon_connections.set_terminal_event_handler(terminal_event_handler);
-        let notification_service = Arc::new(NotificationService::new(
-            Arc::clone(&db),
-            Arc::clone(&event_bus),
-        ));
-        let _notification_service_handle = Arc::clone(&notification_service).start();
-        let project_hook_service = Arc::new(ProjectHookService::new(
-            Arc::clone(&db),
-            Arc::clone(&event_bus),
-            Arc::clone(&task_service),
-            Arc::clone(&notification_service),
-        ));
-        let operator_status_service = Arc::new(OperatorStatusService::new(Arc::clone(&db)));
-        let operator_status_emitter =
-            Arc::new(OperatorStatusEmitter::start(Arc::clone(&event_bus)));
-        let agent_chat_turn_worker = Arc::new(AgentChatTurnWorker::new(
-            Arc::clone(&db),
-            Arc::clone(&embedded_agent_service),
-            Arc::clone(&task_executor),
-            agent_chat_turn_logs.clone(),
-        ));
-        let auth_service = Arc::new(AuthService::new(Arc::clone(&db), jwt_secret, bcrypt_cost));
-        let oauth_service = Arc::new(services::OAuthService::new(
-            Arc::clone(&db),
-            Arc::clone(&auth_service),
-            effective_config.mcp_resource_url(),
-        ));
-        let provider_authorization_service = Arc::new(ProviderAuthorizationService::new(
-            Arc::clone(&db),
-            Arc::clone(&embedded_agent_service),
-            effective_config.trusted_web_origins(),
-        ));
+        let effective_config = effective_config_for_workspace(workspace_root);
+        let runtime = services::ForgeRuntimeBuilder::new(db, event_bus)
+            .with_adapter_registry(adapter_registry)
+            .with_config(effective_config)
+            .with_cleanup_scheduler(cleanup_scheduler)
+            .with_merge_service(merge_service)
+            .with_review_runner(review_runner)
+            .with_shutdown_signal(shutdown_signal)
+            .with_workflows_dir(workflows_dir)
+            .with_jwt_secret(jwt_secret)
+            .with_bcrypt_cost(bcrypt_cost)
+            .start_notification_service()
+            .build();
+        Self::from_runtime(runtime, mcp_enabled)
+    }
 
+    /// Construct API state from the transport-neutral component graph.
+    ///
+    /// The dispatcher belongs to the shared runtime graph, so API state and
+    /// every local presentation observe the same dispatcher identity.
+    pub fn from_runtime(runtime: services::ForgeRuntime, mcp_enabled: bool) -> Self {
+        Self::from_runtime_arc(Arc::new(runtime), mcp_enabled)
+    }
+
+    pub fn from_runtime_arc(runtime: Arc<services::ForgeRuntime>, mcp_enabled: bool) -> Self {
         Self {
-            db,
-            pricing_repository,
-            models_dev_client,
-            task_service,
-            agent_service,
-            embedded_agent_service,
-            agent_chat_service,
-            main_chat_topic_service,
-            agent_inquiry_service,
-            agent_chat_turn_worker,
-            agent_chat_turn_logs,
-            commitment_service,
-            agent_inbox_service,
-            agent_action_service,
-            daemon_service,
-            daemon_connections,
-            workflow_template_service,
-            memory_service,
-            merge_service,
-            notification_service,
-            project_hook_service,
-            terminal_service,
-            operator_status_service,
-            operator_status_emitter,
-            cleanup_scheduler,
-            review_runner,
-            adapter_registry,
-            task_executor,
-            auth_service,
-            oauth_service,
-            provider_authorization_service,
-            task_dispatcher: None,
-            workspace_exec_locks,
-            repo_cache_locks,
-            event_bus,
-            shutdown_signal,
+            db: Arc::clone(&runtime.db),
+            pricing_repository: Arc::clone(&runtime.pricing_repository),
+            models_dev_client: Arc::clone(&runtime.models_dev_client),
+            task_service: Arc::clone(&runtime.task_service),
+            agent_service: Arc::clone(&runtime.agent_service),
+            embedded_agent_service: Arc::clone(&runtime.embedded_agent_service),
+            agent_chat_service: Arc::clone(&runtime.agent_chat_service),
+            main_chat_topic_service: Arc::clone(&runtime.main_chat_topic_service),
+            agent_inquiry_service: Arc::clone(&runtime.agent_inquiry_service),
+            agent_chat_turn_worker: Arc::clone(&runtime.agent_chat_turn_worker),
+            agent_chat_turn_logs: runtime.agent_chat_turn_logs.clone(),
+            commitment_service: Arc::clone(&runtime.commitment_service),
+            agent_inbox_service: Arc::clone(&runtime.agent_inbox_service),
+            agent_action_service: Arc::clone(&runtime.agent_action_service),
+            daemon_service: Arc::clone(&runtime.daemon_service),
+            daemon_connections: Arc::clone(&runtime.daemon_connections),
+            workflow_template_service: Arc::clone(&runtime.workflow_template_service),
+            memory_service: Arc::clone(&runtime.memory_service),
+            merge_service: Arc::clone(&runtime.merge_service),
+            notification_service: Arc::clone(&runtime.notification_service),
+            project_hook_service: Arc::clone(&runtime.project_hook_service),
+            terminal_service: Arc::clone(&runtime.terminal_service),
+            operator_status_service: Arc::clone(&runtime.operator_status_service),
+            operator_status_emitter: Arc::clone(&runtime.operator_status_emitter),
+            cleanup_scheduler: Arc::clone(&runtime.cleanup_scheduler),
+            review_runner: Arc::clone(&runtime.review_runner),
+            adapter_registry: Arc::clone(&runtime.adapter_registry),
+            task_executor: Arc::clone(&runtime.task_executor),
+            task_dispatcher: Some(Arc::clone(&runtime.task_dispatcher)),
+            workspace_exec_locks: Arc::clone(&runtime.workspace_exec_locks),
+            repo_cache_locks: Arc::clone(&runtime.repo_cache_locks),
+            event_bus: Arc::clone(&runtime.event_bus),
+            shutdown_signal: runtime.shutdown_signal.clone(),
+            auth_service: Arc::clone(&runtime.auth_service),
+            oauth_service: Arc::clone(&runtime.oauth_service),
+            provider_authorization_service: Arc::clone(&runtime.provider_authorization_service),
             mcp_enabled,
-            config_path: Arc::new(default_config_path()),
-            effective_config: Arc::new(effective_config),
+            config_path: Arc::clone(&runtime.config_path),
+            effective_config: Arc::clone(&runtime.effective_config),
+            _notification_worker: runtime.notification_worker_handle(),
         }
     }
 

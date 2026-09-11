@@ -14,11 +14,33 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   preserving Forge's Project/Task scope, Workspace-lease, Chat filesystem, and
   user-only approval boundaries. Existing `Auto` profiles keep their prior
   behavior.
+- `make install-local` and `make install-ctl` install this checkout's binaries
+  into `~/.cargo/bin`, and `docs/cli.md` now documents every way to obtain
+  `forge-ctl` (Homebrew, npm/npx, install script, source). The distribution
+  channels already shipped `forge-ctl`; only the documentation was missing.
 - `forge_create_task` now accepts optional `depends_on_ids` and commits all
   validated prerequisite links atomically with the Task. MCP also exposes
   `forge_list_task_dependents`, `forge_list_sub_tasks`, and
   `forge_reorder_sub_tasks`; the latter two report ordered direct children of a
   coordination root.
+- Added the `forge-solo` crate and additive `forge-solo` command: a
+  repository-scoped, chat-first TUI that runs the shared Forge runtime,
+  workflow, validation, review, merge, cleanup, and recovery services in one
+  local process. Solo requires an existing primary Git worktree and an
+  authenticated supported local CLI harness (`codex`, `claude_code`, `cursor`,
+  `opencode`, `gemini`, or `smith`); it does not start the server, HTTP/MCP/web
+  or remote-daemon transports, and does not include provider onboarding.
+- Solo persists one stable `forge-solo-id` marker in the Git common directory
+  and keeps its SQLite database, protected state, logs, media, generated
+  worktrees, and runtime lock under
+  `<Forge data root>/solo/<repository-id>/` (or an exact `--data-dir`). The
+  first-run Project bootstrap is idempotent and remains Charter-gated until
+  the user explicitly approves the exact adoption target; existing Forge
+  Task/Worker/reviewer authority, `autonomous_v1`, and durable crash recovery
+  remain in force. Protected runtime questionnaire interactions are currently
+  unsupported in Solo unless an interaction broker is attached; startup crash
+  recovery completes before the TUI opens. POSIX owner-only mode checks apply
+  on Unix, while published release archives cover Linux and macOS.
 ### Breaking
 
 - Tasks no longer store or expose `repo_id`. Repository selection is owned by
@@ -92,6 +114,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   through Project state reads so revisions preserve its canonical content.
 - Keep successful CLI Agent Chat replies out of Task Git finalization. Chat
   sandboxes do not require a repository or produce an implementation commit.
+- Keep Solo's latest failed turn visible and retryable without treating it as
+  live; prevent message key collisions after restart while retaining the same
+  key for an unchanged failed-send retry. Preserve `R`, `?`, and digits while
+  typing in the composer. Refresh the turn version used by cancellation and
+  accept canonical operating-skill revision tokens in the adoption card. Wire
+  Enter on Project rows to open exact approval and review cards.
 - Upgrade Forge's managed CLI pins to `@openai/codex` 0.154.0 (from 0.147.0)
   and `@anthropic-ai/claude-code` 2.1.267 (from 2.1.226). The older managed
   Codex rejected `gpt-6-astra` even when a newer global Codex CLI was installed.
@@ -592,6 +620,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Rows written before this change keep the old mixed semantics; usage
   recorded by the embedded runtime and the Codex adapter reads high on
   `input_tokens` for historical executions and chat turns.
+
 
 ### Added
 

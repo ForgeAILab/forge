@@ -8,6 +8,151 @@ under the Forge data directory.
 `forge-ctl --version` reports the workspace release version, matching the
 `forge` server built from the same source checkout.
 
+## Install
+
+`forge-ctl` ships in every Forge distribution channel next to the `forge`
+server, so installing Forge installs the CLI:
+
+| Channel | Command | Result |
+| --- | --- | --- |
+| Homebrew | `brew install forgeailab/tap/forge` | `forge` and `forge-ctl` on `PATH` |
+| npm (global) | `npm install -g @forgeailab/forge` | `forge` and `forge-ctl` shims that fetch the matching release archive on first run |
+| npx (no install) | `npx -p @forgeailab/forge forge-ctl <command>` | same bootstrapper, one-off |
+| Install script | `curl -fsSL https://raw.githubusercontent.com/ForgeAILab/forge/main/install.sh \| bash` | binaries under `${PREFIX:-/usr/local}/bin` |
+
+`npx @forgeailab/forge ctl <command>` is equivalent to the `-p` form. The npm
+bootstrapper caches release archives under `~/.forge/npx`; `--release <tag>` or
+`FORGE_NPX_TAG` pins a specific release.
+
+### From a source checkout
+
+```bash
+cargo install --path crates/forge-client --locked   # forge-ctl only
+make install-local                                  # forge, forge-ctl, forge-solo
+```
+
+Both put binaries in `~/.cargo/bin`. Installing `forge` or `forge-solo` from
+source runs the `pnpm` web build unless `FORGE_SKIP_WEB_BUILD=1` is set, and a
+`forge` built that way needs `FORGE_WEB_DIST_DIR` at runtime if the UI assets
+are not alongside it.
+
+A source install and a Homebrew install can coexist; `PATH` order decides which
+one runs. Check with `which -a forge-ctl` and compare `forge-ctl --version`
+against the running server.
+
+## forge-solo
+
+`forge-solo` is a separate additive binary for one existing Git repository. It
+composes the Forge core in-process and opens a keyboard-driven TUI; it does not
+start `forge`, open a TCP listener, serve web assets, expose MCP, perform OAuth
+callbacks, connect a remote daemon, or use the `forge-ctl` HTTP client. Its
+state is isolated from the normal server store.
+
+### Invocation
+
+```text
+forge-solo [PATH] [--data-dir PATH] [--agent EXECUTOR]
+forge-solo --help
+forge-solo --version
+```
+
+`PATH` is optional and defaults to `.`. Solo resolves a nested path to the
+canonical primary Git worktree and rejects non-Git directories, linked
+worktrees, and Forge-managed Task worktrees before writing state. The exact
+`--agent` values are `codex`, `claude_code`, `cursor`, `opencode`, `gemini`,
+and `smith`; each must pass the existing structured availability and
+authentication check. `shell`, `embedded`, and `null` are not user-selectable
+Solo chat harnesses. With no `--agent`, one eligible harness is preselected
+but still confirmed, while several candidates are shown in a picker. A failed
+health check is never replaced silently.
+
+`--data-dir PATH` selects an exact repository-scoped Solo data root for tests
+or recovery. The default is `<Forge data root>/solo/<repository-id>/`, with
+the repository identifier read from the owner-only
+`<git-common-dir>/forge-solo-id` marker. The marker format is:
+
+```text
+version = 1
+repository_id = "<uuid>"
+```
+
+The data root contains the ordinary Forge SQLite database, protected state,
+JSONL logs, media, generated worktrees, and `runtime.lock`; nothing except the
+small marker is written into the tracked checkout. A malformed marker, a
+repository/data-root mismatch, or an active lock fails closed. Solo starts
+ordinary crash recovery before enabling the composer.
+
+### Solo key bindings
+
+The key map is available from `?` or `F1` while no other modal is active.
+Printable characters and editing keys go to the composer when it is focused,
+except for the listed contextual commands. `Enter` submits a non-empty,
+enabled composer draft, or confirms the selected setup/modal option. It never
+treats a word typed in chat as an approval.
+
+| Key | Action |
+|---|---|
+| `Enter` | Submit a non-empty composer draft; confirm the selected setup/question/approval/review/cancellation action. |
+| `Shift+Enter` | Insert a newline in the composer. |
+| `Backspace`, `Delete` | Delete before/after the composer cursor. |
+| `Left`, `Right` | Move the composer cursor. |
+| `Home`, `End` | Move the composer cursor when it is focused; otherwise jump to the oldest/latest timeline position. (`Ctrl` does not change this mapping.) |
+| `Tab`, `Shift+Tab` | Move focus forward/backward across the visible composer, timeline, activity, and Project rail. |
+| `Enter` (Project rail, or a narrow Project tab outside the composer) | Open the selected approval or awaiting-review Task card. Opening a card does not execute its action. |
+| `Up`, `Down` | Scroll the focused timeline/activity, move the selected task, or move a setup/modal selection. |
+| `PageUp`, `PageDown` | Scroll the timeline, or move a modal selection when a modal is focused. |
+| `p` | Toggle the Project rail; on a narrow terminal, cycle its tab view. |
+| `a` | Expand/collapse the live activity row when one is present. |
+| `Shift+R` (outside composer) | Expand/collapse ordinary reasoning (collapsed by default). |
+| `r` | Retry the current eligible failed turn; when setup is unavailable and retryable, refresh setup. |
+| `Ctrl+[`, `Ctrl+]` | Select the previous/next Project rail tab. |
+| `1`, `2`, `3` (narrow terminal, outside composer) | Select the Tasks, Attention, or Approvals Project tab. |
+| `?` (outside composer), `F1` | Open help when no other modal is active; close help when it is focused. |
+| `Esc` | Close the focused modal; in the setup picker it returns focus without changing the selected candidate; otherwise it is ignored. It never cancels a live turn by itself. |
+| `Ctrl+C` (when no modal is active) | With a live turn, open cancellation for that exact turn; otherwise request quit. During bounded shutdown, a second `Ctrl+C` forces terminal restoration and leaves durable recovery for the next launch. |
+| `q` (outside composer), `Ctrl+Q` (when no modal is active) | Request quit; if a live turn is active, Solo opens its exact-turn cancellation card first. |
+
+On question, approval, review, and cancellation cards, use `Up`/`Down` to
+select an option/action and `Enter` to submit it. On approval and review cards,
+`y`/`a` accepts the selected permitted action and `n` rejects or requests
+changes when that action is permitted. These shortcuts are modal-only. A stale
+target returns a conflict and refreshes the card; it does not partially apply
+the action.
+
+The TUI has typed question-card support and renders approvals, Task checks,
+commit evidence, Attention, and canonical recovery actions from durable state.
+The current CLI-only Solo startup does not attach the protected Agent Runtime
+interaction broker, so protected questionnaires remain parked rather than
+showing an answerable card. Solo does not infer meaning from state-name or
+prose text.
+
+### Exit and recovery semantics
+
+Preflight, repository, marker, data-root, lock, migration, or Agent errors are
+printed as bounded normal-terminal diagnostics before raw mode or the alternate
+screen is entered. A normal quit asks the shared runtime supervisor to settle
+owned work within its deadline, then restores the cursor, raw mode, and
+original screen. When the input source is configured with termination signals,
+SIGINT follows the Ctrl-C cancellation/quit flow and SIGTERM requests quit;
+terminal restoration occurs when the controller exits. A panic hook performs
+best-effort restoration immediately after TUI entry. Forced quit does not
+delete the database or claim an unfinished turn or Task succeeded; the next
+launch runs ordinary Forge recovery and restores the same Project/chat state.
+
+The latest failed turn remains visible with its failure and eligible `r`
+retry action. It is not treated as running or cancellable. A newer turn
+supersedes that retry target. New launches generate a fresh command namespace;
+retrying an unchanged draft after a failed send reuses the original command's
+idempotency key.
+
+### Choosing the right command
+
+| Command | Process and scope | Interactive surface |
+|---|---|---|
+| `forge` | Full local server with account/portfolio/Project surfaces, REST, web, MCP, and optional daemon transport. | Browser and API clients; uses the normal Forge data root. |
+| `forge-ctl` | Authenticated HTTP client for a running `forge` server. | Shell commands and scripts; no local domain runtime. |
+| `forge-solo` | One repository, one isolated Project/chat, shared Forge workflow and recovery in one process. | TUI only; no server, browser, MCP, remote daemon, portfolio, or multi-Project navigation. |
+
 ## Global flags
 
 ```text
@@ -199,15 +344,17 @@ forge-ctl embedded provider list
 forge-ctl embedded provider rename <ENTRY_ID> --label "work" --version <VERSION>
 forge-ctl embedded provider remove <ENTRY_ID> --version <VERSION>
 
-# Create a direct agent on an entry
+# Create a direct agent on a ChatGPT login entry; supported efforts are
+# model-specific, and omission uses the provider default
 forge-ctl embedded create \
   --name "Forge Assistant" \
   --credential-id <ENTRY_ID> \
-  --model gpt-5.6
+  --model gpt-5.6-terra \
+  --reasoning-effort ultra
 
 forge-ctl embedded profile list <IDENTITY_ID>
 forge-ctl embedded profile connect <IDENTITY_ID> --version <VERSION> \
-  --credential-id <ENTRY_ID> --model gpt-5.6
+  --credential-id <ENTRY_ID> --model gpt-5.6-terra --reasoning-effort ultra
 forge-ctl embedded profile select <IDENTITY_ID> <PROFILE_ID> --version <VERSION>
 
 # Every session names one canonical scope; only Task scopes can receive a workspace.

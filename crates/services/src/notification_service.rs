@@ -5,6 +5,7 @@ use db::{
     SqliteDb, TaskRepo,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
+use tokio::sync::watch;
 
 pub struct NotificationService {
     db: Arc<SqliteDb>,
@@ -16,15 +17,31 @@ impl NotificationService {
         Self { db, event_bus }
     }
 
-    pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+    pub fn start_with_shutdown(
+        self: Arc<Self>,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            if *shutdown.borrow_and_update() {
+                return;
+            }
+
             let mut rx = self.event_bus.subscribe();
             loop {
-                let Ok(event) = rx.recv().await else {
-                    break;
-                };
-                if let Err(error) = self.handle_event(event).await {
-                    tracing::warn!(%error, "notification service failed to handle event");
+                tokio::select! {
+                    event = rx.recv() => {
+                        let Ok(event) = event else {
+                            break;
+                        };
+                        if let Err(error) = self.handle_event(event).await {
+                            tracing::warn!(%error, "notification service failed to handle event");
+                        }
+                    }
+                    result = shutdown.changed() => {
+                        if result.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                    }
                 }
             }
         })

@@ -1,4 +1,4 @@
-.PHONY: dev dev-demo dev-no-daemon frontend test build ci ci-rust ci-web clean-test
+.PHONY: dev dev-demo dev-no-daemon frontend test build install-local install-ctl ci ci-rust ci-web clean-test
 
 # Start the server using ./test as the data directory (safe for manual/agent testing)
 dev:
@@ -23,6 +23,16 @@ test:
 # Build everything
 build:
 	cargo build
+
+# Install this checkout's binaries into ~/.cargo/bin
+install-local:
+	cargo install --path crates/forge-cli --locked
+	cargo install --path crates/forge-client --locked
+	cargo install --path crates/forge-solo --locked
+
+# Install only the forge-ctl CLI client (no web build)
+install-ctl:
+	cargo install --path crates/forge-client --locked
 
 # Run the same checks Forge review CI uses
 ci:

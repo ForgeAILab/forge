@@ -16,15 +16,21 @@ release archive for macOS, glibc Linux, or musl Linux, caches it under
 `~/.forge/npx`, and starts the local server with the bundled web UI assets. The
 browser does not open automatically; pass `--open` to opt in.
 
+The same package also exposes the CLI client — `npx -p @forgeailab/forge
+forge-ctl <command>`, or `npx @forgeailab/forge ctl <command>`. See
+[docs/cli.md](cli.md#install) for every way to get `forge-ctl`.
+
 ### Homebrew (macOS / Linux, recommended)
 
 ```bash
 brew install forgeailab/tap/forge
 ```
 
-The tap repo is [`ForgeAILab/homebrew-tap`](https://github.com/ForgeAILab/homebrew-tap).
-The formula installs both `forge` and `forge-ctl` and places the web UI assets under
-the Homebrew `share/forge` prefix.
+The formula installs both `forge` and `forge-ctl`. The tap repo is
+[`ForgeAILab/homebrew-tap`](https://github.com/ForgeAILab/homebrew-tap),
+which is maintained separately from this repository. This repository does not
+update that formula; use the release archive or install script below when you
+need the `forge-solo` binary.
 
 ### Install script (curl)
 
@@ -33,11 +39,12 @@ curl -fsSL https://raw.githubusercontent.com/ForgeAILab/forge/main/install.sh | 
 ```
 
 Or grab a tarball directly from [Releases](https://github.com/ForgeAILab/forge/releases).
-Archives ship `forge`, `forge-ctl`, and the built web UI assets. The installer puts
+Archives ship `forge`, `forge-ctl`, `forge-solo`, and the built web UI assets. The installer puts
 the UI under `/usr/local/share/forge/web/dist` and selects the musl Linux archive
-on musl-based systems such as Alpine. For a manual install, run `forge` from the
-extracted archive root or set `FORGE_WEB_DIST_DIR` to the extracted `web/dist`
-directory.
+on musl-based systems such as Alpine. The release workflow and installer currently
+cover x86_64/aarch64 Linux (glibc or musl) and macOS; other platforms need a
+source build. For a manual install, run `forge` from the extracted archive root
+or set `FORGE_WEB_DIST_DIR` to the extracted `web/dist` directory.
 
 ### Build from source
 
@@ -47,6 +54,8 @@ cd forge
 cargo build
 cargo run -p forge-cli         # plain start, data in ~/.forge/
 cargo run -p forge-cli -- --demo  # seed labelled demo data (idempotent)
+make install-local                # install forge, forge-ctl, forge-solo into ~/.cargo/bin
+make install-ctl                  # install just forge-ctl
 ```
 
 The embedded host pins Agent Runtime revision
@@ -91,6 +100,185 @@ API calls, set:
 ```bash
 FORGE_URL=$(jq -r .server_url ~/.forge/server.json)
 ```
+
+## Forge Solo
+
+`forge-solo` is the additive, terminal-first entry point for one existing Git
+repository. It runs the Forge database, Agent Runtime, workflow, Task
+dispatch, validation, review, merge, cleanup, and recovery services in the
+same process as the TUI. It does not require `forge`, a browser, an HTTP
+listener, MCP, OAuth callback transport, or a remote daemon.
+
+### Prerequisites
+
+Before first launch, make sure that:
+
+- the launch path is inside an existing Git repository's primary worktree;
+  non-Git directories, linked worktrees, and Forge-managed Task worktrees are
+  rejected;
+- `git` is available on `PATH`;
+- at least one supported local CLI harness is installed and authenticated; and
+- stdin and stdout are interactive terminals. Solo refuses redirected or
+  piped execution before it creates a marker or writes a database.
+
+Solo v1 discovers only authenticated, healthy local CLI harnesses: `codex`,
+`claude_code`, `cursor`, `opencode`, `gemini`, and `smith`. `shell`,
+`embedded`, and `null` are not first-run Solo chat harnesses. Provider API-key
+entry, OAuth, browser login, and credential-cache import are outside the TUI;
+complete the selected CLI's own login flow and then retry Solo.
+
+On Unix systems (including Linux and macOS), Solo enforces owner-only POSIX
+mode bits for its marker and data root. Other platforms do not receive those
+mode-bit checks; protect the Solo data root with the platform's ACLs when
+building or running there.
+
+### Launch
+
+```bash
+# PATH defaults to the current directory.
+forge-solo
+
+# A repository or a directory below its primary worktree is also accepted.
+forge-solo /path/to/repository
+
+# Preselect a supported local CLI harness; health is checked again at commit.
+forge-solo . --agent codex
+
+# Use an exact isolated data root for testing or recovery.
+forge-solo . --data-dir /absolute/path/to/solo-state
+
+# From a source checkout:
+cargo run -p forge-solo -- /path/to/repository
+```
+
+The command-line contract is intentionally small: `PATH` (optional, default
+`.`), `--data-dir PATH`, `--agent EXECUTOR`, `--help`, and `--version`.
+`--agent` accepts exactly `codex`, `claude_code`, `cursor`, `opencode`,
+`gemini`, or `smith`. `--data-dir` selects that exact Solo root after its
+repository binding is validated; it does not silently fall back to another
+Project. The default root is `<Forge data root>/solo/<repository-id>/`, where
+the Forge data root follows the normal config/env settings (`FORGE_DATA_DIR`
+or the configured data directory).
+
+### First run and Project adoption
+
+On a successful first launch, Solo performs the following bounded setup before
+it enables ordinary repository-mutating work:
+
+1. Resolves and displays the canonical primary worktree, Git common directory,
+   and default branch.
+2. Reads or atomically creates an owner-only `forge-solo-id` marker in the Git
+   common directory. The marker contains only this versioned identifier:
+
+   ```text
+   version = 1
+   repository_id = "<uuid>"
+   ```
+
+3. Acquires the Solo runtime lock, runs the ordinary Forge migrations, starts
+   the local shared runtime, and completes startup crash recovery before the
+   terminal UI is entered.
+4. Confirms one eligible local Agent. With one candidate it is preselected but
+   still requires confirmation; with several candidates, use the picker. With
+   no eligible candidate, Solo explains the structured install/login cause and
+   lets you retry discovery after returning from the CLI's login flow.
+5. Creates or resumes one isolated local owner, Project, owner membership,
+   repository binding, Project Agent Chat, setup binding, and eligible Task
+   Worker selection. Repeating or interrupting setup is idempotent and does
+   not create a second Project or chat.
+6. Answers the adoption conversation with the intended Project outcome. Solo
+   shows the compact Charter's exact revision, render digest, Agent selection,
+   operating-skill revision, assumptions, and impact in a focused approval
+   card.
+7. Explicitly approves that current card. Typing `yes`, `looks good`, or
+   similar prose is only chat and leaves the Project setup-required. The
+   canonical approval receipt must commit before repository-mutating Tasks are
+   admitted.
+
+The visible Agent is the Project Agent Chat principal and has no direct
+repository, shell, or unrestricted filesystem access. Once adoption is
+approved, it coordinates work through the ordinary `autonomous_v1` Task
+workflow: a leased Task Worker, blocking checks, human review, merge, and
+cleanup. The TUI keeps Worker/reviewer identity, checks, commit evidence,
+blockers, and permitted recovery actions visible in the Project rail.
+
+Use `--agent codex` for the scoped adoption and Task-coordination flow. Codex
+chat connects to Forge tools through app-server stdio callbacks. The other
+CLI harnesses currently have text-only Agent Chat transports; successful
+login discovery does not mean their chat can persist a Charter or propose a
+Task. Their ordinary Task executor support is separate.
+
+### Resume, locks, and recovery
+
+Quit with the normal quit command and relaunch from the same repository to
+restore the same owner, Project, Repo, Project Chat, messages, approvals,
+Tasks, and recovery state. Startup recovery completes before the terminal UI
+is entered; there is no in-TUI recovery progress screen. If startup recovery
+fails, Solo prints the error and exits before showing the composer. Queued or
+retry-wait turns resume through the ordinary Agent Chat worker. Awaiting-input
+turns remain durable, but the current Solo startup does not attach the
+protected runtime interaction broker, so those questions are not answerable in
+this TUI and remain parked until handled by a broker-backed surface. Failed,
+blocked, cancelled, and review states remain durable and show only their
+canonical next action. A response that was lost at the boundary can be
+retried with the same dedupe identity, so it does not append a duplicate
+message or turn.
+
+Only one live Solo process may use a data root. A process-scoped
+`<data-root>/runtime.lock` is released by the operating system on normal exit
+or crash. Never delete that lock to force a second process while the first
+process may still be running. A forced quit restores the terminal and leaves
+durable work for the next launch to reconcile; it does not mark unfinished work
+successful.
+
+### Solo state, backup, and removal
+
+The source checkout contains only the small marker in the Git common directory.
+The default Solo root is `<Forge data root>/solo/<repository-id>/` and contains
+the ordinary Forge SQLite database, protected credential/checkpoint state,
+JSONL logs, media, generated Task worktrees, and `runtime.lock` (present while
+Solo owns the root). Exact subdirectories are runtime-managed and may vary with
+the configured workspace and protected-store backends; back up the complete
+root rather than selecting individual files.
+
+To back up a Solo Project, quit Solo first, copy the complete data root while
+preserving permissions, and copy `<git-common-dir>/forge-solo-id` alongside
+the backup. Do not place the backup in the tracked checkout or copy a live
+SQLite/WAL store while the process is writing. Restoring both the marker and
+the matching data root preserves the repository identity and conversation;
+restoring a data root against a different marker/repository fails closed.
+
+For example, after verifying that `SOLO_ROOT` names only the intended
+repository-scoped directory:
+
+```bash
+SOLO_ROOT=/absolute/path/to/solo/<repository-id>
+BACKUP=/absolute/path/to/solo-backup.tar.gz
+tar -C "$(dirname "$SOLO_ROOT")" -czf "$BACKUP" "$(basename "$SOLO_ROOT")"
+# Copy the exact marker from the repository's Git common directory next to the archive.
+```
+
+Removal is explicit and is never part of uninstall. After making any desired
+backup and stopping Solo, remove only the exact repository-scoped data root
+and, when a full reset is intended, the exact
+`<git-common-dir>/forge-solo-id` marker. Removing both starts a new Solo
+identity/project on the next launch; it permanently removes the local history
+unless a backup exists. Removing neither is required for ordinary upgrades.
+
+### Troubleshooting
+
+| Symptom | What to do |
+|---|---|
+| `forge-solo` says stdin/stdout is not a terminal | Run it from an interactive terminal; piped/script mode is not part of v1. |
+| No Git repository, linked worktree, or managed worktree | Launch from the primary worktree; a nested directory under it is fine. |
+| No eligible Agent | Install and authenticate one of the six supported CLI harnesses, then retry discovery. Executable presence alone is not authentication. |
+| The selected Agent became unavailable | Re-run that harness's own login/recovery flow and select it again; Solo never silently substitutes a different Agent. |
+| Another Solo process owns the data root | Exit the other process or use the reported root to find it. Do not remove `runtime.lock` while it is live. |
+| Marker is malformed, insecure, or the data root belongs to another repository | Restore a matching marker/data-root backup or pass an explicit `--data-dir` containing the current repository binding. Do not edit the marker to point at an unrelated Project. |
+| Startup recovery fails before the TUI appears | Read the printed startup error, correct the runtime or data-root issue, and relaunch. Startup recovery is a pre-TUI wait, not an in-TUI progress screen. |
+| A Task is blocked after the TUI appears | Use the displayed typed Attention/review action. Do not infer success from old chat text or bypass the workflow. |
+| A turn is awaiting protected runtime input | Solo currently has no attached interaction broker, so it cannot answer the question; use a broker-backed surface and leave the turn parked until then. |
+| Provider login is requested inside the TUI | Leave Solo, complete the supported CLI's own authentication, and relaunch; provider onboarding is deliberately outside Solo v1. |
 
 ## Configuration
 
@@ -169,7 +357,19 @@ pollutes `~/.forge`. See the project [Makefile](../Makefile).
 
 ## Configuring agents
 
-The embedded daemon auto-detects installed CLIs. Verify what's available:
+The embedded daemon auto-detects installed CLIs.
+
+Forge's managed Codex and Claude Code adapters launch pinned npm packages via
+`npx`: `@openai/codex@0.154.0` and `@anthropic-ai/claude-code@2.1.267`.
+Updating a globally installed CLI does not update these managed versions.
+The packages must be able to install their platform-native dependencies.
+For npm 12, Forge allows the exact pinned Claude Code package's install script
+so its native binary is installed; other dependency scripts remain subject to
+npm policy. An authenticated local CLI alone does not verify the managed
+package can run. Explicit `ignore-scripts` or omitted optional dependencies can
+still prevent installation and must be corrected in the local npm environment.
+
+Verify what's available:
 
 ```bash
 curl -sS "$FORGE_URL/api/v1/daemons" | jq '.items[].cli_inventory'
@@ -255,11 +455,18 @@ CONNECTED=$(curl -sS -X POST "$FORGE_URL/api/v1/embedded-agents" \
     name: "my-forge-agent",
     description: "A persistent account assistant",
     credential_id: $entry,
-    model: "gpt-5.6-terra"
+    model: "gpt-5.6-terra",
+    reasoning_effort: "ultra"
   }')")
 
 AGENT_ID=$(jq -r .agent.id <<<"$CONNECTED")
 ```
+
+Direct agents backed by a ChatGPT browser or device login may set the selected
+model's advertised `reasoning_effort`; current models may offer `low`,
+`medium`, `high`, `xhigh`, `max`, and `ultra`. Omitting it leaves the provider
+default in effect. Agent Settings offers the same model-aware selector when
+creating or editing a compatible direct agent.
 
 The same entry can also power a CLI harness: register a `codex` or `gemini`
 agent with `credential_id` and Forge injects the key into the harness
@@ -563,7 +770,13 @@ POST /api/v1/projects/{id}/execution-setup/repository
 {"repo_id":"<repo>","expected_project_version":<version>,"idempotency_key":"..."}
 ```
 
-This setup path chooses optional defaults. Those selections seed Tasks; they do
+The repository command changes the Project's single current execution
+repository. Tasks do not copy or select that Repo: their REST/MCP/Solo shapes
+contain no `repo_id`, and every new execution resolves the current
+`project.primary_repo_id` and verifies same-Project ownership. Existing
+Workspaces and leases retain the exact Repo used by their execution attempt.
+
+The Worker/reviewer commands choose optional defaults. Those selections seed Tasks; they do
 not lock individual Task execution. On a Task, you may explicitly assign any
 enabled, available configured Agent to Worker or reviewer, including the active
 Main Agent, the Project Agent, and the same identity for both roles. Selecting
@@ -610,6 +823,13 @@ handoff remain intact. A stale version or changed idempotency input is a
 conflict: refetch the projection and use a new key, rather than guessing a
 version.
 
+A Task may be accepted while this repository setup is incomplete. It remains
+in its normal workflow state rather than storing a null Task repository. Once
+a valid same-Project Repo becomes primary, normal scheduling re-evaluates that
+same Task without a backfill or Task update. A missing or invalid Project Repo
+stays a visible setup blocker, and attaching one never clears a manual Project
+pause or fabricates missing Charter governance.
+
 ### 6. Project Chat and the current Profile
 
 The Project binding names an identity, not a permanently frozen Profile. When a
@@ -643,18 +863,24 @@ as an approval gate:
 After Project creation, the Project Agent creates implementation Tasks in the
 bound Project through `POST /api/v1/projects/{id}/tasks`. Each Task is linked to
 the current approved Charter. Plan-item, milestone, and Document links are
-optional traceability.
+optional traceability. The Task has no repository selector: Forge resolves the
+Project's current primary Repo only when admitting a new execution.
 
 When repository setup, dependencies, assignment, workflow, source availability,
 and the current Task version all pass, the
 scheduler assigns the selected Worker and issues one Task-scoped Workspace
-lease. `POST /api/v1/tasks/{id}/start`/`resume` and normal workflow scheduling
+lease pinned to that Workspace's Repo. `POST /api/v1/tasks/{id}/start`/`resume` and normal workflow scheduling
 use the same admission checks. An Agent serving as Main or Project Agent may
 also receive that lease when explicitly assigned, but the Task session is
 isolated from its chat session. Inspect the linked Task, transitions, executions, and Workspace
 diff through `GET /api/v1/tasks/{id}`, `GET /api/v1/tasks/{id}/transitions`,
 `GET /api/v1/tasks/{id}/executions`, and
 `GET /api/v1/tasks/{id}/diff`.
+
+After an attempt starts, its Workspace/lease repository identity is immutable
+provenance for diff, review, pull request, evidence, and release records. A
+later Project repository change does not rewrite that history, and Forge does
+not silently reuse an old-Repo Workspace for a new attempt.
 
 The normal workflow moves work through its configured active state into review
 and delivery. Choose **Agent review** (`default`), **No review**, or **Human
@@ -699,6 +925,8 @@ conflict; they are the links between chat, Project truth, and repository work.
 | Missing reviewer default | No Project-wide reviewer default is selected | Nothing is blocked until a Task workflow needs the role; assign any enabled Agent on that Task, including its Worker. |
 | `execution_setup_state: provisioning` | Durable setup is still reconciling | Refresh the projection; wait for `ready` or follow the recorded retry action. |
 | `execution_setup_state: failed` | A checkpoint stopped with a typed error | Fix the recorded cause and retry the same provisioning operation with its current version and a new idempotency key. |
+| Repository setup is missing or invalid | The Project has no primary Repo, the pointer does not resolve, or the Repo belongs to another Project | Attach a valid same-Project Repo through Project execution setup, then let normal scheduling reconsider existing Tasks. Do not patch Tasks or select an unlisted Repo row. |
+| A Project is still paused after repository repair | The pause is manual rather than the matching automatic setup pause | Resume the Project explicitly; repository attachment never clears a user pause. |
 | `scaffold_runtime_unavailable` or `repository_scaffold_failed` | The `repository_scaffolded` checkpoint could not run create-spark, or create-spark refused the template or pack set | Install `bun` (or fix `FORGE_SCAFFOLD_COMMAND`) and retry; for a bad pack set, amend the Charter's `scaffold` block, then retry the same provisioning operation. The partial directory is removed before the failure is recorded. |
 | `version_conflict`, `digest_conflict`, or stale projection | Another command changed the authoritative revision | Refetch current state and re-propose/retry with the correct version; do not overwrite immutable history. |
 | Wake `deferred` or `setup_required` | Delivery could not safely admit a turn yet | Follow the durable retry/setup action; the event remains traceable and is reconsidered after state changes. |

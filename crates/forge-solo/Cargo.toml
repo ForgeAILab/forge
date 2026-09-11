@@ -1,0 +1,46 @@
+[package]
+name = "forge-solo"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Forge's repository-scoped, chat-first terminal application"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "forge-solo"
+path = "src/main.rs"
+
+[dependencies]
+api-types = { path = "../api-types" }
+cli-adapters = { path = "../cli-adapters" }
+config = { path = "../config" }
+db = { path = "../db" }
+events = { path = "../events" }
+executors = { path = "../executors" }
+forge-agent-host = { path = "../agent-host" }
+review = { path = "../review" }
+services = { path = "../services" }
+workspace = { path = "../workspace" }
+clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.29", default-features = false, features = ["events", "event-stream", "windows"] }
+fs2 = "0.4"
+ratatui = { version = "0.30.2", default-features = false, features = [
+    "crossterm_0_29",
+    # `Paragraph::line_count` powers chat scrollback offsets; it is gated behind
+    # ratatui's opt-in unstable API (ratatui/ratatui#293).
+    "unstable-rendered-line-info",
+] }
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

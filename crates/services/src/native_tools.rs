@@ -57,7 +57,9 @@ use crate::{
     coordination_service::{AgentActionService, ProposeActionInput},
     memory::{MemoryAccessContext, MemoryService},
     project_agent_actions::ExecuteDirectProjectCommandInput,
-    project_runtime::{load_effective_project_state, ProjectCurrentStateResponse},
+    project_runtime::{
+        load_effective_project_state, load_project_adoption_charter, ProjectCurrentStateResponse,
+    },
     task_service::{
         AdaptiveTaskChild, AdaptiveTaskCommand, AdaptiveTaskCommandResult, AdaptiveTaskOperation,
         DirectTaskProposalInput, TaskProposalCommandResult, TaskProposalPayload,
@@ -1402,10 +1404,14 @@ impl CoordinationToolProvider {
         let execution_setup = crate::load_project_execution_setup(&self.db, &project_id)
             .await
             .map_err(|error| AgentHostError::Authority(error.to_string()))?;
+        let adoption_charter = load_project_adoption_charter(&self.db, &project_id)
+            .await
+            .map_err(|error| AgentHostError::Authority(error.to_string()))?;
         serde_json::to_value(ProjectCurrentStateResponse {
             scope: "project".to_owned(),
             effective_state: projection,
             execution_setup: Some(execution_setup),
+            adoption_charter,
         })
         .map_err(|_| AgentHostError::ProtectedPersistence)
     }
@@ -1473,7 +1479,8 @@ impl CoordinationToolProvider {
             (CanonicalScopeType::Project | CanonicalScopeType::AgentChat, Some(project_id)) => {
                 sqlx::query(
                     "SELECT id, parent_task_id, subtask_order, version,
-                            title, status, priority, assignee_type, assignee_id
+                            title, status, priority, assignee_type, assignee_id,
+                            blocked_json, error_annotation, failed_json
                      FROM task WHERE project_id = ? AND deleted_at IS NULL
                      ORDER BY updated_at DESC, id DESC LIMIT ?",
                 )
@@ -1485,7 +1492,8 @@ impl CoordinationToolProvider {
             }
             (CanonicalScopeType::Task, _) => sqlx::query(
                 "SELECT id, parent_task_id, subtask_order, version,
-                        title, status, priority, assignee_type, assignee_id
+                        title, status, priority, assignee_type, assignee_id,
+                        blocked_json, error_annotation, failed_json
                      FROM task WHERE id = ? AND deleted_at IS NULL LIMIT 1",
             )
             .bind(&scope.scope_id)
@@ -1526,11 +1534,77 @@ impl CoordinationToolProvider {
                 dependencies.entry(task_id).or_default().push(depends_on);
             }
         }
+        let mut latest_executions: std::collections::HashMap<String, Value> =
+            std::collections::HashMap::new();
+        if !ids.is_empty() {
+            let placeholders = vec!["?"; ids.len()].join(", ");
+            let sql = format!(
+                "SELECT task_id, id, status, role, agent_session_id, logs_path
+                 FROM (
+                     SELECT task_id, id, status, role, agent_session_id, logs_path,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY task_id ORDER BY created_at DESC, id DESC
+                            ) AS execution_rank
+                     FROM execution
+                     WHERE task_id IN ({placeholders})
+                 )
+                 WHERE execution_rank = 1"
+            );
+            let mut query = sqlx::query(&sql);
+            for id in &ids {
+                query = query.bind(id);
+            }
+            for row in query
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(|_| AgentHostError::ProtectedPersistence)?
+            {
+                let task_id: String = row.try_get("task_id").unwrap_or_default();
+                let execution_id: String = row.try_get("id").unwrap_or_default();
+                let status: String = row.try_get("status").unwrap_or_default();
+                let role: String = row.try_get("role").unwrap_or_default();
+                let agent_session_id = row
+                    .try_get::<Option<String>, _>("agent_session_id")
+                    .ok()
+                    .flatten()
+                    .map(|value| truncate(&value, 256));
+                let logs_path = row
+                    .try_get::<Option<String>, _>("logs_path")
+                    .ok()
+                    .flatten()
+                    .map(|value| truncate(&value, 512));
+                latest_executions.insert(
+                    task_id,
+                    json!({
+                        "execution_id": execution_id,
+                        "status": status,
+                        "role": role,
+                        "agent_session_id": agent_session_id,
+                        "logs_path": logs_path,
+                    }),
+                );
+            }
+        }
         let items = rows
             .into_iter()
             .map(|row| {
                 let id = row.try_get::<String, _>("id").unwrap_or_default();
                 let depends_on = dependencies.remove(&id).unwrap_or_default();
+                let blocked = row
+                    .try_get::<Option<String>, _>("blocked_json")
+                    .ok()
+                    .flatten()
+                    .map(|value| truncate(&value, 2_048));
+                let error = row
+                    .try_get::<Option<String>, _>("error_annotation")
+                    .ok()
+                    .flatten()
+                    .map(|value| truncate(&value, 2_048));
+                let failed = row
+                    .try_get::<Option<String>, _>("failed_json")
+                    .ok()
+                    .flatten()
+                    .map(|value| truncate(&value, 2_048));
                 json!({
                     "id": id,
                     "parent_task_id": row.try_get::<Option<String>, _>("parent_task_id").ok().flatten(),
@@ -1541,7 +1615,11 @@ impl CoordinationToolProvider {
                     "priority": row.try_get::<i64, _>("priority").unwrap_or_default(),
                     "assignee_type": row.try_get::<Option<String>, _>("assignee_type").ok().flatten(),
                     "assignee_id": row.try_get::<Option<String>, _>("assignee_id").ok().flatten(),
+                    "blocked": blocked,
+                    "error": error,
+                    "failed": failed,
                     "depends_on": depends_on,
+                    "latest_execution": latest_executions.remove(&id).unwrap_or(Value::Null),
                 })
             })
             .collect::<Vec<_>>();
@@ -4079,6 +4157,7 @@ fn service_error(error: crate::ServiceError) -> AgentHostError {
         ),
         crate::ServiceError::DependencyGate
         | crate::ServiceError::MissingPrimaryRepo { .. }
+        | crate::ServiceError::PrimaryRepoNotFound { .. }
         | crate::ServiceError::RepoMismatch { .. }
         | crate::ServiceError::PrProviderMissing { .. }
         | crate::ServiceError::PrProviderTokenMissing { .. }

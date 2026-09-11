@@ -75,8 +75,11 @@ pub mod project_runtime;
 pub mod prompt_preview;
 pub mod provider_authorization;
 pub mod recovery;
+pub mod runtime;
 pub mod shared_media_cleanup;
 pub mod shutdown;
+pub mod solo_bootstrap;
+pub mod solo_session;
 pub mod task_diagnostics;
 pub mod task_dispatcher;
 pub mod task_service;
@@ -303,12 +306,17 @@ pub use project_reconciliation::{
     RESOLVE_PROJECT_RECONCILIATION_OPERATION,
 };
 pub use project_runtime::{
-    load_effective_project_state, ProjectCommitmentProjection, ProjectCurrentStateResponse,
-    ProjectEffectiveStateProjection, ProjectInboxProjection,
+    load_effective_project_state, load_project_adoption_charter, ProjectAdoptionCharterProjection,
+    ProjectCommitmentProjection, ProjectCurrentStateResponse, ProjectEffectiveStateProjection,
+    ProjectInboxProjection,
 };
 pub use prompt_preview::preview_effective_prompt;
 pub use provider_authorization::ProviderAuthorizationService;
 pub use recovery::{CrashRecovery, HeartbeatMonitor};
+pub use runtime::{
+    ForgeRuntime, ForgeRuntimeBuilder, RuntimeAssemblyMode, RuntimeMode, RuntimeSupervisor,
+    RuntimeTaskHandle, RuntimeWorker, ShutdownSignal,
+};
 pub use shared_media_cleanup::SharedMediaCleanupScheduler;
 pub use shutdown::GracefulShutdown;
 pub use task_dispatcher::TaskDispatcher;

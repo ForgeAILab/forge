@@ -9,6 +9,7 @@ use db::{
 };
 use events::EventBus;
 use serde_json::json;
+use tokio::time::{timeout, Duration};
 
 use crate::{NotificationService, TaskService};
 
@@ -533,7 +534,6 @@ async fn seed_task(db: &SqliteDb, project_id: &str, status: &str, is_automation:
         CreateTask {
             id: new_uuid_v4(),
             project_id: project_id.to_owned(),
-            repo_id: None,
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -637,4 +637,21 @@ async fn task_count_by_title(db: &SqliteDb, project_id: &str, title: &str) -> i6
     .fetch_one(db.pool())
     .await
     .expect("task count loads")
+}
+
+#[tokio::test]
+async fn start_with_shutdown_stops_and_releases_the_parent_receiver() {
+    let (_db, service) = test_service().await;
+    let event_bus = Arc::clone(&service.event_bus);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = Arc::new(service).start_with_shutdown(shutdown_rx);
+
+    tokio::task::yield_now().await;
+    shutdown_tx.send(true).expect("shutdown receiver is alive");
+
+    timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("project hook worker stops promptly")
+        .expect("project hook worker joins");
+    assert_eq!(event_bus.receiver_count(), 0);
 }

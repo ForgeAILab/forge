@@ -9,7 +9,8 @@
 use std::collections::BTreeMap;
 
 use api_types::{
-    AcceptanceEvidenceRequirement, MilestoneAcceptanceCheck, ProjectExecutionSetupResponse,
+    AcceptanceEvidenceRequirement, MilestoneAcceptanceCheck, ProjectCharterContent,
+    ProjectExecutionSetupResponse,
 };
 use db::SqliteDb;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -20,6 +21,7 @@ use crate::{Result, ServiceError};
 
 const DEFAULT_LIMIT: i64 = 32;
 const MAX_LIMIT: i64 = 64;
+const MAX_ADOPTION_CHARTER_CONTENT_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -56,6 +58,27 @@ pub struct ProjectCurrentStateResponse {
     /// single readiness boolean.
     #[serde(default)]
     pub execution_setup: Option<ProjectExecutionSetupResponse>,
+    /// The unapproved adoption Charter is separate from effective state: it
+    /// is useful while `charter_setup_required` is true, but it cannot become
+    /// the governing Charter until the exact user approval flow consumes it.
+    #[serde(default)]
+    pub adoption_charter: Option<ProjectAdoptionCharterProjection>,
+}
+
+/// The current, unapproved adoption revision for a legacy Project.  This is
+/// intentionally a bounded typed payload rather than a rendered or arbitrary
+/// JSON body so a Project Agent can revise one field while preserving the
+/// server-owned revision, version, and digest guards.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectAdoptionCharterProjection {
+    pub charter_id: String,
+    pub revision_id: String,
+    pub revision: i64,
+    pub version: i64,
+    pub content_digest: String,
+    pub render_digest: String,
+    pub content: ProjectCharterContent,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -282,6 +305,57 @@ pub struct UnreleasedChangesProjection {
 /// Load the one canonical Project projection used by both the Project Agent
 /// prompt and the native `project.current_state` tool. `limit` is a server
 /// bounded presentation limit; it never changes scope or authority.
+///
+/// The adoption revision is read separately because it is not effective
+/// Project state.  Keep this lookup on the same project-id boundary as the
+/// effective projection so callers cannot select an arbitrary Charter.
+pub async fn load_project_adoption_charter(
+    db: &SqliteDb,
+    project_id: &str,
+) -> Result<Option<ProjectAdoptionCharterProjection>> {
+    let row = sqlx::query(
+        "SELECT c.id AS charter_id, c.version AS charter_version,
+                r.id AS revision_id, r.revision, r.content_digest,
+                r.rendered_digest, r.content_json
+         FROM project AS p
+         JOIN project_charter AS c ON c.project_id = p.id
+         JOIN project_charter_revision AS r
+           ON r.id = c.current_draft_revision_id
+          AND r.charter_id = c.id
+         WHERE p.id = ?
+           AND p.charter_status = 'legacy_unverified'
+           AND p.charter_setup_required = 1
+           AND c.current_approved_revision_id IS NULL
+           AND r.lifecycle IN ('draft', 'proposed')
+         ORDER BY c.updated_at DESC, c.id DESC
+         LIMIT 1",
+    )
+    .bind(project_id)
+    .fetch_optional(db.pool())
+    .await?;
+
+    row.map(|row| {
+        let content_json: String = row.try_get("content_json")?;
+        if content_json.len() > MAX_ADOPTION_CHARTER_CONTENT_BYTES {
+            return Err(ServiceError::conflict(
+                "current adoption Charter content exceeds the bounded read limit",
+            ));
+        }
+        let content = serde_json::from_str::<ProjectCharterContent>(&content_json)
+            .map_err(|_| ServiceError::conflict("current adoption Charter content is invalid"))?;
+        Ok(ProjectAdoptionCharterProjection {
+            charter_id: row.try_get("charter_id")?,
+            revision_id: row.try_get("revision_id")?,
+            revision: row.try_get("revision")?,
+            version: row.try_get("charter_version")?,
+            content_digest: row.try_get("content_digest")?,
+            render_digest: row.try_get("rendered_digest")?,
+            content,
+        })
+    })
+    .transpose()
+}
+
 pub async fn load_effective_project_state(
     db: &SqliteDb,
     project_id: &str,
@@ -1290,6 +1364,166 @@ fn validate_primary_milestone_pointer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use db::{
+        create_sqlite_pool, now_rfc3339, run_migrations, CreateProject, ProjectRepo, SqliteDb,
+    };
+
+    fn adoption_content() -> ProjectCharterContent {
+        serde_json::from_value(serde_json::json!({
+            "identity": {
+                "working_name": "Pocket Tasks",
+                "one_line_vision": "A small local task list",
+                "maturity": "mvp"
+            },
+            "problem_and_people": {
+                "problem_or_opportunity": "Keep a short list of local work",
+                "target_users": ["one developer"]
+            },
+            "core_experience": {
+                "primary_outcome": "Tasks can be tracked from a terminal"
+            },
+            "scope": {},
+            "success": {},
+            "constraints_and_risks": {},
+            "knowledge_ledger": {}
+        }))
+        .expect("valid adoption Charter content")
+    }
+
+    async fn adoption_fixture() -> (SqliteDb, ProjectCharterContent, String, String) {
+        let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
+        run_migrations(&pool).await.expect("migrations");
+        let db = SqliteDb::new(pool);
+        let now = now_rfc3339();
+        sqlx::query(
+            "INSERT INTO user (id, email, password_hash, created_at, updated_at)
+             VALUES ('owner-1', 'owner@example.test', 'test', ?, ?)",
+        )
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("owner");
+        ProjectRepo::create(
+            &db,
+            CreateProject {
+                id: "project-adoption-read".to_owned(),
+                name: "Pocket Tasks".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: Some("owner-1".to_owned()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("project");
+
+        let content = adoption_content();
+        let content_json = api_types::canonical_json(&content).expect("canonical content");
+        let rendered = crate::render_project_charter(&content);
+        let content_digest = crate::charter_content_digest(&content);
+        let render_digest =
+            crate::charter_render_digest(crate::PROJECT_CHARTER_RENDER_VERSION, &rendered);
+        sqlx::query(
+            "INSERT INTO project_charter
+                (id, account_id, project_id, project_mode, maturity, lifecycle,
+                 version, created_at, updated_at)
+             VALUES ('adoption-charter-1', 'owner-1', 'project-adoption-read',
+                     'compact', 'mvp', 'draft', 2, ?, ?)",
+        )
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("Charter");
+        sqlx::query(
+            "INSERT INTO project_charter_revision
+                (id, charter_id, revision, base_revision, lifecycle, schema_version,
+                 render_version, content_json, rendered_view, change_summary,
+                 author_type, source_refs_json, content_digest, rendered_digest, created_at)
+             VALUES ('adoption-revision-1', 'adoption-charter-1', 1, 0, 'proposed',
+                     'forge.project-charter/v1', ?, ?, ?, 'initial draft', 'agent',
+                     '[]', ?, ?, ?)",
+        )
+        .bind(crate::PROJECT_CHARTER_RENDER_VERSION)
+        .bind(&content_json)
+        .bind(&rendered)
+        .bind(&content_digest)
+        .bind(&render_digest)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("Charter revision");
+        sqlx::query(
+            "UPDATE project_charter
+             SET current_draft_revision_id = 'adoption-revision-1'
+             WHERE id = 'adoption-charter-1'",
+        )
+        .execute(db.pool())
+        .await
+        .expect("draft pointer");
+        (db, content, content_digest, render_digest)
+    }
+
+    #[tokio::test]
+    async fn current_state_reads_the_pending_adoption_charter_content() {
+        let (db, expected_content, expected_content_digest, expected_render_digest) =
+            adoption_fixture().await;
+        let projection = load_project_adoption_charter(&db, "project-adoption-read")
+            .await
+            .expect("adoption projection")
+            .expect("pending adoption Charter");
+
+        assert_eq!(projection.charter_id, "adoption-charter-1");
+        assert_eq!(projection.revision_id, "adoption-revision-1");
+        assert_eq!(projection.revision, 1);
+        assert_eq!(projection.version, 2);
+        assert_eq!(projection.content_digest, expected_content_digest);
+        assert_eq!(projection.render_digest, expected_render_digest);
+        assert_eq!(projection.content, expected_content);
+    }
+
+    #[tokio::test]
+    async fn current_state_does_not_project_adoption_after_approval() {
+        let (db, _, _, _) = adoption_fixture().await;
+        sqlx::query(
+            "UPDATE project_charter_revision
+             SET lifecycle = 'approved'
+             WHERE id = 'adoption-revision-1'",
+        )
+        .execute(db.pool())
+        .await
+        .expect("approve revision");
+        sqlx::query(
+            "UPDATE project_charter
+             SET current_draft_revision_id = NULL,
+                 current_approved_revision_id = 'adoption-revision-1',
+                 lifecycle = 'attached'
+             WHERE id = 'adoption-charter-1'",
+        )
+        .execute(db.pool())
+        .await
+        .expect("approve Charter");
+        sqlx::query(
+            "UPDATE project
+             SET current_charter_id = 'adoption-charter-1',
+                 current_charter_revision_id = 'adoption-revision-1',
+                 current_charter_version = 3,
+                 charter_status = 'charter_backed',
+                 charter_setup_required = 0
+             WHERE id = 'project-adoption-read'",
+        )
+        .execute(db.pool())
+        .await
+        .expect("back Project with approved Charter");
+
+        assert!(load_project_adoption_charter(&db, "project-adoption-read")
+            .await
+            .expect("adoption projection")
+            .is_none());
+    }
 
     fn milestone(id: &str, lifecycle: &str) -> MilestoneProjection {
         MilestoneProjection {
@@ -1564,6 +1798,7 @@ mod tests {
             scope: "project".to_owned(),
             effective_state: projection,
             execution_setup: None,
+            adoption_charter: None,
         };
         let value = serde_json::to_value(&response).expect("response serializes");
         assert_eq!(value["scope"], "project");

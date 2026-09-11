@@ -15,6 +15,7 @@ runtime uses the singular binding, chat, and handoff model described below.
 ```
 crates/
 ├── forge-cli/     # Binary entrypoint, server startup, CLI commands
+├── forge-solo/    # Repository-scoped chat-first TUI and local entrypoint
 ├── forge-client/  # forge-ctl CLI client
 ├── forge-daemon/  # Local daemon detection and reporting
 ├── api/           # Axum REST endpoints, SSE, middleware
@@ -43,6 +44,9 @@ forge-cli → api → services → db
           → workspace → git
           → config
           → api-types (shared request/response types, zero internal deps)
+
+forge-solo → services → db / events / agent-host / executors / workspace → git
+           → config / api-types / review / cli-adapters
 ```
 
 ## Architectural patterns
@@ -67,12 +71,121 @@ provide headroom for deeply nested Agent tool and recovery calls in debug
 builds. The recovery-to-re-execution future is boxed so it is stored on the
 heap rather than inline in the coordination-tool recovery future.
 
-`forge-cli/main.rs` passes
-`Arc<SqliteDb>`, `Arc<EventBus>`, the Forge agent host/backends, and background
-workers to `AppState`. The revised `AppState` constructs the Task,
+`forge-cli/main.rs` resolves configuration, builds one transport-neutral
+`services::ForgeRuntime` through `ForgeRuntimeBuilder`, starts its
+`RuntimeSupervisor` in server mode, and then constructs `AppState` as the Axum
+adapter over that graph. `AppState` retains `Arc` references to the Task,
 identity/profile, Main/Project Agent Chat, embedded-session, memory,
-commitment, and Attention-facing services. `AppState` is `Clone` (shared fields
-are `Arc`) and used as Axum state.
+commitment, and Attention-facing services; it does not own a second copy of
+the background worker lifecycle. `AppState` is `Clone` (shared fields are
+`Arc`) and used as Axum state.
+
+### Shared runtime composition and Forge Solo
+
+`services::ForgeRuntimeBuilder` is the composition boundary shared by the
+server and `forge-solo`. It resolves the effective configuration and injects
+one database, event bus, adapter registry, Agent Runtime host, credential and
+log roots, workflow, review/merge, workspace, and cleanup graph. The builder
+constructs each domain service once; `RuntimeSupervisor` owns the background
+worker handles and one shutdown signal. The server's `AppState` and Solo's
+session facade consume this graph rather than maintaining parallel persistence,
+workflow, retry, or recovery implementations.
+
+Both modes run the correctness-critical Forge core: migrations, crash
+recovery, Project and Task lifecycle projection, Agent Chat turns, Task
+dispatch, execution heartbeats, workflow hooks, memory/coordination,
+Attention, wake delivery, durable-event projection, validation, merge, and
+workspace cleanup. `forge-solo` additionally starts the local Agent Runtime
+and local adapter execution needed by its reachable Project Agent and Task
+capabilities. It omits only server transports: the Axum listener, web assets,
+MCP endpoint, OAuth callback listener, remote-daemon connection lifecycle,
+external sync, and task-terminal transport. Solo therefore opens no TCP
+listener and does not silently start a hidden `forge` server.
+
+Codex Agent Chat uses app-server stdio dynamic-tool callbacks to invoke the
+same `ScopeToolComposition` and shared `CoordinationToolProvider` as native
+turns. The host resolves the persisted CLI session, verifies the admitted
+identity/chat, and intersects profile, identity, binding, and scope permissions
+before advertising tools. Persisted verification or scratch workspace access
+is narrowed to `Deny` for the CLI chat transport; the original native session
+scope is unchanged. Each invocation is prepared and checked within that
+composition; domain services reauthorize mutations. Setup chats receive the
+adoption catalog with its full nested Charter payload schema, and a later
+turn receives the ready-Project catalog after approval. Chat sandboxes remain filesystem-denied and suppress Task Git
+finalization. CLI transports other than Codex currently retain their text-only
+Agent Chat path.
+
+Solo owns one runtime process for one repository-scoped data root. Before
+migrations or worker startup it acquires an exclusive
+`<data-root>/runtime.lock`; a second live process stops with the data-root
+context and a safe retry instruction. The operating system releases that lock
+on process exit or crash. Normal, signal, panic, and forced shutdown paths
+release owned resources and restore the terminal, but never delete durable
+Project state.
+
+Repository identity is stable across moves of the checkout. Solo resolves the
+primary Git worktree and Git common directory, then reads or atomically creates
+the `<git-common-dir>/forge-solo-id` marker. On Unix, the marker is enforced as
+owner-only; non-Unix builds do not apply POSIX mode-bit checks and must rely on
+the platform's ACLs to protect it. The marker contains only the version and
+UUID repository identifier:
+
+```text
+version = 1
+repository_id = "<uuid>"
+```
+
+Unless `--data-dir` is supplied, the isolated data root is
+`<Forge data root>/solo/<repository-id>/`. SQLite, protected state, JSONL
+logs, media, and generated Task worktrees stay there; no Solo database or
+runtime files are written into the tracked source checkout. On Unix, the data
+root is enforced as owner-only; non-Unix builds do not apply POSIX mode-bit
+checks, so equivalent platform ACLs are required. An explicit data directory
+is used exactly as given only after its recorded repository binding matches the
+marker. Malformed, replaced, symlinked, or insecure markers and mismatched data
+roots fail closed before Project data is exposed or changed.
+
+Bootstrap is an idempotent typed service operation, not a TUI database path.
+It creates or resumes one isolated local owner, owner membership, Project,
+repository binding, Project Agent Chat, setup binding, and eligible Task
+execution selection. First-run discovery accepts only the supported local CLI
+harnesses whose structured availability and authentication checks pass:
+`codex`, `claude_code`, `cursor`, `opencode`, `gemini`, or `smith`. An exact
+single candidate is still confirmed; multiple candidates are picked
+explicitly; no candidate leaves an actionable setup state. Provider API-key,
+OAuth, browser-login, and credential-import flows remain outside Solo v1.
+
+The visible Agent is the canonical Project Agent Chat principal with
+filesystem access denied. It can coordinate repository work only by admitting
+a normal Task. Task Workers and reviewers receive the scheduler-issued
+WorkspaceLease and the existing role-scoped permissions. Solo Projects use
+the existing `autonomous_v1` workflow: blocking checks, explicit human review,
+merge, and cleanup. A Project remains setup-required until the adoption
+conversation drafts the compact Charter and the user confirms the exact
+revision, render digest, Agent selection, and operating-skill revision in its
+focused approval card. Prose such as “yes” never approves a Charter, and no
+repository-mutating Task is admitted before that receipt commits.
+
+The TUI is a projection over ordinary Forge records. Immutable chat messages,
+finite turn states, Tasks, approvals, Attention items, checks, commit evidence,
+and typed failures are authoritative in SQLite. EventBus notifications only
+invalidate projections; incremental JSONL reads through `LogReader` show
+bounded live activity and never determine completion from text. Every Solo
+session is bound to one owner, Project, repository, and Project Chat, and the
+facade rejects opaque IDs outside that scope.
+
+On startup, ordinary crash recovery reconciles ownerless or expired executions
+before the terminal UI is entered; there is no in-TUI recovery progress screen.
+Queued and retry-wait turns resume through `AgentChatTurnWorker`. Awaiting-input
+turns remain durable, but the current Solo startup does not attach the
+protected runtime interaction broker, so those questions are not answerable in
+the TUI and remain parked until a broker-backed surface handles them. Failed,
+blocked, cancelled, approval, and recovery states are shown from durable
+records with only their canonical permitted action. A lost response is retried
+with the same idempotency identity, so bootstrap, message, cancellation, retry,
+and approval commands do not create duplicates. A forced quit may leave work
+for the next launch to reconcile, but it never claims that unfinished work
+succeeded.
 
 ### Shared command/query boundary
 

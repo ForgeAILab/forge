@@ -108,13 +108,21 @@ jobs:
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
         run: ${{ matrix.builder }} build -p forge-client --release --target ${{ matrix.target }}
 
+      - name: Build forge-solo binary
+        env:
+          FORGE_SKIP_WEB_BUILD: "1"
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+        run: ${{ matrix.builder }} build -p forge-solo --release --target ${{ matrix.target }}
+
       - name: Package binaries
         run: |
           mkdir -p dist/web
           cp target/${{ matrix.target }}/release/forge dist/
           cp target/${{ matrix.target }}/release/forge-ctl dist/
+          cp target/${{ matrix.target }}/release/forge-solo dist/
           cp -R web/dist dist/web/dist
-          tar -czf ${{ matrix.artifact }}.tar.gz -C dist forge forge-ctl web
+          tar -czf ${{ matrix.artifact }}.tar.gz -C dist forge forge-ctl forge-solo web
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -226,7 +234,7 @@ jobs:
           npm publish --access public --provenance --tag "$npm_tag"
 
   update-homebrew-tap:
-    name: Update Homebrew Tap
+    name: Request Homebrew Tap Update
     needs: release
     runs-on: ubuntu-latest
     if: ${{ !contains(github.ref_name, '-') }}

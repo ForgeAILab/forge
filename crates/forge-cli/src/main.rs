@@ -140,24 +140,9 @@ async fn run() {
         registry.register(Box::new(cli_adapters::NullAdapter::new()));
     }
     let adapter_registry = Arc::new(registry);
-    let merge_service = Arc::new(services::MergeService::new(
-        Arc::clone(&db),
-        Arc::clone(&event_bus),
-        workspace_root.clone(),
-    ));
-    let cleanup_scheduler = Arc::new(services::WorkspaceCleanupScheduler::new(
-        Arc::clone(&db),
-        Arc::clone(&event_bus),
-        workspace_root.clone(),
-    ));
     let shared_media_cleanup_scheduler = Arc::new(services::SharedMediaCleanupScheduler::new(
         Arc::clone(&db),
         media_storage_root(&effective_config.forge.data_dir),
-    ));
-    let review_runner = Arc::new(review::ReviewRunner::new(
-        Arc::clone(&db),
-        Arc::clone(&event_bus),
-        Arc::clone(&adapter_registry),
     ));
 
     match services::ensure_default_agents(&db, &adapter_registry).await {
@@ -171,6 +156,25 @@ async fn run() {
             std::process::exit(1);
         }
     }
+
+    // Compose the transport-neutral Forge core once.  The server adds its
+    // listener, MCP, web assets, and daemon/sync workers below; Solo can use
+    // this same graph without depending on the API crate.
+    let jwt_secret = config
+        .resolve_jwt_secret()
+        .expect("Failed to resolve JWT secret");
+    let mut runtime_config = effective_config.clone();
+    runtime_config.workspace.root = workspace_root.clone();
+    let runtime = Arc::new(
+        services::ForgeRuntimeBuilder::new(Arc::clone(&db), Arc::clone(&event_bus))
+            .with_adapter_registry(Arc::clone(&adapter_registry))
+            .with_config(runtime_config)
+            .with_workspace_root(workspace_root.clone())
+            .with_workflows_dir(config.workflows_dir())
+            .with_jwt_secret(jwt_secret)
+            .with_bcrypt_cost(effective_config.server.bcrypt_cost)
+            .build(),
+    );
 
     let embedded_daemon = if cli.no_embedded_daemon {
         None
@@ -189,59 +193,14 @@ async fn run() {
     };
     let _embedded_handle = embedded_daemon.as_ref().map(|d| Arc::clone(d).start());
 
-    // 2. Run crash recovery
-    let recovery = services::CrashRecovery::new(Arc::clone(&db), Arc::clone(&event_bus));
-    match recovery.run().await {
-        Ok(count) if count > 0 => info!(recovered_count = count, "recovered orphaned tasks"),
-        Ok(_) => {}
-        Err(error) => warn!(%error, "crash recovery failed"),
-    }
-
-    // 4. Start daemon monitor
-    let daemon_monitor = Arc::new(services::DaemonMonitor::new(
-        Arc::clone(&db),
-        Arc::clone(&event_bus),
-    ));
-    let _daemon_monitor_handle = Arc::clone(&daemon_monitor).start();
-
-    // Start lifecycle event emitter
-    let mut plugin_registry = services::lifecycle::PluginRegistry::new();
-    plugin_registry.register(Arc::new(
-        services::lifecycle::knowledge_inject::KnowledgeInjectPlugin,
-    ));
-    plugin_registry.register(Arc::new(
-        services::lifecycle::knowledge_capture::KnowledgeCapturePlugin,
-    ));
-    let plugin_registry = Arc::new(plugin_registry);
-    let lifecycle_emitter = services::lifecycle::LifecycleEventEmitter::new(
-        Arc::clone(&db),
-        Arc::clone(&plugin_registry),
-    );
-    let lifecycle_rx = event_bus.subscribe();
-    tokio::spawn(async move { lifecycle_emitter.run(lifecycle_rx).await });
-
     // 5. Build app state and start server
     if !effective_config.server.mcp_enabled {
         info!("mcp endpoint disabled");
     }
-    let jwt_secret = config
-        .resolve_jwt_secret()
-        .expect("Failed to resolve JWT secret");
-    let state = api::AppState::with_adapter_registry_services_and_shutdown(
-        Arc::clone(&db),
-        Arc::clone(&event_bus),
-        effective_config.server.mcp_enabled,
-        adapter_registry,
-        merge_service,
-        Arc::clone(&cleanup_scheduler),
-        review_runner,
-        api::state::ShutdownSignal::new(),
-        config.workflows_dir(),
-        jwt_secret,
-        effective_config.server.bcrypt_cost,
-    )
-    .with_effective_config(effective_config.clone());
-    match state
+    // Reconcile stale remote daemons before the shared supervisor launches
+    // dispatch/heartbeat workers. Those workers must never observe an old
+    // external daemon as still eligible for execution.
+    match runtime
         .daemon_service
         .mark_external_daemons_disconnected(
             &services::embedded_daemon::embedded_machine_id(),
@@ -256,97 +215,38 @@ async fn run() {
         Ok(_) => {}
         Err(error) => warn!(%error, "failed to mark stale external daemons offline at startup"),
     }
-    let project_hook_service_handle = Arc::clone(&state.project_hook_service).start();
-    let cleanup_handle = Arc::clone(&cleanup_scheduler).spawn(state.shutdown_signal.subscribe());
+    let mut runtime_supervisor = services::RuntimeSupervisor::new(
+        Arc::clone(&runtime),
+        services::RuntimeAssemblyMode::Server,
+    );
+    match runtime_supervisor.start().await {
+        Ok(count) if count > 0 => info!(recovered_count = count, "recovered orphaned tasks"),
+        Ok(_) => {}
+        Err(error) => warn!(%error, "shared runtime startup failed"),
+    }
+    // Server-only external daemon monitor. The shared supervisor owns local
+    // core workers; this monitor starts after recovery, matching legacy
+    // startup ordering, and remains outside the Solo graph.
+    let daemon_monitor = Arc::new(services::DaemonMonitor::new(
+        Arc::clone(&db),
+        Arc::clone(&event_bus),
+    ));
+    let _daemon_monitor_handle = Arc::clone(&daemon_monitor).start();
+    let state =
+        api::AppState::from_runtime_arc(Arc::clone(&runtime), effective_config.server.mcp_enabled);
     let shared_media_cleanup_handle =
         Arc::clone(&shared_media_cleanup_scheduler).spawn(state.shutdown_signal.subscribe());
-    let task_dispatcher = Arc::new(services::TaskDispatcher::new(
-        Arc::clone(&state.db),
-        Arc::clone(&state.event_bus),
-        Arc::clone(&state.task_service),
-    ));
-    let monitor = Arc::new(
-        services::HeartbeatMonitor::new(Arc::clone(&state.db), Arc::clone(&state.event_bus))
-            .with_task_service(Arc::clone(&state.task_service))
-            .with_task_executor(Arc::clone(&state.task_executor))
-            .with_daemon_connections(Arc::clone(&state.daemon_connections)),
-    );
-    let monitor_handle = Arc::clone(&monitor).start();
-    let task_dispatcher_handle = Arc::clone(&task_dispatcher).start();
     let external_sync = Arc::new(services::ExternalSyncService::new(
         Arc::clone(&state.db),
         Arc::clone(&state.event_bus),
         Arc::clone(&state.task_service),
     ));
     let _external_sync_handle = Arc::clone(&external_sync).start();
-    let state = state.with_task_dispatcher(Arc::clone(&task_dispatcher));
-    let mut agent_chat_turn_worker_handle =
-        Arc::clone(&state.agent_chat_turn_worker).start(state.shutdown_signal.subscribe());
-    let memory_consumer = Arc::new(services::AgentChatMemoryConsumer::new(
-        Arc::clone(&state.db),
-        services::memory_consumer_lease_owner(),
-    ));
-    let mut memory_consumer_handle = memory_consumer.start(state.shutdown_signal.subscribe());
-    let coordination_consumer = Arc::new(services::CoordinationOutcomeConsumer::new(
-        Arc::clone(&state.db),
-        services::coordination_consumer_lease_owner(),
-    ));
-    let mut coordination_consumer_handle =
-        coordination_consumer.start(state.shutdown_signal.subscribe());
-    let attention_projection = Arc::new(
-        services::AttentionService::new(Arc::clone(&state.db))
-            .with_event_bus(Arc::clone(&state.event_bus)),
-    );
-    let mut attention_projection_handle =
-        attention_projection.start(state.shutdown_signal.subscribe());
-    let wake_turn_consumer = Arc::new(services::WakeTurnConsumer::new(
-        Arc::clone(&state.db),
-        services::wake_turn_consumer_lease_owner(),
-    ));
-    let mut wake_turn_consumer_handle = wake_turn_consumer.start(state.shutdown_signal.subscribe());
-    // Mirrors the durable domain-event outbox to the live SSE bus (D20):
-    // several commands (Project creation from a Charter approval, Main
-    // Genesis control transfer, Agent Chat messages/turns, milestone
-    // readiness/release) append their event inside a larger composite
-    // transaction and have no other path to `EventBus`. See
-    // `services::domain_event_broadcast` for why this is generic rather than
-    // a bespoke publish per command.
-    let domain_event_broadcast = Arc::new(services::DomainEventBroadcastConsumer::new(
-        Arc::clone(&state.db),
-        Arc::clone(&state.event_bus),
-    ));
-    let mut domain_event_broadcast_handle =
-        domain_event_broadcast.start(state.shutdown_signal.subscribe());
 
-    if let Err(error) = state.workflow_template_service.initialize().await {
-        warn!(%error, "workflow template initialization failed");
-    }
-
-    // 6. Install graceful shutdown
-    let shutdown = Arc::new(
-        services::GracefulShutdown::new(Arc::clone(&state.db), Arc::clone(&state.event_bus))
-            .with_task_executor(Arc::clone(&state.task_executor)),
-    );
-    let server_shutdown_signal = state.shutdown_signal.clone();
-    let shutdown_clone = Arc::clone(&shutdown);
-    let handler_shutdown_signal = server_shutdown_signal.clone();
-    let shutdown_handle = tokio::spawn(async move {
-        termination_signal().await;
-        info!("shutting down gracefully");
-        handler_shutdown_signal.request();
-        monitor.stop();
-        daemon_monitor.stop();
-        task_dispatcher.stop();
-        external_sync.stop();
-        if let Some(embedded_daemon) = &embedded_daemon {
-            embedded_daemon.stop();
-        }
-        match tokio::time::timeout(Duration::from_secs(10), shutdown_clone.shutdown()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => warn!(%error, "graceful shutdown failed"),
-            Err(_) => warn!("graceful shutdown timed out"),
-        }
-    });
+    // 6. Install graceful shutdown. The shared supervisor owns the core
+    // signal and joins its worker handles; this loop only coordinates the
+    // server-only listener/daemon workers.
+    let server_shutdown_signal = runtime_supervisor.shutdown_signal();
 
     if effective_config.server.mcp_enabled {
         info!(
@@ -395,7 +295,14 @@ async fn run() {
                 }
             }
         }
-        _ = server_shutdown_signal.wait() => {
+        _ = termination_signal() => {
+            info!("shutting down gracefully");
+            runtime_supervisor.request_shutdown();
+            daemon_monitor.stop();
+            external_sync.stop();
+            if let Some(embedded_daemon) = &embedded_daemon {
+                embedded_daemon.stop();
+            }
             match tokio::time::timeout(SERVER_GRACEFUL_SHUTDOWN_TIMEOUT, &mut api_handle).await {
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(error))) => {
@@ -420,76 +327,15 @@ async fn run() {
         }
     }
 
-    let _ = shutdown_handle.await;
-    let _ = cleanup_handle.await;
+    daemon_monitor.stop();
+    external_sync.stop();
+    if let Some(embedded_daemon) = &embedded_daemon {
+        embedded_daemon.stop();
+    }
+    if let Err(error) = runtime_supervisor.shutdown().await {
+        warn!(%error, "shared runtime graceful shutdown failed");
+    }
     let _ = shared_media_cleanup_handle.await;
-    match tokio::time::timeout(Duration::from_secs(5), monitor_handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => warn!(%error, "heartbeat monitor task failed during shutdown"),
-        Err(_) => warn!("heartbeat monitor did not stop before shutdown timeout"),
-    }
-    match tokio::time::timeout(Duration::from_secs(5), task_dispatcher_handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => warn!(%error, "task dispatcher task failed during shutdown"),
-        Err(_) => warn!("task dispatcher did not stop before shutdown timeout"),
-    }
-    project_hook_service_handle.abort();
-    match tokio::time::timeout(Duration::from_secs(5), &mut agent_chat_turn_worker_handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => warn!(%error, "Agent Chat turn worker failed during shutdown"),
-        Err(_) => {
-            warn!("Agent Chat turn worker did not stop before shutdown timeout");
-            agent_chat_turn_worker_handle.abort();
-            let _ = agent_chat_turn_worker_handle.await;
-        }
-    }
-    match tokio::time::timeout(Duration::from_secs(5), &mut memory_consumer_handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => warn!(%error, "Agent Chat memory consumer failed during shutdown"),
-        Err(_) => {
-            warn!("Agent Chat memory consumer did not stop before shutdown timeout");
-            memory_consumer_handle.abort();
-            let _ = memory_consumer_handle.await;
-        }
-    }
-    match tokio::time::timeout(Duration::from_secs(5), &mut coordination_consumer_handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => warn!(%error, "Task coordination consumer failed during shutdown"),
-        Err(_) => {
-            warn!("Task coordination consumer did not stop before shutdown timeout");
-            coordination_consumer_handle.abort();
-            let _ = coordination_consumer_handle.await;
-        }
-    }
-    match tokio::time::timeout(Duration::from_secs(5), &mut attention_projection_handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => warn!(%error, "Attention projection worker failed during shutdown"),
-        Err(_) => {
-            warn!("Attention projection worker did not stop before shutdown timeout");
-            attention_projection_handle.abort();
-            let _ = attention_projection_handle.await;
-        }
-    }
-    match tokio::time::timeout(Duration::from_secs(5), &mut wake_turn_consumer_handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => warn!(%error, "wake turn consumer failed during shutdown"),
-        Err(_) => {
-            warn!("wake turn consumer did not stop before shutdown timeout");
-            wake_turn_consumer_handle.abort();
-            let _ = wake_turn_consumer_handle.await;
-        }
-    }
-    match tokio::time::timeout(Duration::from_secs(5), &mut domain_event_broadcast_handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            warn!(%error, "SSE domain-event broadcast consumer failed during shutdown")
-        }
-        Err(_) => {
-            warn!("SSE domain-event broadcast consumer did not stop before shutdown timeout");
-            domain_event_broadcast_handle.abort();
-            let _ = domain_event_broadcast_handle.await;
-        }
-    }
 }
 
 fn init_tracing(log_dir: &std::path::Path) {
