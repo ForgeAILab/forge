@@ -641,6 +641,21 @@ pub fn agent_response(
     }
 }
 
+pub fn agent_response_for_user(
+    agent: Agent,
+    active_task_count: Option<i64>,
+    effective_status: Option<String>,
+    stats: db::AgentExecutionStats,
+    usage: UsageAggregate,
+    is_admin: bool,
+) -> AgentResponse {
+    let mut response = agent_response(agent, active_task_count, effective_status, stats, usage);
+    if !is_admin {
+        response.daemon_id = None;
+    }
+    response
+}
+
 pub fn daemon_response(daemon: Daemon) -> DaemonResponse {
     DaemonResponse {
         id: daemon.id,

@@ -212,9 +212,14 @@ carries one `AgentChatTurnLogRoot` for both the writer and the route, re-pointed
 when the real `--data-dir` arrives with the effective config.
 
 Creating an operational Project creates its Project Agent binding and Project
-Agent Chat atomically. A migrated Project with no single safe binding is
-explicitly `agent_setup_required` and keeps its Project/Task data readable, but
-cannot admit Project Agent turns until the user resolves the identity. When an
+Agent Chat atomically. Direct REST and MCP Project creation also derives the
+authenticated creator as the Project owner and inserts that user's `owner`
+Project-member row in the same transaction. The creator can therefore use
+Project-scoped reads and writes immediately; a follow-up operation cannot fail
+with a membership-related 404 between Project creation and membership
+materialization. A migrated Project with no single safe binding is explicitly
+`agent_setup_required` and keeps its Project/Task data readable, but cannot
+admit Project Agent turns until the user resolves the identity. When an
 approved adoption Charter resolves that setup binding, the same transaction
 installs the canonical Project-Agent permission ceiling before activating the
 binding; setup's empty ceiling never survives into an admitted Project Agent.
@@ -266,7 +271,7 @@ Charter amendment rotates current binding/approval pointers while retaining the
 same receipt. Already admitted retrying turns continue to use their frozen
 binding/Profile/skill provenance.
 
-The Project operating skill (`forge.project.orchestration/v1@12`) is a
+The Project operating skill (`forge.project.orchestration/v1@16`) is a
 doctrine index, not a doctrine dump: the resident prompt carries the mission,
 authority boundaries, standing invariants, and autonomous-drive rules, plus an
 index of server-owned doctrine sections (`research`, `documents`,
@@ -1580,6 +1585,67 @@ plans internally, implements, self-tests, repairs failures, and reports
 verification evidence, so the preset has no planning state or plan-checklist
 gate.
 
+### Root Tasks and ordered subtasks
+
+A root Task is a Task with no `parent_task_id`. Setting `parent_task_id` makes a
+Task a direct child of that root and selects the root's shared workspace; it is
+the hierarchy/workspace relationship, not a prerequisite edge. A root Task
+with direct children is a non-executing coordination container, not a worker
+execution. The bound Project Agent can create, sequence, assign, and observe
+those children, but Forge never sends the root's implementation prompt to one
+Agent as a proxy for all child work. Converting a Task into a coordination root
+clears its non-review role assignments; only its aggregate review role remains
+assignable at root level.
+
+Each subtask is an independent Task with its own implementation-role
+assignment, status, execution record, session, logs, retry state, comments,
+and completion event. Siblings reuse the root-owned workspace so their commits
+accumulate on one delivery branch. Workspace ownership does not imply Agent
+ownership: the workspace execution lock serializes access, and the dispatcher
+admits only the first incomplete sibling, so ordered children execute one at a
+time even when different Agents are assigned. Execution admission repeats that
+single-run check transactionally against the shared workspace, so remote daemon
+workers cannot bypass serialization. Reordering is transactional as well: the
+terminal prefix and current first incomplete child remain fixed, and only the
+untouched `todo` suffix may be permuted.
+
+The first runnable child creates the root workspace on demand. Completing a
+child wakes the next ordered sibling. Once every child is `done` or
+`cancelled`, Forge advances the coordination root to its aggregate review
+gate; review and merge remain root-level operations, but they bind CI and
+integration to the latest relevant child implementation execution and the
+root-owned shared workspace. The root may receive a reviewer execution for
+that aggregate gate, but it never receives a root implementation execution. A
+failed or blocked child stops the sequence at that child so the Project Agent
+can inspect evidence, reassign it, or otherwise coordinate recovery.
+
+Child terminal/reassignment cleanup never owns the shared root workspace. A
+root cancellation terminalizes active child executions before scheduling root
+cleanup; a scheduled cleanup is deferred while any execution still holds the
+workspace, and a newly admitted sibling clears an older terminal cleanup
+deadline before reusing the branch.
+
+Dependency IDs are separate directed prerequisite-DAG edges. `depends_on_ids`
+on the direct MCP task-creation API (and `depends_on_task_ids` on the native
+Task proposal) names Tasks that must reach `done` before the dependent can be
+dispatched; the REST dependency routes use one `depends_on_id` per edge.
+Dependency edges never establish hierarchy or workspace sharing: two Tasks can
+be prerequisites while keeping unrelated workspaces, and siblings can share a
+root workspace without depending on one another. Edges must stay within the
+Project and remain acyclic. A child cannot depend on its coordination parent,
+because parentage already supplies the shared workspace and the parent only
+advances after its ordered children settle. Dispatch checks all prerequisite
+edges independently of subtask order; reverse-dependent queries expose the
+other direction of the same graph.
+
+Assignment and execution are deliberately separate. `forge_assign_agent`
+only persists the effective implementation-role assignment and therefore
+works while a Project is paused. Resuming the Project lets the scheduler
+start eligible assigned Tasks; assignment itself never creates an Execution.
+Changing an assignment through this assignment-only tool is rejected while the
+implementation role has a running Execution, avoiding hidden cancellation or
+Task-state reset side effects.
+
 These review modes are Task workflow behavior, not Project approval layers.
 Project defaults may select a mode, and an individual Task may override it.
 An execution stop or cancellation first remains an attempt-level audit event.
@@ -2001,6 +2067,15 @@ terminal rows remain ownerless, and pre-existing running rows receive no
 fabricated owner or heartbeat and are eligible for deterministic recovery.
 Lease/version CAS, progress-warning dedupe, and terminal event/WorkspaceLease
 disposition atomicity are repository guarantees layered on these fields.
+
+Migration `V136__project_owner_memberships.sql` backfills the missing
+`owner` membership for every owned Project whose owner account exists. It is
+idempotent and preserves existing memberships, so legacy Projects converge on
+the same owner authorization invariant as new direct REST, MCP, and Genesis
+creation. The subsequent V137 operating-skill migration activates
+`forge.project.orchestration/v1@16`; its task-coordination doctrine makes the
+`parent_task_id` shared-root hierarchy/workspace relation explicit and keeps
+`depends_on_ids` as prerequisite DAG edges that never imply workspace sharing.
 
 For tests, use `create_sqlite_pool("sqlite::memory:")` for an in-memory
 database.

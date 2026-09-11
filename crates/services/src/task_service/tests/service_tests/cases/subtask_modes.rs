@@ -37,7 +37,7 @@ async fn batch_5_4_subtask_management_allows_manual_child_transition() {
 }
 
 #[tokio::test]
-async fn batch_5_6_root_claim_starts_subtask_sequence() {
+async fn batch_5_6_root_is_coordination_only() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let workspace_root = TempDir::new().expect("workspace temp dir creates");
@@ -49,16 +49,16 @@ async fn batch_5_6_root_claim_starts_subtask_sequence() {
     let root = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
     let child = seed_subtask_with_status(&db, &root, "child", "todo".to_owned(), 0).await;
 
-    service
+    let result = service
         .claim_task(root.id.clone(), Assignee::Agent(agent_id), None)
-        .await
-        .expect("root claims");
+        .await;
+    assert!(matches!(result, Err(ServiceError::InvalidOperation { .. })));
 
     let child_after = TaskRepo::get_by_id(&*db, &child.id, false)
         .await
         .expect("child loads")
         .expect("child exists");
-    assert_ne!(child_after.status, "todo");
+    assert_eq!(child_after.status, "todo");
 }
 
 #[tokio::test]
@@ -70,15 +70,20 @@ async fn batch_5_7_reorder_subtasks_requires_all_ids() {
     let root = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
     let first = seed_subtask_with_status(&db, &root, "first", "todo".to_owned(), 0).await;
     let second = seed_subtask_with_status(&db, &root, "second", "todo".to_owned(), 1).await;
+    let third = seed_subtask_with_status(&db, &root, "third", "todo".to_owned(), 2).await;
 
     service
-        .reorder_subtasks(root.id.clone(), vec![second.id.clone(), first.id.clone()])
+        .reorder_subtasks(
+            root.id.clone(),
+            vec![first.id.clone(), third.id.clone(), second.id.clone()],
+        )
         .await
         .expect("reorder with all ids succeeds");
 
     let reordered = TaskRepo::list_subtasks_ordered(&*db, &root.id)
         .await
         .expect("subtasks load");
-    assert_eq!(reordered[0].id, second.id);
-    assert_eq!(reordered[1].id, first.id);
+    assert_eq!(reordered[0].id, first.id);
+    assert_eq!(reordered[1].id, third.id);
+    assert_eq!(reordered[2].id, second.id);
 }

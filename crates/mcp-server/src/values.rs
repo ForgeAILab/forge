@@ -1,4 +1,4 @@
-use db::{Agent, AgentProfile, AgentSession, ClaimedTask, Execution, Page, Project, Task};
+use db::{Agent, AgentProfile, AgentSession, Execution, Page, Project, Task, TaskRoleAssignment};
 use serde_json::{json, Value};
 
 pub(crate) fn task_page_value(page: Page<Task>) -> Value {
@@ -21,10 +21,14 @@ pub(crate) fn execution_page_value(page: Page<Execution>) -> Value {
     })
 }
 
-pub(crate) fn agent_page_value(page: Page<Agent>) -> Value {
+pub(crate) fn agent_page_value_for_user(page: Page<Agent>, is_admin: bool) -> Value {
     let has_more = page.next_cursor.is_some();
     json!({
-        "data": page.items.into_iter().map(agent_value).collect::<Vec<_>>(),
+        "data": page
+            .items
+            .into_iter()
+            .map(|agent| agent_value_for_user(agent, is_admin))
+            .collect::<Vec<_>>(),
         "next_cursor": page.next_cursor,
         "has_more": has_more,
         "total_count": page.total_count,
@@ -64,7 +68,8 @@ pub(crate) fn task_value(task: Task) -> Value {
     })
 }
 
-pub(crate) fn agent_value(agent: Agent) -> Value {
+pub(crate) fn agent_value_for_user(agent: Agent, is_admin: bool) -> Value {
+    let daemon_id = agent.daemon_id.clone().filter(|_| is_admin);
     json!({
         "id": agent.id,
         "name": agent.name,
@@ -80,7 +85,10 @@ pub(crate) fn agent_value(agent: Agent) -> Value {
         "config_json": safe_json(&agent.config_json),
         // Opaque handle only; the protected credential is never serialized.
         "credential_handle_id": agent.credential_ref,
-        "daemon_id": agent.daemon_id,
+        // Daemon identities are sensitive runtime handles. REST redacts this
+        // field for non-admins; MCP must do the same for both single-agent
+        // and paginated responses.
+        "daemon_id": daemon_id,
         "max_concurrent_tasks": agent.max_concurrent_tasks,
         "heartbeat_interval_seconds": agent.heartbeat_interval_seconds,
         "max_missed_heartbeats": agent.max_missed_heartbeats,
@@ -148,10 +156,15 @@ pub(crate) fn agent_session_value(session: AgentSession) -> Value {
     })
 }
 
-pub(crate) fn claimed_task_value(claimed: ClaimedTask) -> Value {
+pub(crate) fn task_role_assignment_value(assignment: TaskRoleAssignment) -> Value {
     json!({
-        "task": task_value(claimed.task),
-        "execution": execution_value(claimed.execution),
+        "id": assignment.id,
+        "task_id": assignment.task_id,
+        "role_name": assignment.role_name,
+        "assignee_type": assignment.assignee_type.map(|kind| kind.to_string()),
+        "assignee_id": assignment.assignee_id,
+        "created_at": assignment.created_at,
+        "updated_at": assignment.updated_at,
     })
 }
 

@@ -17,6 +17,7 @@ use workspace::{WorkspaceError, WorkspaceManager};
 
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const TICK_INTERVAL: Duration = Duration::from_secs(60);
+const ACTIVE_EXECUTION_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 pub struct WorkspaceCleanupScheduler {
     db: Arc<SqliteDb>,
@@ -78,7 +79,7 @@ impl WorkspaceCleanupScheduler {
 
     pub async fn cleanup_now(&self, workspace_id: impl Into<String>) -> Result<()> {
         let workspace_id = workspace_id.into();
-        match timeout(CLEANUP_TIMEOUT, self.cleanup_workspace(&workspace_id)).await {
+        match timeout(CLEANUP_TIMEOUT, self.cleanup_workspace(&workspace_id, true)).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => {
                 tracing::warn!(%workspace_id, %error, "workspace cleanup failed");
@@ -120,15 +121,64 @@ impl WorkspaceCleanupScheduler {
             let Some(workspace) = WorkspaceRepo::get_by_id(&*self.db, &pending.id).await? else {
                 continue;
             };
-            self.cleanup_workspace(&workspace.id).await?;
+            self.cleanup_workspace(&workspace.id, false).await?;
         }
         Ok(())
     }
 
-    async fn cleanup_workspace(&self, workspace_id: &str) -> Result<()> {
+    async fn cleanup_workspace(&self, workspace_id: &str, force: bool) -> Result<()> {
         let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
             .await?
             .ok_or_else(|| crate::ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+        if !force {
+            let Some(cleanup_after) = workspace.cleanup_after.as_deref() else {
+                // A pending-row snapshot may race with a child reusing this
+                // workspace. Reuse clears the stale deadline; never let the
+                // earlier scheduler snapshot delete the revived worktree.
+                tracing::debug!(
+                    workspace_id,
+                    "skipping workspace cleanup after schedule was cleared"
+                );
+                return Ok(());
+            };
+            if chrono::DateTime::parse_from_rfc3339(cleanup_after)
+                .map(|deadline| deadline.with_timezone(&chrono::Utc) > chrono::Utc::now())
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+        }
+
+        let running_executions = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM execution
+             WHERE workspace_id = ? AND status = 'running'",
+        )
+        .bind(workspace_id)
+        .fetch_one(self.db.pool())
+        .await?;
+        if running_executions > 0 {
+            let retry_at = chrono::Utc::now()
+                + chrono::Duration::from_std(ACTIVE_EXECUTION_RETRY_DELAY).map_err(|error| {
+                    crate::ServiceError::invalid_operation(format!(
+                        "invalid active-execution cleanup delay: {error}"
+                    ))
+                })?;
+            WorkspaceRepo::set_cleanup_after(
+                &*self.db,
+                workspace_id,
+                Some(retry_at.to_rfc3339()),
+                &now_rfc3339(),
+            )
+            .await?;
+            tracing::info!(
+                workspace_id,
+                running_executions,
+                cleanup_after = %retry_at.to_rfc3339(),
+                "deferring workspace cleanup while execution is active"
+            );
+            return Ok(());
+        }
+
         info!(
             workspace_id,
             task_id = %workspace.task_id,

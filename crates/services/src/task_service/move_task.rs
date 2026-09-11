@@ -65,6 +65,7 @@ impl TaskService {
         if let Some(replayed) =
             TaskBoardRepo::replay_move_task(&*self.db, &request.operation_id, &identity).await?
         {
+            self.reconcile_terminal_subtask(&replayed.task).await;
             return Ok(replayed);
         }
 
@@ -115,6 +116,18 @@ impl TaskService {
             return self
                 .reorder_within_column(source_task, request, target_column_statuses, &workflow)
                 .await;
+        }
+
+        super::subtask::ensure_coordination_root_target_ready(
+            &self.db,
+            &source_task,
+            &workflow,
+            &request.target_status,
+        )
+        .await?;
+
+        if target_state.kind != api_types::StateKind::Terminal {
+            super::subtask::ensure_subtask_dispatch_order(&self.db, &source_task).await?;
         }
 
         self.ensure_planning_plan_ready_before_leaving(
@@ -258,6 +271,7 @@ impl TaskService {
             &now_rfc3339(),
         )
         .await?;
+        self.reconcile_terminal_subtask(&result.task).await;
         Ok(result)
     }
 

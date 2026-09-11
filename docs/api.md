@@ -107,9 +107,9 @@ database for historical provenance.
 | GET    | `/api/v1/tasks/{id}/prompt-preview?role=&trigger=` | Preview effective prompt without dispatching |
 | PATCH  | `/api/v1/tasks/{id}` | Update task |
 | DELETE | `/api/v1/tasks/{id}` | Soft-delete task |
-| POST   | `/api/v1/tasks/{id}/claim` | Claim task (auto-dispatches the executor) |
+| POST   | `/api/v1/tasks/{id}/claim` | Claim a standalone Task or the first eligible ordered child (auto-dispatches); a root with children is a non-executing coordinator and cannot be claimed |
 | GET    | `/api/v1/tasks/{id}/actions` | List the intent actions currently available for the task (`{"available_actions": [...]}`), so clients need not provoke a 409 to discover them |
-| POST   | `/api/v1/tasks/{id}/start` | Start task work (claims an available agent and dispatches the first active state) |
+| POST   | `/api/v1/tasks/{id}/start` | Start standalone or eligible child work; coordination roots never start implementation |
 | POST   | `/api/v1/tasks/{id}/pause` | Stop the current execution without changing task state |
 | POST   | `/api/v1/tasks/{id}/resume` | Resume the latest worker session, or dispatch fresh work when no session exists |
 | POST   | `/api/v1/tasks/{id}/submit` | Fire the current active state's `accept` trigger |
@@ -119,6 +119,11 @@ database for historical provenance.
 | POST   | `/api/v1/tasks/{id}/archive` | Archive task (hidden from default lists) |
 | POST   | `/api/v1/tasks/{id}/transition` | Transition status; entering `review` returns `{task, review}` inline |
 | POST   | `/api/v1/tasks/{id}/move` | Atomically move/reorder a board task with task and board concurrency checks |
+| POST   | `/api/v1/tasks/{id}/subtasks/reorder` | Reorder a root's direct children; the terminal/current-child prefix stays fixed and only the untouched `todo` suffix may move |
+| GET    | `/api/v1/tasks/{id}/dependencies` | List prerequisite dependency edges |
+| POST   | `/api/v1/tasks/{id}/dependencies` | Add one prerequisite dependency edge |
+| DELETE | `/api/v1/tasks/{id}/dependencies/{dep_id}` | Remove one prerequisite dependency edge |
+| GET    | `/api/v1/tasks/{id}/dependents` | List Tasks that depend on this prerequisite |
 | POST   | `/api/v1/tasks/{id}/recover` | Apply a recovery action to a blocked/failed task |
 | POST   | `/api/v1/tasks/{id}/review` | Re-run the configured review and apply its workflow outcome |
 | GET    | `/api/v1/tasks/{id}/diff` | Get task workspace diff |
@@ -250,7 +255,9 @@ An Agent response represents a stable identity plus its currently selected
 immutable profile. Connection/profile APIs accept provider credentials only in
 request bodies and immediately move them behind a protected write-only store;
 responses, events, errors, and logs contain only opaque credential handles and
-bounded health. Profile `config` fields are recursively redacted.
+bounded health. Profile `config` fields are recursively redacted. Agent
+responses expose `daemon_id` only to administrators, including account rosters,
+Project-agent candidate lists, and embedded-agent create/connect responses.
 
 Creating or connecting an identity grants no Main or Project binding. The
 account may explicitly select one active Main Agent binding, and each
@@ -457,6 +464,16 @@ projection of the independent `coordination_state`, `execution_setup_state`,
 and `execution_gate` dimensions; clients must not treat Project creation or
 any one dimension as evidence that the other two are ready. The same
 projection is available at `GET /api/v1/projects/{id}/execution-setup`.
+
+For both normal direct REST creation and the authenticated MCP
+`forge_create_project` tool, Forge derives the creator from authentication and
+atomically persists `project.owner_id` plus a `project_member` row with
+`role: "owner"`. The response remains the normal Project response; membership
+is an authorization fact rather than an extra response field. This makes the
+creator immediately eligible for Project-scoped follow-up reads, updates, and
+chat operations instead of receiving a 404 while the owner membership is still
+missing. Genesis creation applies the same owner-membership invariant inside
+its larger creation transaction.
 
 Approval and manual-check idempotency is scoped by operation, Project (or the
 account during pre-Project Genesis), and authenticated principal. Reusing the
@@ -1868,6 +1885,34 @@ normal Task workflow; the Project Agent uses the native ReadyOnly `task.review`
 operation, which validates the exact binding, Project, Task version, CI, and
 evidence before transition.
 
+## Task hierarchy, workspaces, and prerequisite dependencies
+
+`parent_task_id` is the hierarchy pointer. A Task that names a parent is a
+direct child of a root coordination Task, inherits the root's shared workspace,
+and receives a `subtask_order` position. A root with one or more children is a
+non-executing coordination container: the root's implementation prompt is not
+dispatched, its non-review role assignments are cleared, and new implementation
+assignments must target children. Each child has its own lifecycle, assignment,
+execution, retry history, and logs. Children may be assigned to different Agents, but Forge
+dispatches only the first incomplete child and runs the ordered sequence
+serially in the root workspace. When all children are terminal, the root moves
+through its aggregate review/merge path.
+
+Dependency IDs describe a separate prerequisite DAG. They gate dispatch until
+each named prerequisite reaches `done`; they do not create parent/child
+hierarchy and never imply workspace sharing. Dependency edges are same-Project
+and acyclic. Forge rejects a child that lists its coordination parent as a
+dependency. A dependency edge between independent roots or between siblings
+does not merge their workspaces, and changing subtask order does not rewrite
+dependency edges. Cancelling a prerequisite projects a durable blocker onto
+unfinished dependents until the cancelled link is removed or otherwise
+resolved.
+
+The current Project Agent operating skill is
+`forge.project.orchestration/v1@16` (activated by V137). Its task-coordination
+doctrine uses the same distinction: `parent_task_id` selects the shared root
+workspace, while dependency IDs only gate execution.
+
 ## Execution status and liveness
 
 `GET /api/v1/executions/{id}` and the execution items returned by
@@ -3025,11 +3070,14 @@ overwriting newer settings or hooks; refresh the Project before retrying.
 
 | Tool | Purpose |
 |------|---------|
-| `forge_create_task` | Create a new task |
-| `forge_create_sub_tasks` | Create ordered subtasks under a root task |
+| `forge_create_task` | Create a task, optionally with atomic prerequisite links in `depends_on_ids` |
+| `forge_create_sub_tasks` | Create independently assignable subtasks; array order is execution order |
 | `forge_add_task_dependency` | Add a prerequisite task dependency |
 | `forge_remove_task_dependency` | Remove a task dependency |
 | `forge_list_task_dependencies` | List a task's prerequisite dependencies |
+| `forge_list_task_dependents` | List Tasks gated by a prerequisite |
+| `forge_list_sub_tasks` | List a coordination root's direct children in execution order |
+| `forge_reorder_sub_tasks` | Reorder a root's direct children; the terminal/current-child prefix stays fixed and only the untouched `todo` suffix may move |
 | `forge_list_tasks` | List tasks with pagination |
 | `forge_get_task` | Get task detail |
 | `forge_preview_prompt` | Preview effective prompt without dispatching |
@@ -3037,7 +3085,7 @@ overwriting newer settings or hooks; refresh the Project before retrying.
 | `forge_transition_task` | Transition a task to another status |
 | `forge_memory_search` | Search project memory with an injection-guard wrapper |
 | `forge_memory_get` | Get one memory item with an injection-guard wrapper |
-| `forge_assign_agent` | Atomic claim |
+| `forge_assign_agent` | Assign the effective implementation role without starting execution; valid while paused |
 | `forge_cancel_task` | Cancel task |
 | `forge_get_task_diff` | Get code diff |
 | `forge_list_executions` | List executions |
@@ -3047,8 +3095,8 @@ overwriting newer settings or hooks; refresh the Project before retrying.
 | `forge_get_project` | Get project details |
 | `forge_update_project` | Update mutable project fields |
 | `forge_update_project_lifecycle_hooks` | Replace project lifecycle hooks |
-| `forge_register_agent` | Register an agent executor |
-| `forge_list_agents` | List registered agents |
+| `forge_register_agent` | Register an account-owned agent from account-scoped MCP; daemon pinning requires admin |
+| `forge_list_agents` | List the authenticated account's and global agents from account-scoped MCP |
 | `forge_list_agent_profiles` | List immutable executable profiles for an owned agent identity |
 | `forge_list_agent_sessions` | List safe status/capability snapshots for an owned identity's sessions |
 | `forge_get_agent_session` | Inspect one owned scope-bound session without protected runtime state |
@@ -3063,6 +3111,60 @@ overwriting newer settings or hooks; refresh the Project before retrying.
 | `forge_list_agent_handoffs` | List immutable Main-to-Project handoffs |
 | `forge_get_agent_handoff` | Inspect one handoff and its delivery outcome |
 | `forge_create_agent_handoff` | Publish a bounded, deduplicated Main-to-Project handoff |
+
+`forge_assign_agent` is assignment-only. Its result contains the persisted
+`assignment` plus `execution_started: false`; it does not claim the Task,
+create an Execution, or bypass Project pause. When the Project resumes, the
+scheduler dispatches the assigned work. It rejects a changed assignment while
+that implementation role has a running Execution; stop the Execution first.
+For a root Task with ordered children, assign each subtask independently; only
+the first incomplete sibling is eligible to run.
+
+Task hierarchy and dependency fields retain separate meanings in every MCP
+tool. `parent_task_id` identifies the coordination root and shared workspace;
+`depends_on_ids` identifies prerequisite DAG edges and never shares a workspace.
+The parent cannot also appear in `depends_on_ids`. `forge_create_sub_tasks`
+creates direct children atomically in the supplied array order; each child may
+name a different `assignee_id`, while the sequence remains serial in the root
+workspace. `forge_reorder_sub_tasks` requires the complete direct-child ID list
+exactly once. Its transaction preserves the terminal prefix and current first
+incomplete child; only untouched `todo` children after that cursor may be
+permuted, so an active child cannot be moved behind a newly selected sibling.
+
+The direct MCP task response is the normal task object plus
+`depends_on_ids: string[]` (an empty array when no prerequisites were supplied).
+The exact response fields for the graph/subtask helpers are:
+
+`forge_list_task_dependencies`:
+
+```json
+{ "task_id": "task-id", "depends_on_ids": ["prerequisite-id"] }
+```
+
+`forge_list_task_dependents`:
+
+```json
+{ "depends_on_id": "prerequisite-id", "dependent_task_ids": ["task-id"] }
+```
+
+`forge_create_sub_tasks`:
+
+```json
+{ "subtasks": [{ "id": "child-id", "role_assignments": [] }] }
+```
+
+`forge_list_sub_tasks` and `forge_reorder_sub_tasks`:
+
+```json
+{ "parent_task_id": "root-id", "subtasks": [{ "id": "child-id", "role_assignments": [] }] }
+```
+
+Each subtask element contains the normal Task fields plus its persisted
+`role_assignments`, so callers can verify per-child agent selection directly.
+
+`forge_list_task_dependencies` uses `depends_on_ids`, not the retired
+`depends_on` response field. The REST dependency responses remain arrays of
+`TaskDependency` objects with `task_id`, `depends_on_id`, and `created_at`.
 
 Agent Chat message results use the shared typed `AgentChatMessageResponse`.
 Usage is exposed as `usage: UsageBreakdown[]` (including typed counters and
@@ -3086,7 +3188,18 @@ outcomes](#native-and-mcp-orchestration-outcomes).
 `planning_task`, `sub_task`, or `discovery`) and passes it through to the
 authoritative Task service. A project-scoped MCP connection may omit
 `project_id`; Forge injects the bound Project and rejects a conflicting
-reference.
+reference. It also accepts optional `parent_task_id` and `depends_on_ids`.
+Forge validates all dependency IDs, same-Project scope, acyclicity,
+cancellation state, and the parent/dependency exclusion before committing the
+Task and every prerequisite link in one transaction; an invalid prerequisite
+leaves no Task behind. `parent_task_id` creates the shared-root subtask
+relationship only, while `depends_on_ids` gates execution only.
+
+`forge_create_project` also derives the authenticated MCP user rather than
+accepting an owner argument. Project creation commits the Project and that
+user's `owner` membership atomically, so a subsequent `forge_get_project`,
+Project update, or other member-authorized call does not encounter a
+membership-related 404.
 
 The MCP registry currently exposes no canonical dotted orchestration operation
 IDs (`charter.*`, `project.*`, or `task.propose`). Those migrated native

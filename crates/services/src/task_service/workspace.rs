@@ -27,8 +27,27 @@ pub(crate) async fn prepare_workspace_owned(
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
 ) -> Result<(Workspace, bool)> {
     if let Some(parent_task_id) = task.parent_task_id.as_deref() {
+        let parent_task = TaskRepo::get_by_id(db, parent_task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", parent_task_id.to_owned()))?;
+        if parent_task.project_id != task.project_id {
+            return Err(ServiceError::invalid_operation(
+                "subtask and coordination root must belong to the same project",
+            ));
+        }
         let Some(workspace) = WorkspaceRepo::get_by_task_id(db, parent_task_id).await? else {
-            return Err(ServiceError::parent_workspace_required(parent_task_id));
+            // The root is a coordination container, so its first runnable
+            // child creates the shared root-owned worktree on demand. A child
+            // admission failure must not clean up that shared workspace.
+            let workspace = create_fresh_workspace(
+                db,
+                workspace_root,
+                &parent_task,
+                parent_task_id,
+                repo_cache_locks,
+            )
+            .await?;
+            return Ok((workspace, false));
         };
         if workspace.status == WorkspaceStatus::Ready {
             match worktree_readiness(Path::new(&workspace.worktree_path)).await {
@@ -40,22 +59,22 @@ pub(crate) async fn prepare_workspace_owned(
                         worktree_path = %workspace.worktree_path,
                         "reusing parent workspace"
                     );
-                    return Ok((workspace, false));
+                    return Ok((clear_workspace_cleanup_after(db, workspace).await?, false));
                 }
                 WorktreeReadiness::Missing | WorktreeReadiness::Invalid => {
-                    let parent_task = TaskRepo::get_by_id(db, parent_task_id, false)
-                        .await?
-                        .ok_or_else(|| {
-                            ServiceError::not_found("task", parent_task_id.to_owned())
-                        })?;
                     return Ok((
-                        recover_missing_worktree(
+                        clear_workspace_cleanup_after(
                             db,
-                            workspace_root,
-                            &parent_task,
-                            parent_task_id,
-                            workspace,
-                            repo_cache_locks,
+                            recover_missing_worktree(
+                                db,
+                                workspace_root,
+                                &parent_task,
+                                parent_task_id,
+                                workspace,
+                                repo_cache_locks,
+                                false,
+                            )
+                            .await?,
                         )
                         .await?,
                         false,
@@ -76,17 +95,22 @@ pub(crate) async fn prepare_workspace_owned(
                         worktree_path = %workspace.worktree_path,
                         "reusing existing workspace"
                     );
-                    return Ok((workspace, false));
+                    return Ok((clear_workspace_cleanup_after(db, workspace).await?, false));
                 }
                 WorktreeReadiness::Missing | WorktreeReadiness::Invalid => {
                     return Ok((
-                        recover_missing_worktree(
+                        clear_workspace_cleanup_after(
                             db,
-                            workspace_root,
-                            task,
-                            task_id,
-                            workspace,
-                            repo_cache_locks,
+                            recover_missing_worktree(
+                                db,
+                                workspace_root,
+                                task,
+                                task_id,
+                                workspace,
+                                repo_cache_locks,
+                                true,
+                            )
+                            .await?,
                         )
                         .await?,
                         false,
@@ -112,6 +136,7 @@ async fn recover_missing_worktree(
     task_id: &str,
     workspace: Workspace,
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
+    delete_missing_workspace: bool,
 ) -> Result<Workspace> {
     let readiness = worktree_readiness(Path::new(&workspace.worktree_path)).await;
     warn!(
@@ -184,7 +209,20 @@ async fn recover_missing_worktree(
             .await?
             .ok_or_else(|| ServiceError::not_found("workspace", workspace.id))
     } else {
-        WorkspaceRepo::delete(db, &workspace.id).await?;
+        if delete_missing_workspace {
+            WorkspaceRepo::delete(db, &workspace.id).await?;
+        } else {
+            // A child may discover that the root branch disappeared while
+            // preparing the shared worktree. Keep the root-owned row so the
+            // required reset remains an explicit root operation; a child
+            // must never delete the delivery workspace as a side effect of
+            // its own admission attempt.
+            warn!(
+                task_id = task_id,
+                workspace_id = %workspace.id,
+                "shared root branch is gone; preserving workspace row for root reset"
+            );
+        }
         warn!(
             task_id = task_id,
             branch = %branch,
@@ -375,6 +413,16 @@ async fn create_fresh_workspace(
     Ok(workspace)
 }
 
+/// Reusing a workspace revives its shared delivery branch. Any cleanup
+/// deadline left by a previously terminal child is stale and must be cleared
+/// before a new execution can rely on the worktree.
+async fn clear_workspace_cleanup_after(db: &SqliteDb, workspace: Workspace) -> Result<Workspace> {
+    if workspace.cleanup_after.is_none() {
+        return Ok(workspace);
+    }
+    Ok(WorkspaceRepo::set_cleanup_after(db, &workspace.id, None, &now_rfc3339()).await?)
+}
+
 /// Ensure the Project Agent's own workspace.
 ///
 /// This is the Agent's working directory, not a delivery worktree. It holds
@@ -534,6 +582,11 @@ pub(super) async fn reset_workspace(
     task: &Task,
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
 ) -> Result<Workspace> {
+    if task.parent_task_id.is_some() {
+        return Err(ServiceError::invalid_operation(
+            "subtask workspaces are shared with the coordination root; reset the root workspace instead",
+        ));
+    }
     if let Some(workspace) = WorkspaceRepo::get_by_task_id(db, &task.id).await? {
         let repo_id = task
             .repo_id
@@ -844,13 +897,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn root_task_reuses_ready_task_workspace() {
+    async fn root_task_reuse_clears_cleanup_deadline() {
         let db = sqlite_db().await;
         let (project_id, repo_id) = seed_project_repo(&db).await;
         let root = seed_task(&db, &project_id, &repo_id, None).await;
         let worktree_dir = TempDir::new().expect("worktree dir creates");
         let workspace =
             seed_workspace(&db, &root, WorkspaceStatus::Ready, worktree_dir.path()).await;
+        let workspace = WorkspaceRepo::set_cleanup_after(
+            &db,
+            &workspace.id,
+            Some("2026-09-10T00:00:00Z".to_owned()),
+            &now_rfc3339(),
+        )
+        .await
+        .expect("cleanup deadline stores");
         let temp = TempDir::new().expect("temp dir creates");
 
         let prepared = prepare_workspace(&db, temp.path(), &root, &root.id, None)
@@ -859,6 +920,7 @@ mod tests {
 
         assert_eq!(prepared.id, workspace.id);
         assert_eq!(prepared.task_id, root.id);
+        assert!(prepared.cleanup_after.is_none());
     }
 
     #[tokio::test]
@@ -881,18 +943,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subtask_rejects_missing_or_not_ready_parent_workspace() {
+    async fn subtask_rejects_not_ready_parent_workspace() {
         let db = sqlite_db().await;
         let (project_id, repo_id) = seed_project_repo(&db).await;
         let root = seed_task(&db, &project_id, &repo_id, None).await;
         let subtask = seed_task(&db, &project_id, &repo_id, Some(root.id.clone())).await;
         let temp = TempDir::new().expect("temp dir creates");
-
-        let missing = prepare_workspace(&db, temp.path(), &subtask, &subtask.id, None).await;
-        assert!(matches!(
-            missing,
-            Err(ServiceError::ParentWorkspaceRequired { parent_task_id }) if parent_task_id == root.id
-        ));
 
         let worktree_dir = TempDir::new().expect("worktree dir creates");
         seed_workspace(&db, &root, WorkspaceStatus::Creating, worktree_dir.path()).await;
@@ -904,18 +960,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subtask_without_parent_workspace_errors() {
+    async fn first_subtask_creates_root_workspace_on_demand() {
         let db = sqlite_db().await;
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let repo_dir = TempDir::new().expect("repo dir creates");
+        let (project_id, repo_id) = seed_project_with_real_repo(&db, repo_dir.path()).await;
         let root = seed_task(&db, &project_id, &repo_id, None).await;
         let subtask = seed_task(&db, &project_id, &repo_id, Some(root.id.clone())).await;
-        let temp = TempDir::new().expect("temp dir creates");
+        let workspace_root = TempDir::new().expect("workspace root creates");
 
-        let result = prepare_workspace(&db, temp.path(), &subtask, &subtask.id, None).await;
-        assert!(matches!(
-            result,
-            Err(ServiceError::ParentWorkspaceRequired { .. })
-        ));
+        let prepared = prepare_workspace(&db, workspace_root.path(), &subtask, &subtask.id, None)
+            .await
+            .expect("first child creates the shared workspace");
+
+        assert_eq!(prepared.task_id, root.id);
+        assert_eq!(prepared.repo_id, repo_id);
+        assert!(WorkspaceRepo::get_by_task_id(&db, &subtask.id)
+            .await
+            .expect("child workspace lookup succeeds")
+            .is_none());
+        assert_eq!(
+            WorkspaceRepo::get_by_task_id(&db, &root.id)
+                .await
+                .expect("root workspace lookup succeeds")
+                .expect("root owns the shared workspace")
+                .id,
+            prepared.id
+        );
     }
 
     async fn seed_project_with_real_repo(

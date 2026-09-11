@@ -104,7 +104,11 @@ async fn validate_role_name(
     let project = ProjectRepo::get_by_id(db, &task.project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("project", task.project_id.clone()))?;
-    let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
+    let workflow = WorkflowEngine::resolve_workflow_for_task(
+        &task,
+        &project.workflow_definition,
+        &Actor::system(SystemComponent::General),
+    );
     if !workflow.roles.iter().any(|role| role.name == role_name) {
         return Err(ApiError::bad_request(format!(
             "role '{role_name}' is not defined in workflow"

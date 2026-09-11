@@ -878,6 +878,67 @@ async fn active_baseline_read_only_task_retains_traceability_and_dependencies() 
 }
 
 #[tokio::test]
+async fn task_proposal_rejects_parent_as_prerequisite() {
+    let fixture = fixture().await;
+    let parent_payload = payload(BASELINE_PROJECT_ID, "Coordination root", "task", true);
+    let parent_action = action(
+        &fixture.db,
+        "task-command-parent-dependency-parent",
+        AGENT_ID,
+        BASELINE_PROJECT_ID,
+        &parent_payload,
+    )
+    .await;
+    let parent = propose(
+        &fixture,
+        parent_action.id,
+        parent_action.version,
+        "task-command-parent-dependency-parent-key",
+    )
+    .await
+    .expect("coordination root proposal")
+    .task;
+
+    let mut child_payload = payload(
+        BASELINE_PROJECT_ID,
+        "Child cannot gate on its parent",
+        "task",
+        true,
+    );
+    child_payload["parent_task_id"] = json!(parent.id.clone());
+    child_payload["depends_on_task_ids"] = json!([parent.id]);
+    let child_action = action(
+        &fixture.db,
+        "task-command-parent-dependency-child",
+        AGENT_ID,
+        BASELINE_PROJECT_ID,
+        &child_payload,
+    )
+    .await;
+    let error = propose(
+        &fixture,
+        child_action.id,
+        child_action.version,
+        "task-command-parent-dependency-child-key",
+    )
+    .await
+    .expect_err("parent must not be accepted as a prerequisite");
+    assert!(error.to_string().contains("shared-workspace"));
+    assert_eq!(
+        count(
+            &fixture.db,
+            "SELECT COUNT(*) FROM task WHERE project_id = 'task-command-baseline-project'",
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(&fixture.db, "SELECT COUNT(*) FROM task_dependency").await,
+        0
+    );
+}
+
+#[tokio::test]
 async fn task_proposal_receipt_failure_rolls_back_prerequisite_links() {
     let fixture = fixture().await;
     let prerequisite_payload = payload(

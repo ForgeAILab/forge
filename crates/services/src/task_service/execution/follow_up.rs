@@ -152,6 +152,9 @@ fn dispatch_role_follow_up_impl(
         let task = TaskRepo::get_by_id(&*service.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        service
+            .ensure_ordered_execution_admission(&task, &role)
+            .await?;
         let role_parent = if execution_role_matches(&supplied_parent_execution, &role) {
             Some(supplied_parent_execution.clone())
         } else {

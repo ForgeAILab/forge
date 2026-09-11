@@ -15,6 +15,11 @@ impl TaskService {
                 "Task dependencies must belong to the same Project",
             ));
         }
+        if task.parent_task_id.as_deref() == Some(depends_on_id) {
+            return Err(ServiceError::invalid_operation(
+                "a subtask cannot depend on its coordination parent; parentage shares a workspace and the parent completes only after its children",
+            ));
+        }
         if self.task_is_cancelled(&dependency).await? {
             return Err(ServiceError::invalid_operation(
                 "Task dependencies cannot reference a cancelled Task",

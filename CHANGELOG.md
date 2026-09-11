@@ -6,8 +6,38 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Breaking
+
+- `forge_assign_agent` now assigns the Task's effective implementation role
+  without claiming the Task or creating an Execution. Assignment is allowed
+  while a Project is paused; the scheduler starts assigned work after resume.
+  The response now contains `assignment` and `execution_started: false` instead
+  of a claimed Task and Execution. It rejects changed assignments during a
+  running implementation Execution instead of silently cancelling that run.
+- Root-owned subtask execution is removed. A root Task with children is now a
+  coordination container: every ordered subtask has its own Agent assignment,
+  Task lifecycle, and Execution while reusing the root-owned workspace. Forge
+  dispatches only the first incomplete sibling, advances to the next after
+  completion, and sends the root to aggregate review after the sequence ends.
+  Splitting clears non-review root role assignments, and later implementation
+  assignment to the coordination root is rejected. MCP subtask responses now
+  include each child's persisted role assignments.
+- `forge_list_task_dependencies` now returns `depends_on_ids` instead of the
+  previous `depends_on` field. Clients must use the plural ID-array field; no
+  compatibility response alias is provided.
+- The canonical Project Agent operating skill advances to
+  `forge.project.orchestration/v1@16` (V137). Project Agent task coordination
+  now treats `parent_task_id` as the shared-root hierarchy/workspace relation
+  and dependency IDs as prerequisite DAG edges only; a child cannot depend on
+  its coordination parent.
+
 ### Added
 
+- `forge_create_task` now accepts optional `depends_on_ids` and commits all
+  validated prerequisite links atomically with the Task. MCP also exposes
+  `forge_list_task_dependents`, `forge_list_sub_tasks`, and
+  `forge_reorder_sub_tasks`; the latter two report ordered direct children of a
+  coordination root.
 - CLI-harness agents and per-execution overrides now offer an explicit `YOLO`
   permission policy. It selects the executor's full-access/no-prompt mode
   (including Codex `danger-full-access` with approvals set to `never`) while
@@ -17,6 +47,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Direct REST and authenticated MCP Project creation now materialize the
+  creator's `owner` Project membership atomically with the Project, fixing
+  immediate follow-up operations that previously returned 404 because the
+  membership row had not been created.
+- V136 backfills that `owner` membership for existing owned Projects when the
+  account still exists, preserving data and making legacy Project authorization
+  converge with new creation.
+- Keep Task hierarchy separate from prerequisite edges: a child cannot list
+  its coordination parent in `depends_on_ids`, and dependency links no longer
+  imply shared workspace ownership or subtask ordering.
+- Bind agents created through authenticated MCP to that account instead of
+  creating unowned global identities. Registration and roster listing now
+  require account-scoped MCP, daemon pinning preserves the REST admin check,
+  roster visibility is filtered before pagination, and every REST/MCP Agent
+  response redacts daemon IDs from non-admin users.
 - Let Agent Settings edit an agent's maximum concurrent task executions and
   delete an agent from the roster with an explicit confirmation while
   preserving its run history.

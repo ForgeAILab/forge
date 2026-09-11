@@ -43,10 +43,91 @@ impl TaskService {
         role_assignments: Option<Vec<api_types::InitialRoleAssignment>>,
         governance: Option<api_types::TaskGovernanceRequest>,
     ) -> Result<Task> {
+        self.create_task_with_governance_and_dependencies(
+            project_id,
+            title,
+            description,
+            parent_task_id,
+            priority,
+            task_type,
+            task_state_config,
+            merge_config,
+            role_assignments,
+            governance,
+            Vec::new(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_task_with_dependencies(
+        &self,
+        project_id: impl Into<String>,
+        title: impl Into<String>,
+        description: Option<String>,
+        parent_task_id: Option<String>,
+        priority: Option<i64>,
+        task_type: Option<String>,
+        task_state_config: Option<String>,
+        merge_config: Option<Value>,
+        role_assignments: Option<Vec<api_types::InitialRoleAssignment>>,
+        dependency_ids: Vec<String>,
+    ) -> Result<Task> {
+        self.create_task_with_governance_and_dependencies(
+            project_id,
+            title,
+            description,
+            parent_task_id,
+            priority,
+            task_type,
+            task_state_config,
+            merge_config,
+            role_assignments,
+            None,
+            dependency_ids,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_task_with_governance_and_dependencies(
+        &self,
+        project_id: impl Into<String>,
+        title: impl Into<String>,
+        description: Option<String>,
+        parent_task_id: Option<String>,
+        priority: Option<i64>,
+        task_type: Option<String>,
+        task_state_config: Option<String>,
+        merge_config: Option<Value>,
+        role_assignments: Option<Vec<api_types::InitialRoleAssignment>>,
+        governance: Option<api_types::TaskGovernanceRequest>,
+        dependency_ids: Vec<String>,
+    ) -> Result<Task> {
         let project_id = project_id.into();
         let title = title.into();
         validate_required("project_id", &project_id)?;
         validate_required("title", &title)?;
+
+        let mut unique_dependency_ids = HashSet::with_capacity(dependency_ids.len());
+        for dependency_id in &dependency_ids {
+            validate_required("depends_on_ids", dependency_id)?;
+            if !unique_dependency_ids.insert(dependency_id.as_str()) {
+                return Err(ServiceError::invalid_operation(format!(
+                    "duplicate dependency Task id: {dependency_id}"
+                )));
+            }
+        }
+        if let Some(parent_task_id) = parent_task_id.as_deref() {
+            if dependency_ids
+                .iter()
+                .any(|dependency_id| dependency_id == parent_task_id)
+            {
+                return Err(ServiceError::invalid_operation(
+                    "parent_task_id creates a shared-workspace subtask relationship and cannot also be a prerequisite dependency",
+                ));
+            }
+        }
 
         let project = ProjectRepo::get_by_id(&*self.db, &project_id)
             .await?
@@ -56,6 +137,9 @@ impl TaskService {
             let parent = TaskRepo::get_by_id(&*self.db, parent_id, false)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("task", parent_id.to_owned()))?;
+            if parent.project_id != project_id {
+                return Err(ServiceError::not_found("task", parent_id.to_owned()));
+            }
             if parent.parent_task_id.is_some() {
                 return Err(ServiceError::nested_subtask_unsupported());
             }
@@ -70,10 +154,11 @@ impl TaskService {
         let now = now_rfc3339();
         let is_subtask = parent_task_id.is_some();
         let is_root = !is_subtask;
+        let project_workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
         let workflow = if is_subtask {
             WorkflowEngine::resolve_subtask_workflow()
         } else {
-            WorkflowEngine::resolve_workflow(&project.workflow_definition)
+            project_workflow.clone()
         };
         // A Task with no repository (the Project has none yet) still starts
         // in the workflow's initial state; the dispatcher pauses that
@@ -164,7 +249,7 @@ impl TaskService {
         };
         let create_task = CreateTask {
             id: new_uuid_v4(),
-            project_id,
+            project_id: project_id.clone(),
             repo_id,
             parent_task_id,
             subtask_order,
@@ -183,7 +268,76 @@ impl TaskService {
             updated_at: now.clone(),
         };
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
+        for dependency_id in &dependency_ids {
+            let dependency =
+                TaskRepo::get_by_id_in_tx(&*self.db, &mut transaction, dependency_id, false)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("task", dependency_id.clone()))?;
+            if dependency.project_id != project_id {
+                return Err(ServiceError::invalid_operation(
+                    "Task dependencies must belong to the same Project",
+                ));
+            }
+            let dependency_workflow = WorkflowEngine::resolve_workflow_for_task(
+                &dependency,
+                &project.workflow_definition,
+                &Actor::system(api_types::SystemComponent::Workflow),
+            );
+            let cancellation_state = dependency_workflow
+                .cancellation_state
+                .as_deref()
+                .unwrap_or(default_states::CANCELLED);
+            if dependency.status == cancellation_state {
+                return Err(ServiceError::invalid_operation(
+                    "Task dependencies cannot reference a cancelled Task",
+                ));
+            }
+        }
         let mut task = TaskRepo::create_in_tx(&*self.db, &mut transaction, create_task).await?;
+        if let Some(parent_task_id) = task.parent_task_id.as_deref() {
+            // Creating the first child atomically converts its parent into a
+            // coordination container. Preserve only aggregate-review roles;
+            // implementation/planning assignments belong on child Tasks.
+            let implementation_role = project_workflow
+                .states
+                .iter()
+                .find(|state| state.name == default_states::IN_PROGRESS)
+                .and_then(crate::workflow::effective_role)
+                .or_else(|| {
+                    project_workflow
+                        .states
+                        .iter()
+                        .find(|state| state.kind == api_types::StateKind::Active)
+                        .and_then(crate::workflow::effective_role)
+                });
+            let aggregate_review_roles = project_workflow
+                .states
+                .iter()
+                .filter(|state| {
+                    state.kind == api_types::StateKind::Gate
+                        && state.canonical_phase == Some(api_types::CanonicalPhase::Review)
+                })
+                .filter_map(|state| state.role.as_deref())
+                .filter(|role| Some(*role) != implementation_role)
+                .collect::<HashSet<_>>();
+            let parent_roles = sqlx::query_scalar::<_, String>(
+                "SELECT role_name FROM task_role_assignment WHERE task_id = ?",
+            )
+            .bind(parent_task_id)
+            .fetch_all(&mut *transaction)
+            .await?;
+            for role_name in parent_roles {
+                if !aggregate_review_roles.contains(role_name.as_str()) {
+                    sqlx::query(
+                        "DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
+                    )
+                    .bind(parent_task_id)
+                    .bind(role_name)
+                    .execute(&mut *transaction)
+                    .await?;
+                }
+            }
+        }
         if !task.is_automation {
             ProjectRepo::increment_project_work_epoch(
                 &*self.db,
@@ -199,6 +353,16 @@ impl TaskService {
                 &task.id,
                 &task.project_id,
                 governance,
+                &now,
+            )
+            .await?;
+        }
+        for dependency_id in &dependency_ids {
+            TaskDependencyRepo::add_dependency_in_tx(
+                &*self.db,
+                &mut transaction,
+                &task.id,
+                dependency_id,
                 &now,
             )
             .await?;

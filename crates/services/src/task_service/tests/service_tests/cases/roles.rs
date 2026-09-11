@@ -875,7 +875,7 @@ async fn remove_coder_role_clears_review_passed_at() {
 }
 
 #[tokio::test]
-async fn remove_coder_role_rejects_after_subtask_sequence_started() {
+async fn remove_root_coder_role_is_independent_of_subtask_progress() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let mut rx = event_bus.subscribe();
@@ -894,17 +894,19 @@ async fn remove_coder_role_rejects_after_subtask_sequence_started() {
     let _ = next_role_reassigned_event(&mut rx).await;
     let _subtask = seed_subtask_with_status(&db, &task, "sub", "in_progress".to_owned(), 0).await;
 
-    let result = service.remove_role(&task.id, "coder", false, false).await;
-
-    assert!(matches!(
-        result,
-        Err(ServiceError::TaskSequenceAlreadyStarted { task_id }) if task_id == task.id
-    ));
-    assert!(rx.try_recv().is_err());
+    service
+        .remove_role(&task.id, "coder", false, false)
+        .await
+        .expect("coordination root role removes independently");
+    let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(&*db, &task.id, "coder")
+        .await
+        .expect("assignment loads");
+    assert!(assignment.is_none());
+    let _ = next_role_reassigned_event(&mut rx).await;
 }
 
 #[tokio::test]
-async fn reassign_subtask_coder_is_rejected() {
+async fn reassign_subtask_coder_is_independent() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -922,23 +924,26 @@ async fn reassign_subtask_coder_is_rejected() {
         .expect("root coder assignment succeeds");
     let subtask = seed_subtask_with_status(&db, &root, "sub", "todo".to_owned(), 0).await;
 
-    let result = service
+    let assignment = service
         .reassign_role(
             role_assignment_input(&subtask.id, "coder", Some(agent_b.clone()), None),
             false,
             false,
         )
-        .await;
-
-    assert!(matches!(result, Err(ServiceError::InvalidOperation { .. })));
+        .await
+        .expect("subtask coder reassigns");
+    assert_eq!(assignment.assignee_id.as_deref(), Some(agent_b.as_str()));
     let child_assignment = TaskRoleAssignmentRepo::get_by_task_and_role(&*db, &subtask.id, "coder")
         .await
         .expect("child assignment loads");
-    assert!(child_assignment.is_none());
+    assert_eq!(
+        child_assignment.and_then(|assignment| assignment.assignee_id),
+        Some(agent_b)
+    );
 }
 
 #[tokio::test]
-async fn reassign_parent_coder_rejects_when_subtask_in_progress() {
+async fn reassign_parent_coder_is_rejected_for_coordination_root() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -964,10 +969,7 @@ async fn reassign_parent_coder_rejects_when_subtask_in_progress() {
         )
         .await;
 
-    assert!(matches!(
-        result,
-        Err(ServiceError::TaskSequenceAlreadyStarted { .. })
-    ));
+    assert!(matches!(result, Err(ServiceError::InvalidOperation { .. })));
 }
 
 #[tokio::test]

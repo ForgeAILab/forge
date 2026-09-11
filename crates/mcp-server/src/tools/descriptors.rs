@@ -4,13 +4,26 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
     json!([
         tool_descriptor(
             "forge_create_task",
-            "Create a task in a project repository.",
+            "Create one standalone task or one child of a coordination root. parent_task_id creates a shared-workspace subtask relationship; depends_on_ids creates prerequisite gates without sharing a workspace. Never use the parent as a dependency.",
             json!({
                 "project_id": { "type": "string" },
                 "title": { "type": "string" },
                 "description": { "type": "string" },
-                "parent_task_id": { "type": "string" },
-                "type": { "type": "string", "enum": ["task", "planning_task", "sub_task", "discovery"] },
+                "parent_task_id": {
+                    "type": "string",
+                    "description": "Optional coordination-root task. The new child shares that root's workspace and joins its ordered, serial subtask sequence. This is hierarchy, not a prerequisite edge; only one child level is supported."
+                },
+                "depends_on_ids": {
+                    "type": "array",
+                    "description": "Unique prerequisite task ids. The new task cannot execute until all reach done. Dependencies do not create hierarchy or workspace sharing and must not include parent_task_id.",
+                    "items": { "type": "string" },
+                    "uniqueItems": true
+                },
+                "type": {
+                    "type": "string",
+                    "description": "Task kind. Hierarchy is determined only by parent_task_id.",
+                    "enum": ["task", "planning_task", "sub_task", "discovery"]
+                },
                 "priority": { "type": "integer" }
             }),
             required(scoped_project, &["project_id", "title"], &["title"]),
@@ -74,7 +87,7 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
         ),
         tool_descriptor(
             "forge_assign_agent",
-            "Assign an agent to a task.",
+            "Assign an agent to a task's implementation role without starting execution. This works while the project is paused; ordered subtasks run separately after resume. Active implementation executions must be stopped before their assignment can change.",
             json!({
                 "task_id": { "type": "string" },
                 "agent_id": { "type": "string" }
@@ -132,7 +145,7 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
         ),
         tool_descriptor(
             "forge_register_agent",
-            "Register an agent executor.",
+            "Register an account-owned agent executor from account-scoped MCP. Pinning a daemon requires an administrator.",
             json!({
                 "name": { "type": "string" },
                 "executor_type": { "type": "string", "enum": ["shell", "codex", "claude_code", "cursor", "gemini", "opencode", "smith"] },
@@ -142,7 +155,7 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
         ),
         tool_descriptor(
             "forge_list_agents",
-            "List registered agents.",
+            "List the authenticated account's agents plus global agents from account-scoped MCP.",
             json!({
                 "status": { "type": "string", "enum": ["idle", "busy", "error", "offline"] },
                 "cursor": { "type": "string" },
@@ -161,7 +174,7 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
         ),
         tool_descriptor(
             "forge_create_project",
-            "Create a project.",
+            "Create a project owned by the authenticated MCP user. The creator is atomically added as the Project owner and can immediately manage Project-local resources.",
             json!({
                 "name": { "type": "string" }
             }),
@@ -251,7 +264,7 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
         ),
         tool_descriptor(
             "forge_add_task_dependency",
-            "Declare that a task depends on another task. The dependent task cannot be freely claimed until the prerequisite task reaches 'done'. Cycles are rejected.",
+            "Add a prerequisite edge between existing tasks. The dependent task cannot execute until the prerequisite reaches done. This does not create parent/child hierarchy or workspace sharing; cycles and a subtask depending on its own parent are rejected.",
             json!({
                 "task_id": { "type": "string", "description": "The task that has the dependency (blocked task)" },
                 "depends_on_id": { "type": "string", "description": "The prerequisite task that must reach 'done' first" }
@@ -260,7 +273,7 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
         ),
         tool_descriptor(
             "forge_remove_task_dependency",
-            "Remove a dependency between two tasks.",
+            "Remove a prerequisite edge. This does not change parent/child hierarchy, subtask order, or workspace ownership.",
             json!({
                 "task_id": { "type": "string", "description": "The dependent task" },
                 "depends_on_id": { "type": "string", "description": "The prerequisite task to remove" }
@@ -269,19 +282,28 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
         ),
         tool_descriptor(
             "forge_list_task_dependencies",
-            "List the dependencies of a task — the prerequisite tasks that must complete before this task can be freely claimed.",
+            "List prerequisite task ids that must reach done before this task can execute. These links do not imply parentage or workspace sharing.",
             json!({
                 "task_id": { "type": "string" }
             }),
             &["task_id"],
         ),
         tool_descriptor(
-            "forge_create_sub_tasks",
-            "Create subtasks under a root task. Order in the array determines display order.",
+            "forge_list_task_dependents",
+            "List task ids that are gated by this prerequisite task. These reverse links do not imply parentage or workspace sharing.",
             json!({
-                "parent_task_id": { "type": "string" },
+                "task_id": { "type": "string", "description": "The prerequisite task" }
+            }),
+            &["task_id"],
+        ),
+        tool_descriptor(
+            "forge_create_sub_tasks",
+            "Atomically create ordered children under a root coordination task. The root becomes a non-executing coordination container; children share its workspace, run serially in array order, and can be assigned to different agents. Responses include each child's role_assignments. Array order is not a dependency graph.",
+            json!({
+                "parent_task_id": { "type": "string", "description": "Root coordination task; nested subtasks are not supported" },
                 "subtasks": {
                     "type": "array",
+                    "description": "Children in execution order. Assign implementation agents per child, not to the coordination root.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -294,6 +316,28 @@ pub(crate) fn tool_descriptors(scoped_project: bool) -> Value {
                 }
             }),
             &["parent_task_id", "subtasks"],
+        ),
+        tool_descriptor(
+            "forge_list_sub_tasks",
+            "List a coordination root's direct children and role_assignments in execution order. Children share the root-owned workspace but keep independent agents, executions, and lifecycle state.",
+            json!({
+                "parent_task_id": { "type": "string", "description": "Root coordination task" }
+            }),
+            &["parent_task_id"],
+        ),
+        tool_descriptor(
+            "forge_reorder_sub_tasks",
+            "Replace a coordination root's child execution order. ordered_ids must contain every current direct child exactly once; the terminal prefix and current first incomplete child are preserved, and only the untouched todo suffix may be reordered.",
+            json!({
+                "parent_task_id": { "type": "string", "description": "Root coordination task" },
+                "ordered_ids": {
+                    "type": "array",
+                    "description": "Complete direct-child id list in the desired execution order",
+                    "items": { "type": "string" },
+                    "uniqueItems": true
+                }
+            }),
+            &["parent_task_id", "ordered_ids"],
         ),
         tool_descriptor(
             "forge_list_agent_profiles",

@@ -24,6 +24,26 @@ impl TaskService {
             &project.workflow_definition,
             &options.triggered_by,
         );
+        super::subtask::ensure_coordination_root_target_ready(
+            &self.db,
+            &task,
+            &workflow,
+            &new_status,
+        )
+        .await?;
+        if new_status != task.status
+            && task.parent_task_id.is_some()
+            && workflow
+                .state_kind(&new_status)
+                .is_some_and(|kind| kind != api_types::StateKind::Terminal)
+        {
+            // Keep every transition surface (REST, MCP, board actions, hooks,
+            // and recovery) on the same durable sequence cursor. Terminal
+            // cancellation remains available for later queued children, but
+            // no later sibling may enter work/review before the first
+            // incomplete child settles.
+            super::subtask::ensure_subtask_dispatch_order(&self.db, &task).await?;
+        }
         if task.repo_id.is_some()
             && workflow.state_kind(&new_status) == Some(api_types::StateKind::Active)
         {
@@ -31,7 +51,17 @@ impl TaskService {
             // claim/launch for every repository-capable task type.  Task
             // labels such as discovery/planning only select a read-only
             // executor profile; they still use the normal lease boundary.
-            self.ensure_task_runnable(&task).await?;
+            let reviewer_state = workflow
+                .states
+                .iter()
+                .find(|state| state.name == new_status)
+                .and_then(crate::workflow::effective_role)
+                == Some(crate::workflow::default_roles::REVIEWER);
+            if reviewer_state {
+                self.ensure_task_reviewable(&task).await?;
+            } else {
+                self.ensure_task_runnable(&task).await?;
+            }
         }
         self.ensure_planning_plan_ready_before_leaving(
             &task,
@@ -172,6 +202,7 @@ impl TaskService {
                 super::execution::clear_execution_retry_metadata(&self.db, &task).await?;
             }
         }
+        self.reconcile_terminal_subtask(&task).await;
 
         Ok(TransitionResult {
             task,
@@ -186,6 +217,9 @@ impl TaskService {
         workflow: &api_types::WorkflowDefinition,
         rejection: bool,
     ) -> Result<()> {
+        if super::subtask::coordination_root_has_subtasks(&self.db, task).await? {
+            return Ok(());
+        }
         if task.status != crate::workflow::default_states::PLANNING
             || new_status == crate::workflow::default_states::PLANNING
             || workflow.cancellation_state.as_deref() == Some(new_status.as_str())
@@ -467,10 +501,34 @@ impl TaskService {
             .as_deref()
             .unwrap_or("cancelled")
             .to_owned();
+        let child_tasks = if task.parent_task_id.is_none() {
+            TaskRepo::list_subtasks_ordered(&*self.db, &task.id).await?
+        } else {
+            Vec::new()
+        };
         if task.status == cancel_target {
-            return Ok(task);
+            // A prior cancellation may have committed while a child was
+            // still starting. Re-check and stop every active child even when
+            // the root state is already terminal, before any cleanup hook can
+            // use the shared workspace.
+            self.cancel_running_executions_for_task(&task, &reason, actor.clone())
+                .await?;
+            self.repair_cancelled_coordination_children(&task, &workflow, &reason, actor.clone())
+                .await?;
+            if let Err(error) = self.block_dependents_of_cancelled_task(&task).await {
+                tracing::warn!(task_id = %task.id, %error, "failed to re-project cancelled prerequisite onto dependents");
+            }
+            self.reconcile_terminal_subtask(&task).await;
+            return TaskRepo::get_by_id(&*self.db, &task.id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", task.id));
         }
         self.cancel_running_executions_for_task(&task, &reason, actor.clone())
+            .await?;
+        // A coordination root owns the shared worktree, but its children own
+        // the running executions. Terminalize those attempts before the root
+        // transition enters its workspace-cleanup hooks.
+        self.cancel_running_executions_for_tasks(&child_tasks, &reason, actor.clone())
             .await?;
         let result = self
             .transition(
@@ -478,14 +536,20 @@ impl TaskService {
                 cancel_target,
                 TransitionOptions {
                     version: expected_version.unwrap_or(task.version),
-                    reason: Some(reason),
-                    triggered_by: actor,
+                    reason: Some(reason.clone()),
+                    triggered_by: actor.clone(),
                     rejection: false,
                     defer_dispatch_seconds: None,
                 },
             )
             .await?;
         let task = clear_manual_advance_error_annotation(&self.db, &task, result.task).await?;
+        // Re-read after the root transition hooks and cancel once more. Any
+        // child execution that committed between the pre-cancel snapshot and
+        // the root transition is now visible, while the transactional parent
+        // admission guard prevents a new one from appearing afterward.
+        self.repair_cancelled_coordination_children(&task, &workflow, &reason, actor.clone())
+            .await?;
         if let Err(error) = self.block_dependents_of_cancelled_task(&task).await {
             // Cancellation already committed.  The dependency gate performs
             // the same durable blocking check on the next attempted dispatch,
@@ -498,6 +562,27 @@ impl TaskService {
             );
         }
         Ok(task)
+    }
+
+    async fn repair_cancelled_coordination_children(
+        &self,
+        root: &Task,
+        workflow: &api_types::WorkflowDefinition,
+        reason: &str,
+        actor: Actor,
+    ) -> Result<()> {
+        if root.parent_task_id.is_some() {
+            return Ok(());
+        }
+        let children = TaskRepo::list_subtasks_ordered(&*self.db, &root.id).await?;
+        for child in children {
+            self.cancel_running_executions_for_task(&child, reason, actor.clone())
+                .await?;
+            if !super::subtask::subtask_is_terminal(&child, workflow) {
+                Box::pin(self.cancel_task_as(child.id, actor.clone())).await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn advance_to_next_state(&self, task_id: impl Into<String>) -> Result<Task> {
@@ -515,6 +600,14 @@ impl TaskService {
             &Actor::user(UserActionSource::ManualAdvance),
         );
         let target = next_workflow_state(&workflow, &task.status)?;
+        super::subtask::ensure_coordination_root_target_ready(&self.db, &task, &workflow, &target)
+            .await?;
+        if !matches!(
+            workflow.state_kind(&target),
+            Some(api_types::StateKind::Terminal)
+        ) {
+            super::subtask::ensure_subtask_dispatch_order(&self.db, &task).await?;
+        }
 
         self.cancel_running_executions_for_manual_advance(&task)
             .await?;
@@ -543,6 +636,7 @@ impl TaskService {
             )
             .await?;
         let task = clear_manual_advance_error_annotation(&self.db, &task, result.task).await?;
+        self.reconcile_terminal_subtask(&task).await;
         Ok(task)
     }
 
@@ -716,6 +810,19 @@ impl TaskService {
                 db::ResumePolicy::None,
             )
             .await?;
+        }
+        Ok(())
+    }
+
+    async fn cancel_running_executions_for_tasks(
+        &self,
+        tasks: &[Task],
+        reason: &str,
+        actor: Actor,
+    ) -> Result<()> {
+        for task in tasks {
+            self.cancel_running_executions_for_task(task, reason, actor.clone())
+                .await?;
         }
         Ok(())
     }

@@ -373,34 +373,6 @@ impl From<ServiceError> for McpToolError {
                     "code": "NESTED_SUBTASK_UNSUPPORTED"
                 }))
             }
-            ServiceError::SubtaskAssigneeUnsupported {
-                root_coder_id,
-                attempted,
-            } => Self::new(-32602, "subtask assignee unsupported").with_data(json!({
-                "code": "SUBTASK_ASSIGNEE_UNSUPPORTED",
-                "root_coder_id": root_coder_id,
-                "attempted": attempted
-            })),
-            ServiceError::SubtaskSequenceStarted { task_id } => Self::new(
-                -32602,
-                format!("subtask sequence already started for task {task_id}"),
-            )
-            .with_data(json!({
-                "code": "SUBTASK_SEQUENCE_STARTED",
-                "task_id": task_id
-            })),
-            ServiceError::SubtaskManagedByRoot {
-                task_id,
-                root_task_id,
-            } => Self::new(
-                -32029,
-                format!("subtask {task_id} is managed by root {root_task_id}"),
-            )
-            .with_data(json!({
-                "code": "SUBTASK_MANAGED_BY_ROOT",
-                "task_id": task_id,
-                "root_task_id": root_task_id
-            })),
             ServiceError::ParentWorkspaceRequired { parent_task_id } => Self::new(
                 -32602,
                 format!("parent workspace required for task {parent_task_id}"),
@@ -417,14 +389,6 @@ impl From<ServiceError> for McpToolError {
                 "code": "WORKSPACE_RESET_REQUIRED",
                 "task_id": task_id,
                 "reason": reason
-            })),
-            ServiceError::TaskSequenceAlreadyStarted { task_id } => Self::new(
-                -32602,
-                format!("task sequence already started for task {task_id}"),
-            )
-            .with_data(json!({
-                "code": "TASK_SEQUENCE_ALREADY_STARTED",
-                "task_id": task_id
             })),
             ServiceError::TerminalDisabled => Self::new(-32029, "terminal access is disabled")
                 .with_data(json!({
@@ -569,6 +533,8 @@ impl From<DbError> for McpToolError {
             DbError::DependencyGate => Self::new(-32029, "dependency gate").with_data(json!({
                 "code": "setup_required"
             })),
+            DbError::CycleDetected => Self::new(-32602, "dependency cycle detected")
+                .with_data(json!({ "code": "cycle_detected" })),
             _ => Self::new(-32603, "internal error"),
         };
         tracing::debug!(

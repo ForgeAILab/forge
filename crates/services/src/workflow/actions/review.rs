@@ -51,12 +51,13 @@ impl HookAction for RunCiSteps {
                 reason: "no workspace".to_string(),
             };
         };
-        let execution_id = match ctx.execution_id.clone() {
-            Some(execution_id) => Some(execution_id),
-            None => latest_executor_execution(ctx)
-                .await
-                .map(|execution| execution.id),
-        };
+        // A coordination root has no implementation execution of its own.
+        // Review its shared workspace against the latest relevant child
+        // execution instead of accidentally binding CI to a reviewer or
+        // other non-implementation execution from the root context.
+        let execution_id = latest_executor_execution(ctx)
+            .await
+            .map(|execution| execution.id);
         let Some(execution_id) = execution_id else {
             return HookResult::Skipped {
                 reason: "no executor execution".to_string(),

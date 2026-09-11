@@ -166,11 +166,11 @@ async fn reorder_subtasks_updates_order() {
         )
         .await
         .expect("subtasks create");
-    let reordered_ids = subtasks
-        .iter()
-        .rev()
-        .map(|subtask| subtask.id.clone())
-        .collect::<Vec<_>>();
+    let reordered_ids = vec![
+        subtasks[0].id.clone(),
+        subtasks[2].id.clone(),
+        subtasks[1].id.clone(),
+    ];
 
     service
         .reorder_subtasks(root.id.clone(), reordered_ids)
@@ -180,7 +180,7 @@ async fn reorder_subtasks_updates_order() {
     let reordered = TaskRepo::list_subtasks_ordered(&*db, &root.id)
         .await
         .expect("subtasks load");
-    assert_eq!(reordered[0].title, "C");
-    assert_eq!(reordered[1].title, "B");
-    assert_eq!(reordered[2].title, "A");
+    assert_eq!(reordered[0].title, "A");
+    assert_eq!(reordered[1].title, "C");
+    assert_eq!(reordered[2].title, "B");
 }

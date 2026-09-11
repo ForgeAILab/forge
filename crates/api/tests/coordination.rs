@@ -157,19 +157,6 @@ async fn project_member_cannot_mutate_another_identity_commitment() {
         CreateProjectMember {
             id: new_uuid_v4(),
             project_id: "coord-project".to_owned(),
-            user_id: "test-user-id".to_owned(),
-            role: "owner".to_owned(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("project owner seeded");
-    ProjectMemberRepo::add_member(
-        &**db,
-        CreateProjectMember {
-            id: new_uuid_v4(),
-            project_id: "coord-project".to_owned(),
             user_id: "member-user-id".to_owned(),
             role: "member".to_owned(),
             created_at: now.clone(),

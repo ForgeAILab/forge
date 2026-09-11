@@ -16,9 +16,10 @@
 Forge hosts durable embedded assistants and task-scoped coding agents in one
 local control plane. Talk to one global Main Agent, hand approved context to
 one Project Agent per Project, and keep each chat's continuity without granting
-repository access outside an admitted Task. Every coding Task still gets an
-isolated git worktree, CI gate, and review before changes touch `main`. REST,
-MCP, CLI, and web UI ship in one self-hosted binary.
+repository access outside an admitted Task. Every standalone coding Task still
+gets an isolated git worktree, CI gate, and review before changes touch `main`;
+ordered child Tasks run serially in their coordination root's shared worktree.
+REST, MCP, CLI, and web UI ship in one self-hosted binary.
 
 [Quickstart](#5-minute-quickstart) · [Why Forge](#why-forge) · [Docs](docs/) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md)
 
@@ -29,10 +30,12 @@ MCP, CLI, and web UI ship in one self-hosted binary.
 ## Why Forge
 
 Running two coding agents against the same repo is how you lose diffs. Forge fixes
-that: every task runs in its own git worktree, hits your CI gate, and waits for
-review before it merges. **Agents collaborate; they don't collide.**
+that: standalone tasks run in their own git worktrees, while ordered child tasks
+share a coordination root's worktree and run serially; every task hits your CI
+gate and waits for review before it merges. **Agents collaborate; they don't
+collide.**
 
-- **One isolated git worktree per task** — Claude Code, Codex, Cursor, Gemini, and Smith can each work in parallel without overwriting each other or polluting your main checkout.
+- **Isolated delivery worktrees** — standalone Tasks get their own worktree; ordered child Tasks run serially in their coordination root's shared worktree, so agents do not overwrite each other or pollute your main checkout.
 - **Main Chat and Project Agent Chats** — one global discovery timeline and one durable conversation per Project; the agent creates tasks and shapes Project records directly from chat, and Main-to-Project handoffs stay explicit and provenance-linked.
 - **Persistent embedded identities** — use Agent Settings for API keys, guided provider login, and exact CLI runtimes. Any enabled configured Agent can serve as Main, Project, Worker, or reviewer—including the same Agent in multiple roles—while each turn or Task still receives only its scoped permissions.
 - **Mission Control** — inspect attention, commitments, current scope, health, and recent outcomes without opening a wall of runtime logs.
@@ -96,7 +99,7 @@ Prefer to build from source? `cargo run -p forge-cli -- --demo`.
 | **Milestone / release** | An outcome contract with evidence-backed readiness and an immutable `Mxxx-rN` Forge snapshot. |
 | **Evidence** | Project-authorized image, video, or report metadata that can reuse Task media and survive release pinning. |
 | **Daemon** | The local process that reports installed CLIs and runs executions. |
-| **Worktree** | An isolated git checkout created per task, cleaned up on `done`/`cancelled`. |
+| **Worktree** | An isolated git checkout for standalone Tasks; ordered children reuse their coordination root's root-owned checkout, cleaned up when that root is `done`/`cancelled`. |
 | **Review mode** | Agent review, no review, or human-required review layered on the Task workflow and CI checks. |
 
 <table>

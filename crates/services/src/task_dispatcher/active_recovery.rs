@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use api_types::{StateKind, WorkflowDefinition};
+use api_types::{Actor, StateKind, SystemComponent, WorkflowDefinition};
 use db::{
     AgentRepo, DbError, ExecutionRepo, ExecutionStatus, PageRequest, Project, SortBy, SortOrder,
     Task, TaskRoleAssignmentRepo,
@@ -16,6 +16,7 @@ use crate::{
             effective_prompt_selection, loader::load_agent_dispatch_context,
         },
         effective_role,
+        engine::WorkflowEngine,
     },
     Result, ServiceError,
 };
@@ -28,12 +29,21 @@ impl TaskDispatcher {
         project: &Project,
         workflow: &WorkflowDefinition,
     ) -> Result<u64> {
-        let active_states: Vec<String> = workflow
+        let mut active_states: Vec<String> = workflow
             .states
             .iter()
             .filter(|state| matches!(state.kind, StateKind::Active | StateKind::Gate))
             .map(|state| state.name.clone())
             .collect();
+        for state in WorkflowEngine::resolve_subtask_workflow()
+            .states
+            .iter()
+            .filter(|state| matches!(state.kind, StateKind::Active | StateKind::Gate))
+        {
+            if !active_states.contains(&state.name) {
+                active_states.push(state.name.clone());
+            }
+        }
         if active_states.is_empty() {
             return Ok(0);
         }
@@ -44,6 +54,32 @@ impl TaskDispatcher {
             if self.is_stopped() {
                 break;
             }
+            let is_coordination_root =
+                crate::task_service::coordination_root_has_subtasks(&self.db, &task).await?;
+            let sequence_complete = is_coordination_root
+                && crate::task_service::coordination_root_sequence_complete(
+                    &self.db, &task, workflow,
+                )
+                .await?;
+            let needs_recovery_advance = sequence_complete
+                && workflow.canonical_phase_for_state(&task.status)
+                    != api_types::CanonicalPhase::Review
+                && workflow.state_kind(&task.status) != Some(StateKind::Terminal);
+            if is_coordination_root
+                && (crate::task_service::coordination_review_pending(&task)
+                    || needs_recovery_advance)
+            {
+                match self.task_service.advance_coordination_root(&task.id).await {
+                    Ok(()) => dispatched += 1,
+                    Err(ServiceError::Db(DbError::VersionConflict)) => {
+                        tracing::debug!(task_id = %task.id, "coordination-root review advance lost version race");
+                    }
+                    Err(error) => {
+                        tracing::warn!(task_id = %task.id, %error, "coordination-root aggregate review advance remains pending");
+                    }
+                }
+                continue;
+            }
             if deferred_dispatch::dispatch_disposition_is_current(&task, &task.status) {
                 // An unchanged deterministic blocker was already observed for
                 // this exact Task version and capability — skip the attempt
@@ -51,7 +87,15 @@ impl TaskDispatcher {
                 // `dispatch_initial_tasks`.
                 continue;
             }
-            match self.recover_active_task(project, workflow, &task).await {
+            let task_workflow = WorkflowEngine::resolve_workflow_for_task(
+                &task,
+                &project.workflow_definition,
+                &Actor::system(SystemComponent::TaskDispatcher),
+            );
+            match self
+                .recover_active_task(project, &task_workflow, &task)
+                .await
+            {
                 Ok(true) => {
                     deferred_dispatch::clear_dispatch_disposition(&self.db, &task).await?;
                     dispatched += 1;
@@ -139,6 +183,19 @@ impl TaskDispatcher {
         let Some(role_name) = effective_role(state) else {
             return Ok(false);
         };
+        if role_name == crate::workflow::default_roles::REVIEWER {
+            self.task_service.ensure_task_reviewable(task).await?;
+        } else {
+            self.task_service.ensure_task_runnable(task).await?;
+        }
+        if crate::task_service::coordination_root_has_subtasks(&self.db, task).await?
+            && role_name != crate::workflow::default_roles::REVIEWER
+        {
+            return Ok(false);
+        }
+        if !crate::task_service::subtask_dispatch_ready(&self.db, task).await? {
+            return Ok(false);
+        }
         if role_name == crate::workflow::default_roles::REVIEWER
             && self.reconcile_terminal_reviewer_execution(&task.id).await?
         {

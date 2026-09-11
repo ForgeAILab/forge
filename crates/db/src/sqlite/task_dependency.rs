@@ -3,6 +3,20 @@ use super::*;
 #[async_trait]
 impl TaskDependencyRepo for SqliteDb {
     async fn add_dependency(&self, task_id: &str, depends_on_id: &str, now: &str) -> Result<()> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        self.add_dependency_in_tx(&mut transaction, task_id, depends_on_id, now)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn add_dependency_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        task_id: &str,
+        depends_on_id: &str,
+        now: &str,
+    ) -> Result<()> {
         if task_id == depends_on_id {
             return Err(DbError::CycleDetected);
         }
@@ -17,7 +31,7 @@ impl TaskDependencyRepo for SqliteDb {
         )
         .bind(depends_on_id)
         .bind(task_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut **transaction)
         .await?;
         if cycle_count > 0 {
             return Err(DbError::CycleDetected);
@@ -29,7 +43,7 @@ impl TaskDependencyRepo for SqliteDb {
         .bind(task_id)
         .bind(depends_on_id)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut **transaction)
         .await?;
         Ok(())
     }

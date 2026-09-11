@@ -416,28 +416,36 @@ async fn claim_rejects_conflicting_implicit_assignee_assignment() {
 }
 
 #[tokio::test]
-async fn claim_rejects_subtask() {
+async fn claim_allows_first_subtask_in_root_workspace() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let workspace_root = TempDir::new().expect("workspace temp dir creates");
+    let service = TaskService::new(Arc::clone(&db), event_bus)
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
     let root = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
     let subtask = seed_subtask_with_status(&db, &root, "child", "todo".to_owned(), 0).await;
 
-    let result = service
+    let claimed = service
         .claim_task(subtask.id.clone(), Assignee::Agent(agent_id), None)
-        .await;
+        .await
+        .expect("first subtask claims");
 
-    assert!(matches!(
-        result,
-        Err(ServiceError::SubtaskManagedByRoot { task_id, root_task_id })
-            if task_id == subtask.id && root_task_id == root.id
-    ));
+    assert_eq!(claimed.task.status, default_states::IN_PROGRESS);
+    let workspace = WorkspaceRepo::get_by_task_id(&*db, &root.id)
+        .await
+        .expect("workspace lookup succeeds")
+        .expect("root workspace exists");
+    assert_eq!(
+        claimed.execution.workspace_id.as_deref(),
+        Some(workspace.id.as_str())
+    );
 }
 
 #[tokio::test]
-async fn claim_root_with_subtask_does_not_dispatch_parent_coder_prompt() {
+async fn claim_rejects_coordination_root_with_subtasks() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service =
@@ -447,12 +455,11 @@ async fn claim_root_with_subtask_does_not_dispatch_parent_coder_prompt() {
     let root = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
     let _subtask = seed_subtask_with_status(&db, &root, "child", "todo".to_owned(), 0).await;
 
-    let claimed = service
+    let result = service
         .claim_task(root.id.clone(), Assignee::Agent(agent_id), None)
-        .await
-        .expect("root with subtask claims");
+        .await;
 
-    assert_eq!(claimed.task.status, "in_progress");
+    assert!(matches!(result, Err(ServiceError::InvalidOperation { .. })));
     let executions = ExecutionRepo::list_by_task_and_role(
         &*db,
         &root.id,
@@ -467,13 +474,7 @@ async fn claim_root_with_subtask_does_not_dispatch_parent_coder_prompt() {
     )
     .await
     .expect("executions load");
-    assert_eq!(
-        executions.items.len(),
-        1,
-        "claim should not create a second initial coder execution for ordered-turn roots"
-    );
-    assert_eq!(executions.items[0].id, claimed.execution.id);
-    assert!(executions.items[0].summary.is_none());
+    assert!(executions.items.is_empty());
 }
 
 #[tokio::test]

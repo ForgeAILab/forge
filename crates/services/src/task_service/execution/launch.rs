@@ -27,7 +27,14 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-        self.ensure_task_runnable(&task).await?;
+        let coordination_root =
+            super::super::subtask::coordination_root_has_subtasks(&self.db, &task).await?;
+        self.ensure_ordered_execution_admission(&task, role).await?;
+        if coordination_root || role == crate::workflow::default_roles::REVIEWER {
+            self.ensure_task_reviewable(&task).await?;
+        } else {
+            self.ensure_task_runnable(&task).await?;
+        }
         self.ensure_no_running_repository_execution(&task).await?;
         self.check_dependency_gate(&task, agent_id).await?;
         let agent = AgentRepo::get_by_id(&*self.db, agent_id)
@@ -116,6 +123,13 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
+        if super::super::subtask::coordination_root_has_subtasks(&self.db, &task).await? {
+            return Err(ServiceError::invalid_operation(
+                "root tasks with subtasks are coordination containers; launch a subtask instead",
+            ));
+        }
+        self.ensure_ordered_execution_admission(&task, "interactive")
+            .await?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -261,6 +275,8 @@ impl TaskService {
             &project.workflow_definition,
             &api_types::Actor::system(api_types::SystemComponent::Executor),
         );
+        self.ensure_ordered_execution_admission(&task, "interactive")
+            .await?;
         if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal) {
             return Err(ServiceError::invalid_operation(format!(
                 "cannot follow up on a task in terminal status {}",
@@ -485,10 +501,11 @@ impl TaskService {
             },
         )
         .await?;
-        if page.items.into_iter().any(|execution| {
-            execution.status == ExecutionStatus::Running
-                && (task.repo_id.is_some() || execution.role == parent_execution.role)
-        }) {
+        if page
+            .items
+            .into_iter()
+            .any(|execution| execution.status == ExecutionStatus::Running)
+        {
             return Err(ServiceError::invalid_operation(format!(
                 "execution already running for role {}",
                 parent_execution.role
@@ -513,6 +530,8 @@ impl TaskService {
             &project.workflow_definition,
             &api_types::Actor::system(api_types::SystemComponent::Executor),
         );
+        self.ensure_ordered_execution_admission(&task, &parent_execution.role)
+            .await?;
         // Verify the execution role matches the current state effective role for cascade eligibility
         let current_state = workflow.states.iter().find(|s| s.name == task.status);
         let effective_role = current_state.and_then(|s| {
@@ -553,7 +572,11 @@ impl TaskService {
             }
             _ => task,
         };
-        self.ensure_task_runnable(&task).await?;
+        if parent_execution.role == crate::workflow::default_roles::REVIEWER {
+            self.ensure_task_reviewable(&task).await?;
+        } else {
+            self.ensure_task_runnable(&task).await?;
+        }
 
         let (workspace, workspace_created_by_attempt) =
             super::super::workspace::prepare_workspace_owned(

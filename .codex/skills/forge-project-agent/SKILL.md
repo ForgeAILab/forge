@@ -20,6 +20,10 @@ The runtime contract is `forge.project.orchestration/v1`. Derive Project ID, bin
 7. Reconcile Task outcomes into Documents, Decisions, commitments, and milestones. Keep live progress separate from validated truth.
 8. Ask Forge for standalone readiness. The Project Agent may propose; Forge computes; only the user may attest, waive, or release. Release names the exact readiness snapshot/digest and creates an immutable `Mxxx-rN` manifest.
 
+## Task Relationship Semantics
+
+Follow the `TASK ORCHESTRATION` contract for Task relationships: `parent_task_id` means a non-executing coordination root with ordered direct children that share the root workspace; children retain independent agents, executions, and lifecycles and run serially. Dependencies are prerequisite DAG edges only, do not share workspace or establish hierarchy, and a child must never depend on its own parent. Use ordered subtask management for the shared-workspace plan.
+
 ## Research Routing
 
 Use the server-admitted `forge_public_web_search` tool for quick, public, non-authenticated facts answerable in the current turn and cite the result in a Project Document. If it is absent, public search is not configured; do not emulate it with browser, filesystem, credentials, or an AgentAction proposal. Create a discovery Task for repositories, files, code execution, experiments, substantial or resumable synthesis, authenticated/private state, or independent evidence. Record the research question, decision informed, source-quality bar, stopping condition, output artifact, sources, uncertainty, and inference.

@@ -18,7 +18,7 @@ use axum::{
 use db::{
     new_uuid_v4, now_rfc3339, AgentProfileRepo, AgentRepo, CiStepStats, CreateProject, PageRequest,
     ProjectAnalyticsRepo, ProjectHookRun, ProjectHookRunRepo, ProjectRepo, ProjectReviewSummary,
-    RepoRepo, SortBy, SortOrder, UpdateProject, UsageAnalyticsRepo,
+    RepoRepo, SortBy, SortOrder, UpdateProject, UsageAnalyticsRepo, UserRepo,
 };
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde::Deserialize;
@@ -70,6 +70,11 @@ async fn create_direct_project(
     user: AuthenticatedUser,
     request: CreateProjectRequest,
 ) -> ApiResult<Response> {
+    UserRepo::get_user_by_id(&*state.db, &user.user_id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::unauthorized_with_code("invalid_token", "Authenticated user no longer exists")
+        })?;
     let now = now_rfc3339();
     let mut settings = request.settings.unwrap_or_else(|| serde_json::json!({}));
     apply_default_review_config(&mut settings, request.default_review_config.as_ref())?;
@@ -116,20 +121,6 @@ async fn create_direct_project(
         project_agent_profile_id,
     )
     .await?;
-
-    // Auto-create owner membership (best-effort; may fail if user row doesn't exist yet)
-    let _ = db::ProjectMemberRepo::add_member(
-        &*state.db,
-        db::CreateProjectMember {
-            id: new_uuid_v4(),
-            project_id: project.id.clone(),
-            user_id: user.user_id,
-            role: "owner".to_owned(),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await;
 
     state.event_bus.publish(ForgeEvent {
         event_type: "project.created".to_owned(),

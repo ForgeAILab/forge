@@ -38,6 +38,29 @@ impl ProjectRepo for SqliteDb {
             .execute(&mut *transaction)
             .await?;
 
+        // Project-member authorization is the stricter boundary used by
+        // Project-local chat, artifact, media, and administration routes.
+        // Materialize an authenticated creator's owner membership in the
+        // same transaction as the Project so every public creation surface
+        // returns a Project the creator can immediately manage. Test/system
+        // fixtures may still use an owner label that has no `user` row; the
+        // INSERT ... SELECT intentionally leaves those legacy fixtures alone.
+        if let Some(owner_id) = input.owner_id.as_deref() {
+            sqlx::query(
+                "INSERT INTO project_member (
+                    id, project_id, user_id, role, created_at, updated_at
+                 )
+                 SELECT ?, ?, id, 'owner', ?, ? FROM user WHERE id = ?",
+            )
+            .bind(new_uuid_v4())
+            .bind(&input.id)
+            .bind(&input.created_at)
+            .bind(&input.updated_at)
+            .bind(owner_id)
+            .execute(&mut *transaction)
+            .await?;
+        }
+
         // V087 makes execution setup a durable Project concern. Keep the
         // operation and its finite checkpoint set in the same transaction as
         // Project creation so a fresh Project cannot become visible without

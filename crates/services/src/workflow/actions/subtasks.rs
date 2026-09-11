@@ -4,7 +4,7 @@ use events::{event_timestamp, EventContext, ForgeEvent};
 
 use crate::workflow::{default_states, HookAction, HookContext, HookResult};
 
-use super::common::transition_subtask_with_inherited_workflow;
+use super::common::cancel_subtask_with_effective_workflow;
 
 pub struct SatisfyDependents;
 
@@ -68,8 +68,7 @@ impl HookAction for SubtaskSequenceComplete {
         };
         let incomplete = subtasks
             .into_iter()
-            .filter(|subtask| subtask.status != default_states::CANCELLED)
-            .filter(|subtask| subtask.status != default_states::DONE)
+            .filter(|subtask| !crate::task_service::subtask_is_terminal(subtask, &ctx.workflow))
             .map(|subtask| subtask.id)
             .collect::<Vec<_>>();
 
@@ -97,18 +96,15 @@ impl HookAction for PropagateDoneToSubtasks {
             }
         };
 
-        for subtask in subtasks {
-            if matches!(
-                subtask.status.as_str(),
-                default_states::DONE | default_states::CANCELLED
-            ) {
-                continue;
-            }
-            if let Err(reason) =
-                transition_subtask_with_inherited_workflow(ctx, subtask, default_states::DONE).await
-            {
-                return HookResult::Failed { reason };
-            }
+        let incomplete = subtasks
+            .into_iter()
+            .filter(|subtask| !crate::task_service::subtask_is_terminal(subtask, &ctx.workflow))
+            .map(|subtask| subtask.id)
+            .collect::<Vec<_>>();
+        if !incomplete.is_empty() {
+            return HookResult::Failed {
+                reason: format!("SUBTASK_SEQUENCE_NOT_COMPLETE: {}", incomplete.join(",")),
+            };
         }
 
         HookResult::Ok
@@ -130,16 +126,10 @@ impl HookAction for CancelPendingSubtasks {
         };
 
         for subtask in subtasks {
-            if matches!(
-                subtask.status.as_str(),
-                default_states::DONE | default_states::CANCELLED
-            ) {
+            if crate::task_service::subtask_is_terminal(&subtask, &ctx.workflow) {
                 continue;
             }
-            if let Err(reason) =
-                transition_subtask_with_inherited_workflow(ctx, subtask, default_states::CANCELLED)
-                    .await
-            {
+            if let Err(reason) = cancel_subtask_with_effective_workflow(ctx, subtask).await {
                 return HookResult::Failed { reason };
             }
         }
@@ -372,14 +362,20 @@ mod propagate_done_to_subtasks {
     use super::{subtask_hook_test_support::*, *};
 
     #[tokio::test]
-    async fn marks_non_cancelled_subtasks_done() {
+    async fn rejects_done_while_any_subtask_is_incomplete() {
         let (ctx, subtask_ids) = build_ctx(MERGING, DONE, &[TODO, IN_PROGRESS, CANCELLED]).await;
 
         let result = PropagateDoneToSubtasks.execute(&ctx).await;
 
-        assert!(matches!(result, HookResult::Ok));
-        assert_status(&ctx, &subtask_ids[0], DONE).await;
-        assert_status(&ctx, &subtask_ids[1], DONE).await;
+        match result {
+            HookResult::Failed { reason } => {
+                assert!(reason.contains("SUBTASK_SEQUENCE_NOT_COMPLETE"));
+                assert!(reason.contains(&subtask_ids[0]));
+            }
+            other => panic!("expected failed result, got {other:?}"),
+        }
+        assert_status(&ctx, &subtask_ids[0], TODO).await;
+        assert_status(&ctx, &subtask_ids[1], IN_PROGRESS).await;
         assert_status(&ctx, &subtask_ids[2], CANCELLED).await;
     }
 }

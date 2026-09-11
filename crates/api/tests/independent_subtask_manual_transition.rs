@@ -6,7 +6,7 @@ use axum::http::{Method, StatusCode};
 use serde_json::json;
 
 #[tokio::test]
-async fn subtask_managed_allows_manual_status_transition() {
+async fn independently_claimed_subtask_allows_manual_status_transition() {
     let repo_dir = common::TestDir::new("forge-subtask-managed-repo");
     let repo_path = common::setup_git_repo(repo_dir.path());
     let workspace_root = common::TestDir::new("forge-subtask-managed-workspaces");
@@ -47,24 +47,36 @@ async fn subtask_managed_allows_manual_status_transition() {
     )
     .await;
 
-    let claimed_root: TaskResponse = common::json_request(
+    let root_claim = common::raw_json_request(
         &harness.app,
         Method::POST,
         &format!("/api/v1/tasks/{}/claim", root.id),
         json!({ "agent_id": agent_id.clone(), "overrides": null }),
+    )
+    .await;
+    assert_eq!(root_claim.status(), StatusCode::BAD_REQUEST);
+
+    let claimed_child: TaskResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/claim", child.id),
+        json!({ "agent_id": agent_id.clone(), "overrides": null }),
         StatusCode::OK,
     )
     .await;
-    assert_eq!(claimed_root.status, "in_progress");
+    assert_eq!(claimed_child.status, "in_progress");
+    assert_eq!(
+        claimed_child.parent_task_id.as_deref(),
+        Some(root.id.as_str())
+    );
 
-    let managed_child = common::poll_task_status(&harness.app, &child.id, "in_progress").await;
     let moved_child: TransitionTaskResponse = common::json_request(
         &harness.app,
         Method::POST,
-        &format!("/api/v1/tasks/{}/transition", managed_child.id),
+        &format!("/api/v1/tasks/{}/transition", claimed_child.id),
         json!({
             "status": "done",
-            "version": managed_child.version,
+            "version": claimed_child.version,
             "reason": "manual move"
         }),
         StatusCode::OK,

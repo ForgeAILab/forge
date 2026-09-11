@@ -22,6 +22,8 @@ pub(crate) struct CreateTaskParams {
     pub(crate) description: Option<String>,
     #[serde(default)]
     pub(crate) parent_task_id: Option<String>,
+    #[serde(default)]
+    pub(crate) depends_on_ids: Vec<String>,
     #[serde(default, rename = "type")]
     pub(crate) task_type: Option<String>,
     pub(crate) priority: Option<i64>,
@@ -162,6 +164,18 @@ pub(crate) struct RemoveTaskDependencyParams {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ListTaskDependenciesParams {
     pub(crate) task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ListSubTasksParams {
+    pub(crate) parent_task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReorderSubTasksParams {
+    pub(crate) parent_task_id: String,
+    pub(crate) ordered_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

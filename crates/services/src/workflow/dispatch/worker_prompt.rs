@@ -117,12 +117,6 @@ fn worker_system(ctx: &AgentDispatchContext, extra_role_boundary: Option<&str>) 
 }
 
 fn implementation_user(ctx: &AgentDispatchContext) -> String {
-    if let Some(ordered_prompt) =
-        crate::task_service::build_first_turn_prompt_from_context(&ctx.task, &ctx.sub_tasks)
-    {
-        return ordered_prompt;
-    }
-
     let mut user = format!(
         "Task: {}\n\nObjective:\nInspect the task contract and repository, make a concise internal plan, implement the requested change, run relevant self-validation, repair failures, and report completion evidence before submitting to review.\n",
         ctx.task.title

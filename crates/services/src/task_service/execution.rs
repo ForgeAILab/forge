@@ -14,7 +14,6 @@ mod launch;
 pub(crate) mod ledger;
 mod recovery;
 mod runner;
-pub(in crate::task_service) mod subtasks;
 
 pub(super) use runner::{bounded_lease_expiry, execution_deadline_seconds, rfc3339_after};
 

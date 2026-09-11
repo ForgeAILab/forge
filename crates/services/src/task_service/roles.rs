@@ -91,14 +91,67 @@ impl TaskService {
             .map_err(Into::into)
     }
 
+    /// Assign an Agent to the Task's implementation role without claiming or
+    /// starting the Task. Dispatch remains the scheduler's responsibility, so
+    /// this operation is valid while the Project is paused.
+    pub async fn assign_agent_to_task(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+    ) -> Result<TaskRoleAssignment> {
+        validate_required("task_id", task_id)?;
+        validate_required("agent_id", agent_id)?;
+        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        let role_name = self.active_work_role(&task).await?.ok_or_else(|| {
+            ServiceError::invalid_operation(format!(
+                "task {} has no implementation role in its effective workflow",
+                task.id
+            ))
+        })?;
+        let now = now_rfc3339();
+        self.reassign_role_with_active_execution_policy(
+            CreateTaskRoleAssignment {
+                id: new_uuid_v4(),
+                task_id: task.id,
+                role_name,
+                assignee_type: Some(AssigneeKind::Agent),
+                assignee_id: Some(agent_id.to_owned()),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+            false,
+            false,
+            false,
+        )
+        .await
+    }
+
     pub async fn reassign_role(
         &self,
         input: CreateTaskRoleAssignment,
         reset_workspace: bool,
         reset_worktree: bool,
     ) -> Result<TaskRoleAssignment> {
+        self.reassign_role_with_active_execution_policy(
+            input,
+            reset_workspace,
+            reset_worktree,
+            true,
+        )
+        .await
+    }
+
+    async fn reassign_role_with_active_execution_policy(
+        &self,
+        input: CreateTaskRoleAssignment,
+        reset_workspace: bool,
+        reset_worktree: bool,
+        cancel_active_execution: bool,
+    ) -> Result<TaskRoleAssignment> {
         let task = self.validate_reassignable_task(&input.task_id).await?;
-        self.enforce_mode_specific_role_guards(&task, &input.role_name, Some(&input))
+        self.ensure_coordination_root_role_allowed(&task, &input.role_name)
             .await?;
         if input.assignee_type == Some(AssigneeKind::Agent) {
             if let Some(identity_id) = input.assignee_id.as_deref() {
@@ -111,6 +164,33 @@ impl TaskService {
                 .await?;
             }
         }
+
+        let is_coder_role =
+            self.active_work_role(&task).await?.as_deref() == Some(input.role_name.as_str());
+        if is_coder_role && !cancel_active_execution {
+            let (previous, assignment, changed) = self.assign_coder_role_if_idle(input).await?;
+            if changed {
+                self.publish_role_reassigned(
+                    &assignment.task_id,
+                    &assignment.role_name,
+                    previous.as_ref(),
+                    Some(&assignment),
+                    RoleReassignmentEventFlags::default(),
+                );
+            }
+            crate::wake_task_dispatch(
+                &self.db,
+                &assignment.task_id,
+                if changed {
+                    "task role assignment changed"
+                } else {
+                    "task role assignment confirmed"
+                },
+            )
+            .await?;
+            return Ok(assignment);
+        }
+
         let previous = TaskRoleAssignmentRepo::get_by_task_and_role(
             &*self.db,
             &input.task_id,
@@ -127,9 +207,6 @@ impl TaskService {
             .await?;
             return Ok(assignment);
         }
-
-        let is_coder_role =
-            self.active_work_role(&task).await?.as_deref() == Some(input.role_name.as_str());
 
         if !is_coder_role {
             let assignment = TaskRoleAssignmentRepo::assign(&*self.db, input).await?;
@@ -171,6 +248,13 @@ impl TaskService {
             .await?;
             return Ok(assignment);
         };
+
+        if !cancel_active_execution {
+            return Err(ServiceError::invalid_operation(format!(
+                "task {} has a running {} execution; stop it before changing its assignment",
+                task.id, input.role_name
+            )));
+        }
 
         self.cancel_active_execution(
             &active_execution,
@@ -231,8 +315,6 @@ impl TaskService {
         reset_worktree: bool,
     ) -> Result<()> {
         let task = self.validate_reassignable_task(task_id).await?;
-        self.enforce_mode_specific_role_guards(&task, role_name, None)
-            .await?;
         let previous =
             TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, task_id, role_name).await?;
         let Some(previous) = previous else {
@@ -339,40 +421,173 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        Ok(WorkflowEngine::resolve_workflow(
+        Ok(WorkflowEngine::resolve_workflow_for_task(
+            task,
             &project.workflow_definition,
+            &api_types::Actor::system(api_types::SystemComponent::TaskDispatcher),
         ))
     }
 
-    async fn enforce_mode_specific_role_guards(
+    async fn ensure_coordination_root_role_allowed(
         &self,
         task: &Task,
         role_name: &str,
-        _incoming: Option<&CreateTaskRoleAssignment>,
-    ) -> Result<RoleGuardAction> {
-        if role_name != "coder" {
-            return Ok(RoleGuardAction::Continue);
+    ) -> Result<()> {
+        if !super::subtask::coordination_root_has_subtasks(&self.db, task).await? {
+            return Ok(());
         }
-
-        if task.parent_task_id.is_some() {
+        let workflow = self.workflow_for_task(task).await?;
+        let implementation_role = workflow
+            .states
+            .iter()
+            .find(|state| state.name == default_states::IN_PROGRESS)
+            .and_then(crate::workflow::effective_role)
+            .or_else(|| {
+                workflow
+                    .states
+                    .iter()
+                    .find(|state| state.kind == api_types::StateKind::Active)
+                    .and_then(crate::workflow::effective_role)
+            });
+        if implementation_role == Some(role_name) {
             return Err(ServiceError::invalid_operation(
-                "subtask coder assignment is managed by the root task",
+                "root tasks with subtasks are coordination containers; assign implementation agents to the subtasks",
             ));
         }
+        let aggregate_review_role = workflow.states.iter().any(|state| {
+            state.role.as_deref() == Some(role_name)
+                && state.kind == api_types::StateKind::Gate
+                && state.canonical_phase == Some(api_types::CanonicalPhase::Review)
+        });
+        if aggregate_review_role {
+            return Ok(());
+        }
+        Err(ServiceError::invalid_operation(
+            "root tasks with subtasks are coordination containers; assign implementation agents to the subtasks",
+        ))
+    }
 
-        if TaskRepo::list_subtasks_ordered(&*self.db, &task.id)
-            .await?
-            .iter()
-            .any(|s| {
-                s.status != default_states::TODO
-                    && s.status != default_states::DONE
-                    && s.status != default_states::CANCELLED
+    /// Assignment-only writes share SQLite's immediate transaction boundary
+    /// with Running execution creation. Whichever mutation wins first is
+    /// authoritative: a changed assignment rejects an already-running worker,
+    /// while execution insertion rechecks the resulting role binding.
+    async fn assign_coder_role_if_idle(
+        &self,
+        input: CreateTaskRoleAssignment,
+    ) -> Result<(Option<TaskRoleAssignment>, TaskRoleAssignment, bool)> {
+        let mut transaction = db::begin_immediate(self.db.pool()).await?;
+        let is_coordination_root = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM task AS root
+                 JOIN task AS child ON child.parent_task_id = root.id
+                 WHERE root.id = ?
+                   AND root.parent_task_id IS NULL
+                   AND root.deleted_at IS NULL
+                   AND child.deleted_at IS NULL
+             )",
+        )
+        .bind(&input.task_id)
+        .fetch_one(&mut *transaction)
+        .await?
+            != 0;
+        if is_coordination_root {
+            return Err(ServiceError::invalid_operation(
+                "root tasks with subtasks are coordination containers; assign implementation agents to the subtasks",
+            ));
+        }
+        let previous_row = sqlx::query(
+            "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at
+             FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
+        )
+        .bind(&input.task_id)
+        .bind(&input.role_name)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let previous = previous_row
+            .map(|row| {
+                let assignee_type = row
+                    .try_get::<Option<String>, _>("assignee_type")?
+                    .map(|value| {
+                        value.parse::<AssigneeKind>().map_err(|_| {
+                            ServiceError::invalid_operation(format!(
+                                "invalid stored assignee type '{value}'"
+                            ))
+                        })
+                    })
+                    .transpose()?;
+                Ok::<_, ServiceError>(TaskRoleAssignment {
+                    id: row.try_get("id")?,
+                    task_id: row.try_get("task_id")?,
+                    role_name: row.try_get("role_name")?,
+                    assignee_type,
+                    assignee_id: row.try_get("assignee_id")?,
+                    created_at: row.try_get("created_at")?,
+                    updated_at: row.try_get("updated_at")?,
+                })
             })
-        {
-            return Err(ServiceError::task_sequence_already_started(task.id.clone()));
+            .transpose()?;
+
+        if same_assignment(previous.as_ref(), Some(&input)) {
+            let assignment = previous
+                .clone()
+                .expect("same assignment requires an existing assignment");
+            transaction.commit().await?;
+            return Ok((previous, assignment, false));
         }
 
-        Ok(RoleGuardAction::Continue)
+        let running_execution_id = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM execution
+             WHERE task_id = ? AND status = 'running' AND (role = ? OR role = 'executor')
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(&input.task_id)
+        .bind(&input.role_name)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if running_execution_id.is_some() {
+            return Err(ServiceError::invalid_operation(format!(
+                "task {} has a running {} execution; stop it before changing its assignment",
+                input.task_id, input.role_name
+            )));
+        }
+
+        sqlx::query(
+            "INSERT INTO task_role_assignment
+                (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(task_id, role_name) DO UPDATE SET
+                assignee_type = excluded.assignee_type,
+                assignee_id = excluded.assignee_id,
+                updated_at = excluded.updated_at",
+        )
+        .bind(&input.id)
+        .bind(&input.task_id)
+        .bind(&input.role_name)
+        .bind(input.assignee_type.as_ref().map(ToString::to_string))
+        .bind(input.assignee_id.as_deref())
+        .bind(&input.created_at)
+        .bind(&input.updated_at)
+        .execute(&mut *transaction)
+        .await?;
+
+        let assignment = TaskRoleAssignment {
+            id: previous
+                .as_ref()
+                .map(|assignment| assignment.id.clone())
+                .unwrap_or(input.id),
+            task_id: input.task_id,
+            role_name: input.role_name,
+            assignee_type: input.assignee_type,
+            assignee_id: input.assignee_id,
+            created_at: previous
+                .as_ref()
+                .map(|assignment| assignment.created_at.clone())
+                .unwrap_or(input.created_at),
+            updated_at: input.updated_at,
+        };
+        transaction.commit().await?;
+        Ok((previous, assignment, true))
     }
 
     async fn active_work_role(&self, task: &Task) -> Result<Option<String>> {
@@ -563,6 +778,18 @@ impl TaskService {
         reset_worktree: bool,
     ) -> Result<(bool, bool)> {
         if reset_workspace {
+            if task.parent_task_id.is_some() {
+                // Ordered subtasks do not own their execution workspace. The
+                // execution points at the coordination root's shared row, so
+                // cleaning it here would remove the branch needed by the
+                // remaining siblings.
+                tracing::info!(
+                    task_id = %task.id,
+                    execution_id = %execution.id,
+                    "skipping shared workspace reset for subtask reassignment"
+                );
+                return Ok((false, false));
+            }
             let mut workspace_id = execution.workspace_id.clone();
             if workspace_id.is_none() {
                 workspace_id = WorkspaceRepo::get_by_task_id(&*self.db, &task.id)
@@ -655,10 +882,6 @@ struct RoleReassignmentEventFlags {
     reset_workspace: bool,
     reset_worktree: bool,
     transitioned_to_todo: bool,
-}
-
-enum RoleGuardAction {
-    Continue,
 }
 
 pub(crate) struct RoleSweepEvent {

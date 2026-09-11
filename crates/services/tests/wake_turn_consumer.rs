@@ -249,21 +249,6 @@ async fn chat_turn_fixture() -> ChatTurnFixture {
     )
     .await
     .unwrap();
-    // ProjectRepo creates the canonical chat/binding, but membership is a
-    // separate durable record used by the chat service's authorization gate.
-    sqlx::query(
-        "INSERT INTO project_member (id, project_id, user_id, role, created_at, updated_at)
-         VALUES (?, ?, ?, 'owner', ?, ?)",
-    )
-    .bind(new_uuid_v4())
-    .bind(&project_id)
-    .bind(&account_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .unwrap();
-
     let identity_id = new_uuid_v4();
     let profile_id = new_uuid_v4();
     owned_identity_with_profile(&db, &identity_id, &account_id, &profile_id).await;

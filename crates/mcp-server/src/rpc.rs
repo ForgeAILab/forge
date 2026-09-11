@@ -194,20 +194,27 @@ async fn apply_project_scope(
 
     if tool_accepts_project_id(tool_name) {
         if let Some(project_id) = context.project_id.as_deref() {
-            match object.get("project_id").and_then(Value::as_str) {
-                Some(existing) if existing == project_id => {}
-                Some(_) => {
+            match object.get("project_id") {
+                None => {
+                    object.insert(
+                        "project_id".to_owned(),
+                        Value::String(project_id.to_owned()),
+                    );
+                }
+                Some(Value::String(existing)) if existing == project_id => {}
+                Some(Value::String(_)) => {
                     return Err(McpToolError::new(
                         -32602,
                         "project_id does not match scoped MCP project",
                     )
                     .with_data(json!({ "project_id": project_id })));
                 }
-                None => {
-                    object.insert(
-                        "project_id".to_owned(),
-                        Value::String(project_id.to_owned()),
-                    );
+                Some(_) => {
+                    return Err(McpToolError::new(-32602, "project_id must be a string")
+                        .with_data(json!({
+                            "field": "project_id",
+                            "accepted": { "type": "string" }
+                        })));
                 }
             }
         }
@@ -224,6 +231,11 @@ async fn apply_project_scope(
                     .filter(|id| !id.trim().is_empty())
                 {
                     assert_task_access(state, Some(project_id), parent_id, user_id).await?;
+                }
+                if let Some(value) = object.get("depends_on_ids") {
+                    for dependency_id in string_array_arg(value, "depends_on_ids")? {
+                        assert_task_access(state, Some(project_id), dependency_id, user_id).await?;
+                    }
                 }
             }
         }
@@ -250,6 +262,27 @@ async fn apply_project_scope(
                     user_id,
                 )
                 .await?;
+            }
+        }
+        if tool_name == "forge_list_task_dependents" {
+            for dependent_id in TaskDependencyRepo::list_dependents(&*state.db, task_id).await? {
+                assert_task_access(state, context.project_id.as_deref(), &dependent_id, user_id)
+                    .await?;
+            }
+        }
+        if tool_name == "forge_list_sub_tasks" {
+            for subtask in TaskRepo::list_subtasks_ordered(&*state.db, task_id).await? {
+                assert_task_access(state, context.project_id.as_deref(), &subtask.id, user_id)
+                    .await?;
+            }
+        }
+        if tool_name == "forge_reorder_sub_tasks" {
+            let ordered_ids = object
+                .get("ordered_ids")
+                .ok_or_else(|| McpToolError::new(-32602, "missing required field `ordered_ids`"))?;
+            for subtask_id in string_array_arg(ordered_ids, "ordered_ids")? {
+                assert_task_access(state, context.project_id.as_deref(), subtask_id, user_id)
+                    .await?;
             }
         }
         return Ok(arguments);
@@ -293,8 +326,11 @@ fn task_scope_field(tool_name: &str) -> Option<&'static str> {
         | "forge_transition_task"
         | "forge_add_task_dependency"
         | "forge_remove_task_dependency"
-        | "forge_list_task_dependencies" => Some("task_id"),
-        "forge_create_sub_tasks" => Some("parent_task_id"),
+        | "forge_list_task_dependencies"
+        | "forge_list_task_dependents" => Some("task_id"),
+        "forge_create_sub_tasks" | "forge_list_sub_tasks" | "forge_reorder_sub_tasks" => {
+            Some("parent_task_id")
+        }
         _ => None,
     }
 }
@@ -308,6 +344,27 @@ fn required_string_arg<'a>(
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| McpToolError::new(-32602, format!("missing required field `{field_name}`")))
+}
+
+fn string_array_arg<'a>(value: &'a Value, field_name: &str) -> Result<Vec<&'a str>, McpToolError> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| McpToolError::new(-32602, format!("`{field_name}` must be an array")))?;
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            value
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    McpToolError::new(
+                        -32602,
+                        format!("`{field_name}[{index}]` must be a non-empty string"),
+                    )
+                })
+        })
+        .collect()
 }
 
 async fn assert_task_access(

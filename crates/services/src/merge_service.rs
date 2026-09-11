@@ -1,7 +1,7 @@
 use crate::{Result, ServiceError};
 use db::{
-    now_rfc3339, Execution, ExecutionRepo, PageRequest, RepoRepo, ReviewConformanceRepo, SortBy,
-    SortOrder, SqliteDb, TaskRepo, WorkMode, WorkspaceRepo,
+    now_rfc3339, ExecutionRepo, RepoRepo, ReviewConformanceRepo, SqliteDb, TaskRepo, WorkMode,
+    WorkspaceRepo,
 };
 use events::EventBus;
 use serde::{Deserialize, Serialize};
@@ -79,7 +79,11 @@ impl MergeService {
                 "subtasks do not merge; only root tasks merge to the default branch",
             ));
         }
-        let execution = latest_executor_execution(&self.db, &task_id).await?;
+        let execution = crate::task_service::latest_executor_execution_for_task(&*self.db, &task)
+            .await?
+            .ok_or_else(|| ServiceError::InvalidOperation {
+                message: format!("task {task_id} has no executor execution"),
+            })?;
         let workspace_id =
             execution
                 .workspace_id
@@ -255,7 +259,11 @@ impl MergeService {
                 "subtasks do not publish pull requests; only root tasks publish",
             ));
         }
-        let execution = latest_executor_execution(&self.db, &task_id).await?;
+        let execution = crate::task_service::latest_executor_execution_for_task(&*self.db, &task)
+            .await?
+            .ok_or_else(|| ServiceError::InvalidOperation {
+                message: format!("task {task_id} has no executor execution"),
+            })?;
         let workspace_id = execution.workspace_id.as_deref().ok_or_else(|| {
             ServiceError::invalid_operation("executor execution missing workspace_id")
         })?;
@@ -438,27 +446,6 @@ async fn read_conflict_paths(worktree_path: &Path) -> Vec<PathBuf> {
             Vec::new()
         }
     }
-}
-
-async fn latest_executor_execution(db: &SqliteDb, task_id: &str) -> Result<Execution> {
-    let page = ExecutionRepo::list_by_task(
-        db,
-        task_id,
-        PageRequest {
-            cursor: None,
-            limit: 500,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Desc,
-        },
-    )
-    .await?;
-    page.items
-        .into_iter()
-        .find(|execution| matches!(execution.role.as_str(), "executor" | "coder" | "worker"))
-        .ok_or_else(|| ServiceError::InvalidOperation {
-            message: format!("task {task_id} has no executor execution"),
-        })
 }
 
 fn target_branch(merge_config: &Option<String>, repo_default_branch: &str) -> Result<String> {

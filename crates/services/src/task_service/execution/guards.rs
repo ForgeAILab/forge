@@ -1,6 +1,112 @@
 use super::*;
 
 impl TaskService {
+    /// Admit an execution attempt against the coordination hierarchy before a
+    /// caller transitions a Task or prepares a workspace.  A root with
+    /// children is a container: only its aggregate reviewer may run after
+    /// every child is terminal.  A child must be the first incomplete sibling,
+    /// and its root must still be live and unblocked.
+    pub(super) async fn ensure_ordered_execution_admission(
+        &self,
+        task: &Task,
+        role: &str,
+    ) -> Result<()> {
+        if task.parent_task_id.is_none() {
+            if !super::super::subtask::coordination_root_has_subtasks(&self.db, task).await? {
+                return Ok(());
+            }
+
+            if task.blocked_json.is_some()
+                || task.failed_json.is_some()
+                || task.error_annotation.is_some()
+                || task.entry_barrier_json.is_some()
+            {
+                return Err(ServiceError::invalid_operation(format!(
+                    "coordination root {} is blocked or has an error",
+                    task.id
+                )));
+            }
+
+            let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+            let workflow = WorkflowEngine::resolve_workflow_for_task(
+                task,
+                &project.workflow_definition,
+                &api_types::Actor::system(api_types::SystemComponent::Executor),
+            );
+            if workflow.canonical_phase_for_state(&task.status) != api_types::CanonicalPhase::Review
+            {
+                return Err(ServiceError::invalid_operation(format!(
+                    "coordination root {} is not in its aggregate review state",
+                    task.id
+                )));
+            }
+            let expected_role = workflow
+                .states
+                .iter()
+                .find(|state| state.name == task.status)
+                .and_then(crate::workflow::effective_role);
+            if expected_role != Some(role) {
+                return Err(ServiceError::invalid_operation(
+                    "root tasks with subtasks are coordination containers; only their aggregate review role may execute",
+                ));
+            }
+
+            let subtasks = TaskRepo::list_subtasks_ordered(&*self.db, &task.id).await?;
+            if let Some(next) = subtasks
+                .iter()
+                .find(|candidate| !ordered_task_is_terminal(candidate))
+            {
+                return Err(ServiceError::invalid_operation(format!(
+                    "coordination-root review is not ready; subtask {} is still incomplete",
+                    next.id
+                )));
+            }
+            return Ok(());
+        }
+
+        let parent_task_id = task
+            .parent_task_id
+            .as_deref()
+            .expect("parent_task_id was checked above");
+        let parent = TaskRepo::get_by_id(&*self.db, parent_task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", parent_task_id.to_owned()))?;
+        if parent.blocked_json.is_some()
+            || parent.failed_json.is_some()
+            || parent.error_annotation.is_some()
+            || parent.entry_barrier_json.is_some()
+        {
+            return Err(ServiceError::invalid_operation(format!(
+                "subtask {} cannot execute while coordination root {} is blocked or has an error",
+                task.id, parent.id
+            )));
+        }
+
+        let project = ProjectRepo::get_by_id(&*self.db, &parent.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", parent.project_id.clone()))?;
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &parent,
+            &project.workflow_definition,
+            &api_types::Actor::system(api_types::SystemComponent::Executor),
+        );
+        if matches!(
+            workflow.state_kind(&parent.status),
+            Some(api_types::StateKind::Backlog | api_types::StateKind::Terminal)
+        ) || workflow.canonical_phase_for_state(&parent.status)
+            == api_types::CanonicalPhase::Review
+        {
+            return Err(ServiceError::invalid_operation(format!(
+                "subtask {} cannot execute while coordination root {} is in {}",
+                task.id, parent.id, parent.status
+            )));
+        }
+
+        super::super::subtask::ensure_subtask_dispatch_order(&self.db, task).await
+    }
+
     pub(super) async fn wait_for_agent_active_before_dispatch(
         &self,
         execution: &Execution,
@@ -120,35 +226,30 @@ impl TaskService {
         Ok(())
     }
 
-    /// Repository Tasks have one active WorkspaceLease per Task, so any
-    /// running repository execution excludes every other role—not only a
-    /// second interactive session. This preflight prevents a losing launch
-    /// from creating a failed execution and annotating the Task while the
-    /// scheduler's legitimate execution is still running.
+    /// A repository workspace admits only one running execution, including a
+    /// root workspace shared by ordered subtasks. This preflight avoids
+    /// preparing side effects for a losing launch; the execution INSERT
+    /// repeats the check transactionally to close races and cover remote
+    /// daemon execution.
     pub(super) async fn ensure_no_running_repository_execution(&self, task: &Task) -> Result<()> {
-        if task.repo_id.is_none() {
-            return Ok(());
-        }
-        let page = ExecutionRepo::list_by_task(
-            &*self.db,
-            &task.id,
-            PageRequest {
-                cursor: None,
-                limit: 100,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Desc,
-            },
-        )
-        .await?;
-        if let Some(running) = page
-            .items
-            .into_iter()
-            .find(|execution| execution.status == ExecutionStatus::Running)
-        {
+        let workspace_task_id = task.parent_task_id.as_deref().unwrap_or(&task.id);
+        let workspace = WorkspaceRepo::get_by_task_id(&*self.db, workspace_task_id).await?;
+        let running_execution_id = if let Some(workspace) = workspace {
+            sqlx::query_scalar::<_, String>(
+                "SELECT id FROM execution
+                 WHERE workspace_id = ? AND status = 'running'
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+            )
+            .bind(&workspace.id)
+            .fetch_optional(self.db.pool())
+            .await?
+        } else {
+            None
+        };
+        if let Some(running_execution_id) = running_execution_id {
             return Err(ServiceError::invalid_operation(format!(
                 "repository execution already running: {}",
-                running.id
+                running_execution_id
             )));
         }
         Ok(())
@@ -300,4 +401,11 @@ impl TaskService {
             }
         }
     }
+}
+
+fn ordered_task_is_terminal(task: &Task) -> bool {
+    matches!(
+        task.status.as_str(),
+        crate::workflow::default_states::DONE | crate::workflow::default_states::CANCELLED
+    )
 }

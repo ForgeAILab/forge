@@ -3031,7 +3031,7 @@ async fn executor_completion_guard_rejection_follows_up_before_blocking() {
 }
 
 #[tokio::test]
-async fn subtask_sequence_guard_rejection_runs_orchestrator_instead_of_coder_follow_up() {
+async fn subtask_sequence_guard_rejection_never_resumes_root_coder() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service =
@@ -3047,7 +3047,7 @@ async fn subtask_sequence_guard_rejection_runs_orchestrator_instead_of_coder_fol
     service
         .maybe_cascade_executor_completion(&execution.id)
         .await
-        .expect("handoff succeeds");
+        .expect("coordination handoff succeeds");
 
     let executions = ExecutionRepo::list_by_task(
         &*db,
@@ -3062,27 +3062,12 @@ async fn subtask_sequence_guard_rejection_runs_orchestrator_instead_of_coder_fol
     )
     .await
     .expect("executions load");
-    let resumed = executions
-        .items
-        .iter()
-        .find(|candidate| candidate.status == ExecutionStatus::Running)
-        .expect("lease-backed subtask follow-up exists");
-    assert_eq!(
-        resumed.parent_execution_id.as_deref(),
-        Some(execution.id.as_str())
-    );
-    let execution = ExecutionRepo::get_by_id(&*db, &resumed.id)
-        .await
-        .expect("execution loads")
-        .expect("execution exists");
-    assert_eq!(execution.status, ExecutionStatus::Running);
     assert!(
-        execution
-            .summary
-            .as_deref()
-            .is_some_and(|s| s.contains("Subtask 1 of 1")),
-        "execution summary should contain subtask prompt, got: {:?}",
-        execution.summary
+        executions
+            .items
+            .iter()
+            .all(|candidate| candidate.status != ExecutionStatus::Running),
+        "coordination roots must not receive a coder follow-up"
     );
 
     let task = TaskRepo::get_by_id(&*db, &task.id, false)

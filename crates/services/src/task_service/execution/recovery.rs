@@ -454,6 +454,8 @@ impl TaskService {
         } else {
             updated_snapshot
         };
+        self.ensure_ordered_execution_admission(&task, &blocked_execution.role)
+            .await?;
         self.ensure_task_runnable(&task).await?;
         let (workspace, workspace_created_by_attempt) =
             super::super::workspace::prepare_workspace_owned(
@@ -607,6 +609,8 @@ impl TaskService {
         let role_name = crate::workflow::effective_role(state).ok_or_else(|| {
             ServiceError::invalid_operation(format!("state {} has no executable role", task.status))
         })?;
+        self.ensure_ordered_execution_admission(&task, role_name)
+            .await?;
         let assignment =
             TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role_name)
                 .await?
@@ -1026,7 +1030,7 @@ impl TaskService {
                 workspace_root: self.workspace_root.clone(),
                 repo_cache_locks: self.repo_cache_locks.clone(),
             };
-            return Ok(engine
+            let recovered = engine
                 .manual_override_transition(
                     &task.id,
                     &target_state,
@@ -1037,7 +1041,9 @@ impl TaskService {
                     true,
                 )
                 .await?
-                .task);
+                .task;
+            self.reconcile_terminal_subtask(&recovered).await;
+            return Ok(recovered);
         }
 
         Ok(self

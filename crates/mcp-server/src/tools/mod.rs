@@ -7,10 +7,8 @@ use crate::{error::McpToolError, protocol::McpContext, state::AppState};
 
 pub(crate) use descriptors::tool_descriptors;
 
-// NOTE: role reassignment (POST/DELETE /api/v1/tasks/{id}/roles/...) is intentionally
-// NOT exposed as an MCP tool. Agents must not re-route work between themselves or
-// between agent and human through MCP. Any future change that adds such a tool
-// requires its own authorization spec.
+// MCP exposes only assignment of an Agent to the Task's effective implementation
+// role. Arbitrary role selection and Agent↔human routing remain REST/user actions.
 pub(crate) async fn dispatch_tool(
     state: &AppState,
     name: &str,
@@ -27,6 +25,11 @@ pub(crate) async fn dispatch_tool(
         "forge_list_task_dependencies" => {
             handlers::forge_list_task_dependencies(state, arguments).await
         }
+        "forge_list_task_dependents" => {
+            handlers::forge_list_task_dependents(state, arguments).await
+        }
+        "forge_list_sub_tasks" => handlers::forge_list_sub_tasks(state, arguments).await,
+        "forge_reorder_sub_tasks" => handlers::forge_reorder_sub_tasks(state, arguments).await,
         "forge_list_tasks" => handlers::forge_list_tasks(state, arguments).await,
         "forge_get_task" => handlers::forge_get_task(state, arguments).await,
         "forge_preview_prompt" => handlers::forge_preview_prompt(state, arguments).await,
@@ -38,8 +41,8 @@ pub(crate) async fn dispatch_tool(
         "forge_list_executions" => handlers::forge_list_executions(state, arguments).await,
         "forge_update_task" => handlers::forge_update_task(state, arguments).await,
         "forge_transition_task" => handlers::forge_transition_task(state, arguments).await,
-        "forge_register_agent" => handlers::forge_register_agent(state, arguments).await,
-        "forge_list_agents" => handlers::forge_list_agents(state, arguments).await,
+        "forge_register_agent" => handlers::forge_register_agent(state, arguments, context).await,
+        "forge_list_agents" => handlers::forge_list_agents(state, arguments, context).await,
         "forge_list_projects" => handlers::forge_list_projects(state, arguments, context).await,
         "forge_get_project" => handlers::forge_get_project(state, arguments).await,
         "forge_create_project" => handlers::forge_create_project(state, arguments, context).await,

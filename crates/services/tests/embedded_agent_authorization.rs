@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
-    CreateAgentIdentity, CreateAgentProfile, CreateProject, ProjectAgentBindingRepo,
-    ProjectMemberRepo, ProjectRepo, SqliteDb,
+    CreateAgentIdentity, CreateAgentProfile, CreateProject, ProjectAgentBindingRepo, ProjectRepo,
+    SqliteDb,
 };
 use services::embedded_agent_service::RequestedCanonicalScope;
 use services::{
@@ -207,19 +207,6 @@ async fn project_chat_gets_task_management_only_after_charter_setup_for_its_owni
     )
     .await
     .expect("Project A");
-    ProjectMemberRepo::add_member(
-        &*db,
-        db::CreateProjectMember {
-            id: new_uuid_v4(),
-            project_id: "project-a".to_owned(),
-            user_id: "user-1".to_owned(),
-            role: "owner".to_owned(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("Project member");
     let chats = AgentChatService::new(Arc::clone(&db));
     chats
         .set_project_binding(SetProjectAgentBindingInput {

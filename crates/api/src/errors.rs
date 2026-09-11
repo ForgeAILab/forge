@@ -348,30 +348,6 @@ impl From<ServiceError> for ApiError {
                 message: "nested subtasks are unsupported".to_string(),
                 details: None,
             },
-            ServiceError::SubtaskAssigneeUnsupported {
-                root_coder_id,
-                attempted,
-            } => Self {
-                status: StatusCode::CONFLICT,
-                code: "SUBTASK_ASSIGNEE_UNSUPPORTED",
-                message: "subtask assignee unsupported".to_string(),
-                details: Some(json!({ "root_coder_id": root_coder_id, "attempted": attempted })),
-            },
-            ServiceError::SubtaskSequenceStarted { task_id } => Self {
-                status: StatusCode::CONFLICT,
-                code: "SUBTASK_SEQUENCE_STARTED",
-                message: format!("subtask sequence already started for task {task_id}"),
-                details: Some(json!({ "task_id": task_id })),
-            },
-            ServiceError::SubtaskManagedByRoot {
-                task_id,
-                root_task_id,
-            } => Self {
-                status: StatusCode::CONFLICT,
-                code: "SUBTASK_MANAGED_BY_ROOT",
-                message: format!("subtask {task_id} is managed by root {root_task_id}"),
-                details: Some(json!({ "task_id": task_id, "root_task_id": root_task_id })),
-            },
             ServiceError::ParentWorkspaceRequired { parent_task_id } => Self {
                 status: StatusCode::CONFLICT,
                 code: "PARENT_WORKSPACE_REQUIRED",
@@ -383,12 +359,6 @@ impl From<ServiceError> for ApiError {
                 code: "WORKSPACE_RESET_REQUIRED",
                 message: format!("workspace reset required for task {task_id}: {reason}"),
                 details: Some(json!({ "task_id": task_id, "reason": reason })),
-            },
-            ServiceError::TaskSequenceAlreadyStarted { task_id } => Self {
-                status: StatusCode::CONFLICT,
-                code: "TASK_SEQUENCE_ALREADY_STARTED",
-                message: format!("task sequence already started for task {task_id}"),
-                details: Some(json!({ "task_id": task_id })),
             },
             ServiceError::TerminalDisabled => Self {
                 status: StatusCode::FORBIDDEN,

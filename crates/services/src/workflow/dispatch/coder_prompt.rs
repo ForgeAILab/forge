@@ -115,12 +115,6 @@ fn coder_system(ctx: &AgentDispatchContext, extra_role_boundary: Option<&str>) -
 }
 
 fn implementation_user(ctx: &AgentDispatchContext) -> String {
-    if let Some(ordered_prompt) =
-        crate::task_service::build_first_turn_prompt_from_context(&ctx.task, &ctx.sub_tasks)
-    {
-        return ordered_prompt;
-    }
-
     let mut user = format!(
         "Task: {}\n\nImplementation objective:\nMake the requested code changes in the worktree and leave the task ready for review.\n",
         ctx.task.title

@@ -1472,7 +1472,8 @@ impl CoordinationToolProvider {
         let rows = match (scope.scope_type, project_scope_id.as_deref()) {
             (CanonicalScopeType::Project | CanonicalScopeType::AgentChat, Some(project_id)) => {
                 sqlx::query(
-                    "SELECT id, title, status, priority, assignee_type, assignee_id
+                    "SELECT id, parent_task_id, subtask_order, version,
+                            title, status, priority, assignee_type, assignee_id
                      FROM task WHERE project_id = ? AND deleted_at IS NULL
                      ORDER BY updated_at DESC, id DESC LIMIT ?",
                 )
@@ -1483,7 +1484,8 @@ impl CoordinationToolProvider {
                 .map_err(|_| AgentHostError::ProtectedPersistence)?
             }
             (CanonicalScopeType::Task, _) => sqlx::query(
-                "SELECT id, title, status, priority, assignee_type, assignee_id
+                "SELECT id, parent_task_id, subtask_order, version,
+                        title, status, priority, assignee_type, assignee_id
                      FROM task WHERE id = ? AND deleted_at IS NULL LIMIT 1",
             )
             .bind(&scope.scope_id)
@@ -1531,6 +1533,9 @@ impl CoordinationToolProvider {
                 let depends_on = dependencies.remove(&id).unwrap_or_default();
                 json!({
                     "id": id,
+                    "parent_task_id": row.try_get::<Option<String>, _>("parent_task_id").ok().flatten(),
+                    "subtask_order": row.try_get::<Option<i64>, _>("subtask_order").ok().flatten(),
+                    "version": row.try_get::<i64, _>("version").unwrap_or_default(),
                     "title": row.try_get::<String, _>("title").unwrap_or_default(),
                     "status": row.try_get::<String, _>("status").unwrap_or_default(),
                     "priority": row.try_get::<i64, _>("priority").unwrap_or_default(),

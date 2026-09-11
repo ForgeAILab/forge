@@ -9,9 +9,10 @@ use db::{
     CreateUsageEvent, CreateUsageInvocation, DaemonRepo, DaemonStatus, ExecutionRepo,
     ExecutionStatus, PageRequest, PricingAdmissionProvenanceKind, PricingDomainKind,
     PricingSelectionStatus, ProjectAgentBindingRepo, ProjectMemberRepo, ProjectRepo, RepoRepo,
-    SortBy, SortOrder, SqliteDb, StartUsageInvocation, Task, TaskRepo, TaskRoleAssignmentRepo,
-    UpdateProject, UpsertDaemon, UsageCostKind, UsageEventProvenanceKind, UsageEventReportMode,
-    UsageLedgerRepo, UsageLedgerSettlement, UsageSurface, UsageTelemetryState, UserRepo,
+    SortBy, SortOrder, SqliteDb, StartUsageInvocation, Task, TaskDependencyRepo, TaskRepo,
+    TaskRoleAssignmentRepo, UpdateDaemonReport, UpdateProject, UpsertDaemon, UsageCostKind,
+    UsageEventProvenanceKind, UsageEventReportMode, UsageLedgerRepo, UsageLedgerSettlement,
+    UsageSurface, UsageTelemetryState, UserRepo,
 };
 use events::EventBus;
 use serde_json::{json, Value};
@@ -153,19 +154,6 @@ async fn seed_chat_project(state: &AppState, identity_id: &str) -> String {
     )
     .await
     .expect("chat project creates");
-    ProjectMemberRepo::add_member(
-        &*state.db,
-        CreateProjectMember {
-            id: new_uuid_v4(),
-            project_id: project_id.clone(),
-            user_id: "chat-user".to_owned(),
-            role: "owner".to_owned(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("chat project member creates");
     let expected_version =
         ProjectAgentBindingRepo::get_active_project_binding(&*state.db, &project_id)
             .await
@@ -573,6 +561,20 @@ async fn seed_agent(state: &AppState, name: &str) -> Agent {
     .await
     .expect("daemon creates");
 
+    DaemonRepo::update_report(
+        &*state.db,
+        UpdateDaemonReport {
+            id: daemon.id.clone(),
+            last_report_at: now.clone(),
+            status: DaemonStatus::Online,
+            detected_clis_json: r#"[{"kind":"shell","availability":"authenticated"}]"#.to_owned(),
+            labels_json: None,
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("daemon report updates");
+
     AgentRepo::create(
         &*state.db,
         CreateAgent {
@@ -742,6 +744,24 @@ fn known_tool_internal_failure_redacts_provider_details() {
 }
 
 #[test]
+fn cycle_detected_maps_to_client_validation_error() {
+    let error = McpToolError::from(db::DbError::CycleDetected);
+    assert_eq!(error.code, -32602);
+    let response = error
+        .with_call_context(
+            "forge_add_task_dependency",
+            Some("project-1"),
+            Some("user-1"),
+        )
+        .into_tool_response(json!(1));
+    let result = response.result.expect("tool failures use a success result");
+    assert_eq!(result["isError"], true);
+    assert_eq!(result["structuredContent"]["code"], "validation_error");
+    assert_eq!(result["structuredContent"]["status"], "failed");
+    assert_ne!(result["structuredContent"]["code"], "internal_failure");
+}
+
+#[test]
 fn malformed_and_unknown_mcp_failures_remain_json_rpc_errors() {
     for (code, message) in [(-32700, "parse error"), (-32601, "method not found")] {
         let response = McpToolError::protocol(code, message).into_response(json!(1));
@@ -791,11 +811,14 @@ fn tools_list_returns_descriptors() {
             "forge_list_agents",
             "forge_list_executions",
             "forge_list_projects",
+            "forge_list_sub_tasks",
             "forge_list_task_dependencies",
+            "forge_list_task_dependents",
             "forge_list_tasks",
             "forge_preview_prompt",
             "forge_register_agent",
             "forge_remove_task_dependency",
+            "forge_reorder_sub_tasks",
             "forge_send_agent_chat_message",
             "forge_set_main_agent",
             "forge_set_project_agent",
@@ -811,6 +834,28 @@ fn tools_list_returns_descriptors() {
         assert!(tools
             .iter()
             .any(|tool| tool.get("name").is_some() && tool.get("inputSchema").is_some()));
+
+        let create_task = tools
+            .iter()
+            .find(|tool| tool["name"] == "forge_create_task")
+            .expect("create task descriptor");
+        assert_eq!(
+            create_task["inputSchema"]["properties"]["depends_on_ids"]["type"],
+            "array"
+        );
+        assert!(create_task["description"]
+            .as_str()
+            .expect("create task description")
+            .contains("shared-workspace subtask relationship"));
+
+        let create_subtasks = tools
+            .iter()
+            .find(|tool| tool["name"] == "forge_create_sub_tasks")
+            .expect("create subtasks descriptor");
+        assert!(create_subtasks["description"]
+            .as_str()
+            .expect("create subtasks description")
+            .contains("non-executing coordination container"));
     });
 }
 
@@ -1365,6 +1410,120 @@ fn forge_create_task_persists_validated_task_type() {
 }
 
 #[test]
+fn forge_create_task_atomically_persists_prerequisites() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (project_id, _) = seed_project_repo(&state).await;
+        let first = seed_task_in_project(&state, project_id.clone()).await;
+        let second = seed_task_in_project(&state, project_id.clone()).await;
+
+        let result = call_tool(
+            &state,
+            "forge_create_task",
+            json!({
+                "project_id": project_id,
+                "title": "Dependent task",
+                "depends_on_ids": [first.id, second.id]
+            }),
+        )
+        .await;
+
+        let task_id = result["id"].as_str().expect("task id");
+        let dependency_ids = result["depends_on_ids"]
+            .as_array()
+            .expect("creation returns dependency ids");
+        assert_eq!(dependency_ids.len(), 2);
+        let stored = TaskDependencyRepo::list_dependencies(&*state.db, task_id)
+            .await
+            .expect("dependencies load");
+        assert_eq!(stored.len(), 2);
+
+        let listed = call_tool(
+            &state,
+            "forge_list_task_dependencies",
+            json!({ "task_id": task_id }),
+        )
+        .await;
+        assert_eq!(listed["depends_on_ids"].as_array().map(Vec::len), Some(2));
+
+        let reverse = call_tool(
+            &state,
+            "forge_list_task_dependents",
+            json!({ "task_id": stored[0] }),
+        )
+        .await;
+        assert_eq!(reverse["dependent_task_ids"], json!([task_id]));
+    });
+}
+
+#[test]
+fn forge_create_task_rejects_invalid_prerequisites_without_creating_task() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (project_id, _) = seed_project_repo(&state).await;
+        let before = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task WHERE project_id = ?")
+            .bind(&project_id)
+            .fetch_one(state.db.pool())
+            .await
+            .expect("task count loads");
+
+        let error = call_tool_error(
+            &state,
+            "forge_create_task",
+            json!({
+                "project_id": project_id.clone(),
+                "title": "Must not persist",
+                "depends_on_ids": ["missing-task"]
+            }),
+        )
+        .await;
+
+        assert_eq!(error.code, -32004);
+        let after = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task WHERE project_id = ?")
+            .bind(&project_id)
+            .fetch_one(state.db.pool())
+            .await
+            .expect("task count reloads");
+        assert_eq!(after, before);
+    });
+}
+
+#[test]
+fn forge_create_task_keeps_parentage_distinct_from_dependencies() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let root = seed_task(&state).await;
+        let before = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task")
+            .fetch_one(state.db.pool())
+            .await
+            .expect("task count loads");
+
+        let error = call_tool_error(
+            &state,
+            "forge_create_task",
+            json!({
+                "project_id": root.project_id,
+                "title": "Impossible child",
+                "parent_task_id": root.id,
+                "depends_on_ids": [root.id]
+            }),
+        )
+        .await;
+
+        assert_eq!(error.code, -32602);
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["field"].as_str()),
+            Some("depends_on_ids")
+        );
+        let after = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task")
+            .fetch_one(state.db.pool())
+            .await
+            .expect("task count reloads");
+        assert_eq!(after, before);
+    });
+}
+
+#[test]
 fn forge_create_task_rejects_invalid_priority_with_field_error() {
     run_async(async {
         let state = sqlite_state().await;
@@ -1666,22 +1825,121 @@ fn forge_transition_task_changes_status() {
 fn forge_register_agent_registers_agent() {
     run_async(async {
         let state = sqlite_state().await;
-        let (executor_type, daemon_id) = seed_agent_registration_deps(&state).await;
+        let (executor_type, _daemon_id) = seed_agent_registration_deps(&state).await;
         let result = call_tool(
             &state,
             "forge_register_agent",
             json!({
                 "name": "codex",
                 "executor_type": executor_type.clone(),
-                "daemon_id": daemon_id.clone(),
             }),
         )
         .await;
 
         assert_eq!(result["name"], "codex");
         assert_eq!(result["executor_type"], executor_type);
-        assert_eq!(result["daemon_id"], daemon_id);
+        assert_eq!(result["daemon_id"], Value::Null);
         assert_eq!(result["status"], "idle");
+
+        let stored = AgentRepo::get_by_id(
+            &*state.db,
+            result["id"].as_str().expect("registered agent id"),
+        )
+        .await
+        .expect("registered agent lookup succeeds")
+        .expect("registered agent exists");
+        assert_eq!(stored.owner_id.as_deref(), Some("mcp-test-user"));
+        assert_eq!(stored.visibility, "account");
+    });
+}
+
+#[test]
+fn forge_register_agent_rejects_daemon_pin_for_non_admin() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (executor_type, daemon_id) = seed_agent_registration_deps(&state).await;
+        let error = call_tool_error(
+            &state,
+            "forge_register_agent",
+            json!({
+                "name": "unprivileged",
+                "executor_type": executor_type,
+                "daemon_id": daemon_id,
+            }),
+        )
+        .await;
+
+        assert_eq!(error.code, -32003);
+        assert_eq!(error.data, Some(json!({ "code": "admin_required" })));
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM agent_identity WHERE owner_id = 'mcp-test-user'",
+        )
+        .fetch_one(state.db.pool())
+        .await
+        .expect("agent count loads");
+        assert_eq!(count, 0);
+    });
+}
+
+#[test]
+fn forge_register_agent_allows_admin_daemon_pin() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (executor_type, daemon_id) = seed_agent_registration_deps(&state).await;
+        UserRepo::set_admin(&*state.db, "mcp-test-user", true)
+            .await
+            .expect("test user becomes admin");
+        let result = call_tool(
+            &state,
+            "forge_register_agent",
+            json!({
+                "name": "privileged",
+                "executor_type": executor_type,
+                "daemon_id": daemon_id.clone(),
+            }),
+        )
+        .await;
+
+        assert_eq!(result["daemon_id"], daemon_id);
+    });
+}
+
+#[test]
+fn forge_assign_agent_only_updates_the_task_assignment() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let task = seed_task(&state).await;
+        let agent = seed_agent(&state, "luna").await;
+
+        let result = call_tool(
+            &state,
+            "forge_assign_agent",
+            json!({
+                "task_id": task.id,
+                "agent_id": agent.id,
+            }),
+        )
+        .await;
+
+        assert_eq!(result["execution_started"], false);
+        assert_eq!(result["assignment"]["task_id"], task.id);
+        assert_eq!(result["assignment"]["assignee_id"], agent.id);
+        assert_eq!(result["assignment"]["assignee_type"], "agent");
+
+        let executions = ExecutionRepo::list_by_task(
+            &*state.db,
+            &task.id,
+            PageRequest {
+                cursor: None,
+                limit: 20,
+                include_total: false,
+                sort_by: SortBy::CreatedAt,
+                sort_order: SortOrder::Desc,
+            },
+        )
+        .await
+        .expect("execution lookup succeeds");
+        assert!(executions.items.is_empty());
     });
 }
 
@@ -1689,14 +1947,13 @@ fn forge_register_agent_registers_agent() {
 fn forge_list_agents_returns_paginated_agents() {
     run_async(async {
         let state = sqlite_state().await;
-        let (executor_type, daemon_id) = seed_agent_registration_deps(&state).await;
+        let (executor_type, _daemon_id) = seed_agent_registration_deps(&state).await;
         call_tool(
             &state,
             "forge_register_agent",
             json!({
                 "name": "codex",
                 "executor_type": executor_type.clone(),
-                "daemon_id": daemon_id.clone(),
             }),
         )
         .await;
@@ -1714,6 +1971,111 @@ fn forge_list_agents_returns_paginated_agents() {
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0]["name"], "codex");
         assert_eq!(result["has_more"], false);
+    });
+}
+
+#[test]
+fn forge_list_agents_filters_before_pagination_and_redacts_daemon_id() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (_executor_type, daemon_id) = seed_agent_registration_deps(&state).await;
+        for (id, name, owner_id, visibility, created_at) in [
+            (
+                "mcp-hidden-agent",
+                "hidden",
+                Some("another-user"),
+                "account",
+                "2026-09-10T00:00:03Z",
+            ),
+            (
+                "mcp-owned-agent",
+                "owned",
+                Some("mcp-test-user"),
+                "account",
+                "2026-09-10T00:00:02Z",
+            ),
+            (
+                "mcp-global-agent",
+                "global",
+                None,
+                "global",
+                "2026-09-10T00:00:01Z",
+            ),
+        ] {
+            AgentRepo::create(
+                &*state.db,
+                CreateAgent {
+                    id: id.to_owned(),
+                    name: name.to_owned(),
+                    description: None,
+                    executor_type: "shell".to_owned(),
+                    model: None,
+                    reasoning_effort: None,
+                    permission_policy: None,
+                    capabilities_json: "[]".to_owned(),
+                    config_json: "{}".to_owned(),
+                    credential_ref: None,
+                    daemon_id: Some(daemon_id.clone()),
+                    max_concurrent_tasks: 1,
+                    heartbeat_interval_seconds: 30,
+                    max_missed_heartbeats: 3,
+                    status: AgentStatus::Idle,
+                    last_heartbeat_at: None,
+                    is_default: false,
+                    paused: false,
+                    owner_id: owner_id.map(str::to_owned),
+                    visibility: visibility.to_owned(),
+                    prompt_template: None,
+                    created_at: created_at.to_owned(),
+                    updated_at: created_at.to_owned(),
+                },
+            )
+            .await
+            .expect("agent creates");
+        }
+
+        let page = AgentRepo::list_visible(
+            &*state.db,
+            "mcp-test-user",
+            db::AgentListQuery {
+                status: None,
+                executor_type: None,
+                capabilities: Vec::new(),
+                page: PageRequest {
+                    cursor: None,
+                    limit: 1,
+                    include_total: true,
+                    sort_by: SortBy::CreatedAt,
+                    sort_order: SortOrder::Desc,
+                },
+            },
+        )
+        .await
+        .expect("visible agent page loads");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].name, "owned");
+        assert_eq!(page.total_count, Some(2));
+        assert!(page.next_cursor.is_some());
+
+        let result = call_tool(&state, "forge_list_agents", json!({ "limit": 1 })).await;
+        assert_eq!(result["data"].as_array().map(Vec::len), Some(1));
+        assert_eq!(result["data"][0]["name"], "owned");
+        assert_eq!(result["data"][0]["daemon_id"], Value::Null);
+        assert_eq!(result["has_more"], true);
+
+        let next = call_tool(
+            &state,
+            "forge_list_agents",
+            json!({
+                "limit": 1,
+                "cursor": result["next_cursor"].clone(),
+            }),
+        )
+        .await;
+        assert_eq!(next["data"].as_array().map(Vec::len), Some(1));
+        assert_eq!(next["data"][0]["name"], "global");
+        assert_eq!(next["data"][0]["daemon_id"], Value::Null);
+        assert_eq!(next["has_more"], false);
     });
 }
 
@@ -1755,6 +2117,25 @@ fn forge_create_project_creates_project() {
         assert!(result["id"].as_str().is_some());
         assert_eq!(result["settings"], json!({}));
         assert_eq!(result["paused"], false);
+
+        let project_id = result["id"].as_str().expect("project id");
+        let member = ProjectMemberRepo::get_member(&*state.db, project_id, "mcp-test-user")
+            .await
+            .expect("owner membership lookup succeeds")
+            .expect("MCP creator is a Project member");
+        assert_eq!(member.role, "owner");
+
+        let updated = call_tool(
+            &state,
+            "forge_update_project",
+            json!({
+                "project_id": project_id,
+                "version": result["version"],
+                "name": "MCP managed"
+            }),
+        )
+        .await;
+        assert_eq!(updated["name"], "MCP managed");
     });
 }
 
@@ -1907,13 +2288,14 @@ fn forge_create_sub_tasks_creates_subtasks() {
     run_async(async {
         let state = sqlite_state().await;
         let root = seed_task(&state).await;
+        let agent = seed_agent(&state, "child-coder").await;
         let result = call_tool(
             &state,
             "forge_create_sub_tasks",
             json!({
                 "parent_task_id": root.id.clone(),
                 "subtasks": [
-                    { "title": "One" },
+                    { "title": "One", "assignee_id": agent.id },
                     { "title": "Two" },
                     { "title": "Three" }
                 ]
@@ -1926,6 +2308,48 @@ fn forge_create_sub_tasks_creates_subtasks() {
         for (index, subtask) in subtasks.iter().enumerate() {
             assert_eq!(subtask["subtask_order"], index as i64);
         }
+        assert_eq!(subtasks[0]["role_assignments"][0]["assignee_id"], agent.id);
+        assert_eq!(subtasks[0]["role_assignments"][0]["role_name"], "coder");
+
+        let listed = call_tool(
+            &state,
+            "forge_list_sub_tasks",
+            json!({ "parent_task_id": root.id.clone() }),
+        )
+        .await;
+        assert_eq!(
+            listed["subtasks"]
+                .as_array()
+                .expect("listed subtasks")
+                .iter()
+                .map(|task| task["title"].as_str().expect("title"))
+                .collect::<Vec<_>>(),
+            vec!["One", "Two", "Three"]
+        );
+
+        let ordered_ids = [
+            subtasks[0]["id"].as_str().expect("first subtask id"),
+            subtasks[2]["id"].as_str().expect("third subtask id"),
+            subtasks[1]["id"].as_str().expect("second subtask id"),
+        ];
+        let reordered = call_tool(
+            &state,
+            "forge_reorder_sub_tasks",
+            json!({
+                "parent_task_id": root.id,
+                "ordered_ids": ordered_ids
+            }),
+        )
+        .await;
+        assert_eq!(
+            reordered["subtasks"]
+                .as_array()
+                .expect("reordered subtasks")
+                .iter()
+                .map(|task| task["title"].as_str().expect("title"))
+                .collect::<Vec<_>>(),
+            vec!["One", "Three", "Two"]
+        );
     });
 }
 

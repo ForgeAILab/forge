@@ -60,7 +60,7 @@ pub const PROJECT_OPERATING_SKILL_POLICY_JSON: &str =
 pub const PROJECT_OPERATING_SKILL_POLICY_DIGEST: &str =
     "b9364db0792d4a7aa3e9dcae9ebfab78f6a239db55dc21831b201c9b905dd54b";
 pub const PROJECT_OPERATING_SKILL_CONTENT_DIGEST: &str =
-    "1051cb539ec9d49959999890972fb74dc0a82d7d4aed08fd3bc60703b8f8c977";
+    "83dc68545c9a154ca279a7469cca3a7805dcf5165a18a60ae18856180e8e1d29";
 
 /// Returns the exact immutable body of the Main Agent account baseline skill.
 /// This body is server-owned source code, not a seeded database row.
@@ -806,6 +806,7 @@ STANDING INVARIANTS
 - A claimed step exists only as a server record. Persist milestones, decisions, and Tasks through their typed operations and confirm the returned IDs; a described-but-unpersisted artifact is nothing and must never be reported as done.
 - Never claim to have edited, tested, merged, or observed repository behavior unless an authoritative Task, validation, or evidence record says so. Worklog entries are narration, never workflow truth, and never satisfy an acceptance check.
 - Use each milestone's exact acceptance-check ID and definition revision. Never invent aliases such as `ac-1`, renumber a stable check, or use a description as its identity.
+- Parentage and dependencies are separate: `parent_task_id` establishes one-level coordination hierarchy: a root with children is non-executing; direct children share the root Workspace and run serially by `subtask_order` while retaining independent assignment, execution, and lifecycle. Dependency edges only gate execution, never hierarchy or Workspace sharing, and a child must not depend on its parent.
 - A material scope change (Project identity, target user, core loop, in-scope outcome, explicit non-goal, success measure, material constraint, safety/compliance posture, launch commitment, or expected cost) requires a typed CharterAmendment and explicit user approval; never reinterpret the Charter to make it appear pre-approved. Classify smaller changes per the scope_change section before acting.
 - Record validation results with `project.validation` exactly as observed, `fail` included. A `task_validation` pass or fail must cite `observed_command_ids`: the observation ids `forge_task_command` returned for commands you ran yourself in `checkout/` after the delivered Task landed; the server refuses a result that cites none, one that is not yours, or one older than the delivery. A Task's worklog or a reviewer's report is narration about someone else's run and settles nothing. Task status alone is not validation, and an unsettled check blocks a milestone exactly as a failing one does.
 - Integrated verification is your own work, never a Task's. Exercise the delivered software in your workspace `checkout/`, record results with `project.validation`, and capture the proof yourself with `project.evidence` (`capture`). Never create a Task whose outcome is only to verify, validate, or collect evidence: an implementation Task's completion contract demands repository changes, so a read-only Task wedges its worker. When verification fails, create the Task that fixes the defect.
@@ -900,6 +901,8 @@ Do not reinterpret the original Charter to make a material change appear pre-app
 
 const PROJECT_SKILL_SECTION_TASKS: &str = r#"TASK ORCHESTRATION
 - Create Tasks only through typed Project-scoped actions and only when they have a clear outcome, source artifact/revision, acceptance criteria, dependencies, and appropriate task type.
+- Use `parent_task_id` only for a one-level coordination hierarchy: a root Task with children is a non-executing coordination container, and its direct children share the root Workspace and execute serially in `subtask_order` while keeping independent agent assignment, execution attempts, review, and lifecycle. Do not nest subtasks or schedule/launch the root as implementation work.
+- Use dependency edges only for execution prerequisites. They do not establish parentage, hierarchy, or Workspace sharing; a child must never depend on its coordination parent. Model sibling or unrelated prerequisites with dependencies and keep coordination parentage separate.
 - Use discovery Tasks for research, planning Tasks for decomposed planning work, and normal implementation/review flows for repository changes. Task type never grants extra authority.
 - Every implementation Task must change the repository: its completion contract requires a commit on the Task branch, and a run that completes with nothing committed fails and burns the retry budget. Never create a Task to verify, validate, or gather evidence for delivered work — integrated verification and evidence capture are your own work in your Project workspace (see the milestones section). When verification finds a defect, create the implementation Task that fixes it, not one that re-checks it.
 - Link every Task immutably to its governing Charter revision and, when present, the relevant milestone and artifact revisions. Avoid duplication; use idempotency and inspect current Project work first.
@@ -1243,6 +1246,8 @@ mod tests {
             include_str!("../../db/migrations/V126__spark_scaffold_at_genesis.sql");
         const V133_MIGRATION: &str =
             include_str!("../../db/migrations/V133__project_agent_can_cancel_tasks.sql");
+        const V137_MIGRATION: &str =
+            include_str!("../../db/migrations/V137__project_task_parentage_and_dependencies.sql");
         const V106_MIGRATION: &str =
             include_str!("../../db/migrations/V106__charter_execution_and_agent_availability.sql");
 
@@ -1297,7 +1302,9 @@ mod tests {
         assert!(V120_MIGRATION.contains("forge.project.orchestration/v1@12"));
         assert!(V125_MIGRATION.contains("forge.project.orchestration/v1@14"));
         assert!(V133_MIGRATION.contains("forge.project.orchestration/v1@15"));
-        assert!(V133_MIGRATION.contains(PROJECT_OPERATING_SKILL_CONTENT_DIGEST));
+        assert!(V137_MIGRATION.contains("forge.project.orchestration/v1@16"));
+        assert!(V137_MIGRATION.contains("WHERE id = 'forge.project.orchestration/v1@15'"));
+        assert!(V137_MIGRATION.contains(PROJECT_OPERATING_SKILL_CONTENT_DIGEST));
         let seeded_project = seeded_body(V125_MIGRATION, "Forge Project Agent")
             .replace(
                 "You may decide a Task workflow's human-required review only through the typed `task.review` action.",
@@ -1306,6 +1313,10 @@ mod tests {
             .replace(
                 "reassign a role from eligible agents, cancel and replace a wedged Task within the adaptive envelope, including cancelling a verification-shaped Task and settling its checks yourself.",
                 "reassign a role from eligible agents, cancel obsolete or wedged work with `task.cancel`, and replace incorrect work through the adaptive envelope, including cancelling a verification-shaped Task and settling its checks yourself.",
+            )
+            .replace(
+                "- Use each milestone's exact acceptance-check ID and definition revision. Never invent aliases such as `ac-1`, renumber a stable check, or use a description as its identity.",
+                "- Use each milestone's exact acceptance-check ID and definition revision. Never invent aliases such as `ac-1`, renumber a stable check, or use a description as its identity.\n- Parentage and dependencies are separate: `parent_task_id` establishes one-level coordination hierarchy: a root with children is non-executing; direct children share the root Workspace and run serially by `subtask_order` while retaining independent assignment, execution, and lifecycle. Dependency edges only gate execution, never hierarchy or Workspace sharing, and a child must not depend on its parent.",
             );
         assert_eq!(seeded_project, canonical_project_operating_skill_body());
         assert_eq!(
@@ -1355,6 +1366,15 @@ mod tests {
         assert!(tasks.contains("effective_state.project.default_review_ci_steps"));
         assert!(tasks.contains("review_requirement_ids"));
         assert!(tasks.contains("Unselected Project outcomes stay deferred"));
+        assert!(tasks.contains("parent_task_id"));
+        assert!(tasks.contains("one-level coordination hierarchy"));
+        assert!(tasks.contains("share the root Workspace"));
+        assert!(tasks.contains("serially in `subtask_order`"));
+        assert!(tasks
+            .contains("independent agent assignment, execution attempts, review, and lifecycle"));
+        assert!(tasks.contains("Use dependency edges only for execution prerequisites"));
+        assert!(tasks.contains("do not establish parentage, hierarchy, or Workspace sharing"));
+        assert!(tasks.contains("child must never depend on its coordination parent"));
     }
 
     #[test]

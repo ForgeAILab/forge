@@ -3,9 +3,8 @@ use std::sync::Arc;
 use api_types::{OrchestrationOutcome, OutcomeCode, OutcomeStatus};
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
-    CreateAgentIdentity, CreateAgentProfile, CreateProject, CreateProjectAgentBinding,
-    CreateProjectMember, CreateTask, MemoryItem, MemoryRepository, ProjectAgentBindingRepo,
-    ProjectMemberRepo, ProjectRepo, SqliteDb, TaskRepo,
+    CreateAgentIdentity, CreateAgentProfile, CreateProject, CreateProjectAgentBinding, CreateTask,
+    MemoryItem, MemoryRepository, ProjectAgentBindingRepo, ProjectRepo, SqliteDb, TaskRepo,
 };
 use forge_agent_host::{
     AgentHostError, CanonicalScope, CanonicalScopeType, ForgeToolProvider, WorkspaceAccess,
@@ -862,19 +861,6 @@ async fn project_chat_never_infers_worker_as_binding() {
     let db = database().await;
     project(&db, "project-worker-primary").await;
     identity_with_project_permission(&db, "worker-identity", "project-worker-primary", false).await;
-    ProjectMemberRepo::add_member(
-        db.as_ref(),
-        CreateProjectMember {
-            id: new_uuid_v4(),
-            project_id: "project-worker-primary".to_owned(),
-            user_id: "user-1".to_owned(),
-            role: "owner".to_owned(),
-            created_at: now_rfc3339(),
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("project member creates");
     let binding =
         ProjectAgentBindingRepo::get_active_project_binding(db.as_ref(), "project-worker-primary")
             .await
@@ -1238,19 +1224,6 @@ async fn untrusted_text_from_every_source_cannot_raise_the_server_ceiling() {
 
     // Probe 5 (source 9): Agent Chat content is admitted only inside its own
     // canonical scope, and credential-bearing content is refused outright.
-    ProjectMemberRepo::add_member(
-        db.as_ref(),
-        CreateProjectMember {
-            id: new_uuid_v4(),
-            project_id: "project-a".to_owned(),
-            user_id: "user-1".to_owned(),
-            role: "owner".to_owned(),
-            created_at: now_rfc3339(),
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await
-    .expect("project member creates");
     let chats = AgentChatService::new(Arc::clone(&db));
     let chat = chats
         .ensure_project_chat("project-a")

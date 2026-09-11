@@ -268,6 +268,21 @@ pub(super) async fn apply_adaptive_task_command(
                     .execute(&mut *tx)
                     .await?;
                 }
+                if let Some(agent_id) = item.assignee_id.as_deref() {
+                    sqlx::query(
+                        "INSERT INTO task_role_assignment
+                            (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at)
+                         VALUES (?, ?, 'coder', 'agent', ?, ?, ?)",
+                    )
+                    .bind(crate::new_uuid_v4())
+                    .bind(&task.id)
+                    .bind(agent_id)
+                    .bind(&now)
+                    .bind(&now)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(super::orchestration::orchestration_write_error)?;
+                }
                 if let Some(governance) = adaptive_child_governance(
                     &gate.governance,
                     &gate,
@@ -796,13 +811,22 @@ async fn validate_sequence(
     source: &Task,
     ordered_task_ids: &[String],
 ) -> Result<()> {
-    let sibling_ids: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM task WHERE parent_task_id = ? AND deleted_at IS NULL
-         ORDER BY subtask_order ASC, created_at ASC, id ASC",
-    )
+    let sibling_rows = sqlx::query(&format!(
+        "SELECT {TASK_COLUMNS} FROM task
+         WHERE parent_task_id = ? AND deleted_at IS NULL
+         ORDER BY subtask_order ASC, created_at ASC, id ASC"
+    ))
     .bind(&source.id)
     .fetch_all(&mut **tx)
     .await?;
+    let siblings = sibling_rows
+        .into_iter()
+        .map(super::map_task)
+        .collect::<Result<Vec<_>>>()?;
+    let sibling_ids = siblings
+        .iter()
+        .map(|task| task.id.clone())
+        .collect::<Vec<_>>();
     let submitted = ordered_task_ids
         .iter()
         .collect::<std::collections::HashSet<_>>();
@@ -813,6 +837,46 @@ async fn validate_sequence(
         return Err(DbError::Check(
             "adaptive Task sequence must contain exactly the source's active subtasks".to_owned(),
         ));
+    }
+
+    // The sequence cursor is durable state: the terminal prefix and current
+    // first incomplete child may already have been observed or dispatched by
+    // another worker while the Project Agent is choosing a new suffix order.
+    // Keep that cursor fixed and only permit a permutation of untouched todo
+    // children after it. The transaction holds the writer lock, so this check
+    // and every order update below see one consistent sequence.
+    let workflow_definition =
+        sqlx::query_scalar::<_, String>("SELECT workflow_definition FROM project WHERE id = ?")
+            .bind(&source.project_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    let mut terminal_states =
+        std::collections::HashSet::from(["done".to_owned(), "cancelled".to_owned()]);
+    if let Ok(workflow) =
+        serde_json::from_str::<api_types::WorkflowDefinition>(&workflow_definition)
+    {
+        terminal_states.extend(
+            workflow
+                .states
+                .into_iter()
+                .filter(|state| state.kind == api_types::StateKind::Terminal)
+                .map(|state| state.name),
+        );
+    }
+    let first_incomplete = siblings
+        .iter()
+        .position(|task| !terminal_states.contains(&task.status));
+    let prefix_len = first_incomplete.map_or(siblings.len(), |index| index + 1);
+    if ordered_task_ids[..prefix_len] != sibling_ids[..prefix_len] {
+        return Err(DbError::InvalidTransition);
+    }
+    if siblings[prefix_len..].iter().any(|task| {
+        task.status.as_str() != "todo"
+            || task.blocked_json.is_some()
+            || task.failed_json.is_some()
+            || task.error_annotation.is_some()
+    }) {
+        return Err(DbError::InvalidTransition);
     }
     Ok(())
 }

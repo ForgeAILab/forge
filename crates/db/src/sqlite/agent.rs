@@ -6,6 +6,104 @@ use crate::now_rfc3339;
 // Chat filesystem access or let Main cross into Project/Task mutations.
 const DEFAULT_CLI_SCOPE_PERMISSIONS: &str = r#"{"permissions":["read_account","read_project","read_agent_chat","read_task","read_memory","propose_task","propose_discovery","propose_project","propose_handoff","propose_message","propose_review","propose_commitment","propose_memory","propose_decision","propose_session","task_read","task_write"]}"#;
 
+async fn list_agents_filtered(
+    db: &SqliteDb,
+    query: AgentListQuery,
+    user_id: Option<&str>,
+) -> Result<Page<Agent>> {
+    let offset = decode_offset(&query.page.cursor)?;
+    let mut where_parts = Vec::new();
+    if user_id.is_some() {
+        // Apply visibility in SQL before pagination and counting. The REST
+        // and MCP surfaces use this same predicate, so neither can leak
+        // private identities through an offset or total-count mismatch.
+        where_parts.push("(agent.visibility = 'global' OR agent.owner_id = ?)");
+    }
+    if query.status.is_some() {
+        where_parts.push("agent.status = ?");
+    }
+    if query.executor_type.is_some() {
+        where_parts.push("agent.executor_type = ?");
+    }
+    where_parts.extend(std::iter::repeat_n(
+        "agent.capabilities_json LIKE ?",
+        query.capabilities.len(),
+    ));
+    let where_sql = if where_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", where_parts.join(" AND "))
+    };
+    let order_sql = match (&query.page.sort_by, &query.page.sort_order) {
+        (SortBy::CreatedAt, SortOrder::Asc) => "agent.created_at ASC, agent.id ASC",
+        (SortBy::CreatedAt, SortOrder::Desc) => "agent.created_at DESC, agent.id DESC",
+        (SortBy::UpdatedAt, SortOrder::Asc) => "agent.updated_at ASC, agent.id ASC",
+        (SortBy::UpdatedAt, SortOrder::Desc) => "agent.updated_at DESC, agent.id DESC",
+        (SortBy::Id, SortOrder::Asc) => "agent.id ASC",
+        (SortBy::Id, SortOrder::Desc) => "agent.id DESC",
+        (SortBy::Priority, SortOrder::Asc) => "agent.created_at ASC, agent.id ASC",
+        (SortBy::Priority, SortOrder::Desc) => "agent.created_at DESC, agent.id DESC",
+        (SortBy::BoardPosition, SortOrder::Asc) => "agent.created_at ASC, agent.id ASC",
+        (SortBy::BoardPosition, SortOrder::Desc) => "agent.created_at DESC, agent.id DESC",
+        (SortBy::Title, SortOrder::Asc) => "agent.name ASC, agent.id ASC",
+        (SortBy::Title, SortOrder::Desc) => "agent.name DESC, agent.id DESC",
+        (SortBy::Status, SortOrder::Asc) => "agent.status ASC, agent.id ASC",
+        (SortBy::Status, SortOrder::Desc) => "agent.status DESC, agent.id DESC",
+        (SortBy::Agent, SortOrder::Asc) | (SortBy::TaskType, SortOrder::Asc) => {
+            "agent.created_at ASC, agent.id ASC"
+        }
+        (SortBy::Agent, SortOrder::Desc) | (SortBy::TaskType, SortOrder::Desc) => {
+            "agent.created_at DESC, agent.id DESC"
+        }
+    };
+    let sql = format!(
+        "SELECT agent.* FROM agent_current AS agent{} ORDER BY {} LIMIT ? OFFSET ?",
+        where_sql, order_sql
+    );
+    let mut q = sqlx::query(&sql);
+    if let Some(user_id) = user_id {
+        q = q.bind(user_id);
+    }
+    if let Some(status) = &query.status {
+        q = q.bind(status.to_string());
+    }
+    if let Some(executor_type) = &query.executor_type {
+        q = q.bind(executor_type);
+    }
+    for capability in &query.capabilities {
+        q = q.bind(format!("%\"{capability}\"%"));
+    }
+    let rows = q
+        .bind(limit(&query.page) + 1)
+        .bind(offset)
+        .fetch_all(&db.pool)
+        .await?;
+    let items = rows
+        .into_iter()
+        .map(map_agent)
+        .collect::<Result<Vec<_>>>()?;
+    let total = if query.page.include_total {
+        let count_sql = format!("SELECT COUNT(*) FROM agent_current AS agent{}", where_sql);
+        let mut q = sqlx::query_scalar::<_, i64>(&count_sql);
+        if let Some(user_id) = user_id {
+            q = q.bind(user_id);
+        }
+        if let Some(status) = &query.status {
+            q = q.bind(status.to_string());
+        }
+        if let Some(executor_type) = &query.executor_type {
+            q = q.bind(executor_type);
+        }
+        for capability in &query.capabilities {
+            q = q.bind(format!("%\"{capability}\"%"));
+        }
+        Some(q.fetch_one(&db.pool).await?)
+    } else {
+        None
+    };
+    page_from_items(items, &query.page, offset, total)
+}
+
 #[async_trait]
 impl AgentRepo for SqliteDb {
     async fn create(&self, input: CreateAgent) -> Result<Agent> {
@@ -150,85 +248,11 @@ impl AgentRepo for SqliteDb {
     }
 
     async fn list(&self, query: AgentListQuery) -> Result<Page<Agent>> {
-        let offset = decode_offset(&query.page.cursor)?;
-        let mut where_parts = Vec::new();
-        if query.status.is_some() {
-            where_parts.push("agent.status = ?");
-        }
-        if query.executor_type.is_some() {
-            where_parts.push("agent.executor_type = ?");
-        }
-        where_parts.extend(std::iter::repeat_n(
-            "agent.capabilities_json LIKE ?",
-            query.capabilities.len(),
-        ));
-        let where_sql = if where_parts.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", where_parts.join(" AND "))
-        };
-        let order_sql = match (&query.page.sort_by, &query.page.sort_order) {
-            (SortBy::CreatedAt, SortOrder::Asc) => "agent.created_at ASC, agent.id ASC",
-            (SortBy::CreatedAt, SortOrder::Desc) => "agent.created_at DESC, agent.id DESC",
-            (SortBy::UpdatedAt, SortOrder::Asc) => "agent.updated_at ASC, agent.id ASC",
-            (SortBy::UpdatedAt, SortOrder::Desc) => "agent.updated_at DESC, agent.id DESC",
-            (SortBy::Id, SortOrder::Asc) => "agent.id ASC",
-            (SortBy::Id, SortOrder::Desc) => "agent.id DESC",
-            (SortBy::Priority, SortOrder::Asc) => "agent.created_at ASC, agent.id ASC",
-            (SortBy::Priority, SortOrder::Desc) => "agent.created_at DESC, agent.id DESC",
-            (SortBy::BoardPosition, SortOrder::Asc) => "agent.created_at ASC, agent.id ASC",
-            (SortBy::BoardPosition, SortOrder::Desc) => "agent.created_at DESC, agent.id DESC",
-            (SortBy::Title, SortOrder::Asc) => "agent.name ASC, agent.id ASC",
-            (SortBy::Title, SortOrder::Desc) => "agent.name DESC, agent.id DESC",
-            (SortBy::Status, SortOrder::Asc) => "agent.status ASC, agent.id ASC",
-            (SortBy::Status, SortOrder::Desc) => "agent.status DESC, agent.id DESC",
-            (SortBy::Agent, SortOrder::Asc) | (SortBy::TaskType, SortOrder::Asc) => {
-                "agent.created_at ASC, agent.id ASC"
-            }
-            (SortBy::Agent, SortOrder::Desc) | (SortBy::TaskType, SortOrder::Desc) => {
-                "agent.created_at DESC, agent.id DESC"
-            }
-        };
-        let sql = format!(
-            "SELECT agent.* FROM agent_current AS agent{} ORDER BY {} LIMIT ? OFFSET ?",
-            where_sql, order_sql
-        );
-        let mut q = sqlx::query(&sql);
-        if let Some(status) = &query.status {
-            q = q.bind(status.to_string());
-        }
-        if let Some(executor_type) = &query.executor_type {
-            q = q.bind(executor_type);
-        }
-        for capability in &query.capabilities {
-            q = q.bind(format!("%\"{capability}\"%"));
-        }
-        let rows = q
-            .bind(limit(&query.page) + 1)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?;
-        let items = rows
-            .into_iter()
-            .map(map_agent)
-            .collect::<Result<Vec<_>>>()?;
-        let total = if query.page.include_total {
-            let count_sql = format!("SELECT COUNT(*) FROM agent_current AS agent{}", where_sql);
-            let mut q = sqlx::query_scalar::<_, i64>(&count_sql);
-            if let Some(status) = &query.status {
-                q = q.bind(status.to_string());
-            }
-            if let Some(executor_type) = &query.executor_type {
-                q = q.bind(executor_type);
-            }
-            for capability in &query.capabilities {
-                q = q.bind(format!("%\"{capability}\"%"));
-            }
-            Some(q.fetch_one(&self.pool).await?)
-        } else {
-            None
-        };
-        page_from_items(items, &query.page, offset, total)
+        list_agents_filtered(self, query, None).await
+    }
+
+    async fn list_visible(&self, user_id: &str, query: AgentListQuery) -> Result<Page<Agent>> {
+        list_agents_filtered(self, query, Some(user_id)).await
     }
 
     async fn update(&self, input: UpdateAgent) -> Result<Agent> {

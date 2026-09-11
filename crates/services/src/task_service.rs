@@ -73,10 +73,14 @@ pub use actions::TaskActionResult;
 pub use adaptive::{
     AdaptiveTaskChild, AdaptiveTaskCommand, AdaptiveTaskCommandResult, AdaptiveTaskOperation,
 };
+pub(crate) use common::latest_executor_execution_for_task;
 pub use create_subtasks::NewSubtaskInput;
-pub use execution::subtasks::build_first_turn_prompt_from_context;
 pub use proposal::{
     DirectTaskProposalInput, TaskProposalCommandResult, TaskProposalPayload, TASK_PROPOSE_COMMAND,
+};
+pub(crate) use subtask::{
+    coordination_review_pending, coordination_root_has_subtasks,
+    coordination_root_sequence_complete, subtask_dispatch_ready, subtask_is_terminal,
 };
 pub use subtask::{is_root_task, is_subtask, root_for};
 

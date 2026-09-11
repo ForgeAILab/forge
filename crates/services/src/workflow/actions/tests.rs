@@ -1820,7 +1820,7 @@ async fn ci_passes_then_reviewer_dispatched_via_dispatch_role_agent() {
 }
 
 #[tokio::test]
-async fn subtask_root_still_dispatches_reviewer_after_coder_completion() {
+async fn coordination_root_dispatches_reviewer_after_child_completion() {
     let task_id = new_uuid_v4();
     let reviewer_id = "agent-reviewer-subtask-root";
     let mut harness =
@@ -1857,14 +1857,42 @@ async fn subtask_root_still_dispatches_reviewer_after_coder_completion() {
     )
     .await
     .expect("subtask creates");
-    TaskRepo::set_metadata_json(
+    let root_execution = ExecutionRepo::get_by_id(
         &*ctx.db,
-        &subtask_id,
-        Some(r#"{"ordered_sequence_started":true}"#.to_owned()),
-        &now,
+        ctx.execution_id.as_deref().expect("root execution id"),
     )
     .await
-    .expect("subtask metadata writes");
+    .expect("root execution loads")
+    .expect("root execution exists");
+    ExecutionRepo::create(
+        &*ctx.db,
+        CreateExecution {
+            id: new_uuid_v4(),
+            task_id: subtask_id,
+            agent_id: None,
+            role: "executor".to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("child executor summary".to_owned()),
+            logs_path: None,
+            before_sha: root_execution.before_sha.clone(),
+            after_sha: root_execution.after_sha.clone(),
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: root_execution.workspace_id,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("child execution creates");
 
     let ci_result = RunCiSteps.execute(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");

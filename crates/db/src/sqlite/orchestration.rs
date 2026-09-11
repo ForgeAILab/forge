@@ -1496,6 +1496,18 @@ impl ProjectOrchestrationRepo for SqliteDb {
         )
         .await?;
 
+        if input.task.parent_task_id.as_ref().is_some_and(|parent_id| {
+            input
+                .depends_on_task_ids
+                .iter()
+                .any(|depends_on_task_id| depends_on_task_id == parent_id)
+        }) {
+            return Err(DbError::Check(
+                "task proposal parent_task_id creates a shared-workspace subtask relationship and cannot also be a prerequisite dependency"
+                    .to_owned(),
+            ));
+        }
+
         // Dependencies are part of the proposal's authoritative acceptance,
         // not a best-effort follow-up. Re-authorize every prerequisite while
         // holding the same writer lock that will insert the Task and receipt.

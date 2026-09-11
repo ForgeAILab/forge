@@ -17,13 +17,13 @@ use db::{
     AgentSessionRepo, CreateAccountMainAgentBinding, CreateProject, ExecutionRepo,
     MemoryScopeGrant, PageRequest, ProjectAgentBinding, ProjectAgentBindingRepo, ProjectMemberRepo,
     ProjectRepo, ReplaceAccountMainAgentBinding, SortBy, SortOrder, TaskDependencyRepo,
-    TaskListQuery, TaskRepo, UpdateProject, UpdateTask,
+    TaskListQuery, TaskRepo, TaskRoleAssignmentRepo, UpdateProject, UpdateTask, UserRepo,
 };
 use executors::ExecutionOverrides;
 use serde_json::{json, Map, Value};
 use services::{
-    workflow::engine::WorkflowEngine, Assignee, DiffService, MemoryAccessContext,
-    MemorySearchResult, SetProjectAgentBindingInput,
+    workflow::engine::WorkflowEngine, DiffService, MemoryAccessContext, MemorySearchResult,
+    SetProjectAgentBindingInput,
 };
 use uuid::Uuid;
 
@@ -36,17 +36,18 @@ use crate::{
         GetAgentSessionParams, GetProjectAgentParams, GetProjectParams, GetTaskParams,
         ListAgentChatMessagesParams, ListAgentChatsParams, ListAgentHandoffsParams,
         ListAgentProfilesParams, ListAgentSessionsParams, ListAgentsParams, ListExecutionsParams,
-        ListProjectsParams, ListTaskDependenciesParams, ListTasksParams, MemoryGetParams,
-        MemorySearchParams, PreviewPromptParams, RegisterAgentParams, RemoveTaskDependencyParams,
-        SendAgentChatMessageParams, TransitionTaskParams, UpdateProjectLifecycleHooksParams,
-        UpdateProjectParams, UpdateTaskParams,
+        ListProjectsParams, ListSubTasksParams, ListTaskDependenciesParams, ListTasksParams,
+        MemoryGetParams, MemorySearchParams, PreviewPromptParams, RegisterAgentParams,
+        RemoveTaskDependencyParams, ReorderSubTasksParams, SendAgentChatMessageParams,
+        TransitionTaskParams, UpdateProjectLifecycleHooksParams, UpdateProjectParams,
+        UpdateTaskParams,
     },
     protocol::McpContext,
     state::AppState,
     values::{
-        agent_page_value, agent_profile_value, agent_session_value, agent_value,
-        claimed_task_value, execution_page_value, execution_value, project_page_value,
-        project_value, task_page_value, task_value,
+        agent_page_value_for_user, agent_profile_value, agent_session_value, agent_value_for_user,
+        execution_page_value, execution_value, project_page_value, project_value, task_page_value,
+        task_role_assignment_value, task_value,
     },
 };
 
@@ -103,9 +104,10 @@ pub(super) async fn forge_create_task(
             })),
         ));
     }
+    let dependency_ids = params.depends_on_ids.clone();
     let task = state
         .task_service
-        .create_task(
+        .create_task_with_dependencies(
             params.project_id,
             params.title,
             params.description,
@@ -115,20 +117,38 @@ pub(super) async fn forge_create_task(
             None,
             None,
             None,
+            params.depends_on_ids,
         )
         .await
         .map_err(|error| match error {
+            services::ServiceError::NotFound { entity: "task", id }
+                if dependency_ids.contains(&id) =>
+            {
+                invalid_field_error(
+                    "depends_on_ids",
+                    format!("prerequisite task not found: {id}"),
+                    Some(json!({
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "constraint": "existing task ids in the same project"
+                    })),
+                )
+            }
             services::ServiceError::NotFound { entity: "task", id } => invalid_field_error(
                 "parent_task_id",
                 format!("parent task not found: {id}"),
                 Some(json!({
                     "type": "string",
-                    "constraint": "existing root task id"
+                    "constraint": "existing root task id in the same project"
                 })),
             ),
             other => other.into(),
         })?;
-    Ok(task_value(task))
+    let mut result = task_value(task);
+    if let Some(object) = result.as_object_mut() {
+        object.insert("depends_on_ids".to_owned(), json!(dependency_ids));
+    }
+    Ok(result)
 }
 
 pub(super) async fn forge_create_sub_tasks(
@@ -150,8 +170,32 @@ pub(super) async fn forge_create_sub_tasks(
         .create_subtasks(params.parent_task_id, inputs)
         .await?;
     Ok(serde_json::json!({
-        "subtasks": tasks.into_iter().map(task_value).collect::<Vec<_>>(),
+        "subtasks": tasks_with_role_assignments(state, tasks).await?,
     }))
+}
+
+async fn tasks_with_role_assignments(
+    state: &AppState,
+    tasks: Vec<db::Task>,
+) -> Result<Vec<Value>, McpToolError> {
+    let mut values = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let assignments = TaskRoleAssignmentRepo::list_by_task(&*state.db, &task.id).await?;
+        let mut value = task_value(task);
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "role_assignments".to_owned(),
+                Value::Array(
+                    assignments
+                        .into_iter()
+                        .map(task_role_assignment_value)
+                        .collect(),
+                ),
+            );
+        }
+        values.push(value);
+    }
+    Ok(values)
 }
 
 fn invalid_field_error(
@@ -225,6 +269,71 @@ fn validate_create_task_arguments(params: &Value) -> Result<(), McpToolError> {
                 "parent_task_id",
                 "must be a string",
                 Some(json!({ "type": "string" })),
+            ));
+        }
+    }
+    if let Some(value) = object.get("depends_on_ids") {
+        let Some(dependency_ids) = value.as_array() else {
+            return Err(invalid_field_error(
+                "depends_on_ids",
+                "must be an array of unique, non-empty task id strings",
+                Some(json!({
+                    "type": "array",
+                    "items": { "type": "string", "non_empty": true },
+                    "uniqueItems": true
+                })),
+            ));
+        };
+        let mut unique = HashSet::with_capacity(dependency_ids.len());
+        for (index, dependency_id) in dependency_ids.iter().enumerate() {
+            let Some(dependency_id) = dependency_id.as_str() else {
+                return Err(invalid_field_error(
+                    "depends_on_ids",
+                    format!("item {index} must be a string"),
+                    Some(json!({
+                        "type": "array",
+                        "items": { "type": "string", "non_empty": true },
+                        "uniqueItems": true
+                    })),
+                ));
+            };
+            if dependency_id.trim().is_empty() {
+                return Err(invalid_field_error(
+                    "depends_on_ids",
+                    format!("item {index} must be non-empty"),
+                    Some(json!({
+                        "type": "array",
+                        "items": { "type": "string", "non_empty": true },
+                        "uniqueItems": true
+                    })),
+                ));
+            }
+            if !unique.insert(dependency_id) {
+                return Err(invalid_field_error(
+                    "depends_on_ids",
+                    format!("contains duplicate task id `{dependency_id}`"),
+                    Some(json!({
+                        "type": "array",
+                        "items": { "type": "string", "non_empty": true },
+                        "uniqueItems": true
+                    })),
+                ));
+            }
+        }
+        if object
+            .get("parent_task_id")
+            .and_then(Value::as_str)
+            .is_some_and(|parent_task_id| unique.contains(parent_task_id))
+        {
+            return Err(invalid_field_error(
+                "depends_on_ids",
+                "must not contain parent_task_id; parentage shares a workspace, while dependencies only gate execution",
+                Some(json!({
+                    "type": "array",
+                    "items": { "type": "string", "non_empty": true },
+                    "uniqueItems": true,
+                    "excludes": "parent_task_id"
+                })),
             ));
         }
     }
@@ -461,11 +570,14 @@ pub(super) async fn forge_assign_agent(
     params: Value,
 ) -> Result<Value, McpToolError> {
     let params: AssignAgentParams = parse_params(params)?;
-    let claimed = state
+    let assignment = state
         .task_service
-        .claim_task(params.task_id, Assignee::Agent(params.agent_id), None)
+        .assign_agent_to_task(&params.task_id, &params.agent_id)
         .await?;
-    Ok(claimed_task_value(claimed))
+    Ok(json!({
+        "assignment": task_role_assignment_value(assignment),
+        "execution_started": false,
+    }))
 }
 
 pub(super) async fn forge_cancel_task(
@@ -559,8 +671,18 @@ pub(super) async fn forge_transition_task(
 pub(super) async fn forge_register_agent(
     state: &AppState,
     params: Value,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
+    require_account_scope(context)?;
     let params: RegisterAgentParams = parse_params(params)?;
+    let user = authenticated_user_record(state, context).await?;
+    let is_admin = user.is_admin;
+    if !is_admin && params.daemon_id.is_some() {
+        return Err(
+            McpToolError::new(-32003, "Admin access required to pin an agent to a daemon")
+                .with_data(json!({ "code": "admin_required" })),
+        );
+    }
     let agent = state
         .agent_service
         .register(
@@ -574,25 +696,29 @@ pub(super) async fn forge_register_agent(
             "[]".to_owned(),
             "{}".to_owned(),
             None,
-            params.daemon_id,
+            params.daemon_id.filter(|_| is_admin),
             None,
             None,
             None,
             false,
-            None,
-            None,
+            Some(user.id),
+            Some("account".to_owned()),
         )
         .await?;
-    Ok(agent_value(agent))
+    Ok(agent_value_for_user(agent, is_admin))
 }
 
 pub(super) async fn forge_list_agents(
     state: &AppState,
     params: Value,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
+    require_account_scope(context)?;
     let params: ListAgentsParams = parse_params(params)?;
-    let page = AgentRepo::list(
+    let user = authenticated_user_record(state, context).await?;
+    let page = AgentRepo::list_visible(
         &*state.db,
+        &user.id,
         AgentListQuery {
             status: params.status.map(Into::into),
             executor_type: None,
@@ -601,7 +727,7 @@ pub(super) async fn forge_list_agents(
         },
     )
     .await?;
-    Ok(agent_page_value(page))
+    Ok(agent_page_value_for_user(page, user.is_admin))
 }
 
 pub(super) async fn forge_list_projects(
@@ -625,7 +751,7 @@ pub(super) async fn forge_create_project(
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
     require_account_scope(context)?;
-    let user_id = authenticated_user(context)?;
+    let user = authenticated_user_record(state, context).await?;
     let params: CreateProjectParams = parse_params(params)?;
     if params.name.trim().is_empty() {
         return Err(McpToolError::new(-32602, "name must not be empty"));
@@ -639,7 +765,7 @@ pub(super) async fn forge_create_project(
             settings: "{}".to_owned(),
             workflow_definition: "{}".to_string(),
             primary_repo_id: None,
-            owner_id: Some(user_id.to_owned()),
+            owner_id: Some(user.id),
             created_at: now.clone(),
             updated_at: now,
         },
@@ -1035,7 +1161,62 @@ pub(super) async fn forge_list_task_dependencies(
 ) -> Result<Value, McpToolError> {
     let params: ListTaskDependenciesParams = parse_params(params)?;
     let deps = TaskDependencyRepo::list_dependencies(&*state.db, &params.task_id).await?;
-    Ok(json!({ "task_id": params.task_id, "depends_on": deps }))
+    Ok(json!({ "task_id": params.task_id, "depends_on_ids": deps }))
+}
+
+pub(super) async fn forge_list_task_dependents(
+    state: &AppState,
+    params: Value,
+) -> Result<Value, McpToolError> {
+    let params: ListTaskDependenciesParams = parse_params(params)?;
+    let dependents = TaskDependencyRepo::list_dependents(&*state.db, &params.task_id).await?;
+    Ok(json!({
+        "depends_on_id": params.task_id,
+        "dependent_task_ids": dependents,
+    }))
+}
+
+pub(super) async fn forge_list_sub_tasks(
+    state: &AppState,
+    params: Value,
+) -> Result<Value, McpToolError> {
+    let params: ListSubTasksParams = parse_params(params)?;
+    let subtasks = TaskRepo::list_subtasks_ordered(&*state.db, &params.parent_task_id).await?;
+    Ok(json!({
+        "parent_task_id": params.parent_task_id,
+        "subtasks": tasks_with_role_assignments(state, subtasks).await?,
+    }))
+}
+
+pub(super) async fn forge_reorder_sub_tasks(
+    state: &AppState,
+    params: Value,
+) -> Result<Value, McpToolError> {
+    let params: ReorderSubTasksParams = parse_params(params)?;
+    state
+        .task_service
+        .reorder_subtasks(params.parent_task_id.clone(), params.ordered_ids)
+        .await
+        .map_err(|error| match error {
+            services::ServiceError::Db(db::DbError::Check(details)) => invalid_field_error(
+                "ordered_ids",
+                details,
+                Some(json!({
+                    "constraint": "every current direct child exactly once"
+                })),
+            ),
+            services::ServiceError::Db(db::DbError::InvalidTransition) => invalid_field_error(
+                "ordered_ids",
+                "the terminal prefix and current first incomplete child must remain fixed; only the untouched todo suffix may be reordered",
+                None,
+            ),
+            other => other.into(),
+        })?;
+    let subtasks = TaskRepo::list_subtasks_ordered(&*state.db, &params.parent_task_id).await?;
+    Ok(json!({
+        "parent_task_id": params.parent_task_id,
+        "subtasks": tasks_with_role_assignments(state, subtasks).await?,
+    }))
 }
 
 pub(super) async fn forge_list_agent_profiles(
@@ -1425,6 +1606,16 @@ fn authenticated_user(context: &McpContext) -> Result<&str, McpToolError> {
         .user_id
         .as_deref()
         .filter(|user_id| !user_id.trim().is_empty())
+        .ok_or_else(|| McpToolError::new(-32001, "authenticated MCP user is required"))
+}
+
+async fn authenticated_user_record(
+    state: &AppState,
+    context: &McpContext,
+) -> Result<db::User, McpToolError> {
+    let user_id = authenticated_user(context)?;
+    UserRepo::get_user_by_id(&*state.db, user_id)
+        .await?
         .ok_or_else(|| McpToolError::new(-32001, "authenticated MCP user is required"))
 }
 

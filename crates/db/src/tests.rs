@@ -1464,19 +1464,11 @@ async fn test_list_agents_usable_in_project() {
     let u2_agent_id = seed_agent(&db, "u2 account agent", "account", Some(u2_id.clone())).await;
     let project_id = seed_project(&db, "Usable agents", Some(u1_id.clone())).await;
 
-    ProjectMemberRepo::add_member(
-        &db,
-        CreateProjectMember {
-            id: new_uuid_v4(),
-            project_id: project_id.clone(),
-            user_id: u1_id.clone(),
-            role: "owner".to_owned(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .expect("u1 project member creates");
+    let owner_member = ProjectMemberRepo::get_member(&db, &project_id, &u1_id)
+        .await
+        .expect("u1 owner membership loads")
+        .expect("project creation materializes the owner membership");
+    assert_eq!(owner_member.role, "owner");
     ProjectMemberRepo::add_member(
         &db,
         CreateProjectMember {
@@ -6906,7 +6898,7 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
             ),
             (
                 "forge.project.orchestration/v1".to_owned(),
-                "forge.project.orchestration/v1@15".to_owned(),
+                "forge.project.orchestration/v1@16".to_owned(),
             ),
         ],
         "a seeded operating-skill revision must be repointed in the same release (V081 regression)"
@@ -6914,7 +6906,7 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
     let (body, digest): (String, String) = sqlx::query_as(
         "SELECT canonical_body, content_digest
          FROM operating_skill_revision
-         WHERE id = 'forge.project.orchestration/v1@15'",
+         WHERE id = 'forge.project.orchestration/v1@16'",
     )
     .fetch_one(db.pool())
     .await
@@ -6929,6 +6921,10 @@ async fn operating_skills_point_at_their_latest_seeded_revisions() {
     assert!(body.contains("skill.section"));
     assert!(body.contains("read `project.charter` and `project.current_state`"));
     assert!(body.contains("cancel a non-terminal Task only through versioned `task.cancel`"));
+    assert!(body.contains("`parent_task_id` establishes one-level coordination"));
+    assert!(
+        body.contains("Dependency edges only gate execution, never hierarchy or Workspace sharing")
+    );
     assert!(!body.contains("Evidence is mandatory proof, not optional decoration"));
     assert!(!body.contains("MILESTONES AND EVIDENCE"));
     assert_eq!(hex::encode(Sha256::digest(body.as_bytes())), digest);

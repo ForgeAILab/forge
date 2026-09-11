@@ -1,57 +1,69 @@
 use super::*;
 
+/// Resolve the implementation execution that owns the current delivery
+/// workspace. A coordination root deliberately has no implementation
+/// execution of its own: its aggregate review/merge operates on the latest
+/// relevant child execution instead. Ordinary tasks continue to resolve their
+/// own latest worker/coder/executor execution.
+pub(crate) async fn latest_executor_execution_for_task(
+    db: &SqliteDb,
+    task: &Task,
+) -> Result<Option<Execution>> {
+    let task_ids = if task.parent_task_id.is_none() {
+        let subtasks = TaskRepo::list_subtasks_ordered(db, &task.id).await?;
+        if subtasks.is_empty() {
+            vec![task.id.clone()]
+        } else {
+            subtasks.into_iter().map(|subtask| subtask.id).collect()
+        }
+    } else {
+        vec![task.id.clone()]
+    };
+
+    let mut latest = None;
+    for task_id in task_ids {
+        let page = ExecutionRepo::list_by_task(
+            db,
+            &task_id,
+            PageRequest {
+                cursor: None,
+                limit: 100,
+                include_total: false,
+                sort_by: SortBy::CreatedAt,
+                sort_order: SortOrder::Desc,
+            },
+        )
+        .await?;
+        let Some(candidate) = page
+            .items
+            .into_iter()
+            .find(|execution| matches!(execution.role.as_str(), "executor" | "coder" | "worker"))
+        else {
+            continue;
+        };
+        let candidate_is_newer = latest.as_ref().is_none_or(|current: &Execution| {
+            candidate.created_at.as_str() > current.created_at.as_str()
+                || (candidate.created_at.as_str() == current.created_at.as_str()
+                    && candidate.id.as_str() > current.id.as_str())
+        });
+        if candidate_is_newer {
+            latest = Some(candidate);
+        }
+    }
+
+    Ok(latest)
+}
+
 impl TaskService {
     pub(super) async fn latest_executor_execution(&self, task_id: &str) -> Result<Execution> {
-        let page = ExecutionRepo::list_by_task_and_role(
-            &*self.db,
-            task_id,
-            crate::workflow::default_roles::WORKER,
-            PageRequest {
-                cursor: None,
-                limit: 100,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Desc,
-            },
-        )
-        .await?;
-        if let Some(execution) = page.items.into_iter().next() {
-            return Ok(execution);
-        }
-
-        let page = ExecutionRepo::list_by_task_and_role(
-            &*self.db,
-            task_id,
-            "coder",
-            PageRequest {
-                cursor: None,
-                limit: 100,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Desc,
-            },
-        )
-        .await?;
-        if let Some(execution) = page.items.into_iter().next() {
-            return Ok(execution);
-        }
-
-        let page = ExecutionRepo::list_by_task_and_role(
-            &*self.db,
-            task_id,
-            "executor",
-            PageRequest {
-                cursor: None,
-                limit: 1,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Desc,
-            },
-        )
-        .await?;
-        page.items.into_iter().next().ok_or_else(|| {
-            ServiceError::invalid_operation(format!("task {task_id} has no executor execution"))
-        })
+        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        latest_executor_execution_for_task(&*self.db, &task)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(format!("task {task_id} has no executor execution"))
+            })
     }
 
     pub(super) async fn latest_review_for_task(&self, task_id: &str) -> Result<Review> {

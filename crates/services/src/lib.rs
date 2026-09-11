@@ -412,29 +412,11 @@ pub enum ServiceError {
     #[error("nested subtasks are unsupported")]
     NestedSubtaskUnsupported,
 
-    #[error("subtask assignee unsupported: root coder {root_coder_id:?}, attempted {attempted}")]
-    SubtaskAssigneeUnsupported {
-        root_coder_id: Option<String>,
-        attempted: String,
-    },
-
-    #[error("subtask sequence already started for task {task_id}")]
-    SubtaskSequenceStarted { task_id: String },
-
-    #[error("subtask {task_id} is managed by root {root_task_id}")]
-    SubtaskManagedByRoot {
-        task_id: String,
-        root_task_id: String,
-    },
-
     #[error("parent workspace required for task {parent_task_id}")]
     ParentWorkspaceRequired { parent_task_id: String },
 
     #[error("workspace reset required for task {task_id}: {reason}")]
     WorkspaceResetRequired { task_id: String, reason: String },
-
-    #[error("task sequence already started for task {task_id}")]
-    TaskSequenceAlreadyStarted { task_id: String },
 
     #[error("terminal access is disabled")]
     TerminalDisabled,
@@ -537,38 +519,9 @@ impl ServiceError {
         Self::NestedSubtaskUnsupported
     }
 
-    pub fn subtask_assignee_unsupported(root_coder_id: Option<String>, attempted: String) -> Self {
-        Self::SubtaskAssigneeUnsupported {
-            root_coder_id,
-            attempted,
-        }
-    }
-
-    pub fn subtask_sequence_started(task_id: impl Into<String>) -> Self {
-        Self::SubtaskSequenceStarted {
-            task_id: task_id.into(),
-        }
-    }
-
-    pub fn subtask_managed_by_root(
-        task_id: impl Into<String>,
-        root_task_id: impl Into<String>,
-    ) -> Self {
-        Self::SubtaskManagedByRoot {
-            task_id: task_id.into(),
-            root_task_id: root_task_id.into(),
-        }
-    }
-
     pub fn parent_workspace_required(parent_task_id: impl Into<String>) -> Self {
         Self::ParentWorkspaceRequired {
             parent_task_id: parent_task_id.into(),
-        }
-    }
-
-    pub fn task_sequence_already_started(task_id: impl Into<String>) -> Self {
-        Self::TaskSequenceAlreadyStarted {
-            task_id: task_id.into(),
         }
     }
 }

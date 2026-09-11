@@ -320,7 +320,7 @@ async fn unscoped_mcp_authorizes_projects_tasks_executions_and_dependency_refere
             json!({"task_id": bob_task.id})
         )
         .await
-        .unwrap()["depends_on"],
+        .unwrap()["depends_on_ids"],
         json!([alice_task.id])
     );
     assert_eq!(
@@ -380,4 +380,22 @@ async fn mcp_creation_binds_owner_and_known_tools_require_a_principal() {
     .await
     .unwrap_err();
     assert_eq!(error.code, -32001);
+
+    let error = call_as(
+        &state,
+        "missing-user",
+        None,
+        "forge_create_project",
+        json!({"name": "Orphaned"}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, -32001);
+    let orphaned_count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM project WHERE name = ?")
+            .bind("Orphaned")
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(orphaned_count, 0);
 }

@@ -419,11 +419,7 @@ pub fn outcome_for_service_error_with_correction(
         | ServiceError::TaskActionUnavailable { .. }
         | ServiceError::Conflict(_)
         | ServiceError::NestedSubtaskUnsupported
-        | ServiceError::SubtaskAssigneeUnsupported { .. }
-        | ServiceError::SubtaskSequenceStarted { .. }
-        | ServiceError::SubtaskManagedByRoot { .. }
         | ServiceError::WorkspaceResetRequired { .. }
-        | ServiceError::TaskSequenceAlreadyStarted { .. }
         | ServiceError::TerminalSessionLimit { .. }
         | ServiceError::TerminalNotFound => (
             OutcomeCode::ValidationError,

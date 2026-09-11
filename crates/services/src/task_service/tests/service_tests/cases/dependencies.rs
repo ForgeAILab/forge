@@ -2,6 +2,101 @@ use super::super::*;
 use crate::task_service::tests::helpers::seed_role_assignment;
 
 #[tokio::test]
+async fn create_task_with_dependencies_commits_links_atomically() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+
+    let first = service
+        .create_task(
+            project_id.clone(),
+            "First prerequisite",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("first prerequisite creates");
+    let second = service
+        .create_task(
+            project_id.clone(),
+            "Second prerequisite",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("second prerequisite creates");
+
+    let dependent = service
+        .create_task_with_dependencies(
+            project_id.clone(),
+            "Dependent task",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![first.id.clone(), second.id.clone()],
+        )
+        .await
+        .expect("dependent creates with prerequisite links");
+    let links = TaskDependencyRepo::list_dependencies(&*db, &dependent.id)
+        .await
+        .expect("dependency links load");
+    assert_eq!(links.len(), 2);
+    assert!(links.contains(&first.id));
+    assert!(links.contains(&second.id));
+
+    let failed = service
+        .create_task_with_dependencies(
+            project_id,
+            "Missing prerequisite",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec!["missing-prerequisite".to_owned()],
+        )
+        .await
+        .expect_err("missing prerequisite rejects the whole create");
+    assert!(matches!(
+        failed,
+        ServiceError::NotFound { entity: "task", .. }
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task")
+            .fetch_one(db.pool())
+            .await
+            .expect("task count loads"),
+        3,
+        "failed dependency validation must not leave a Task behind"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task_dependency")
+            .fetch_one(db.pool())
+            .await
+            .expect("dependency count loads"),
+        2,
+        "failed dependency validation must not leave links behind"
+    );
+}
+
+#[tokio::test]
 async fn test_done_transition_emits_dependency_satisfied_event() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));

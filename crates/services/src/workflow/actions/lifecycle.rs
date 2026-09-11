@@ -264,6 +264,16 @@ pub struct CleanupWorkspaceNow;
 #[async_trait]
 impl HookAction for CleanupWorkspaceNow {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
+        let current_task = match task(ctx).await {
+            Ok(task) => task,
+            Err(reason) => return HookResult::Failed { reason },
+        };
+        if current_task.parent_task_id.is_some() {
+            return HookResult::Skipped {
+                reason: "subtask shares the coordination root workspace; cleanup is root-owned"
+                    .to_string(),
+            };
+        }
         let Some(cleanup_scheduler) = ctx.cleanup_scheduler.as_ref() else {
             return HookResult::Skipped {
                 reason: "cleanup scheduler not configured".to_string(),
@@ -296,6 +306,17 @@ impl HookAction for ScheduleWorkspaceCleanup {
                 project_id: ctx.project_id.clone(),
             },
         });
+
+        let current_task = match task(ctx).await {
+            Ok(task) => task,
+            Err(reason) => return HookResult::Failed { reason },
+        };
+        if current_task.parent_task_id.is_some() {
+            return HookResult::Skipped {
+                reason: "subtask shares the coordination root workspace; cleanup is root-owned"
+                    .to_string(),
+            };
+        }
 
         let Some(cleanup_scheduler) = ctx.cleanup_scheduler.as_ref() else {
             return HookResult::Skipped {

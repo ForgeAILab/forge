@@ -520,10 +520,10 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
                 "capability_class":string_or_null_schema(),
                 "risk_class":string_or_null_schema(),
                 "review_requirement_ids":{"type":"array","items":{"type":"string","minLength":1},"description":"Exact non-universal requirement IDs from the approved Charter that this Task owns, copied verbatim from selectable_review_requirements in the project.charter read. Do not construct these strings: an ID that does not match the catalog exactly is rejected and no Task is created. Task acceptance, linked-Document acceptance, and universal Project exclusions/non-claims are included automatically."},
-                "depends_on_task_ids":string_array_schema()
+                "depends_on_task_ids":{"type":"array","items":{"type":"string","minLength":1},"description":"Optional prerequisite Task ids in this Project. These are prerequisite DAG edges only: they do not create a parent/child hierarchy or workspace sharing. Every prerequisite must reach done before this Task can dispatch."}
             }),
             &["action", "title", "review_requirement_ids"],
-            "Create one Task in the authenticated Project scope. The server binds the current approved Charter, optional traceability references, permissions, and Task workflow state. review_requirement_ids is an explicit ownership decision: list only non-universal Charter requirements this Task directly owns, or use [] when it owns none. Copy each ID verbatim from selectable_review_requirements in the project.charter read rather than constructing it. Project-wide completion is evaluated at milestone readiness.",
+            "Create one Task in the authenticated Project scope. The server binds the current approved Charter, optional traceability references, permissions, and Task workflow state. review_requirement_ids is an explicit ownership decision: list only non-universal Charter requirements this Task directly owns, or use [] when it owns none. Copy each ID verbatim from selectable_review_requirements in the project.charter read rather than constructing it. depends_on_task_ids expresses prerequisite DAG edges only: it does not create a parent/child hierarchy or workspace sharing. Project-wide completion is evaluated at milestone readiness.",
         ),
         TASK_RECOVER_OPERATION => described_object_schema(
             json!({
@@ -584,7 +584,7 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
                 }),
                 &["title"],
             );
-            let split = object_schema(
+            let split = described_object_schema(
                 json!({
                     "action":{"const":"split"},
                     "source_task_id":{"type":"string","minLength":1},
@@ -601,8 +601,9 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
                     "rationale",
                     "items",
                 ],
+                "task.adaptive split creates ordered direct children under a non-executing coordination root. Children share the root workspace but keep independent agents, executions, and lifecycles and execute serially in the declared order.",
             );
-            let sequence = object_schema(
+            let sequence = described_object_schema(
                 json!({
                     "action":{"const":"sequence"},
                     "source_task_id":{"type":"string","minLength":1},
@@ -619,6 +620,7 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
                     "rationale",
                     "ordered_task_ids",
                 ],
+                "task.adaptive sequence manages the order of existing direct children under the coordination root; it manages child order only and does not create a dependency graph.",
             );
             let replace = object_schema(
                 json!({
@@ -655,7 +657,7 @@ pub(crate) fn orchestration_payload_schema(operation: &str) -> Value {
                 },
                 "oneOf":[split,sequence,replace],
                 "additionalProperties":false,
-                "description":"Bounded Project Task adaptive command. Forge derives Project, actor, permission, governance, and fixed execution boundaries from the authenticated binding and active baseline; those values cannot be supplied in the payload."
+                "description":"Bounded Project Task adaptive command. split creates ordered direct children under a non-executing coordination root; children share the root workspace but keep independent agents, executions, and lifecycles and execute serially in the declared order. sequence manages that child order only; it does not create a dependency graph. Forge derives Project, actor, permission, governance, and fixed execution boundaries from the authenticated binding and active baseline; those values cannot be supplied in the payload."
             })
         }
         _ => object_schema(json!({}), &[]),
@@ -865,8 +867,9 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
             "\"repository_read\", \"repository_write\", \"read_only\", \"discovery_read\", ",
             "\"planning_read\" — and, when the baseline declares allowed classes, also one of ",
             "those); risk_class (only when the baseline declares allowed classes). ",
-            "depends_on_task_ids (optional accepted Task ids in this Project; each prerequisite ",
-            "must reach done before this Task can dispatch). ",
+            "depends_on_task_ids (optional accepted Task ids in this Project; these are ",
+            "prerequisite DAG edges only, not a parent/child hierarchy or workspace sharing; ",
+            "each prerequisite must reach done before this Task can dispatch). ",
             "Forge binds implementation authority to the Project's current approved Charter. ",
             "Baseline references are optional traceability; never echo baseline ids or digests.",
         ));
@@ -877,7 +880,10 @@ pub(crate) fn coordination_payload_guidance(operations: &BTreeSet<String>) -> St
             "Fields: action (required: \"split\", \"sequence\", or \"replace\"); ",
             "source_task_id, expected_task_version, expected_board_revision, and rationale ",
             "(all required); split requires non-empty items of {title, description?, assignee_id?}; ",
-            "sequence requires non-empty ordered_task_ids; replace requires title and optional description. ",
+            "split creates ordered direct children under a non-executing coordination root; children ",
+            "share the root workspace but keep independent agents, executions, and lifecycles ",
+            "and execute serially in the declared order. sequence manages that child order only and ",
+            "does not create a dependency graph. replace requires title and optional description. ",
             "Project, scope, actor, permission, governance, and fixed-boundary values are server-derived ",
             "and unknown fields are rejected."
         ));
@@ -990,7 +996,7 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
         "depends_on_task_ids": {
             "type": ["array", "null"],
             "items": {"type": "string", "minLength": 1},
-            "description": "task.propose: optional accepted Task ids in this Project; every prerequisite must reach done before dispatch. Use this for implementation-before-verification ordering instead of narration."
+            "description": "task.propose: optional accepted Task ids in this Project; these are prerequisite DAG edges only, not a parent/child hierarchy or workspace sharing. Every prerequisite must reach done before dispatch. Use this for implementation-before-verification ordering instead of narration."
         }
     });
     if operations.contains(TASK_ADAPTIVE_OPERATION) || operations.contains(TASK_CANCEL_OPERATION) {
@@ -1014,12 +1020,12 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
         });
         properties["items"] = json!({
             "type": ["array", "null"],
-            "description": "task.adaptive split: non-empty child list; each child has title and optional description/assignee_id.",
+            "description": "task.adaptive split: non-empty ordered direct-child list; creates children under a non-executing coordination root. Children share the root workspace but keep independent agents, executions, and lifecycles and execute serially in the declared order.",
             "items": orchestration_payload_schema(TASK_ADAPTIVE_OPERATION)["properties"]["items"]["items"].clone()
         });
         properties["ordered_task_ids"] = json!({
             "type": ["array", "null"],
-            "description": "task.adaptive sequence: non-empty ordered Task ids.",
+            "description": "task.adaptive sequence: non-empty ordered direct-child Task ids; manages child order only and does not create a dependency graph.",
             "items": {"type":"string","minLength":1}
         });
     }
@@ -1395,6 +1401,30 @@ mod tests {
             schema["properties"]["review_requirement_ids"]["type"],
             "array"
         );
+        let prerequisite_description = schema["properties"]["depends_on_task_ids"]["description"]
+            .as_str()
+            .expect("prerequisite guidance");
+        for phrase in [
+            "prerequisite DAG edges only",
+            "parent/child hierarchy",
+            "workspace sharing",
+        ] {
+            assert!(
+                prerequisite_description.contains(phrase),
+                "task.propose prerequisite guidance must distinguish {phrase}: {prerequisite_description}"
+            );
+        }
+        let operations = BTreeSet::from([TASK_PROPOSE_OPERATION.to_owned()]);
+        let guidance = coordination_payload_guidance(&operations);
+        assert!(guidance.contains("prerequisite DAG edges only"));
+        assert!(guidance.contains("not a parent/child hierarchy or workspace sharing"));
+        let properties = coordination_payload_properties(&operations).expect("flat properties");
+        assert!(
+            properties["depends_on_task_ids"]["description"]
+                .as_str()
+                .expect("flat prerequisite guidance")
+                .contains("prerequisite DAG edges only")
+        );
     }
 
     #[test]
@@ -1465,6 +1495,31 @@ mod tests {
         for variant in variants {
             assert_eq!(variant["additionalProperties"], false);
         }
+        let adaptive_description = schema["description"].as_str().expect("adaptive guidance");
+        for phrase in [
+            "non-executing coordination root",
+            "share the root workspace",
+            "independent agents, executions, and lifecycles",
+            "execute serially",
+            "does not create a dependency graph",
+        ] {
+            assert!(
+                adaptive_description.contains(phrase),
+                "adaptive guidance must distinguish {phrase}: {adaptive_description}"
+            );
+        }
+        assert!(
+            variants[0]["description"]
+                .as_str()
+                .expect("split variant guidance")
+                .contains("ordered direct children")
+        );
+        assert!(
+            variants[1]["description"]
+                .as_str()
+                .expect("sequence variant guidance")
+                .contains("does not create a dependency graph")
+        );
         let properties = schema["properties"].as_object().expect("properties");
         for forbidden in [
             "project_id",
@@ -1485,10 +1540,34 @@ mod tests {
         let guidance = coordination_payload_guidance(&operations);
         assert!(guidance.contains("task.adaptive"));
         assert!(guidance.contains("split"));
+        for phrase in [
+            "non-executing coordination root",
+            "share the root workspace",
+            "independent agents, executions, and lifecycles",
+            "execute serially",
+            "does not create a dependency graph",
+        ] {
+            assert!(
+                guidance.contains(phrase),
+                "coordination guidance must distinguish {phrase}: {guidance}"
+            );
+        }
         let properties = coordination_payload_properties(&operations).expect("flat properties");
         assert!(properties.get("action").is_some());
         assert!(properties.get("source_task_id").is_some());
         assert!(properties.get("ordered_task_ids").is_some());
+        assert!(
+            properties["items"]["description"]
+                .as_str()
+                .expect("split property guidance")
+                .contains("non-executing coordination root")
+        );
+        assert!(
+            properties["ordered_task_ids"]["description"]
+                .as_str()
+                .expect("sequence property guidance")
+                .contains("does not create a dependency graph")
+        );
     }
 
     #[test]

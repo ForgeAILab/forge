@@ -623,6 +623,119 @@ impl SqliteDb {
         if input.status == ExecutionStatus::Running && input.workspace_id.is_some() {
             Self::ensure_execution_admission_in_tx(transaction, &input.task_id).await?;
         }
+        if input.status == ExecutionStatus::Running {
+            // Child admission is rechecked under the same writer lock as the
+            // execution insert. A root cancellation/review transition that
+            // wins the race therefore prevents a stale child launcher from
+            // minting a Running execution after the coordination boundary.
+            let parent_row = sqlx::query(
+                "SELECT parent.status,
+                        parent.blocked_json,
+                        parent.failed_json,
+                        parent.error_annotation,
+                        parent.entry_barrier_json,
+                        project.workflow_definition
+                 FROM task AS child
+                 JOIN task AS parent ON parent.id = child.parent_task_id
+                 JOIN project ON project.id = parent.project_id
+                 WHERE child.id = ?
+                   AND child.deleted_at IS NULL
+                   AND parent.deleted_at IS NULL",
+            )
+            .bind(&input.task_id)
+            .fetch_optional(&mut **transaction)
+            .await?;
+            if let Some(parent_row) = parent_row {
+                let parent_status: String = parent_row.try_get("status")?;
+                let workflow_definition: String = parent_row.try_get("workflow_definition")?;
+                let parsed_workflow =
+                    serde_json::from_str::<api_types::WorkflowDefinition>(&workflow_definition)
+                        .ok();
+                let parent_state_blocks_execution = parsed_workflow
+                    .as_ref()
+                    .and_then(|workflow| {
+                        workflow
+                            .states
+                            .iter()
+                            .find(|state| state.name == parent_status)
+                    })
+                    .is_some_and(|state| {
+                        matches!(
+                            state.kind,
+                            api_types::StateKind::Backlog | api_types::StateKind::Terminal
+                        ) || state.canonical_phase == Some(api_types::CanonicalPhase::Review)
+                    })
+                    || parsed_workflow
+                        .as_ref()
+                        .and_then(|workflow| workflow.cancellation_state.as_deref())
+                        == Some(parent_status.as_str())
+                    || matches!(
+                        parent_status.as_str(),
+                        "backlog" | "review" | "merging" | "merge_failed" | "done" | "cancelled"
+                    );
+                let parent_has_blocker = parent_row
+                    .try_get::<Option<String>, _>("blocked_json")?
+                    .is_some()
+                    || parent_row
+                        .try_get::<Option<String>, _>("failed_json")?
+                        .is_some()
+                    || parent_row
+                        .try_get::<Option<String>, _>("error_annotation")?
+                        .is_some()
+                    || parent_row
+                        .try_get::<Option<String>, _>("entry_barrier_json")?
+                        .is_some();
+                if parent_state_blocks_execution || parent_has_blocker {
+                    return Err(DbError::InvalidTransition);
+                }
+            }
+
+            // `executor` is the historical transport alias for the canonical
+            // implementation role. Re-execution/recovery may still carry the
+            // alias, but it must observe the same assignment CAS as `coder`.
+            let assignment_role = if input.role == "executor" {
+                "coder"
+            } else {
+                input.role.as_str()
+            };
+            let role_assignment = sqlx::query(
+                "SELECT assignee_type, assignee_id
+                 FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
+            )
+            .bind(&input.task_id)
+            .bind(assignment_role)
+            .fetch_optional(&mut **transaction)
+            .await?;
+            if let Some(role_assignment) = role_assignment {
+                let assignee_type: Option<String> = role_assignment.try_get("assignee_type")?;
+                let assignee_id: Option<String> = role_assignment.try_get("assignee_id")?;
+                let matches_agent = assignee_type.as_deref() == Some("agent")
+                    && assignee_id.as_deref() == input.agent_id.as_deref();
+                let matches_user =
+                    assignee_type.as_deref() == Some("user") && input.agent_id.is_none();
+                if !matches_agent && !matches_user {
+                    return Err(DbError::Check(format!(
+                        "running execution principal does not match role assignment for {}",
+                        assignment_role
+                    )));
+                }
+            }
+            if let Some(workspace_id) = input.workspace_id.as_deref() {
+                let running_execution_id = sqlx::query_scalar::<_, String>(
+                    "SELECT id FROM execution
+                     WHERE workspace_id = ? AND status = 'running'
+                     ORDER BY created_at DESC, id DESC LIMIT 1",
+                )
+                .bind(workspace_id)
+                .fetch_optional(&mut **transaction)
+                .await?;
+                if let Some(running_execution_id) = running_execution_id {
+                    return Err(DbError::Check(format!(
+                        "workspace already has a running execution: {running_execution_id}"
+                    )));
+                }
+            }
+        }
         let stop_reason = input.stop_reason.as_ref().map(ToString::to_string);
         let resume_policy = input.resume_policy.as_ref().map(ToString::to_string);
         let prompt = input.summary.as_deref();

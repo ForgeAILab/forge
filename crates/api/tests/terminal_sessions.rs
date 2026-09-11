@@ -183,19 +183,6 @@ async fn seed_task(harness: &Harness) -> SeededTask {
     )
     .await
     .unwrap();
-    db::ProjectMemberRepo::add_member(
-        &*harness.state.db,
-        db::CreateProjectMember {
-            id: new_uuid_v4(),
-            project_id: project_id.clone(),
-            user_id: TEST_USER_ID.to_owned(),
-            role: "owner".to_owned(),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await
-    .unwrap();
     db::RepoRepo::create(
         &*harness.state.db,
         db::CreateRepo {

@@ -88,22 +88,13 @@ pub(super) async fn task_execution_is_read_only(
 }
 
 pub(super) async fn latest_executor_execution(ctx: &HookContext) -> Option<Execution> {
-    let page = ExecutionRepo::list_by_task(
-        &*ctx.db,
-        &ctx.task_id,
-        PageRequest {
-            cursor: None,
-            limit: 20,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Desc,
-        },
-    )
-    .await
-    .ok()?;
-    page.items
-        .into_iter()
-        .find(|execution| matches!(execution.role.as_str(), "executor" | "coder" | "worker"))
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .ok()??;
+    crate::task_service::latest_executor_execution_for_task(&*ctx.db, &task)
+        .await
+        .ok()
+        .flatten()
 }
 
 pub(super) async fn workspace_id(ctx: &HookContext) -> Option<String> {
@@ -122,12 +113,28 @@ pub(super) async fn workspace_id(ctx: &HookContext) -> Option<String> {
         .map(|workspace| workspace.id)
 }
 
-pub(super) async fn transition_subtask_with_inherited_workflow(
+pub(super) async fn cancel_subtask_with_effective_workflow(
     ctx: &HookContext,
     subtask: db::Task,
-    target_state: &str,
 ) -> Result<(), String> {
-    let workflow = inherited_subtask_workflow();
+    let inherited = inherited_subtask_workflow();
+    let workflow = if inherited
+        .states
+        .iter()
+        .any(|state| state.name == subtask.status)
+    {
+        inherited
+    } else {
+        ctx.workflow.as_ref().clone()
+    };
+    if workflow.state_kind(&subtask.status) == Some(api_types::StateKind::Terminal) {
+        return Ok(());
+    }
+    let target_state = workflow
+        .cancellation_state
+        .as_deref()
+        .unwrap_or(default_states::CANCELLED)
+        .to_owned();
     let engine = WorkflowEngine {
         db: Arc::clone(&ctx.db),
         event_bus: Arc::clone(&ctx.event_bus),
@@ -141,29 +148,11 @@ pub(super) async fn transition_subtask_with_inherited_workflow(
         workspace_root: ctx.workspace_root.clone(),
         repo_cache_locks: ctx.repo_cache_locks.clone(),
     };
-    let mut current = subtask;
-
-    if target_state == default_states::DONE && current.status == default_states::TODO {
-        current = engine
-            .transition(
-                &current.id,
-                default_states::IN_PROGRESS,
-                current.version,
-                &workflow,
-                &api_types::Actor::system(api_types::SystemComponent::Workflow),
-                "root done propagation",
-                false,
-            )
-            .await
-            .map_err(|error| error.to_string())?
-            .task;
-    }
-
     engine
         .transition(
-            &current.id,
-            target_state,
-            current.version,
+            &subtask.id,
+            &target_state,
+            subtask.version,
             &workflow,
             &api_types::Actor::system(api_types::SystemComponent::Workflow),
             "root subtask cascade",
@@ -521,18 +510,13 @@ pub(super) async fn ensure_review_awaiting_human(ctx: &HookContext) -> Result<()
             review
         }
         _ => {
-            let execution_id = match ctx.execution_id.clone() {
-                Some(execution_id) => execution_id,
-                None => match latest_executor_execution(ctx)
-                    .await
-                    .map(|execution| execution.id)
-                {
-                    Some(execution_id) => execution_id,
-                    None => {
-                        set_review_awaiting_human_metadata(ctx).await?;
-                        return Ok(());
-                    }
-                },
+            let execution_id = latest_executor_execution(ctx)
+                .await
+                .map(|execution| execution.id)
+                .or_else(|| ctx.execution_id.clone());
+            let Some(execution_id) = execution_id else {
+                set_review_awaiting_human_metadata(ctx).await?;
+                return Ok(());
             };
             create_review_attempt(ctx, &execution_id).await?
         }

@@ -7,6 +7,7 @@ use crate::{
     agent_service::{compute_effective_status, EffectiveStatus},
     deferred_dispatch,
     task_service::TransitionOptions,
+    workflow::engine::WorkflowEngine,
     Result, ServiceError,
 };
 
@@ -25,12 +26,21 @@ impl TaskDispatcher {
         project: &Project,
         workflow: &WorkflowDefinition,
     ) -> Result<u64> {
-        let initial_states: Vec<String> = workflow
+        let mut initial_states: Vec<String> = workflow
             .states
             .iter()
             .filter(|state| state.kind == StateKind::Initial)
             .map(|state| state.name.clone())
             .collect();
+        for state in WorkflowEngine::resolve_subtask_workflow()
+            .states
+            .iter()
+            .filter(|state| state.kind == StateKind::Initial)
+        {
+            if !initial_states.contains(&state.name) {
+                initial_states.push(state.name.clone());
+            }
+        }
         if initial_states.is_empty() {
             return Ok(0);
         }
@@ -49,6 +59,42 @@ impl TaskDispatcher {
             if self.is_stopped() {
                 break;
             }
+            if !crate::task_service::subtask_dispatch_ready(&self.db, &task).await? {
+                continue;
+            }
+            if crate::task_service::coordination_root_has_subtasks(&self.db, &task).await? {
+                // The Project Agent coordinates this root through its child
+                // records. Only children receive implementation dispatches.
+                let sequence_complete = crate::task_service::coordination_root_sequence_complete(
+                    &self.db, &task, workflow,
+                )
+                .await?;
+                let needs_recovery_advance = sequence_complete
+                    && workflow.canonical_phase_for_state(&task.status)
+                        != api_types::CanonicalPhase::Review
+                    && workflow.state_kind(&task.status) != Some(StateKind::Terminal);
+                if crate::task_service::coordination_review_pending(&task) || needs_recovery_advance
+                {
+                    match self.task_service.advance_coordination_root(&task.id).await {
+                        Ok(()) => dispatched += 1,
+                        Err(ServiceError::Db(DbError::VersionConflict)) => {
+                            tracing::debug!(task_id = %task.id, "coordination-root review advance lost version race");
+                        }
+                        Err(error) => {
+                            tracing::warn!(task_id = %task.id, %error, "coordination-root aggregate review advance remains pending");
+                        }
+                    }
+                }
+                continue;
+            }
+            let task_workflow = WorkflowEngine::resolve_workflow_for_task(
+                &task,
+                &project.workflow_definition,
+                &Actor::system(SystemComponent::TaskDispatcher),
+            );
+            if task_workflow.state_kind(&task.status) != Some(StateKind::Initial) {
+                continue;
+            }
             // Creation gives a Task the Project's default assignees, so a Task
             // with no role assignment at all was proposed before those
             // defaults existed in Project settings (e.g. while the Project
@@ -64,7 +110,7 @@ impl TaskDispatcher {
                 }
             }
             let Some(target) = self
-                .resolve_initial_schedule_target(workflow, &task)
+                .resolve_initial_schedule_target(&task_workflow, &task)
                 .await?
             else {
                 continue;
@@ -126,7 +172,11 @@ impl TaskDispatcher {
         // claim/launch/lease issuance. It loads persisted capability/risk,
         // canonical setup projection, and the exact baseline rather than
         // reconstructing authority from Task kind or repository presence.
-        self.task_service.ensure_task_runnable(task).await?;
+        if target.role == crate::workflow::default_roles::REVIEWER {
+            self.task_service.ensure_task_reviewable(task).await?;
+        } else {
+            self.task_service.ensure_task_runnable(task).await?;
+        }
         if task.repo_id.is_none() {
             return Ok(false);
         }

@@ -85,6 +85,7 @@ pub trait AgentRepo: Send + Sync {
     ) -> Result<Agent>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Agent>>;
     async fn list(&self, query: AgentListQuery) -> Result<Page<Agent>>;
+    async fn list_visible(&self, user_id: &str, query: AgentListQuery) -> Result<Page<Agent>>;
     async fn update(&self, input: UpdateAgent) -> Result<Agent>;
     async fn set_paused(&self, id: &str, paused: bool) -> Result<()>;
     async fn duplicate_agent(
@@ -1721,6 +1722,13 @@ pub trait NotificationRepo: Send + Sync {
 #[async_trait]
 pub trait TaskDependencyRepo: Send + Sync {
     async fn add_dependency(&self, task_id: &str, depends_on_id: &str, now: &str) -> Result<()>;
+    async fn add_dependency_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        task_id: &str,
+        depends_on_id: &str,
+        now: &str,
+    ) -> Result<()>;
     async fn remove_dependency(&self, task_id: &str, depends_on_id: &str) -> Result<()>;
     async fn list_dependencies(&self, task_id: &str) -> Result<Vec<String>>;
     async fn list_dependents(&self, depends_on_id: &str) -> Result<Vec<String>>;

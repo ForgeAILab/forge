@@ -31,9 +31,9 @@ A stable `1.0` will land once the workflow engine consolidation, multi-user stor
 
 ```bash
 cargo build                          # Build entire workspace
-cargo test                           # Run all tests
-cargo test -p db                     # Run tests for a specific crate
-cargo test -p api --test happy_path  # End-to-end happy-path test
+cargo test                           # Full test suite (CI only)
+cargo test -p db <test-filter>       # Run focused tests for the changed behavior
+cargo test -p api --test happy_path <test-name>  # Run one relevant end-to-end case
 cargo run -p forge-client -- --help  # forge-ctl CLI client
 cargo build -p forge-client          # Build forge-ctl binary
 cargo clippy --workspace --all-targets -- -D warnings
@@ -41,7 +41,9 @@ cargo fmt --all
 FORGE_SKIP_WEB_BUILD=1 cargo check -p forge-cli  # Skip pnpm web build during Rust-only work
 ```
 
-The happy-path test (`crates/api/tests/happy_path.rs`) is the canonical end-to-end smoke and a forcing function for spec alignment — if you break it, you probably need to revisit the spec, not the test.
+During local agent work, run only the focused tests directly related to the files and behavior being changed. Do not run a full crate, workspace, or all-target test suite locally; full-suite coverage belongs in CI. Expand to an adjacent focused test only when the change's impact analysis identifies that path as affected.
+
+The happy-path test (`crates/api/tests/happy_path.rs`) is the canonical end-to-end smoke and a forcing function for spec alignment. Run only the relevant named case locally; CI runs the complete test target. If you break it, you probably need to revisit the spec, not the test.
 
 ### Running the server
 

@@ -194,6 +194,33 @@ pub struct RequirePlanChecklistComplete;
 #[async_trait]
 impl HookAction for RequirePlanChecklistComplete {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
+        let task = match db::TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false).await {
+            Ok(Some(task)) => task,
+            Ok(None) => {
+                return HookResult::Failed {
+                    reason: format!("task not found: {}", ctx.task_id),
+                };
+            }
+            Err(error) => {
+                return HookResult::Failed {
+                    reason: error.to_string(),
+                };
+            }
+        };
+        match crate::task_service::coordination_root_has_subtasks(&ctx.db, &task).await {
+            Ok(true) => {
+                return HookResult::Skipped {
+                    reason: "coordination root is governed by ordered subtask completion"
+                        .to_string(),
+                };
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return HookResult::Failed {
+                    reason: error.to_string(),
+                };
+            }
+        }
         let Some(workspace_id) = workspace_id(ctx).await else {
             return HookResult::Skipped {
                 reason: "no workspace".to_string(),

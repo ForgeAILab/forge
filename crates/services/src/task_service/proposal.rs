@@ -400,6 +400,16 @@ impl TaskService {
         } else {
             None
         };
+        if parent.as_ref().is_some_and(|parent| {
+            payload
+                .depends_on_task_ids
+                .iter()
+                .any(|depends_on_task_id| depends_on_task_id == &parent.id)
+        }) {
+            return Err(ServiceError::invalid_operation(
+                "task proposal parent_task_id creates a shared-workspace subtask relationship and cannot also be a prerequisite dependency",
+            ));
+        }
         let mut seen_dependency_ids = HashSet::new();
         for depends_on_task_id in &payload.depends_on_task_ids {
             if depends_on_task_id.trim().is_empty()

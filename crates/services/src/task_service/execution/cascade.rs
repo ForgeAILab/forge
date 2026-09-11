@@ -61,6 +61,27 @@ impl TaskService {
         else {
             return Ok(());
         };
+        if super::super::subtask::coordination_root_has_subtasks(&self.db, &task).await? {
+            // A coordination root never resumes or advances from a legacy
+            // implementation execution. Its children own implementation;
+            // recover by waking the first incomplete child, or advance the
+            // root only after the entire ordered sequence has settled.
+            self.clear_workflow_guard_retry_metadata(&task.id).await?;
+            if super::super::subtask::coordination_root_sequence_complete(
+                &self.db, &task, &workflow,
+            )
+            .await?
+            {
+                self.advance_coordination_root(&task.id).await?;
+            } else {
+                self.wake_next_ordered_subtask(
+                    &task.id,
+                    "coordination root is waiting for its next ordered subtask",
+                )
+                .await?;
+            }
+            return Ok(());
+        }
         if let Some(summary) = execution.summary.as_deref().map(str::trim) {
             if !summary.is_empty() {
                 let content = format!("Agent completed execution: {summary}");
@@ -91,7 +112,7 @@ impl TaskService {
                     entity_id: task.id.clone(),
                     timestamp: event_timestamp(),
                     context: EventContext::TaskAutoTransitioned {
-                        task_id: task.id,
+                        task_id: task.id.clone(),
                         from,
                         to: target,
                         reason: "executor_completed".to_owned(),
@@ -128,29 +149,16 @@ impl TaskService {
         guard: &str,
         reason: &str,
     ) -> Result<()> {
-        if guard == "subtask_sequence_complete" && task.parent_task_id.is_none() {
-            if let Some(next_turn) = self.subtasks_handoff(task).await? {
-                match next_turn {
-                    super::subtasks::NextTurn::Prompt { user_prompt } => {
-                        if execution.agent_session_id.is_none() {
-                            tracing::warn!(
-                                task_id = %task.id,
-                                execution_id = %execution.id,
-                                "subtask handoff cannot resume: missing agent_session_id; blocking task"
-                            );
-                            return self
-                                .annotate_workflow_guard_block(execution, task, guard, reason)
-                                .await;
-                        }
-                        self.resume_execution_for_workflow_guard(execution, task, user_prompt)
-                            .await?;
-                    }
-                    super::subtasks::NextTurn::AllDone => {
-                        self.retry_parent_cascade_after_last_subtask(task).await?;
-                    }
-                }
-                return Ok(());
-            }
+        if guard == "subtask_sequence_complete"
+            && super::super::subtask::coordination_root_has_subtasks(&self.db, task).await?
+        {
+            self.clear_workflow_guard_retry_metadata(&task.id).await?;
+            self.wake_next_ordered_subtask(
+                &task.id,
+                "coordination root is waiting for its next ordered subtask",
+            )
+            .await?;
+            return Ok(());
         }
 
         let budget = crate::task_service::config::runtime_retry_budget(
@@ -290,98 +298,6 @@ impl TaskService {
 
             Ok(resumed)
         })
-    }
-
-    async fn subtasks_handoff(&self, task: &Task) -> Result<Option<super::subtasks::NextTurn>> {
-        let subtasks = db::TaskRepo::list_subtasks_ordered(&*self.db, &task.id).await?;
-        if subtasks.is_empty() {
-            return Ok(None);
-        }
-
-        match super::subtasks::finish_current_turn_and_begin_next(
-            &self.db,
-            &self.event_bus,
-            &self.workspace_root,
-            &task.id,
-        )
-        .await
-        {
-            Ok(next_turn) => Ok(Some(next_turn)),
-            Err(error) => {
-                tracing::error!(
-                    task_id = %task.id,
-                    %error,
-                    "subtask handoff failed, falling back to generic handling"
-                );
-                Ok(None)
-            }
-        }
-    }
-
-    async fn retry_parent_cascade_after_last_subtask(&self, task: &Task) -> Result<()> {
-        let task = TaskRepo::get_by_id(&*self.db, &task.id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            &task,
-            &project.workflow_definition,
-            &api_types::Actor::system(api_types::SystemComponent::Workflow),
-        );
-        let Some(target) = workflow
-            .auto_transition_target(&task.status)
-            .map(str::to_owned)
-        else {
-            return Ok(());
-        };
-
-        let from = task.status.clone();
-        match self
-            .transition(
-                task.id.clone(),
-                target.clone(),
-                TransitionOptions {
-                    version: task.version,
-                    reason: Some("all subtasks completed".to_owned()),
-                    triggered_by: api_types::Actor::system(api_types::SystemComponent::Workflow),
-                    rejection: false,
-                    defer_dispatch_seconds: None,
-                },
-            )
-            .await
-        {
-            Ok(_) => {
-                if let Err(error) = self.clear_workflow_guard_retry_metadata(&task.id).await {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        %error,
-                        "failed to clear workflow guard retry metadata"
-                    );
-                }
-                self.publish(ForgeEvent {
-                    event_type: "task.auto_transitioned".to_owned(),
-                    entity_id: task.id.clone(),
-                    timestamp: event_timestamp(),
-                    context: EventContext::TaskAutoTransitioned {
-                        task_id: task.id,
-                        from,
-                        to: target,
-                        reason: "all_subtasks_completed".to_owned(),
-                    },
-                });
-                Ok(())
-            }
-            Err(ServiceError::Db(DbError::VersionConflict)) => {
-                tracing::warn!(
-                    task_id = %task.id,
-                    "last subtask cascade version conflict"
-                );
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
     }
 
     async fn annotate_workflow_guard_block(
@@ -699,50 +615,6 @@ impl TaskService {
                 .await?
         {
             return Ok(());
-        }
-
-        // Even on executor failure the agent may have committed real work for the
-        // current subtask before its process died. Credit that commit so the
-        // subtask isn't stuck `in_progress` and the parent doesn't miss progress.
-        if task.parent_task_id.is_none() {
-            match super::subtasks::credit_in_progress_subtask_commit(
-                &self.db,
-                &self.event_bus,
-                &self.workspace_root,
-                &task.id,
-            )
-            .await
-            {
-                Ok(super::subtasks::CreditResult::Committed { all_done: true }) => {
-                    tracing::info!(
-                        task_id = %task.id,
-                        execution_id = %execution.id,
-                        "executor failed but final subtask was committed; cascading parent to next state"
-                    );
-                    let task = TaskRepo::get_by_id(&*self.db, &task.id, false)
-                        .await?
-                        .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
-                    return self.retry_parent_cascade_after_last_subtask(&task).await;
-                }
-                Ok(super::subtasks::CreditResult::Committed { all_done: false }) => {
-                    tracing::info!(
-                        task_id = %task.id,
-                        execution_id = %execution.id,
-                        "executor failed but a subtask was committed; crediting and falling through to block"
-                    );
-                    // Fall through to the original block-annotation path. The
-                    // user can resume to dispatch the next subtask.
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        execution_id = %execution.id,
-                        %error,
-                        "failed to credit in-progress subtask commit on executor failure"
-                    );
-                }
-            }
         }
 
         self.block_task_after_executor_failure(&task, execution)

@@ -102,6 +102,115 @@ async fn file_backed_migrations_apply_cleanly() {
 }
 
 #[tokio::test]
+async fn project_owner_membership_backfill_preserves_existing_memberships() {
+    let migration_dir = unique_temp_path("project-owner-membership-migrations");
+    fs::create_dir_all(&migration_dir).expect("temp migration dir creates");
+    copy_migrations_up_to(135, &migration_dir);
+
+    let db_path = unique_temp_path("project-owner-membership-db").with_extension("db");
+    let url = format!("sqlite://{}", db_path.display());
+    let pool = create_sqlite_pool(&url).await.expect("pool");
+    run_migrations_from(&pool, &migration_dir)
+        .await
+        .expect("pre-V136 migrations apply");
+
+    let now = "2026-09-10T00:00:00Z";
+    sqlx::query(
+        "INSERT INTO user (id, email, password_hash, display_name, created_at, updated_at)
+         VALUES ('owner-v136', 'owner-v136@example.test', 'not-a-password', 'V136 owner', ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("owner inserts");
+
+    for (project_id, owner_id) in [
+        ("v136-owned", Some("owner-v136")),
+        ("v136-existing-member", Some("owner-v136")),
+        ("v136-ownerless", None),
+        ("v136-dangling-owner", Some("missing-v136-owner")),
+    ] {
+        sqlx::query(
+            "INSERT INTO project (
+                id, name, settings, workflow_definition, owner_id, created_at, updated_at
+             ) VALUES (?, ?, '{}', '{}', ?, ?, ?)",
+        )
+        .bind(project_id)
+        .bind(project_id)
+        .bind(owner_id)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("project inserts");
+    }
+
+    sqlx::query(
+        "INSERT INTO project_member (
+            id, project_id, user_id, role, created_at, updated_at
+         ) VALUES ('v136-existing-member-row', 'v136-existing-member', 'owner-v136', 'member', ?, ?)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("existing membership inserts");
+
+    run_migrations(&pool).await.expect("V136 applies");
+
+    let owner_membership: (String, String) = sqlx::query_as(
+        "SELECT user_id, role FROM project_member
+         WHERE project_id = 'v136-owned'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("owner membership loads");
+    assert_eq!(
+        owner_membership,
+        ("owner-v136".to_owned(), "owner".to_owned())
+    );
+
+    let existing_membership: (String, String) = sqlx::query_as(
+        "SELECT user_id, role FROM project_member
+         WHERE project_id = 'v136-existing-member'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("existing membership loads");
+    assert_eq!(
+        existing_membership,
+        ("owner-v136".to_owned(), "member".to_owned())
+    );
+
+    let untouched: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM project_member
+         WHERE project_id IN ('v136-ownerless', 'v136-dangling-owner')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("untouched membership count loads");
+    assert_eq!(untouched, 0);
+
+    // The migration is replay-safe and does not add a second owner row.
+    run_migrations(&pool)
+        .await
+        .expect("V136 replay is idempotent");
+    let owner_membership_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM project_member
+         WHERE project_id = 'v136-owned' AND user_id = 'owner-v136'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("owner membership count loads");
+    assert_eq!(owner_membership_count, 1);
+
+    pool.close().await;
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(migration_dir);
+}
+
+#[tokio::test]
 async fn delivery_followup_backfill_replays_latest_unreconciled_done_task_after_cursor() {
     let migration_dir = unique_temp_path("delivery-followup-migrations");
     fs::create_dir_all(&migration_dir).expect("temp migration dir creates");

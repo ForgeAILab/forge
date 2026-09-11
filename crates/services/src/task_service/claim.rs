@@ -17,19 +17,15 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        if task.parent_task_id.is_some() {
-            return Err(ServiceError::subtask_managed_by_root(
-                task_id.clone(),
-                task.parent_task_id.clone().unwrap_or_default(),
+        if super::subtask::coordination_root_has_subtasks(&self.db, &task).await? {
+            return Err(ServiceError::invalid_operation(
+                "root tasks with subtasks are coordination containers; assign and run their subtasks",
             ));
         }
+        super::subtask::ensure_subtask_dispatch_order(&self.db, &task).await?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        // Do this before workspace preparation so a blocked Charter-backed
-        // implementation Task can never receive a workspace/lease as a side
-        // effect of an attempted claim.
-        self.ensure_task_runnable(&task).await?;
         if matches!(&assignee, Assignee::Agent(_)) && project.paused_at.is_some() {
             return Err(ServiceError::ProjectPaused {
                 project_id: project.id,
@@ -48,6 +44,14 @@ impl TaskService {
             .find(|state| state.name == target_status)
             .and_then(crate::workflow::effective_role)
             .map(str::to_owned);
+        // Do this before workspace preparation so a blocked Charter-backed
+        // Task can never receive a workspace/lease as a side effect of an
+        // attempted claim. Independent reviewer work uses its read-only gate.
+        if target_role.as_deref() == Some(crate::workflow::default_roles::REVIEWER) {
+            self.ensure_task_reviewable(&task).await?;
+        } else {
+            self.ensure_task_runnable(&task).await?;
+        }
         let capacity_statuses = workflow_capacity_statuses(&workflow);
         let (assignee_type, agent, assignee_id, max_concurrent_tasks, event_assignee_id) =
             match assignee {
@@ -341,22 +345,6 @@ impl TaskService {
         });
 
         if agent_id.is_some() {
-            if claimed.task.parent_task_id.is_none() {
-                if let Err(error) = super::execution::subtasks::begin_next_turn(
-                    &self.db,
-                    &self.event_bus,
-                    &self.workspace_root,
-                    &claimed.task.id,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        task_id = %claimed.task.id,
-                        %error,
-                        "failed to begin subtask sequence, dispatching normally"
-                    );
-                }
-            }
             self.dispatch_claim_state_role_agent(
                 &claimed.task,
                 &previous_status,

@@ -1,5 +1,4 @@
 import type { QueryClient } from '@tanstack/react-query'
-import { ApiError } from '@/api/client'
 import { qk } from '@/api/query-keys'
 import { getApiErrorMessage } from '@/lib/api-error'
 import type {
@@ -84,29 +83,6 @@ export function getErrorInfo(
 }
 
 export function getTaskDetailApiErrorMessage(error: unknown, fallback = 'Request failed'): string {
-  if (error instanceof ApiError) {
-    let code: unknown
-    let requestId = error.requestId
-    try {
-      const parsed = JSON.parse(error.message) as {
-        code?: unknown
-        request_id?: unknown
-      }
-      code = parsed.code
-      if (typeof parsed.request_id === 'string' && parsed.request_id) {
-        requestId = parsed.request_id
-      }
-    } catch {
-      return getApiErrorMessage(error, fallback)
-    }
-    const message =
-      code === 'SUBTASK_MANAGED_BY_ROOT'
-        ? 'This subtask is managed by its root task.'
-        : code === 'SUBTASK_ORDERED_TURN_ROOT_OWNED'
-          ? 'Ordered-turn subtask coder is inherited from the root task.'
-          : undefined
-    if (message) return `${message}${requestId ? ` Request ID: ${requestId}` : ''}`
-  }
   return getApiErrorMessage(error, fallback)
 }
 

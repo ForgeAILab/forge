@@ -55,12 +55,32 @@ impl HookAction for DispatchRoleAgent {
                 reason: "task is blocked".to_string(),
             };
         }
-        // Note: we used to skip dispatch here for parents-with-subtasks because a
-        // separate SubtaskOrchestrator drove the agent. After collapsing to the
-        // cascade-handoff model, the parent's coder dispatch is the one that runs
-        // each turn (including the review_fix bounce when CI fails). Skipping here
-        // would leave the parent stranded in `in_progress` after a review failure
-        // — see `finish_current_turn_and_begin_next` for the per-turn handoff.
+        match crate::task_service::coordination_root_has_subtasks(&ctx.db, &current_task).await {
+            Ok(true) if role_name != crate::workflow::default_roles::REVIEWER => {
+                return HookResult::Skipped {
+                    reason: "root task is a subtask coordination container".to_string(),
+                };
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return HookResult::Failed {
+                    reason: error.to_string(),
+                };
+            }
+        }
+        match crate::task_service::subtask_dispatch_ready(&ctx.db, &current_task).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return HookResult::Skipped {
+                    reason: "subtask is waiting for an earlier ordered sibling".to_string(),
+                };
+            }
+            Err(error) => {
+                return HookResult::Failed {
+                    reason: error.to_string(),
+                };
+            }
+        }
 
         let assignment = match get_role_assignment(ctx, role_name).await {
             Ok(assignment) => assignment,

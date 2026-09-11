@@ -320,7 +320,7 @@ async function createViteReactFixture(): Promise<string> {
 }
 
 test.describe('subtask flow (integration)', () => {
-  test('creates a parent task with ordered-turn subtasks, runs them sequentially, reviews, and merges', async ({
+  test('creates a coordination root with independently executed ordered subtasks, reviews, and merges', async ({
     page,
     request,
   }) => {
@@ -337,10 +337,11 @@ test.describe('subtask flow (integration)', () => {
       )
 
       const project = await api<ProjectResponse>(request, 'POST', '/api/v1/projects', {
-        name: `Subtask Ordered Turn ${runId}`,
+        name: `Ordered Subtasks ${runId}`,
         settings: { lifecycle_hooks: fixtureLifecycleHooks },
         default_review_config: fixtureReviewConfig,
       })
+      await api<ProjectResponse>(request, 'POST', `/api/v1/projects/${project.id}/pause`)
       await api<unknown>(request, 'PUT', `/api/v1/projects/${project.id}/workflow`, {
         template_name: 'no-user-approval',
       })
@@ -396,7 +397,7 @@ test.describe('subtask flow (integration)', () => {
         {
           title: `Parent task with ordered subtasks ${runId}`,
           description:
-            'This is a parent task. The actual work is done by ordered-turn subtasks below. Do not edit any files directly in this task.',
+            'This root coordinates the ordered subtasks below. Implementation runs only on the child tasks.',
           task_type: 'task',
           priority: 0,
         },
@@ -449,11 +450,13 @@ test.describe('subtask flow (integration)', () => {
       // --- Verify subtask ordering ---
       expect(subtask1.subtask_order).toBeLessThan(subtask2.subtask_order!)
 
-      // --- Wait for parent to move to in_progress (claimed by daemon) ---
+      await api<ProjectResponse>(request, 'POST', `/api/v1/projects/${project.id}/resume`)
+
+      // --- The first child, not the coordination root, starts implementation ---
       await waitForTaskStatus(
         request,
-        parentTask.id,
-        ['in_progress', 'review', 'merging', 'done'],
+        subtask1.id,
+        ['in_progress', 'done'],
         120000,
       )
 
@@ -473,15 +476,14 @@ test.describe('subtask flow (integration)', () => {
       expect(doneSubtask1.status).toBe('done')
       expect(doneSubtask2.status).toBe('done')
 
-      // --- Verify ordered subtasks ran as turns on the parent workspace ---
-      const coderExecution = await waitForCompletedExecution(
-        request,
-        parentTask.id,
-        'coder',
-        coder.id,
-        120000,
-      )
-      expect(coderExecution.workspace_id).toBe(parentWorkspace.id)
+      // --- Each child has its own execution while sharing the root workspace ---
+      const [subtask1Execution, subtask2Execution] = await Promise.all([
+        waitForCompletedExecution(request, subtask1.id, 'coder', coder.id, 120000),
+        waitForCompletedExecution(request, subtask2.id, 'coder', coder.id, 120000),
+      ])
+      expect(subtask1Execution.id).not.toBe(subtask2Execution.id)
+      expect(subtask1Execution.workspace_id).toBe(parentWorkspace.id)
+      expect(subtask2Execution.workspace_id).toBe(parentWorkspace.id)
 
       const [subtask1Transitions, subtask2Transitions] = await Promise.all([
         getTransitions(request, subtask1.id),
@@ -504,6 +506,9 @@ test.describe('subtask flow (integration)', () => {
         15 * 60 * 1000,
       )
       expect(reviewerExecution.workspace_id).toBe(parentWorkspace.id)
+
+      const rootExecutions = await getExecutions(request, parentTask.id)
+      expect(rootExecutions.some((execution) => execution.role === 'coder')).toBeFalsy()
 
       // --- Wait for parent to reach done ---
       const doneParent = await waitForTaskStatus(request, parentTask.id, ['done'], 5 * 60 * 1000)
