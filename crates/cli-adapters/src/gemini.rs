@@ -41,15 +41,19 @@ impl GeminiAdapter {
             "--output-format=json".to_owned(),
         ];
 
-        if config.yolo.unwrap_or(false) {
+        let policy_is_yolo = matches!(
+            config.permission_policy.as_ref(),
+            Some(PermissionPolicy::Yolo)
+        );
+        let unattended = policy_is_yolo
+            || config.yolo.unwrap_or(false)
+            || matches!(
+                config.permission_policy.as_ref(),
+                Some(PermissionPolicy::Auto)
+            );
+
+        if unattended {
             adapter_args.push("--yolo".to_owned());
-        } else if let Some(ref policy) = config.permission_policy {
-            match policy {
-                PermissionPolicy::Auto => {
-                    adapter_args.push("--yolo".to_owned());
-                }
-                PermissionPolicy::Supervised | PermissionPolicy::Plan => {}
-            }
         }
 
         if let Some(ref model) = config.model {
@@ -57,7 +61,7 @@ impl GeminiAdapter {
             adapter_args.push(model.clone());
         }
 
-        if let Some(ref sandbox) = config.sandbox {
+        if !policy_is_yolo && let Some(ref sandbox) = config.sandbox {
             adapter_args.push("--sandbox".to_owned());
             adapter_args.push(sandbox.clone());
         }
@@ -170,7 +174,7 @@ impl CodingExecutorAdapter for GeminiAdapter {
                 "gemini-2.5-flash".into(),
                 "gemini-2.5-flash-lite".into(),
             ],
-            permission_policies: vec!["auto".into(), "supervised".into()],
+            permission_policies: vec!["auto".into(), "supervised".into(), "yolo".into()],
             cli_specific: serde_json::json!({}),
         })
     }
@@ -599,10 +603,30 @@ mod tests {
     }
 
     #[test]
-    fn command_builder_maps_permission_policy_auto_to_yolo() {
+    fn command_builder_maps_unattended_policies_to_yolo() {
+        for policy in [PermissionPolicy::Yolo, PermissionPolicy::Auto] {
+            let config = GeminiConfig {
+                permission_policy: Some(policy),
+                command_overrides: CommandOverrides::default(),
+                ..GeminiConfig::default()
+            };
+
+            let cmd = GeminiAdapter::build_command(&config, "do the task");
+            let args: Vec<_> = cmd
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+
+            assert!(args.contains(&"--yolo".to_owned()));
+        }
+    }
+
+    #[test]
+    fn yolo_policy_ignores_legacy_sandbox_setting() {
         let config = GeminiConfig {
-            permission_policy: Some(PermissionPolicy::Auto),
-            command_overrides: CommandOverrides::default(),
+            permission_policy: Some(PermissionPolicy::Yolo),
+            sandbox: Some("docker".to_owned()),
             ..GeminiConfig::default()
         };
 
@@ -614,6 +638,7 @@ mod tests {
             .collect();
 
         assert!(args.contains(&"--yolo".to_owned()));
+        assert!(!args.contains(&"--sandbox".to_owned()));
     }
 
     #[test]

@@ -127,7 +127,12 @@ impl CodingExecutorAdapter for CursorAdapter {
     ) -> Result<DiscoveredOptions, ExecutorError> {
         Ok(DiscoveredOptions {
             models: vec![],
-            permission_policies: vec!["auto".into(), "supervised".into(), "plan".into()],
+            permission_policies: vec![
+                "auto".into(),
+                "supervised".into(),
+                "plan".into(),
+                "yolo".into(),
+            ],
             cli_specific: serde_json::json!({
                 "output_formats": ["text", "json", "stream-json"],
             }),
@@ -428,7 +433,10 @@ fn classify_cursor_event(event: &Value) -> LogKind {
 }
 
 fn should_force(config: &CursorConfig) -> bool {
-    config.force.unwrap_or({
+    matches!(
+        config.permission_policy.as_ref(),
+        Some(PermissionPolicy::Yolo)
+    ) || config.force.unwrap_or({
         !matches!(
             config.permission_policy.as_ref(),
             Some(PermissionPolicy::Plan)
@@ -670,6 +678,25 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
+        assert!(args.contains(&"--force".to_owned()));
+    }
+
+    #[test]
+    fn yolo_policy_enables_force() {
+        let config = CursorConfig {
+            permission_policy: Some(PermissionPolicy::Yolo),
+            force: Some(false),
+            command_overrides: CommandOverrides::default(),
+            ..CursorConfig::default()
+        };
+
+        let cmd = CursorAdapter::build_command(&config, "hello");
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
         assert!(args.contains(&"--force".to_owned()));
     }
 

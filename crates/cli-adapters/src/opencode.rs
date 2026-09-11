@@ -122,7 +122,7 @@ impl CodingExecutorAdapter for OpencodeAdapter {
     ) -> Result<DiscoveredOptions, ExecutorError> {
         Ok(DiscoveredOptions {
             models: vec![],
-            permission_policies: vec!["auto".into(), "supervised".into()],
+            permission_policies: vec!["auto".into(), "supervised".into(), "yolo".into()],
             cli_specific: serde_json::json!({}),
         })
     }
@@ -398,7 +398,7 @@ async fn stream_run_output(
 fn should_skip_permissions(config: &OpencodeConfig) -> bool {
     matches!(
         config.permission_policy.as_ref(),
-        Some(PermissionPolicy::Auto)
+        Some(PermissionPolicy::Yolo) | Some(PermissionPolicy::Auto)
     ) || config.auto_approve == Some(true)
 }
 
@@ -805,7 +805,7 @@ mod tests {
     fn command_builder_uses_run_cli_and_permission_env() {
         let config = OpencodeConfig {
             model: Some("anthropic/claude-sonnet-4-6".to_owned()),
-            permission_policy: Some(PermissionPolicy::Auto),
+            permission_policy: Some(PermissionPolicy::Yolo),
             command_overrides: CommandOverrides::default(),
             ..OpencodeConfig::default()
         };

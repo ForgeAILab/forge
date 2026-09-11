@@ -99,12 +99,14 @@ impl CodexAdapter {
 
     fn thread_start_params(config: &CodexConfig, worktree_path: &str) -> ThreadStartParams {
         let permission = config.permission_policy.clone().unwrap_or_default();
+        let is_yolo = matches!(permission, PermissionPolicy::Yolo);
         let fallback_sandbox = match permission {
+            PermissionPolicy::Yolo => SandboxMode::DangerFullAccess,
             PermissionPolicy::Auto | PermissionPolicy::Supervised => SandboxMode::WorkspaceWrite,
             PermissionPolicy::Plan => SandboxMode::ReadOnly,
         };
         let fallback_approval = match permission {
-            PermissionPolicy::Auto => AskForApproval::Never,
+            PermissionPolicy::Yolo | PermissionPolicy::Auto => AskForApproval::Never,
             PermissionPolicy::Supervised | PermissionPolicy::Plan => AskForApproval::OnRequest,
         };
 
@@ -132,14 +134,16 @@ impl CodexAdapter {
             model: config.model.clone(),
             model_provider: None,
             cwd: Some(worktree_path.to_owned()),
-            approval_policy: Some(AskForApproval::from_config(
-                config.ask_for_approval.as_deref(),
-                fallback_approval,
-            )),
-            sandbox: Some(SandboxMode::from_config(
-                config.sandbox.as_deref(),
-                fallback_sandbox,
-            )),
+            approval_policy: Some(if is_yolo {
+                AskForApproval::Never
+            } else {
+                AskForApproval::from_config(config.ask_for_approval.as_deref(), fallback_approval)
+            }),
+            sandbox: Some(if is_yolo {
+                SandboxMode::DangerFullAccess
+            } else {
+                SandboxMode::from_config(config.sandbox.as_deref(), fallback_sandbox)
+            }),
             config: (!config_overrides.is_empty()).then_some(config_overrides),
             base_instructions: config
                 .base_instructions
@@ -261,7 +265,12 @@ impl CodingExecutorAdapter for CodexAdapter {
                 "gpt-5.4-mini".into(),
                 "gpt-5.3-codex-spark".into(),
             ],
-            permission_policies: vec!["auto".into(), "supervised".into(), "plan".into()],
+            permission_policies: vec![
+                "auto".into(),
+                "supervised".into(),
+                "plan".into(),
+                "yolo".into(),
+            ],
             cli_specific: json!({
                 "sandbox_modes": ["read-only", "workspace-write", "danger-full-access"],
                 "approval_modes": ["never", "on-request", "on-failure", "unless-trusted"],
@@ -868,6 +877,27 @@ mod tests {
                 .and_then(Value::as_str),
             Some("high")
         );
+    }
+
+    #[test]
+    fn thread_start_params_maps_yolo_to_full_access_without_approval() {
+        let config = CodexConfig {
+            permission_policy: Some(PermissionPolicy::Yolo),
+            sandbox: Some("read-only".to_owned()),
+            ask_for_approval: Some("on-request".to_owned()),
+            ..CodexConfig::default()
+        };
+
+        let params = CodexAdapter::thread_start_params(&config, "/tmp/worktree");
+
+        assert!(matches!(
+            params.sandbox,
+            Some(SandboxMode::DangerFullAccess)
+        ));
+        assert!(matches!(
+            params.approval_policy,
+            Some(AskForApproval::Never)
+        ));
     }
 
     #[test]

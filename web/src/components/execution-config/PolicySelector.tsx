@@ -1,4 +1,4 @@
-import { FastForward, HandPalm, ListChecks } from '@phosphor-icons/react'
+import { FastForward, HandPalm, ListChecks, Warning } from '@phosphor-icons/react'
 import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
 import { cn } from '@/lib/cn'
@@ -22,6 +22,12 @@ const policyOptions = [
     description: 'Plan first, then wait for approval.',
     Icon: ListChecks,
   },
+  {
+    id: 'yolo',
+    label: 'YOLO',
+    description: 'Full host access with no approval prompts.',
+    Icon: Warning,
+  },
 ]
 
 export function PolicySelector({
@@ -38,10 +44,14 @@ export function PolicySelector({
   onChange: (policy: string | null) => void
 }) {
   const selectedPolicy = policyOptions.find((policy) => policy.id === value)
+  const yoloSelected = value === 'yolo'
 
   return (
     <div className={cn('min-w-0 space-y-1', className)}>
-      <Label htmlFor={id} className="flex items-center gap-1.5">
+      <Label
+        htmlFor={id}
+        className={cn('flex items-center gap-1.5', yoloSelected && 'text-warning')}
+      >
         {selectedPolicy ? <selectedPolicy.Icon size={12} /> : <FastForward size={12} />}
         Policy
       </Label>
@@ -49,7 +59,7 @@ export function PolicySelector({
         id={id}
         value={value ?? ''}
         disabled={disabled}
-        className="h-9 text-xs"
+        className={cn('h-9 text-xs', yoloSelected && 'border-warning/70')}
         title={selectedPolicy?.description ?? 'Use profile default'}
         placeholder="Default"
         options={policyOptions.map((policy) => ({
@@ -58,6 +68,11 @@ export function PolicySelector({
         }))}
         onChange={(v) => onChange(v || null)}
       />
+      {yoloSelected ? (
+        <p className="text-micro leading-4 text-warning" role="status">
+          Full host access. Forge scope and user-only approval boundaries still apply.
+        </p>
+      ) : null}
     </div>
   )
 }

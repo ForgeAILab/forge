@@ -35,6 +35,9 @@ pub struct EmbeddedConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionPolicy {
+    /// Disable executor approval prompts and select its least-restricted
+    /// execution mode. Forge's own scope and role authorization still apply.
+    Yolo,
     Auto,
     #[default]
     Supervised,
@@ -44,6 +47,7 @@ pub enum PermissionPolicy {
 impl std::fmt::Display for PermissionPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Yolo => write!(f, "yolo"),
             Self::Auto => write!(f, "auto"),
             Self::Supervised => write!(f, "supervised"),
             Self::Plan => write!(f, "plan"),
@@ -55,6 +59,7 @@ impl std::str::FromStr for PermissionPolicy {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "yolo" => Ok(Self::Yolo),
             "auto" => Ok(Self::Auto),
             "supervised" => Ok(Self::Supervised),
             "plan" => Ok(Self::Plan),
@@ -812,5 +817,21 @@ mod tests {
         assert!(error
             .to_string()
             .contains("Failed to deserialize claude_code config"));
+    }
+
+    #[test]
+    fn yolo_permission_policy_round_trips() {
+        let value = serde_json::json!({ "permission_policy": "yolo" });
+
+        let resolved =
+            resolve_config_value(ExecutorKind::Codex, &value, &ExecutionOverrides::default())
+                .expect("yolo policy resolves");
+
+        assert_eq!(resolved["permission_policy"], "yolo");
+        assert_eq!(PermissionPolicy::Yolo.to_string(), "yolo");
+        assert_eq!(
+            "yolo".parse::<PermissionPolicy>(),
+            Ok(PermissionPolicy::Yolo)
+        );
     }
 }

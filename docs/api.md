@@ -1917,6 +1917,16 @@ reasoning controls, `cli_specific.model_reasoning_efforts` maps each model id
 to its supported values; `cli_specific.reasoning_efforts` is the union used
 when no model is selected.
 
+CLI adapters that can bypass their own approval boundary advertise `yolo` in
+`permission_policies`. Selecting it disables executor approval prompts and
+uses that adapter's least-restricted mode (for Codex, `danger-full-access` plus
+`never`; for Claude Code, `bypassPermissions`; for Gemini and Smith, `--yolo`;
+for OpenCode, `--dangerously-skip-permissions`; and for Cursor, `--force`). It
+applies only to admitted CLI Task executions. Forge still derives Project and
+Task scope server-side, requires the normal assignment and Workspace lease,
+keeps Agent Chat read-only, and reserves approvals, waivers, and releases for
+the user.
+
 Codex currently advertises GPT-5.6 Sol, Terra, and Luna plus supported older
 picker models. Claude Code advertises Claude Fable 5, Opus 5, Sonnet 5, and
 Haiku 4.5. The web client uses the per-model map so, for example, Codex

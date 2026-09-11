@@ -444,7 +444,12 @@ impl CodingExecutorAdapter for ClaudeCodeAdapter {
                 "claude-sonnet-5".into(),
                 "claude-haiku-4-5".into(),
             ],
-            permission_policies: vec!["auto".into(), "supervised".into(), "plan".into()],
+            permission_policies: vec![
+                "auto".into(),
+                "supervised".into(),
+                "plan".into(),
+                "yolo".into(),
+            ],
             cli_specific: serde_json::json!({
                 "reasoning_efforts": ["low", "medium", "high", "xhigh", "max", "ultracode"],
                 "model_reasoning_efforts": {
@@ -981,6 +986,13 @@ fn claude_session_exists(home: &Path, cwd: &Path, session_id: &str) -> bool {
 }
 
 fn claude_permission_mode(config: &ClaudeCodeConfig) -> Option<&'static str> {
+    if matches!(
+        config.permission_policy.as_ref(),
+        Some(PermissionPolicy::Yolo)
+    ) {
+        return Some("bypassPermissions");
+    }
+
     if config.plan.unwrap_or(false) {
         return Some("plan");
     }
@@ -992,7 +1004,9 @@ fn claude_permission_mode(config: &ClaudeCodeConfig) -> Option<&'static str> {
     // inside the worktree is double-supervision. Map both Auto and Supervised to
     // bypassPermissions until the MCP-based forge_approval prompt tool is wired up.
     match config.permission_policy.as_ref()? {
-        PermissionPolicy::Auto | PermissionPolicy::Supervised => Some("bypassPermissions"),
+        PermissionPolicy::Yolo | PermissionPolicy::Auto | PermissionPolicy::Supervised => {
+            Some("bypassPermissions")
+        }
         PermissionPolicy::Plan => Some("plan"),
     }
 }
@@ -1276,7 +1290,11 @@ mod tests {
 
     #[test]
     fn command_builder_maps_permission_policy() {
-        for policy in [PermissionPolicy::Auto, PermissionPolicy::Supervised] {
+        for policy in [
+            PermissionPolicy::Yolo,
+            PermissionPolicy::Auto,
+            PermissionPolicy::Supervised,
+        ] {
             let config = ClaudeCodeConfig {
                 permission_policy: Some(policy.clone()),
                 command_overrides: CommandOverrides::default(),
@@ -1296,6 +1314,27 @@ mod tests {
                 "{policy:?} should map to bypassPermissions, got {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn yolo_policy_overrides_legacy_plan_toggle() {
+        let config = ClaudeCodeConfig {
+            permission_policy: Some(PermissionPolicy::Yolo),
+            plan: Some(true),
+            ..ClaudeCodeConfig::default()
+        };
+
+        let cmd = ClaudeCodeAdapter::build_command(&config, None);
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--permission-mode", "bypassPermissions"])
+        );
     }
 
     #[test]

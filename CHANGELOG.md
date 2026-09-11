@@ -6,6 +6,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Added
+
+- CLI-harness agents and per-execution overrides now offer an explicit `YOLO`
+  permission policy. It selects the executor's full-access/no-prompt mode
+  (including Codex `danger-full-access` with approvals set to `never`) while
+  preserving Forge's Project/Task scope, Workspace-lease, Chat filesystem, and
+  user-only approval boundaries. Existing `Auto` agents keep their prior
+  behavior.
+
 ### Fixed
 
 - Let Agent Settings edit an agent's maximum concurrent task executions and

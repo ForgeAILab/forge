@@ -428,6 +428,15 @@ assigned explicitly. Read-only planning/discovery and write-capable
 implementation both derive authority from the current Charter and their Task
 workflow.
 
+The CLI permission policy includes an explicit high-risk `yolo` value. It maps
+to each adapter's strongest local execution mode and disables that adapter's
+approval prompts; Codex receives `danger-full-access` with `never` approval.
+This is an execution-harness setting, not a Forge capability grant. Canonical
+Project/Task scope, role assignment, Workspace leases, Agent Chat filesystem
+denial, and user-only approvals, waivers, and release actions remain enforced
+by `TaskService` and workflow; repository mutation remains limited to admitted
+Task Worker/reviewer executions in their Task Workspaces.
+
 #### Canonical execution blocker and capability-aware review
 
 `ExecutionBlockerProjection` (`api-types::execution_blocker`) is the one

@@ -274,6 +274,13 @@ Chat sessions remain filesystem-denied; only an identity admitted through the
 existing Task Worker/reviewer assignment and workflow can receive a Task
 Workspace.
 
+For a CLI-harness agent, Agent Settings and per-execution controls include an
+explicit **YOLO** permission policy. Use it only when the Task genuinely needs
+unrestricted host access: Forge disables that CLI's approval prompts and
+selects its least-restricted execution mode. YOLO does not grant the Agent a
+different Forge role, another Project, a Chat filesystem, or any user-only
+approval, waiver, or release action.
+
 To recover from an OAuth failure, cancel the visible operation and start a new
 one. Disconnecting a credential immediately invalidates its local lease. Forge
 reports whether remote provider revocation was `not_supported`, `succeeded`, or

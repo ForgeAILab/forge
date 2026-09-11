@@ -68,14 +68,19 @@ impl SmithAdapter {
             "stream-json".to_owned(),
         ];
 
-        if config.yolo.unwrap_or(false) {
+        let policy_is_yolo = matches!(
+            config.permission_policy.as_ref(),
+            Some(PermissionPolicy::Yolo)
+        );
+
+        if policy_is_yolo || config.yolo.unwrap_or(false) {
             adapter_args.push("--yolo".to_owned());
         } else if let Some(ref approval) = config.approval {
             adapter_args.push("--approval".to_owned());
             adapter_args.push(approval.clone());
         } else if let Some(ref policy) = config.permission_policy {
             match policy {
-                PermissionPolicy::Auto => {
+                PermissionPolicy::Yolo | PermissionPolicy::Auto => {
                     adapter_args.push("--yolo".to_owned());
                 }
                 PermissionPolicy::Supervised | PermissionPolicy::Plan => {
@@ -178,7 +183,7 @@ impl CodingExecutorAdapter for SmithAdapter {
 
         Ok(DiscoveredOptions {
             models: surface.models,
-            permission_policies: vec!["auto".into(), "supervised".into()],
+            permission_policies: vec!["auto".into(), "supervised".into(), "yolo".into()],
             cli_specific: serde_json::json!({
                 "profiles": surface.profiles,
                 "providers": surface.providers,
@@ -1237,6 +1242,25 @@ mod tests {
         assert!(args.contains(&"work".to_string()));
         assert!(args.contains(&"--model".to_string()));
         assert!(args.contains(&"gemini-3.6-flash".to_string()));
+    }
+
+    #[test]
+    fn permission_policy_yolo_adds_yolo_flag() {
+        let config = SmithConfig {
+            permission_policy: Some(PermissionPolicy::Yolo),
+            approval: Some("ask".to_owned()),
+            ..SmithConfig::default()
+        };
+
+        let cmd = SmithAdapter::build_command(&config, "test prompt");
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(args.contains(&"--yolo".to_owned()));
+        assert!(!args.contains(&"--approval".to_owned()));
     }
 
     #[test]

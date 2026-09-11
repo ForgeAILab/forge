@@ -13,13 +13,15 @@ pub fn resolve_effective_policy(
     let permission_policy = config_string(config, config_snapshot, "permission_policy")
         .unwrap_or_else(|| "unknown".to_owned());
     let isolation_posture = resolve_isolation_posture(executor_kind, config, config_snapshot);
+    let yolo_high_risk = permission_policy == "yolo";
     let codex_high_risk =
         matches!(executor_kind, ExecutorKind::Codex) && isolation_posture == "danger-full-access";
     let claude_code_high_risk = matches!(executor_kind, ExecutorKind::ClaudeCode)
         && config_bool(config, config_snapshot, "dangerously_skip_permissions") == Some(true);
     let cursor_high_risk =
         matches!(executor_kind, ExecutorKind::Cursor) && isolation_posture == "force";
-    let is_high_risk = codex_high_risk || claude_code_high_risk || cursor_high_risk;
+    let is_high_risk =
+        yolo_high_risk || codex_high_risk || claude_code_high_risk || cursor_high_risk;
 
     EffectiveExecutionPolicy {
         executor_kind: executor_kind.to_string(),
@@ -87,24 +89,42 @@ fn resolve_isolation_posture(
 ) -> String {
     match executor_kind {
         ExecutorKind::Embedded => "task_workspace".to_owned(),
+        ExecutorKind::Codex
+            if config_string(config, config_snapshot, "permission_policy").as_deref()
+                == Some("yolo") =>
+        {
+            "danger-full-access".to_owned()
+        }
         ExecutorKind::Codex => config_string(config, config_snapshot, "sandbox")
             .unwrap_or_else(|| "not_applicable".to_owned()),
         ExecutorKind::ClaudeCode => {
-            if config_bool(config, config_snapshot, "dangerously_skip_permissions") == Some(true) {
+            if config_bool(config, config_snapshot, "dangerously_skip_permissions") == Some(true)
+                || config_string(config, config_snapshot, "permission_policy").as_deref()
+                    == Some("yolo")
+            {
                 "dangerously_skip_permissions".to_owned()
             } else {
                 "standard".to_owned()
             }
         }
         ExecutorKind::Cursor => {
-            if config_bool(config, config_snapshot, "force").unwrap_or_else(|| {
-                config_string(config, config_snapshot, "permission_policy").as_deref()
-                    != Some("plan")
-            }) {
+            if config_string(config, config_snapshot, "permission_policy").as_deref()
+                == Some("yolo")
+                || config_bool(config, config_snapshot, "force").unwrap_or_else(|| {
+                    config_string(config, config_snapshot, "permission_policy").as_deref()
+                        != Some("plan")
+                })
+            {
                 "force".to_owned()
             } else {
                 "propose_only".to_owned()
             }
+        }
+        ExecutorKind::Opencode | ExecutorKind::Gemini | ExecutorKind::Smith
+            if config_string(config, config_snapshot, "permission_policy").as_deref()
+                == Some("yolo") =>
+        {
+            "yolo".to_owned()
         }
         ExecutorKind::Shell
         | ExecutorKind::Opencode
@@ -297,6 +317,20 @@ mod tests {
         );
 
         assert_eq!(policy.isolation_posture, "dangerously_skip_permissions");
+        assert!(policy.is_high_risk);
+    }
+
+    #[test]
+    fn yolo_policy_derives_full_access_and_high_risk() {
+        let policy = resolve_effective_policy(
+            &ExecutorKind::Codex,
+            &json!({ "permission_policy": "yolo", "sandbox": "read-only" }),
+            Some("/tmp/workspace/task/repo"),
+            Some("/tmp/workspace"),
+        );
+
+        assert_eq!(policy.permission_policy, "yolo");
+        assert_eq!(policy.isolation_posture, "danger-full-access");
         assert!(policy.is_high_risk);
     }
 
