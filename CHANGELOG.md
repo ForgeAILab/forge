@@ -55,6 +55,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Harden JWT signing-secret handling: the secret file and every component of
+  its parent path must be a real directory or regular file, never a symlink
+  (macOS `/var`, `/tmp`, and `/etc` aliases excepted), the file must be
+  owner-only on Unix, oversized files are rejected, and first-run publication
+  is atomic so concurrent starts converge on one installed secret instead of
+  signing with a value that was never persisted.
 - Direct REST and authenticated MCP Project creation now materialize the
   creator's `owner` Project membership atomically with the Project, fixing
   immediate follow-up operations that previously returned 404 because the
