@@ -490,13 +490,19 @@ export function useTestProjectLifecycleHook(projectId: string) {
 
 // --- Tasks ---
 
-export function useTasksQuery(projectId: string, search: TaskSearch) {
+export function useTasksQuery(
+  projectId: string,
+  search: TaskSearch,
+  options: { enabled?: boolean } = {},
+) {
   return useInfiniteQuery({
     queryKey: qk.tasks(projectId, filterKey(search)),
-    queryFn: ({ pageParam }) =>
+    queryFn: ({ pageParam, signal }) =>
       apiFetch<PaginatedResponse<Task>>(`/projects/${projectId}/tasks`, {
         search: { ...search, cursor: pageParam as string | undefined },
+        signal,
       }),
+    enabled: options.enabled ?? true,
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (last) => last.next_cursor ?? undefined,
   })
@@ -1234,7 +1240,7 @@ export function useOperationsStatusQuery() {
   return useQuery({
     queryKey: qk.operationsStatus,
     queryFn: getOperationsStatus,
-    refetchInterval: 30_000,
+    refetchInterval: (query) => (query.state.status === 'error' ? false : 30_000),
   })
 }
 
@@ -1556,7 +1562,7 @@ export function useExecutionLogs(
   return useQuery({
     queryKey: [...qk.executionLogs(executionId), params ?? {}] as const,
     enabled: Boolean(executionId),
-    refetchInterval: isRunning ? 3000 : false,
+    refetchInterval: (query) => (query.state.status === 'error' || !isRunning ? false : 3_000),
     queryFn: () => getExecutionLogs(executionId, params),
   })
 }
@@ -1665,10 +1671,7 @@ export function useIntegrationQuery(projectId: string) {
   return useQuery({
     queryKey: qk.integration(projectId),
     queryFn: () => apiFetch<IntegrationResponse | null>(`/projects/${projectId}/integration`),
-    retry: (failureCount, error) => {
-      if (error instanceof ApiError && error.status === 404) return false
-      return failureCount < 3
-    },
+    retry: false,
   })
 }
 
@@ -1975,7 +1978,10 @@ export function useAgentInquiryLogsQuery(
   return useQuery({
     queryKey,
     enabled: Boolean(inquiryId) && (options.enabled ?? true),
-    refetchInterval: options.live ? AGENT_INQUIRY_ACTIVITY_POLL_INTERVAL : false,
+    refetchInterval: (query) =>
+      query.state.status === 'error' || !options.live
+        ? false
+        : AGENT_INQUIRY_ACTIVITY_POLL_INTERVAL,
     refetchOnMount: options.live ? true : 'always',
     staleTime: options.live ? 0 : Number.POSITIVE_INFINITY,
     queryFn: () =>
@@ -1995,7 +2001,8 @@ export function useAgentInquiriesQuery(
     enabled: Boolean(chatId),
     // Creation has no event notification. Keep discovering runs while this
     // list is mounted, including from an empty or all-terminal cache.
-    refetchInterval: AGENT_INQUIRY_POLL_INTERVAL,
+    refetchInterval: (query) =>
+      query.state.status === 'error' ? false : AGENT_INQUIRY_POLL_INTERVAL,
   })
 }
 

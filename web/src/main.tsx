@@ -24,8 +24,12 @@ const queryClient = new QueryClient({
     queries: {
       staleTime: 5_000,
       gcTime: 5 * 60_000,
-      retry: 1,
+      // Failed reads stay failed until the user retries or the SSE stream
+      // proves the server is reachable again. Automatic retries across many
+      // mounted queries turn one outage into a request storm.
+      retry: false,
       refetchOnWindowFocus: false,
+      refetchOnReconnect: false,
     },
   },
 })

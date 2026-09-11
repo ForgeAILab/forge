@@ -23,9 +23,10 @@ function stableSearchKey(search: BoardTaskSearch): string {
 export function useBoardTasks(projectId: string, search: BoardTaskSearch) {
   return useInfiniteQuery({
     queryKey: qk.tasks(projectId, `board:${stableSearchKey(search)}`),
-    queryFn: ({ pageParam }) =>
+    queryFn: ({ pageParam, signal }) =>
       apiFetch<TasksResponse>(`/projects/${projectId}/tasks`, {
         search: { ...search, cursor: pageParam as string | undefined },
+        signal,
       }),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (last) => last.next_cursor ?? undefined,

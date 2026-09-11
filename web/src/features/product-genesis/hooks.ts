@@ -29,7 +29,7 @@ export function useProductGenesisActiveQuery() {
     staleTime: 3_000,
     // Genesis lifecycle transitions are server-side events. Keep the status
     // chip current even when the backend has no SSE event for the transition.
-    refetchInterval: 2_000,
+    refetchInterval: (query) => (query.state.status === 'error' ? false : 2_000),
   })
 }
 
@@ -39,7 +39,7 @@ export function useProductGenesisCharterQuery(sessionId: string | undefined) {
     queryFn: () => getProductGenesisCharter(sessionId!),
     enabled: Boolean(sessionId),
     staleTime: 1_000,
-    refetchInterval: 2_000,
+    refetchInterval: (query) => (query.state.status === 'error' ? false : 2_000),
   })
 }
 

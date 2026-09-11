@@ -23,7 +23,9 @@ export function useProjectExecutionSetupQuery(projectId: string) {
     // it is in progress, and stop as soon as the projection reaches a terminal
     // state so an idle Project does not create background traffic.
     refetchInterval: (query) =>
-      query.state.data?.execution_setup_state === 'provisioning' ? 4_000 : false,
+      query.state.status !== 'error' && query.state.data?.execution_setup_state === 'provisioning'
+        ? 4_000
+        : false,
   })
 }
 

@@ -45,7 +45,7 @@ export function CommandPalette({ projectId }: { projectId: string }) {
   const [recentTasks, setRecentTasks] = useState<RecentTask[]>(() => readRecentTasks())
   const theme = useLayoutStore((s) => s.theme)
   const setTheme = useLayoutStore((s) => s.setTheme)
-  const tasks = useTasksQuery(projectId, {})
+  const tasks = useTasksQuery(projectId, {}, { enabled: open })
   const taskItems = useMemo(() => tasks.data?.pages.flatMap((p) => p.items) ?? [], [tasks.data])
 
   useEffect(() => {

@@ -95,7 +95,7 @@ describe('routeSsePayload', () => {
       expect.arrayContaining([
         [{ queryKey: ['tasks', 'task-1'] }],
         [{ queryKey: ['tasks', 'task-1', 'detail'] }],
-        [{ queryKey: ['projects', 'proj-1', 'tasks'] }],
+        [{ queryKey: ['projects', 'proj-1', 'tasks'] }, { cancelRefetch: false }],
       ]),
     )
   })
@@ -197,6 +197,7 @@ describe('routeSsePayload', () => {
     )
     expect(invalidateQueries).toHaveBeenCalledWith(
       expect.objectContaining({ refetchType: 'active' }),
+      { cancelRefetch: false },
     )
   })
 
@@ -267,6 +268,7 @@ describe('routeSsePayload', () => {
     )
     expect(invalidateQueries).toHaveBeenCalledWith(
       expect.objectContaining({ refetchType: 'active' }),
+      { cancelRefetch: false },
     )
     expect(dispatch).not.toHaveBeenCalled()
   })
@@ -494,6 +496,7 @@ describe('useSSE', () => {
   // authoritative queries exactly once" — this is what makes convergence
   // independent of whether any particular frame was actually lost.
   it('invalidates active queries once on connect (lost event / reconnect convergence)', () => {
+    vi.useFakeTimers()
     vi.stubGlobal('EventSource', FakeEventSource as unknown as typeof EventSource)
     const queryClient = new QueryClient()
     const invalidateSpy = vi.spyOn(queryClient, 'invalidateQueries')
@@ -502,10 +505,15 @@ describe('useSSE', () => {
     const source = FakeEventSource.instances[0]
     invalidateSpy.mockClear()
 
-    source.onopen?.()
+    act(() => {
+      source.onopen?.()
+      vi.advanceTimersByTime(1_000)
+    })
 
     expect(invalidateSpy).toHaveBeenCalledTimes(1)
-    expect(invalidateSpy).toHaveBeenCalledWith(expect.objectContaining({ refetchType: 'active' }))
+    expect(invalidateSpy).toHaveBeenCalledWith(expect.objectContaining({ refetchType: 'active' }), {
+      cancelRefetch: false,
+    })
   })
 
   it('reconnects with a refreshed access token after a lost connection', () => {
@@ -527,6 +535,30 @@ describe('useSSE', () => {
 
     expect(FakeEventSource.instances).toHaveLength(2)
     expect(FakeEventSource.instances[1]?.url).toContain('token=refreshed-token')
+  })
+
+  it('does not refetch active queries for a connection that opens and immediately fails', () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('EventSource', FakeEventSource as unknown as typeof EventSource)
+    const queryClient = new QueryClient()
+    const invalidateSpy = vi.spyOn(queryClient, 'invalidateQueries')
+
+    renderHook(() => useSSE(queryClient, 'test-token'))
+    const source = FakeEventSource.instances[0]
+    source?.onopen?.()
+    act(() => {
+      vi.advanceTimersByTime(500)
+      source?.onerror?.()
+      vi.advanceTimersByTime(500)
+    })
+
+    expect(invalidateSpy).not.toHaveBeenCalled()
+    expect(FakeEventSource.instances).toHaveLength(1)
+
+    act(() => {
+      vi.advanceTimersByTime(500)
+    })
+    expect(FakeEventSource.instances).toHaveLength(2)
   })
 
   it('closes the stream and cancels a scheduled reconnect on unmount', () => {

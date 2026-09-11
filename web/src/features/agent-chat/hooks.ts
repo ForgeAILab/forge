@@ -43,7 +43,8 @@ export function useAgentChatsQuery() {
     queryKey: agentChatQueryKeys.chats,
     queryFn: () => listAgentChats(),
     staleTime: 5_000,
-    refetchInterval: AGENT_CHAT_SWITCHER_POLL_INTERVAL,
+    refetchInterval: (query) =>
+      query.state.status === 'error' ? false : AGENT_CHAT_SWITCHER_POLL_INTERVAL,
   })
 }
 
@@ -53,7 +54,8 @@ export function useAgentChatQuery(chatId: string | undefined) {
     queryFn: () => getAgentChat(chatId!),
     enabled: Boolean(chatId),
     staleTime: 3_000,
-    refetchInterval: AGENT_CHAT_SWITCHER_POLL_INTERVAL,
+    refetchInterval: (query) =>
+      query.state.status === 'error' ? false : AGENT_CHAT_SWITCHER_POLL_INTERVAL,
   })
 }
 
@@ -63,7 +65,7 @@ export function useAgentChatMessagesQuery(chatId: string | undefined) {
     queryFn: () => listAgentChatMessages(chatId!),
     enabled: Boolean(chatId),
     staleTime: 2_000,
-    refetchInterval: AGENT_CHAT_POLL_INTERVAL,
+    refetchInterval: (query) => (query.state.status === 'error' ? false : AGENT_CHAT_POLL_INTERVAL),
   })
 }
 
@@ -73,7 +75,7 @@ export function useAgentChatTurnsQuery(chatId: string | undefined) {
     queryFn: () => listAgentChatTurns(chatId!),
     enabled: Boolean(chatId),
     staleTime: 1_000,
-    refetchInterval: AGENT_CHAT_POLL_INTERVAL,
+    refetchInterval: (query) => (query.state.status === 'error' ? false : AGENT_CHAT_POLL_INTERVAL),
   })
 }
 
@@ -116,7 +118,8 @@ export function useAgentChatTurnLogsQuery(
   return useQuery({
     queryKey,
     enabled: Boolean(chatId && turnId) && (options.enabled ?? true),
-    refetchInterval: options.live ? AGENT_CHAT_ACTIVITY_POLL_INTERVAL : false,
+    refetchInterval: (query) =>
+      query.state.status === 'error' || !options.live ? false : AGENT_CHAT_ACTIVITY_POLL_INTERVAL,
     refetchOnMount: options.live ? true : 'always',
     staleTime: options.live ? 0 : Number.POSITIVE_INFINITY,
     queryFn: () =>
@@ -167,7 +170,7 @@ export function useAgentHandoffsQuery(projectId: string | undefined) {
     queryFn: () => listAgentHandoffs(projectId!),
     enabled: Boolean(projectId),
     staleTime: 5_000,
-    refetchInterval: AGENT_CHAT_POLL_INTERVAL,
+    refetchInterval: (query) => (query.state.status === 'error' ? false : AGENT_CHAT_POLL_INTERVAL),
   })
 }
 
@@ -190,7 +193,8 @@ export function useAgentHandoffsForProjectsQuery(projectIds: string[]) {
       queryKey: agentChatQueryKeys.handoffs(projectId),
       queryFn: () => listAgentHandoffs(projectId),
       staleTime: 5_000,
-      refetchInterval: AGENT_CHAT_POLL_INTERVAL,
+      refetchInterval: (query: { state: { status: string } }) =>
+        query.state.status === 'error' ? false : AGENT_CHAT_POLL_INTERVAL,
     })),
   })
   return {
@@ -206,6 +210,6 @@ export function useAgentHandoffQuery(projectId: string | undefined, handoffId: s
     queryFn: () => getAgentHandoff(projectId!, handoffId!),
     enabled: Boolean(projectId && handoffId),
     staleTime: 10_000,
-    refetchInterval: AGENT_CHAT_POLL_INTERVAL,
+    refetchInterval: (query) => (query.state.status === 'error' ? false : AGENT_CHAT_POLL_INTERVAL),
   })
 }

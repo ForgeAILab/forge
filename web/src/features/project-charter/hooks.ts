@@ -91,7 +91,7 @@ export function useProjectCharterApproval(projectId: string): ProjectCharterAppr
   const charterQuery = useQuery({
     queryKey: projectCharterQueryKey(projectId),
     queryFn: () => getProjectCharter(projectId),
-    refetchInterval: 15_000,
+    refetchInterval: (query) => (query.state.status === 'error' ? false : 15_000),
   })
 
   const charterData = charterQuery.data ?? null
@@ -125,7 +125,8 @@ export function useProjectCharterApproval(projectId: string): ProjectCharterAppr
   const mutation = useMutation({
     mutationFn: async () => {
       const project = projectQuery.data
-      if (!revision || !charter) throw new Error('The Charter is not loaded yet. Refresh and retry.')
+      if (!revision || !charter)
+        throw new Error('The Charter is not loaded yet. Refresh and retry.')
       if (!agent) {
         throw new Error('No eligible Project Agent is bound — pick one in Agent Settings first.')
       }

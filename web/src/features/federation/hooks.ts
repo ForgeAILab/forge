@@ -433,6 +433,7 @@ export function useProviderAuthorizationQuery(id: string | undefined) {
     queryFn: () => getProviderAuthorization(id!),
     enabled: Boolean(id),
     refetchInterval: (query) => {
+      if (query.state.status === 'error') return false
       const state = query.state.data?.state
       return state && ['succeeded', 'denied', 'expired', 'cancelled', 'failed'].includes(state)
         ? false
@@ -463,17 +464,12 @@ export function useCancelProviderAuthorizationMutation() {
   })
 }
 
-/** A 404 means "no binding yet" — an expected state, never worth retrying. */
-function retryUnlessMissing(failureCount: number, error: unknown): boolean {
-  return !(error instanceof ApiError && error.status === 404) && failureCount < 1
-}
-
 export function useMainAgentBindingQuery() {
   return useQuery({
     queryKey: federationQueryKeys.mainAgent,
     queryFn: getMainAgentBinding,
     staleTime: 10_000,
-    retry: retryUnlessMissing,
+    retry: false,
   })
 }
 
@@ -519,7 +515,7 @@ export function useMissionControlQuery() {
     queryKey: federationQueryKeys.missionControl,
     queryFn: getMissionControl,
     staleTime: 15_000,
-    refetchInterval: 30_000,
+    refetchInterval: (query) => (query.state.status === 'error' ? false : 30_000),
   })
 }
 
@@ -559,7 +555,7 @@ export function useProjectAgentBindingQuery(projectId: string | undefined) {
     queryFn: () => getProjectAgentBinding(projectId!),
     enabled: Boolean(projectId),
     staleTime: 10_000,
-    retry: retryUnlessMissing,
+    retry: false,
   })
 }
 

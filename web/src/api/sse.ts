@@ -83,20 +83,85 @@ function parseSseData(raw: string): SsePayload | undefined {
 }
 
 function invalidateAllActiveQueries(queryClient: QueryClient): void {
-  void queryClient.invalidateQueries({
-    predicate: () => true,
-    refetchType: 'active',
-  })
+  void queryClient.invalidateQueries(
+    {
+      predicate: () => true,
+      refetchType: 'active',
+    },
+    { cancelRefetch: false },
+  )
+}
+
+const TASK_LIST_INVALIDATION_THROTTLE_MS = 500
+type TaskListInvalidationState = {
+  lastRunAt: number | null
+  trailingTimer: ReturnType<typeof setTimeout> | null
+  pendingAll: boolean
+  pendingProjectIds: Set<string>
+}
+const taskListInvalidationStates = new WeakMap<QueryClient, TaskListInvalidationState>()
+
+function runProjectTaskListInvalidation(queryClient: QueryClient, projectId?: string): void {
+  if (projectId) {
+    void queryClient.invalidateQueries(
+      { queryKey: qk.projectTasks(projectId) },
+      { cancelRefetch: false },
+    )
+    return
+  }
+  void queryClient.invalidateQueries(
+    {
+      predicate: (query) => query.queryKey[0] === 'projects' && query.queryKey[2] === 'tasks',
+    },
+    { cancelRefetch: false },
+  )
 }
 
 function invalidateProjectTaskLists(queryClient: QueryClient, projectId?: string): void {
+  let state = taskListInvalidationStates.get(queryClient)
+  if (!state) {
+    state = {
+      lastRunAt: null,
+      trailingTimer: null,
+      pendingAll: false,
+      pendingProjectIds: new Set(),
+    }
+    taskListInvalidationStates.set(queryClient, state)
+  }
   if (projectId) {
-    void queryClient.invalidateQueries({ queryKey: qk.projectTasks(projectId) })
+    if (!state.pendingAll) state.pendingProjectIds.add(projectId)
+  } else {
+    state.pendingAll = true
+    state.pendingProjectIds.clear()
+  }
+
+  const flush = () => {
+    state.trailingTimer = null
+    state.lastRunAt = Date.now()
+    if (state.pendingAll) {
+      state.pendingAll = false
+      state.pendingProjectIds.clear()
+      runProjectTaskListInvalidation(queryClient)
+      return
+    }
+    const pendingProjectIds = [...state.pendingProjectIds]
+    state.pendingProjectIds.clear()
+    for (const pendingProjectId of pendingProjectIds) {
+      runProjectTaskListInvalidation(queryClient, pendingProjectId)
+    }
+  }
+
+  const now = Date.now()
+  if (state.lastRunAt === null || now - state.lastRunAt >= TASK_LIST_INVALIDATION_THROTTLE_MS) {
+    if (state.trailingTimer) clearTimeout(state.trailingTimer)
+    flush()
     return
   }
-  void queryClient.invalidateQueries({
-    predicate: (query) => query.queryKey[0] === 'projects' && query.queryKey[2] === 'tasks',
-  })
+  if (state.trailingTimer) return
+  state.trailingTimer = setTimeout(
+    flush,
+    TASK_LIST_INVALIDATION_THROTTLE_MS - (now - state.lastRunAt),
+  )
 }
 
 function invalidateMissionControl(queryClient: QueryClient): void {
@@ -424,16 +489,29 @@ function pollStalePendingTurns(queryClient: QueryClient): void {
   }
 
   for (const chatId of staleChatIds) {
+    const messagesKey = ['agent-chats', chatId, 'messages'] as const
+    const turnsKey = ['agent-chats', chatId, 'turns'] as const
+    if (
+      queryClient.getQueryState(messagesKey)?.status === 'error' ||
+      queryClient.getQueryState(turnsKey)?.status === 'error'
+    ) {
+      continue
+    }
     void queryClient.refetchQueries({
-      queryKey: ['agent-chats', chatId, 'messages'],
+      queryKey: messagesKey,
       type: 'active',
     })
     void queryClient.refetchQueries({
-      queryKey: ['agent-chats', chatId, 'turns'],
+      queryKey: turnsKey,
       type: 'active',
     })
   }
 }
+
+const SSE_INITIAL_RECONNECT_MS = 1_000
+const SSE_MAX_RECONNECT_MS = 30_000
+const SSE_STABLE_CONNECTION_MS = 30_000
+const SSE_RESYNC_AFTER_OPEN_MS = 1_000
 
 export function useSSE(queryClient: QueryClient, accessToken: string | null): void {
   useEffect(() => {
@@ -444,8 +522,10 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
 
     let cancelled = false
     let source: EventSource | null = null
-    let backoffMs = 1000
+    let backoffMs = SSE_INITIAL_RECONNECT_MS
     let backoffTimer: ReturnType<typeof setTimeout> | null = null
+    let stableConnectionTimer: ReturnType<typeof setTimeout> | null = null
+    let resyncTimer: ReturnType<typeof setTimeout> | null = null
     // EventSource cannot send an Authorization header, so the access token rides
     // in the query string and is fixed for the life of a connection. Access
     // tokens expire in 15 minutes, well inside a single sitting, after which
@@ -473,33 +553,56 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
         clearTimeout(backoffTimer)
         backoffTimer = null
       }
-      source = new EventSource(`/api/v1/events?token=${encodeURIComponent(streamToken)}`)
+      const nextSource = new EventSource(`/api/v1/events?token=${encodeURIComponent(streamToken)}`)
+      source = nextSource
 
       // Every frame is a default `message` event (D20): the server no
       // longer sets an SSE `event:` name, so `onmessage` alone sees
       // everything and `routeSsePayload` routes by `payload.event_type`.
-      source.onmessage = handleEvent
+      nextSource.onmessage = handleEvent
 
-      source.onerror = () => {
-        source?.close()
+      nextSource.onerror = () => {
+        nextSource.close()
+        // Ignore a late callback from a stream that has already been replaced.
+        if (source !== nextSource) return
         if (cancelled) return
-        backoffTimer = setTimeout(reconnect, backoffMs)
+        if (stableConnectionTimer) {
+          clearTimeout(stableConnectionTimer)
+          stableConnectionTimer = null
+        }
+        if (resyncTimer) {
+          clearTimeout(resyncTimer)
+          resyncTimer = null
+        }
+        if (backoffTimer) return
+        const reconnectDelay = backoffMs
+        backoffMs = Math.min(backoffMs * 2, SSE_MAX_RECONNECT_MS)
+        backoffTimer = setTimeout(reconnect, reconnectDelay)
       }
 
-      source.onopen = () => {
-        backoffMs = 1000
-        // 8.4.3: converge once on open/reconnect regardless of whether
-        // anything was actually missed while disconnected — this is what
-        // makes correctness independent of SSE delivery (lost event,
-        // reconnect after a backgrounded tab, or a fresh connection after
-        // an access-token refresh all land here).
-        invalidateAllActiveQueries(queryClient)
+      nextSource.onopen = () => {
+        const openedSource = nextSource
+        if (stableConnectionTimer) clearTimeout(stableConnectionTimer)
+        stableConnectionTimer = setTimeout(() => {
+          if (!cancelled && source === openedSource) {
+            backoffMs = SSE_INITIAL_RECONNECT_MS
+          }
+        }, SSE_STABLE_CONNECTION_MS)
+        // A connection that opens and immediately fails must not trigger a
+        // full-query refetch on every flap. Resync only after it remains open
+        // long enough to be useful; an error clears this timer.
+        if (resyncTimer) clearTimeout(resyncTimer)
+        resyncTimer = setTimeout(() => {
+          resyncTimer = null
+          if (!cancelled && source === openedSource) {
+            invalidateAllActiveQueries(queryClient)
+          }
+        }, SSE_RESYNC_AFTER_OPEN_MS)
       }
     }
 
     const reconnect = () => {
       if (cancelled) return
-      backoffMs = Math.min(backoffMs * 2, 30_000)
       const current = useAuthStore.getState().accessToken
       if (current) streamToken = current
       connect()
@@ -513,6 +616,8 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
     return () => {
       cancelled = true
       if (backoffTimer) clearTimeout(backoffTimer)
+      if (stableConnectionTimer) clearTimeout(stableConnectionTimer)
+      if (resyncTimer) clearTimeout(resyncTimer)
       clearInterval(pendingTurnWatchdog)
       source?.close()
     }
