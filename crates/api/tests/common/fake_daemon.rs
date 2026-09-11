@@ -21,8 +21,8 @@ use db::{
     CreateProject, CreateRepo, CreateTask, CreateTaskRoleAssignment, CreateWorkspace,
     CreateWorkspaceLease, DaemonRepo, DaemonStatus, Execution, ExecutionLeaseMutation,
     ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo, TaskRepo, TaskRoleAssignmentRepo,
-    UpdateDaemonReport, UpsertDaemon, UserRepo, WorkMode, WorkspaceLeaseRepo, WorkspaceRepo,
-    WorkspaceStatus,
+    UpdateDaemonReport, UpdateProject, UpsertDaemon, UserRepo, WorkMode, WorkspaceLeaseRepo,
+    WorkspaceRepo, WorkspaceStatus,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -501,7 +501,6 @@ pub async fn seed_running_execution_for_daemon(state: &AppState, daemon_id: &str
         CreateTask {
             id: task_id.clone(),
             project_id: project_id.clone(),
-            repo_id: None,
             parent_task_id: None,
             assignee_type: Some("agent".to_owned()),
             assignee_id: Some(agent_id.clone()),
@@ -652,7 +651,7 @@ pub async fn seed_startable_execution_for_daemon(
     .await
     .expect("remote daemon shell report updates");
 
-    ProjectRepo::create(
+    let project = ProjectRepo::create(
         &*state.db,
         CreateProject {
             id: project_id.clone(),
@@ -683,12 +682,26 @@ pub async fn seed_startable_execution_for_daemon(
     )
     .await
     .expect("repo creates");
+    ProjectRepo::update_at_version(
+        &*state.db,
+        UpdateProject {
+            id: project_id.clone(),
+            name: None,
+            settings: None,
+            primary_repo_id: Some(Some(repo_id.clone())),
+            paused_at: None,
+            updated_at: now.clone(),
+        },
+        project.version,
+        None,
+    )
+    .await
+    .expect("project primary repo updates");
     let task = TaskRepo::create(
         &*state.db,
         CreateTask {
             id: task_id.clone(),
             project_id: project_id.clone(),
-            repo_id: Some(repo_id.clone()),
             parent_task_id: None,
             assignee_type: Some("agent".to_owned()),
             assignee_id: Some(agent_id.clone()),
@@ -848,7 +861,7 @@ pub async fn seed_terminal_task_for_daemon(
     let agent_id = uuid::Uuid::new_v4().to_string();
     let workspace_id = uuid::Uuid::new_v4().to_string();
 
-    ProjectRepo::create(
+    let project = ProjectRepo::create(
         &*state.db,
         CreateProject {
             id: project_id.clone(),
@@ -879,12 +892,26 @@ pub async fn seed_terminal_task_for_daemon(
     )
     .await
     .expect("repo creates");
+    ProjectRepo::update_at_version(
+        &*state.db,
+        UpdateProject {
+            id: project_id.clone(),
+            name: None,
+            settings: None,
+            primary_repo_id: Some(Some(repo_id.clone())),
+            paused_at: None,
+            updated_at: now.clone(),
+        },
+        project.version,
+        None,
+    )
+    .await
+    .expect("terminal fixture primary repo updates");
     TaskRepo::create(
         &*state.db,
         CreateTask {
             id: task_id.clone(),
             project_id,
-            repo_id: Some(repo_id.clone()),
             parent_task_id: None,
             assignee_type: None,
             assignee_id: None,

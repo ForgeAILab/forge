@@ -824,7 +824,6 @@ async fn a_worker_at_capacity_is_still_eligible_for_its_own_role() {
         CreateTask {
             id: task_id.clone(),
             project_id: project.id.clone(),
-            repo_id: None,
             parent_task_id: None,
             assignee_type: Some("agent".to_owned()),
             assignee_id: Some(worker_id.clone()),
@@ -978,7 +977,7 @@ async fn ready_project(db: &Arc<SqliteDb>, project: &Project) -> (String, String
 
 /// Create a repository-backed implementation Task with governance bound to
 /// the approved Charter, so `ensure_task_runnable` admits it.
-async fn governed_task(db: &SqliteDb, project_id: &str, repo_id: &str, title: &str) -> String {
+async fn governed_task(db: &SqliteDb, project_id: &str, title: &str) -> String {
     let task_id = new_uuid_v4();
     let now = now_rfc3339();
     TaskRepo::create(
@@ -986,7 +985,6 @@ async fn governed_task(db: &SqliteDb, project_id: &str, repo_id: &str, title: &s
         CreateTask {
             id: task_id.clone(),
             project_id: project_id.to_owned(),
-            repo_id: Some(repo_id.to_owned()),
             parent_task_id: None,
             assignee_type: None,
             assignee_id: None,
@@ -1122,14 +1120,8 @@ async fn insert_task_scoped_reconciliation(
 async fn task_with_executions_and_a_commit_is_never_not_started() {
     let db = database().await;
     let project = coordinated_project(&db, "f12 progress language").await;
-    let (repo_id, _charter_revision_id) = ready_project(&db, &project).await;
-    let task_id = governed_task(
-        &db,
-        &project.id,
-        &repo_id,
-        "task with attempts and a commit",
-    )
-    .await;
+    let (_repo_id, _charter_revision_id) = ready_project(&db, &project).await;
+    let task_id = governed_task(&db, &project.id, "task with attempts and a commit").await;
     // Mirror the preserved run: one failed attempt, one completed execution
     // with a commit.
     insert_execution(&db, &task_id, "executor", "failed", false).await;
@@ -1159,8 +1151,8 @@ async fn task_with_executions_and_a_commit_is_never_not_started() {
 async fn unchanged_checkout_sha_is_not_implementation_commit_evidence() {
     let db = database().await;
     let project = coordinated_project(&db, "unchanged checkout evidence").await;
-    let (repo_id, _charter_revision_id) = ready_project(&db, &project).await;
-    let task_id = governed_task(&db, &project.id, &repo_id, "read-only discovery").await;
+    let (_repo_id, _charter_revision_id) = ready_project(&db, &project).await;
+    let task_id = governed_task(&db, &project.id, "read-only discovery").await;
     let now = now_rfc3339();
     sqlx::query(
         "INSERT INTO execution
@@ -1199,8 +1191,8 @@ async fn unchanged_checkout_sha_is_not_implementation_commit_evidence() {
 async fn reconciliation_required_blocker_never_renders_baseline_approval_copy() {
     let db = database().await;
     let project = coordinated_project(&db, "f12 reconciliation copy").await;
-    let (repo_id, _charter_revision_id) = ready_project(&db, &project).await;
-    let task_id = governed_task(&db, &project.id, &repo_id, "task blocked by reconciliation").await;
+    let (_repo_id, _charter_revision_id) = ready_project(&db, &project).await;
+    let task_id = governed_task(&db, &project.id, "task blocked by reconciliation").await;
     insert_execution(&db, &task_id, "executor", "failed", false).await;
     insert_execution(&db, &task_id, "executor", "completed", true).await;
     insert_task_scoped_reconciliation(
@@ -1258,18 +1250,11 @@ async fn reconciliation_required_blocker_never_renders_baseline_approval_copy() 
 async fn task_scoped_reconciliation_does_not_block_the_project_gate() {
     let db = database().await;
     let project = coordinated_project(&db, "f12 scoped reconciliation").await;
-    let (repo_id, _charter_revision_id) = ready_project(&db, &project).await;
-    let blocked_task_id = governed_task(
-        &db,
-        &project.id,
-        &repo_id,
-        "task with its own reconciliation",
-    )
-    .await;
+    let (_repo_id, _charter_revision_id) = ready_project(&db, &project).await;
+    let blocked_task_id = governed_task(&db, &project.id, "task with its own reconciliation").await;
     let unrelated_task_id = governed_task(
         &db,
         &project.id,
-        &repo_id,
         "unrelated task under the same active plan",
     )
     .await;

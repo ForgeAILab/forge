@@ -4,14 +4,13 @@ use super::*;
 #[tokio::test]
 async fn test_workflow_health_stuck_no_execution() {
     let db = Arc::new(sqlite_db().await);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let workflow = crate::workflow::default_workflow::default_workflow();
     let reviewer_id = seed_agent(&db).await;
     let stale_timestamp = "2000-01-01T00:00:00Z";
     let assigned_task = seed_task_with_status_at(
         &db,
         &project_id,
-        &repo_id,
         crate::workflow::default_states::REVIEW,
         stale_timestamp,
     )
@@ -46,7 +45,6 @@ async fn test_workflow_health_stuck_no_execution() {
     let unassigned_task = seed_task_with_status_at(
         &db,
         &project_id,
-        &repo_id,
         crate::workflow::default_states::REVIEW,
         stale_timestamp,
     )
@@ -75,16 +73,11 @@ async fn test_workflow_health_stuck_no_execution() {
 #[tokio::test]
 async fn test_workflow_health_running_reviewer() {
     let db = Arc::new(sqlite_db().await);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let workflow = crate::workflow::default_workflow::default_workflow();
     let reviewer_id = seed_agent(&db).await;
-    let task = seed_task_with_status(
-        &db,
-        &project_id,
-        &repo_id,
-        crate::workflow::default_states::REVIEW,
-    )
-    .await;
+    let task =
+        seed_task_with_status(&db, &project_id, crate::workflow::default_states::REVIEW).await;
     let execution = seed_execution(
         &db,
         &task.id,
@@ -117,13 +110,12 @@ async fn test_workflow_health_running_reviewer() {
 #[tokio::test]
 async fn test_workflow_health_stuck_when_coder_completed_without_transition() {
     let db = Arc::new(sqlite_db().await);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let workflow = crate::workflow::default_workflow::default_workflow();
     let coder_id = seed_agent(&db).await;
     let task = seed_task_with_status(
         &db,
         &project_id,
-        &repo_id,
         crate::workflow::default_states::IN_PROGRESS,
     )
     .await;
@@ -170,13 +162,12 @@ async fn test_workflow_health_stuck_when_coder_completed_without_transition() {
 #[tokio::test]
 async fn test_workflow_health_failed_when_coder_failed_without_block_marker() {
     let db = Arc::new(sqlite_db().await);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let workflow = crate::workflow::default_workflow::default_workflow();
     let coder_id = seed_agent(&db).await;
     let task = seed_task_with_status(
         &db,
         &project_id,
-        &repo_id,
         crate::workflow::default_states::IN_PROGRESS,
     )
     .await;

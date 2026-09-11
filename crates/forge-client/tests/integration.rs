@@ -555,7 +555,6 @@ fn task_response(
     TaskResponse {
         id,
         project_id,
-        repo_id: None,
         parent_task_id: None,
         assignee_type: None,
         assignee_id: None,

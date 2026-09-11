@@ -6,14 +6,10 @@ async fn test_reset_retry_window_publishes_recovery_and_resume_events() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(
-        &db,
-        &project_id,
-        &repo_id,
-        crate::workflow::default_states::REVIEW,
-    )
-    .await;
+    let (project_id, _repo_id, repo_dir) = seed_project_repo(&db).await;
+    initialize_primary_repository(&repo_dir);
+    let task =
+        seed_task_with_status(&db, &project_id, crate::workflow::default_states::REVIEW).await;
     let execution = seed_execution(
         &db,
         &task.id,
@@ -106,19 +102,13 @@ async fn test_reset_retry_window_publishes_recovery_and_resume_events() {
     );
 }
 
-async fn seed_assigned_task(
-    db: &SqliteDb,
-    project_id: &str,
-    repo_id: &str,
-    agent_id: &str,
-) -> Task {
+async fn seed_assigned_task(db: &SqliteDb, project_id: &str, agent_id: &str) -> Task {
     let now = now_rfc3339();
     TaskRepo::create(
         db,
         db::CreateTask {
             id: new_uuid_v4(),
             project_id: project_id.to_owned(),
-            repo_id: Some(repo_id.to_owned()),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: Some("agent".to_owned()),
@@ -145,9 +135,9 @@ async fn test_reset_to_initial_clears_assignee_after_workspace_failure() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_assigned_task(&db, &project_id, &repo_id, &agent_id).await;
+    let task = seed_assigned_task(&db, &project_id, &agent_id).await;
     assert_eq!(task.assignee_id.as_deref(), Some(agent_id.as_str()));
 
     // The workspace-failure path ends in fail_task, which clears any blocking
@@ -183,9 +173,9 @@ async fn test_reset_to_initial_keeps_assignee_for_non_workspace_failure() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_assigned_task(&db, &project_id, &repo_id, &agent_id).await;
+    let task = seed_assigned_task(&db, &project_id, &agent_id).await;
     assert_eq!(task.assignee_id.as_deref(), Some(agent_id.as_str()));
 
     service

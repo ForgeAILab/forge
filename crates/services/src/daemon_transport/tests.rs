@@ -168,7 +168,6 @@ async fn seed_running_execution(
         CreateTask {
             id: task_id.clone(),
             project_id,
-            repo_id: Some(repo_id),
             parent_task_id: None,
             assignee_type: Some("agent".to_owned()),
             assignee_id: Some(agent_id.clone()),

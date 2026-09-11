@@ -218,7 +218,6 @@ async fn seed_review(db: &db::SqliteDb, step_results_json: String) -> String {
         CreateTask {
             id: task_id.clone(),
             project_id,
-            repo_id: Some(repo_id),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,

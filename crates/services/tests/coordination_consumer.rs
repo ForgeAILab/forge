@@ -89,7 +89,6 @@ async fn task_outcome_reconciliation_replays_after_cursor_reset_without_duplicat
         CreateTask {
             id: "task-outcome".to_owned(),
             project_id: project_id.to_owned(),
-            repo_id: None,
             parent_task_id: None,
             assignee_type: None,
             assignee_id: None,
@@ -417,7 +416,6 @@ async fn binding_replacement_requires_explicit_transfer_and_keeps_outcomes_with_
         CreateTask {
             id: "continuity-task".to_owned(),
             project_id: project_id.to_owned(),
-            repo_id: None,
             parent_task_id: None,
             assignee_type: None,
             assignee_id: None,

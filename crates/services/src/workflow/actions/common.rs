@@ -91,7 +91,7 @@ pub(super) async fn latest_executor_execution(ctx: &HookContext) -> Option<Execu
     let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
         .await
         .ok()??;
-    crate::task_service::latest_executor_execution_for_task(&*ctx.db, &task)
+    crate::task_service::latest_executor_execution_for_task(&ctx.db, &task)
         .await
         .ok()
         .flatten()

@@ -1573,6 +1573,36 @@ fn forge_create_task_rejects_invalid_type_with_field_error() {
 }
 
 #[test]
+fn forge_create_task_rejects_task_repository_selector() {
+    run_async(async {
+        let state = sqlite_state().await;
+        let (project_id, repo_id) = seed_project_repo(&state).await;
+        let before = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task")
+            .fetch_one(state.db.pool())
+            .await
+            .expect("Task count loads");
+
+        let error = call_tool_error(
+            &state,
+            "forge_create_task",
+            json!({
+                "project_id": project_id,
+                "title": "Client-selected repository",
+                "repo_id": repo_id
+            }),
+        )
+        .await;
+
+        assert_eq!(error.code, -32602);
+        let after = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task")
+            .fetch_one(state.db.pool())
+            .await
+            .expect("Task count reloads");
+        assert_eq!(after, before, "rejected selector must not create a Task");
+    });
+}
+
+#[test]
 fn forge_create_task_rejects_missing_project_id_with_field_error() {
     run_async(async {
         let state = sqlite_state().await;
@@ -1677,6 +1707,10 @@ fn scoped_mcp_allows_task_id_tool_for_same_project() {
 
         assert_eq!(result["id"], task.id);
         assert_eq!(result["project_id"], project_id);
+        assert!(
+            result.get("repo_id").is_none(),
+            "MCP Task values must not expose a repository binding: {result}"
+        );
     });
 }
 
@@ -2364,7 +2398,6 @@ fn forge_create_sub_tasks_nested_rejected() {
             CreateTask {
                 id: new_uuid_v4(),
                 project_id: root.project_id.clone(),
-                repo_id: root.repo_id.clone(),
                 parent_task_id: Some(root.id.clone()),
                 assignee_type: None,
                 assignee_id: None,

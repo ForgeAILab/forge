@@ -6,7 +6,7 @@
 
 **Date:** 2026-06-28
 
-**Status:** Pre-refactor analysis. Intended to seed a spec-driven change under `docs/spec/changes/`.
+**Status:** Historical pre-refactor analysis. Paths and behavior below describe the 2026-06-28 snapshot and are not current; use [`architecture.md`](architecture.md) for the implemented contract.
 
 ---
 
@@ -80,7 +80,7 @@ Findings are rated **Critical** (latent incorrectness), **High** (structural blo
 | Execution launch/completion | `execution/launch.rs:190,365,573` | `"system"` (via `From<i64>`) | **Agent** |
 | Cascade transitions | `execution/cascade.rs:320`, `:1292` | `"system"` | System |
 | Follow-up dispatch | `execution/follow_up.rs:243` | `"system"` (via `From<i64>`) | **Agent** |
-| Subtask transitions | `execution/subtasks/mod.rs:163,351,484,533,544` | `"system"` (via `From<i64>`) | **Agent/System** |
+| Historical subtask transitions | Former subtask transition module (deleted; ordered-sequence coordination now lives in `task_service/subtask.rs` and `execution/cascade.rs`) | `"system"` (via `From<i64>`) | **Agent/System** |
 | Initial scheduling | `task_dispatcher/initial_scheduling.rs:98` | `"system:task_dispatcher"` | System |
 | **MCP `forge_transition_task`** | `mcp-server/tools/handlers.rs:479` | `"system"` (via `From<i64>`) | **Agent ✗** |
 
@@ -324,7 +324,7 @@ Keep the `transition_log.triggered_by` **column** as TEXT; convert via `Actor::t
 This is where F1 is actually fixed. Map each call site to its real actor:
 
 - `claim.rs:250` → `Actor::Agent` (intent already correct).
-- `execution/launch.rs`, `execution/follow_up.rs`, `execution/subtasks/mod.rs` (agent-driven) → `Actor::System` is honest for launch/cascade; revisit whether subtask-completion transitions should carry the originating agent id.
+- `execution/launch.rs` and `execution/follow_up.rs` (agent-driven) → `Actor::System` is honest for launch/cascade. Ordered-child sequencing now lives in `task_service/subtask.rs` and `execution/cascade.rs`; child executions are independent and serial in the root workspace, so the former subtask transition path is not a current behavior to preserve.
 - **`mcp-server/tools/handlers.rs:479` `forge_transition_task`** → `Actor::Agent { id: <calling agent> }`. This requires the MCP layer to know the calling agent (it has `McpState`); if agent identity is not yet plumbed through, this is the place to add it. This single change is what makes `AgentOnly` meaningful.
 - `gates.rs:73,113`, `transitions.rs:15` → `Actor::User`.
 - `recovery.rs:829,1569` (user-driven) → `Actor::User`; system-driven recovery → `Actor::System`.
@@ -389,7 +389,7 @@ Once `Actor` is real and the wrapper is collapsed:
 ## 9. Open questions
 
 1. **MCP caller identity:** does `McpState` currently carry the calling agent id? If not, Phase 3's `forge_transition_task → Actor::Agent` requires plumbing it through. Needs a check of `crates/mcp-server/src/state.rs` and the MCP auth path.
-2. **Subtask transitions:** should `execution/subtasks/mod.rs` transitions carry the originating agent (the parent task's agent) or be `System`? Currently all `"system"`. A product decision.
+2. **Subtask transitions:** the former subtask transition module has been removed. Current ordered-child sequencing is coordinated by `task_service/subtask.rs` and `execution/cascade.rs`; each child owns its execution and the root only receives aggregate review after the serial sequence settles.
 3. **Cascade actor:** engine cascades re-enter `transition_inner` with `"system"` (`engine/mod.rs` cascade recursion). Should a cascade preserve the originating actor, or always be `System`? Currently always `System`; defensible, but worth making explicit.
 
 ---
@@ -417,7 +417,7 @@ Plus the implicit `"system"` via `From<i64>` at:
 ```
 crates/services/src/task_service/execution/launch.rs:190,365,573
 crates/services/src/task_service/execution/follow_up.rs:243
-crates/services/src/task_service/execution/subtasks/mod.rs:163,351,484,533,544
+crates/services/src/task_service/subtask.rs and execution/cascade.rs (ordered-child sequencing)
 crates/mcp-server/src/tools/handlers.rs:479  (forge_transition_task)
 ```
 

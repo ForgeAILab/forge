@@ -449,10 +449,6 @@ impl TaskService {
                 ));
             }
         }
-        let repo_id = parent
-            .as_ref()
-            .map(|task| task.repo_id.clone())
-            .unwrap_or_else(|| project.primary_repo_id.clone());
         let task_type = payload.task_type.clone().unwrap_or_else(|| {
             if parent.is_some() {
                 "sub_task".to_owned()
@@ -496,7 +492,7 @@ impl TaskService {
             }
         }
         let prepared_governance = self
-            .prepare_task_governance(&project, repo_id.as_ref(), &task_type, governance)
+            .prepare_task_governance(&project, &task_type, governance)
             .await?;
 
         let workflow = if parent.is_some() {
@@ -540,7 +536,6 @@ impl TaskService {
         let task = Task {
             id: task_id.clone(),
             project_id: project_id.clone(),
-            repo_id: repo_id.clone(),
             parent_task_id: payload.parent_task_id.clone(),
             assignee_type: None,
             assignee_id: None,
@@ -611,7 +606,6 @@ impl TaskService {
                 task: CreateTask {
                     id: task.id.clone(),
                     project_id: task.project_id.clone(),
-                    repo_id: task.repo_id.clone(),
                     parent_task_id: task.parent_task_id.clone(),
                     subtask_order: None,
                     assignee_type: None,

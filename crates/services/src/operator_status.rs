@@ -755,21 +755,26 @@ mod tests {
         .execute(db.pool())
         .await
         .expect("repo inserts");
+        sqlx::query("UPDATE project SET primary_repo_id = ? WHERE id = ?")
+            .bind(&repo_id)
+            .bind(&project_id)
+            .execute(db.pool())
+            .await
+            .expect("project primary repo updates");
 
         (project_id, repo_id)
     }
 
     async fn insert_task(db: &SqliteDb, status: &str) -> String {
-        let (project_id, repo_id) = seed_project_repo(db).await;
+        let (project_id, _repo_id) = seed_project_repo(db).await;
         let task_id = new_uuid_v4();
         let now = Utc::now().to_rfc3339();
         sqlx::query(
-            "INSERT INTO task (id, project_id, repo_id, title, status, priority, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+            "INSERT INTO task (id, project_id, title, status, priority, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 0, ?, ?)",
         )
         .bind(&task_id)
         .bind(&project_id)
-        .bind(&repo_id)
         .bind(format!("Task {task_id}"))
         .bind(status)
         .bind(&now)
@@ -846,11 +851,16 @@ mod tests {
         cleanup_after: &str,
         worktree_path: &str,
     ) -> String {
-        let repo_id = sqlx::query_scalar::<_, String>("SELECT repo_id FROM task WHERE id = ?")
-            .bind(task_id)
-            .fetch_one(db.pool())
-            .await
-            .expect("task repo exists");
+        let repo_id = sqlx::query_scalar::<_, String>(
+            "SELECT p.primary_repo_id
+             FROM task t
+             JOIN project p ON p.id = t.project_id
+             WHERE t.id = ?",
+        )
+        .bind(task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("project repo exists");
         let workspace_id = new_uuid_v4();
         let now = Utc::now().to_rfc3339();
         sqlx::query(

@@ -199,24 +199,6 @@ pub enum EventContext {
         status: String,
         reason: Option<String>,
     },
-    TaskSubtaskSequenceStarted {
-        task_id: String,
-    },
-    TaskSubtaskSequencePaused {
-        task_id: String,
-        subtask_id: String,
-        reason: String,
-    },
-    TaskSubtaskSequenceResumed {
-        task_id: String,
-        subtask_id: String,
-    },
-    TaskSubtaskCommitRecorded {
-        task_id: String,
-        subtask_id: String,
-        result_type: String,
-        commit_sha: Option<String>,
-    },
     ReviewStarted {
         task_id: String,
         attempt_number: i64,

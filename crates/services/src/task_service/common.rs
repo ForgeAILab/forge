@@ -59,7 +59,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-        latest_executor_execution_for_task(&*self.db, &task)
+        latest_executor_execution_for_task(&self.db, &task)
             .await?
             .ok_or_else(|| {
                 ServiceError::invalid_operation(format!("task {task_id} has no executor execution"))
@@ -238,13 +238,6 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-        let repo_id = task
-            .repo_id
-            .as_deref()
-            .ok_or_else(|| ServiceError::invalid_operation("task has no associated repo"))?;
-        let repo = RepoRepo::get_by_id(&*self.db, repo_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("repo", repo_id.to_owned()))?;
         let execution = self.latest_executor_execution(task_id).await?;
         let workspace_id = execution.workspace_id.as_deref().ok_or_else(|| {
             ServiceError::invalid_operation("executor execution missing workspace_id")
@@ -252,6 +245,10 @@ impl TaskService {
         let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+        let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
+            .await?
+            .filter(|repo| repo.project_id == task.project_id)
+            .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
 
         let branch_ref = format!("{}...HEAD", repo.default_branch);
         let output = Command::new("git")

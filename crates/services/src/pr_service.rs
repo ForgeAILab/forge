@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use db::{
     new_uuid_v4, now_rfc3339, CreatePrMetadata, PrMetadata, PrMetadataRepo, PrProviderConfig,
     PrProviderConfigRepo, Repo, RepoRepo, SqliteDb, Task, TaskMetadata, TaskRepo, UpdatePrMetadata,
-    UpdateTaskStatus,
+    UpdateTaskStatus, WorkspaceRepo,
 };
 use events::EventBus;
 use serde_json::json;
@@ -300,13 +300,27 @@ impl PrReconciler {
         let task = TaskRepo::get_by_id(&*self.db, &metadata.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", metadata.task_id.clone()))?;
-        let repo_id = task
-            .repo_id
-            .as_deref()
-            .ok_or_else(|| ServiceError::invalid_operation("task has no associated repo"))?;
-        let repo = RepoRepo::get_by_id(&*self.db, repo_id)
+        let execution = crate::task_service::latest_executor_execution_for_task(&self.db, &task)
             .await?
-            .ok_or_else(|| ServiceError::not_found("repo", repo_id.to_owned()))?;
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(format!(
+                    "task {} has no executor execution for PR reconciliation",
+                    task.id
+                ))
+            })?;
+        let workspace_id = execution.workspace_id.as_deref().ok_or_else(|| {
+            ServiceError::invalid_operation(format!(
+                "executor execution {} is missing workspace_id",
+                execution.id
+            ))
+        })?;
+        let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+        let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
+            .await?
+            .filter(|repo| repo.project_id == task.project_id)
+            .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
         let config = PrProviderConfigRepo::get_by_repo_id(&*self.db, &repo.id)
             .await?
             .ok_or_else(|| ServiceError::PrProviderMissing {

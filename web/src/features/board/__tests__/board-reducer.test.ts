@@ -7,7 +7,6 @@ function task(id: string, position: number, version = 1): Task {
   return {
     id,
     project_id: 'project',
-    repo_id: null,
     title: id,
     task_type: 'task',
     status: 'todo',

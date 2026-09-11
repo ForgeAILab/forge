@@ -5,8 +5,8 @@ async fn batch_5_4_subtask_management_allows_manual_child_transition() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let root = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let root = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     let child = seed_subtask_with_status(&db, &root, "child", "todo".to_owned(), 0).await;
 
     let result = service
@@ -44,9 +44,9 @@ async fn batch_5_6_root_is_coordination_only() {
     let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
         .with_workspace_root(workspace_root.path().to_path_buf())
         .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()));
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let root = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let root = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     let child = seed_subtask_with_status(&db, &root, "child", "todo".to_owned(), 0).await;
 
     let result = service
@@ -66,8 +66,8 @@ async fn batch_5_7_reorder_subtasks_requires_all_ids() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let root = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let root = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     let first = seed_subtask_with_status(&db, &root, "first", "todo".to_owned(), 0).await;
     let second = seed_subtask_with_status(&db, &root, "second", "todo".to_owned(), 1).await;
     let third = seed_subtask_with_status(&db, &root, "third", "todo".to_owned(), 2).await;

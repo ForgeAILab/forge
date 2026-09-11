@@ -398,7 +398,6 @@ fn task(id: &str, project_id: &str, title: &str) -> CreateTask {
     CreateTask {
         id: id.to_owned(),
         project_id: project_id.to_owned(),
-        repo_id: None,
         parent_task_id: None,
         assignee_type: None,
         assignee_id: None,

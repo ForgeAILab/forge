@@ -61,27 +61,6 @@ impl TaskService {
         else {
             return Ok(());
         };
-        if super::super::subtask::coordination_root_has_subtasks(&self.db, &task).await? {
-            // A coordination root never resumes or advances from a legacy
-            // implementation execution. Its children own implementation;
-            // recover by waking the first incomplete child, or advance the
-            // root only after the entire ordered sequence has settled.
-            self.clear_workflow_guard_retry_metadata(&task.id).await?;
-            if super::super::subtask::coordination_root_sequence_complete(
-                &self.db, &task, &workflow,
-            )
-            .await?
-            {
-                self.advance_coordination_root(&task.id).await?;
-            } else {
-                self.wake_next_ordered_subtask(
-                    &task.id,
-                    "coordination root is waiting for its next ordered subtask",
-                )
-                .await?;
-            }
-            return Ok(());
-        }
         if let Some(summary) = execution.summary.as_deref().map(str::trim) {
             if !summary.is_empty() {
                 let content = format!("Agent completed execution: {summary}");

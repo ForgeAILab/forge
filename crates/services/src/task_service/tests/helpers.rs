@@ -74,6 +74,35 @@ pub(super) async fn seed_project_repo(db: &SqliteDb) -> (String, String, TempDir
     (project_id, repo_id, repo_dir)
 }
 
+pub(super) fn initialize_primary_repository(repo_dir: &TempDir) {
+    for args in [
+        &["init", "-b", "main"][..],
+        &["config", "user.email", "test@forge.dev"][..],
+        &["config", "user.name", "Forge Test"][..],
+    ] {
+        run_git_fixture(repo_dir, args);
+    }
+    std::fs::write(repo_dir.path().join("README.md"), "# Forge\n").expect("fixture README writes");
+    run_git_fixture(repo_dir, &["add", "-A"]);
+    run_git_fixture(repo_dir, &["commit", "-m", "initial fixture"]);
+}
+
+fn run_git_fixture(repo_dir: &TempDir, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo_dir.path())
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .expect("git fixture command runs");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 pub(super) async fn seed_agent(db: &SqliteDb) -> String {
     let now = now_rfc3339();
     let daemon_id = new_uuid_v4();
@@ -145,19 +174,13 @@ pub(super) async fn seed_agent(db: &SqliteDb) -> String {
     agent_id
 }
 
-pub(super) async fn seed_task_with_status(
-    db: &SqliteDb,
-    project_id: &str,
-    repo_id: &str,
-    status: &str,
-) -> Task {
-    seed_task_with_status_at(db, project_id, repo_id, status, &now_rfc3339()).await
+pub(super) async fn seed_task_with_status(db: &SqliteDb, project_id: &str, status: &str) -> Task {
+    seed_task_with_status_at(db, project_id, status, &now_rfc3339()).await
 }
 
 pub(super) async fn seed_task_with_status_at(
     db: &SqliteDb,
     project_id: &str,
-    repo_id: &str,
     status: &str,
     timestamp: &str,
 ) -> Task {
@@ -166,7 +189,6 @@ pub(super) async fn seed_task_with_status_at(
         CreateTask {
             id: new_uuid_v4(),
             project_id: project_id.to_owned(),
-            repo_id: Some(repo_id.to_owned()),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,

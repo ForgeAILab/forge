@@ -49,12 +49,18 @@ async fn all_migrations_apply_and_task_role_assignment_post_sweep_shape_is_valid
     .await
     .expect("repo inserts");
 
+    sqlx::query("UPDATE project SET primary_repo_id = ? WHERE id = ?")
+        .bind(&repo_id)
+        .bind(&project_id)
+        .execute(&pool)
+        .await
+        .expect("project primary repo attaches");
+
     sqlx::query(
-        "INSERT INTO task (id, project_id, repo_id, title, created_at, updated_at) VALUES (?, ?, ?, 'Task', ?, ?)",
+        "INSERT INTO task (id, project_id, title, created_at, updated_at) VALUES (?, ?, 'Task', ?, ?)",
     )
     .bind(&task_id)
     .bind(&project_id)
-    .bind(&repo_id)
     .bind(&now)
     .bind(&now)
     .execute(&pool)

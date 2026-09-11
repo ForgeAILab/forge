@@ -6,8 +6,30 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Added
+
+- CLI-harness agents and per-execution overrides now offer an explicit `YOLO`
+  permission policy. It selects the executor's full-access/no-prompt mode
+  (including Codex `danger-full-access` with approvals set to `never`) while
+  preserving Forge's Project/Task scope, Workspace-lease, Chat filesystem, and
+  user-only approval boundaries. Existing `Auto` profiles keep their prior
+  behavior.
+- `forge_create_task` now accepts optional `depends_on_ids` and commits all
+  validated prerequisite links atomically with the Task. MCP also exposes
+  `forge_list_task_dependents`, `forge_list_sub_tasks`, and
+  `forge_reorder_sub_tasks`; the latter two report ordered direct children of a
+  coordination root.
 ### Breaking
 
+- Tasks no longer store or expose `repo_id`. Repository selection is owned by
+  the Project's current `primary_repo_id`, so Tasks accepted before repository
+  setup become dispatchable after a valid same-Project Repo is attached without
+  a Task backfill. Task REST/MCP/Solo responses and generated clients remove the
+  field with no compatibility alias. Workspaces and Workspace leases continue
+  to pin the exact repository used by an execution attempt, and review, PR,
+  evidence, and release records retain their historical repository provenance.
+  Deleting a Repo no longer cascades into deleting its Project's Tasks; Tasks
+  remain as history while the Project returns to repository-setup-required.
 - `forge_assign_agent` now assigns the Task's effective implementation role
   without claiming the Task or creating an Execution. Assignment is allowed
   while a Project is paused; the scheduler starts assigned work after resume.
@@ -30,20 +52,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   now treats `parent_task_id` as the shared-root hierarchy/workspace relation
   and dependency IDs as prerequisite DAG edges only; a child cannot depend on
   its coordination parent.
-
-### Added
-
-- `forge_create_task` now accepts optional `depends_on_ids` and commits all
-  validated prerequisite links atomically with the Task. MCP also exposes
-  `forge_list_task_dependents`, `forge_list_sub_tasks`, and
-  `forge_reorder_sub_tasks`; the latter two report ordered direct children of a
-  coordination root.
-- CLI-harness agents and per-execution overrides now offer an explicit `YOLO`
-  permission policy. It selects the executor's full-access/no-prompt mode
-  (including Codex `danger-full-access` with approvals set to `never`) while
-  preserving Forge's Project/Task scope, Workspace-lease, Chat filesystem, and
-  user-only approval boundaries. Existing `Auto` agents keep their prior
-  behavior.
 
 ### Fixed
 
@@ -554,7 +562,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Rows written before this change keep the old mixed semantics; usage
   recorded by the embedded runtime and the Codex adapter reads high on
   `input_tokens` for historical executions and chat turns.
-
 
 ### Added
 

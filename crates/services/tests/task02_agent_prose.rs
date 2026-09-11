@@ -137,7 +137,6 @@ async fn fixture() -> Fixture {
         CreateTask {
             id: TASK_ID.to_owned(),
             project_id: PROJECT_ID.to_owned(),
-            repo_id: None,
             parent_task_id: None,
             assignee_type: None,
             assignee_id: None,

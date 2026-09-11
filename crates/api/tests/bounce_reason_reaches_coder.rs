@@ -163,7 +163,6 @@ async fn seed_project_repo_and_task(db: &SqliteDb, status: &str) -> String {
         CreateTask {
             id: task_id.clone(),
             project_id,
-            repo_id: Some(repo_id),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,

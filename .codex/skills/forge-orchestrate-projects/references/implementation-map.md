@@ -67,14 +67,16 @@ The implementation must preserve the current singular-scope architecture:
 
 The internal WorkspaceLease path is concrete. V076 creates the
 `workspace_lease` table with Project/Task plus exact Task version and execution
-attempt, logical repository binding, base ref, role, capability JSON, assigned
+attempt, attempt-pinned repository binding, base ref, role, capability JSON, assigned
 principal, capability-profile revision/digest, issuing principal, issue/expiry,
 status, and version. `WorkspaceLeaseRepo` persists issue/read/revoke/expire
 operations; `TaskService` creates the execution/lease pair atomically for
-claims, checks Charter/baseline governance and repository-binding equality, and
+claims, resolves the Project's current primary Repo, checks same-Project
+ownership plus Charter/baseline governance and Workspace-binding equality, and
 verifies the active lease against the execution/principal/profile/capability
 before launch and recovery. SQLite enforces one active lease per Task,
-Project/Task and running-execution scope, exact Task-version/assignment/profile
+Project/Task, current Project primary Repo, execution Workspace, and
+running-execution scope, exact Task-version/assignment/profile
 predicates, and either the active user-approved baseline or the narrowly
 read-only pre-baseline discovery/planning branch. The exact execution identity
 is persisted as the lease operation idempotency key: replay returns the same
@@ -650,7 +652,7 @@ Add focused tests for:
 Run the black-box acceptance IDs in
 `.codex/skills/forge-orchestrate-projects/references/acceptance-scenarios.md`,
 at minimum AUTH-01–04, HAND-01–04, APPR-01–03, PLAN-01–04, CHANGE-01–05,
-TASK-01–02, RES-01–02, MILE-01–07, MEDIA-01–05, and STATE-01–04.
+TASK-01–04, RES-01–02, MILE-01–07, MEDIA-01–05, and STATE-01–04.
 
 The live browser gate is a real embedded/local flow, not a mocked dashboard:
 

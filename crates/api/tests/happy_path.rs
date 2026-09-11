@@ -352,6 +352,7 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
         failed_follow_up.parent_execution_id.as_deref(),
         Some(first_ci_execution.id.as_str())
     );
+    poll_until_execution_stopped(&harness.state.db, &failed_follow_up.id).await;
     let after_ci_failure: TaskResponse = empty_request(
         &harness.app,
         Method::GET,
@@ -741,6 +742,21 @@ async fn poll_until_execution_completed(db: &Arc<db::SqliteDb>, execution_id: &s
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("execution did not complete within timeout");
+}
+
+async fn poll_until_execution_stopped(db: &Arc<db::SqliteDb>, execution_id: &str) {
+    for _ in 0..100 {
+        if let Some(execution) = db::ExecutionRepo::get_by_id(&**db, execution_id)
+            .await
+            .expect("execution lookup")
+        {
+            if execution.status != db::ExecutionStatus::Running {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("execution did not stop within timeout");
 }
 
 async fn poll_until_workspace_written(app: &Router, task_id: &str, greeting_path: &Path) {

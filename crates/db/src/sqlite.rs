@@ -204,7 +204,7 @@ fn order_clause_for(page: &PageRequest, supports_priority: bool) -> &'static str
     }
 }
 
-const TASK_COLUMNS: &str = "id, project_id, repo_id, parent_task_id, assignee_type, assignee_id, title, description, task_type, status, is_automation, priority, board_position, subtask_order, task_state_config, merge_config, metadata_json, plan, error_annotation, blocked_json, failed_json, entry_barrier_json, review_passed_at, archived_at, deleted_at, version, created_at, updated_at";
+const TASK_COLUMNS: &str = "id, project_id, parent_task_id, assignee_type, assignee_id, title, description, task_type, status, is_automation, priority, board_position, subtask_order, task_state_config, merge_config, metadata_json, plan, error_annotation, blocked_json, failed_json, entry_barrier_json, review_passed_at, archived_at, deleted_at, version, created_at, updated_at";
 const PROJECT_COLUMNS: &str = "id, name, settings, workflow_definition, workflow_template_name, primary_repo_id, paused_at, system_pause_reason, owner_id, project_hooks_json, project_work_epoch, charter_status, charter_setup_required, current_charter_id, current_charter_revision_id, current_charter_version, primary_milestone_id, version, created_at, updated_at";
 
 fn limit(page: &PageRequest) -> i64 {
@@ -440,7 +440,6 @@ fn map_task(row: SqliteRow) -> Result<Task> {
     Ok(Task {
         id: row.try_get("id")?,
         project_id: row.try_get("project_id")?,
-        repo_id: row.try_get("repo_id")?,
         parent_task_id: row.try_get("parent_task_id")?,
         assignee_type: row.try_get("assignee_type")?,
         assignee_id: row.try_get("assignee_id")?,
@@ -620,8 +619,11 @@ impl SqliteDb {
         // The service removes a newly prepared workspace when this guard
         // rejects the execution, so no fresh lease remains behind.
         // Legacy/unverified Projects intentionally bypass this guard.
-        if input.status == ExecutionStatus::Running && input.workspace_id.is_some() {
-            Self::ensure_execution_admission_in_tx(transaction, &input.task_id).await?;
+        if input.status == ExecutionStatus::Running {
+            if let Some(workspace_id) = input.workspace_id.as_deref() {
+                Self::ensure_execution_admission_in_tx(transaction, &input.task_id, workspace_id)
+                    .await?;
+            }
         }
         if input.status == ExecutionStatus::Running {
             // Child admission is rechecked under the same writer lock as the
@@ -782,21 +784,38 @@ impl SqliteDb {
     async fn ensure_execution_admission_in_tx(
         transaction: &mut Transaction<'_, Sqlite>,
         task_id: &str,
+        workspace_id: &str,
     ) -> Result<()> {
         let blocked: Option<i64> = sqlx::query_scalar(
-            "SELECT CASE WHEN p.charter_status = 'charter_backed'
-                                  AND p.charter_setup_required = 0
-                                  AND t.repo_id IS NOT NULL
-                                  AND NOT (
-                                      COALESCE(g.runnable, 0) = 1
-                                      AND g.charter_revision_id = p.current_charter_revision_id
-                                  )
-                             THEN 1 ELSE 0 END
+            "SELECT CASE
+                        WHEN p.primary_repo_id IS NULL
+                          OR NOT EXISTS (
+                              SELECT 1 FROM repo r
+                              WHERE r.id = p.primary_repo_id
+                                AND r.project_id = p.id
+                          )
+                          OR NOT EXISTS (
+                              SELECT 1 FROM workspace w
+                              WHERE w.id = ? AND w.repo_id = p.primary_repo_id
+                          )
+                        THEN 1
+                        WHEN p.charter_status = 'charter_backed'
+                          AND p.charter_setup_required = 0
+                          AND (
+                              p.current_charter_revision_id IS NULL
+                              OR g.charter_revision_id IS NULL
+                              OR g.charter_revision_id != p.current_charter_revision_id
+                          )
+                        THEN 1
+                        ELSE 0
+                    END
              FROM task t
              JOIN project p ON p.id = t.project_id
-             LEFT JOIN project_task_governance g ON g.task_id = t.id
+             LEFT JOIN project_task_governance g
+               ON g.task_id = t.id AND g.project_id = p.id
              WHERE t.id = ?",
         )
+        .bind(workspace_id)
         .bind(task_id)
         .fetch_optional(&mut **transaction)
         .await?;

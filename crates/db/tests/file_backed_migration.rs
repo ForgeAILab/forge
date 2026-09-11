@@ -842,7 +842,6 @@ async fn discovery_task_type_migration_preserves_rows_and_constraints() {
         CreateTask {
             id: "discovery-task".to_owned(),
             project_id: "discovery-project".to_owned(),
-            repo_id: Some("discovery-repo".to_owned()),
             parent_task_id: None,
             assignee_type: None,
             assignee_id: None,
@@ -873,7 +872,6 @@ async fn discovery_task_type_migration_preserves_rows_and_constraints() {
     for object in [
         "idx_task_status_project",
         "idx_task_parent",
-        "idx_task_repo",
         "idx_task_assignee",
         "idx_task_parent_subtask_order",
         "idx_task_project_archived",
@@ -890,6 +888,19 @@ async fn discovery_task_type_migration_preserves_rows_and_constraints() {
             .expect("schema object lookup");
         assert_eq!(count, 1, "schema object {object} should survive rebuild");
     }
+    let retired_task_repo_index: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_task_repo'")
+            .fetch_one(&pool)
+            .await
+            .expect("retired Task repository index lookup");
+    assert_eq!(
+        retired_task_repo_index, 0,
+        "V138 should remove the Task repository index"
+    );
+    assert!(
+        !task_sql.contains("repo_id"),
+        "V138 should remove the Task repository column"
+    );
     let foreign_key_violations: Vec<(String, i64, String, i64)> =
         sqlx::query_as("PRAGMA foreign_key_check")
             .fetch_all(&pool)

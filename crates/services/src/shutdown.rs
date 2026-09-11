@@ -298,7 +298,6 @@ mod tests {
     async fn seed_task(
         db: &SqliteDb,
         project_id: String,
-        repo_id: String,
         status: TaskStatus,
         agent_id: Option<String>,
     ) -> String {
@@ -308,7 +307,6 @@ mod tests {
             CreateTask {
                 id: new_uuid_v4(),
                 project_id,
-                repo_id: Some(repo_id),
                 parent_task_id: None,
                 subtask_order: None,
                 assignee_type: agent_id.as_ref().map(|_| "agent".to_owned()),
@@ -376,12 +374,11 @@ mod tests {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let mut rx = event_bus.subscribe();
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let agent_id = seed_agent(&db).await;
         let task_id = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(agent_id.clone()),
         )
@@ -418,12 +415,11 @@ mod tests {
     async fn shutdown_cancels_running_executor_processes_before_recovery() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let agent_id = seed_agent(&db).await;
         let task_id = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(agent_id.clone()),
         )
@@ -451,12 +447,11 @@ mod tests {
     async fn shutdown_keeps_active_task_with_resumable_execution() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let task_agent_id = seed_agent(&db).await;
         let task_id = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(task_agent_id.clone()),
         )
@@ -492,8 +487,8 @@ mod tests {
     async fn shutdown_leaves_non_running_tasks_unchanged() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
-        let (project_id, repo_id) = seed_project_repo(&db).await;
-        let task_id = seed_task(&db, project_id, repo_id, "todo".to_owned(), None).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
+        let task_id = seed_task(&db, project_id, "todo".to_owned(), None).await;
         let version = TaskRepo::get_by_id(&*db, &task_id, false)
             .await
             .expect("task fetches")

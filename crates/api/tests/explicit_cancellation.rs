@@ -152,7 +152,6 @@ async fn seed_project_repo_and_task(db: &SqliteDb, task_id: &str, status: &str) 
         CreateTask {
             id: task_id.to_owned(),
             project_id,
-            repo_id: Some(repo_id),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,

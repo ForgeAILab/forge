@@ -63,7 +63,6 @@ function task(
   return {
     id: 'task-1',
     project_id: 'project-1',
-    repo_id: 'repo-1',
     title: 'Task',
     task_type: 'task',
     status,

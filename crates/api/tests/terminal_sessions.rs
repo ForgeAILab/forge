@@ -168,7 +168,7 @@ async fn seed_task(harness: &Harness) -> SeededTask {
     let project_id = new_uuid_v4();
     let repo_id = new_uuid_v4();
     let task_id = new_uuid_v4();
-    db::ProjectRepo::create(
+    let project = db::ProjectRepo::create(
         &*harness.state.db,
         db::CreateProject {
             id: project_id.clone(),
@@ -199,12 +199,26 @@ async fn seed_task(harness: &Harness) -> SeededTask {
     )
     .await
     .unwrap();
+    db::ProjectRepo::update_at_version(
+        &*harness.state.db,
+        db::UpdateProject {
+            id: project_id.clone(),
+            name: None,
+            settings: None,
+            primary_repo_id: Some(Some(repo_id.clone())),
+            paused_at: None,
+            updated_at: now.clone(),
+        },
+        project.version,
+        None,
+    )
+    .await
+    .expect("terminal fixture primary repo updates");
     db::TaskRepo::create(
         &*harness.state.db,
         db::CreateTask {
             id: task_id.clone(),
             project_id,
-            repo_id: Some(repo_id.clone()),
             parent_task_id: None,
             assignee_type: None,
             assignee_id: None,

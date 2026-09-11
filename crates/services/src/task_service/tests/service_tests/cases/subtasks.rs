@@ -3,8 +3,8 @@ use super::super::*;
 #[tokio::test]
 async fn subtask_helpers_resolve_root_and_subtask() {
     let db = Arc::new(sqlite_db().await);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let root = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let root = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     let subtask = seed_subtask_with_status(&db, &root, "child", "todo".to_owned(), 0).await;
     let root_id = root.id.clone();
 
@@ -81,10 +81,10 @@ async fn create_subtasks_preserves_input_order_and_rejects_different_assignee_at
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
     let _agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let root = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let root = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(&root.id, "coder", Some(agent_a.clone()), None),
@@ -118,10 +118,6 @@ async fn create_subtasks_preserves_input_order_and_rejects_different_assignee_at
     assert_eq!(subtasks[1].subtask_order, Some(1));
     assert_eq!(subtasks[0].project_id.as_str(), root.project_id.as_str());
     assert_eq!(
-        subtasks[0].repo_id.as_deref().unwrap(),
-        root.repo_id.as_deref().unwrap()
-    );
-    assert_eq!(
         subtasks[0].parent_task_id.as_deref(),
         Some(root.id.as_str())
     );
@@ -141,8 +137,8 @@ async fn reorder_subtasks_updates_order() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let root = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let root = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     let subtasks = service
         .create_subtasks(
             root.id.clone(),
@@ -166,6 +162,8 @@ async fn reorder_subtasks_updates_order() {
         )
         .await
         .expect("subtasks create");
+    // The first incomplete child is the durable sequence cursor. Reorder only
+    // the untouched todo suffix behind it.
     let reordered_ids = vec![
         subtasks[0].id.clone(),
         subtasks[2].id.clone(),

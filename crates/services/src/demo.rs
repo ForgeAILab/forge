@@ -121,10 +121,10 @@ const DEMO_TASKS: &[DemoTask] = &[
 pub async fn install_demo_data(db: &SqliteDb) -> Result<()> {
     let now = now_rfc3339();
     let project = find_or_create_demo_project(db, &now).await?;
-    let repo = find_or_create_demo_repo(db, &project.id, &now).await?;
+    find_or_create_demo_repo(db, &project.id, &now).await?;
     let agent_id = find_or_create_null_agent(db, &now).await?;
     install_demo_daemon(db, &now).await?;
-    install_demo_tasks(db, &project.id, &repo.id, &agent_id, &now).await?;
+    install_demo_tasks(db, &project.id, &agent_id, &now).await?;
 
     tracing::info!("demo data installed");
     Ok(())
@@ -272,7 +272,6 @@ async fn install_demo_daemon(db: &SqliteDb, now: &str) -> Result<()> {
 async fn install_demo_tasks(
     db: &SqliteDb,
     project_id: &str,
-    repo_id: &str,
     agent_id: &str,
     now: &str,
 ) -> Result<()> {
@@ -309,7 +308,6 @@ async fn install_demo_tasks(
             CreateTask {
                 id: task_id.clone(),
                 project_id: project_id.to_owned(),
-                repo_id: Some(repo_id.to_owned()),
                 parent_task_id: None,
                 subtask_order: None,
                 assignee_type: if is_active {

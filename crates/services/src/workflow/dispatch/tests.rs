@@ -18,7 +18,6 @@ fn fake_task(id: &str, title: &str, description: Option<&str>) -> db::Task {
     db::Task {
         id: id.to_string(),
         project_id: "project-1".to_string(),
-        repo_id: Some("repo-1".to_string()),
         parent_task_id: None,
         subtask_order: None,
         assignee_type: None,
@@ -658,7 +657,6 @@ async fn review_feedback_comes_from_the_reviewer_execution_not_the_reviewed_one(
         CreateTask {
             id: db::new_uuid_v4(),
             project_id: project_id.clone(),
-            repo_id: Some(repo_id),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,

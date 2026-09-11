@@ -57,10 +57,15 @@ async fn fixture_with_url(url: &str) -> SqliteDb {
     .execute(db.pool())
     .await
     .expect("repo");
+    sqlx::query("UPDATE project SET primary_repo_id = 'repo-evidence-command' WHERE id = ?")
+        .bind(PROJECT_ID)
+        .execute(db.pool())
+        .await
+        .expect("project primary repo");
     sqlx::query(
         "INSERT INTO task
-         (id, project_id, repo_id, title, task_type, status, created_at, updated_at)
-         VALUES (?, ?, 'repo-evidence-command', 'Evidence Task', 'task', 'todo', ?, ?)",
+         (id, project_id, title, task_type, status, created_at, updated_at)
+         VALUES (?, ?, 'Evidence Task', 'task', 'todo', ?, ?)",
     )
     .bind(TASK_ID)
     .bind(PROJECT_ID)

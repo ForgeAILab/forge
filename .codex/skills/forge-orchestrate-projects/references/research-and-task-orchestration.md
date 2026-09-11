@@ -7,7 +7,7 @@
 - Typed ResearchRecord and provenance
 - Pre-baseline limits
 - Task proposal contract and traceability
-- Repository bindings and capability profiles
+- Project repository authority and capability profiles
 - Scheduler-owned WorkspaceLease
 - Sanitized results and independent validation
 - Validation freshness
@@ -172,8 +172,8 @@ the Project Agent may:
 - create non-mutating discovery or planning Tasks with an explicit
   server-enforced profile;
 - perform read-only repository inspection only through an assigned Worker and
-  scheduler-issued read lease, when the Project and repository binding are
-  already authorized;
+  scheduler-issued read lease, when the Project's current primary Repo is
+  already valid and authorized;
 - draft or revise Project Documents, Decisions, ResearchRecords, assumptions,
   and non-runnable Task proposals; and
 - decompose implementation intent so that it can be reviewed as part of a
@@ -235,8 +235,9 @@ Every accepted Task is linked to exact immutable references:
 - parent Task, replacement/supersession, or discovery lineage when applicable;
 - acceptance criteria, evidence requirements, check-definition revisions, and
   release-policy revision; and
-- the capability-profile ID/revision/digest and repository-binding ID, when
-  relevant.
+- the capability-profile ID/revision/digest when relevant. Repository
+  selection is not copied into the Task; attempt provenance begins with the
+  Workspace and lease.
 
 These references are copied into the accepted Task revision and cannot be
 silently changed by a status update, retry, worker message, or chat turn. A
@@ -248,8 +249,7 @@ second mutable truth in a Markdown checklist or memory.
 
 The proposal must state:
 
-- the logical repository_binding_id, if any;
-- required server-resolved base input identity, without a path or bearer
+- required server-resolved base input identity, when applicable, without a path or bearer
   capability;
 - requested capability profile, risk class, time/resource bound, and retry
   policy;
@@ -262,43 +262,47 @@ The proposal must state:
 - expected governing versions/digests for compare-and-swap acceptance.
 
 Task prose may explain intent, but it cannot add capabilities, bypass
-dependencies, widen scope, waive a check, choose an unapproved repository, or
+dependencies, widen scope, waive a check, choose a repository, or
 make an external side effect safe. The server rejects fields that attempt to
 carry such authority.
 
-## Logical Repository Bindings and Capability Profiles
+## Project Repository Authority and Capability Profiles
 
-### Logical repository_binding_id only
+### Project selects; Task does not
 
-Task proposals may reference only an opaque, server-authorized
-repository_binding_id. The binding identifies the repository and policy
-without exposing how it is reached. The server re-authorizes that binding
-against the Project, Task, baseline, and principal at every boundary.
+Task proposals and Task records carry no repository selector or
+`repository_binding_id`. For every new repository-capable attempt, TaskService
+derives the Task's Project, resolves its current `project.primary_repo_id`, and
+requires that Repo to exist in and belong to the same Project. A missing or
+invalid pointer is a typed Project setup blocker; the server never substitutes
+an unselected Repo row or copies the selection into the Task.
 
 Reject model-generated repository paths, filesystem roots, raw repository URLs,
 branch checkout instructions, credentials, tokens, cookies, auth headers,
 environment variables, Workspace handles, lease secrets, and arbitrary
 capability instructions. A base ref or commit identity may be recorded only
 when the server resolves and pins it as an approved immutable input; it is not
-a substitute for a repository binding.
+a substitute for valid Project repository setup.
 
-The Project Agent never resolves the binding itself and never receives the
-resolved Workspace location. A repository binding is a logical reference, not
-a lease or permission.
+The Project Agent never resolves the Repo itself and never receives the
+resolved Workspace location. The scheduler records the resolved Repo as
+`workspace.repo_id` and `workspace_lease.repository_binding_id` only when it
+creates a concrete attempt. Those values are attempt-pinned provenance, not a
+Task selector or a lease exposed to chat.
 
 ### Capability profiles
 
 Capability profiles are server-owned allowlists with immutable revision and
 policy digest. A Task selects an eligible profile; it cannot define, extend, or
 reinterpret one in Task prose. The server checks the profile against the
-governing baseline, risk class, principal role, repository binding, and
+governing baseline, risk class, principal role, current Project repository, and
 operation type.
 
 A profile states at least:
 
 - permitted resource classes and operations, with read/write distinction;
 - command or tool allowlist and network/external-side-effect policy;
-- repository binding and base-input constraints;
+- Project repository and base-input constraints;
 - secret policy, data-egress/redaction rules, and protected-data exclusions;
 - maximum duration, retry/attempt budget, concurrency, and lease lifetime;
 - evidence/output classes that may be returned; and
@@ -321,10 +325,12 @@ capability; never guess an identifier or encode capability in prose.
 
 Only the scheduler may issue a WorkspaceLease after TaskService has accepted a
 runnable Task, checked its dependencies, and confirmed the governing baseline
-and profile are current. The lease is short-lived and bound to:
+and profile are current. Immediately before issuance, it resolves and
+re-authorizes the Project's current primary Repo and verifies that the
+execution Workspace uses the same Repo. The lease is short-lived and bound to:
 
 - Project ID, Task ID/revision, and attempt ID;
-- logical repository_binding_id and server-resolved immutable base ref;
+- attempt-pinned `repository_binding_id` and server-resolved immutable base ref;
 - assigned principal and role (Worker, reviewer, or automated runner);
 - exact capability-profile revision/digest;
 - lease version, issue time, expiry, and revocation policy.
@@ -501,7 +507,7 @@ reconciliation.
 - Partial outputs become canonical only after the server verifies their
   digest, scope, retention, and provenance. Unverifiable files, logs, or
   model claims remain non-authoritative diagnostic data.
-- A repository conflict, missing binding, stale profile, stale baseline,
+- A repository conflict, missing or invalid Project primary Repo, stale profile, stale baseline,
   dependency failure, or policy denial fails closed. Do not substitute a
   different repository, base ref, principal, or capability.
 - If a governing Charter/baseline/check revision changes, mark affected Tasks,
@@ -524,7 +530,8 @@ Before proposing a Task, confirm:
   server-derived and current;
 - the Task has an immutable origin plan item, milestone, acceptance boundary,
   evidence/validation plan, and idempotency key;
-- only a logical repository_binding_id is present;
+- the Task contains no repository selector, and any repository-capable attempt
+  will resolve only the Project's current same-Project primary Repo;
 - the selected server capability profile is eligible and cannot be widened by
   prose;
 - pre-baseline work is non-mutating, or an active approved baseline gates the

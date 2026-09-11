@@ -1578,7 +1578,6 @@ mod tests {
             CreateTask {
                 id: task_id.clone(),
                 project_id: project_id.to_string(),
-                repo_id: None,
                 parent_task_id: None,
                 assignee_type: None,
                 assignee_id: None,

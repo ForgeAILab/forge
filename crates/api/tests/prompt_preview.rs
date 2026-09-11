@@ -180,7 +180,7 @@ async fn direct_prompt_for_accept_to_planning(
         trigger_dispatch.as_ref(),
         state_dispatch.as_ref(),
     );
-    let context = review::contract::load_context(&db, task_id)
+    let context = review::contract::load_context(&db, task_id, None)
         .await
         .expect("governing context loads");
     prompt

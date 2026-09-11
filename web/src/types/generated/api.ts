@@ -549,7 +549,6 @@ export interface PaginatedResponse<T> {
 export interface Task {
   id: string
   project_id: string
-  repo_id: string | null
   parent_task_id?: string | null
   assignee_type?: string | null
   assignee_id?: string | null

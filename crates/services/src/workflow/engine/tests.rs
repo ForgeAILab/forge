@@ -89,7 +89,6 @@ async fn seed_project_repo_and_task(db: &SqliteDb, task_id: &str, status: &str) 
         CreateTask {
             id: task_id.to_owned(),
             project_id,
-            repo_id: Some(repo_id),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -1067,7 +1066,6 @@ async fn seed_custom_workflow_task(
         CreateTask {
             id: task_id.to_owned(),
             project_id: project_id.clone(),
-            repo_id: Some(repo_id),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -1321,7 +1319,6 @@ async fn gate_approve_reject_on_custom_gate_states() {
             CreateTask {
                 id: task_id.to_owned(),
                 project_id: project_id.clone(),
-                repo_id: Some(repo_id.clone()),
                 parent_task_id: None,
                 subtask_order: None,
                 assignee_type: None,
@@ -1751,7 +1748,6 @@ async fn planning_gate_reject_back_to_itself() {
         CreateTask {
             id: task_id.clone(),
             project_id: project_id.clone(),
-            repo_id: Some(repo_id),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -1963,7 +1959,6 @@ async fn seed_parent_and_subtask(
         CreateTask {
             id: subtask_id.to_owned(),
             project_id: parent.project_id.clone(),
-            repo_id: parent.repo_id.clone(),
             parent_task_id: Some(parent_id.to_owned()),
             subtask_order: Some(0),
             assignee_type: None,

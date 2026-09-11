@@ -255,9 +255,7 @@ An Agent response represents a stable identity plus its currently selected
 immutable profile. Connection/profile APIs accept provider credentials only in
 request bodies and immediately move them behind a protected write-only store;
 responses, events, errors, and logs contain only opaque credential handles and
-bounded health. Profile `config` fields are recursively redacted. Agent
-responses expose `daemon_id` only to administrators, including account rosters,
-Project-agent candidate lists, and embedded-agent create/connect responses.
+bounded health. Profile `config` fields are recursively redacted.
 
 Creating or connecting an identity grants no Main or Project binding. The
 account may explicitly select one active Main Agent binding, and each
@@ -325,6 +323,14 @@ unavailable in one local transaction. The response is
 `{"id":"...","status":"revoked","provider_revocation":"not_supported|succeeded|failed"}`;
 remote provider revocation is best effort when supported and a failure never
 restores the local secret.
+
+Direct ChatGPT-login profiles accept an optional `reasoning_effort` on both
+`POST /api/v1/embedded-agents` and
+`POST /api/v1/agents/{id}/profiles/connect`. Supported values are resolved per
+model from the Codex catalog; current models may advertise `low`, `medium`,
+`high`, `xhigh`, `max`, and `ultra`. Omission preserves the provider default.
+The selected value is stored on the immutable profile and applied to native
+Main Chat, Project Agent Chat, Task, and inquiry turns.
 
 `PATCH /api/v1/projects/{id}` requires `version`. A successful mutation
 increments the Project version; a stale request returns HTTP 409.
@@ -483,6 +489,14 @@ checked before replay lookup, so an idempotency key cannot be used to probe a
 foreign Charter, milestone check, or Document approval.
 
 ### Project Charters, Documents, Decisions, and effective state
+
+The scoped `project.current_state` tool includes `adoption_charter` while the
+bound Project still requires initial Charter adoption. It contains the latest
+unapproved draft's `charter_id`, `revision_id`, `revision`, Charter `version`,
+`content_digest`, `render_digest`, and typed `content` (bounded to 128 KiB).
+It is null when no draft exists or adoption is complete. This draft remains
+separate from `effective_state.governing_charter`; reading it grants no approval
+or repository authority.
 
 The Project Charter route exposes immutable revisions, exact content/render
 digests, approval/supersession history, and the current-approved pointer.
@@ -833,7 +847,9 @@ the frozen original Task; reusing the key with changed input or principal is an
 idempotency conflict. A denied or invalid proposal is never listed as a Task.
 The exact closed proposal payload is validated before the command runs. For a
 Charter-backed Project, an omitted governance object is derived from the
-current approved Charter and repository-backed Tasks are runnable immediately.
+current approved Charter. Repository-capable Tasks may run once the Project's
+current primary Repo and ordinary Task gates are ready; the proposal neither
+accepts nor persists a Task repository selector.
 `planning_task` and `discovery` use the read-only capability lane. A proposal that supplies
 `plan_item_id` or `milestone_id` binds those optional references to the
 Project's own records even when `capability_class` is read-only. Optional
@@ -1808,6 +1824,17 @@ independently, along with the current repository, selected principals, eligible
 identities, typed setup requirements, and the durable provisioning operation
 when one exists.
 
+Repository selection is Project-owned. `project.primary_repo_id` must resolve
+to a Repo owned by that same Project and is the only pre-execution repository
+authority for every Task in the Project. Task create/update requests do not
+accept a repository selector, and Task responses no longer contain `repo_id`.
+A Task accepted before repository attachment therefore needs no Task mutation
+or backfill: after a valid Repo becomes primary, the next normal scheduler wake
+may dispatch it when its independent Charter, workflow, dependency, assignment,
+capability, retry, and version gates pass. A missing, nonexistent, or
+cross-Project primary pointer is returned as Project setup required; Forge
+issues no Workspace or lease and never substitutes another Repo row.
+
 The response also includes `availability` for each dimension. `current` means
 the authoritative rows were read; `unavailable` (with a `refresh_and_retry`
 action) means that dimension must not be inferred from the other two. A
@@ -1863,6 +1890,12 @@ response-build time from the project's resolved workflow and the task's current
 `status`; it is not persisted. The value is one of `backlog`, `ready`,
 `working`, `review`, or `done`. Cancelled workflow states map to `done`.
 
+`repo_id` is not a Task field. REST and MCP Task objects, Solo Task snapshots,
+and generated clients omit it. For work that has already run, repository
+identity is read from the execution's Workspace or Workspace lease; review,
+pull-request, evidence, and release records retain that attempt-pinned
+provenance even if the Project later selects another primary Repo.
+
 Task role rows, not Project defaults, authorize Task execution. `PUT
 /api/v1/tasks/{id}/roles/{role_name}` accepts any effectively available
 Project-usable Agent; the same eligible identity may be assigned to both
@@ -1876,14 +1909,6 @@ assignment, wakes a Task parked on a stale dispatch blocker. When that role
 selection is newer than the latest stopped attempt for the role, the dispatcher
 treats it as the explicit retry signal and starts one fresh attempt without a
 separate `POST /resume` action.
-
-Built-in workflow templates expose four review choices: `default` (Agent
-review), `no-review`, `human-required`, and the `autonomous_v1` compatibility
-preset. A Task may override the Project default. In `human-required`, either the
-interactive user or the bound Project Agent may accept or reject through the
-normal Task workflow; the Project Agent uses the native ReadyOnly `task.review`
-operation, which validates the exact binding, Project, Task version, CI, and
-evidence before transition.
 
 ## Task hierarchy, workspaces, and prerequisite dependencies
 
@@ -1912,6 +1937,14 @@ The current Project Agent operating skill is
 `forge.project.orchestration/v1@16` (activated by V137). Its task-coordination
 doctrine uses the same distinction: `parent_task_id` selects the shared root
 workspace, while dependency IDs only gate execution.
+
+Built-in workflow templates expose four review choices: `default` (Agent
+review), `no-review`, `human-required`, and the `autonomous_v1` compatibility
+preset. A Task may override the Project default. In `human-required`, either the
+interactive user or the bound Project Agent may accept or reject through the
+normal Task workflow; the Project Agent uses the native ReadyOnly `task.review`
+operation, which validates the exact binding, Project, Task version, CI, and
+evidence before transition.
 
 ## Execution status and liveness
 
@@ -1969,8 +2002,8 @@ uses that adapter's least-restricted mode (for Codex, `danger-full-access` plus
 for OpenCode, `--dangerously-skip-permissions`; and for Cursor, `--force`). It
 applies only to admitted CLI Task executions. Forge still derives Project and
 Task scope server-side, requires the normal assignment and Workspace lease,
-keeps Agent Chat read-only, and reserves approvals, waivers, and releases for
-the user.
+keeps Main/Project Agent Chats filesystem-denied, and reserves user-only
+approval, waiver, and release operations for the user.
 
 Codex currently advertises GPT-5.6 Sol, Terra, and Luna plus supported older
 picker models. Claude Code advertises Claude Fable 5, Opus 5, Sonnet 5, and
@@ -3133,6 +3166,7 @@ permuted, so an active child cannot be moved behind a newly selected sibling.
 
 The direct MCP task response is the normal task object plus
 `depends_on_ids: string[]` (an empty array when no prerequisites were supplied).
+It does not expose `repo_id`; repository selection belongs to Project setup.
 The exact response fields for the graph/subtask helpers are:
 
 `forge_list_task_dependencies`:
@@ -3186,14 +3220,14 @@ outcomes](#native-and-mcp-orchestration-outcomes).
 `task.propose` action/receipt operation; its result therefore has no
 `AgentAction` execution id. It accepts the optional `type` field (`task`,
 `planning_task`, `sub_task`, or `discovery`) and passes it through to the
-authoritative Task service. A project-scoped MCP connection may omit
-`project_id`; Forge injects the bound Project and rejects a conflicting
-reference. It also accepts optional `parent_task_id` and `depends_on_ids`.
-Forge validates all dependency IDs, same-Project scope, acyclicity,
-cancellation state, and the parent/dependency exclusion before committing the
-Task and every prerequisite link in one transaction; an invalid prerequisite
-leaves no Task behind. `parent_task_id` creates the shared-root subtask
-relationship only, while `depends_on_ids` gates execution only.
+authoritative Task service. It also accepts optional `parent_task_id` and
+`depends_on_ids`. Forge validates all dependency IDs, same-Project scope,
+acyclicity, cancellation state, and the parent/dependency exclusion before
+committing the Task and every prerequisite link in one transaction; an invalid
+prerequisite leaves no Task behind. `parent_task_id` creates the shared-root
+subtask relationship only, while `depends_on_ids` gates execution only. A
+project-scoped MCP connection may omit `project_id`; Forge injects the bound
+Project and rejects a conflicting reference.
 
 `forge_create_project` also derives the authenticated MCP user rather than
 accepting an owner argument. Project creation commits the Project and that

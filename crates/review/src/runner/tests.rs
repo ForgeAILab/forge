@@ -156,7 +156,6 @@ async fn seeded_review(ci_steps: Vec<&str>) -> SeededReview {
         CreateTask {
             id: task_id.to_string(),
             project_id,
-            repo_id: Some(repo_id.clone()),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -292,7 +291,7 @@ async fn review_source_includes_task_worklog_and_media_deliverables() {
 
     let source = seed
         .db
-        .review_source(&seed.task_id.to_string())
+        .review_source(&seed.task_id.to_string(), None)
         .await
         .expect("review source loads");
     assert_eq!(
@@ -313,6 +312,65 @@ async fn review_source_includes_task_worklog_and_media_deliverables() {
         context.task_scope["evidence"]["worklog"][0]["kind"],
         "validation"
     );
+}
+
+#[tokio::test]
+async fn review_source_keeps_execution_workspace_repository_after_project_reselection() {
+    let seed = seeded_review(Vec::new()).await;
+    let task = TaskRepo::get_by_id(&*seed.db, &seed.task_id.to_string(), false)
+        .await
+        .expect("task lookup succeeds")
+        .expect("seed task exists");
+    let workspace = WorkspaceRepo::get_by_task_id(&*seed.db, &task.id)
+        .await
+        .expect("workspace lookup succeeds")
+        .expect("seed workspace exists");
+    let replacement_repo_id = Uuid::new_v4().to_string();
+    let now = now_rfc3339();
+    RepoRepo::create(
+        &*seed.db,
+        CreateRepo {
+            id: replacement_repo_id.clone(),
+            project_id: task.project_id.clone(),
+            name: "replacement".to_owned(),
+            remote_url: "https://example.com/replacement.git".to_owned(),
+            local_path: None,
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch: "trunk".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("replacement repo creates");
+    let project = ProjectRepo::get_by_id(&*seed.db, &task.project_id)
+        .await
+        .expect("project lookup succeeds")
+        .expect("seed project exists");
+    ProjectRepo::update_at_version(
+        &*seed.db,
+        UpdateProject {
+            id: project.id,
+            name: None,
+            settings: None,
+            primary_repo_id: Some(Some(replacement_repo_id)),
+            paused_at: None,
+            updated_at: now_rfc3339(),
+        },
+        project.version,
+        None,
+    )
+    .await
+    .expect("project repo selection updates");
+
+    let source = seed
+        .db
+        .review_source(&task.id, Some(&seed.executor_execution_id.to_string()))
+        .await
+        .expect("review source loads");
+
+    assert_eq!(source["repo_id"], workspace.repo_id);
+    assert_eq!(source["task_scope"]["default_branch"], "main");
 }
 
 #[tokio::test]
@@ -639,7 +697,7 @@ async fn shell_governing_context_is_data_and_preserves_the_command() {
     let actual: api_types::ReviewGoverningContext = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         actual,
-        crate::contract::load_context(&seed.db, &seed.task_id.to_string())
+        crate::contract::load_context(&seed.db, &seed.task_id.to_string(), None)
             .await
             .unwrap()
     );

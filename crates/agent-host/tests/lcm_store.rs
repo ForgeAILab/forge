@@ -362,7 +362,6 @@ async fn runtime_session_rotation_restart_preserves_scope_timeline_and_isolation
         CreateTask {
             id: task_id.clone(),
             project_id: project_id.clone(),
-            repo_id: None,
             parent_task_id: None,
             assignee_type: None,
             assignee_id: None,

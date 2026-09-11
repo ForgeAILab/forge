@@ -25,9 +25,9 @@ async fn board_reorder_is_idempotent_and_emits_one_move_event() {
     let event_bus = Arc::new(EventBus::new(32));
     let mut events = event_bus.subscribe();
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let first = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
-    let moved = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let first = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
+    let moved = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     let revision = TaskBoardRepo::board_revision(&*db, &project_id)
         .await
         .expect("revision loads");
@@ -78,8 +78,8 @@ async fn cross_column_move_preserves_workflow_cascade_and_event_contract() {
     let event_bus = Arc::new(EventBus::new(64));
     let mut events = event_bus.subscribe();
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     let revision = TaskBoardRepo::board_revision(&*db, &project_id)
         .await
         .expect("revision loads");
@@ -135,12 +135,12 @@ async fn board_move_conflicts_and_guard_rejection_write_nothing() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(32));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     let stale_revision = TaskBoardRepo::board_revision(&*db, &project_id)
         .await
         .expect("revision loads");
-    let _other = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let _other = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     let stale = service
         .move_task(
             task.id.clone(),

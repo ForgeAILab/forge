@@ -224,7 +224,6 @@ mod tests {
             CreateTask {
                 id: root_id.clone(),
                 project_id: project_id.clone(),
-                repo_id: Some(repo_id.clone()),
                 parent_task_id: None,
                 subtask_order: None,
                 assignee_type: None,
@@ -250,7 +249,6 @@ mod tests {
             CreateTask {
                 id: new_uuid_v4(),
                 project_id,
-                repo_id: Some(repo_id),
                 parent_task_id: Some(root_id),
                 subtask_order: Some(0),
                 assignee_type: None,

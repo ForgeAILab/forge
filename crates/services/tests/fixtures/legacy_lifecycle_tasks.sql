@@ -46,7 +46,6 @@ WHERE id = 'fixture-project-strict';
 INSERT INTO task (
     id,
     project_id,
-    repo_id,
     title,
     description,
     task_type,
@@ -58,10 +57,10 @@ INSERT INTO task (
     created_at,
     updated_at
 ) VALUES
-    ('fixture-task-backlog', 'fixture-project-strict', 'fixture-repo-strict', 'Backlog task', 'Queued legacy work', 'task', 'backlog', 0, 0, '{}', 1, '2026-01-01T00:01:00Z', '2026-01-01T00:01:00Z'),
-    ('fixture-task-planning', 'fixture-project-strict', 'fixture-repo-strict', 'Planning task', 'Awaiting plan approval', 'task', 'planning', 0, 1, '{}', 1, '2026-01-01T00:02:00Z', '2026-01-01T00:02:00Z'),
-    ('fixture-task-active', 'fixture-project-strict', 'fixture-repo-strict', 'Active task', 'Being implemented', 'task', 'in_progress', 0, 2, '{}', 1, '2026-01-01T00:03:00Z', '2026-01-01T00:03:00Z'),
-    ('fixture-task-review', 'fixture-project-strict', 'fixture-repo-strict', 'Review task', 'Awaiting review', 'task', 'review', 0, 2, '{}', 1, '2026-01-01T00:04:00Z', '2026-01-01T00:04:00Z'),
-    ('fixture-task-merge-failed', 'fixture-project-strict', 'fixture-repo-strict', 'Merge failed task', 'Needs merge repair', 'task', 'merge_failed', 0, 2, '{}', 1, '2026-01-01T00:05:00Z', '2026-01-01T00:05:00Z'),
-    ('fixture-task-done', 'fixture-project-strict', 'fixture-repo-strict', 'Done task', 'Completed legacy work', 'task', 'done', 0, 0, '{}', 1, '2026-01-01T00:06:00Z', '2026-01-01T00:06:00Z'),
-    ('fixture-task-cancelled', 'fixture-project-strict', 'fixture-repo-strict', 'Cancelled task', 'Cancelled legacy work', 'task', 'cancelled', 0, 0, '{}', 1, '2026-01-01T00:07:00Z', '2026-01-01T00:07:00Z');
+    ('fixture-task-backlog', 'fixture-project-strict', 'Backlog task', 'Queued legacy work', 'task', 'backlog', 0, 0, '{}', 1, '2026-01-01T00:01:00Z', '2026-01-01T00:01:00Z'),
+    ('fixture-task-planning', 'fixture-project-strict', 'Planning task', 'Awaiting plan approval', 'task', 'planning', 0, 1, '{}', 1, '2026-01-01T00:02:00Z', '2026-01-01T00:02:00Z'),
+    ('fixture-task-active', 'fixture-project-strict', 'Active task', 'Being implemented', 'task', 'in_progress', 0, 2, '{}', 1, '2026-01-01T00:03:00Z', '2026-01-01T00:03:00Z'),
+    ('fixture-task-review', 'fixture-project-strict', 'Review task', 'Awaiting review', 'task', 'review', 0, 2, '{}', 1, '2026-01-01T00:04:00Z', '2026-01-01T00:04:00Z'),
+    ('fixture-task-merge-failed', 'fixture-project-strict', 'Merge failed task', 'Needs merge repair', 'task', 'merge_failed', 0, 2, '{}', 1, '2026-01-01T00:05:00Z', '2026-01-01T00:05:00Z'),
+    ('fixture-task-done', 'fixture-project-strict', 'Done task', 'Completed legacy work', 'task', 'done', 0, 0, '{}', 1, '2026-01-01T00:06:00Z', '2026-01-01T00:06:00Z'),
+    ('fixture-task-cancelled', 'fixture-project-strict', 'Cancelled task', 'Cancelled legacy work', 'task', 'cancelled', 0, 0, '{}', 1, '2026-01-01T00:07:00Z', '2026-01-01T00:07:00Z');

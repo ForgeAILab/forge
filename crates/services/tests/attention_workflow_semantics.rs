@@ -80,7 +80,6 @@ impl Fixture {
             CreateTask {
                 id: new_uuid_v4(),
                 project_id: self.project_id.clone(),
-                repo_id: None,
                 parent_task_id,
                 subtask_order: None,
                 assignee_type: None,

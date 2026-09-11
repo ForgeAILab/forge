@@ -381,6 +381,7 @@ pub fn outcome_for_service_error_with_correction(
         ),
         ServiceError::DependencyGate
         | ServiceError::MissingPrimaryRepo { .. }
+        | ServiceError::PrimaryRepoNotFound { .. }
         | ServiceError::RepoMismatch { .. }
         | ServiceError::PrProviderMissing { .. }
         | ServiceError::PrProviderTokenMissing { .. }
@@ -465,6 +466,7 @@ pub fn outcome_for_service_error_with_correction(
 fn setup_requirement_for(error: &ServiceError) -> SetupRequirement {
     let mut requirement = match error {
         ServiceError::MissingPrimaryRepo { .. } => SetupRequirement::new("primary_repository"),
+        ServiceError::PrimaryRepoNotFound { .. } => SetupRequirement::new("repository_link"),
         ServiceError::RepoMismatch { .. } => SetupRequirement::new("repository_link"),
         ServiceError::PrProviderMissing { .. } => SetupRequirement::new("pull_request_provider"),
         ServiceError::PrProviderTokenMissing { .. } => {

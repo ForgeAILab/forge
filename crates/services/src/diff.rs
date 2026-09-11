@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::Path, process::Stdio, sync::Arc};
 
 use api_types::{DiffFileStatus, DiffResponse, DiffStats, FileDiffSummary};
-use db::{RepoRepo, SqliteDb, Workspace, WorkspaceRepo, WorkspaceStatus};
+use db::{RepoRepo, SqliteDb, TaskRepo, Workspace, WorkspaceRepo, WorkspaceStatus};
 use tokio::process::Command;
 
 use crate::{Result, ServiceError};
@@ -32,8 +32,12 @@ impl DiffService {
     }
 
     async fn workspace_diff_inner(&self, workspace: &Workspace) -> Result<DiffResponse> {
+        let task = TaskRepo::get_by_id(&*self.db, &workspace.task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", workspace.task_id.clone()))?;
         let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
             .await?
+            .filter(|repo| repo.project_id == task.project_id)
             .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
 
         let default_branch = repo.default_branch;

@@ -8,8 +8,8 @@ async fn user_subtask_into_review_review_pass_cascade_and_hooks_succeed() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let root = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let root = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let subtask = seed_subtask_with_status(&db, &root, "child", "in_progress".to_owned(), 0).await;
     let execution = seed_execution(
         &db,
@@ -58,8 +58,8 @@ async fn user_subtask_in_progress_to_review_succeeds() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let root = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let root = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let subtask = seed_subtask_with_status(&db, &root, "child", "in_progress".to_owned(), 0).await;
 
     let result = service
@@ -80,8 +80,8 @@ async fn root_task_resolution_unchanged() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
 
     let valid = service
         .transition(
@@ -120,8 +120,8 @@ async fn system_subtask_transition_still_uses_subtask_workflow() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let root = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let root = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let subtask = seed_subtask_with_status(&db, &root, "child", "in_progress".to_owned(), 0).await;
 
     let result = service
@@ -155,7 +155,7 @@ async fn no_agent_override_move_writes_log_and_no_executor() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
 
     let workflow = WorkflowDefinition {
         roles: Vec::new(),
@@ -189,7 +189,7 @@ async fn no_agent_override_move_writes_log_and_no_executor() {
     };
     update_project_workflow(&db, &project_id, &workflow).await;
 
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "working".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "working".to_owned()).await;
     let reason = "override into dispatchable state without agent";
 
     let result = service
@@ -243,7 +243,7 @@ async fn override_move_out_of_active_state_cancels_running_execution() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
 
     let workflow = WorkflowDefinition {
@@ -269,7 +269,7 @@ async fn override_move_out_of_active_state_cancels_running_execution() {
     };
     update_project_workflow(&db, &project_id, &workflow).await;
 
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "working".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "working".to_owned()).await;
     let execution = seed_running_coder_execution(&db, &task.id, Some(agent_id), None).await;
 
     let result = service
@@ -304,8 +304,8 @@ async fn subtask_in_project_only_state_cannot_be_deleted() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let root = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let root = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let subtask = seed_subtask_with_status(&db, &root, "child", "in_progress".to_owned(), 0).await;
 
     let routed = service
@@ -345,13 +345,12 @@ async fn park_running_task_to_backlog() {
 
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let workspace_dir = TempDir::new().expect("workspace dir creates");
     let agent_id = seed_agent(&db).await;
     let task = seed_task_with_status(
         &db,
         &project_id,
-        &repo_id,
         crate::workflow::default_states::IN_PROGRESS.to_owned(),
     )
     .await;
@@ -436,11 +435,10 @@ async fn user_assigned_task_moves_anywhere() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let task = seed_task_with_status(
         &db,
         &project_id,
-        &repo_id,
         crate::workflow::default_states::IN_PROGRESS.to_owned(),
     )
     .await;
@@ -494,11 +492,10 @@ async fn undefined_target_still_enumerates() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let task = seed_task_with_status(
         &db,
         &project_id,
-        &repo_id,
         crate::workflow::default_states::IN_PROGRESS.to_owned(),
     )
     .await;

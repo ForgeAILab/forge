@@ -4,7 +4,7 @@ use super::super::*;
 async fn hook_test_does_not_transition_or_create_execution() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let now = now_rfc3339();
     let task_id = new_uuid_v4();
     let task = TaskRepo::create(
@@ -12,7 +12,6 @@ async fn hook_test_does_not_transition_or_create_execution() {
         CreateTask {
             id: task_id.clone(),
             project_id: project_id.clone(),
-            repo_id: Some(repo_id),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,

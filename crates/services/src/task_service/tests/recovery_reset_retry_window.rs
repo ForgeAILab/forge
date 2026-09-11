@@ -6,14 +6,10 @@ async fn test_reset_retry_window_preserves_history_and_refreshes_budget() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(
-        &db,
-        &project_id,
-        &repo_id,
-        crate::workflow::default_states::REVIEW,
-    )
-    .await;
+    let (project_id, _repo_id, repo_dir) = seed_project_repo(&db).await;
+    initialize_primary_repository(&repo_dir);
+    let task =
+        seed_task_with_status(&db, &project_id, crate::workflow::default_states::REVIEW).await;
 
     let execution = seed_execution(
         &db,
@@ -141,14 +137,10 @@ async fn test_resume_process_moves_failed_review_back_to_in_progress() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(
-        &db,
-        &project_id,
-        &repo_id,
-        crate::workflow::default_states::REVIEW,
-    )
-    .await;
+    let (project_id, _repo_id, repo_dir) = seed_project_repo(&db).await;
+    initialize_primary_repository(&repo_dir);
+    let task =
+        seed_task_with_status(&db, &project_id, crate::workflow::default_states::REVIEW).await;
     let execution = seed_execution(
         &db,
         &task.id,

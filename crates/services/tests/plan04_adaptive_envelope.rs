@@ -208,7 +208,6 @@ async fn fixture_with_allowed_operations(
         CreateTask {
             id: ROOT_TASK_ID.to_owned(),
             project_id: PROJECT_ID.to_owned(),
-            repo_id: Some(REPO_ID.to_owned()),
             parent_task_id: None,
             assignee_type: None,
             assignee_id: None,

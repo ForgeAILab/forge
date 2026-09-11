@@ -387,19 +387,13 @@ async fn seed_agent_with_executor_type(
     agent_id
 }
 
-async fn seed_task_with_status(
-    db: &SqliteDb,
-    project_id: &str,
-    repo_id: &str,
-    status: TaskStatus,
-) -> Task {
+async fn seed_task_with_status(db: &SqliteDb, project_id: &str, status: TaskStatus) -> Task {
     let now = now_rfc3339();
     TaskRepo::create(
         db,
         CreateTask {
             id: new_uuid_v4(),
             project_id: project_id.to_owned(),
-            repo_id: Some(repo_id.to_owned()),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -434,7 +428,6 @@ async fn seed_subtask_with_status(
         CreateTask {
             id: new_uuid_v4(),
             project_id: parent.project_id.clone(),
-            repo_id: parent.repo_id.clone(),
             parent_task_id: Some(parent.id.clone()),
             subtask_order: Some(subtask_order),
             assignee_type: None,
@@ -454,14 +447,6 @@ async fn seed_subtask_with_status(
     )
     .await
     .expect("subtask creates")
-}
-
-async fn seed_ordered_sequence_started(db: &SqliteDb, task: &Task) {
-    let mut metadata = task.metadata().expect("task metadata parses");
-    metadata.ordered_sequence_started = Some(true);
-    TaskRepo::set_metadata_json(db, &task.id, metadata.to_json(), &now_rfc3339())
-        .await
-        .expect("task metadata updates");
 }
 
 fn role_assignment_input(
@@ -661,6 +646,7 @@ async fn seed_running_role_execution(
 async fn seed_workspace_for_task(
     db: &SqliteDb,
     task: &Task,
+    repo_id: &str,
     workspace_root: &std::path::Path,
 ) -> String {
     let now = now_rfc3339();
@@ -671,7 +657,7 @@ async fn seed_workspace_for_task(
         CreateWorkspace {
             id: workspace_id.clone(),
             task_id: task.id.clone(),
-            repo_id: task.repo_id.clone().unwrap(),
+            repo_id: repo_id.to_owned(),
             worktree_path: worktree_path.to_string_lossy().into_owned(),
             branch: ::workspace::task_branch_name(&task.id),
             status: WorkspaceStatus::Ready,
@@ -702,8 +688,8 @@ async fn add_user_comment_indexes_comment_memory_item() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
 
     let comment = service
         .add_user_comment(

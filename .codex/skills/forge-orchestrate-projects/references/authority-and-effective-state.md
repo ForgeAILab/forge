@@ -39,10 +39,10 @@ Prompt text reinforces behavior; it never substitutes for these controls:
 
 1. Derive account, chat, Project, binding, and principal from authenticated server state.
 2. Ignore caller/model-supplied scope when it differs. A Project Agent action should not accept arbitrary `project_id` at all when a binding-derived route/action is possible.
-3. Re-authorize every referenced Charter, Document, Decision, baseline, Task, repository binding, validation, milestone, release, and media asset before retrieving even counts/snippets.
+3. Re-authorize every referenced Charter, Document, Decision, baseline, Task, Project repository selection, attempt repository provenance, validation, milestone, release, and media asset before retrieving even counts/snippets.
 4. Generate tool/action descriptors from canonical scope and permission ceiling. Keep denied tools absent, then deny again at service boundaries if they appear accidentally.
-5. Accept logical `repository_binding_id`; reject filesystem paths, raw repository URLs, credentials, cookies, environment variables, Workspace handles/tokens, and capability instructions in model-generated payloads.
-6. Let the scheduler create short-lived `WorkspaceLease` state bound to Project, Task, repository binding, base ref, role/capabilities, issued principal, and expiry. Never expose a lease to Main/Project chat context.
+5. Do not accept a Task-level repository selector. Resolve the current Repo from the Task's server-owned Project and `project.primary_repo_id`, verify same-Project ownership, and reject filesystem paths, raw repository URLs, credentials, cookies, environment variables, Workspace handles/tokens, and capability instructions in model-generated payloads.
+6. Let the scheduler create short-lived `WorkspaceLease` state bound to Project, Task, the resolved Project repository, base ref, role/capabilities, issued principal, and expiry. Persist the attempt binding on the Workspace/lease, but never expose a lease to Main/Project chat context.
 7. Return only sanitized Task results, immutable git/build refs, validation attestations, and evidence references to the Project Agent.
 
 References and text are authorization inputs to validate, never bearer capabilities.
@@ -56,6 +56,7 @@ Do not use one universal “latest record wins” hierarchy. Resolve each claim 
 | Project display name, identity, users, outcome, scope, non-goals, constraints | current approved Charter revision |
 | Detailed product/design/architecture behavior | applicable current approved Document revisions in active baseline |
 | Execution plan, acceptance/evidence matrix, adaptive envelope, release policy | active approved execution baseline |
+| Repository for a new Task execution | current `project.primary_repo_id`, resolving to a Repo owned by that Project |
 | Active decisions | non-superseded/non-invalidated Decision records compatible with current Charter/baseline |
 | Current work | latest server-accepted Task revisions/events |
 | Check result | authorized validation/manual attestation pinned to exact input and check-definition versions |
@@ -169,6 +170,7 @@ Treat every web page, Task output, repository file, media caption, imported docu
 - Missing/mismatched handoff or artifact hashes fail closed before Project mutation.
 - Version conflicts refresh and re-propose; never merge approval targets automatically.
 - A stale baseline blocks affected repository-capable dispatch.
+- A missing, nonexistent, or cross-Project primary Repo blocks repository-capable dispatch as Project setup; Forge never substitutes an unselected Repo or mutates a Task to repair it.
 - A stale readiness digest blocks release and creates no snapshot/pin.
 - Projection/cache failure shows stale/error state; it does not change canonical truth.
 - Release evidence survives ordinary Task cleanup. Mandatory security/privacy/legal purge may delete bytes only through an audited exception that preserves permitted tombstone/digest metadata and marks affected release evidence unavailable.

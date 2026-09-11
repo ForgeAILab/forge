@@ -733,7 +733,6 @@ async fn seed_awaiting_human_review(
         CreateTask {
             id: task_id.clone(),
             project_id,
-            repo_id: Some(repo_id.clone()),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -972,7 +971,6 @@ async fn seed_awaiting_human_review_with_workspace(
         CreateTask {
             id: task_id.to_owned(),
             project_id,
-            repo_id: Some(repo_id.clone()),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -1123,7 +1121,6 @@ async fn seed_review_with_status(db: &db::SqliteDb, status: ReviewStatus) -> Str
         CreateTask {
             id: task_id.clone(),
             project_id,
-            repo_id: Some(repo_id),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -1253,7 +1250,6 @@ async fn seed_task_with_system_comment(db: &db::SqliteDb) -> String {
         CreateTask {
             id: task_id.clone(),
             project_id,
-            repo_id: Some(repo_id),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,

@@ -32,10 +32,9 @@ impl TaskRepo for SqliteDb {
         transaction: &mut Transaction<'_, Sqlite>,
         input: CreateTask,
     ) -> Result<Task> {
-        sqlx::query("INSERT INTO task (id, project_id, repo_id, parent_task_id, assignee_type, assignee_id, title, description, task_type, status, is_automation, priority, board_position, subtask_order, task_state_config, merge_config, metadata_json, plan, created_at, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(MAX(board_position), 0.0) + 1.0, ?, ?, ?, ?, ?, ?, ? FROM task WHERE project_id = ?")
+        sqlx::query("INSERT INTO task (id, project_id, parent_task_id, assignee_type, assignee_id, title, description, task_type, status, is_automation, priority, board_position, subtask_order, task_state_config, merge_config, metadata_json, plan, created_at, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(MAX(board_position), 0.0) + 1.0, ?, ?, ?, ?, ?, ?, ? FROM task WHERE project_id = ?")
             .bind(&input.id)
             .bind(&input.project_id)
-            .bind(input.repo_id.as_deref())
             .bind(input.parent_task_id.as_deref())
             .bind(input.assignee_type.as_deref())
             .bind(input.assignee_id.as_deref())
@@ -564,10 +563,11 @@ impl TaskRepo for SqliteDb {
         // Charter-backed execution admission here before mutating Task
         // assignment/status; the service's earlier read gate only avoids
         // unnecessary workspace side effects.
-        if input.execution.status == ExecutionStatus::Running
-            && input.execution.workspace_id.is_some()
-        {
-            Self::ensure_execution_admission_in_tx(transaction, &input.task_id).await?;
+        if input.execution.status == ExecutionStatus::Running {
+            if let Some(workspace_id) = input.execution.workspace_id.as_deref() {
+                Self::ensure_execution_admission_in_tx(transaction, &input.task_id, workspace_id)
+                    .await?;
+            }
         }
 
         let assignee_agent_id = match input.assignee_type.as_str() {

@@ -21,7 +21,7 @@ use tower::ServiceExt;
 #[tokio::test]
 async fn event_bus_creates_notification_and_api_manages_inbox() {
     let harness = test_app().await;
-    let (project, repo) = create_project_and_repo(&harness.app).await;
+    let (project, _repo) = create_project_and_repo(&harness.app).await;
 
     let now = now_rfc3339();
     let task_id = new_uuid_v4();
@@ -30,7 +30,6 @@ async fn event_bus_creates_notification_and_api_manages_inbox() {
         CreateTask {
             id: task_id.clone(),
             project_id: project.id.clone(),
-            repo_id: Some(repo.id.clone()),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,

@@ -450,8 +450,9 @@ Required sections:
 3. **Sequence and dependencies** — ordering, parallelism, prerequisites,
    blocking relationships, external dependencies, and primary milestone.
 4. **Task decomposition** — Task type (discovery, planning, implementation,
-   review/validation), logical repository binding when applicable, sanitized
-   inputs, idempotency key strategy, and worker/reviewer separation.
+   review/validation), Project repository setup preconditions without a Task
+   selector, sanitized inputs, idempotency key strategy, and worker/reviewer
+   separation.
 5. **Acceptance and evidence matrix** — check ID/definition revision,
    authoritative input, expected result, evidence kind/source, validator,
    freshness rule, and mapping to plan item/milestone/release policy.

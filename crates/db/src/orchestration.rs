@@ -1300,8 +1300,8 @@ pub struct CreateTaskProposalCommand {
 /// One bounded child payload for an adaptive Task split.  The payload is
 /// intentionally smaller than `CreateTask`: adaptive reshaping inherits the
 /// source Task's repository, workflow, governance, capability, and risk
-/// facts.  Callers can only supply the child text (and the historical
-/// optional assignee hint).
+/// facts. Callers can supply child text and an optional Agent assignment for
+/// the inherited subtask implementation role.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdaptiveTaskChild {
     pub title: String,

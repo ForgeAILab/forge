@@ -6,10 +6,10 @@ async fn reassign_role_updates_assignment_and_emits_event() {
     let event_bus = Arc::new(EventBus::new(16));
     let mut rx = event_bus.subscribe();
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
     let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(&task.id, "coder", Some(agent_a), None),
@@ -41,10 +41,10 @@ async fn reassign_role_cancels_running_active_executor() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
     let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
@@ -121,9 +121,9 @@ async fn user_transition_cancels_running_active_executor_before_status_change() 
     let event_bus = Arc::new(EventBus::new(16));
     let mut rx = event_bus.subscribe();
     let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let execution = seed_running_coder_execution(&db, &task.id, Some(agent_id), None).await;
 
     let result = service
@@ -172,9 +172,9 @@ async fn cancel_execution_invokes_task_executor_cancel() {
     let event_bus = Arc::new(EventBus::new(16));
     let executor = Arc::new(RecordingCancelExecutor::default());
     let service = TaskService::new(Arc::clone(&db), event_bus).with_task_executor(executor.clone());
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let execution = seed_running_coder_execution(&db, &task.id, Some(agent_id), None).await;
 
     service
@@ -192,9 +192,9 @@ async fn cancel_task_cancels_running_execution() {
     let event_bus = Arc::new(EventBus::new(16));
     let executor = Arc::new(RecordingCancelExecutor::default());
     let service = TaskService::new(Arc::clone(&db), event_bus).with_task_executor(executor.clone());
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let execution = seed_running_coder_execution(&db, &task.id, Some(agent_id), None).await;
 
     let cancelled_task = service
@@ -228,9 +228,9 @@ async fn run_execution_rechecks_cancelled_status_before_adapter_launch() {
         .execute(db.pool())
         .await
         .expect("agent capacity updates");
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let workspace_root = TempDir::new().expect("workspace root creates");
-    let workspace_id = seed_workspace_for_task(&db, &task, workspace_root.path()).await;
+    let workspace_id = seed_workspace_for_task(&db, &task, &repo_id, workspace_root.path()).await;
     let execution = {
         let now = now_rfc3339();
         service
@@ -297,9 +297,9 @@ async fn system_transition_does_not_cancel_running_active_executor() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let execution = seed_running_coder_execution(&db, &task.id, Some(agent_id), None).await;
 
     service
@@ -320,9 +320,9 @@ async fn reassign_role_rejects_terminal_task() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "done".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "done".to_owned()).await;
 
     let error = service
         .reassign_role(
@@ -342,9 +342,9 @@ async fn reassign_role_same_assignee_does_not_emit_event() {
     let event_bus = Arc::new(EventBus::new(16));
     let mut rx = event_bus.subscribe();
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(&task.id, "coder", Some(agent_id.clone()), None),
@@ -390,10 +390,10 @@ async fn reassign_coder_clears_review_passed_at_on_non_running_task() {
     let event_bus = Arc::new(EventBus::new(16));
     let mut rx = event_bus.subscribe();
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
     let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(&task.id, "coder", Some(agent_a), None),
@@ -455,7 +455,7 @@ async fn reassign_mid_exec_coder_with_reset_worktree_flag_in_event() {
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
     let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
@@ -465,7 +465,8 @@ async fn reassign_mid_exec_coder_with_reset_worktree_flag_in_event() {
         .await
         .expect("initial role assignment succeeds");
     let _ = next_role_reassigned_event(&mut rx).await;
-    seed_running_coder_execution(&db, &task.id, Some(agent_a), None).await;
+    let workspace_id = seed_workspace_for_task(&db, &task, &repo_id, workspace_root.path()).await;
+    seed_running_coder_execution(&db, &task.id, Some(agent_a), Some(workspace_id)).await;
 
     let result = service
         .reassign_role(
@@ -521,7 +522,7 @@ async fn reassign_coder_with_workspace_allows_reset_workspace() {
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
     let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
@@ -531,7 +532,7 @@ async fn reassign_coder_with_workspace_allows_reset_workspace() {
         .await
         .expect("initial role assignment succeeds");
     let _ = next_role_reassigned_event(&mut rx).await;
-    let workspace_id = seed_workspace_for_task(&db, &task, workspace_root.path()).await;
+    let workspace_id = seed_workspace_for_task(&db, &task, &repo_id, workspace_root.path()).await;
     seed_running_coder_execution(&db, &task.id, Some(agent_a), Some(workspace_id)).await;
 
     service
@@ -577,7 +578,7 @@ async fn reassign_coder_with_workspace_allows_both_reset_flags() {
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
     let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
@@ -587,7 +588,7 @@ async fn reassign_coder_with_workspace_allows_both_reset_flags() {
         .await
         .expect("initial role assignment succeeds");
     let _ = next_role_reassigned_event(&mut rx).await;
-    let workspace_id = seed_workspace_for_task(&db, &task, workspace_root.path()).await;
+    let workspace_id = seed_workspace_for_task(&db, &task, &repo_id, workspace_root.path()).await;
     seed_running_coder_execution(&db, &task.id, Some(agent_a), Some(workspace_id)).await;
 
     service
@@ -623,9 +624,9 @@ async fn reassign_coder_to_human_mid_execution_cancels_and_moves_to_todo() {
     let event_bus = Arc::new(EventBus::new(16));
     let mut rx = event_bus.subscribe();
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),
@@ -680,10 +681,10 @@ async fn reassign_non_coder_role_does_not_cancel_or_transition() {
     let event_bus = Arc::new(EventBus::new(16));
     let mut rx = event_bus.subscribe();
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
     let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(&task.id, "reviewer", Some(agent_a.clone()), None),
@@ -750,9 +751,9 @@ async fn on_agent_deleted_clears_coder_assignee_id_and_preserves_agent_type() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
 
     service
         .reassign_role(
@@ -787,10 +788,10 @@ async fn reassign_non_coder_role_ignores_reset_flags() {
     let event_bus = Arc::new(EventBus::new(16));
     let mut rx = event_bus.subscribe();
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
     let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(&task.id, "reviewer", Some(agent_a), None),
@@ -834,9 +835,9 @@ async fn remove_coder_role_clears_review_passed_at() {
     let event_bus = Arc::new(EventBus::new(16));
     let mut rx = event_bus.subscribe();
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(&task.id, "coder", Some(agent_a), None),
@@ -880,9 +881,9 @@ async fn remove_root_coder_role_is_independent_of_subtask_progress() {
     let event_bus = Arc::new(EventBus::new(16));
     let mut rx = event_bus.subscribe();
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(&task.id, "coder", Some(agent_a), None),
@@ -910,10 +911,10 @@ async fn reassign_subtask_coder_is_independent() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
     let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let root = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let root = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(&root.id, "coder", Some(agent_a.clone()), None),
@@ -947,10 +948,10 @@ async fn reassign_parent_coder_is_rejected_for_coordination_root() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
     let agent_b = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let root = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let root = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(&root.id, "coder", Some(agent_a), None),
@@ -968,7 +969,6 @@ async fn reassign_parent_coder_is_rejected_for_coordination_root() {
             false,
         )
         .await;
-
     assert!(matches!(result, Err(ServiceError::InvalidOperation { .. })));
 }
 
@@ -978,9 +978,9 @@ async fn remove_non_coder_role_does_not_clear_review_passed_at() {
     let event_bus = Arc::new(EventBus::new(16));
     let mut rx = event_bus.subscribe();
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(&task.id, "reviewer", Some(agent_a), None),
@@ -1020,9 +1020,9 @@ async fn reassign_same_coder_noop_preserves_review_passed_at() {
     let event_bus = Arc::new(EventBus::new(16));
     let mut rx = event_bus.subscribe();
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_a = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(&task.id, "coder", Some(agent_a.clone()), None),

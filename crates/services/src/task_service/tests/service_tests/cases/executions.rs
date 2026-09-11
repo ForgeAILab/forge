@@ -645,9 +645,9 @@ async fn dispatch_initial_role_execution_creates_execution_and_spawns() {
         .with_task_executor(Arc::new(NoDiffExecutor))
         .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
         .with_workspace_root(workspace_root.path().to_path_buf());
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
 
     let execution = service
         .dispatch_initial_role_execution(
@@ -689,12 +689,11 @@ async fn planner_completion_marks_task_awaiting_plan_review_until_approved() {
         .with_task_executor(Arc::new(NoDiffExecutor))
         .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
         .with_workspace_root(workspace_root.path().to_path_buf());
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
     let task = seed_task_with_status(
         &db,
         &project_id,
-        &repo_id,
         crate::workflow::default_states::PLANNING.to_owned(),
     )
     .await;
@@ -801,7 +800,7 @@ async fn before_enter_runs_required_before_work_hook_before_role_dispatch() {
         .with_task_executor(Arc::new(NoDiffExecutor))
         .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
         .with_workspace_root(workspace_root.path().to_path_buf());
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let settings = json!({
         "lifecycle_hooks": {
             "before_work": [{
@@ -820,7 +819,7 @@ async fn before_enter_runs_required_before_work_hook_before_role_dispatch() {
         .await
         .expect("project settings update");
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(
@@ -885,7 +884,7 @@ async fn before_enter_blocks_when_required_before_work_hook_fails() {
         .with_task_executor(Arc::new(NoDiffExecutor))
         .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
         .with_workspace_root(workspace_root.path().to_path_buf());
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let settings = json!({
         "lifecycle_hooks": {
             "before_work": [{
@@ -904,7 +903,7 @@ async fn before_enter_blocks_when_required_before_work_hook_fails() {
         .await
         .expect("project settings update");
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(
@@ -1013,7 +1012,7 @@ async fn retry_hook_reruns_blocked_before_enter_and_dispatches_when_it_passes() 
         .with_task_executor(Arc::new(NoDiffExecutor))
         .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
         .with_workspace_root(workspace_root.path().to_path_buf());
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let failing_settings = json!({
         "lifecycle_hooks": {
             "before_work": [{
@@ -1032,7 +1031,7 @@ async fn retry_hook_reruns_blocked_before_enter_and_dispatches_when_it_passes() 
         .await
         .expect("project settings update");
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(
@@ -1128,7 +1127,7 @@ async fn update_workspace_and_retry_hook_rebases_before_retrying_blocked_hook() 
         .with_task_executor(Arc::new(NoDiffExecutor))
         .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
         .with_workspace_root(workspace_root.path().to_path_buf());
-    let (project_id, repo_id, repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, repo_dir) = seed_project_repo(&db).await;
     let settings = json!({
         "lifecycle_hooks": {
             "before_work": [{
@@ -1147,7 +1146,7 @@ async fn update_workspace_and_retry_hook_rebases_before_retrying_blocked_hook() 
         .await
         .expect("project settings update");
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(
@@ -1210,7 +1209,7 @@ async fn skip_hook_once_bypasses_only_one_dispatch_attempt() {
         .with_task_executor(Arc::new(NoDiffExecutor))
         .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
         .with_workspace_root(workspace_root.path().to_path_buf());
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let settings = json!({
         "lifecycle_hooks": {
             "before_work": [{
@@ -1230,7 +1229,7 @@ async fn skip_hook_once_bypasses_only_one_dispatch_attempt() {
         .expect("project settings update");
     let planner_id = seed_agent(&db).await;
     let coder_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     service
         .reassign_role(
             role_assignment_input(
@@ -1337,9 +1336,9 @@ async fn dispatch_initial_role_execution_runs_reviewer_when_agent_is_busy_on_sam
         .with_task_executor(Arc::new(NoDiffExecutor))
         .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
         .with_workspace_root(workspace_root.path().to_path_buf());
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "review".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "review".to_owned()).await;
 
     TaskRoleAssignmentRepo::assign(
         &*db,
@@ -1406,8 +1405,8 @@ async fn settled_reviewer_outcome_reconciles_a_missed_task_cascade() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "review".to_owned()).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(&db, &project_id, "review".to_owned()).await;
     let now = now_rfc3339();
     let execution = ExecutionRepo::create(
         &*db,
@@ -1488,7 +1487,7 @@ async fn complete_unverified_assessment_uses_review_remediation_without_executio
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "review".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "review".to_owned()).await;
     sqlx::query("UPDATE task SET task_state_config = ?, metadata_json = ? WHERE id = ?")
         .bind(r#"{"retry_budgets":{"execution":3,"review":3}}"#)
         .bind(r#"{"execution_retry_count":0}"#)
@@ -1647,9 +1646,9 @@ async fn assert_failed_reviewer_disposition(
     let event_bus = Arc::new(EventBus::new(16));
     let mut events = event_bus.subscribe();
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "review".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "review".to_owned()).await;
     sqlx::query("UPDATE task SET task_state_config = ?, metadata_json = ? WHERE id = ?")
         .bind(json!({ "retry_budgets": { "execution": budget } }).to_string())
         .bind(json!({ "execution_retry_count": retry_count }).to_string())
@@ -1833,7 +1832,7 @@ async fn human_required_review_can_be_rejected_by_the_bound_project_agent() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let mut workflow = crate::workflow::default_workflow::default_workflow();
     workflow
         .states
@@ -1849,7 +1848,7 @@ async fn human_required_review_can_be_rejected_by_the_bound_project_agent() {
         .await
         .expect("project workflow updates");
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "review".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "review".to_owned()).await;
     let now = now_rfc3339();
     let execution = ExecutionRepo::create(
         &*db,
@@ -2036,9 +2035,9 @@ async fn follow_up_execution_creates_interactive_child() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent_with_executor_type(&db, "claude_code", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let message = "Please continue with the remaining edge cases".to_owned();
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
@@ -2099,10 +2098,13 @@ async fn follow_up_execution_creates_interactive_child() {
 async fn follow_up_rejects_a_running_repository_role_without_mutating_task() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let service = TaskService::new(Arc::clone(&db), event_bus)
+        .with_workspace_root(workspace_root.path().to_path_buf());
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent_with_executor_type(&db, "claude_code", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
+    let workspace_id = seed_workspace_for_task(&db, &task, &repo_id, workspace_root.path()).await;
     let now = now_rfc3339();
     let parent = ExecutionRepo::create(
         &*db,
@@ -2128,7 +2130,7 @@ async fn follow_up_rejects_a_running_repository_role_without_mutating_task() {
             executor_config_snapshot_json: Some(
                 r#"{"executor_type":"claude_code","config":{}}"#.to_owned(),
             ),
-            workspace_id: None,
+            workspace_id: Some(workspace_id.clone()),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -2159,7 +2161,7 @@ async fn follow_up_rejects_a_running_repository_role_without_mutating_task() {
             executor_config_snapshot_json: Some(
                 r#"{"executor_type":"claude_code","config":{}}"#.to_owned(),
             ),
-            workspace_id: None,
+            workspace_id: Some(workspace_id),
             created_at: now.clone(),
             updated_at: now,
         },
@@ -2172,7 +2174,7 @@ async fn follow_up_rejects_a_running_repository_role_without_mutating_task() {
         .await;
 
     assert!(matches!(
-        result,
+        &result,
         Err(ServiceError::InvalidOperation { message })
             if message.contains("repository execution already running")
                 && message.contains(&running.id)
@@ -2204,9 +2206,9 @@ async fn follow_up_execution_codex_resumes_with_message_only_fallback() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let message = "Please continue with the remaining edge cases".to_owned();
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
@@ -2266,9 +2268,9 @@ async fn follow_up_execution_rejects_running_parent() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
         &*db,
@@ -2314,9 +2316,9 @@ async fn follow_up_on_cancelled_execution_with_session_succeeds() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
         &*db,
@@ -2362,9 +2364,9 @@ async fn follow_up_on_cancelled_execution_without_session_returns_error() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
         &*db,
@@ -2414,9 +2416,9 @@ async fn follow_up_execution_rejects_missing_session_id() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
         &*db,
@@ -2462,9 +2464,9 @@ async fn follow_up_execution_rejects_terminal_task() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "done".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "done".to_owned()).await;
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
         &*db,
@@ -2510,9 +2512,9 @@ async fn follow_up_execution_on_blocked_task() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     TaskRepo::update(
         &*db,
         db::UpdateTask {
@@ -2583,10 +2585,10 @@ async fn follow_up_execution_rejects_executor_mismatch() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let shell_agent_id = seed_agent(&db).await;
     let codex_agent_id = seed_agent_with_executor_type(&db, "codex", "{}").await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
         &*db,
@@ -2641,9 +2643,9 @@ async fn re_execute_cancelled_execution_dispatches_fresh() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
         &*db,
@@ -2693,9 +2695,9 @@ async fn re_execute_rejects_running_parent() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
         &*db,
@@ -2743,9 +2745,9 @@ async fn re_execute_rejects_concurrent_running_execution() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
         &*db,
@@ -2875,9 +2877,9 @@ async fn recover_reexecute_without_blocked_execution_dispatches_current_state_ro
         .with_task_executor(Arc::new(PendingExecutor))
         .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
         .with_workspace_root(workspace_root.path().to_path_buf());
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     TaskRoleAssignmentRepo::assign(
         &*db,
         role_assignment_input(
@@ -2981,8 +2983,9 @@ async fn executor_completion_guard_rejection_follows_up_before_blocking() {
         TaskService::new(Arc::clone(&db), event_bus).with_task_executor(Arc::new(PendingExecutor));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
-    let workspace = seed_workspace_with_plan(&db, &task, "- [ ] finish implementation\n").await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
+    let workspace =
+        seed_workspace_with_plan(&db, &task, &repo_id, "- [ ] finish implementation\n").await;
     let execution =
         seed_completed_coder_execution(&db, &task, &agent_id, Some(&workspace.id)).await;
 
@@ -3038,16 +3041,20 @@ async fn subtask_sequence_guard_rejection_never_resumes_root_coder() {
         TaskService::new(Arc::clone(&db), event_bus).with_task_executor(Arc::new(PendingExecutor));
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let _subtask = seed_subtask_with_status(&db, &task, "child", "todo".to_owned(), 0).await;
-    let workspace = seed_workspace_with_plan(&db, &task, "- [x] parent work\n").await;
+    let workspace = seed_workspace_with_plan(&db, &task, &repo_id, "- [x] parent work\n").await;
     let execution =
         seed_completed_coder_execution(&db, &task, &agent_id, Some(&workspace.id)).await;
 
-    service
+    let result = service
         .maybe_cascade_executor_completion(&execution.id)
-        .await
-        .expect("coordination handoff succeeds");
+        .await;
+    assert!(matches!(
+        result,
+        Err(ServiceError::InvalidOperation { message })
+            if message.contains("cannot enter aggregate review")
+    ));
 
     let executions = ExecutionRepo::list_by_task(
         &*db,
@@ -3086,7 +3093,7 @@ async fn executor_completion_guard_rejection_blocks_when_retry_budget_exhausted(
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let task = TaskRepo::update(
         &*db,
         db::UpdateTask {
@@ -3107,7 +3114,8 @@ async fn executor_completion_guard_rejection_blocks_when_retry_budget_exhausted(
     )
     .await
     .expect("task config updates");
-    let workspace = seed_workspace_with_plan(&db, &task, "- [ ] finish implementation\n").await;
+    let workspace =
+        seed_workspace_with_plan(&db, &task, &repo_id, "- [ ] finish implementation\n").await;
     let execution =
         seed_completed_coder_execution(&db, &task, &agent_id, Some(&workspace.id)).await;
 
@@ -3131,9 +3139,9 @@ async fn executor_completion_comment_uses_execution_agent() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let now = now_rfc3339();
     let execution = ExecutionRepo::create(
         &*db,
@@ -3195,7 +3203,12 @@ async fn executor_completion_comment_uses_execution_agent() {
     assert_eq!(comment.author_name, "shell");
 }
 
-async fn seed_workspace_with_plan(db: &SqliteDb, task: &Task, plan: &str) -> Workspace {
+async fn seed_workspace_with_plan(
+    db: &SqliteDb,
+    task: &Task,
+    repo_id: &str,
+    plan: &str,
+) -> Workspace {
     let workspace_dir = std::env::temp_dir()
         .join(format!("forge-guard-plan-{}", new_uuid_v4()))
         .join(&task.id);
@@ -3212,7 +3225,7 @@ async fn seed_workspace_with_plan(db: &SqliteDb, task: &Task, plan: &str) -> Wor
         CreateWorkspace {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
-            repo_id: task.repo_id.clone().unwrap(),
+            repo_id: repo_id.to_owned(),
             worktree_path: worktree_path.to_string_lossy().into_owned(),
             branch: ::workspace::task_branch_name(&task.id),
             status: WorkspaceStatus::Ready,

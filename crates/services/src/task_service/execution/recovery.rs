@@ -1711,13 +1711,9 @@ impl TaskService {
             self.repo_cache_locks.clone(),
         )
         .await?;
-        let repo_id = task
-            .repo_id
-            .as_deref()
-            .ok_or_else(|| ServiceError::invalid_operation("task has no associated repo"))?;
-        let repo = RepoRepo::get_by_id(&*self.db, repo_id)
+        let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
             .await?
-            .ok_or_else(|| ServiceError::not_found("repo", repo_id.to_owned()))?;
+            .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
         let target_branch = default_target_branch(&repo.default_branch);
         let worktree_path = std::path::Path::new(&workspace.worktree_path);
 

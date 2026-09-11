@@ -363,7 +363,6 @@ async fn seed_review_task_with_executor(
         db::CreateTask {
             id: task_id.to_owned(),
             project_id: project_id.to_owned(),
-            repo_id: Some(repo_id.to_owned()),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,

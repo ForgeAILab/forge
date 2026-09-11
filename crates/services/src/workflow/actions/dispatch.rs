@@ -92,11 +92,6 @@ impl HookAction for DispatchRoleAgent {
                 if assignment.assignee_type == Some(db::AssigneeKind::Agent)
                     && assignment.assignee_id.is_some() =>
             {
-                if current_task.repo_id.is_none() {
-                    return HookResult::Skipped {
-                        reason: "task has no associated repo".to_string(),
-                    };
-                }
                 if role_name == crate::workflow::default_roles::REVIEWER {
                     match latest_review(ctx).await {
                         Ok(Some(review))

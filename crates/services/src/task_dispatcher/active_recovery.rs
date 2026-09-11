@@ -174,9 +174,6 @@ impl TaskDispatcher {
         if helpers::has_blocking_annotation(task) {
             return Ok(false);
         }
-        if task.repo_id.is_none() {
-            return Ok(false);
-        }
         if deferred_dispatch::is_pending(task, chrono::Utc::now()) {
             return Ok(false);
         }

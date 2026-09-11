@@ -4,11 +4,10 @@ use super::*;
 #[tokio::test]
 async fn test_resolve_execution_actions_targets_current_role() {
     let db = Arc::new(sqlite_db().await);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let task = seed_task_with_status(
         &db,
         &project_id,
-        &repo_id,
         crate::workflow::default_states::IN_PROGRESS,
     )
     .await;

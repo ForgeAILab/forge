@@ -323,6 +323,13 @@ deny-all filesystem access. Project Agent Task actions go through the existing
 `TaskService` and workflow; repository mutation remains limited to admitted
 Task Worker/reviewer executions in their Task Workspaces.
 
+The CLI permission policy includes an explicit high-risk `yolo` value. It maps
+to each adapter's strongest local execution mode and disables that adapter's
+approval prompts; Codex receives `danger-full-access` with `never` approval.
+This is an execution-harness setting, not a Forge capability grant. Canonical
+scope, Task assignment, Workspace-lease admission, chat filesystem denial, and
+user-only approval/waiver/release authority are still enforced independently.
+
 Every native Task scope admitted for `task_read` receives both bounded UTF-8
 file reads and `forge_task_list`. The list tool enumerates at most 256 sorted
 direct children and may filter entry names with `*` and `?`; returned paths are
@@ -349,6 +356,7 @@ derives read models from those records. Authority is scoped by domain:
 | --- | --- | --- |
 | Project identity and scope | approved `ProjectCharterRevision` | User approves; Main Agent recommends before handoff; Project Agent proposes amendments afterward |
 | Execution traceability | approved Project Documents | Project Agent proposes; user may approve the traceability snapshot |
+| Current execution repository | `project.primary_repo_id` resolving to a same-Project `Repo` | Project owner/admin configures Project setup; Tasks cannot select or persist a repository |
 | Consequential choices | effective `DecisionRecord` (`active`, `superseded`, or `invalidated`) | Authorized principal recorded on the decision; candidate/editor records are not effective decisions |
 | Work state | Task, validation, review, and event records | Task/workflow services, assigned workers, reviewers, and authorized users under existing policy |
 | Outcome and release | milestone definition, `ReadinessSnapshot`, and immutable `Mxxx-rN` release manifest | Project Agent proposes; Forge evaluates; user alone releases |
@@ -366,14 +374,18 @@ Model output, Agent Profile text, chat prose, web pages, repository text, and
 memory are data; none can widen a permission ceiling or satisfy an approval.
 
 `WorkspaceLease` is an internal scheduler record, not a public API or chat
-capability. The V076 `workspace_lease` table persists the Project/Task plus
-exact Task version and execution attempt, logical repository binding, resolved
-base ref, role, capability JSON, assigned principal, capability-profile
+capability. Before execution, `TaskService` resolves the Task's Project, loads
+its current `primary_repo_id`, and verifies that the selected Repo belongs to
+that Project. A Task has no repository selector or persisted repository copy.
+The V076 `workspace_lease` table then persists the Project/Task plus exact Task
+version and execution attempt, attempt-pinned repository binding, resolved base
+ref, role, capability JSON, assigned principal, capability-profile
 revision/digest, issuing principal, issue/expiry timestamps, status, and
-optimistic version. Its database guards require the same Project, Task version,
-repository binding, assigned principal, running execution, current approved
-Charter traceability, and profile revision/digest; one active lease is allowed
-per Task and identity fields are immutable. Main and Project Agent identities
+optimistic version. Its database guards require the lease binding to equal the
+Project's current same-Project primary Repo and the execution Workspace Repo,
+plus the same Project, Task version, assigned principal, running execution,
+current approved Charter traceability, and profile revision/digest. One active
+lease is allowed per Task and identity fields are immutable. Main and Project Agent identities
 are eligible when explicitly assigned to the Task; their chat turns and Task
 executions remain separate scoped sessions.
 Custom workflow execution-role names are retained for assignment matching and
@@ -392,9 +404,17 @@ the exact Task Worker/reviewer role or Task assignment, not equality with the
 Project default for that role.
 `WorkspaceLeaseRepo` provides CAS renewal/revoke and bounded expiry operations.
 The heartbeat renews an active lease before its deadline only while the exact
-execution is still running and its Task, assignment, governance, repository,
-and capability bindings remain valid. Renewal changes only `expires_at`,
+execution is still running and its Task, assignment, governance, current
+Project repository, execution Workspace repository, and capability bindings
+remain valid. Renewal changes only `expires_at`,
 `updated_at`, and the optimistic version; all authority fields stay immutable.
+
+Once an attempt exists, its Workspace and lease are historical repository
+provenance. Diff, review, merge, evidence, and release paths use that pinned
+identity rather than reinterpreting completed work through a later Project
+selection. A reusable Workspace whose Repo differs from the current Project
+primary Repo is not reused or granted a new lease; it must pass the normal safe
+reset/setup boundary first.
 
 The scheduler delivers authority through the internal execution channel by
 creating the running execution and lease together; the executor acknowledges
@@ -432,15 +452,6 @@ Agent—including Main, Project, or the same Agent in both Task roles—may be
 assigned explicitly. Read-only planning/discovery and write-capable
 implementation both derive authority from the current Charter and their Task
 workflow.
-
-The CLI permission policy includes an explicit high-risk `yolo` value. It maps
-to each adapter's strongest local execution mode and disables that adapter's
-approval prompts; Codex receives `danger-full-access` with `never` approval.
-This is an execution-harness setting, not a Forge capability grant. Canonical
-Project/Task scope, role assignment, Workspace leases, Agent Chat filesystem
-denial, and user-only approvals, waivers, and release actions remain enforced
-by `TaskService` and workflow; repository mutation remains limited to admitted
-Task Worker/reviewer executions in their Task Workspaces.
 
 #### Canonical execution blocker and capability-aware review
 
@@ -718,8 +729,9 @@ cannot leave a backgrounded `retry_wait` turn visibly stuck after REST truth
 has advanced to `failed`.
 
 When Task creation omits an explicit governance envelope, Forge derives one
-from the Project's current approved Charter. The approved Charter makes a repository-backed
-Task runnable; optional plan-item, milestone, and Document references add
+from the Project's current approved Charter. The approved Charter makes a
+repository-capable Task runnable once Project-level repository setup and the
+ordinary Task gates pass; optional plan-item, milestone, and Document references add
 immutable traceability only. `planning_task` and
 `discovery` use a read-only repository capability, while implementation Tasks
 use the write capability selected by their workflow and assignment. Prompt
@@ -1138,6 +1150,12 @@ per-credential single-flight lock and rotate ciphertext plus the handle version
 in one transaction. Exact-revision invalidation prevents an older rejected
 request from invalidating a newer lease. Provider errors, events, public rows,
 and Debug output remain redacted.
+
+An immutable direct ChatGPT-login profile may carry one reasoning effort
+advertised for its selected model by the Codex catalog, including `xhigh`,
+`max`, and `ultra` where supported. Native Main Chat, Project Agent Chat, Task,
+and inquiry turns copy that profile value into Agent Runtime's reasoning
+config; an omitted value leaves provider behavior unchanged.
 
 The Project Agent route is an Agent Workspace: one durable conversation beside
 a typed Project-record rail on desktop and a Conversation/Project segmented
@@ -1724,20 +1742,20 @@ state.
 - **`custom`** — no built-in behavior beyond graph validation.
 
 A Project's Tasks never sit in `backlog` just because the Project has no
-primary repository — that used to be Task creation's rule, and nothing ever
-released those Tasks once a repository was attached. Instead, the Task
-dispatcher's own scan (`TaskDispatcher::sync_repository_pause`, ahead of its
-per-project dispatch/recovery in `check_once`) pauses the Project itself when
-`primary_repo_id` is `None`, recording `system_pause_reason =
-"missing_repository"` on it (migration V128); it resumes a Project paused for
-exactly that reason once a repository is attached. A user's own pause via
-`POST /projects/{id}/pause` (or any general Project update that sets
+primary repository. Tasks persist no repository selector and remain in their
+normal workflow state while repository readiness is a Project-level execution
+setup dimension. The Task dispatcher's scan (`TaskDispatcher::sync_repository_pause`,
+ahead of its per-project dispatch/recovery in `check_once`) resolves
+`primary_repo_id` to a Repo owned by that same Project. Missing or invalid
+selection records a visible setup blocker, issues no execution or lease, and
+never substitutes an unselected legacy Repo row. Attaching a valid Repo wakes
+normal scheduling, so an already governed Task can launch without a Task
+update or backfill. A matching system pause may clear, but a user's own pause
+via `POST /projects/{id}/pause` (or any general Project update that sets
 `paused_at`) always clears `system_pause_reason`, so a deliberate pause is
-never auto-resumed and never mistaken for this automatic one, and this
-reconciliation never touches a Project already paused for a different
-reason. `dispatch_initial_task` still checks `task.repo_id.is_none()` before
-launching anything, so nothing changes for a Task that somehow reaches an
-active state without a repository.
+never auto-resumed or mistaken for automatic setup state. Repository readiness
+does not fabricate Charter governance; a Task missing required current-Charter
+traceability remains separately blocked before lease issuance.
 
 `WorkflowEngine::transition` lifecycle for `A → B`:
 
@@ -1916,7 +1934,7 @@ snapshot and its agent still owns the exact Task role.
 
 ### Crash recovery
 
-`CrashRecovery` runs at server startup and deterministically reconciles
+`CrashRecovery` runs at server and Solo startup and deterministically reconciles
 ownerless or expired running executions left by an earlier process. Migration
 `V089` does not invent ownership for pre-existing rows: a running row without
 verifiable lease ownership is immediately eligible for this recovery pass.
@@ -2076,6 +2094,15 @@ creation. The subsequent V137 operating-skill migration activates
 `forge.project.orchestration/v1@16`; its task-coordination doctrine makes the
 `parent_task_id` shared-root hierarchy/workspace relation explicit and keeps
 `depends_on_ids` as prerequisite DAG edges that never imply workspace sharing.
+
+Migration `V138__project_owned_task_repository.sql` removes the nullable
+`task.repo_id` column and its index without rewriting Task rows or historical
+execution records. Workspace-lease guards instead require the Project's current
+primary Repo to exist in that Project and to match both the new lease binding
+and execution Workspace. Workspace, lease, review, pull-request, evidence,
+release, and extra unselected Repo rows retain their repository identities;
+removing Project repository setup no longer deletes Tasks through a Repo
+foreign-key cascade.
 
 For tests, use `create_sqlite_pool("sqlite::memory:")` for an in-memory
 database.

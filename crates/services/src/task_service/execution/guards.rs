@@ -56,7 +56,7 @@ impl TaskService {
             let subtasks = TaskRepo::list_subtasks_ordered(&*self.db, &task.id).await?;
             if let Some(next) = subtasks
                 .iter()
-                .find(|candidate| !ordered_task_is_terminal(candidate))
+                .find(|candidate| !super::super::subtask::subtask_is_terminal(candidate, &workflow))
             {
                 return Err(ServiceError::invalid_operation(format!(
                     "coordination-root review is not ready; subtask {} is still incomplete",
@@ -401,11 +401,4 @@ impl TaskService {
             }
         }
     }
-}
-
-fn ordered_task_is_terminal(task: &Task) -> bool {
-    matches!(
-        task.status.as_str(),
-        crate::workflow::default_states::DONE | crate::workflow::default_states::CANCELLED
-    )
 }

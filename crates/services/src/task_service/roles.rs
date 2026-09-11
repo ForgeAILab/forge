@@ -806,13 +806,15 @@ impl TaskService {
         }
 
         if reset_worktree {
-            let repo_id = task
-                .repo_id
-                .as_deref()
-                .ok_or_else(|| ServiceError::invalid_operation("task has no associated repo"))?;
-            let repo = RepoRepo::get_by_id(&*self.db, repo_id)
+            let workspace = if let Some(workspace_id) = execution.workspace_id.as_deref() {
+                WorkspaceRepo::get_by_id(&*self.db, workspace_id).await?
+            } else {
+                WorkspaceRepo::get_by_task_id(&*self.db, &task.id).await?
+            }
+            .ok_or_else(|| ServiceError::not_found("workspace", task.id.clone()))?;
+            let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
                 .await?
-                .ok_or_else(|| ServiceError::not_found("repo", repo_id.to_owned()))?;
+                .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
             let repo_url = repo
                 .local_path
                 .filter(|path| !path.trim().is_empty())

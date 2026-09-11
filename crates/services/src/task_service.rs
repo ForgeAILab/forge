@@ -60,6 +60,7 @@ pub(crate) mod logs;
 mod move_task;
 mod proposal;
 mod reorder_subtasks;
+mod repository_authority;
 mod review;
 mod review_config;
 mod roles;
@@ -78,6 +79,7 @@ pub use create_subtasks::NewSubtaskInput;
 pub use proposal::{
     DirectTaskProposalInput, TaskProposalCommandResult, TaskProposalPayload, TASK_PROPOSE_COMMAND,
 };
+pub(crate) use repository_authority::resolve_task_repository_authority;
 pub(crate) use subtask::{
     coordination_review_pending, coordination_root_has_subtasks,
     coordination_root_sequence_complete, subtask_dispatch_ready, subtask_is_terminal,
@@ -515,15 +517,9 @@ impl TaskService {
                 .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
             Some((task, workspace))
         } else {
-            let task = TaskRepo::get_by_id(&*self.db, &input.task_id, false)
-                .await?
-                .ok_or_else(|| ServiceError::not_found("task", input.task_id.clone()))?;
-            if task.repo_id.is_some() {
-                return Err(ServiceError::invalid_operation(
-                    "repository execution requires a scheduler WorkspaceLease-backed workspace",
-                ));
-            }
-            None
+            return Err(ServiceError::invalid_operation(
+                "repository execution requires a scheduler WorkspaceLease-backed workspace",
+            ));
         };
 
         let create_result = if input.status == ExecutionStatus::Running {

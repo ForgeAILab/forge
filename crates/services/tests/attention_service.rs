@@ -113,7 +113,6 @@ async fn project_task(db: &Arc<SqliteDb>, project_id: &str, title: &str) -> db::
         CreateTask {
             id: new_uuid_v4(),
             project_id: project_id.to_owned(),
-            repo_id: None,
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -2021,7 +2020,6 @@ async fn expected_cancellation_is_audit_only_without_attention_or_wake() {
         CreateTask {
             id: new_uuid_v4(),
             project_id: project_id.clone(),
-            repo_id: None,
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -2177,7 +2175,6 @@ async fn review_attention_rows(db: &Arc<SqliteDb>, workflow_definition: &str) ->
         CreateTask {
             id: new_uuid_v4(),
             project_id: project_id.clone(),
-            repo_id: None,
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,

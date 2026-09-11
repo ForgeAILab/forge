@@ -120,7 +120,6 @@ async fn fixture() -> ExecutionFixture {
         CreateTask {
             id: task_id.clone(),
             project_id: project_id.clone(),
-            repo_id: Some(repo_id.clone()),
             parent_task_id: None,
             assignee_type: Some("agent".to_owned()),
             assignee_id: Some(agent_id.clone()),

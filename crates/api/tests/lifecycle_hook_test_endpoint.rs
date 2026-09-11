@@ -104,5 +104,9 @@ async fn project_hook_test_endpoint_returns_debug_fields_without_launching_execu
         .expect("task fetch")
         .expect("task exists");
     assert_eq!(refreshed.status, "todo");
-    assert_eq!(refreshed.repo_id.as_deref(), Some(repo_id.as_str()));
+    let project = db::ProjectRepo::get_by_id(&*harness.state.db, &refreshed.project_id)
+        .await
+        .expect("project fetch")
+        .expect("project exists");
+    assert_eq!(project.primary_repo_id.as_deref(), Some(repo_id.as_str()));
 }

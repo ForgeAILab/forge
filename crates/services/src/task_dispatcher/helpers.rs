@@ -40,6 +40,7 @@ pub(super) fn is_deterministic_dispatch_refusal(error: &ServiceError) -> bool {
         | ServiceError::TaskActionUnavailable { .. }
         | ServiceError::DependencyGate
         | ServiceError::MissingPrimaryRepo { .. }
+        | ServiceError::PrimaryRepoNotFound { .. }
         | ServiceError::RepoMismatch { .. }
         | ServiceError::PrProviderMissing { .. } => true,
         ServiceError::GuardRejection { guard, .. } => guard == "dependency_gate",

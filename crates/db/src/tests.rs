@@ -38,11 +38,10 @@ fn page(limit: i64) -> PageRequest {
 #[tokio::test]
 async fn task_interruption_changes_are_atomic_and_bounded() {
     let db = sqlite_db().await;
-    let (project_id, repo_id, _) = seed_project_repo_agent(&db).await;
+    let (project_id, _repo_id, _) = seed_project_repo_agent(&db).await;
     let task_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         None,
         "todo".to_owned(),
         "interruption task",
@@ -1384,11 +1383,10 @@ async fn test_agent_session_rotation_is_atomic_and_preserves_lineage() {
 #[tokio::test]
 async fn task_context_scopes_are_distinct_per_role_for_the_same_identity() {
     let db = sqlite_db().await;
-    let (project_id, repo_id, identity_id) = seed_project_repo_agent(&db).await;
+    let (project_id, _repo_id, identity_id) = seed_project_repo_agent(&db).await;
     let task_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&identity_id),
         "review".to_owned(),
         "same identity, different Task roles",
@@ -1553,7 +1551,6 @@ async fn test_list_agents_usable_in_project() {
 async fn seed_task(
     db: &SqliteDb,
     project_id: &str,
-    repo_id: &str,
     agent_id: Option<&str>,
     status: String,
     title: &str,
@@ -1565,7 +1562,6 @@ async fn seed_task(
         CreateTask {
             id: task_id.clone(),
             project_id: project_id.to_owned(),
-            repo_id: Some(repo_id.to_owned()),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -1633,12 +1629,12 @@ async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
     let task_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&agent_id),
         "in_progress".to_owned(),
         "Long-running repository task",
     )
     .await;
+    let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
     let task = TaskRepo::get_by_id(&db, &task_id, true)
         .await
         .expect("task lookup")
@@ -1666,7 +1662,7 @@ async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
             after_sha: None,
             error: None,
             executor_config_snapshot_json: None,
-            workspace_id: None,
+            workspace_id: Some(workspace_id),
             created_at: now.to_rfc3339(),
             updated_at: now.to_rfc3339(),
         },
@@ -1741,7 +1737,7 @@ async fn active_workspace_lease_can_be_renewed_while_execution_is_running() {
 #[tokio::test]
 async fn prebaseline_discovery_task_is_admitted_to_running_execution() {
     let db = sqlite_db().await;
-    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
     let now = now_rfc3339();
     let user_id = new_uuid_v4();
     sqlx::query(
@@ -1816,7 +1812,6 @@ async fn prebaseline_discovery_task_is_admitted_to_running_execution() {
         CreateTask {
             id: task_id.clone(),
             project_id: project_id.clone(),
-            repo_id: Some(repo_id),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -1912,15 +1907,7 @@ async fn terminal_session_create_get_and_list_filters_running_and_ended() {
     let db = sqlite_db().await;
     let (project_id, repo_id, _agent_id) = seed_project_repo_agent(&db).await;
     let user_id = seed_user(&db).await;
-    let task_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_owned(),
-        "Terminal task",
-    )
-    .await;
+    let task_id = seed_task(&db, &project_id, None, "todo".to_owned(), "Terminal task").await;
     let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
 
     let running = seed_terminal_session(
@@ -2031,15 +2018,7 @@ async fn terminal_session_status_updates_increment_version() {
     let db = sqlite_db().await;
     let (project_id, repo_id, _agent_id) = seed_project_repo_agent(&db).await;
     let user_id = seed_user(&db).await;
-    let task_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_owned(),
-        "Terminal status",
-    )
-    .await;
+    let task_id = seed_task(&db, &project_id, None, "todo".to_owned(), "Terminal status").await;
     let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
     let session = seed_terminal_session(
         &db,
@@ -2102,15 +2081,7 @@ async fn terminal_session_size_update_touches_activity() {
     let db = sqlite_db().await;
     let (project_id, repo_id, _agent_id) = seed_project_repo_agent(&db).await;
     let user_id = seed_user(&db).await;
-    let task_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_owned(),
-        "Terminal resize",
-    )
-    .await;
+    let task_id = seed_task(&db, &project_id, None, "todo".to_owned(), "Terminal resize").await;
     let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
     let session = seed_terminal_session(
         &db,
@@ -2158,7 +2129,6 @@ async fn terminal_session_status_update_detects_version_conflict() {
     let task_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         None,
         "todo".to_owned(),
         "Terminal conflict",
@@ -2219,7 +2189,6 @@ async fn terminal_sessions_cascade_when_workspace_is_deleted() {
     let task_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         None,
         "todo".to_owned(),
         "Terminal cascade",
@@ -2254,7 +2223,6 @@ async fn terminal_sessions_cascade_when_workspace_is_deleted() {
 async fn seed_ordered_task(
     db: &SqliteDb,
     project_id: &str,
-    repo_id: &str,
     parent_task_id: Option<&str>,
     subtask_order: Option<i64>,
     title: &str,
@@ -2265,7 +2233,6 @@ async fn seed_ordered_task(
         CreateTask {
             id: new_uuid_v4(),
             project_id: project_id.to_owned(),
-            repo_id: Some(repo_id.to_owned()),
             parent_task_id: parent_task_id.map(str::to_owned),
             subtask_order,
             assignee_type: None,
@@ -2290,11 +2257,10 @@ async fn seed_ordered_task(
 #[tokio::test]
 async fn task_list_hides_cancelled_and_archived_by_default() {
     let db = sqlite_db().await;
-    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
     let visible_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&agent_id),
         "todo".to_owned(),
         "Visible",
@@ -2303,7 +2269,6 @@ async fn task_list_hides_cancelled_and_archived_by_default() {
     let cancelled_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&agent_id),
         "cancelled".to_owned(),
         "Cancelled",
@@ -2312,7 +2277,6 @@ async fn task_list_hides_cancelled_and_archived_by_default() {
     let archived_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&agent_id),
         "done".to_owned(),
         "Archived",
@@ -2390,20 +2354,11 @@ async fn task_list_hides_cancelled_and_archived_by_default() {
 #[tokio::test]
 async fn task_list_filters_by_user_assignee() {
     let db = sqlite_db().await;
-    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
-    let human_task_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_owned(),
-        "Human task",
-    )
-    .await;
+    let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let human_task_id = seed_task(&db, &project_id, None, "todo".to_owned(), "Human task").await;
     let agent_task_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&agent_id),
         "todo".to_owned(),
         "Agent task",
@@ -2471,52 +2426,19 @@ async fn task_list_filters_by_user_assignee() {
 #[tokio::test]
 async fn task_list_filters_by_search_query() {
     let db = sqlite_db().await;
-    let (project_id, repo_id, _agent_id) = seed_project_repo_agent(&db).await;
-    let alpha_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_owned(),
-        "Alpha release",
-    )
-    .await;
+    let (project_id, _repo_id, _agent_id) = seed_project_repo_agent(&db).await;
+    let alpha_id = seed_task(&db, &project_id, None, "todo".to_owned(), "Alpha release").await;
     let description_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         None,
         "todo".to_owned(),
         "Description only",
     )
     .await;
-    let percent_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_owned(),
-        "100% literal",
-    )
-    .await;
-    let wildcard_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_owned(),
-        "100x wildcard",
-    )
-    .await;
-    seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_owned(),
-        "Beta rollout",
-    )
-    .await;
+    let percent_id = seed_task(&db, &project_id, None, "todo".to_owned(), "100% literal").await;
+    let wildcard_id = seed_task(&db, &project_id, None, "todo".to_owned(), "100x wildcard").await;
+    seed_task(&db, &project_id, None, "todo".to_owned(), "Beta rollout").await;
 
     let description_task = TaskRepo::get_by_id(&db, &description_id, false)
         .await
@@ -2684,11 +2606,10 @@ async fn migration_creates_schema_and_enforces_foreign_keys() {
     .expect("agent inserts");
 
     sqlx::query(
-        "INSERT INTO task (id, project_id, repo_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO task (id, project_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
     )
     .bind(&task_id)
     .bind(&project_id)
-    .bind(&repo_id)
     .bind("Build DB foundation")
     .bind(&now)
     .bind(&now)
@@ -2753,7 +2674,6 @@ async fn delete_lifecycle_foreign_keys_match_repository_operations() {
     let task_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         None,
         "todo".to_owned(),
         "Delete lifecycle",
@@ -2849,22 +2769,20 @@ async fn delete_lifecycle_foreign_keys_match_repository_operations() {
     );
 
     let (project_id, repo_id, _agent_id) = seed_project_repo_agent(&db).await;
-    let task_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_owned(),
-        "Repo cascade",
-    )
-    .await;
+    let task_id = seed_task(&db, &project_id, None, "todo".to_owned(), "Repo cascade").await;
     RepoRepo::delete(&db, &repo_id)
         .await
-        .expect("repo delete cascades task data");
-    assert!(TaskRepo::get_by_id(&db, &task_id, true)
+        .expect("repo delete succeeds without deleting task history");
+    let task = TaskRepo::get_by_id(&db, &task_id, true)
         .await
         .expect("task lookup succeeds")
-        .is_none());
+        .expect("task remains after repository deletion");
+    assert_eq!(task.project_id, project_id);
+    let project = ProjectRepo::get_by_id(&db, &project_id)
+        .await
+        .expect("project lookup succeeds")
+        .expect("project remains after repository deletion");
+    assert_eq!(project.primary_repo_id, None);
 }
 
 #[tokio::test]
@@ -3000,11 +2918,10 @@ async fn sqlite_repo_create_rejects_missing_remote_url() {
 async fn sqlite_execution_role_auditor_round_trips() {
     let db = sqlite_db().await;
     let now = now_rfc3339();
-    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
     let task_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&agent_id),
         "review".to_string(),
         "Audit me",
@@ -3143,12 +3060,11 @@ async fn execution_liveness_migration_preserves_history_and_does_not_fabricate_o
     .await
     .expect("repo inserts");
     sqlx::query(
-        "INSERT INTO task (id, project_id, repo_id, title, status, created_at, updated_at)
-         VALUES (?, ?, ?, 'migration task', 'done', ?, ?)",
+        "INSERT INTO task (id, project_id, title, status, created_at, updated_at)
+         VALUES (?, ?, 'migration task', 'done', ?, ?)",
     )
     .bind(&task_id)
     .bind(&project_id)
-    .bind(&repo_id)
     .bind(now)
     .bind(now)
     .execute(&pool)
@@ -3258,12 +3174,12 @@ async fn execution_lease_and_terminal_cas_are_single_winner_and_preserve_deadlin
     let task_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&agent_id),
         "in_progress".to_owned(),
         "Execution liveness CAS",
     )
     .await;
+    let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
     let execution_id = new_uuid_v4();
     let now = "2026-08-21T00:00:00Z";
     let claimed = ExecutionRepo::create_with_lease(
@@ -3288,7 +3204,7 @@ async fn execution_lease_and_terminal_cas_are_single_winner_and_preserve_deadlin
             after_sha: None,
             error: None,
             executor_config_snapshot_json: None,
-            workspace_id: None,
+            workspace_id: Some(workspace_id),
             created_at: now.to_owned(),
             updated_at: now.to_owned(),
         },
@@ -3811,9 +3727,9 @@ async fn task_board_revision_migration_preserves_tasks_and_tracks_board_changes(
 #[tokio::test]
 async fn compare_and_move_is_atomic_versioned_and_idempotent() {
     let db = sqlite_db().await;
-    let (project_id, repo_id, _) = seed_project_repo_agent(&db).await;
-    let first_id = seed_task(&db, &project_id, &repo_id, None, "todo".to_owned(), "first").await;
-    let moved_id = seed_task(&db, &project_id, &repo_id, None, "todo".to_owned(), "moved").await;
+    let (project_id, _repo_id, _) = seed_project_repo_agent(&db).await;
+    let first_id = seed_task(&db, &project_id, None, "todo".to_owned(), "first").await;
+    let moved_id = seed_task(&db, &project_id, None, "todo".to_owned(), "moved").await;
     let moved = TaskRepo::get_by_id(&db, &moved_id, false)
         .await
         .expect("task loads")
@@ -3906,16 +3822,8 @@ async fn compare_and_move_is_atomic_versioned_and_idempotent() {
 #[tokio::test]
 async fn compare_and_move_emits_interruption_resolution_with_the_task_update() {
     let db = sqlite_db().await;
-    let (project_id, repo_id, _) = seed_project_repo_agent(&db).await;
-    let task_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_owned(),
-        "blocked move",
-    )
-    .await;
+    let (project_id, _repo_id, _) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(&db, &project_id, None, "todo".to_owned(), "blocked move").await;
     let task = TaskRepo::get_by_id(&db, &task_id, false)
         .await
         .expect("task loads")
@@ -3996,18 +3904,10 @@ async fn compare_and_move_emits_interruption_resolution_with_the_task_update() {
 #[tokio::test]
 async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
     let db = sqlite_db().await;
-    let (project_id, repo_id, _) = seed_project_repo_agent(&db).await;
-    let before_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_owned(),
-        "before",
-    )
-    .await;
-    let after_id = seed_task(&db, &project_id, &repo_id, None, "todo".to_owned(), "after").await;
-    let moved_id = seed_task(&db, &project_id, &repo_id, None, "todo".to_owned(), "moved").await;
+    let (project_id, _repo_id, _) = seed_project_repo_agent(&db).await;
+    let before_id = seed_task(&db, &project_id, None, "todo".to_owned(), "before").await;
+    let after_id = seed_task(&db, &project_id, None, "todo".to_owned(), "after").await;
+    let moved_id = seed_task(&db, &project_id, None, "todo".to_owned(), "moved").await;
     sqlx::query("UPDATE task SET board_position = 1.0 WHERE id = ?")
         .bind(&before_id)
         .execute(db.pool())
@@ -4061,15 +3961,7 @@ async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
     assert_eq!(result.task.board_position, 1.5);
     assert!(result.board_revision > revision + 1);
 
-    let source_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_owned(),
-        "source",
-    )
-    .await;
+    let source_id = seed_task(&db, &project_id, None, "todo".to_owned(), "source").await;
     let source = TaskRepo::get_by_id(&db, &source_id, false)
         .await
         .expect("source loads")
@@ -4103,15 +3995,7 @@ async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
     .expect("empty destination accepts null neighbors");
     assert!(matches!(empty_move, MoveTaskPersistence::Committed { .. }));
 
-    let another_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_owned(),
-        "another",
-    )
-    .await;
+    let another_id = seed_task(&db, &project_id, None, "todo".to_owned(), "another").await;
     let another = TaskRepo::get_by_id(&db, &another_id, false)
         .await
         .expect("another loads")
@@ -4149,11 +4033,10 @@ async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
 async fn notification_repo_crud_and_cascade_delete() {
     let db = sqlite_db().await;
     let now = now_rfc3339();
-    let (project_id, repo_id, _agent_id) = seed_project_repo_agent(&db).await;
+    let (project_id, _repo_id, _agent_id) = seed_project_repo_agent(&db).await;
     let task_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         None,
         "todo".to_owned(),
         "Notification target",
@@ -4279,7 +4162,6 @@ async fn notification_repo_crud_and_cascade_delete() {
     let task_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         None,
         "todo".to_owned(),
         "Notification target 2",
@@ -4417,7 +4299,6 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
         CreateTask {
             id: task_id.clone(),
             project_id: project_id.clone(),
-            repo_id: Some(repo_id.clone()),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -4887,7 +4768,6 @@ async fn workspace_task_id_unique_is_preserved() {
     let task_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&agent_id),
         "todo".to_owned(),
         "Workspace owner",
@@ -4934,11 +4814,10 @@ async fn workspace_task_id_unique_is_preserved() {
 async fn next_subtask_order_appends_after_existing_siblings() {
     let db = sqlite_db().await;
     let now = now_rfc3339();
-    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
     let parent_task_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&agent_id),
         "todo".to_owned(),
         "Parent",
@@ -4957,7 +4836,6 @@ async fn next_subtask_order_appends_after_existing_siblings() {
     seed_ordered_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&parent_task_id),
         Some(first_order),
         "First",
@@ -4976,7 +4854,6 @@ async fn next_subtask_order_appends_after_existing_siblings() {
     seed_ordered_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&parent_task_id),
         Some(second_order),
         "Second",
@@ -4995,11 +4872,10 @@ async fn next_subtask_order_appends_after_existing_siblings() {
 #[tokio::test]
 async fn list_subtasks_ordered_uses_subtask_order_before_tiebreakers() {
     let db = sqlite_db().await;
-    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
     let parent_task_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&agent_id),
         "todo".to_owned(),
         "Parent",
@@ -5009,7 +4885,6 @@ async fn list_subtasks_ordered_uses_subtask_order_before_tiebreakers() {
     seed_ordered_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&parent_task_id),
         Some(2),
         "Third",
@@ -5019,7 +4894,6 @@ async fn list_subtasks_ordered_uses_subtask_order_before_tiebreakers() {
     seed_ordered_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&parent_task_id),
         Some(0),
         "First",
@@ -5029,7 +4903,6 @@ async fn list_subtasks_ordered_uses_subtask_order_before_tiebreakers() {
     seed_ordered_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&parent_task_id),
         Some(1),
         "Second",
@@ -5050,11 +4923,10 @@ async fn list_subtasks_ordered_uses_subtask_order_before_tiebreakers() {
 #[tokio::test]
 async fn reorder_subtasks_persists_and_rejects_invalid_orders() {
     let db = sqlite_db().await;
-    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
     let parent_task_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&agent_id),
         "todo".to_owned(),
         "Parent",
@@ -5063,7 +4935,6 @@ async fn reorder_subtasks_persists_and_rejects_invalid_orders() {
     let first = seed_ordered_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&parent_task_id),
         Some(0),
         "First",
@@ -5073,7 +4944,6 @@ async fn reorder_subtasks_persists_and_rejects_invalid_orders() {
     let second = seed_ordered_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&parent_task_id),
         Some(1),
         "Second",
@@ -5122,11 +4992,10 @@ async fn reorder_subtasks_persists_and_rejects_invalid_orders() {
 #[tokio::test]
 async fn task_list_orders_equal_board_positions_by_created_at() {
     let db = sqlite_db().await;
-    let (project_id, repo_id, _agent_id) = seed_project_repo_agent(&db).await;
+    let (project_id, _repo_id, _agent_id) = seed_project_repo_agent(&db).await;
     let later = seed_ordered_task(
         &db,
         &project_id,
-        &repo_id,
         None,
         None,
         "Later",
@@ -5136,7 +5005,6 @@ async fn task_list_orders_equal_board_positions_by_created_at() {
     let earlier = seed_ordered_task(
         &db,
         &project_id,
-        &repo_id,
         None,
         None,
         "Earlier",
@@ -5184,14 +5052,13 @@ async fn task_list_orders_equal_board_positions_by_created_at() {
 async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
     let db = sqlite_db().await;
     let now = now_rfc3339();
-    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
     let task_id = new_uuid_v4();
     TaskRepo::create(
         &db,
         CreateTask {
             id: task_id.clone(),
             project_id,
-            repo_id: Some(repo_id),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -5332,7 +5199,7 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
 #[tokio::test]
 async fn agent_active_task_count_uses_workflow_state_kinds() {
     let db = sqlite_db().await;
-    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
     let workflow = serde_json::json!({
         "states": [
             { "name": "todo", "kind": "initial" },
@@ -5352,7 +5219,6 @@ async fn agent_active_task_count_uses_workflow_state_kinds() {
     seed_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&agent_id),
         "running".to_owned(),
         "custom active state",
@@ -5361,7 +5227,6 @@ async fn agent_active_task_count_uses_workflow_state_kinds() {
     seed_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&agent_id),
         "waiting_review".to_owned(),
         "custom gate state",
@@ -5370,7 +5235,6 @@ async fn agent_active_task_count_uses_workflow_state_kinds() {
     seed_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&agent_id),
         "done".to_owned(),
         "terminal state",
@@ -5386,20 +5250,12 @@ async fn agent_active_task_count_uses_workflow_state_kinds() {
 #[tokio::test]
 async fn agent_task_list_uses_execution_history() {
     let db = sqlite_db().await;
-    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
-    let executed_task_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "done".to_owned(),
-        "executed task",
-    )
-    .await;
+    let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let executed_task_id =
+        seed_task(&db, &project_id, None, "done".to_owned(), "executed task").await;
     seed_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&agent_id),
         "done".to_owned(),
         "assigned only task",
@@ -5464,14 +5320,13 @@ async fn agent_task_list_uses_execution_history() {
 async fn task_claim_rejects_active_entry_barrier() {
     let db = sqlite_db().await;
     let now = now_rfc3339();
-    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
     let task_id = new_uuid_v4();
     let task = TaskRepo::create(
         &db,
         CreateTask {
             id: task_id.clone(),
             project_id,
-            repo_id: Some(repo_id),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -5556,25 +5411,16 @@ async fn task_claim_rejects_active_entry_barrier() {
 async fn test_add_dependency_success() {
     let db = sqlite_db().await;
     let now = now_rfc3339();
-    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
     let dependency_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&agent_id),
         "todo".to_string(),
         "Dependency",
     )
     .await;
-    let task_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_string(),
-        "Dependent",
-    )
-    .await;
+    let task_id = seed_task(&db, &project_id, None, "todo".to_string(), "Dependent").await;
 
     TaskDependencyRepo::add_dependency(&db, &task_id, &dependency_id, &now)
         .await
@@ -5598,25 +5444,16 @@ async fn test_add_dependency_success() {
 async fn test_add_dependency_cycle_rejected() {
     let db = sqlite_db().await;
     let now = now_rfc3339();
-    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
     let first_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&agent_id),
         "todo".to_string(),
         "First",
     )
     .await;
-    let second_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_string(),
-        "Second",
-    )
-    .await;
+    let second_id = seed_task(&db, &project_id, None, "todo".to_string(), "Second").await;
 
     TaskDependencyRepo::add_dependency(&db, &second_id, &first_id, &now)
         .await
@@ -5630,7 +5467,7 @@ async fn test_add_dependency_cycle_rejected() {
 async fn test_dependency_gate_blocks_non_context_holder() {
     let db = sqlite_db().await;
     let now = now_rfc3339();
-    let (project_id, repo_id, context_agent_id) = seed_project_repo_agent(&db).await;
+    let (project_id, _repo_id, context_agent_id) = seed_project_repo_agent(&db).await;
     let other_agent_id = new_uuid_v4();
     let other_daemon_id = seed_daemon(&db).await;
     AgentRepo::create(
@@ -5666,21 +5503,12 @@ async fn test_dependency_gate_blocks_non_context_holder() {
     let dependency_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&context_agent_id),
         "review".to_string(),
         "Dependency",
     )
     .await;
-    let task_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_string(),
-        "Dependent",
-    )
-    .await;
+    let task_id = seed_task(&db, &project_id, None, "todo".to_string(), "Dependent").await;
     ExecutionRepo::create(
         &db,
         CreateExecution {
@@ -5771,25 +5599,16 @@ async fn test_dependency_gate_blocks_non_context_holder() {
 async fn test_unsatisfied_dependencies_empty_when_done() {
     let db = sqlite_db().await;
     let now = now_rfc3339();
-    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
     let dependency_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         Some(&agent_id),
         "done".to_string(),
         "Dependency",
     )
     .await;
-    let task_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_string(),
-        "Dependent",
-    )
-    .await;
+    let task_id = seed_task(&db, &project_id, None, "todo".to_string(), "Dependent").await;
     TaskDependencyRepo::add_dependency(&db, &task_id, &dependency_id, &now)
         .await
         .expect("dependency adds");
@@ -6056,8 +5875,8 @@ async fn test_normalize_failure_kinds_migration_backfill() {
                   blocked: Option<&str>,
                   failed: Option<&str>| {
         sqlx::query(
-            "INSERT INTO task (id, project_id, repo_id, title, status, error_annotation, blocked_json, failed_json, created_at, updated_at)
-             VALUES (?, 'p', 'r', 'legacy', 'blocked', ?, ?, ?, ?, ?)",
+            "INSERT INTO task (id, project_id, title, status, error_annotation, blocked_json, failed_json, created_at, updated_at)
+             VALUES (?, 'p', 'legacy', 'blocked', ?, ?, ?, ?, ?)",
         )
         .bind(id.to_owned())
         .bind(error_annotation.map(str::to_owned))
@@ -6607,16 +6426,8 @@ async fn domain_event_append_in_tx_rolls_back_with_the_mutation() {
 #[tokio::test]
 async fn direct_task_status_updates_emit_a_ledger_event_atomically() {
     let db = sqlite_db().await;
-    let (project_id, repo_id, _) = seed_project_repo_agent(&db).await;
-    let task_id = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        None,
-        "todo".to_owned(),
-        "ledger task",
-    )
-    .await;
+    let (project_id, _repo_id, _) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(&db, &project_id, None, "todo".to_owned(), "ledger task").await;
     let task = TaskRepo::get_by_id(&db, &task_id, false)
         .await
         .expect("task lookup succeeds")
@@ -6650,13 +6461,12 @@ async fn direct_task_status_updates_emit_a_ledger_event_atomically() {
 }
 
 #[tokio::test]
-async fn non_runnable_governance_cannot_mint_a_running_execution_after_read_gate() {
+async fn legacy_non_runnable_governance_flag_does_not_block_current_charter_execution() {
     let db = sqlite_db().await;
     let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
     let task_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         None,
         "todo".to_owned(),
         "baseline race task",
@@ -6754,9 +6564,10 @@ async fn non_runnable_governance_cannot_mint_a_running_execution_after_read_gate
     .await
     .expect("runnable governance creates");
 
-    // This represents a readiness race after the service's read-only admission
-    // check: durable Task governance becomes non-runnable before the
-    // authoritative execution INSERT starts.
+    // `runnable` was historically derived from repository readiness. Repository
+    // readiness now belongs to the Project, so this legacy projection must not
+    // become an independent execution-admission gate. Exact current Charter
+    // provenance remains authoritative.
     sqlx::query(
         "UPDATE project_task_governance
          SET runnable = 0, version = version + 1, updated_at = ?
@@ -6766,7 +6577,7 @@ async fn non_runnable_governance_cannot_mint_a_running_execution_after_read_gate
     .bind(&task_id)
     .execute(db.pool())
     .await
-    .expect("governance is revoked");
+    .expect("legacy governance readiness projection updates");
 
     let task_before = TaskRepo::get_by_id(&db, &task_id, false)
         .await
@@ -6776,7 +6587,7 @@ async fn non_runnable_governance_cannot_mint_a_running_execution_after_read_gate
         .await
         .expect("claim transaction begins");
     let execution_id = new_uuid_v4();
-    let claim = TaskRepo::claim(
+    let _claim = TaskRepo::claim(
         &db,
         &mut claim_transaction,
         ClaimTask {
@@ -6816,49 +6627,19 @@ async fn non_runnable_governance_cannot_mint_a_running_execution_after_read_gate
             claimed_at: now.clone(),
         },
     )
-    .await;
-    assert!(matches!(claim, Err(DbError::InvalidTransition)));
+    .await
+    .expect("current Charter governance admits execution despite legacy flag");
     claim_transaction
-        .rollback()
+        .commit()
         .await
-        .expect("claim transaction rolls back");
+        .expect("claim transaction commits");
     let task_after = TaskRepo::get_by_id(&db, &task_id, false)
         .await
         .expect("task rereads")
         .expect("task remains");
-    assert_eq!(task_after.version, task_before.version);
-    assert_eq!(task_after.status, "todo");
-    assert!(task_after.assignee_id.is_none());
-
-    let execution = ExecutionRepo::create(
-        &db,
-        CreateExecution {
-            id: new_uuid_v4(),
-            task_id: task_id.clone(),
-            agent_id: Some(agent_id),
-            role: "executor".to_owned(),
-            status: ExecutionStatus::Running,
-            stop_reason: None,
-            stopped_by: None,
-            resume_policy: None,
-            stopped_at: None,
-            parent_execution_id: None,
-            agent_session_id: None,
-            agent_message_id: None,
-            last_activity_at: None,
-            summary: None,
-            logs_path: None,
-            before_sha: None,
-            after_sha: None,
-            error: None,
-            executor_config_snapshot_json: None,
-            workspace_id: Some(workspace_id.clone()),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        },
-    )
-    .await;
-    assert!(matches!(execution, Err(DbError::InvalidTransition)));
+    assert_eq!(task_after.version, task_before.version + 1);
+    assert_eq!(task_after.status, "in_progress");
+    assert_eq!(task_after.assignee_id.as_deref(), Some(agent_id.as_str()));
     let execution_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM execution WHERE task_id = ? AND status = 'running'",
     )
@@ -6866,7 +6647,10 @@ async fn non_runnable_governance_cannot_mint_a_running_execution_after_read_gate
     .fetch_one(db.pool())
     .await
     .expect("execution count reads");
-    assert_eq!(execution_count, 0, "stale baseline must not mint execution");
+    assert_eq!(
+        execution_count, 1,
+        "current Charter provenance mints execution"
+    );
     let workspace_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM workspace WHERE task_id = ?")
             .bind(&task_id)
@@ -6875,7 +6659,7 @@ async fn non_runnable_governance_cannot_mint_a_running_execution_after_read_gate
             .expect("workspace count reads");
     assert_eq!(
         workspace_count, 1,
-        "race guard does not duplicate a workspace"
+        "execution admission does not duplicate the prepared workspace"
     );
 }
 
@@ -7347,11 +7131,10 @@ async fn project_delete_tears_down_genesis_chat_and_handoff_rows() {
 async fn project_delete_survives_immutable_rows_that_reference_a_sibling() {
     let db = sqlite_db().await;
     let now = now_rfc3339();
-    let (project_id, repo_id, _agent_id) = seed_project_repo_agent(&db).await;
+    let (project_id, _repo_id, _agent_id) = seed_project_repo_agent(&db).await;
     let task_id = seed_task(
         &db,
         &project_id,
-        &repo_id,
         None,
         "todo".to_owned(),
         "Task with an attached memory",

@@ -62,15 +62,13 @@ async fn create_task_rejects_charter_requirements_on_discovery_before_persistenc
 }
 
 #[tokio::test]
-async fn transition_allows_user_move_for_root_managed_subtask() {
+async fn transition_allows_user_move_for_independent_subtask() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let root = seed_task_with_status(&db, &project_id, &repo_id, "in_progress".to_owned()).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let root = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let subtask = seed_subtask_with_status(&db, &root, "child", "todo".to_owned(), 0).await;
-    seed_ordered_sequence_started(&db, &root).await;
-
     let result = service
         .transition(
             subtask.id.clone(),
@@ -144,7 +142,6 @@ async fn transition_from_planning_requires_plan_checklist_but_allows_unchecked_w
     let task = seed_task_with_status(
         &db,
         &project_id,
-        &repo_id,
         crate::workflow::default_states::PLANNING.to_owned(),
     )
     .await;
@@ -157,7 +154,7 @@ async fn transition_from_planning_requires_plan_checklist_but_allows_unchecked_w
         CreateWorkspace {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
-            repo_id: task.repo_id.clone().unwrap(),
+            repo_id: repo_id.clone(),
             worktree_path: worktree_path.to_string_lossy().into_owned(),
             branch: ::workspace::task_branch_name(&task.id),
             status: WorkspaceStatus::Ready,
@@ -199,7 +196,6 @@ async fn transition_from_active_work_requires_complete_plan_checklist() {
     let task = seed_task_with_status(
         &db,
         &project_id,
-        &repo_id,
         crate::workflow::default_states::IN_PROGRESS.to_owned(),
     )
     .await;
@@ -212,7 +208,7 @@ async fn transition_from_active_work_requires_complete_plan_checklist() {
         CreateWorkspace {
             id: new_uuid_v4(),
             task_id: task.id.clone(),
-            repo_id: task.repo_id.clone().unwrap(),
+            repo_id: repo_id.clone(),
             worktree_path: worktree_path.to_string_lossy().into_owned(),
             branch: ::workspace::task_branch_name(&task.id),
             status: WorkspaceStatus::Ready,
@@ -331,9 +327,9 @@ async fn is_awaiting_human_stays_false_while_review_entry_barrier_is_running() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "review".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "review".to_owned()).await;
     let now = now_rfc3339();
     let execution = ExecutionRepo::create(
         &*db,

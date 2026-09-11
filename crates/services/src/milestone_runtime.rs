@@ -2375,7 +2375,7 @@ impl MilestoneRuntime {
         let mut context = Vec::new();
         for task in tasks {
             let rows = sqlx::query(
-                "SELECT t.repo_id, repo.name AS repository_name, repo.work_mode AS repository_kind,
+                "SELECT repo.id AS repo_id, repo.name AS repository_name, repo.work_mode AS repository_kind,
                         repo.remote_url, repo.default_branch,
                         e.id AS execution_id, e.status AS execution_status, e.role AS execution_role,
                         e.before_sha, e.after_sha, e.summary AS execution_summary,
@@ -2385,12 +2385,17 @@ impl MilestoneRuntime {
                         NULL AS human_decision,
                         r.created_at AS review_created_at, r.updated_at AS review_updated_at
                  FROM task t
-                 JOIN repo ON repo.id = t.repo_id AND repo.project_id = t.project_id
+                 JOIN project p ON p.id = t.project_id
                  LEFT JOIN execution e ON e.id = (
                      SELECT e2.id FROM execution e2
                      WHERE e2.task_id = t.id
                      ORDER BY e2.updated_at DESC, e2.id DESC LIMIT 1
                  )
+                 LEFT JOIN workspace w ON w.id = e.workspace_id
+                 JOIN repo ON repo.id = CASE
+                     WHEN e.id IS NULL THEN p.primary_repo_id
+                     ELSE w.repo_id
+                 END AND repo.project_id = t.project_id
                  LEFT JOIN review r ON r.id = (
                      SELECT r2.id FROM review r2
                      WHERE r2.execution_id = e.id
@@ -4610,6 +4615,7 @@ fn evidence_availability_name(value: EvidenceAvailability) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use db::{create_sqlite_pool, run_migrations};
 
     #[test]
     fn principal_identity_ignores_the_display_label() {
@@ -4691,6 +4697,107 @@ mod tests {
             release_evidence_tombstone("purged").expect("purge overlay"),
             api_types::ReleaseEvidenceAvailability::EvidenceUnavailable
         );
+    }
+
+    #[tokio::test]
+    async fn repository_context_uses_execution_workspace_after_project_reselection() {
+        let pool = create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("pool creates");
+        run_migrations(&pool).await.expect("migrations run");
+        let db = Arc::new(SqliteDb::new(pool));
+        let now = "2026-09-10T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO project
+             (id, name, settings, workflow_definition, created_at, updated_at)
+             VALUES ('project-provenance', 'Project', '{}', '{}', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .expect("project inserts");
+        for (id, name, branch) in [
+            ("repo-attempt", "Attempt Repo", "main"),
+            ("repo-current", "Current Repo", "trunk"),
+        ] {
+            sqlx::query(
+                "INSERT INTO repo
+                 (id, project_id, name, remote_url, work_mode, default_branch, created_at, updated_at)
+                 VALUES (?, 'project-provenance', ?, ?, 'direct_merge', ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(format!("https://example.com/{id}.git"))
+            .bind(branch)
+            .bind(now)
+            .bind(now)
+            .execute(db.pool())
+            .await
+            .expect("repo inserts");
+        }
+        sqlx::query(
+            "UPDATE project SET primary_repo_id = 'repo-current' WHERE id = 'project-provenance'",
+        )
+        .execute(db.pool())
+        .await
+        .expect("current project repo selects");
+        sqlx::query(
+            "INSERT INTO task
+             (id, project_id, title, task_type, status, created_at, updated_at)
+             VALUES ('task-provenance', 'project-provenance', 'Task', 'task', 'done', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .expect("task inserts");
+        sqlx::query(
+            "INSERT INTO workspace
+             (id, task_id, repo_id, worktree_path, branch, status, created_at, updated_at)
+             VALUES ('workspace-provenance', 'task-provenance', 'repo-attempt', '/tmp/provenance',
+                     'forge/task-provenance', 'ready', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .expect("workspace inserts");
+        sqlx::query(
+            "INSERT INTO execution
+             (id, task_id, role, status, workspace_id, created_at, updated_at)
+             VALUES ('execution-provenance', 'task-provenance', 'executor', 'completed',
+                     'workspace-provenance', ?, ?)",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(db.pool())
+        .await
+        .expect("execution inserts");
+
+        let service = MilestoneRuntime::new(Arc::clone(&db));
+        let mut tx = db.pool().begin().await.expect("transaction begins");
+        let contexts = service
+            .commit_build_check_context_in_tx(
+                &mut tx,
+                "project-provenance",
+                &[ReadinessTaskState {
+                    task_id: "task-provenance".to_owned(),
+                    version: 1,
+                    task_type: "task".to_owned(),
+                    state: "done".to_owned(),
+                    observed_at: now.to_owned(),
+                }],
+            )
+            .await
+            .expect("repository context builds");
+        tx.rollback().await.expect("transaction rolls back");
+
+        let reference: RepositoryContextReference =
+            serde_json::from_str(&contexts[0]).expect("repository context decodes");
+        assert_eq!(reference.repository_id, "repo-attempt");
+        assert_eq!(reference.repository_name, "Attempt Repo");
+        assert_eq!(reference.default_branch, "main");
     }
 
     #[test]

@@ -85,13 +85,13 @@ async fn project_agent_identity_can_claim_a_task_role() {
 }
 
 #[tokio::test]
-async fn claim_recovers_task_branch_left_by_a_rejected_workspace_attempt() {
+async fn claim_recovers_task_branch_and_uses_project_primary_repository() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let workspace_root = TempDir::new().expect("workspace root creates");
     let service = TaskService::new(Arc::clone(&db), event_bus)
         .with_workspace_root(workspace_root.path().to_path_buf());
-    let (project_id, _repo_id, repo_dir) = seed_project_repo(&db).await;
+    let (project_id, repo_id, repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
     let task = service
         .create_task(
@@ -120,8 +120,88 @@ async fn claim_recovers_task_branch_left_by_a_rejected_workspace_attempt() {
         .expect("workspace lookup")
         .expect("workspace exists");
     assert_eq!(workspace.branch, branch);
+    assert_eq!(workspace.repo_id, repo_id);
+    let lease = WorkspaceLeaseRepo::get_active_for_task(&*db, &task.id)
+        .await
+        .expect("Workspace lease lookup")
+        .expect("Agent claim creates a Workspace lease");
+    assert_eq!(lease.repository_binding_id, workspace.repo_id);
     assert!(std::path::Path::new(&workspace.worktree_path).exists());
     assert_eq!(claimed.task.status, "in_progress");
+}
+
+#[tokio::test]
+async fn claim_rejects_cross_project_primary_repository_before_workspace_creation() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let service = TaskService::new(Arc::clone(&db), event_bus)
+        .with_workspace_root(workspace_root.path().to_path_buf());
+    let (project_id, _project_repo_id, _project_repo_dir) = seed_project_repo(&db).await;
+    let (_other_project_id, other_repo_id, _other_repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let project = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("Project loads")
+        .expect("Project exists");
+    ProjectRepo::update_at_version(
+        &*db,
+        UpdateProject {
+            id: project_id.clone(),
+            name: None,
+            settings: None,
+            primary_repo_id: Some(Some(other_repo_id)),
+            paused_at: None,
+            updated_at: now_rfc3339(),
+        },
+        project.version,
+        None,
+    )
+    .await
+    .expect("cross-Project pointer stores for legacy-corruption fixture");
+    let task = service
+        .create_task(
+            project_id.clone(),
+            "Reject invalid Project repository authority",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("Task creates without selecting a repository");
+
+    let result = service
+        .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(ServiceError::RepoMismatch { project_id: rejected_project })
+            if rejected_project == project_id
+    ));
+    assert!(WorkspaceRepo::get_by_task_id(&*db, &task.id)
+        .await
+        .expect("Workspace lookup succeeds")
+        .is_none());
+    assert!(ExecutionRepo::list_by_task(
+        &*db,
+        &task.id,
+        PageRequest {
+            cursor: None,
+            limit: 10,
+            include_total: false,
+            sort_by: SortBy::CreatedAt,
+            sort_order: SortOrder::Asc,
+        },
+    )
+    .await
+    .expect("Execution lookup succeeds")
+    .items
+    .is_empty());
 }
 
 #[tokio::test]
@@ -311,7 +391,7 @@ async fn claim_ignores_system_only_active_edges() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let mut stalled = workflow_state(
         "stalled",
         StateKind::Active,
@@ -353,7 +433,7 @@ async fn claim_ignores_system_only_active_edges() {
     };
     update_project_workflow(&db, &project_id, &workflow).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(&db, &project_id, &repo_id, "stalled".to_owned()).await;
+    let task = seed_task_with_status(&db, &project_id, "stalled".to_owned()).await;
 
     let result = service
         .claim_task(task.id, Assignee::Agent(agent_id), None)
@@ -423,9 +503,9 @@ async fn claim_allows_first_subtask_in_root_workspace() {
     let service = TaskService::new(Arc::clone(&db), event_bus)
         .with_workspace_root(workspace_root.path().to_path_buf())
         .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()));
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let root = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let root = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     let subtask = seed_subtask_with_status(&db, &root, "child", "todo".to_owned(), 0).await;
 
     let claimed = service
@@ -450,9 +530,9 @@ async fn claim_rejects_coordination_root_with_subtasks() {
     let event_bus = Arc::new(EventBus::new(16));
     let service =
         TaskService::new(Arc::clone(&db), event_bus).with_task_executor(Arc::new(NoDiffExecutor));
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let root = seed_task_with_status(&db, &project_id, &repo_id, "todo".to_owned()).await;
+    let root = seed_task_with_status(&db, &project_id, "todo".to_owned()).await;
     let _subtask = seed_subtask_with_status(&db, &root, "child", "todo".to_owned(), 0).await;
 
     let result = service

@@ -33,8 +33,15 @@ Return exactly one JSON object, without markdown fences or verdict markers:
 {"contract_digest":"<the supplied digest>","verdict":"pass|fail","requirements":[{"requirement_id":"<supplied id>","disposition":"satisfied|violated|unverified","rationale":"expected versus actual","evidence":[{"kind":"file","path":"relative/path","commit_sha":"<reviewed commit>","start_line":1,"end_line":3}]}],"findings":[]}
 A finding has {"blocking":true,"expected":"...","actual":"...","evidence":[...]}. Check evidence uses {"kind":"check","check_id":"<supplied id>"}. Include every supplied requirement exactly once. Cite real file lines at the reviewed commit or configured checks. Satisfied requirements need evidence. A violation or blocking finding may have empty evidence only when it is an absence claim for which no positive file can exist; explain what you inspected in the rationale. Use unverified when the available evidence cannot prove satisfied or violated. An evidence gap can never support PASS. Report all blocking violations relevant to this Task scope, including pre-existing violations of universal Project exclusions or non-claims. A PASS requires every supplied requirement satisfied and no blocking findings."#;
 
-pub async fn load_context(db: &SqliteDb, task_id: &str) -> Result<ReviewGoverningContext, String> {
-    let source = db.review_source(task_id).await.map_err(|e| e.to_string())?;
+pub async fn load_context(
+    db: &SqliteDb,
+    task_id: &str,
+    execution_id: Option<&str>,
+) -> Result<ReviewGoverningContext, String> {
+    let source = db
+        .review_source(task_id, execution_id)
+        .await
+        .map_err(|e| e.to_string())?;
     context_from_source(&source)
 }
 
@@ -574,7 +581,7 @@ pub async fn admit(
     task_id: &str,
     path: &Path,
 ) -> Result<ReviewContract, String> {
-    let context = load_context(db, task_id).await?;
+    let context = load_context(db, task_id, Some(execution_id)).await?;
     let check_results = completed_ci_check_results(db, task_id, &context).await?;
     let commit_sha = git_read(path, &["rev-parse", "HEAD"])
         .await?
@@ -705,7 +712,7 @@ pub async fn prepare_prompt(
         let contract = admit(db, execution_id, task_id, path).await?;
         (contract.context.clone(), Some(contract))
     } else {
-        (load_context(db, task_id).await?, None)
+        (load_context(db, task_id, Some(execution_id)).await?, None)
     };
     if shell {
         // Shell descriptions are executable programs. Supply structured context
@@ -950,7 +957,8 @@ async fn evaluate_inner(
     // when a semantic claim or citation cannot be verified. A negative review
     // is useful remediation input and cannot grant acceptance.
     result.assessment = Some(report.clone());
-    if load_context(db, &contract.context.task_id).await? != contract.context
+    if load_context(db, &contract.context.task_id, Some(&contract.execution_id)).await?
+        != contract.context
         || git_read(path, &["rev-parse", "HEAD"]).await?.trim() != contract.commit_sha
     {
         return Err("review context or commit changed; fresh review required".into());

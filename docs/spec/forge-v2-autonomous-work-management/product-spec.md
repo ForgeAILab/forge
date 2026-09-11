@@ -208,11 +208,11 @@ Forge should not require a separate reviewer merely to create the appearance of 
 
 ### 7.1 Project
 
-A workspace that groups repositories, tasks, agents, policies, validation profiles, and project activity.
+A workspace that groups its current execution repository, tasks, agents, policies, validation profiles, and project activity.
 
 A project owns:
 
-- one or more repositories;
+- zero or one selected current primary repository, with prior execution repository identities retained only as history;
 - a default autonomy policy;
 - a default validation profile;
 - task views and board configuration;
@@ -227,7 +227,7 @@ A task owns:
 
 - title and objective;
 - description and acceptance criteria;
-- project and repository context;
+- project context;
 - parent, subtasks, and dependencies;
 - primary assignee;
 - risk and policy overrides;
@@ -238,6 +238,11 @@ A task owns:
 - comments, decisions, and audit history.
 
 A task can survive multiple runs and multiple agents.
+
+Repository selection is Project setup, not Task state. A Task carries no
+repository selector; each new run resolves the Project's current primary
+repository, while the run's Workspace and lease preserve the exact repository
+used for delivery evidence and history.
 
 ### 7.3 Agent
 
@@ -488,7 +493,6 @@ Required:
 Optional:
 
 - description;
-- repository when the project has multiple repos;
 - assignee.
 
 Defaulted by project policy:
@@ -581,7 +585,7 @@ Requesting changes resumes the same task thread by default and preserves the wor
 A transfer package includes:
 
 - task contract;
-- repository and worktree;
+- the current run's attempt-pinned repository and worktree;
 - current diff and commits;
 - concise conversation and decision summary;
 - prior plans;
@@ -600,7 +604,7 @@ The global Work surface supports:
 - tasks awaiting review;
 - running tasks;
 - blocked or failed tasks;
-- filtering by project, repository, agent, phase, risk, and label;
+- filtering by project, agent, phase, risk, and label;
 - list and optional Kanban views;
 - saved views.
 
@@ -813,7 +817,7 @@ Raw tool calls are collapsed.
 
 ### 14.3 Sidebar
 
-- project and repository;
+- project and its current repository (read-only Project setup context);
 - assignee;
 - risk;
 - validation profile;
@@ -990,7 +994,6 @@ Notify on decisions and exceptions, not routine progress.
 Global filters:
 
 - project;
-- repository;
 - phase;
 - attention type;
 - assignee;
@@ -1150,4 +1153,3 @@ The product specification is satisfied when all of the following are true:
 13. Existing task, execution, transition, review, and audit history remain readable after migration.
 14. Low-, medium-, high-, and critical-risk policies produce the expected approval and review behavior.
 15. End-to-end tests cover normal work, questions, validation failure, recovery, transfer, review, merge failure, and legacy projects.
-

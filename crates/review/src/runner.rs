@@ -5,6 +5,7 @@ use db::{
     CreateReview, Execution, ExecutionLeaseDisposition, ExecutionLeaseMutation, ExecutionRepo,
     ExecutionStatus, ExecutionTerminalOutcome, RenewExecutionLease, RepoRepo, Review,
     ReviewConformanceRepo, ReviewRepo, ReviewStatus, SqliteDb, TaskRepo, TerminalizeExecution,
+    WorkspaceRepo,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{
@@ -161,21 +162,24 @@ impl ReviewRunner {
             .ok_or(ReviewError::ExecutorExecutionNotFound(
                 req.executor_execution_id,
             ))?;
+        let workspace_id = executor_execution.workspace_id.clone().ok_or(
+            ReviewError::ExecutorExecutionMissingWorkspace(req.executor_execution_id),
+        )?;
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or(db::DbError::NotFound)?;
         let ci_only_review = task.review_passed_at.is_some() && req.auditor_agent_id.is_none();
         let state_config = read_review_state_config(task.task_state_config.as_deref())?;
-        let review_source = self.db.review_source(&task_id).await?;
+        let review_source = self
+            .db
+            .review_source(&task_id, Some(&executor_execution_id))
+            .await?;
         let ci_steps = if crate::contract::task_scope_is_read_only(&review_source) {
             Vec::new()
         } else {
             read_ci_steps(&state_config)
         };
         let review_prompt = read_review_prompt(&state_config);
-        let workspace_id = executor_execution.workspace_id.clone().ok_or(
-            ReviewError::ExecutorExecutionMissingWorkspace(req.executor_execution_id),
-        )?;
 
         let (reviewer_execution, reviewer_owner) = self
             .create_reviewer_execution(&task_id, &executor_execution_id, workspace_id.clone(), &req)
@@ -500,9 +504,12 @@ impl ReviewRunner {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or(db::DbError::NotFound)?;
-        let repo_id = task.repo_id.as_deref().ok_or(db::DbError::NotFound)?;
-        let repo = RepoRepo::get_by_id(&*self.db, repo_id)
+        let workspace = WorkspaceRepo::get_by_id(&*self.db, &workspace_id)
             .await?
+            .ok_or(db::DbError::NotFound)?;
+        let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
+            .await?
+            .filter(|repo| repo.project_id == task.project_id)
             .ok_or(db::DbError::NotFound)?;
         let Some(auditor_agent) = self.load_auditor_agent(auditor_agent_id).await? else {
             return Ok(Some(AuditorRunResult::failed("auditor_agent_unavailable")));

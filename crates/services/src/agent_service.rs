@@ -734,7 +734,6 @@ mod tests {
             CreateTask {
                 id: new_uuid_v4(),
                 project_id,
-                repo_id: Some(repo_id),
                 parent_task_id: None,
                 subtask_order: None,
                 assignee_type: Some("agent".to_owned()),

@@ -238,7 +238,6 @@ pub(super) async fn apply_adaptive_task_command(
                 let create = CreateTask {
                     id: task_id,
                     project_id: source.project_id.clone(),
-                    repo_id: source.repo_id.clone(),
                     parent_task_id: Some(source.id.clone()),
                     assignee_type: None,
                     assignee_id: None,
@@ -364,7 +363,6 @@ pub(super) async fn apply_adaptive_task_command(
             let create = CreateTask {
                 id: task_id,
                 project_id: source.project_id.clone(),
-                repo_id: source.repo_id.clone(),
                 parent_task_id: source.parent_task_id.clone(),
                 assignee_type: source.assignee_type.clone(),
                 assignee_id: source.assignee_id.clone(),

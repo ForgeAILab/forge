@@ -360,12 +360,17 @@ pub struct DeliveryReport {
 ```
 
 Delivery reports are versioned snapshots. Avoid reconstructing old review evidence from mutable current task state.
+`DeliveryRepository` is populated from the execution Workspace/lease, not from
+the Task or the Project's later current repository selection.
 
 ---
 
 ## 7. Persistence changes
 
-Migration numbers assume the current repository ends at `V058`; adjust if new migrations land first.
+The original V2 slices below assumed the repository ended at `V058`. Their
+historical V059–V064 labels remain as the proposal sequence; the later
+Project-owned repository-authority correction uses the actual current V138
+number and does not edit an earlier migration.
 
 ### V059 — canonical workflow phase
 
@@ -444,6 +449,21 @@ Avoid unnecessary schema churn.
 ### V064 — decision/question records, if existing comments are insufficient
 
 A first implementation may use structured task comments plus task interruption metadata. Introduce a dedicated decision record only if reliable open/resolved question queries cannot be implemented otherwise.
+
+### V138 — Project-owned Task repository authority
+
+Remove `task.repo_id` and its index in one forward-only, data-preserving
+migration. A Task does not select or snapshot a repository. Before each new
+execution, TaskService resolves `project.primary_repo_id`, requires the Repo to
+belong to that Project, and exposes a typed setup blocker when it is missing or
+invalid. Lease insertion and renewal require that Project selection to match
+the execution Workspace and the lease's `repository_binding_id`.
+
+Do not rewrite Task versions or migrate the discarded Task value into another
+selector. Preserve Workspace, execution, lease, delivery/review, pull-request,
+evidence, release, and unselected legacy Repo rows; those records remain
+attempt-level or historical provenance. Removing repository setup no longer
+cascades Task deletion.
 
 ---
 
@@ -729,7 +749,7 @@ Generation triggers:
 Inputs:
 
 - task and contract;
-- repository/workspace;
+- execution Workspace and its attempt-pinned repository;
 - Git diff and commits;
 - execution metadata;
 - validation results;
@@ -770,7 +790,6 @@ GET /api/v1/review-queue
 
 ```text
 project_id
-repo_id
 canonical_phase
 attention_kind
 assignee_type
@@ -856,6 +875,12 @@ Keep existing fields during migration:
 - `execution_observability`;
 - `plan_progress`;
 - `plan_artifact`.
+
+The separate Project-repository correction is a public-beta breaking change:
+remove `repo_id` from `TaskResponse` and generated Task bindings. Do not retain
+an alias. Repository context for a completed or running attempt comes from its
+Workspace/lease and delivery provenance; pre-execution selection comes only
+from `project.primary_repo_id`.
 
 The web client can progressively switch to the new summary fields.
 
@@ -1221,10 +1246,12 @@ If external telemetry is ever added, it must remain explicit and privacy-preserv
 
 ### 25.2 Existing API clients
 
-- additive response fields only in the first release;
+- additive response fields only in the first V2 release, except for the
+  coordinated removal of Task `repo_id` described above;
 - existing task transition endpoints remain;
 - execution and daemon route names remain;
-- generated TypeScript bindings update additively;
+- generated TypeScript Task bindings remove `repo_id` with no compatibility
+  field;
 - CLI output changes should support a compatibility mode if scripts parse exact columns.
 
 ### 25.3 Existing tasks during migration
@@ -1365,3 +1392,6 @@ This sequencing allows UX validation before deep policy automation.
 13. REST, MCP, CLI, and web clients continue to operate against legacy workflows.
 14. All new API types regenerate clean TypeScript bindings.
 15. The Playwright suite covers both autonomous and legacy project paths.
+16. Tasks accepted before repository attachment become runnable after valid
+    Project setup without Task mutation, while attempt Workspaces keep their
+    original repository provenance.

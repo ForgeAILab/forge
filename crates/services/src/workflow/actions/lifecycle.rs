@@ -102,18 +102,23 @@ impl HookAction for RunBeforeWorkHooks {
             },
         };
 
-        let repo_path = match task.repo_id.as_deref() {
-            Some(id) => match RepoRepo::get_by_id(&*ctx.db, id).await {
-                Ok(repo) => repo
-                    .and_then(|repo| repo.local_path)
-                    .unwrap_or_else(|| workspace.worktree_path.clone()),
-                Err(error) => {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
-                }
-            },
-            None => workspace.worktree_path.clone(),
+        let repo_path = match RepoRepo::get_by_id(&*ctx.db, &workspace.repo_id).await {
+            Ok(Some(repo)) if repo.project_id == project.id => repo
+                .local_path
+                .unwrap_or_else(|| workspace.worktree_path.clone()),
+            Ok(_) => {
+                return HookResult::Failed {
+                    reason: format!(
+                        "workspace repository {} is not owned by project {}",
+                        workspace.repo_id, project.id
+                    ),
+                };
+            }
+            Err(error) => {
+                return HookResult::Failed {
+                    reason: error.to_string(),
+                };
+            }
         };
         let assigned_agent_id = target_role_agent_id(ctx).await;
         let log_dir = std::env::temp_dir()

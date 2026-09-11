@@ -56,10 +56,7 @@ impl TaskService {
             self.repo_cache_locks.clone(),
         )
         .await?;
-        let repo = match task.repo_id.as_deref() {
-            Some(id) => RepoRepo::get_by_id(&*self.db, id).await?,
-            None => None,
-        };
+        let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id).await?;
         let repo_path = repo
             .and_then(|repo| repo.local_path)
             .unwrap_or_else(|| workspace.worktree_path.clone());

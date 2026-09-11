@@ -129,7 +129,7 @@ One same-Project asset may have many attachments and pins across milestones, che
 An evidence attachment used by a gate must capture the exact source context, including as applicable:
 
 - `source_task_id`, immutable Task revision/event or result ID, assignment/reviewer scope, and run/attempt ID;
-- immutable repository binding plus commit/tree digest (never only a branch name), and the relevant artifact/document revision;
+- immutable attempt-pinned Workspace/lease repository binding plus commit/tree digest (never only a branch name), and the relevant artifact/document revision;
 - `build_id`, build/input artifact digest, build-definition or pipeline revision, runner/toolchain/platform context, and result;
 - `check_definition_id` and revision, release-policy revision, validation/run ID, runner, principal, start/finish times, result, and input-manifest digest;
 - `asset_id`, original content digest/checksum, content type/size, capture time, evidence kind, caption, and supported acceptance requirement;
@@ -265,7 +265,7 @@ Never decide GC from a cached count, a stale UI list, or a Task's deleted flag. 
 Validation and evidence are fresh only for the exact contexts they record. At capture and at readiness recomputation, bind the evidence to:
 
 - the approved Charter/baseline/milestone and release-policy revisions;
-- the exact repository binding, commit/tree digest, and artifact/document revisions;
+- the exact attempt-pinned Workspace/lease repository binding, commit/tree digest, and artifact/document revisions;
 - build/run ID, input/output artifact digests, build-definition/toolchain/platform context, and result;
 - check-definition revision, validation runner and principal, input-manifest digest, and attestation time;
 - evidence asset/attachment digest, capture time, supported acceptance check, and release-candidate/readiness identity.

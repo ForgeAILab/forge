@@ -1779,9 +1779,9 @@ mod tests {
         create_sqlite_pool, new_uuid_v4, run_migrations, AgentContextScopeRepo, AgentProfileRepo,
         AgentSession, CreateAgent, CreateAgentContextScope, CreateAgentProfile, CreateAgentSession,
         CreateExecution, CreateProject, CreateRepo, CreateReview, CreateTask,
-        CreateTaskRoleAssignment, CreateWorkspaceLease, DaemonRepo, DaemonStatus, DomainEventRepo,
-        RepoRepo, ReviewRepo, ReviewStatus, TaskRoleAssignmentRepo, TaskStatus, UpdateProject,
-        UpsertDaemon,
+        CreateTaskRoleAssignment, CreateWorkspace, CreateWorkspaceLease, DaemonRepo, DaemonStatus,
+        DomainEventRepo, RepoRepo, ReviewRepo, ReviewStatus, TaskRoleAssignmentRepo, TaskStatus,
+        UpdateProject, UpsertDaemon, WorkspaceRepo, WorkspaceStatus,
     };
     use executors::{ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError};
     use serde_json::Value;
@@ -1945,17 +1945,15 @@ mod tests {
     async fn seed_task(
         db: &SqliteDb,
         project_id: String,
-        repo_id: String,
         status: TaskStatus,
         agent_id: Option<String>,
     ) -> Task {
-        seed_task_with_assignee(db, project_id, repo_id, status, "agent", agent_id).await
+        seed_task_with_assignee(db, project_id, status, "agent", agent_id).await
     }
 
     async fn seed_task_with_assignee(
         db: &SqliteDb,
         project_id: String,
-        repo_id: String,
         status: TaskStatus,
         assignee_type: &str,
         assignee_id: Option<String>,
@@ -1966,7 +1964,6 @@ mod tests {
             CreateTask {
                 id: new_uuid_v4(),
                 project_id,
-                repo_id: Some(repo_id),
                 parent_task_id: None,
                 subtask_order: None,
                 assignee_type: assignee_id.as_ref().map(|_| assignee_type.to_owned()),
@@ -2013,6 +2010,16 @@ mod tests {
         agent_id: String,
         agent_session_id: Option<String>,
     ) -> db::Execution {
+        seed_running_execution_in_workspace(db, task_id, agent_id, agent_session_id, None).await
+    }
+
+    async fn seed_running_execution_in_workspace(
+        db: &SqliteDb,
+        task_id: String,
+        agent_id: String,
+        agent_session_id: Option<String>,
+        workspace_id: Option<String>,
+    ) -> db::Execution {
         let now = now_rfc3339();
         ExecutionRepo::create(
             db,
@@ -2038,7 +2045,7 @@ mod tests {
                 executor_config_snapshot_json: Some(
                     r#"{"executor_type":"shell","config":{}}"#.to_owned(),
                 ),
-                workspace_id: None,
+                workspace_id,
                 created_at: now.clone(),
                 updated_at: now,
             },
@@ -2235,17 +2242,16 @@ mod tests {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let mut rx = event_bus.subscribe();
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let agent = seed_agent(&db, AgentStatus::Busy, Some(now_rfc3339())).await;
         let in_progress = seed_task(
             &db,
             project_id.clone(),
-            repo_id.clone(),
             "in_progress".to_owned(),
             Some(agent.id),
         )
         .await;
-        let todo = seed_task(&db, project_id, repo_id, "todo".to_owned(), None).await;
+        let todo = seed_task(&db, project_id, "todo".to_owned(), None).await;
 
         let recovery = CrashRecovery::new(Arc::clone(&db), event_bus);
         let recovered = recovery.run_recovery().await.expect("recovery runs");
@@ -2273,11 +2279,10 @@ mod tests {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let mut rx = event_bus.subscribe();
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let user_task = seed_task_with_assignee(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             "user",
             Some("human-user".to_owned()),
@@ -2302,8 +2307,8 @@ mod tests {
     async fn crash_recovery_blocks_interrupted_entry_barriers() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
-        let (project_id, repo_id) = seed_project_repo(&db).await;
-        let task = seed_task(&db, project_id, repo_id, "review".to_owned(), None).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
+        let task = seed_task(&db, project_id, "review".to_owned(), None).await;
         TaskRepo::set_entry_barrier(
             &*db,
             &task.id,
@@ -2343,13 +2348,12 @@ mod tests {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let mut rx = event_bus.subscribe();
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let old_heartbeat = "1970-01-01T00:00:00+00:00".to_owned();
         let agent = seed_agent(&db, AgentStatus::Busy, Some(old_heartbeat.clone())).await;
         let task = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(agent.id.clone()),
         )
@@ -2411,7 +2415,7 @@ mod tests {
     async fn heartbeat_monitor_stale_busy_agent_does_not_cancel_healthy_quiet_execution() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let agent = seed_agent(
             &db,
             AgentStatus::Busy,
@@ -2421,7 +2425,6 @@ mod tests {
         let task = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(agent.id.clone()),
         )
@@ -2503,7 +2506,7 @@ mod tests {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let mut rx = event_bus.subscribe();
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let (agent_id, _) = seed_agent_with_daemon(
             &db,
             &crate::embedded_daemon::embedded_machine_id(),
@@ -2513,7 +2516,6 @@ mod tests {
         let task = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(agent_id.clone()),
         )
@@ -2620,7 +2622,7 @@ mod tests {
     async fn heartbeat_monitor_routes_expired_reviewer_through_review_retry() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(32));
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let (agent_id, _) = seed_agent_with_daemon(
             &db,
             &crate::embedded_daemon::embedded_machine_id(),
@@ -2630,7 +2632,6 @@ mod tests {
         let task = seed_task(
             &db,
             project_id,
-            repo_id,
             default_states::REVIEW.to_owned(),
             Some(agent_id.clone()),
         )
@@ -2719,7 +2720,7 @@ mod tests {
     async fn heartbeat_monitor_warns_on_live_stale_progress_without_terminalizing() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(32));
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let (agent_id, _) = seed_agent_with_daemon(
             &db,
             &crate::embedded_daemon::embedded_machine_id(),
@@ -2729,7 +2730,6 @@ mod tests {
         let task = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(agent_id.clone()),
         )
@@ -2800,7 +2800,7 @@ mod tests {
     async fn heartbeat_monitor_terminal_cas_race_emits_one_terminal_event() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(32));
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let (agent_id, _) = seed_agent_with_daemon(
             &db,
             &crate::embedded_daemon::embedded_machine_id(),
@@ -2810,7 +2810,6 @@ mod tests {
         let task = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(agent_id.clone()),
         )
@@ -2916,7 +2915,7 @@ mod tests {
     async fn recovery_monitors_all_active_states() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         sqlx::query("UPDATE project SET workflow_definition = ? WHERE id = ?")
             .bind(
                 serde_json::to_string(&crate::workflow::default_workflow::default_workflow())
@@ -2936,19 +2935,12 @@ mod tests {
         let task_in_progress = seed_task(
             &db,
             project_id.clone(),
-            repo_id.clone(),
             "in_progress".to_owned(),
             Some(agent.id.clone()),
         )
         .await;
-        let task_merge_failed = seed_task(
-            &db,
-            project_id,
-            repo_id,
-            "merge_failed".to_owned(),
-            Some(agent.id),
-        )
-        .await;
+        let task_merge_failed =
+            seed_task(&db, project_id, "merge_failed".to_owned(), Some(agent.id)).await;
 
         let recovery = CrashRecovery::new(Arc::clone(&db), event_bus);
         let recovered = recovery.run_recovery().await.expect("recovery runs");
@@ -2971,12 +2963,11 @@ mod tests {
     async fn crash_recovery_cancels_running_executions() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let agent = seed_agent(&db, AgentStatus::Busy, Some(now_rfc3339())).await;
         let task = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(agent.id.clone()),
         )
@@ -3010,12 +3001,11 @@ mod tests {
     #[tokio::test]
     async fn cancel_running_executions_returns_cancelled_execution_metadata() {
         let db = Arc::new(sqlite_db().await);
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let agent = seed_agent(&db, AgentStatus::Busy, Some(now_rfc3339())).await;
         let task = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(agent.id.clone()),
         )
@@ -3054,17 +3044,41 @@ mod tests {
         let task = seed_task(
             &db,
             project_id.clone(),
-            repo_id.clone(),
             "in_progress".to_owned(),
             Some(agent.id.clone()),
         )
         .await;
 
+        let workspace_id = new_uuid_v4();
+        WorkspaceRepo::create(
+            &*db,
+            CreateWorkspace {
+                id: workspace_id.clone(),
+                task_id: task.id.clone(),
+                repo_id: repo_id.clone(),
+                worktree_path: format!("/tmp/forge-recovery-{workspace_id}"),
+                branch: ::workspace::task_branch_name(&task.id),
+                status: WorkspaceStatus::Ready,
+                before_sha: None,
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("successor workspace creates");
+
         // Leave an active lease for a newer successor attempt. The successor
         // is made terminal through a direct fixture update so the stale
         // recovery calls below only race on the older running attempt; the
         // lease remains the protected task-scoped grant.
-        let successor = seed_running_execution(&db, task.id.clone(), agent.id.clone(), None).await;
+        let successor = seed_running_execution_in_workspace(
+            &db,
+            task.id.clone(),
+            agent.id.clone(),
+            None,
+            Some(workspace_id.clone()),
+        )
+        .await;
         let now = Utc::now();
         let successor_lease = WorkspaceLeaseRepo::issue(
             &*db,
@@ -3102,8 +3116,14 @@ mod tests {
             .await
             .expect("successor fixture terminalizes");
 
-        let stale_execution =
-            seed_running_execution(&db, task.id.clone(), agent.id.clone(), None).await;
+        let stale_execution = seed_running_execution_in_workspace(
+            &db,
+            task.id.clone(),
+            agent.id.clone(),
+            None,
+            Some(workspace_id),
+        )
+        .await;
         let stale_task = TaskRepo::get_by_id(&*db, &task.id, false)
             .await
             .expect("stale task loads")
@@ -3151,12 +3171,11 @@ mod tests {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(1024));
         let _task_service = Arc::new(TaskService::new(Arc::clone(&db), Arc::clone(&event_bus)));
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let agent = seed_agent(&db, AgentStatus::Busy, Some(now_rfc3339())).await;
         let task = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(agent.id.clone()),
         )
@@ -3197,12 +3216,11 @@ mod tests {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(1024));
         let _task_service = Arc::new(TaskService::new(Arc::clone(&db), Arc::clone(&event_bus)));
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let agent = seed_agent(&db, AgentStatus::Busy, Some(now_rfc3339())).await;
         let task = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(agent.id.clone()),
         )
@@ -3285,8 +3303,8 @@ mod tests {
     async fn crash_recovery_clears_stale_recovery_annotations_without_execution() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
-        let (project_id, repo_id) = seed_project_repo(&db).await;
-        let task = seed_task(&db, project_id, repo_id, "in_progress".to_owned(), None).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
+        let task = seed_task(&db, project_id, "in_progress".to_owned(), None).await;
         stamp_recovery_annotation(&db, &task, None).await;
 
         let recovered = CrashRecovery::new(Arc::clone(&db), event_bus)
@@ -3306,12 +3324,11 @@ mod tests {
     async fn crash_recovery_preserves_legitimate_pending_recovery_annotations() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let agent = seed_agent(&db, AgentStatus::Busy, Some(now_rfc3339())).await;
         let task = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(agent.id.clone()),
         )
@@ -3375,8 +3392,8 @@ mod tests {
     async fn crash_recovery_clears_stale_recovery_annotations_for_missing_execution() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
-        let (project_id, repo_id) = seed_project_repo(&db).await;
-        let task = seed_task(&db, project_id, repo_id, "in_progress".to_owned(), None).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
+        let task = seed_task(&db, project_id, "in_progress".to_owned(), None).await;
         stamp_recovery_annotation(&db, &task, Some("missing-execution-id")).await;
 
         let recovered = CrashRecovery::new(Arc::clone(&db), event_bus)
@@ -3500,13 +3517,12 @@ mod tests {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let (agent_id, _) =
             seed_agent_with_daemon(&db, "remote-machine-a", AgentStatus::Idle).await;
         let task = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(agent_id.clone()),
         )
@@ -3535,13 +3551,12 @@ mod tests {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let (agent_id, _) =
             seed_agent_with_daemon(&db, "remote-machine-b", AgentStatus::Idle).await;
         let task = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(agent_id.clone()),
         )
@@ -3567,14 +3582,13 @@ mod tests {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let (agent_id, agent) =
             seed_agent_with_daemon(&db, "remote-machine-c", AgentStatus::Idle).await;
         let daemon_id = agent.daemon_id.clone().expect("daemon id");
         let task = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(agent_id.clone()),
         )
@@ -3603,7 +3617,7 @@ mod tests {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let registry = Arc::new(DaemonConnectionRegistry::without_handlers());
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let (agent_id, _) = seed_agent_with_daemon(
             &db,
             &crate::embedded_daemon::embedded_machine_id(),
@@ -3613,7 +3627,6 @@ mod tests {
         let task = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(agent_id.clone()),
         )
@@ -3640,13 +3653,12 @@ mod tests {
     async fn heartbeat_monitor_does_not_cancel_remote_stalled_executions_via_embedded_executor() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let (agent_id, _) =
             seed_agent_with_daemon(&db, "remote-machine-d", AgentStatus::Idle).await;
         let task = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(agent_id.clone()),
         )
@@ -3716,7 +3728,7 @@ mod tests {
     async fn heartbeat_monitor_cancels_stalled_executions_of_daemonless_agents() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let now = now_rfc3339();
         let agent = AgentRepo::create(
             &*db,
@@ -3751,7 +3763,6 @@ mod tests {
         let task = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(agent.id.clone()),
         )
@@ -3827,14 +3838,13 @@ mod tests {
         let task_service = Arc::new(TaskService::new(Arc::clone(&db), Arc::clone(&event_bus)));
         let service = DaemonService::new(Arc::clone(&db), Arc::clone(&event_bus))
             .with_task_service(task_service);
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let (agent_id, agent) =
             seed_agent_with_daemon(&db, "remote-machine-report", AgentStatus::Idle).await;
         let daemon_id = agent.daemon_id.clone().expect("daemon id");
         let task = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(agent_id.clone()),
         )
@@ -3879,14 +3889,13 @@ mod tests {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let service = DaemonService::new(Arc::clone(&db), Arc::clone(&event_bus));
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let (agent_id, agent) =
             seed_agent_with_daemon(&db, "remote-machine-fresh", AgentStatus::Idle).await;
         let daemon_id = agent.daemon_id.clone().expect("daemon id");
         let task = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(agent_id.clone()),
         )
@@ -3924,14 +3933,13 @@ mod tests {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let service = DaemonService::new(Arc::clone(&db), Arc::clone(&event_bus));
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let (agent_id, agent) =
             seed_agent_with_daemon(&db, "remote-machine-none", AgentStatus::Idle).await;
         let daemon_id = agent.daemon_id.clone().expect("daemon id");
         let task = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(agent_id.clone()),
         )
@@ -3974,12 +3982,11 @@ mod tests {
     async fn crash_recovery_clears_stale_recovery_annotations_for_completed_execution() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
-        let (project_id, repo_id) = seed_project_repo(&db).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
         let agent = seed_agent(&db, AgentStatus::Busy, Some(now_rfc3339())).await;
         let task = seed_task(
             &db,
             project_id,
-            repo_id,
             "in_progress".to_owned(),
             Some(agent.id.clone()),
         )

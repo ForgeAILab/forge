@@ -361,6 +361,7 @@ impl From<ServiceError> for McpToolError {
                 Self::new(-32602, "Product Genesis session already active")
             }
             ServiceError::MissingPrimaryRepo { .. }
+            | ServiceError::PrimaryRepoNotFound { .. }
             | ServiceError::RepoMismatch { .. }
             | ServiceError::PrProviderMissing { .. }
             | ServiceError::PrProviderTokenMissing { .. } => {

@@ -20,7 +20,6 @@ let objectUrlCounter = 0
 const task = {
   id: 'task-1',
   project_id: 'project-1',
-  repo_id: null,
   title: 'Task',
   task_type: 'task',
   status: 'todo',

@@ -34,7 +34,7 @@ On receipt consumption, Forge atomically creates the Project, Project Agent bind
 
 ### Project Agent continuation
 
-The Project Agent verifies the handoff, then drafts a Delivery Brief. Before user baseline approval it may create a read-only discovery Task to inspect an explicitly selected repository binding, but it may not dispatch a repository-capable implementation Task.
+The Project Agent verifies the handoff, then drafts a Delivery Brief. Before user baseline approval it may create a read-only discovery Task to inspect the Project's current authorized primary Repo, but it may not dispatch a repository-capable implementation Task. The Task itself carries no repository selector.
 
 The proposed compact baseline could contain:
 
@@ -130,6 +130,6 @@ Reject or reformulate these behaviors:
 - “I created the Project because you said yes in chat.” No exact approval receipt exists.
 - “Main archived a struggling Project.” Main has no Project-local lifecycle authority.
 - “Project Agent passed its own review.” Release-gating validation must come from an allowed independent principal.
-- “The Task contains `/Volumes/Data/repo` and a GitHub token.” Task prose may identify only a logical repository binding; the scheduler supplies a scoped lease.
+- “The Task contains `/Volumes/Data/repo`, a Repo ID, and a GitHub token.” Task prose carries no repository selector; TaskService derives the Project's current primary Repo and the scheduler supplies a scoped, attempt-pinned lease.
 - “The dashboard says 100%, therefore release is ready.” Progress is a projection; readiness is a system snapshot over exact policy-bound inputs.
 - “We moved legacy media into a new release directory.” Preserve asset IDs, URLs, storage keys, and bytes in place; add ownership, attachment, and pin metadata.

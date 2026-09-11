@@ -64,7 +64,6 @@ async fn seed_base(db: &SqliteDb) {
         CreateTask {
             id: "receipt-task".to_owned(),
             project_id: "receipt-project".to_owned(),
-            repo_id: Some("receipt-repo".to_owned()),
             parent_task_id: None,
             assignee_type: None,
             assignee_id: None,

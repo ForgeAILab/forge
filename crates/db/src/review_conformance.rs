@@ -7,7 +7,7 @@ use sqlx::{Row, SqliteConnection};
 
 #[async_trait]
 pub trait ReviewConformanceRepo: Send + Sync {
-    async fn review_source(&self, task_id: &str) -> Result<Value>;
+    async fn review_source(&self, task_id: &str, execution_id: Option<&str>) -> Result<Value>;
     async fn lock_review_integration(&self, task_id: &str) -> Result<ReviewIntegrationGuard>;
     async fn create_review_contract(&self, contract: &ReviewContract) -> Result<()>;
     async fn review_contract(&self, execution_id: &str) -> Result<Option<ReviewContract>>;
@@ -35,18 +35,43 @@ fn json_error(error: serde_json::Error) -> DbError {
 pub(crate) async fn review_source_in_tx(
     conn: &mut SqliteConnection,
     task_id: &str,
+    execution_id: Option<&str>,
 ) -> Result<Value> {
     let row = sqlx::query(
-        "SELECT t.id, t.project_id, t.repo_id, t.title, t.description, t.task_type,
+        "SELECT t.id, t.project_id, r.id AS repo_id, e.id AS repository_execution_id,
+                t.title, t.description, t.task_type,
                 t.plan, t.task_state_config, t.merge_config, r.default_branch, p.workflow_definition, p.settings,
                 p.charter_status, p.charter_setup_required, p.current_charter_revision_id,
                 g.charter_revision_id AS task_charter_revision_id, g.document_revisions_json,
                 g.plan_item_id, g.milestone_id, g.capability_class
          FROM task t JOIN project p ON p.id = t.project_id
-         LEFT JOIN repo r ON r.id = t.repo_id
+         LEFT JOIN execution e ON e.id = COALESCE(
+             ?,
+             (SELECT e2.id FROM execution e2
+              WHERE e2.task_id = t.id
+              ORDER BY e2.updated_at DESC, e2.id DESC LIMIT 1)
+         ) AND e.task_id = t.id
+         LEFT JOIN workspace w ON w.id = e.workspace_id
+         LEFT JOIN repo r ON r.id = CASE
+             WHEN e.id IS NULL THEN p.primary_repo_id
+             ELSE w.repo_id
+         END AND r.project_id = t.project_id
          LEFT JOIN project_task_governance g ON g.task_id = t.id AND g.project_id = t.project_id
          WHERE t.id = ? AND t.deleted_at IS NULL")
-        .bind(task_id).fetch_optional(&mut *conn).await?.ok_or(DbError::NotFound)?;
+        .bind(execution_id)
+        .bind(task_id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or(DbError::NotFound)?;
+    let resolved_execution_id: Option<String> = row.try_get("repository_execution_id")?;
+    if execution_id.is_some_and(|expected| resolved_execution_id.as_deref() != Some(expected)) {
+        return Err(DbError::NotFound);
+    }
+    if resolved_execution_id.is_some() && row.try_get::<Option<String>, _>("repo_id")?.is_none() {
+        return Err(DbError::Check(
+            "review execution has no Workspace repository provenance".to_owned(),
+        ));
+    }
     let project_id: String = row.try_get("project_id")?;
     let charter_id: Option<String> = row.try_get("current_charter_revision_id")?;
     let charter = if let Some(id) = &charter_id {
@@ -173,7 +198,12 @@ pub(crate) async fn verify_review_source(
     conn: &mut SqliteConnection,
     contract: &ReviewContract,
 ) -> Result<()> {
-    let source = review_source_in_tx(conn, &contract.context.task_id).await?;
+    let source = review_source_in_tx(
+        conn,
+        &contract.context.task_id,
+        Some(&contract.execution_id),
+    )
+    .await?;
     if api_types::canonical_digest(&source).map_err(json_error)? != contract.context.source_digest {
         return Err(DbError::Check(
             "review governing context changed; fresh review required".into(),
@@ -186,7 +216,7 @@ pub(crate) async fn verify_review_source(
 impl ReviewConformanceRepo for SqliteDb {
     async fn lock_review_integration(&self, task_id: &str) -> Result<ReviewIntegrationGuard> {
         let mut tx = crate::begin_immediate(self.pool()).await?;
-        let source = review_source_in_tx(&mut tx, task_id).await?;
+        let source = review_source_in_tx(&mut tx, task_id, None).await?;
         let assigned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_role_assignment WHERE task_id = ? AND role_name = 'reviewer' AND assignee_type = 'agent' AND assignee_id IS NOT NULL)")
             .bind(task_id).fetch_one(&mut *tx).await?;
         let has_review_role = source
@@ -213,8 +243,10 @@ impl ReviewConformanceRepo for SqliteDb {
                     "review acceptance uses an obsolete policy; fresh review required".into(),
                 ));
             }
+            let contract_source =
+                review_source_in_tx(&mut tx, task_id, Some(&contract.execution_id)).await?;
             if contract.context.task_id != task_id
-                || api_types::canonical_digest(&source).map_err(json_error)?
+                || api_types::canonical_digest(&contract_source).map_err(json_error)?
                     != contract.context.source_digest
             {
                 return Err(DbError::Check(
@@ -249,9 +281,9 @@ impl ReviewConformanceRepo for SqliteDb {
         })
     }
 
-    async fn review_source(&self, task_id: &str) -> Result<Value> {
+    async fn review_source(&self, task_id: &str, execution_id: Option<&str>) -> Result<Value> {
         let mut tx = self.pool().begin().await?;
-        let source = review_source_in_tx(&mut tx, task_id).await?;
+        let source = review_source_in_tx(&mut tx, task_id, execution_id).await?;
         tx.commit().await?;
         Ok(source)
     }

@@ -7,6 +7,7 @@ use db::{
     DaemonStatus, ExecutionRepo, ExecutionStatus, PageRequest, RepoRepo, ResumePolicy, ReviewRepo,
     ReviewStatus, SortBy, SortOrder, StopReason, TaskRepo, TaskRoleAssignmentRepo,
     TransitionLogRepo, UpdateDaemonReport, UpdateProject, UpdateTask, UpsertDaemon,
+    WorkspaceLeaseRepo, WorkspaceRepo,
 };
 use executors::{ExecutionContext, ExecutionResult, ExecutorError, TaskExecutor};
 use tempfile::TempDir;
@@ -223,7 +224,6 @@ async fn seed_agent(
 async fn seed_task(
     db: &db::SqliteDb,
     project_id: &str,
-    repo_id: &str,
     title: &str,
     status: &str,
     priority: i64,
@@ -234,7 +234,6 @@ async fn seed_task(
         CreateTask {
             id: new_uuid_v4(),
             project_id: project_id.to_owned(),
-            repo_id: Some(repo_id.to_owned()),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -607,13 +606,64 @@ async fn dispatcher_pauses_a_project_with_no_primary_repository() {
 }
 
 #[tokio::test]
-async fn dispatcher_resumes_a_project_it_paused_once_its_repository_is_attached() {
+async fn dispatcher_pauses_a_project_with_cross_project_primary_repository() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let project_id = seed_unprovisioned_project(&db, "Invalid repository owner").await;
+    let (_other_project_id, other_repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let project = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists");
+    ProjectRepo::update_at_version(
+        &*db,
+        UpdateProject {
+            id: project_id.clone(),
+            name: None,
+            settings: None,
+            primary_repo_id: Some(Some(other_repo_id)),
+            paused_at: None,
+            updated_at: now_rfc3339(),
+        },
+        project.version,
+        None,
+    )
+    .await
+    .expect("cross-Project pointer stores for legacy-corruption fixture");
+    let (dispatcher, _rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 0);
+
+    let paused = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("project reloads")
+        .expect("project exists");
+    assert!(paused.paused_at.is_some());
+    assert_eq!(
+        paused.system_pause_reason.as_deref(),
+        Some(super::repo_pause_sync::INVALID_REPOSITORY)
+    );
+}
+
+#[tokio::test]
+async fn dispatcher_dispatches_pre_repository_task_after_primary_repo_is_attached() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
     let project_id = seed_unprovisioned_project(&db, "Unprovisioned").await;
-    let (dispatcher, _rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
-    dispatcher.check_once().await.expect("dispatcher runs");
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let task = seed_task(&db, &project_id, "created before repository", "todo", 1).await;
+    assign_role(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        &agent_id,
+    )
+    .await;
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 0);
     let paused = ProjectRepo::get_by_id(&*db, &project_id)
         .await
         .expect("project loads")
@@ -646,7 +696,7 @@ async fn dispatcher_resumes_a_project_it_paused_once_its_repository_is_attached(
             id: project_id.clone(),
             name: None,
             settings: None,
-            primary_repo_id: Some(Some(repo_id)),
+            primary_repo_id: Some(Some(repo_id.clone())),
             paused_at: None,
             updated_at: now_rfc3339(),
         },
@@ -660,7 +710,9 @@ async fn dispatcher_resumes_a_project_it_paused_once_its_repository_is_attached(
     .await
     .expect("project repository attaches");
 
-    dispatcher.check_once().await.expect("dispatcher runs");
+    // The first scan after attachment only clears the system-owned pause so
+    // this check never dispatches from the stale in-memory Project snapshot.
+    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 0);
 
     let resumed = ProjectRepo::get_by_id(&*db, &project_id)
         .await
@@ -668,6 +720,65 @@ async fn dispatcher_resumes_a_project_it_paused_once_its_repository_is_attached(
         .expect("project exists");
     assert!(resumed.paused_at.is_none());
     assert!(resumed.system_pause_reason.is_none());
+
+    let (first_scan, second_scan) = tokio::join!(dispatcher.check_once(), dispatcher.check_once());
+    assert_eq!(
+        first_scan.expect("first concurrent dispatcher scan runs")
+            + second_scan.expect("second concurrent dispatcher scan runs"),
+        1,
+        "concurrent scans must accept exactly one dispatch"
+    );
+    let execution_ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("execution spawned in time")
+        .expect("execution context received");
+    assert_eq!(execution_ctx.task_id, task.id);
+
+    let dispatched_task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("Task reloads")
+        .expect("Task exists");
+    assert_eq!(
+        dispatched_task.status,
+        crate::workflow::default_states::IN_PROGRESS
+    );
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(
+            &*db,
+            &task.id,
+            crate::workflow::default_roles::CODER,
+        )
+        .await
+        .expect("execution count loads"),
+        1
+    );
+    let workspace = WorkspaceRepo::get_by_task_id(&*db, &task.id)
+        .await
+        .expect("Workspace loads")
+        .expect("Workspace exists");
+    assert_eq!(workspace.repo_id, repo_id);
+    let lease = WorkspaceLeaseRepo::get_active_for_task(&*db, &task.id)
+        .await
+        .expect("Workspace lease loads")
+        .expect("Workspace lease exists");
+    assert_eq!(lease.repository_binding_id, workspace.repo_id);
+
+    assert_eq!(
+        dispatcher.check_once().await.expect("dispatcher runs"),
+        0,
+        "an already-running Task must not be dispatched twice"
+    );
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(
+            &*db,
+            &task.id,
+            crate::workflow::default_roles::CODER,
+        )
+        .await
+        .expect("execution count reloads"),
+        1
+    );
 }
 
 #[tokio::test]
@@ -695,7 +806,24 @@ async fn dispatcher_leaves_a_deliberately_paused_project_alone() {
 
     // Attaching a repository must not auto-resume a pause the dispatcher
     // never issued.
-    let repo_id = seed_project_repo(&db, repo_dir.path()).await.1;
+    let default_branch = setup_git_repo(repo_dir.path());
+    let repo_id = new_uuid_v4();
+    RepoRepo::create(
+        &*db,
+        CreateRepo {
+            id: repo_id.clone(),
+            project_id: project_id.clone(),
+            name: "manual-pause-repo".to_owned(),
+            remote_url: repo_dir.path().to_string_lossy().into_owned(),
+            local_path: Some(repo_dir.path().to_string_lossy().into_owned()),
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("same-Project Repo creates");
     ProjectRepo::update_at_version(
         &*db,
         UpdateProject {
@@ -730,18 +858,10 @@ async fn dispatcher_gives_unassigned_initial_tasks_the_project_defaults() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     // Already released to `todo` but never assigned: exactly the shape a Task
     // proposed before provisioning has once it leaves backlog.
-    let task = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        "released but unassigned",
-        "todo",
-        1,
-    )
-    .await;
+    let task = seed_task(&db, &project_id, "released but unassigned", "todo", 1).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Offline, AgentStatus::Idle).await;
     ProjectRepo::update_at_version(
         &*db,
@@ -789,9 +909,9 @@ async fn dispatcher_check_once_does_not_dispatch_after_stop() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "high", "todo", 1).await;
+    let task = seed_task(&db, &project_id, "high", "todo", 1).await;
     assign_role(
         &db,
         &task.id,
@@ -820,9 +940,9 @@ async fn dispatcher_skips_unassigned_planning_gate_before_coder_dispatch() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "high", "todo", 1).await;
+    let task = seed_task(&db, &project_id, "high", "todo", 1).await;
     assign_role(
         &db,
         &task.id,
@@ -862,12 +982,11 @@ async fn dispatcher_waits_for_deferred_dispatch_cooldown() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
     let task = seed_task(
         &db,
         &project_id,
-        &repo_id,
         "deferred",
         crate::workflow::default_states::IN_PROGRESS,
         1,
@@ -939,10 +1058,10 @@ async fn dispatcher_enters_unassigned_auto_planning_gate_before_coder_dispatch()
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     set_planning_gate_auto_approval(&db, &project_id).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "auto plan", "todo", 1).await;
+    let task = seed_task(&db, &project_id, "auto plan", "todo", 1).await;
     assign_role(
         &db,
         &task.id,
@@ -1000,12 +1119,11 @@ async fn dispatcher_recovers_task_stuck_in_unassigned_optional_planning_gate() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
     let task = seed_task(
         &db,
         &project_id,
-        &repo_id,
         "stuck planning",
         crate::workflow::default_states::PLANNING,
         1,
@@ -1050,9 +1168,9 @@ async fn dispatcher_skips_task_when_agent_at_capacity() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let blocked = seed_task(&db, &project_id, &repo_id, "blocked", "in_progress", 0).await;
+    let blocked = seed_task(&db, &project_id, "blocked", "in_progress", 0).await;
     assign_role(
         &db,
         &blocked.id,
@@ -1068,7 +1186,7 @@ async fn dispatcher_skips_task_when_agent_at_capacity() {
     )
     .await;
     crate::test_support::set_test_agent_capacity(&db, &agent_id, 1).await;
-    let task = seed_task(&db, &project_id, &repo_id, "todo", "todo", 0).await;
+    let task = seed_task(&db, &project_id, "todo", "todo", 0).await;
     assign_role(
         &db,
         &task.id,
@@ -1096,9 +1214,9 @@ async fn dispatcher_skips_task_when_agent_offline() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Offline, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "todo", "todo", 0).await;
+    let task = seed_task(&db, &project_id, "todo", "todo", 0).await;
     assign_role(
         &db,
         &task.id,
@@ -1126,9 +1244,9 @@ async fn dispatcher_skips_paused_project() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "todo", "todo", 0).await;
+    let task = seed_task(&db, &project_id, "todo", "todo", 0).await;
     assign_role(
         &db,
         &task.id,
@@ -1162,9 +1280,9 @@ async fn dispatcher_recovers_undispatched_active_task() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "active", "in_progress", 0).await;
+    let task = seed_task(&db, &project_id, "active", "in_progress", 0).await;
     assign_role(
         &db,
         &task.id,
@@ -1199,9 +1317,9 @@ async fn dispatcher_recovers_undispatched_reviewer_task() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "review", "review", 0).await;
+    let task = seed_task(&db, &project_id, "review", "review", 0).await;
     assign_role(
         &db,
         &task.id,
@@ -1240,9 +1358,9 @@ async fn dispatcher_reconciles_completed_reviewer_and_launches_its_retry() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "stuck review", "review", 0).await;
+    let task = seed_task(&db, &project_id, "stuck review", "review", 0).await;
     assign_role(
         &db,
         &task.id,
@@ -1313,9 +1431,9 @@ async fn reviewer_assignment_after_stopped_attempt_dispatches_without_separate_r
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "review retry", "review", 0).await;
+    let task = seed_task(&db, &project_id, "review retry", "review", 0).await;
     assign_role(
         &db,
         &task.id,
@@ -1374,9 +1492,9 @@ async fn dispatcher_respects_priority_ordering() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let low = seed_task(&db, &project_id, &repo_id, "low", "todo", 1).await;
+    let low = seed_task(&db, &project_id, "low", "todo", 1).await;
     assign_role(
         &db,
         &low.id,
@@ -1384,15 +1502,7 @@ async fn dispatcher_respects_priority_ordering() {
         &agent_id,
     )
     .await;
-    let high = seed_task(
-        &db,
-        &project_id,
-        &repo_id,
-        "high",
-        "todo",
-        "10".parse().unwrap(),
-    )
-    .await;
+    let high = seed_task(&db, &project_id, "high", "todo", "10".parse().unwrap()).await;
     assign_role(
         &db,
         &high.id,
@@ -1435,9 +1545,9 @@ async fn dispatcher_skips_auto_restart_for_user_cancelled_execution() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "cancelled", "in_progress", 0).await;
+    let task = seed_task(&db, &project_id, "cancelled", "in_progress", 0).await;
     assign_role(
         &db,
         &task.id,
@@ -1509,9 +1619,9 @@ async fn dispatcher_skips_auto_restart_for_task_cancelled_execution() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "cancelled", "in_progress", 0).await;
+    let task = seed_task(&db, &project_id, "cancelled", "in_progress", 0).await;
     assign_role(
         &db,
         &task.id,
@@ -1553,9 +1663,9 @@ async fn dispatcher_dispatches_when_graceful_shutdown_stop_is_auto() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "cancelled", "in_progress", 0).await;
+    let task = seed_task(&db, &project_id, "cancelled", "in_progress", 0).await;
     assign_role(
         &db,
         &task.id,
@@ -1599,9 +1709,9 @@ async fn dispatcher_does_not_dispatch_when_graceful_shutdown_stop_is_manual() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "cancelled", "in_progress", 0).await;
+    let task = seed_task(&db, &project_id, "cancelled", "in_progress", 0).await;
     assign_role(
         &db,
         &task.id,
@@ -1643,9 +1753,9 @@ async fn dispatcher_skips_legacy_stopped_execution_without_resume_policy() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "legacy", "in_progress", 0).await;
+    let task = seed_task(&db, &project_id, "legacy", "in_progress", 0).await;
     assign_role(
         &db,
         &task.id,
@@ -1687,9 +1797,9 @@ async fn dispatcher_skips_active_task_with_blocking_annotation() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "blocked", "in_progress", 0).await;
+    let task = seed_task(&db, &project_id, "blocked", "in_progress", 0).await;
     assign_role(
         &db,
         &task.id,
@@ -1754,9 +1864,9 @@ async fn dispatcher_skips_todo_task_with_dispatch_failed_annotation() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "parked", "todo", 0).await;
+    let task = seed_task(&db, &project_id, "parked", "todo", 0).await;
     assign_role(
         &db,
         &task.id,
@@ -1822,9 +1932,9 @@ async fn dispatcher_skips_reviewer_until_configured_ci_has_finished() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "review", "review", 0).await;
+    let task = seed_task(&db, &project_id, "review", "review", 0).await;
     let task = set_review_ci_config(&db, &task).await;
     assign_role(
         &db,
@@ -1886,9 +1996,9 @@ async fn dispatcher_dispatches_read_only_reviewer_without_ci_review_record() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "research review", "review", 0).await;
+    let task = seed_task(&db, &project_id, "research review", "review", 0).await;
     let task = set_review_ci_config(&db, &task).await;
     sqlx::query("UPDATE task SET task_type = 'discovery' WHERE id = ?")
         .bind(&task.id)
@@ -2070,14 +2180,68 @@ async fn make_task_charter_governed(db: &db::SqliteDb, task: &Task) {
 }
 
 #[tokio::test]
+async fn dispatcher_parks_charter_task_with_missing_governance_before_execution() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    make_project_charter_backed(&db, &project_id).await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let task = seed_task(
+        &db,
+        &project_id,
+        "Charter work missing governance",
+        "in_progress",
+        0,
+    )
+    .await;
+    assign_role(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        &agent_id,
+    )
+    .await;
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    assert_eq!(dispatcher.check_once().await.expect("dispatcher runs"), 0);
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(
+            &*db,
+            &task.id,
+            crate::workflow::default_roles::CODER,
+        )
+        .await
+        .expect("execution count loads"),
+        0
+    );
+    assert!(
+        WorkspaceRepo::get_by_task_id(&*db, &task.id)
+            .await
+            .expect("Workspace lookup succeeds")
+            .is_none(),
+        "governance admission must fail before Workspace creation"
+    );
+    let parked = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("Task reloads")
+        .expect("Task exists");
+    let disposition = deferred_dispatch::dispatch_disposition_for_test(&parked)
+        .expect("missing governance records a visible deterministic blocker");
+    assert!(disposition.safe_message.contains("Charter governance"));
+    assert!(disposition.safe_message.contains("missing or stale"));
+}
+
+#[tokio::test]
 async fn dispatcher_starts_charter_backed_work_without_a_baseline_gate() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     make_project_charter_backed(&db, &project_id).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "charter work", "in_progress", 0).await;
+    let task = seed_task(&db, &project_id, "charter work", "in_progress", 0).await;
     make_task_charter_governed(&db, &task).await;
     assign_role(
         &db,
@@ -2138,10 +2302,10 @@ async fn wake_does_not_duplicate_already_dispatched_charter_work() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");
     let workspace_dir = TempDir::new().expect("workspace dir creates");
-    let (project_id, repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     make_project_charter_backed(&db, &project_id).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
-    let task = seed_task(&db, &project_id, &repo_id, "charter work", "in_progress", 0).await;
+    let task = seed_task(&db, &project_id, "charter work", "in_progress", 0).await;
     make_task_charter_governed(&db, &task).await;
     assign_role(
         &db,

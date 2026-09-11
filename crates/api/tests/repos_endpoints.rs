@@ -249,7 +249,7 @@ async fn create_repo_sets_and_returns_primary_repo_id() {
 }
 
 #[tokio::test]
-async fn create_task_accepts_primary_repo_without_repo_id() {
+async fn task_repo_id_is_rejected_and_never_exposed_before_or_after_attach() {
     let (app, _db) = test_app_with_db().await;
     let project: ProjectResponse = json_request(
         &app,
@@ -259,6 +259,36 @@ async fn create_task_accepts_primary_repo_without_repo_id() {
         StatusCode::OK,
     )
     .await;
+
+    let _rejected: Value = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project.id),
+        json!({
+            "title": "Repository selected by project",
+            "repo_id": "client-owned-binding"
+        }),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+
+    let created: Value = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project.id),
+        json!({ "title": "Repository selected by project" }),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(
+        created.get("repo_id").is_none(),
+        "Task responses must not expose a repository binding: {created}"
+    );
+    let task_id = created["id"]
+        .as_str()
+        .expect("created Task has an id")
+        .to_owned();
+
     let _repo: RepoResponse = json_request(
         &app,
         Method::POST,
@@ -272,18 +302,16 @@ async fn create_task_accepts_primary_repo_without_repo_id() {
     )
     .await;
 
-    let created: Value = json_request(
+    let fetched: Value = empty_request(
         &app,
-        Method::POST,
-        &format!("/api/v1/projects/{}/tasks", project.id),
-        json!({ "title": "Primary repo selected by project" }),
+        Method::GET,
+        &format!("/api/v1/tasks/{task_id}"),
         StatusCode::OK,
     )
     .await;
-
     assert!(
-        created.get("repo_id").and_then(Value::as_str).is_some(),
-        "unexpected create-task response: {created}"
+        fetched.get("repo_id").is_none(),
+        "attaching a Project repository must not add a Task binding: {fetched}"
     );
 }
 

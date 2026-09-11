@@ -177,9 +177,6 @@ impl TaskDispatcher {
         } else {
             self.task_service.ensure_task_runnable(task).await?;
         }
-        if task.repo_id.is_none() {
-            return Ok(false);
-        }
         let agent = AgentRepo::get_by_id(&*self.db, &target.agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", target.agent_id.clone()))?;

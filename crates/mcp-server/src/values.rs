@@ -49,7 +49,6 @@ pub(crate) fn task_value(task: Task) -> Value {
     json!({
         "id": task.id,
         "project_id": task.project_id,
-        "repo_id": task.repo_id,
         "parent_task_id": task.parent_task_id,
         "subtask_order": task.subtask_order,
         "assignee_type": task.assignee_type,

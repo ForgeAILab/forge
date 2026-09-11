@@ -388,6 +388,9 @@ pub enum ServiceError {
     #[error("project {project_id} has no primary repo")]
     MissingPrimaryRepo { project_id: String },
 
+    #[error("project {project_id} primary repo was not found: {repo_id}")]
+    PrimaryRepoNotFound { project_id: String, repo_id: String },
+
     #[error("repo does not match primary repo for project {project_id}")]
     RepoMismatch { project_id: String },
 

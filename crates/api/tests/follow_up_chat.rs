@@ -443,7 +443,6 @@ async fn seed_parent_execution(
         db::CreateTask {
             id: task_id.clone(),
             project_id: project_id.to_owned(),
-            repo_id: Some(repo_id.to_owned()),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: Some("agent".to_owned()),

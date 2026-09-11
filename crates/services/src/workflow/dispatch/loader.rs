@@ -452,7 +452,6 @@ mod tests {
             CreateTask {
                 id: db::new_uuid_v4(),
                 project_id: project.id.clone(),
-                repo_id: None,
                 parent_task_id: None,
                 assignee_type: None,
                 assignee_id: None,
@@ -477,7 +476,6 @@ mod tests {
             CreateTask {
                 id: db::new_uuid_v4(),
                 project_id: project.id,
-                repo_id: None,
                 parent_task_id: Some(parent.id.clone()),
                 assignee_type: None,
                 assignee_id: None,

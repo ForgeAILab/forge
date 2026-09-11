@@ -62,7 +62,6 @@ pub struct TaskActionsResponse {
 pub struct TaskResponse {
     pub id: String,
     pub project_id: String,
-    pub repo_id: Option<String>,
     pub parent_task_id: Option<String>,
     pub assignee_type: Option<String>,
     pub assignee_id: Option<String>,

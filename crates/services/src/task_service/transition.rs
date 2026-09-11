@@ -44,9 +44,7 @@ impl TaskService {
             // incomplete child settles.
             super::subtask::ensure_subtask_dispatch_order(&self.db, &task).await?;
         }
-        if task.repo_id.is_some()
-            && workflow.state_kind(&new_status) == Some(api_types::StateKind::Active)
-        {
+        if workflow.state_kind(&new_status) == Some(api_types::StateKind::Active) {
             // Direct transitions must obey the same admission boundary as
             // claim/launch for every repository-capable task type.  Task
             // labels such as discovery/planning only select a read-only

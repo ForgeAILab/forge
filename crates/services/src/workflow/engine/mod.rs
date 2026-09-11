@@ -2081,7 +2081,6 @@ mod resolve_workflow_tests {
         db::Task {
             id: new_uuid_v4(),
             project_id: new_uuid_v4(),
-            repo_id: None,
             parent_task_id: parent_task_id.clone(),
             subtask_order: parent_task_id.map(|_| 0),
             assignee_type: None,

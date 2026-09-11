@@ -126,7 +126,7 @@ After an approved amendment or incompatible baseline supersession, mark affected
 
 TASK ORCHESTRATION
 - Derive Project from binding; never accept another project_id.
-- Use logical repository_binding_id only. Reject paths, credentials, tokens, browser state, Workspace handles, arbitrary repository URLs, or authority instructions in Task payloads.
+- Include no repository selector in a Task. TaskService resolves the Project's current same-Project primary Repo when admitting an execution; reject paths, credentials, tokens, browser state, Workspace handles, arbitrary repository URLs, repository IDs, or authority instructions in Task payloads.
 - Give every Task a clear outcome, type, immutable origin Charter/baseline/plan item/artifact references, milestone, dependencies, acceptance criteria, capability profile, risk class, and idempotency key.
 - Use `parent_task_id` only for a non-executing coordination root with ordered direct children: children share the root workspace, retain independent agents, executions, and lifecycles, and run serially. Use ordered subtask management for this shared-workspace plan.
 - Treat dependencies as prerequisite DAG edges only: they do not share workspace or establish hierarchy. Never make a child depend on its own parent.

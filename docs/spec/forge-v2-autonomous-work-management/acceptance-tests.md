@@ -23,7 +23,8 @@ Maintain at least these fixtures:
 ### E2 — Multi-project workspace
 
 - three projects;
-- four repositories;
+- three selected primary repositories plus one preserved, unselected legacy
+  Repo row;
 - multiple agents and runtimes;
 - active, review, blocked, failed-run, and done tasks;
 - overlapping project names and labels to test contextual display.
@@ -263,7 +264,8 @@ Planning, testing, retrying, merging, and merge failure may appear as activity o
 
 - both views represent the same task IDs;
 - tasks are not copied into global-board records;
-- project and repository context are visible;
+- Project context is visible, with attempt-pinned repository provenance only
+  where work has run;
 - canonical phase grouping remains correct.
 
 ## A-018 — Home prioritization
@@ -380,13 +382,45 @@ Home, Work, project board, task detail, agent roster, runtime settings, contract
 - respect reduced motion;
 - avoid document-level horizontal overflow.
 
+## A-031 — Task predates Project repository setup
+
+**Given** an eligible, governed Task was accepted while its Project had no
+primary Repo
+
+**When** an owner attaches a valid Repo owned by that Project and the Project
+is not manually paused
+
+**Then**:
+
+- the existing Task becomes eligible on the next scheduler wake without a
+  Task update or backfill;
+- its Task representation has no `repo_id`;
+- the execution Workspace and Workspace lease identify the Project's current
+  primary Repo; and
+- normal Charter, dependency, assignment, capability, retry, and version gates
+  still apply.
+
+## A-032 — Repository changes preserve attempt history
+
+**Given** a Task has an execution Workspace, lease, delivery/review evidence,
+or release reference for Repo A
+
+**When** the Project later selects Repo B
+
+**Then** Forge preserves Repo A on all attempt-derived provenance, does not
+rewrite it from the Project pointer, does not silently reuse an old-Repo
+Workspace for a new attempt, and admits future work only after the normal safe
+reset/setup boundary against Repo B.
+
 ---
 
 ## 3. API contract tests
 
-### API-001 — Additive task response
+### API-001 — Task response repository cutover
 
-Legacy clients can ignore new fields. Existing required fields and enum serialization remain compatible.
+Task REST/MCP/Solo responses and generated bindings omit `repo_id` with no
+compatibility alias. Other additive V2 fields retain their documented enum and
+serialization contracts.
 
 ### API-002 — Canonical phase filter
 
@@ -546,6 +580,8 @@ Before autonomous_v1 becomes the default for new projects:
 - [ ] All M1 workflow acceptance scenarios pass.
 - [ ] Home and Work E2E tests pass across projects.
 - [ ] Task creation requires no advanced configuration in E1.
+- [ ] Pre-repository Tasks dispatch after Project Repo attachment without Task
+  mutation, and repository changes preserve attempt history.
 - [ ] Delivery report versions and checks are correct.
 - [ ] Legacy strict and custom workflow suites pass.
 - [ ] Typed actor attribution is deployed.
@@ -556,4 +592,3 @@ Before autonomous_v1 becomes the default for new projects:
 - [ ] Clean install/demo smoke test passes.
 - [ ] Feature flag rollback is verified.
 - [ ] No critical or high unresolved security finding remains.
-

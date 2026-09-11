@@ -367,19 +367,18 @@ impl TaskService {
     pub(super) async fn prepare_task_governance(
         &self,
         project: &db::Project,
-        repo_id: Option<&String>,
         task_type: &str,
         requested: Option<TaskGovernanceRequest>,
     ) -> Result<Option<PreparedTaskGovernance>> {
-        // A repository binding is capability-bearing regardless of the task
-        // label. Planning/discovery labels may use the explicit pre-baseline
-        // read-only branch, but they never infer a write profile or receive a
-        // repository lease as an accidental side effect.
+        // Planning/discovery labels may use the explicit read-only branch, but
+        // they never infer a write profile. Repository readiness is Project
+        // setup and is deliberately independent from immutable Task
+        // governance, so a Task accepted before repository attachment becomes
+        // executable without rewriting its governance row.
         let requested_capability = requested
             .as_ref()
             .and_then(|request| request.capability_class.as_deref());
         let execution_class = classify_task_execution(task_type, requested_capability)?;
-        let repository_capable = repo_id.is_some();
         let implementation = execution_class == TaskExecutionClass::Implementation;
         // Implementation intent remains governed even while repository setup
         // is incomplete. A missing primary_repo_id must not downgrade it to
@@ -455,7 +454,7 @@ impl TaskService {
         )
         .await?;
 
-        if repository_capable && execution_class == TaskExecutionClass::ReadOnlyPlanning {
+        if execution_class == TaskExecutionClass::ReadOnlyPlanning {
             if let Some(capability_class) = requested.capability_class.as_deref() {
                 if !is_read_only_capability(capability_class) {
                     return Err(ServiceError::invalid_operation(
@@ -475,10 +474,10 @@ impl TaskService {
         // Task whose every dispatch would be refused by the lease issuer.
         require_server_approved_capability_class(requested.capability_class.as_deref())?;
 
-        // `runnable` now records Charter-backed repository readiness. The
-        // workflow, role, availability, repository, capability, retry, and
-        // lease checks are repeated immediately before dispatch.
-        let runnable = repository_capable;
+        // `runnable` records Charter authorization, not mutable repository
+        // setup. Workflow, role, availability, repository, capability, retry,
+        // and lease checks are repeated immediately before dispatch.
+        let runnable = true;
         let provenance_json = build_provenance(
             requested.provenance.clone(),
             requested.plan_item_id.as_deref(),
@@ -595,6 +594,40 @@ impl TaskService {
 
         let charter_status: String = row.get("charter_status");
         let charter_setup_required: i64 = row.get("charter_setup_required");
+
+        // Resolve repository authority before any legacy/Charter branching.
+        // Every execution-capable Task uses the Project's current Repo; Task
+        // kind never turns missing setup into a repository-free execution.
+        let _authority = self.resolve_task_repository(task).await?;
+        let setup = crate::load_project_execution_setup(&self.db, &task.project_id).await?;
+        if setup.execution_setup_state != ExecutionSetupState::Ready || setup.primary_repo.is_none()
+        {
+            let mut requirements = setup.setup_requirements.clone();
+            if setup.primary_repo.is_none()
+                && !requirements
+                    .iter()
+                    .any(|requirement| requirement.requirement_type == "repository")
+            {
+                let mut requirement = SetupRequirement::new("repository");
+                requirement.capability = Some(
+                    match capability {
+                        ExecutionGateCapability::RepositoryMutation => "repository_write",
+                        ExecutionGateCapability::ReadOnlyReview => "repository_read",
+                    }
+                    .to_owned(),
+                );
+                requirement.action = Some(RetryAction::AttachRepository);
+                requirements.push(requirement);
+            }
+            if requirements.is_empty() {
+                requirements.push(SetupRequirement::new("execution_setup"));
+            }
+            return Err(ServiceError::execution_setup_required(
+                "Task is not runnable: Project repository execution setup is incomplete",
+                requirements,
+            ));
+        }
+
         if charter_status != "charter_backed" || charter_setup_required != 0 {
             // Legacy/unverified Projects retain the pre-Charter workflow.
             return Ok(());
@@ -605,56 +638,24 @@ impl TaskService {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(canonical_task_capability(&task_type, None)?);
         let execution_class = classify_task_execution(&task_type, Some(&capability_class))?;
-        let bounded_read_only = execution_class == TaskExecutionClass::ReadOnlyPlanning
-            && is_read_only_capability(&capability_class);
-
-        if bounded_read_only {
-            // Bounded discovery/planning remains admissible without repository
-            // setup. It receives no repository WorkspaceLease.
-            return Ok(());
-        }
 
         if execution_class == TaskExecutionClass::Implementation {
-            // The canonical Project setup projection is the authority for
-            // durable repository readiness. A primary_repo_id check by itself
-            // is insufficient because a failed provisioning operation must
-            // not receive a write lease.
-            let setup = crate::load_project_execution_setup(&self.db, &task.project_id).await?;
-            if setup.execution_setup_state != ExecutionSetupState::Ready
-                || setup.primary_repo.is_none()
-            {
-                let mut requirements = setup.setup_requirements.clone();
-                if setup.primary_repo.is_none()
-                    && !requirements
-                        .iter()
-                        .any(|requirement| requirement.requirement_type == "repository")
-                {
-                    let mut requirement = SetupRequirement::new("repository");
-                    requirement.capability = Some("repository_write".to_owned());
-                    requirement.action = Some(RetryAction::AttachRepository);
-                    requirements.push(requirement);
-                }
-                if requirements.is_empty() {
-                    requirements.push(SetupRequirement::new("execution_setup"));
-                }
-                return Err(ServiceError::execution_setup_required(
-                    "repository implementation Task is not runnable: Project execution setup is incomplete",
-                    requirements,
-                ));
-            }
             self.ensure_capability_permits_execution(task, capability, setup.execution_gate)
                 .await?;
         }
 
         let governance_charter = row.get::<Option<String>, _>("charter_revision_id");
-        if governance_charter.is_some()
-            && governance_charter.as_deref()
-                != row
-                    .get::<Option<String>, _>("current_charter_revision_id")
-                    .as_deref()
+        let current_charter = row.get::<Option<String>, _>("current_charter_revision_id");
+        if current_charter.is_none() || governance_charter.as_deref() != current_charter.as_deref()
         {
-            return Err(ServiceError::invalid_operation(
-                "repository Task cannot start because its Charter traceability is stale",
+            let mut requirement = SetupRequirement::new("task_governance");
+            requirement.resource_type = Some("task".to_owned());
+            requirement.resource_id = Some(task.id.clone());
+            requirement.capability = Some(capability_class);
+            requirement.action = Some(RetryAction::Repropose);
+            return Err(ServiceError::execution_setup_required(
+                "Task is not runnable: current approved Charter governance is missing or stale",
+                vec![requirement],
             ));
         }
         Ok(())
@@ -745,9 +746,6 @@ impl TaskService {
         execution_id: &str,
         operation_key: &str,
     ) -> Result<Option<db::WorkspaceLease>> {
-        let Some(repo_id) = task.repo_id.as_deref() else {
-            return Ok(None);
-        };
         let canonical_role = canonical_workspace_lease_role(role)?;
         // The dedicated reviewer role is independent read-only review; every
         // other resolved role is repository-mutating and stays fully gated
@@ -760,9 +758,9 @@ impl TaskService {
         let principal_id = self
             .validate_workspace_assignment(task, role, principal_id)
             .await?;
-        let (_repo, capability_class, base_ref) = self
-            .workspace_lease_inputs(task, workspace, repo_id)
-            .await?;
+        let (repo, capability_class, base_ref) =
+            self.workspace_lease_inputs(task, workspace).await?;
+        let repo_id = repo.id;
 
         // A lease is reusable only while every binding remains exact.  This
         // also closes the race where two launchers observe no lease and one
@@ -800,7 +798,7 @@ impl TaskService {
             task_version: task.version,
             execution_id: execution_id.to_owned(),
             operation_idempotency_key: operation_key.to_owned(),
-            repository_binding_id: repo_id.to_owned(),
+            repository_binding_id: repo_id,
             base_ref,
             role: canonical_role.to_owned(),
             capabilities_json,
@@ -860,11 +858,10 @@ impl TaskService {
         principal_id: Option<&str>,
         execution_id: &str,
     ) -> Result<db::WorkspaceLease> {
-        let Some(repo_id) = task.repo_id.as_deref() else {
-            return Err(ServiceError::invalid_operation(
-                "WorkspaceLease requires a repository-backed Task",
-            ));
-        };
+        let authority = self
+            .resolve_task_repository_in_tx(transaction, task)
+            .await?;
+        let repo_id = authority.repo_id.as_str();
         let canonical_role = canonical_workspace_lease_role(role)?;
         let principal_id = principal_id
             .or(task.assignee_id.as_deref())
@@ -875,7 +872,7 @@ impl TaskService {
                 )
             })?;
         let task_row = sqlx::query(
-            "SELECT t.project_id, t.repo_id, t.assignee_type, t.assignee_id,
+            "SELECT t.project_id, t.assignee_type, t.assignee_id,
                     t.task_type, p.charter_status, p.charter_setup_required
              FROM task t
              JOIN project p ON p.id = t.project_id
@@ -887,14 +884,13 @@ impl TaskService {
         .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
         let assigned_type: Option<String> = task_row.get("assignee_type");
         let assigned_id: Option<String> = task_row.get("assignee_id");
-        let bound_repo_id: Option<String> = task_row.get("repo_id");
         let task_type: String = task_row.get("task_type");
         let charter_backed = task_row.get::<String, _>("charter_status") == "charter_backed"
             && task_row.get::<i64, _>("charter_setup_required") == 0;
         let has_task_assignment = assigned_type.is_some() || assigned_id.is_some();
-        if bound_repo_id.as_deref() != Some(repo_id) || workspace.repo_id != repo_id {
+        if workspace.repo_id != repo_id {
             return Err(ServiceError::invalid_operation(
-                "workspace repository does not match the Task repository binding",
+                "workspace repository does not match the Project primary repository",
             ));
         }
         let role_assignment = sqlx::query(
@@ -922,18 +918,6 @@ impl TaskService {
         {
             return Err(ServiceError::invalid_operation(
                 "WorkspaceLease requires the lease subject to be the assigned Task Worker/reviewer",
-            ));
-        }
-        let repo_row = sqlx::query("SELECT project_id, default_branch FROM repo WHERE id = ?")
-            .bind(repo_id)
-            .fetch_optional(&mut **transaction)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("repo", repo_id.to_owned()))?;
-        let repo_project_id: String = repo_row.get("project_id");
-        let default_branch: String = repo_row.get("default_branch");
-        if repo_project_id != task.project_id {
-            return Err(ServiceError::invalid_operation(
-                "Task repository binding belongs to a different Project",
             ));
         }
         let capability_class = sqlx::query_scalar::<_, Option<String>>(
@@ -973,12 +957,10 @@ impl TaskService {
         .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
         let charter_backed = gate.get::<String, _>("charter_status") == "charter_backed"
             && gate.get::<i64, _>("charter_setup_required") == 0;
-        let charter_governed = gate
-            .get::<Option<String>, _>("charter_revision_id")
-            .as_deref()
-            == gate
-                .get::<Option<String>, _>("current_charter_revision_id")
-                .as_deref();
+        let governance_charter = gate.get::<Option<String>, _>("charter_revision_id");
+        let current_charter = gate.get::<Option<String>, _>("current_charter_revision_id");
+        let charter_governed = current_charter.is_some()
+            && governance_charter.as_deref() == current_charter.as_deref();
         if charter_backed && !charter_governed {
             return Err(ServiceError::invalid_operation(
                 "WorkspaceLease requires the Task's current approved Charter revision",
@@ -987,7 +969,10 @@ impl TaskService {
         let issued_at = now_rfc3339();
         let expires_at =
             (Utc::now() + ChronoDuration::seconds(WORKSPACE_LEASE_SECONDS)).to_rfc3339();
-        let base_ref = workspace.before_sha.clone().unwrap_or(default_branch);
+        let base_ref = workspace
+            .before_sha
+            .clone()
+            .unwrap_or(authority.default_branch);
         let capabilities_json = serde_json::to_string(std::slice::from_ref(&capability_class))
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
         let lease_id = new_uuid_v4();
@@ -1048,9 +1033,6 @@ impl TaskService {
         principal_id: Option<&str>,
         execution_id: &str,
     ) -> Result<db::WorkspaceLease> {
-        let repo_id = task.repo_id.as_deref().ok_or_else(|| {
-            ServiceError::invalid_operation("WorkspaceLease requires a repository-backed Task")
-        })?;
         let canonical_role = canonical_workspace_lease_role(role)?;
         if canonical_role == "reviewer" {
             self.ensure_task_reviewable(task).await?;
@@ -1060,9 +1042,9 @@ impl TaskService {
         let principal_id = self
             .validate_workspace_assignment(task, role, principal_id)
             .await?;
-        let (repo, capability_class, base_ref) = self
-            .workspace_lease_inputs(task, workspace, repo_id)
-            .await?;
+        let (repo, capability_class, base_ref) =
+            self.workspace_lease_inputs(task, workspace).await?;
+        let repo_id = repo.id.as_str();
         let lease = WorkspaceLeaseRepo::get_active_for_task(&*self.db, &task.id)
             .await?
             .ok_or_else(|| {
@@ -1118,21 +1100,14 @@ impl TaskService {
         &self,
         task: &db::Task,
         workspace: &db::Workspace,
-        repo_id: &str,
     ) -> Result<(db::Repo, String, String)> {
-        if workspace.repo_id != repo_id {
+        let authority = self.resolve_task_repository(task).await?;
+        if workspace.repo_id != authority.repo.id {
             return Err(ServiceError::invalid_operation(
-                "workspace repository does not match the Task repository binding",
+                "workspace repository does not match the Project primary repository",
             ));
         }
-        let repo = RepoRepo::get_by_id(&*self.db, repo_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("repo", repo_id.to_owned()))?;
-        if repo.project_id != task.project_id {
-            return Err(ServiceError::invalid_operation(
-                "Task repository binding belongs to a different Project",
-            ));
-        }
+        let repo = authority.repo;
         let capability_class = sqlx::query_scalar::<_, Option<String>>(
             "SELECT capability_class FROM project_task_governance
              WHERE task_id = ? AND project_id = ?",
@@ -1276,12 +1251,9 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
         let Some(workspace_id) = execution.workspace_id.as_deref() else {
-            if task.repo_id.is_some() {
-                return Err(ServiceError::invalid_operation(
-                    "repository execution requires a scheduler WorkspaceLease-backed workspace",
-                ));
-            }
-            return Ok(None);
+            return Err(ServiceError::invalid_operation(
+                "repository execution requires a scheduler WorkspaceLease-backed workspace",
+            ));
         };
         let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
             .await?
@@ -1379,12 +1351,9 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
         let Some(workspace_id) = execution.workspace_id.as_deref() else {
-            if task.repo_id.is_some() {
-                return Err(ServiceError::invalid_operation(
-                    "repository execution requires a scheduler WorkspaceLease-backed workspace",
-                ));
-            }
-            return Ok(());
+            return Err(ServiceError::invalid_operation(
+                "repository execution requires a scheduler WorkspaceLease-backed workspace",
+            ));
         };
         let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
             .await?
@@ -1636,7 +1605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn charter_backed_repository_task_is_runnable_without_a_baseline() {
+    async fn charter_backed_task_governance_is_runnable_before_repository_attachment() {
         let pool = db::create_sqlite_pool("sqlite::memory:")
             .await
             .expect("pool creates");
@@ -1644,13 +1613,10 @@ mod tests {
             Arc::new(db::SqliteDb::new(pool)),
             Arc::new(EventBus::new(4)),
         );
+        let mut project = charter_backed_project();
+        project.primary_repo_id = None;
         let governance = service
-            .prepare_task_governance(
-                &charter_backed_project(),
-                Some(&"repo-1".to_owned()),
-                "task",
-                None,
-            )
+            .prepare_task_governance(&project, "task", None)
             .await
             .expect("implementation task can be recorded before the baseline")
             .expect("repository task receives a governance row");
@@ -1668,7 +1634,6 @@ mod tests {
         db::Task {
             id: id.to_owned(),
             project_id: project_id.to_owned(),
-            repo_id: None,
             parent_task_id: None,
             assignee_type: None,
             assignee_id: None,
@@ -1750,12 +1715,7 @@ mod tests {
             Arc::new(EventBus::new(4)),
         );
         let governance = service
-            .prepare_task_governance(
-                &charter_backed_project(),
-                Some(&"repo-1".to_owned()),
-                "discovery",
-                None,
-            )
+            .prepare_task_governance(&charter_backed_project(), "discovery", None)
             .await
             .expect("discovery plan can be recorded before baseline")
             .expect("repository discovery receives a governance row");
@@ -1780,7 +1740,6 @@ mod tests {
         let error = service
             .prepare_task_governance(
                 &charter_backed_project(),
-                Some(&"repo-1".to_owned()),
                 "planning_task",
                 Some(TaskGovernanceRequest {
                     charter_revision_id: Some("charter-revision-1".to_owned()),
@@ -1828,7 +1787,6 @@ mod tests {
         let error = service
             .prepare_task_governance(
                 &charter_backed_project(),
-                Some(&"repo-1".to_owned()),
                 "task",
                 Some(TaskGovernanceRequest {
                     charter_revision_id: Some("charter-revision-1".to_owned()),

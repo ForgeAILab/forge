@@ -299,6 +299,13 @@ impl From<ServiceError> for ApiError {
                 "missing_primary_repo",
                 format!("project {project_id} has no primary repo"),
             ),
+            ServiceError::PrimaryRepoNotFound {
+                project_id,
+                repo_id,
+            } => Self::conflict_with_code(
+                "primary_repo_not_found",
+                format!("project {project_id} primary repo was not found: {repo_id}"),
+            ),
             ServiceError::RepoMismatch { project_id } => Self::conflict_with_code(
                 "repo_mismatch",
                 format!("repo does not match primary repo for project {project_id}"),

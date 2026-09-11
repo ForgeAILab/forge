@@ -79,30 +79,16 @@ impl MergeService {
                 "subtasks do not merge; only root tasks merge to the default branch",
             ));
         }
-        let execution = crate::task_service::latest_executor_execution_for_task(&*self.db, &task)
+        let execution = crate::task_service::latest_executor_execution_for_task(&self.db, &task)
             .await?
             .ok_or_else(|| ServiceError::InvalidOperation {
                 message: format!("task {task_id} has no executor execution"),
             })?;
-        let workspace_id =
-            execution
-                .workspace_id
-                .as_deref()
-                .ok_or_else(|| ServiceError::InvalidOperation {
-                    message: "executor execution missing workspace_id".to_owned(),
-                })?;
-        let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
-            .await?
-            .ok_or_else(|| ServiceError::NotFound {
-                entity: "workspace",
-                id: workspace_id.to_owned(),
-            })?;
-        let repo_id = task
-            .repo_id
-            .as_deref()
-            .ok_or_else(|| ServiceError::invalid_operation("task has no associated repo"))?;
+        let workspace = resolve_delivery_workspace(&self.db, &execution).await?;
+        let repo_id = workspace.repo_id.as_str();
         let repo = RepoRepo::get_by_id(&*self.db, repo_id)
             .await?
+            .filter(|repo| repo.project_id == task.project_id)
             .ok_or_else(|| ServiceError::NotFound {
                 entity: "repo",
                 id: repo_id.to_owned(),
@@ -259,23 +245,16 @@ impl MergeService {
                 "subtasks do not publish pull requests; only root tasks publish",
             ));
         }
-        let execution = crate::task_service::latest_executor_execution_for_task(&*self.db, &task)
+        let execution = crate::task_service::latest_executor_execution_for_task(&self.db, &task)
             .await?
             .ok_or_else(|| ServiceError::InvalidOperation {
                 message: format!("task {task_id} has no executor execution"),
             })?;
-        let workspace_id = execution.workspace_id.as_deref().ok_or_else(|| {
-            ServiceError::invalid_operation("executor execution missing workspace_id")
-        })?;
-        let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
-        let repo_id = task
-            .repo_id
-            .as_deref()
-            .ok_or_else(|| ServiceError::invalid_operation("task has no associated repo"))?;
+        let workspace = resolve_delivery_workspace(&self.db, &execution).await?;
+        let repo_id = workspace.repo_id.as_str();
         let repo = RepoRepo::get_by_id(&*self.db, repo_id)
             .await?
+            .filter(|repo| repo.project_id == task.project_id)
             .ok_or_else(|| ServiceError::not_found("repo", repo_id.to_owned()))?;
         if repo.work_mode != WorkMode::PullRequest {
             return Err(ServiceError::invalid_operation(
@@ -361,6 +340,21 @@ impl MergeService {
     fn managed_repo_path(&self, repo_id: &str) -> PathBuf {
         self.workspace_root.join(".repos").join(repo_id)
     }
+}
+
+/// Resolve the exact worktree pinned to the selected implementation attempt.
+/// Child executions may point at the coordination root's shared Workspace,
+/// but the execution reference remains the immutable repository provenance.
+async fn resolve_delivery_workspace(
+    db: &SqliteDb,
+    execution: &db::Execution,
+) -> Result<db::Workspace> {
+    let workspace_id = execution.workspace_id.as_deref().ok_or_else(|| {
+        ServiceError::invalid_operation("executor execution missing workspace_id")
+    })?;
+    WorkspaceRepo::get_by_id(db, workspace_id)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))
 }
 
 async fn ensure_managed_clone(remote_url: &str, clone_path: &Path) -> Result<String> {
@@ -593,7 +587,6 @@ mod tests {
                     .expect("repo loads")
                     .expect("repo exists")
                     .project_id,
-                repo_id: Some(repo_id.clone()),
                 parent_task_id: None,
                 subtask_order: None,
                 assignee_type: None,
@@ -663,7 +656,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clean_merge_returns_done() {
+    async fn clean_merge_uses_execution_workspace_repository_after_project_reselection() {
         let db = sqlite_db().await;
         let event_bus = Arc::new(EventBus::new(16));
         let temp = TempDir::new().expect("temp creates");
@@ -682,6 +675,47 @@ mod tests {
             .await
             .expect("feature commits");
         let execution_id = seed_merge_rows(&db, &repo_path, &worktree_path, &task_id).await;
+        let task = TaskRepo::get_by_id(&*db, &task_id, false)
+            .await
+            .expect("task loads")
+            .expect("task exists");
+        let replacement_repo_id = new_uuid_v4();
+        let now = now_rfc3339();
+        RepoRepo::create(
+            &*db,
+            CreateRepo {
+                id: replacement_repo_id.clone(),
+                project_id: task.project_id.clone(),
+                name: "replacement".to_owned(),
+                remote_url: temp.path().join("replacement.git").display().to_string(),
+                local_path: None,
+                work_mode: db::WorkMode::DirectMerge,
+                default_branch: "trunk".to_owned(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("replacement repo creates");
+        let project = ProjectRepo::get_by_id(&*db, &task.project_id)
+            .await
+            .expect("project loads")
+            .expect("project exists");
+        ProjectRepo::update_at_version(
+            &*db,
+            UpdateProject {
+                id: project.id,
+                name: None,
+                settings: None,
+                primary_repo_id: Some(Some(replacement_repo_id)),
+                paused_at: None,
+                updated_at: now_rfc3339(),
+            },
+            project.version,
+            None,
+        )
+        .await
+        .expect("project primary repo changes after execution");
         let before_sha = git::get_current_sha(&repo_path)
             .await
             .expect("before sha reads");

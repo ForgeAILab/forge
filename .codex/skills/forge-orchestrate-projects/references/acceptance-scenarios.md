@@ -24,7 +24,7 @@ authenticated and all referenced records belong to the named account.
 
 - **Given** implementation Task `T` is assigned to Worker `W` and independent review is assigned to Reviewer `R`
 - **When** the scheduler issues execution and review capabilities
-- **Then** only the assigned principal receives a short-lived lease bound to Project, Task, base ref, capabilities, and expiry; chat agents receive no path, token, or Workspace handle, and `R` cannot silently become a write-capable implementer
+- **Then** only the assigned principal receives a short-lived lease bound to Project, Task, the current same-Project primary Repo, base ref, capabilities, and expiry; chat agents receive no path, token, or Workspace handle, and `R` cannot silently become a write-capable implementer
 
 ### AUTH-04 — Untrusted text cannot widen authority
 
@@ -148,13 +148,25 @@ authenticated and all referenced records belong to the named account.
 
 - **Given** an approved Charter, active baseline, plan item, artifact revision, and applicable Milestone
 - **When** the bound Project Agent creates an implementation Task
-- **Then** TaskService records immutable links to those exact revisions plus outcome, type, dependencies, acceptance, capability/risk class, and idempotency key, while the Project Agent receives no repository or filesystem authority
+- **Then** TaskService records immutable links to those exact revisions plus outcome, type, dependencies, acceptance, capability/risk class, and idempotency key, but no repository selector, while the Project Agent receives no repository or filesystem authority
 
 ### TASK-02 — Agent prose cannot manufacture delivery or validation
 
 - **Given** no authoritative Task delivery, review, validation, git, or evidence record reports an outcome
 - **When** the Project Agent claims it edited, tested, merged, deployed, or validated repository work
 - **Then** Forge keeps the work pending/unverified and exposes only sanitized authoritative results; the planner cannot self-attest or rewrite Task history
+
+### TASK-03 — A Task accepted before repository setup becomes runnable
+
+- **Given** governed Task `T` was accepted while Project `P` had no primary Repo
+- **When** an authorized user attaches Repo `R`, `R` belongs to `P`, and ordinary Task gates pass
+- **Then** the scheduler may dispatch the unchanged Task on its next wake, the Workspace and lease pin `R`, and no Task backfill or Task-level repository field is created
+
+### TASK-04 — Project repository changes do not rewrite attempted work
+
+- **Given** Task `T` has an execution Workspace and lease pinned to Repo `R-A`
+- **When** Project `P` later selects Repo `R-B`
+- **Then** review/evidence/release history retains `R-A`, no new lease is issued against the old Workspace, and future execution requires the normal safe reset/setup boundary against `R-B`
 
 ## Research and provenance
 

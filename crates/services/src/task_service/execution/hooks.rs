@@ -27,12 +27,12 @@ impl TaskService {
             return Ok(());
         }
 
-        let repo = match task.repo_id.as_deref() {
-            Some(id) => RepoRepo::get_by_id(&*self.db, id).await?,
-            None => None,
-        };
+        let repo = RepoRepo::get_by_id(&*self.db, &workspace.repo_id)
+            .await?
+            .filter(|repo| repo.project_id == project.id)
+            .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
         let repo_path = repo
-            .and_then(|repo| repo.local_path)
+            .local_path
             .unwrap_or_else(|| workspace.worktree_path.clone());
         let log_dir = std::env::temp_dir()
             .join("forge")

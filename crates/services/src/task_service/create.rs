@@ -132,7 +132,7 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", project_id.clone()))?;
-        let (repo_id, subtask_order) = if let Some(parent_id) = parent_task_id.as_deref() {
+        let subtask_order = if let Some(parent_id) = parent_task_id.as_deref() {
             validate_required("parent_task_id", parent_id)?;
             let parent = TaskRepo::get_by_id(&*self.db, parent_id, false)
                 .await?
@@ -143,12 +143,9 @@ impl TaskService {
             if parent.parent_task_id.is_some() {
                 return Err(ServiceError::nested_subtask_unsupported());
             }
-            (
-                parent.repo_id,
-                Some(TaskRepo::next_subtask_order(&*self.db, parent_id).await?),
-            )
+            Some(TaskRepo::next_subtask_order(&*self.db, parent_id).await?)
         } else {
-            (project.primary_repo_id.clone(), None)
+            None
         };
 
         let now = now_rfc3339();
@@ -160,10 +157,10 @@ impl TaskService {
         } else {
             project_workflow.clone()
         };
-        // A Task with no repository (the Project has none yet) still starts
-        // in the workflow's initial state; the dispatcher pauses that
-        // Project instead of parking the Task. `backlog` is reserved for a
-        // deliberate later move by a user or the Agent.
+        // A Task created before its Project has repository setup still starts
+        // in the workflow's initial state; the dispatcher pauses the Project
+        // instead of parking the Task. `backlog` is reserved for a deliberate
+        // later move by a user or the Agent.
         let initial_status = workflow
             .states
             .iter()
@@ -205,7 +202,7 @@ impl TaskService {
                 .await?;
         }
         let prepared_governance = self
-            .prepare_task_governance(&project, repo_id.as_ref(), &effective_task_type, governance)
+            .prepare_task_governance(&project, &effective_task_type, governance)
             .await?;
         let validated_assignments = if let Some(ref assignments) = role_assignments {
             let workflow_roles: std::collections::HashSet<&str> =
@@ -250,7 +247,6 @@ impl TaskService {
         let create_task = CreateTask {
             id: new_uuid_v4(),
             project_id: project_id.clone(),
-            repo_id,
             parent_task_id,
             subtask_order,
             assignee_type: None,
@@ -426,7 +422,6 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", project_id.clone()))?;
-        let repo_id = project.primary_repo_id.clone();
         let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
         // See the other `create_task*` variant: a repository-less Task
         // still starts in the workflow's initial state; the dispatcher
@@ -441,12 +436,11 @@ impl TaskService {
         let now = now_rfc3339();
         let effective_task_type = task_type.unwrap_or_else(|| "task".to_owned());
         let prepared_governance = self
-            .prepare_task_governance(&project, repo_id.as_ref(), &effective_task_type, None)
+            .prepare_task_governance(&project, &effective_task_type, None)
             .await?;
         let create_task = CreateTask {
             id: new_uuid_v4(),
             project_id,
-            repo_id,
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,

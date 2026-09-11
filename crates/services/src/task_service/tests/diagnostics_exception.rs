@@ -4,14 +4,9 @@ use super::*;
 #[tokio::test]
 async fn test_derive_workflow_exception_review_failed_no_annotation() {
     let db = Arc::new(sqlite_db().await);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(
-        &db,
-        &project_id,
-        &repo_id,
-        crate::workflow::default_states::REVIEW,
-    )
-    .await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task =
+        seed_task_with_status(&db, &project_id, crate::workflow::default_states::REVIEW).await;
     assert_eq!(task.error_annotation, None);
     assert_eq!(task.blocked_json, None);
     let execution = seed_execution(
@@ -138,14 +133,9 @@ async fn test_derive_workflow_exception_review_failed_no_annotation() {
 #[tokio::test]
 async fn test_derive_workflow_exception_infers_actions_for_empty_exhausted_annotation() {
     let db = Arc::new(sqlite_db().await);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(
-        &db,
-        &project_id,
-        &repo_id,
-        crate::workflow::default_states::REVIEW,
-    )
-    .await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task =
+        seed_task_with_status(&db, &project_id, crate::workflow::default_states::REVIEW).await;
     let execution = seed_execution(
         &db,
         &task.id,
@@ -230,14 +220,9 @@ async fn test_derive_workflow_exception_infers_actions_for_empty_exhausted_annot
 #[tokio::test]
 async fn test_retry_exhausted_blocked_metadata_takes_precedence_over_stale_error_annotation() {
     let db = Arc::new(sqlite_db().await);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(
-        &db,
-        &project_id,
-        &repo_id,
-        crate::workflow::default_states::MERGING,
-    )
-    .await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task =
+        seed_task_with_status(&db, &project_id, crate::workflow::default_states::MERGING).await;
     let execution = seed_execution(
         &db,
         &task.id,
@@ -366,14 +351,9 @@ async fn test_retry_exhausted_blocked_metadata_takes_precedence_over_stale_error
 #[tokio::test]
 async fn test_merge_gate_stale_error_annotation_offers_retry_merge_when_window_available() {
     let db = Arc::new(sqlite_db().await);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(
-        &db,
-        &project_id,
-        &repo_id,
-        crate::workflow::default_states::MERGING,
-    )
-    .await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task =
+        seed_task_with_status(&db, &project_id, crate::workflow::default_states::MERGING).await;
     let execution = seed_execution(
         &db,
         &task.id,
@@ -459,14 +439,9 @@ async fn test_merge_gate_stale_error_annotation_offers_retry_merge_when_window_a
 #[tokio::test]
 async fn test_reviewer_execution_failure_only_offers_retry_or_pass() {
     let db = Arc::new(sqlite_db().await);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let task = seed_task_with_status(
-        &db,
-        &project_id,
-        &repo_id,
-        crate::workflow::default_states::REVIEW,
-    )
-    .await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task =
+        seed_task_with_status(&db, &project_id, crate::workflow::default_states::REVIEW).await;
     let execution = seed_execution(
         &db,
         &task.id,
@@ -523,11 +498,10 @@ async fn test_reviewer_execution_failure_only_offers_retry_or_pass() {
 #[tokio::test]
 async fn test_failed_task_supersedes_blocking_annotation() {
     let db = Arc::new(sqlite_db().await);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let task = seed_task_with_status(
         &db,
         &project_id,
-        &repo_id,
         crate::workflow::default_states::IN_PROGRESS,
     )
     .await;
@@ -606,11 +580,10 @@ async fn test_failed_task_supersedes_blocking_annotation() {
 #[tokio::test]
 async fn test_annotation_hook_details_surface_as_failing_step() {
     let db = Arc::new(sqlite_db().await);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let task = seed_task_with_status(
         &db,
         &project_id,
-        &repo_id,
         crate::workflow::default_states::IN_PROGRESS,
     )
     .await;
@@ -675,7 +648,7 @@ async fn test_annotation_hook_details_surface_as_failing_step() {
 #[tokio::test]
 async fn test_reworded_reason_does_not_change_offered_actions() {
     let db = Arc::new(sqlite_db().await);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let workflow = crate::workflow::default_workflow::default_workflow();
 
     let mut action_sets = Vec::new();
@@ -683,13 +656,8 @@ async fn test_reworded_reason_does_not_change_offered_actions() {
         ("keyword", "review retry budget exhausted after 3 attempts"),
         ("reworded", "we ran out of automated attempts, human needed"),
     ] {
-        let task = seed_task_with_status(
-            &db,
-            &project_id,
-            &repo_id,
-            crate::workflow::default_states::REVIEW,
-        )
-        .await;
+        let task =
+            seed_task_with_status(&db, &project_id, crate::workflow::default_states::REVIEW).await;
         let task = db::TaskRepo::update(
             &*db,
             db::UpdateTask {
@@ -745,15 +713,10 @@ async fn test_reworded_reason_does_not_change_offered_actions() {
 #[tokio::test]
 async fn test_resume_session_requires_the_execution_agent_to_own_its_role() {
     let db = Arc::new(sqlite_db().await);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
-    let task = seed_task_with_status(
-        &db,
-        &project_id,
-        &repo_id,
-        crate::workflow::default_states::REVIEW,
-    )
-    .await;
+    let task =
+        seed_task_with_status(&db, &project_id, crate::workflow::default_states::REVIEW).await;
     let execution = seed_execution(
         &db,
         &task.id,
@@ -851,11 +814,10 @@ async fn test_unknown_kind_is_info_only_and_rejects_recovery() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let task = seed_task_with_status(
         &db,
         &project_id,
-        &repo_id,
         crate::workflow::default_states::IN_PROGRESS,
     )
     .await;

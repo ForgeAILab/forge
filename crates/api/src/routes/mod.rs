@@ -380,7 +380,6 @@ async fn task_response_inner(
     Ok(TaskResponse {
         id: task.id,
         project_id: task.project_id,
-        repo_id: task.repo_id,
         parent_task_id: task.parent_task_id.clone(),
         assignee_type: task.assignee_type,
         assignee_id: task.assignee_id,
@@ -639,21 +638,6 @@ pub fn agent_response(
         created_at: agent.created_at,
         updated_at: agent.updated_at,
     }
-}
-
-pub fn agent_response_for_user(
-    agent: Agent,
-    active_task_count: Option<i64>,
-    effective_status: Option<String>,
-    stats: db::AgentExecutionStats,
-    usage: UsageAggregate,
-    is_admin: bool,
-) -> AgentResponse {
-    let mut response = agent_response(agent, active_task_count, effective_status, stats, usage);
-    if !is_admin {
-        response.daemon_id = None;
-    }
-    response
 }
 
 pub fn daemon_response(daemon: Daemon) -> DaemonResponse {

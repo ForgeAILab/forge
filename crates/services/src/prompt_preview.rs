@@ -58,7 +58,7 @@ pub async fn preview_effective_prompt(
         trigger_dispatch.as_ref(),
         state_dispatch.as_ref(),
     );
-    let context = ::review::contract::load_context(&db, task_id)
+    let context = ::review::contract::load_context(&db, task_id, None)
         .await
         .map_err(ServiceError::invalid_operation)?;
     prompt

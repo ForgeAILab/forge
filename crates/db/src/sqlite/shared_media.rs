@@ -142,11 +142,9 @@ async fn populate_evidence_context_in_tx(
     };
 
     let task = sqlx::query(
-        "SELECT t.project_id, t.version, t.updated_at, t.repo_id,
-                repo.name AS repository_name, repo.work_mode AS repository_kind,
-                repo.remote_url, repo.default_branch
+        "SELECT t.project_id, t.version, t.updated_at, p.primary_repo_id
          FROM task t
-         LEFT JOIN repo ON repo.id = t.repo_id AND repo.project_id = t.project_id
+         JOIN project p ON p.id = t.project_id
          WHERE t.id = ?",
     )
     .bind(&task_id)
@@ -174,7 +172,7 @@ async fn populate_evidence_context_in_tx(
 
     let execution = if let Some(source_execution_id) = attachment.source_execution_id.as_deref() {
         sqlx::query(
-            "SELECT id, task_id, status, role, before_sha, after_sha, summary,
+            "SELECT id, task_id, status, role, before_sha, after_sha, summary, workspace_id,
                     created_at, updated_at
              FROM execution
              WHERE id = ? AND task_id = ?",
@@ -185,7 +183,7 @@ async fn populate_evidence_context_in_tx(
         .await?
     } else {
         sqlx::query(
-            "SELECT id, task_id, status, role, before_sha, after_sha, summary,
+            "SELECT id, task_id, status, role, before_sha, after_sha, summary, workspace_id,
                     created_at, updated_at
              FROM execution
              WHERE task_id = ?
@@ -197,6 +195,54 @@ async fn populate_evidence_context_in_tx(
     };
     if attachment.source_execution_id.is_some() && execution.is_none() {
         return Err(DbError::NotFound);
+    }
+
+    let repository_id = match execution.as_ref() {
+        Some(execution) => {
+            let workspace_id = execution
+                .try_get::<Option<String>, _>("workspace_id")?
+                .ok_or_else(|| {
+                    DbError::Check(
+                        "evidence execution has no Workspace repository provenance".to_owned(),
+                    )
+                })?;
+            sqlx::query_scalar::<_, String>(
+                "SELECT w.repo_id
+                 FROM workspace w
+                 JOIN repo r ON r.id = w.repo_id AND r.project_id = ?
+                 WHERE w.id = ?",
+            )
+            .bind(&task_project)
+            .bind(workspace_id)
+            .fetch_optional(&mut **transaction)
+            .await?
+            .ok_or_else(|| {
+                DbError::Check(
+                    "evidence execution Workspace repository provenance is unavailable".to_owned(),
+                )
+            })?
+        }
+        None => task
+            .try_get::<Option<String>, _>("primary_repo_id")?
+            .unwrap_or_default(),
+    };
+    let repository = if repository_id.is_empty() {
+        None
+    } else {
+        sqlx::query(
+            "SELECT id, name, work_mode, remote_url, default_branch
+             FROM repo
+             WHERE id = ? AND project_id = ?",
+        )
+        .bind(&repository_id)
+        .bind(&task_project)
+        .fetch_optional(&mut **transaction)
+        .await?
+    };
+    if execution.is_some() && repository.is_none() {
+        return Err(DbError::Check(
+            "evidence execution repository provenance is unavailable".to_owned(),
+        ));
     }
 
     let execution_id = execution
@@ -220,11 +266,11 @@ async fn populate_evidence_context_in_tx(
     let context = serde_json::json!({
         "task_id": task_id,
         "task_version": task_version,
-        "repository_id": task.try_get::<Option<String>, _>("repo_id")?.unwrap_or_default(),
-        "repository_name": task.try_get::<Option<String>, _>("repository_name")?.unwrap_or_default(),
-        "repository_kind": task.try_get::<Option<String>, _>("repository_kind")?.unwrap_or_default(),
-        "remote_url": task.try_get::<Option<String>, _>("remote_url")?,
-        "default_branch": task.try_get::<Option<String>, _>("default_branch")?.unwrap_or_default(),
+        "repository_id": repository.as_ref().map(|row| row.try_get::<String, _>("id")).transpose()?.unwrap_or_default(),
+        "repository_name": repository.as_ref().map(|row| row.try_get::<String, _>("name")).transpose()?.unwrap_or_default(),
+        "repository_kind": repository.as_ref().map(|row| row.try_get::<String, _>("work_mode")).transpose()?.unwrap_or_default(),
+        "remote_url": repository.as_ref().map(|row| row.try_get::<String, _>("remote_url")).transpose()?,
+        "default_branch": repository.as_ref().map(|row| row.try_get::<String, _>("default_branch")).transpose()?.unwrap_or_default(),
         "execution_id": execution.as_ref().map(|row| row.try_get::<String, _>("id")).transpose()?,
         "execution_status": execution.as_ref().map(|row| row.try_get::<String, _>("status")).transpose()?,
         "execution_role": execution.as_ref().map(|row| row.try_get::<String, _>("role")).transpose()?,

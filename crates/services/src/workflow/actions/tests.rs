@@ -95,7 +95,6 @@ async fn seed_project_repo_and_task(db: &SqliteDb, task_id: &str, status: &str) 
         CreateTask {
             id: task_id.to_owned(),
             project_id: project_id.clone(),
-            repo_id: Some(repo_id),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -143,7 +142,6 @@ async fn seed_project_without_repo_and_task(db: &SqliteDb, task_id: &str, status
         CreateTask {
             id: task_id.to_owned(),
             project_id: project_id.clone(),
-            repo_id: None,
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -266,7 +264,6 @@ async fn seed_local_project_repo_and_task(
         CreateTask {
             id: task_id.to_owned(),
             project_id: project_id.clone(),
-            repo_id: Some(repo_id),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -650,6 +647,12 @@ async fn seed_completed_executor_execution(ctx: &HookContext) -> String {
         .await
         .expect("task loads")
         .expect("task exists");
+    let repo_id = ProjectRepo::get_by_id(&*ctx.db, &task.project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists")
+        .primary_repo_id
+        .expect("project has a primary repository");
     let now = now_rfc3339();
     let workspace_id = new_uuid_v4();
     let worktree_path = std::env::temp_dir().join(format!("forge-workflow-action-{workspace_id}"));
@@ -661,7 +664,7 @@ async fn seed_completed_executor_execution(ctx: &HookContext) -> String {
         CreateWorkspace {
             id: workspace_id.clone(),
             task_id: ctx.task_id.clone(),
-            repo_id: task.repo_id.clone().unwrap(),
+            repo_id,
             worktree_path: worktree_path.to_string_lossy().into_owned(),
             branch: ::workspace::task_branch_name(&ctx.task_id),
             status: WorkspaceStatus::Ready,
@@ -1091,7 +1094,6 @@ async fn run_ci_steps_keeps_review_running_when_reviewer_at_capacity() {
         CreateTask {
             id: other_task_id.to_owned(),
             project_id: current_task.project_id.clone(),
-            repo_id: current_task.repo_id.clone(),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -1532,26 +1534,24 @@ async fn dispatch_role_agent_initial_dispatch_creates_execution_with_capacity() 
 }
 
 #[tokio::test]
-async fn dispatch_role_agent_skips_initial_dispatch_without_repo() {
+async fn dispatch_role_agent_fails_initial_dispatch_without_project_repo() {
     let agent_id = "agent-coder-no-repo";
     let mut harness = build_no_repo_dispatch_harness("task-dispatch-no-repo", agent_id, 1).await;
     let ctx = harness.ctx.clone();
-    let mut event_rx = ctx.event_bus.subscribe();
 
     let result = DispatchRoleAgent.execute(&ctx).await;
 
     match result {
-        HookResult::Skipped { reason } => assert_eq!(reason, "task has no associated repo"),
-        other => panic!("expected skipped result, got {other:?}"),
+        HookResult::Failed { reason } => assert_eq!(
+            reason,
+            format!("project {} has no primary repo", ctx.project_id)
+        ),
+        other => panic!("expected failed result, got {other:?}"),
     }
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(100), harness.rx.recv())
             .await
             .is_err()
-    );
-    assert!(
-        event_rx.try_recv().is_err(),
-        "dispatch event should not emit for repo-less task"
     );
     assert_eq!(
         ExecutionRepo::count_by_task_and_role(&*ctx.db, &ctx.task_id, default_roles::CODER)
@@ -1576,7 +1576,6 @@ async fn dispatch_role_agent_initial_dispatch_skips_at_capacity() {
         CreateTask {
             id: other_task_id.to_owned(),
             project_id: task.project_id.clone(),
-            repo_id: task.repo_id.clone(),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -1820,12 +1819,12 @@ async fn ci_passes_then_reviewer_dispatched_via_dispatch_role_agent() {
 }
 
 #[tokio::test]
-async fn coordination_root_dispatches_reviewer_after_child_completion() {
+async fn subtask_root_still_dispatches_reviewer_after_coder_completion() {
     let task_id = new_uuid_v4();
     let reviewer_id = "agent-reviewer-subtask-root";
     let mut harness =
         build_reviewer_dispatch_harness(&task_id, reviewer_id, 2, vec!["test -d ."]).await;
-    let ctx = harness.ctx.clone();
+    let mut ctx = harness.ctx.clone();
     let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
         .await
         .expect("task loads")
@@ -1837,7 +1836,6 @@ async fn coordination_root_dispatches_reviewer_after_child_completion() {
         CreateTask {
             id: subtask_id.clone(),
             project_id: task.project_id.clone(),
-            repo_id: task.repo_id.clone(),
             parent_task_id: Some(task.id.clone()),
             subtask_order: Some(0),
             assignee_type: None,
@@ -1859,15 +1857,18 @@ async fn coordination_root_dispatches_reviewer_after_child_completion() {
     .expect("subtask creates");
     let root_execution = ExecutionRepo::get_by_id(
         &*ctx.db,
-        ctx.execution_id.as_deref().expect("root execution id"),
+        ctx.execution_id
+            .as_deref()
+            .expect("root execution is seeded"),
     )
     .await
     .expect("root execution loads")
     .expect("root execution exists");
+    let child_execution_id = new_uuid_v4();
     ExecutionRepo::create(
         &*ctx.db,
         CreateExecution {
-            id: new_uuid_v4(),
+            id: child_execution_id.clone(),
             task_id: subtask_id,
             agent_id: None,
             role: "executor".to_owned(),
@@ -1876,14 +1877,14 @@ async fn coordination_root_dispatches_reviewer_after_child_completion() {
             stopped_by: None,
             resume_policy: None,
             stopped_at: None,
-            parent_execution_id: None,
+            parent_execution_id: Some(root_execution.id),
             agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
-            summary: Some("child executor summary".to_owned()),
+            summary: Some("subtask executor summary".to_owned()),
             logs_path: None,
             before_sha: root_execution.before_sha.clone(),
-            after_sha: root_execution.after_sha.clone(),
+            after_sha: root_execution.after_sha,
             error: None,
             executor_config_snapshot_json: None,
             workspace_id: root_execution.workspace_id,
@@ -1892,8 +1893,8 @@ async fn coordination_root_dispatches_reviewer_after_child_completion() {
         },
     )
     .await
-    .expect("child execution creates");
-
+    .expect("subtask execution creates");
+    ctx.execution_id = Some(child_execution_id);
     let ci_result = RunCiSteps.execute(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
 
@@ -1927,7 +1928,6 @@ async fn reviewer_dispatch_ignores_waiting_review_tasks_without_running_executio
         CreateTask {
             id: other_task_id.to_owned(),
             project_id: task.project_id.clone(),
-            repo_id: task.repo_id.clone(),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,
@@ -2030,7 +2030,6 @@ async fn reviewer_at_capacity_ci_runs_dispatch_queues() {
         CreateTask {
             id: other_task_id.clone(),
             project_id: task.project_id.clone(),
-            repo_id: task.repo_id.clone(),
             parent_task_id: None,
             subtask_order: None,
             assignee_type: None,

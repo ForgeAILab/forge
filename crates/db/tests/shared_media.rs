@@ -43,9 +43,14 @@ async fn fixture() -> (SqliteDb, String, String) {
     .execute(db.pool())
     .await
     .expect("repo");
+    sqlx::query("UPDATE project SET primary_repo_id = 'repo-media' WHERE id = ?")
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .expect("project primary repo");
     sqlx::query(
-        "INSERT INTO task (id, project_id, repo_id, title, task_type, status, created_at, updated_at)
-         VALUES (?, ?, 'repo-media', 'Media Task', 'task', 'todo', ?, ?)",
+        "INSERT INTO task (id, project_id, title, task_type, status, created_at, updated_at)
+         VALUES (?, ?, 'Media Task', 'task', 'todo', ?, ?)",
     )
     .bind(&task_id)
     .bind(&project_id)
@@ -88,6 +93,43 @@ async fn upload(db: &SqliteDb, task_id: &str, id: &str) -> db::TaskMedia {
     .await
     .expect("legacy media checksum reconciliation");
     media
+}
+
+fn evidence_attachment(
+    id: &str,
+    project_id: &str,
+    task_id: &str,
+    asset_id: &str,
+    execution_id: &str,
+) -> CreateProjectMediaAttachment {
+    CreateProjectMediaAttachment {
+        id: id.to_owned(),
+        project_id: project_id.to_owned(),
+        asset_id: asset_id.to_owned(),
+        attachment_kind: "evidence".to_owned(),
+        task_media_id: None,
+        task_id: None,
+        milestone_id: None,
+        milestone_check_id: None,
+        source_task_id: Some(task_id.to_owned()),
+        source_execution_id: Some(execution_id.to_owned()),
+        source_validation_id: None,
+        source_task_version: None,
+        source_context_digest: None,
+        source_definition_revision_id: None,
+        acceptance_check_ids_json: "[]".to_owned(),
+        caption: Some("attempt proof".to_owned()),
+        evidence_kind: Some("screenshot".to_owned()),
+        checksum: Some(
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".to_owned(),
+        ),
+        availability: "available".to_owned(),
+        project_url: None,
+        author_type: "user".to_owned(),
+        author_id: Some("user-media".to_owned()),
+        authorization_json: "{}".to_owned(),
+        created_at: now_rfc3339(),
+    }
 }
 
 async fn create_release(db: &SqliteDb, project_id: &str) {
@@ -331,6 +373,83 @@ async fn active_project_evidence_blocks_task_media_gc_until_removed() {
             .gc_state,
         "gc_candidate"
     );
+}
+
+#[tokio::test]
+async fn execution_evidence_digest_keeps_workspace_repo_after_project_reselection() {
+    let (db, project_id, task_id) = fixture().await;
+    let now = now_rfc3339();
+    sqlx::query(
+        "INSERT INTO workspace
+         (id, task_id, repo_id, worktree_path, branch, status, created_at, updated_at)
+         VALUES ('workspace-media', ?, 'repo-media', '/tmp/media-worktree', 'forge/media',
+                 'ready', ?, ?)",
+    )
+    .bind(&task_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("workspace");
+    sqlx::query(
+        "INSERT INTO execution
+         (id, task_id, role, status, workspace_id, created_at, updated_at)
+         VALUES ('execution-media', ?, 'executor', 'completed', 'workspace-media', ?, ?)",
+    )
+    .bind(&task_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("execution");
+
+    let first_media = upload(&db, &task_id, "asset-before-reselection").await;
+    let first = SharedMediaRepo::create_project_media_attachment(
+        &db,
+        evidence_attachment(
+            "evidence-before-reselection",
+            &project_id,
+            &task_id,
+            &first_media.id,
+            "execution-media",
+        ),
+    )
+    .await
+    .expect("first evidence attachment");
+
+    sqlx::query(
+        "INSERT INTO repo
+         (id, project_id, name, remote_url, local_path, work_mode, default_branch, created_at, updated_at)
+         VALUES ('repo-replacement', ?, 'Replacement Repo', '/tmp/replacement', '/tmp/replacement',
+                 'direct_merge', 'trunk', ?, ?)",
+    )
+    .bind(&project_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(db.pool())
+    .await
+    .expect("replacement repo");
+    sqlx::query("UPDATE project SET primary_repo_id = 'repo-replacement' WHERE id = ?")
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .expect("project repository reselection");
+
+    let second_media = upload(&db, &task_id, "asset-after-reselection").await;
+    let second = SharedMediaRepo::create_project_media_attachment(
+        &db,
+        evidence_attachment(
+            "evidence-after-reselection",
+            &project_id,
+            &task_id,
+            &second_media.id,
+            "execution-media",
+        ),
+    )
+    .await
+    .expect("second evidence attachment");
+
+    assert_eq!(first.source_context_digest, second.source_context_digest);
 }
 
 #[tokio::test]

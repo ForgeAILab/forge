@@ -26,14 +26,15 @@ pub(crate) async fn prepare_workspace_owned(
     task_id: &str,
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
 ) -> Result<(Workspace, bool)> {
+    let authority = resolve_task_repository_authority(db, task).await?;
     if let Some(parent_task_id) = task.parent_task_id.as_deref() {
         let parent_task = TaskRepo::get_by_id(db, parent_task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", parent_task_id.to_owned()))?;
-        if parent_task.project_id != task.project_id {
-            return Err(ServiceError::invalid_operation(
-                "subtask and coordination root must belong to the same project",
-            ));
+        if parent_task.project_id != authority.project.id {
+            return Err(ServiceError::RepoMismatch {
+                project_id: task.project_id.clone(),
+            });
         }
         let Some(workspace) = WorkspaceRepo::get_by_task_id(db, parent_task_id).await? else {
             // The root is a coordination container, so its first runnable
@@ -42,13 +43,15 @@ pub(crate) async fn prepare_workspace_owned(
             let workspace = create_fresh_workspace(
                 db,
                 workspace_root,
-                &parent_task,
+                &authority.repo,
                 parent_task_id,
                 repo_cache_locks,
             )
             .await?;
             return Ok((workspace, false));
         };
+        ensure_workspace_repository_current(db, task, &workspace, &authority.repo, parent_task_id)
+            .await?;
         if workspace.status == WorkspaceStatus::Ready {
             match worktree_readiness(Path::new(&workspace.worktree_path)).await {
                 WorktreeReadiness::Ready => {
@@ -68,7 +71,7 @@ pub(crate) async fn prepare_workspace_owned(
                             recover_missing_worktree(
                                 db,
                                 workspace_root,
-                                &parent_task,
+                                &authority.repo,
                                 parent_task_id,
                                 workspace,
                                 repo_cache_locks,
@@ -86,6 +89,7 @@ pub(crate) async fn prepare_workspace_owned(
     }
 
     if let Some(workspace) = WorkspaceRepo::get_by_task_id(db, task_id).await? {
+        ensure_workspace_repository_current(db, task, &workspace, &authority.repo, task_id).await?;
         if workspace.status == WorkspaceStatus::Ready {
             match worktree_readiness(Path::new(&workspace.worktree_path)).await {
                 WorktreeReadiness::Ready => {
@@ -104,7 +108,7 @@ pub(crate) async fn prepare_workspace_owned(
                             recover_missing_worktree(
                                 db,
                                 workspace_root,
-                                task,
+                                &authority.repo,
                                 task_id,
                                 workspace,
                                 repo_cache_locks,
@@ -124,15 +128,48 @@ pub(crate) async fn prepare_workspace_owned(
     }
 
     Ok((
-        create_fresh_workspace(db, workspace_root, task, task_id, repo_cache_locks).await?,
+        create_fresh_workspace(
+            db,
+            workspace_root,
+            &authority.repo,
+            task_id,
+            repo_cache_locks,
+        )
+        .await?,
         true,
     ))
+}
+
+async fn ensure_workspace_repository_current(
+    db: &SqliteDb,
+    task: &Task,
+    workspace: &Workspace,
+    current_repo: &db::Repo,
+    reset_task_id: &str,
+) -> Result<()> {
+    if workspace.repo_id == current_repo.id {
+        return Ok(());
+    }
+
+    // A lease tied to an old repository can never authorize work after the
+    // Project selects a different primary Repo. Revoke only this Task's lease;
+    // the Workspace itself remains intact until the normal guarded reset.
+    if let Some(lease) = WorkspaceLeaseRepo::get_active_for_task(db, &task.id).await? {
+        WorkspaceLeaseRepo::revoke(db, &lease.id, lease.version, &now_rfc3339()).await?;
+    }
+    Err(ServiceError::WorkspaceResetRequired {
+        task_id: reset_task_id.to_owned(),
+        reason: format!(
+            "workspace repository {} differs from current Project repository {}; reset is required before a new execution",
+            workspace.repo_id, current_repo.id
+        ),
+    })
 }
 
 async fn recover_missing_worktree(
     db: &SqliteDb,
     workspace_root: &std::path::Path,
-    task: &Task,
+    repo: &db::Repo,
     task_id: &str,
     workspace: Workspace,
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
@@ -147,14 +184,7 @@ async fn recover_missing_worktree(
         "workspace worktree path missing or unusable, attempting recovery"
     );
 
-    let repo_id = task
-        .repo_id
-        .as_deref()
-        .ok_or_else(|| ServiceError::invalid_operation("task has no associated repo"))?;
-    let repo = RepoRepo::get_by_id(db, repo_id)
-        .await?
-        .ok_or_else(|| ServiceError::not_found("repo", repo_id.to_owned()))?;
-    let repo_source = resolve_repo_source(&repo, workspace_root).await?;
+    let repo_source = resolve_repo_source(repo, workspace_root).await?;
 
     if !Path::new(&repo_source).exists() {
         return Err(ServiceError::invalid_operation(format!(
@@ -330,23 +360,17 @@ async fn move_unusable_worktree_aside(worktree_path: &Path) -> Result<()> {
 async fn create_fresh_workspace(
     db: &SqliteDb,
     workspace_root: &std::path::Path,
-    task: &Task,
+    repo: &db::Repo,
     task_id: &str,
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
 ) -> Result<Workspace> {
-    let repo_id = task
-        .repo_id
-        .as_deref()
-        .ok_or_else(|| ServiceError::invalid_operation("task has no associated repo"))?;
-    let repo = RepoRepo::get_by_id(db, repo_id)
-        .await?
-        .ok_or_else(|| ServiceError::not_found("repo", repo_id.to_owned()))?;
+    let repo_id = repo.id.as_str();
     let now = now_rfc3339();
     let mut manager = WorkspaceManager::new(workspace_root.to_path_buf());
     if let Some(locks) = repo_cache_locks {
         manager = manager.with_repo_cache_locks(locks);
     }
-    let worktree_source = resolve_repo_source(&repo, workspace_root).await?;
+    let worktree_source = resolve_repo_source(repo, workspace_root).await?;
     let branch = ::workspace::task_branch_name(task_id);
     let branch_exists = git::branch_exists(Path::new(&worktree_source), &branch)
         .await
@@ -587,14 +611,13 @@ pub(super) async fn reset_workspace(
             "subtask workspaces are shared with the coordination root; reset the root workspace instead",
         ));
     }
+    let authority = resolve_task_repository_authority(db, task).await?;
     if let Some(workspace) = WorkspaceRepo::get_by_task_id(db, &task.id).await? {
-        let repo_id = task
-            .repo_id
-            .as_deref()
-            .ok_or_else(|| ServiceError::invalid_operation("task has no associated repo"))?;
-        let repo = RepoRepo::get_by_id(db, repo_id)
+        // Cleanup follows the attempt-pinned Workspace repository. The fresh
+        // replacement below follows the Project's current primary Repo.
+        let repo = RepoRepo::get_by_id(db, &workspace.repo_id)
             .await?
-            .ok_or_else(|| ServiceError::not_found("repo", repo_id.to_owned()))?;
+            .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
         let repo_source = resolve_repo_source(&repo, workspace_root).await?;
         let worktree_path = Path::new(&workspace.worktree_path);
         if worktree_path.exists() {
@@ -646,7 +669,14 @@ pub(super) async fn reset_workspace(
         .await?
         .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
 
-    create_fresh_workspace(db, workspace_root, &refreshed, &task.id, repo_cache_locks).await
+    create_fresh_workspace(
+        db,
+        workspace_root,
+        &authority.repo,
+        &refreshed.id,
+        repo_cache_locks,
+    )
+    .await
 }
 
 pub(crate) fn default_workspace_root() -> PathBuf {
@@ -835,19 +865,13 @@ mod tests {
         (project_id, repo_id)
     }
 
-    async fn seed_task(
-        db: &SqliteDb,
-        project_id: &str,
-        repo_id: &str,
-        parent_task_id: Option<String>,
-    ) -> Task {
+    async fn seed_task(db: &SqliteDb, project_id: &str, parent_task_id: Option<String>) -> Task {
         let now = now_rfc3339();
         TaskRepo::create(
             db,
             CreateTask {
                 id: new_uuid_v4(),
                 project_id: project_id.to_owned(),
-                repo_id: Some(repo_id.to_owned()),
                 parent_task_id,
                 subtask_order: None,
                 assignee_type: None,
@@ -878,12 +902,18 @@ mod tests {
         let worktree_path = worktree_dir.join(&task.id);
         std::fs::create_dir_all(&worktree_path).expect("worktree dir creates");
         let now = now_rfc3339();
+        let repo_id = ProjectRepo::get_by_id(db, &task.project_id)
+            .await
+            .expect("Project loads")
+            .expect("Project exists")
+            .primary_repo_id
+            .expect("Project has a primary Repo");
         WorkspaceRepo::create(
             db,
             CreateWorkspace {
                 id: new_uuid_v4(),
                 task_id: task.id.clone(),
-                repo_id: task.repo_id.clone().unwrap_or_default(),
+                repo_id,
                 worktree_path: worktree_path.to_string_lossy().into_owned(),
                 branch: ::workspace::task_branch_name(&task.id),
                 status,
@@ -897,21 +927,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn root_task_reuse_clears_cleanup_deadline() {
+    async fn root_task_reuses_ready_task_workspace() {
         let db = sqlite_db().await;
-        let (project_id, repo_id) = seed_project_repo(&db).await;
-        let root = seed_task(&db, &project_id, &repo_id, None).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
+        let root = seed_task(&db, &project_id, None).await;
         let worktree_dir = TempDir::new().expect("worktree dir creates");
         let workspace =
             seed_workspace(&db, &root, WorkspaceStatus::Ready, worktree_dir.path()).await;
-        let workspace = WorkspaceRepo::set_cleanup_after(
-            &db,
-            &workspace.id,
-            Some("2026-09-10T00:00:00Z".to_owned()),
-            &now_rfc3339(),
-        )
-        .await
-        .expect("cleanup deadline stores");
         let temp = TempDir::new().expect("temp dir creates");
 
         let prepared = prepare_workspace(&db, temp.path(), &root, &root.id, None)
@@ -920,15 +942,81 @@ mod tests {
 
         assert_eq!(prepared.id, workspace.id);
         assert_eq!(prepared.task_id, root.id);
-        assert!(prepared.cleanup_after.is_none());
+    }
+
+    #[tokio::test]
+    async fn existing_workspace_for_old_primary_is_not_reused() {
+        let db = sqlite_db().await;
+        let (project_id, old_repo_id) = seed_project_repo(&db).await;
+        let task = seed_task(&db, &project_id, None).await;
+        let worktree_dir = TempDir::new().expect("worktree dir creates");
+        let old_workspace =
+            seed_workspace(&db, &task, WorkspaceStatus::Ready, worktree_dir.path()).await;
+        assert_eq!(old_workspace.repo_id, old_repo_id);
+
+        let replacement_repo_id = new_uuid_v4();
+        let now = now_rfc3339();
+        RepoRepo::create(
+            &db,
+            CreateRepo {
+                id: replacement_repo_id.clone(),
+                project_id: project_id.clone(),
+                name: "replacement".to_owned(),
+                remote_url: "/tmp/replacement-repo".to_owned(),
+                local_path: Some("/tmp/replacement-repo".to_owned()),
+                work_mode: db::WorkMode::DirectMerge,
+                default_branch: "main".to_owned(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("replacement Repo creates");
+        let project = ProjectRepo::get_by_id(&db, &project_id)
+            .await
+            .expect("Project loads")
+            .expect("Project exists");
+        ProjectRepo::update_at_version(
+            &db,
+            UpdateProject {
+                id: project_id,
+                name: None,
+                settings: None,
+                primary_repo_id: Some(Some(replacement_repo_id.clone())),
+                paused_at: None,
+                updated_at: now_rfc3339(),
+            },
+            project.version,
+            None,
+        )
+        .await
+        .expect("Project primary Repo changes");
+
+        let result = prepare_workspace(&db, worktree_dir.path(), &task, &task.id, None).await;
+        assert!(
+            matches!(
+                &result,
+                Err(ServiceError::WorkspaceResetRequired { task_id, reason })
+                    if task_id == &task.id
+                        && reason.contains(&old_repo_id)
+                        && reason.contains(&replacement_repo_id)
+            ),
+            "expected an explicit reset boundary, got: {result:?}"
+        );
+        let preserved = WorkspaceRepo::get_by_task_id(&db, &task.id)
+            .await
+            .expect("Workspace reload succeeds")
+            .expect("historical Workspace remains until guarded reset");
+        assert_eq!(preserved.id, old_workspace.id);
+        assert_eq!(preserved.repo_id, old_repo_id);
     }
 
     #[tokio::test]
     async fn subtask_reuses_ready_parent_workspace() {
         let db = sqlite_db().await;
-        let (project_id, repo_id) = seed_project_repo(&db).await;
-        let root = seed_task(&db, &project_id, &repo_id, None).await;
-        let subtask = seed_task(&db, &project_id, &repo_id, Some(root.id.clone())).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
+        let root = seed_task(&db, &project_id, None).await;
+        let subtask = seed_task(&db, &project_id, Some(root.id.clone())).await;
         let worktree_dir = TempDir::new().expect("worktree dir creates");
         let workspace =
             seed_workspace(&db, &root, WorkspaceStatus::Ready, worktree_dir.path()).await;
@@ -945,11 +1033,10 @@ mod tests {
     #[tokio::test]
     async fn subtask_rejects_not_ready_parent_workspace() {
         let db = sqlite_db().await;
-        let (project_id, repo_id) = seed_project_repo(&db).await;
-        let root = seed_task(&db, &project_id, &repo_id, None).await;
-        let subtask = seed_task(&db, &project_id, &repo_id, Some(root.id.clone())).await;
+        let (project_id, _repo_id) = seed_project_repo(&db).await;
+        let root = seed_task(&db, &project_id, None).await;
+        let subtask = seed_task(&db, &project_id, Some(root.id.clone())).await;
         let temp = TempDir::new().expect("temp dir creates");
-
         let worktree_dir = TempDir::new().expect("worktree dir creates");
         seed_workspace(&db, &root, WorkspaceStatus::Creating, worktree_dir.path()).await;
         let not_ready = prepare_workspace(&db, temp.path(), &subtask, &subtask.id, None).await;
@@ -960,31 +1047,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_subtask_creates_root_workspace_on_demand() {
+    async fn subtask_without_parent_workspace_creates_root_owned_workspace() {
         let db = sqlite_db().await;
         let repo_dir = TempDir::new().expect("repo dir creates");
         let (project_id, repo_id) = seed_project_with_real_repo(&db, repo_dir.path()).await;
-        let root = seed_task(&db, &project_id, &repo_id, None).await;
-        let subtask = seed_task(&db, &project_id, &repo_id, Some(root.id.clone())).await;
+        let root = seed_task(&db, &project_id, None).await;
+        let subtask = seed_task(&db, &project_id, Some(root.id.clone())).await;
         let workspace_root = TempDir::new().expect("workspace root creates");
 
-        let prepared = prepare_workspace(&db, workspace_root.path(), &subtask, &subtask.id, None)
+        let workspace = prepare_workspace(&db, workspace_root.path(), &subtask, &subtask.id, None)
             .await
-            .expect("first child creates the shared workspace");
+            .expect("subtask creates the shared root workspace");
 
-        assert_eq!(prepared.task_id, root.id);
-        assert_eq!(prepared.repo_id, repo_id);
-        assert!(WorkspaceRepo::get_by_task_id(&db, &subtask.id)
-            .await
-            .expect("child workspace lookup succeeds")
-            .is_none());
-        assert_eq!(
-            WorkspaceRepo::get_by_task_id(&db, &root.id)
+        assert_eq!(workspace.task_id, root.id);
+        assert_eq!(workspace.repo_id, repo_id);
+        assert_eq!(workspace.status, WorkspaceStatus::Ready);
+        assert!(std::path::Path::new(&workspace.worktree_path).exists());
+        assert!(
+            WorkspaceRepo::get_by_task_id(&db, &subtask.id)
                 .await
-                .expect("root workspace lookup succeeds")
-                .expect("root owns the shared workspace")
-                .id,
-            prepared.id
+                .expect("subtask Workspace lookup succeeds")
+                .is_none(),
+            "the shared Workspace must remain owned by the coordination root"
         );
     }
 
@@ -1094,9 +1178,9 @@ mod tests {
     async fn missing_worktree_with_branch_auto_recovers() {
         let db = sqlite_db().await;
         let repo_dir = TempDir::new().expect("repo dir creates");
-        let (project_id, repo_id) = seed_project_with_real_repo(&db, repo_dir.path()).await;
+        let (project_id, _repo_id) = seed_project_with_real_repo(&db, repo_dir.path()).await;
         let workspace_root = TempDir::new().expect("workspace root creates");
-        let task = seed_task(&db, &project_id, &repo_id, None).await;
+        let task = seed_task(&db, &project_id, None).await;
 
         let fresh = prepare_workspace(&db, workspace_root.path(), &task, &task.id, None)
             .await
@@ -1121,9 +1205,9 @@ mod tests {
     async fn unusable_existing_worktree_with_branch_auto_recovers() {
         let db = sqlite_db().await;
         let repo_dir = TempDir::new().expect("repo dir creates");
-        let (project_id, repo_id) = seed_project_with_real_repo(&db, repo_dir.path()).await;
+        let (project_id, _repo_id) = seed_project_with_real_repo(&db, repo_dir.path()).await;
         let workspace_root = TempDir::new().expect("workspace root creates");
-        let task = seed_task(&db, &project_id, &repo_id, None).await;
+        let task = seed_task(&db, &project_id, None).await;
 
         let fresh = prepare_workspace(&db, workspace_root.path(), &task, &task.id, None)
             .await
@@ -1156,9 +1240,9 @@ mod tests {
     async fn existing_worktree_with_missing_repo_source_errors_before_reuse() {
         let db = sqlite_db().await;
         let repo_dir = TempDir::new().expect("repo dir creates");
-        let (project_id, repo_id) = seed_project_with_real_repo(&db, repo_dir.path()).await;
+        let (project_id, _repo_id) = seed_project_with_real_repo(&db, repo_dir.path()).await;
         let workspace_root = TempDir::new().expect("workspace root creates");
-        let task = seed_task(&db, &project_id, &repo_id, None).await;
+        let task = seed_task(&db, &project_id, None).await;
 
         let fresh = prepare_workspace(&db, workspace_root.path(), &task, &task.id, None)
             .await
@@ -1180,9 +1264,9 @@ mod tests {
     async fn missing_worktree_and_branch_returns_reset_required() {
         let db = sqlite_db().await;
         let repo_dir = TempDir::new().expect("repo dir creates");
-        let (project_id, repo_id) = seed_project_with_real_repo(&db, repo_dir.path()).await;
+        let (project_id, _repo_id) = seed_project_with_real_repo(&db, repo_dir.path()).await;
         let workspace_root = TempDir::new().expect("workspace root creates");
-        let task = seed_task(&db, &project_id, &repo_id, None).await;
+        let task = seed_task(&db, &project_id, None).await;
 
         let fresh = prepare_workspace(&db, workspace_root.path(), &task, &task.id, None)
             .await
@@ -1225,9 +1309,9 @@ mod tests {
     async fn missing_repo_source_returns_io_error() {
         let db = sqlite_db().await;
         let repo_dir = TempDir::new().expect("repo dir creates");
-        let (project_id, repo_id) = seed_project_with_real_repo(&db, repo_dir.path()).await;
+        let (project_id, _repo_id) = seed_project_with_real_repo(&db, repo_dir.path()).await;
         let workspace_root = TempDir::new().expect("workspace root creates");
-        let task = seed_task(&db, &project_id, &repo_id, None).await;
+        let task = seed_task(&db, &project_id, None).await;
 
         let fresh = prepare_workspace(&db, workspace_root.path(), &task, &task.id, None)
             .await
