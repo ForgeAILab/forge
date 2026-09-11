@@ -103,7 +103,7 @@ async fn seed_blocked_task(harness: &common::Harness, title: &str) -> String {
         StatusCode::OK,
     )
     .await;
-    let repo: RepoResponse = common::json_request(
+    let _repo: RepoResponse = common::json_request(
         &harness.app,
         Method::POST,
         &format!("/api/v1/projects/{}/repos", project.id),
@@ -121,14 +121,13 @@ async fn seed_blocked_task(harness: &common::Harness, title: &str) -> String {
     let now = now_rfc3339();
     sqlx::query(
         "INSERT INTO task (
-            id, project_id, repo_id, parent_task_id, subtask_order, title, description,
+            id, project_id, parent_task_id, subtask_order, title, description,
             status, priority, task_state_config, merge_config, plan, created_at, updated_at
          )
-         VALUES (?, ?, ?, NULL, NULL, ?, NULL, 'blocked', 0, NULL, NULL, NULL, ?, ?)",
+         VALUES (?, ?, NULL, NULL, ?, NULL, 'blocked', 0, NULL, NULL, NULL, ?, ?)",
     )
     .bind(&task_id)
     .bind(&project.id)
-    .bind(&repo.id)
     .bind(title)
     .bind(&now)
     .bind(&now)
