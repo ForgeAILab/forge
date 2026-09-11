@@ -240,6 +240,16 @@ pub(super) async fn merge_fix_budget_result(ctx: &HookContext) -> Option<HookRes
     }
 }
 
+/// Marker written into the transition reason of every `merging -> merge_failed`
+/// bounce caused by the integration target moving during review.
+///
+/// Those bounces are recorded with `rejection = true` like any other cascade
+/// out of a gate (`cascade_rejection` in `workflow::engine` is derived from the
+/// state being entered), but they are contention rather than a merge-fix
+/// attempt, so they must not be charged to the merge-fix budget — see
+/// `merge_fix_rejections_since_boundary`.
+pub(super) const TARGET_MOVED_MARKER: &str = "[target-moved-rebase]";
+
 pub(super) fn merge_fix_rejections_since_boundary(entries: &[TransitionLog]) -> i64 {
     let boundary = entries.iter().rposition(|entry| {
         entry.from_state == default_states::MERGING
@@ -256,6 +266,10 @@ pub(super) fn merge_fix_rejections_since_boundary(entries: &[TransitionLog]) -> 
             entry.from_state == default_states::MERGING
                 && entry.to_state == default_states::MERGE_FAILED
                 && entry.rejection
+                // Losing a merge race is not a merge-fix attempt. Counting it
+                // spent the Task's single merge-fix retry on ordinary
+                // concurrency and blocked it dead on the next one.
+                && !entry.trigger_reason.contains(TARGET_MOVED_MARKER)
         })
         .count() as i64
 }
@@ -570,6 +584,10 @@ pub(super) async fn run_ci_steps_in_worktree(
     let mut results = Vec::with_capacity(ci_steps.len());
 
     for (index, step) in ci_steps.iter().enumerate() {
+        // `StepResultEntry` declares `started_at`/`finished_at` and the review
+        // API publishes them, so stamp each step here — this is the only place
+        // that knows when a step actually ran.
+        let started_at = now_rfc3339();
         let output = Command::new("bash")
             .arg("-lc")
             .arg(step)
@@ -577,6 +595,7 @@ pub(super) async fn run_ci_steps_in_worktree(
             .output()
             .await
             .map_err(|error| error.to_string())?;
+        let finished_at = now_rfc3339();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let output_tail = if stdout.is_empty() {
@@ -593,6 +612,8 @@ pub(super) async fn run_ci_steps_in_worktree(
             "exit_code": exit_code,
             "stderr_tail": tail_bytes(&stderr, 4096),
             "output_tail": tail_bytes(&output_tail, 4096),
+            "started_at": started_at,
+            "finished_at": finished_at,
         }));
 
         if exit_code != 0 {

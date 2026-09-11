@@ -41,7 +41,10 @@ pub struct AgentAvailabilityResponse {
     pub available: bool,
     pub effective_status: String,
     pub resolved_daemon_id: Option<String>,
-    pub active_task_count: i64,
+    /// Assigned workload; see `Agent::active_assigned_task_count`.
+    pub active_assigned_task_count: i64,
+    /// Live concurrency; this is what `max_concurrent_tasks` gates.
+    pub running_execution_count: i64,
     pub max_concurrent_tasks: i64,
     pub reason: Option<String>,
 }

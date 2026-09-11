@@ -51,7 +51,8 @@ export interface FederatedAgent {
   daemon_id: string | null
   max_concurrent_tasks: number
   status: AgentStatus
-  active_task_count: number | null
+  active_assigned_task_count: number | null
+  running_execution_count: number | null
   effective_status: string | null
   avg_duration_ms: number | null
   success_rate: number | null

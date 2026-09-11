@@ -1060,3 +1060,54 @@ async fn reassign_same_coder_noop_preserves_review_passed_at() {
     );
     assert!(rx.try_recv().is_err());
 }
+
+/// Regression coverage for F10 part 2: confirming the agent a role already
+/// has (the `forge_assign_agent` MCP path, which never cancels an active
+/// Execution) must still be a real, timestamped write. Otherwise
+/// `latest_stopped_execution_blocks_dispatch`'s documented escape hatch — an
+/// assignment newer than the gating Execution authorizes one fresh dispatch
+/// — never fires for a same-agent confirmation, which is exactly how the
+/// wedge in F10 was worked around in practice.
+#[tokio::test]
+async fn assign_agent_to_task_confirmation_refreshes_assignment_timestamp() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_a = seed_agent(&db).await;
+    let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
+
+    let first = service
+        .assign_agent_to_task(&task.id, &agent_a)
+        .await
+        .expect("initial assignment succeeds");
+    assert_eq!(first.assignee_id.as_deref(), Some(agent_a.as_str()));
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    let second = service
+        .assign_agent_to_task(&task.id, &agent_a)
+        .await
+        .expect("confirming the same agent succeeds");
+
+    assert_eq!(second.assignee_id.as_deref(), Some(agent_a.as_str()));
+    assert!(
+        second.updated_at > first.updated_at,
+        "confirming the already-assigned agent must advance updated_at (first={}, second={})",
+        first.updated_at,
+        second.updated_at
+    );
+
+    // Confirmation must stay a pure assignment write: no claim, no Execution.
+    let task_after = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert_eq!(task_after.status, "in_progress");
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(&*db, &task.id, "coder")
+            .await
+            .expect("execution count loads"),
+        0
+    );
+}

@@ -663,7 +663,11 @@ export interface Agent {
   daemon?: Daemon
   max_concurrent_tasks: number
   status: AgentStatus
-  active_task_count?: number | null
+  /** Tasks assigned to this identity in an active or gate state. Assigned
+   * workload, not live concurrency: not bounded by max_concurrent_tasks. */
+  active_assigned_task_count?: number | null
+  /** Executions currently running. This is what max_concurrent_tasks gates. */
+  running_execution_count?: number | null
   effective_status?: string | null
   avg_duration_ms: number | null
   success_rate: number | null
@@ -1083,7 +1087,8 @@ export interface AgentAvailability {
   available: boolean
   effective_status: string
   resolved_daemon_id: string | null
-  active_task_count: number
+  active_assigned_task_count: number
+  running_execution_count: number
   max_concurrent_tasks: number
   reason?: string | null
 }

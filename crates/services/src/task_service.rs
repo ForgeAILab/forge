@@ -82,7 +82,8 @@ pub use proposal::{
 pub(crate) use repository_authority::resolve_task_repository_authority;
 pub(crate) use subtask::{
     coordination_review_pending, coordination_root_has_subtasks,
-    coordination_root_sequence_complete, subtask_dispatch_ready, subtask_is_terminal,
+    coordination_root_sequence_complete, mark_coordination_review_pending_if_root,
+    subtask_dispatch_ready, subtask_is_terminal,
 };
 pub use subtask::{is_root_task, is_subtask, root_for};
 

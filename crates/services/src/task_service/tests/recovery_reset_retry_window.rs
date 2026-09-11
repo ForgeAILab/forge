@@ -133,6 +133,66 @@ async fn test_reset_retry_window_preserves_history_and_refreshes_budget() {
 }
 
 #[tokio::test]
+async fn test_proceed_once_from_review_reject_target_preserves_exhausted_window() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, repo_dir) = seed_project_repo(&db).await;
+    initialize_primary_repository(&repo_dir);
+    let task = seed_task_with_status(
+        &db,
+        &project_id,
+        crate::workflow::default_states::IN_PROGRESS,
+    )
+    .await;
+    seed_review_rejection_log(&db, &task.id, "review failed once").await;
+    seed_review_rejection_log(&db, &task.id, "review failed twice").await;
+    let task = set_retry_exhausted_metadata(&db, &task).await;
+
+    let recovered = service
+        .recover_task(
+            task.id.clone(),
+            api_types::RecoveryAction::ProceedOnce,
+            Some("allow one focused repair".to_owned()),
+            Some("address the latest review finding".to_owned()),
+        )
+        .await
+        .expect("proceed once succeeds from the review reject target");
+
+    assert_eq!(
+        recovered.status,
+        crate::workflow::default_states::IN_PROGRESS
+    );
+    assert_eq!(recovered.error_annotation, None);
+    assert_eq!(recovered.blocked_json, None);
+
+    let logs = TransitionLogRepo::list_by_task(&*db, &task.id)
+        .await
+        .expect("transition logs reload");
+    let marker = logs
+        .iter()
+        .find(|log| log.trigger_name.as_deref() == Some("proceed_once"))
+        .expect("proceed-once marker exists");
+    assert_eq!(marker.from_state, crate::workflow::default_states::REVIEW);
+    assert_eq!(marker.to_state, crate::workflow::default_states::REVIEW);
+    assert!(!marker.rejection);
+    assert!(marker
+        .trigger_reason
+        .contains("Guidance: address the latest review finding"));
+    assert_eq!(
+        TransitionLogRepo::count_gate_rejections(
+            &*db,
+            &task.id,
+            crate::workflow::default_states::REVIEW,
+        )
+        .await
+        .expect("post-recovery rejection count loads"),
+        2,
+        "proceed once must not reset the exhausted retry window"
+    );
+}
+
+#[tokio::test]
 async fn test_resume_process_moves_failed_review_back_to_in_progress() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));

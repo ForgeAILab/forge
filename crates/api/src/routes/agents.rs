@@ -110,9 +110,11 @@ pub async fn list_agents(
     let has_more = page.next_cursor.is_some();
     let mut items = Vec::with_capacity(page.items.len());
     for agent in page.items {
-        let active_task_count = AgentRepo::count_active_tasks(&*state.db, &agent.id).await?;
+        let active_assigned_task_count =
+            AgentRepo::count_active_assigned_tasks(&*state.db, &agent.id).await?;
         items.push(
-            build_agent_response_for_user(&state, agent, Some(active_task_count), &user).await?,
+            build_agent_response_for_user(&state, agent, Some(active_assigned_task_count), &user)
+                .await?,
         );
     }
     Ok(Json(PaginatedResponse {
@@ -132,9 +134,11 @@ pub async fn get_agent(
         .await?
         .ok_or_else(|| ApiError::not_found("agent", id.clone()))?;
     require_agent_visible(&agent, &user, &id)?;
-    let active_task_count = AgentRepo::count_active_tasks(&*state.db, &agent.id).await?;
+    let active_assigned_task_count =
+        AgentRepo::count_active_assigned_tasks(&*state.db, &agent.id).await?;
     Ok(Json(
-        build_agent_response_for_user(&state, agent, Some(active_task_count), &user).await?,
+        build_agent_response_for_user(&state, agent, Some(active_assigned_task_count), &user)
+            .await?,
     ))
 }
 
@@ -224,9 +228,11 @@ pub async fn update_agent(
         },
     )
     .await?;
-    let active_task_count = AgentRepo::count_active_tasks(&*state.db, &agent.id).await?;
+    let active_assigned_task_count =
+        AgentRepo::count_active_assigned_tasks(&*state.db, &agent.id).await?;
     Ok(Json(
-        build_agent_response_for_user(&state, agent, Some(active_task_count), &user).await?,
+        build_agent_response_for_user(&state, agent, Some(active_assigned_task_count), &user)
+            .await?,
     ))
 }
 
@@ -256,7 +262,7 @@ pub async fn pause_agent(
         let response = build_agent_response_for_user(
             &state,
             agent,
-            Some(AgentRepo::count_active_tasks(&*state.db, &id).await?),
+            Some(AgentRepo::count_active_assigned_tasks(&*state.db, &id).await?),
             &user,
         )
         .await?;
@@ -274,9 +280,11 @@ pub async fn pause_agent(
         timestamp: event_timestamp(),
         context: EventContext::AgentPaused {},
     });
-    let active_task_count = AgentRepo::count_active_tasks(&*state.db, &agent.id).await?;
+    let active_assigned_task_count =
+        AgentRepo::count_active_assigned_tasks(&*state.db, &agent.id).await?;
     let response =
-        build_agent_response_for_user(&state, agent, Some(active_task_count), &user).await?;
+        build_agent_response_for_user(&state, agent, Some(active_assigned_task_count), &user)
+            .await?;
     Ok(Json(response))
 }
 
@@ -293,7 +301,7 @@ pub async fn resume_agent(
         let response = build_agent_response_for_user(
             &state,
             agent,
-            Some(AgentRepo::count_active_tasks(&*state.db, &id).await?),
+            Some(AgentRepo::count_active_assigned_tasks(&*state.db, &id).await?),
             &user,
         )
         .await?;
@@ -311,9 +319,11 @@ pub async fn resume_agent(
         timestamp: event_timestamp(),
         context: EventContext::AgentResumed {},
     });
-    let active_task_count = AgentRepo::count_active_tasks(&*state.db, &agent.id).await?;
+    let active_assigned_task_count =
+        AgentRepo::count_active_assigned_tasks(&*state.db, &agent.id).await?;
     let response =
-        build_agent_response_for_user(&state, agent, Some(active_task_count), &user).await?;
+        build_agent_response_for_user(&state, agent, Some(active_assigned_task_count), &user)
+            .await?;
     Ok(Json(response))
 }
 
@@ -330,9 +340,11 @@ pub async fn duplicate_agent(
     let agent =
         AgentRepo::duplicate_agent(&*state.db, &id, new_uuid_v4(), request.name, now_rfc3339())
             .await?;
-    let active_task_count = AgentRepo::count_active_tasks(&*state.db, &agent.id).await?;
+    let active_assigned_task_count =
+        AgentRepo::count_active_assigned_tasks(&*state.db, &agent.id).await?;
     Ok(Json(
-        build_agent_response_for_user(&state, agent, Some(active_task_count), &user).await?,
+        build_agent_response_for_user(&state, agent, Some(active_assigned_task_count), &user)
+            .await?,
     ))
 }
 
@@ -345,7 +357,8 @@ pub async fn agent_availability(
         .await?
         .ok_or_else(|| ApiError::not_found("agent", id.clone()))?;
     require_agent_visible(&agent, &user, &id)?;
-    let active_task_count = AgentRepo::count_active_tasks(&*state.db, &agent.id).await?;
+    let active_assigned_task_count =
+        AgentRepo::count_active_assigned_tasks(&*state.db, &agent.id).await?;
     let effective_status = compute_effective_status(&state.db, &agent).await?;
     let resolved_daemon = resolve_daemon_for_agent(&state.db, &agent).await.ok();
     let available = effective_status.as_str() == "active" || effective_status.as_str() == "busy";
@@ -372,7 +385,8 @@ pub async fn agent_availability(
         } else {
             None
         },
-        active_task_count,
+        active_assigned_task_count,
+        running_execution_count: AgentRepo::count_running_executions(&*state.db, &agent.id).await?,
         max_concurrent_tasks: agent.max_concurrent_tasks,
         reason,
     }))
@@ -429,7 +443,7 @@ pub async fn agent_discovered_options(
 async fn build_agent_response(
     state: &AppState,
     agent: Agent,
-    active_task_count: Option<i64>,
+    active_assigned_task_count: Option<i64>,
 ) -> ApiResult<AgentResponse> {
     let effective_status = compute_effective_status(&state.db, &agent)
         .await?
@@ -437,9 +451,15 @@ async fn build_agent_response(
         .to_owned();
     let stats = ExecutionRepo::stats_by_agent(&*state.db, &agent.id).await?;
     let usage = services::usage_projection::usage_aggregate_for_agent(&state.db, &agent.id).await?;
+    // Derived here rather than threaded through every caller: this is the
+    // quantity `max_concurrent_tasks` actually bounds, so it should always be
+    // present wherever the cap is.
+    let running_execution_count =
+        AgentRepo::count_running_executions(&*state.db, &agent.id).await?;
     Ok(agent_response(
         agent,
-        active_task_count,
+        active_assigned_task_count,
+        Some(running_execution_count),
         Some(effective_status),
         stats,
         usage,
@@ -449,10 +469,10 @@ async fn build_agent_response(
 async fn build_agent_response_for_user(
     state: &AppState,
     agent: Agent,
-    active_task_count: Option<i64>,
+    active_assigned_task_count: Option<i64>,
     user: &AuthenticatedUser,
 ) -> ApiResult<AgentResponse> {
-    let mut response = build_agent_response(state, agent, active_task_count).await?;
+    let mut response = build_agent_response(state, agent, active_assigned_task_count).await?;
     if !user.is_admin {
         response.daemon_id = None;
     }

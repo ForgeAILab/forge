@@ -13,6 +13,12 @@ use crate::{
 
 use super::{helpers, TaskDispatcher};
 
+/// Dispatch-disposition capability for the coordination-root aggregate review
+/// advance. A root never takes an ordinary role dispatch — both scans `continue`
+/// out of the root branch — so it owns the single disposition slot outright and
+/// cannot collide with a role capability.
+pub(super) const COORDINATION_ROOT_CAPABILITY: &str = "coordination_root_advance";
+
 #[derive(Debug)]
 pub(super) struct InitialScheduleTarget {
     pub(super) transition_to: String,
@@ -21,6 +27,60 @@ pub(super) struct InitialScheduleTarget {
 }
 
 impl TaskDispatcher {
+    /// Attempt one coordination-root aggregate-review advance, quiescing on a
+    /// deterministic refusal.
+    ///
+    /// Ordinary role dispatch already parks a Task whose deterministic blocker
+    /// has not changed, so the identical denial is not re-derived and re-logged
+    /// on every scan. The coordination-root branch had no equivalent guard: a
+    /// root that could not enter aggregate review re-attempted the advance and
+    /// re-logged the same warning every 10s indefinitely — observed running for
+    /// 19 consecutive scans until a user recovered the Task by hand.
+    ///
+    /// Parking is safe here because every event that can change the answer also
+    /// wakes the root: `advance_subtask_sequence` calls `wake_task_dispatch` on
+    /// the parent before advancing it, and any recovery action that clears the
+    /// root's blocker bumps its `version`. Either invalidates the disposition.
+    ///
+    /// Returns the number of advances that actually committed, so callers can
+    /// fold it straight into their dispatched count.
+    pub(super) async fn advance_coordination_root_once(&self, task: &Task) -> Result<u64> {
+        if deferred_dispatch::dispatch_disposition_is_current(task, COORDINATION_ROOT_CAPABILITY) {
+            return Ok(0);
+        }
+        match self.task_service.advance_coordination_root(&task.id).await {
+            Ok(()) => {
+                deferred_dispatch::clear_dispatch_disposition(&self.db, task).await?;
+                Ok(1)
+            }
+            Err(ServiceError::Db(DbError::VersionConflict)) => {
+                tracing::debug!(task_id = %task.id, "coordination-root review advance lost version race");
+                Ok(0)
+            }
+            Err(error) if helpers::is_deterministic_dispatch_refusal(&error) => {
+                deferred_dispatch::record_dispatch_disposition(
+                    &self.db,
+                    task,
+                    COORDINATION_ROOT_CAPABILITY,
+                    &error.to_string(),
+                )
+                .await?;
+                tracing::warn!(
+                    task_id = %task.id,
+                    %error,
+                    "coordination-root aggregate review advance parked until Task state changes or an explicit wake"
+                );
+                Ok(0)
+            }
+            Err(error) => {
+                // Potentially transient: no disposition, so the next scan
+                // retries instead of stalling on a momentary failure.
+                tracing::warn!(task_id = %task.id, %error, "coordination-root aggregate review advance remains pending");
+                Ok(0)
+            }
+        }
+    }
+
     pub(super) async fn dispatch_initial_tasks(
         &self,
         project: &Project,
@@ -75,15 +135,7 @@ impl TaskDispatcher {
                     && workflow.state_kind(&task.status) != Some(StateKind::Terminal);
                 if crate::task_service::coordination_review_pending(&task) || needs_recovery_advance
                 {
-                    match self.task_service.advance_coordination_root(&task.id).await {
-                        Ok(()) => dispatched += 1,
-                        Err(ServiceError::Db(DbError::VersionConflict)) => {
-                            tracing::debug!(task_id = %task.id, "coordination-root review advance lost version race");
-                        }
-                        Err(error) => {
-                            tracing::warn!(task_id = %task.id, %error, "coordination-root aggregate review advance remains pending");
-                        }
-                    }
+                    dispatched += self.advance_coordination_root_once(&task).await?;
                 }
                 continue;
             }

@@ -464,7 +464,7 @@ impl AgentRepo for SqliteDb {
         Ok(())
     }
 
-    async fn count_active_tasks(&self, agent_id: &str) -> Result<i64> {
+    async fn count_active_assigned_tasks(&self, agent_id: &str) -> Result<i64> {
         Ok(sqlx::query_scalar::<_, i64>(
             "SELECT
                 (
@@ -514,6 +514,15 @@ impl AgentRepo for SqliteDb {
                 )",
         )
         .bind(agent_id)
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    async fn count_running_executions(&self, agent_id: &str) -> Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM execution WHERE agent_id = ? AND status = 'running'",
+        )
         .bind(agent_id)
         .fetch_one(&self.pool)
         .await?)

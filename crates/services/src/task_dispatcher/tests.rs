@@ -1488,6 +1488,238 @@ async fn reviewer_assignment_after_stopped_attempt_dispatches_without_separate_r
 }
 
 #[tokio::test]
+async fn coordination_root_target_moved_rebase_returns_to_aggregate_review() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+
+    // Keep aggregate review parked for a human decision so this test observes
+    // the recovery destination without needing a reviewer execution/workspace.
+    let mut workflow = crate::workflow::default_workflow::default_workflow();
+    let review = workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == crate::workflow::default_states::REVIEW)
+        .expect("default workflow has review state");
+    review.role = None;
+    review.dispatch = None;
+    let review_gate = review.gate_config.as_mut().expect("review has gate config");
+    review_gate.requires_user_approval = Some(true);
+    review_gate.optional_when_unassigned = Some(false);
+    sqlx::query(
+        "UPDATE project SET workflow_definition = ?, workflow_template_name = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(serde_json::to_string(&workflow).expect("workflow serializes"))
+    .bind("human-required")
+    .bind(now_rfc3339())
+    .bind(&project_id)
+    .execute(db.pool())
+    .await
+    .expect("project workflow updates");
+
+    let root = seed_task(
+        &db,
+        &project_id,
+        "coordination root",
+        crate::workflow::default_states::MERGE_FAILED,
+        0,
+    )
+    .await;
+    let now = now_rfc3339();
+    TaskRepo::create(
+        &*db,
+        CreateTask {
+            id: new_uuid_v4(),
+            project_id: project_id.clone(),
+            parent_task_id: Some(root.id.clone()),
+            subtask_order: Some(0),
+            assignee_type: None,
+            assignee_id: None,
+            title: "completed child".to_owned(),
+            description: None,
+            task_type: "task".to_owned(),
+            status: crate::workflow::default_states::DONE.to_owned(),
+            is_automation: false,
+            priority: 0,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("completed child creates");
+    assert!(
+        crate::task_service::mark_coordination_review_pending_if_root(&db, &root)
+            .await
+            .expect("clean target-moved rebase marks aggregate review pending")
+    );
+
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+
+    assert_eq!(dispatched, 1);
+    let recovered = TaskRepo::get_by_id(&*db, &root.id, false)
+        .await
+        .expect("coordination root reloads")
+        .expect("coordination root exists");
+    assert_eq!(
+        recovered.status,
+        crate::workflow::default_states::REVIEW,
+        "a clean target-moved rebase must return the root to aggregate review"
+    );
+    assert!(!crate::task_service::coordination_review_pending(
+        &recovered
+    ));
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(
+            &*db,
+            &root.id,
+            crate::workflow::default_roles::CODER,
+        )
+        .await
+        .expect("root coder execution count loads"),
+        0,
+        "coordination roots must never receive a merge-fix coder turn"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "aggregate review should wait for a user"
+    );
+}
+
+/// Regression coverage for F10: a Task whose newest coder Execution is the
+/// normal, *successful* run that preceded review/merge (e.g. a Task sitting
+/// in `merge_failed` after the coder's own attempt completed cleanly) must
+/// never be gated behind the "explicit retry required" rule. That rule
+/// exists for genuinely stopped attempts, not for a completed one.
+#[tokio::test]
+async fn latest_stopped_execution_blocks_dispatch_ignores_completed_execution() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let task = seed_task(&db, &project_id, "merge failed", "merge_failed", 0).await;
+    assign_role(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        &agent_id,
+    )
+    .await;
+    seed_completed_coder_execution(&db, &task.id).await;
+
+    let blocked = super::helpers::latest_stopped_execution_blocks_dispatch(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+    )
+    .await
+    .expect("guard evaluates");
+
+    assert!(
+        !blocked,
+        "a completed coder execution must not gate re-dispatch out of merge_failed"
+    );
+}
+
+/// The other half of the F10 fix: a genuinely stopped attempt (failed or
+/// cancelled, with no auto-retry policy) must keep gating re-dispatch exactly
+/// as before — only `Completed` is now exempt.
+#[tokio::test]
+async fn latest_stopped_execution_blocks_dispatch_still_gates_failed_and_cancelled_executions() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+
+    let cancelled_task = seed_task(&db, &project_id, "cancelled coder", "merge_failed", 0).await;
+    assign_role(
+        &db,
+        &cancelled_task.id,
+        crate::workflow::default_roles::CODER,
+        &agent_id,
+    )
+    .await;
+    seed_cancelled_execution(
+        &db,
+        &cancelled_task.id,
+        &agent_id,
+        crate::workflow::default_roles::CODER,
+        Some(StopReason::AgentTimeout),
+        None,
+    )
+    .await;
+
+    let cancelled_blocked = super::helpers::latest_stopped_execution_blocks_dispatch(
+        &db,
+        &cancelled_task.id,
+        crate::workflow::default_roles::CODER,
+    )
+    .await
+    .expect("guard evaluates");
+    assert!(
+        cancelled_blocked,
+        "a cancelled coder execution with no explicit retry must still gate re-dispatch"
+    );
+
+    let failed_task = seed_task(&db, &project_id, "failed coder", "merge_failed", 0).await;
+    assign_role(
+        &db,
+        &failed_task.id,
+        crate::workflow::default_roles::CODER,
+        &agent_id,
+    )
+    .await;
+    let now = now_rfc3339();
+    ExecutionRepo::create(
+        &*db,
+        db::CreateExecution {
+            id: new_uuid_v4(),
+            task_id: failed_task.id.clone(),
+            agent_id: Some(agent_id.clone()),
+            role: crate::workflow::default_roles::CODER.to_owned(),
+            status: ExecutionStatus::Failed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: Some(now.clone()),
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: Some("intentional failure".to_owned()),
+            executor_config_snapshot_json: Some(
+                r#"{"executor_type":"shell","config":{}}"#.to_owned(),
+            ),
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("failed execution creates");
+
+    let failed_blocked = super::helpers::latest_stopped_execution_blocks_dispatch(
+        &db,
+        &failed_task.id,
+        crate::workflow::default_roles::CODER,
+    )
+    .await
+    .expect("guard evaluates");
+    assert!(
+        failed_blocked,
+        "a failed coder execution with no explicit retry must still gate re-dispatch"
+    );
+}
+
+#[tokio::test]
 async fn dispatcher_respects_priority_ordering() {
     let db = Arc::new(sqlite_db().await);
     let repo_dir = TempDir::new().expect("repo dir creates");

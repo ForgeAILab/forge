@@ -438,7 +438,7 @@ export function AgentAssigneeDropdown({
               ) : (
                 filtered.map((agent) => {
                   const selected = agent.id === selectedAgentId
-                  const activeTasks = agent.active_task_count ?? 0
+                  const runningExecutions = agent.running_execution_count ?? 0
                   return (
                     <button
                       key={agent.id}
@@ -463,7 +463,7 @@ export function AgentAssigneeDropdown({
                           />
                           {agent.status}
                           <span aria-hidden="true">/</span>
-                          {activeTasks}/{agent.max_concurrent_tasks}
+                          {runningExecutions}/{agent.max_concurrent_tasks}
                         </span>
                       </span>
                       {selected ? <Check size={14} className="shrink-0 text-primary" /> : null}

@@ -200,6 +200,20 @@ impl TaskService {
                 super::execution::clear_execution_retry_metadata(&self.db, &task).await?;
             }
         }
+        if previous_status != task.status
+            && workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal)
+            && workflow.cancellation_state.as_deref() != Some(task.status.as_str())
+        {
+            // The success-path mirror of the cancellation projection above:
+            // a Task that just completed (reached a terminal, non-cancelled
+            // state) may be the prerequisite other Tasks are waiting on.
+            // Wake them so a stale dependency-gate dispatch disposition
+            // (keyed on the *dependent's* own version, which this commit
+            // never touches) does not strand them forever. See F6.
+            if let Err(error) = self.wake_dependents_of_completed_task(&task).await {
+                tracing::warn!(task_id = %task.id, %error, "failed to wake dependents of completed task");
+            }
+        }
         self.reconcile_terminal_subtask(&task).await;
 
         Ok(TransitionResult {
@@ -321,6 +335,26 @@ impl TaskService {
             if latest_review
                 .as_ref()
                 .is_some_and(|review| review.status == ReviewStatus::AwaitingHuman)
+            {
+                return Ok(true);
+            }
+            // A *failed* review parked in `review` is also waiting on a
+            // person, and nothing said so. The dispatcher cannot re-dispatch
+            // a reviewer while the latest review is `Failed`
+            // (`reviewer_dispatch_ready` requires a `Running` review), so the
+            // Task sits reporting "Waiting for reviewer dispatch" at `info`
+            // severity with `awaiting_human: false` while only a human
+            // `retry_hook` can move it.
+            if latest_review
+                .as_ref()
+                .is_some_and(|review| review.status == ReviewStatus::Failed)
+                && sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM execution WHERE task_id = ? AND status = 'running'",
+                )
+                .bind(&task.id)
+                .fetch_one(self.db.pool())
+                .await?
+                    == 0
             {
                 return Ok(true);
             }
@@ -634,6 +668,15 @@ impl TaskService {
             )
             .await?;
         let task = clear_manual_advance_error_annotation(&self.db, &task, result.task).await?;
+        if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal)
+            && workflow.cancellation_state.as_deref() != Some(task.status.as_str())
+        {
+            // Manual advance bypasses `transition()` entirely, so it needs
+            // its own success-path wake, mirroring the one added above.
+            if let Err(error) = self.wake_dependents_of_completed_task(&task).await {
+                tracing::warn!(task_id = %task.id, %error, "failed to wake dependents of completed task");
+            }
+        }
         self.reconcile_terminal_subtask(&task).await;
         Ok(task)
     }
@@ -935,6 +978,15 @@ pub(super) fn should_clear_transient_error_annotation(task: &Task) -> bool {
     if task.status.as_str() == default_states::MERGE_FAILED {
         return false;
     }
+    // A blocked Task has not moved on, and its annotation is the only thing
+    // carrying the blocking reason and the recovery actions a client can
+    // offer. Clearing it here is what left a Task blocked in `merging` with
+    // `blocking_reason: ""` and `recovery_actions: []` — visibly stuck with
+    // no documented way out. The annotation is cleared with the block itself
+    // (see `clear_retry_exhausted_blocking_metadata`).
+    if task.blocked_json.is_some() {
+        return false;
+    }
 
     task.error_annotation
         .as_deref()
@@ -1019,5 +1071,57 @@ mod tests {
         });
 
         assert!(is_transient_error_annotation(&target_dirty.to_string()));
+    }
+
+    #[test]
+    fn blocked_task_keeps_its_transient_annotation() {
+        // The annotation is the only carrier of `blocking_reason` and
+        // `recovery_actions`. Clearing it while the Task is still blocked left
+        // a Task stuck in `merging` advertising no way out at all.
+        let now = db::now_rfc3339();
+        let mut task = Task {
+            id: "task".into(),
+            project_id: "project".into(),
+            parent_task_id: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "contended".into(),
+            description: None,
+            task_type: "task".into(),
+            status: default_states::MERGING.into(),
+            is_automation: false,
+            priority: 0,
+            board_position: 0.0,
+            subtask_order: None,
+            task_state_config: None,
+            merge_config: None,
+            metadata_json: None,
+            plan: None,
+            error_annotation: Some(
+                serde_json::json!({"type": "merge_fix_budget_exhausted"}).to_string(),
+            ),
+            blocked_json: None,
+            failed_json: None,
+            entry_barrier_json: None,
+            review_passed_at: None,
+            archived_at: None,
+            deleted_at: None,
+            version: 1,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+
+        task.blocked_json = None;
+        assert!(
+            should_clear_transient_error_annotation(&task),
+            "an unblocked Task moving on still drops a stale transient annotation"
+        );
+
+        task.blocked_json =
+            Some(serde_json::json!({"kind": "merge_fix_budget_exhausted"}).to_string());
+        assert!(
+            !should_clear_transient_error_annotation(&task),
+            "a blocked Task must keep the annotation explaining the block"
+        );
     }
 }

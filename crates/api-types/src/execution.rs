@@ -150,7 +150,10 @@ pub struct AgentResponse {
     pub daemon_id: Option<String>,
     pub max_concurrent_tasks: i64,
     pub status: AgentStatus,
-    pub active_task_count: Option<i64>,
+    /// Assigned workload; see `Agent::active_assigned_task_count`.
+    pub active_assigned_task_count: Option<i64>,
+    /// Live concurrency; this is what `max_concurrent_tasks` gates.
+    pub running_execution_count: Option<i64>,
     pub effective_status: Option<String>,
     pub avg_duration_ms: Option<i64>,
     pub success_rate: Option<f64>,

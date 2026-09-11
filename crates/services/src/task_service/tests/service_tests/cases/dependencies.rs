@@ -192,6 +192,112 @@ async fn test_done_transition_emits_dependency_satisfied_event() {
 }
 
 #[tokio::test]
+async fn done_prerequisite_wakes_dependent_with_stale_dispatch_disposition() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus));
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    crate::test_support::clear_project_execution_role_defaults(&db, &project_id).await;
+
+    let prerequisite = service
+        .create_task(
+            project_id.clone(),
+            "Implement prerequisite",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("prerequisite task creates");
+    let dependent = service
+        .create_task(
+            project_id,
+            "Implement dependent",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("dependent task creates");
+    service
+        .add_task_dependency(&dependent.id, &prerequisite.id)
+        .await
+        .expect("dependency creates");
+
+    // Simulate exactly what the dispatcher persists on the *dependent* Task
+    // after the dependency gate refuses a dispatch attempt
+    // (`record_dispatch_disposition` in `task_dispatcher::initial_scheduling`):
+    // a disposition keyed on the dependent's own, unchanged version.
+    let dependent_before = TaskRepo::get_by_id(&*db, &dependent.id, false)
+        .await
+        .expect("dependent reloads")
+        .expect("dependent exists");
+    crate::deferred_dispatch::record_dispatch_disposition(
+        &db,
+        &dependent_before,
+        "coder",
+        "guard rejected: dependency_gate: task has 1 unsatisfied dependency",
+    )
+    .await
+    .expect("dispatch disposition records");
+    // `record_dispatch_disposition` persists through `set_metadata_json`; it
+    // does not mutate the snapshot passed to it, so re-read before asserting.
+    let dependent_parked = TaskRepo::get_by_id(&*db, &dependent.id, false)
+        .await
+        .expect("dependent reloads")
+        .expect("dependent exists");
+    assert!(
+        crate::deferred_dispatch::dispatch_disposition_for_test(&dependent_parked).is_some(),
+        "the dispatcher's dependency-gate refusal must be persisted before the prerequisite completes"
+    );
+
+    // Drive the prerequisite all the way through to `done`.
+    let claimed = service
+        .claim_task(prerequisite.id.clone(), Assignee::Agent(agent_id), None)
+        .await
+        .expect("prerequisite claims");
+    let review = service
+        .transition(
+            claimed.task.id.clone(),
+            "review".to_owned(),
+            claimed.task.version,
+        )
+        .await
+        .expect("prerequisite enters review");
+    assert_eq!(review.task.status, "merging");
+    let done = service
+        .transition(review.task.id, "done".to_owned(), review.task.version)
+        .await
+        .expect("prerequisite completes");
+    assert_eq!(done.task.status, "done");
+
+    // The dependent's own version never changed, so before the fix its
+    // stale disposition would make `dispatch_disposition_is_current` return
+    // true forever and the dispatcher would skip it on every scan (F6).
+    let dependent_after = TaskRepo::get_by_id(&*db, &dependent.id, false)
+        .await
+        .expect("dependent reloads")
+        .expect("dependent exists");
+    assert_eq!(
+        dependent_after.version, dependent_before.version,
+        "the dependent's own version is not expected to change"
+    );
+    assert!(
+        crate::deferred_dispatch::dispatch_disposition_for_test(&dependent_after).is_none(),
+        "completing the prerequisite must wake the dependent's stale dispatch disposition"
+    );
+}
+
+#[tokio::test]
 async fn test_unsatisfied_dependency_blocks_agent_work_but_not_user_managed_moves() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));

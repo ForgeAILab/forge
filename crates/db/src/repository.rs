@@ -96,7 +96,14 @@ pub trait AgentRepo: Send + Sync {
         now: String,
     ) -> Result<Agent>;
     async fn archive(&self, id: &str, archived_at: &str) -> Result<()>;
-    async fn count_active_tasks(&self, agent_id: &str) -> Result<i64>;
+    /// Tasks assigned to this identity that sit in an active or gate workflow
+    /// state, plus its in-flight chat turns. This is assigned workload, not
+    /// live concurrency, and is deliberately *not* what
+    /// `max_concurrent_tasks` gates — see [`Self::count_running_executions`].
+    async fn count_active_assigned_tasks(&self, agent_id: &str) -> Result<i64>;
+    /// Executions currently running for this identity. This is the quantity
+    /// `max_concurrent_tasks` bounds, and the one a capacity ratio should use.
+    async fn count_running_executions(&self, agent_id: &str) -> Result<i64>;
 }
 
 #[async_trait]

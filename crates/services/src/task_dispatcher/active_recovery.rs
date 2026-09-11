@@ -69,15 +69,7 @@ impl TaskDispatcher {
                 && (crate::task_service::coordination_review_pending(&task)
                     || needs_recovery_advance)
             {
-                match self.task_service.advance_coordination_root(&task.id).await {
-                    Ok(()) => dispatched += 1,
-                    Err(ServiceError::Db(DbError::VersionConflict)) => {
-                        tracing::debug!(task_id = %task.id, "coordination-root review advance lost version race");
-                    }
-                    Err(error) => {
-                        tracing::warn!(task_id = %task.id, %error, "coordination-root aggregate review advance remains pending");
-                    }
-                }
+                dispatched += self.advance_coordination_root_once(&task).await?;
                 continue;
             }
             if deferred_dispatch::dispatch_disposition_is_current(&task, &task.status) {
@@ -327,7 +319,7 @@ impl TaskDispatcher {
         if execution.status == ExecutionStatus::Running {
             return Ok(false);
         }
-        if !helpers::latest_stopped_execution_blocks_dispatch(
+        if !helpers::latest_execution_awaits_completion_cascade(
             &self.db,
             task_id,
             crate::workflow::default_roles::REVIEWER,

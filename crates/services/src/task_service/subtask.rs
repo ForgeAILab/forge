@@ -166,6 +166,20 @@ pub(crate) fn coordination_review_pending(task: &Task) -> bool {
         .unwrap_or(false)
 }
 
+/// Mark a coordination root for another aggregate-review pass after a
+/// mechanical repository update, such as a clean rebase onto a moved target.
+/// Standalone Tasks and children keep their ordinary recovery path.
+pub(crate) async fn mark_coordination_review_pending_if_root(
+    db: &SqliteDb,
+    task: &Task,
+) -> Result<bool> {
+    if !coordination_root_has_subtasks(db, task).await? {
+        return Ok(false);
+    }
+    update_coordination_review_pending(db, &task.id, true).await?;
+    Ok(true)
+}
+
 impl TaskService {
     pub(crate) async fn reconcile_terminal_subtask(&self, task: &Task) {
         if task.parent_task_id.is_none() {
@@ -407,33 +421,31 @@ impl TaskService {
         parent_task_id: &str,
         pending: bool,
     ) -> Result<()> {
-        let parent = TaskRepo::get_by_id(&*self.db, parent_task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", parent_task_id.to_owned()))?;
-        let mut metadata =
-            TaskMetadata::parse(parent.metadata_json.as_deref()).map_err(|error| {
-                ServiceError::invalid_operation(format!(
-                    "invalid task metadata for {}: {error}",
-                    parent.id
-                ))
-            })?;
-        if pending {
-            metadata.extra.insert(
-                COORDINATION_REVIEW_PENDING_KEY.to_owned(),
-                Value::Bool(true),
-            );
-        } else {
-            metadata.extra.remove(COORDINATION_REVIEW_PENDING_KEY);
-        }
-        TaskRepo::set_metadata_json(
-            &*self.db,
-            parent_task_id,
-            metadata.to_json(),
-            &now_rfc3339(),
-        )
-        .await?;
-        Ok(())
+        update_coordination_review_pending(&self.db, parent_task_id, pending).await
     }
+}
+
+async fn update_coordination_review_pending(
+    db: &SqliteDb,
+    parent_task_id: &str,
+    pending: bool,
+) -> Result<()> {
+    let parent = TaskRepo::get_by_id(db, parent_task_id, false)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("task", parent_task_id.to_owned()))?;
+    let mut metadata = TaskMetadata::parse(parent.metadata_json.as_deref()).map_err(|error| {
+        ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", parent.id))
+    })?;
+    if pending {
+        metadata.extra.insert(
+            COORDINATION_REVIEW_PENDING_KEY.to_owned(),
+            Value::Bool(true),
+        );
+    } else {
+        metadata.extra.remove(COORDINATION_REVIEW_PENDING_KEY);
+    }
+    TaskRepo::set_metadata_json(db, parent_task_id, metadata.to_json(), &now_rfc3339()).await?;
+    Ok(())
 }
 
 fn ensure_coordination_root_unblocked(parent: &Task) -> Result<()> {

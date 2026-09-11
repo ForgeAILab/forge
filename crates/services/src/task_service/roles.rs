@@ -529,9 +529,24 @@ impl TaskService {
             .transpose()?;
 
         if same_assignment(previous.as_ref(), Some(&input)) {
-            let assignment = previous
+            // Confirming the already-assigned agent is still an explicit
+            // recovery decision (see `latest_stopped_execution_blocks_dispatch`
+            // in `task_dispatcher::helpers`): its whole purpose is to refresh
+            // `updated_at` so that timestamp can authorize one fresh dispatch
+            // attempt past a gated Execution. Returning the stale row here
+            // silently broke that escape hatch, so this must be a real write.
+            let mut assignment = previous
                 .clone()
                 .expect("same assignment requires an existing assignment");
+            sqlx::query(
+                "UPDATE task_role_assignment SET updated_at = ? WHERE task_id = ? AND role_name = ?",
+            )
+            .bind(&input.updated_at)
+            .bind(&input.task_id)
+            .bind(&input.role_name)
+            .execute(&mut *transaction)
+            .await?;
+            assignment.updated_at = input.updated_at;
             transaction.commit().await?;
             return Ok((previous, assignment, false));
         }

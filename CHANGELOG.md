@@ -43,6 +43,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   on Unix, while published release archives cover Linux and macOS.
 ### Breaking
 
+- Agent responses rename `active_task_count` to `active_assigned_task_count`
+  and add `running_execution_count`. The old name described neither of the two
+  things callers wanted: it counts Tasks assigned to the identity that sit in
+  an active or gate workflow state, which is assigned workload and is not
+  bounded by `max_concurrent_tasks`. Publishing it beside the cap made an idle
+  Agent read as over capacity — the Agent picker and Daemons page rendered
+  values like `10/4`. `running_execution_count` is the quantity the cap
+  actually gates; both UI surfaces now use it for the ratio. Scheduling was
+  never affected. Clients reading the old field must move to whichever of the
+  two they meant; there is no compatibility alias.
+
+
 - Tasks no longer store or expose `repo_id`. Repository selection is owned by
   the Project's current `primary_repo_id`, so Tasks accepted before repository
   setup become dispatchable after a valid same-Project Repo is attached without
@@ -77,6 +89,71 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Losing an ordinary merge race no longer blocks a Task. When another Task
+  merged first, Forge treated the moved integration target as a merge failure,
+  spent the Task's single merge-fix retry on it, and blocked the Task outright
+  on the second occurrence with no recovery actions offered — a failure mode
+  that got worse the more Workers were running. A moved target is now a
+  distinct outcome: Forge rebases the worktree onto the new target itself
+  instead of spending an agent turn on `git rebase`, sends the Task back for a
+  fresh review of the rebased commit, and does not charge the merge-fix
+  budget. Rebase conflicts still need the Worker and still count. Repeated
+  contention is bounded separately, and a Task blocked on an exhausted merge
+  budget now carries a real blocking reason and usable recovery actions. For a
+  coordination root, a clean rebase queues another aggregate review instead of
+  trying to dispatch the root as a merge-fix Worker.
+- `reset_retry_window` and `proceed_once` work again on a Task a gate has
+  already rejected. Both resolved the retry budget only from the Task's
+  current state, but a failed review moves the Task to `in_progress` and a
+  failed merge moves it to `merge_failed` — so both were rejected with "state
+  … is not a retry-budget gate" in exactly the window where the Task's own
+  recovery actions advertise them. They now resolve the originating gate
+  through its reject target.
+- A coordination root that cannot enter aggregate review no longer retries and
+  re-logs the identical warning on every scheduler scan. It is parked like any
+  other deterministic blocker and reconsidered when the Task changes or is
+  explicitly woken.
+- Deleting a repository no longer deletes its Workspaces. Tasks already
+  survived, but `workspace.repo_id` still cascaded, so the per-execution
+  repository pin, branch name, and worktree path the changelog promised to
+  retain were destroyed. A Workspace now keeps the historical repository id as
+  provenance after the Repo row is gone, and deleting a Repo still succeeds.
+- Review CI steps now record when each step started and finished. The
+  `started_at`/`finished_at` fields on review step results were published but
+  never populated, so there was no per-step duration to diagnose a slow check.
+- A Task on a Project with no repository now says so. It previously sat in
+  `todo` reporting `Idle` with no blocker and an enabled Start action that
+  could not succeed, because the Task blocker projection was skipped entirely
+  for Projects that are not Charter-backed. A missing repository is reported
+  either way; read-only discovery work is still allowed to proceed.
+- A Task parked on a failed review now reports that it is waiting on a person.
+  No reviewer can be dispatched while the latest review has failed, so the
+  Task could only move via an explicit retry, yet it reported itself as
+  ordinary in-progress work needing no attention.
+
+- A Task that failed to merge (`merge_failed`) could get permanently stuck
+  with no execution, no log line, and no annotation, even though its Worker
+  was idle. The dispatcher's re-dispatch guard treated any non-`Running`
+  execution as requiring an explicit retry, including the normal, successful
+  coder run that preceded review and merge, so the guard blocked forever.
+  Only a genuinely failed or cancelled execution now gates re-dispatch; a
+  completed one never does. Separately, confirming the agent a role already
+  has (`forge_assign_agent` with the same agent) is the documented recovery
+  path past that gate, but it was a silent no-op that never advanced the
+  assignment's timestamp; it now always records a fresh, real confirmation.
+- A Task that depends on another Task could get permanently stuck in
+  `todo`/`ready` even after its prerequisite finished. The dispatcher's
+  cached "blocked by dependency" refusal was keyed on the dependent Task's
+  own version, which the prerequisite's completion never touches, so the
+  dependent was silently skipped on every future scheduling scan. Completing
+  a prerequisite now wakes every Task waiting on it, clearing that stale
+  refusal so it is reconsidered on the next scan.
+- The independent code reviewer now diffs a Task against the commit its
+  branch actually forked from, instead of the target branch's current tip.
+  Previously, any file merged into the target branch after the Task's
+  worktree was created showed up in the reviewed diff as a deletion the
+  worker never made, so the reviewer could fail a correct delivery as a
+  regression.
 - Harden JWT signing-secret handling: the secret file and every component of
   its parent path must be a real directory or regular file, never a symlink
   (macOS `/var`, `/tmp`, and `/etc` aliases excepted), the file must be

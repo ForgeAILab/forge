@@ -493,6 +493,27 @@ pub async fn git_read(path: &Path, args: &[&str]) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|e| e.to_string())
 }
 
+/// Like `git_read`, but a nonzero exit (no common ancestor, unknown ref, ...)
+/// resolves to `Ok(None)` instead of an error. Mirrors
+/// `crates/services/src/diff.rs::try_run_git` so callers can attempt a
+/// `merge-base` lookup and fall back cleanly when it does not apply.
+async fn try_git_read(path: &Path, args: &[&str]) -> Result<Option<String>, String> {
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(path)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE");
+    let output = bounded_output(&mut command, 30, MAX_EVIDENCE_BYTES).await?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    String::from_utf8(output.stdout)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
 pub fn effective_review_config(source: &Value) -> Value {
     let state = source
         .pointer("/workflow/states")
@@ -552,6 +573,22 @@ pub fn task_scope_is_read_only(source: &Value) -> bool {
     )
 }
 
+/// Resolve the review base commit: the point the reviewed branch actually
+/// forked from, not the target branch's current tip. If the reviewer is
+/// handed the tip instead, every file merged into the target branch after
+/// the task's worktree was created shows up in the reviewed diff as a
+/// deletion the worker never made, and the reviewer fails conformance on a
+/// phantom regression.
+///
+/// Precedence mirrors `crates/services/src/diff.rs::workspace_diff_inner`:
+/// 1. `git merge-base <target_branch> HEAD` — the true fork point.
+/// 2. (diff.rs also falls back to the workspace's recorded `before_sha` here.
+///    `ReviewGoverningContext` does not carry that value today — the
+///    `review_source` query and struct would both need a new field to plumb
+///    it through — so that middle step is intentionally not implemented; see
+///    the fix report for what that would take.)
+/// 3. The previous behavior: the named branch's current tip, or `HEAD` when
+///    no branch is known.
 async fn review_base(path: &Path, context: &ReviewGoverningContext) -> Result<String, String> {
     let config: Value = context.task_scope["merge_config"]
         .as_str()
@@ -562,17 +599,23 @@ async fn review_base(path: &Path, context: &ReviewGoverningContext) -> Result<St
     let branch = config["target_branch"]
         .as_str()
         .or_else(|| context.task_scope["default_branch"].as_str());
-    match branch {
-        Some(branch) => git_read(
-            path,
-            &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
-        )
-        .await
-        .map(|s| s.trim().to_owned()),
-        None => git_read(path, &["rev-parse", "HEAD"])
+    let Some(branch) = branch else {
+        return git_read(path, &["rev-parse", "HEAD"])
             .await
-            .map(|s| s.trim().to_owned()),
+            .map(|s| s.trim().to_owned());
+    };
+    if let Some(merge_base) = try_git_read(path, &["merge-base", branch, "HEAD"]).await? {
+        let merge_base = merge_base.trim();
+        if !merge_base.is_empty() {
+            return Ok(merge_base.to_owned());
+        }
     }
+    git_read(
+        path,
+        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+    )
+    .await
+    .map(|s| s.trim().to_owned())
 }
 
 pub async fn admit(
@@ -1538,5 +1581,55 @@ mod tests {
         )
         .await
         .is_ok());
+    }
+
+    #[tokio::test]
+    async fn review_base_resolves_the_fork_point_not_the_target_branch_tip() {
+        // Reproduces finding F2: once the target branch moves past the point
+        // the task's worktree forked from, every file it picked up in the
+        // meantime must not show up in the reviewed diff as a phantom
+        // deletion the worker never made.
+        let origin = tempfile::tempdir().unwrap();
+        let repo_path = origin.path();
+        git::init(repo_path).await.unwrap();
+        tokio::fs::write(repo_path.join("README.md"), "root\n")
+            .await
+            .unwrap();
+        let fork_point = git::commit_all(repo_path, "initial commit").await.unwrap();
+
+        let worktree_dir = tempfile::tempdir().unwrap();
+        let worktree_path = worktree_dir.path().join("task-worktree");
+        git::create_worktree(repo_path, "task/branch", &worktree_path)
+            .await
+            .unwrap();
+
+        // The worker does their change on the task branch, forked at `fork_point`.
+        tokio::fs::write(worktree_path.join("feature.txt"), "worker change\n")
+            .await
+            .unwrap();
+        git::commit_all(&worktree_path, "worker change")
+            .await
+            .unwrap();
+
+        // Meanwhile something else merges into main, moving its tip past the
+        // point the task branch forked from.
+        tokio::fs::write(repo_path.join("unrelated.txt"), "later main progress\n")
+            .await
+            .unwrap();
+        let main_tip = git::commit_all(repo_path, "unrelated main progress")
+            .await
+            .unwrap();
+        assert_ne!(main_tip, fork_point);
+
+        let mut s = source();
+        s["task_scope"]["default_branch"] = json!("main");
+        let context = context_from_source(&s).unwrap();
+
+        let base = review_base(&worktree_path, &context).await.unwrap();
+        assert_eq!(
+            base, fork_point,
+            "review base must be the branch's true fork point, not the target branch's current tip"
+        );
+        assert_ne!(base, main_tip);
     }
 }

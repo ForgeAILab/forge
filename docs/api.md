@@ -154,6 +154,15 @@ database for historical provenance.
 | POST   | `/api/v1/agents/{id}/resume` | Re-enable one paused Agent |
 | DELETE | `/api/v1/agents/{id}` | Archive an owned agent identity |
 | GET    | `/api/v1/agents/{id}/discovered-options` | Get adapter model, reasoning, permission, and daemon options for an agent |
+
+Agent responses report two different counts, and only one of them is a capacity
+ratio:
+
+| Field | Meaning |
+| --- | --- |
+| `active_assigned_task_count` | Tasks assigned to this identity that sit in an active or gate workflow state, plus its in-flight chat turns. This is assigned workload. It is **not** bounded by `max_concurrent_tasks` and routinely exceeds it. |
+| `running_execution_count` | Executions currently running for this identity. This is the quantity `max_concurrent_tasks` gates, and the one to pair with it when rendering `n/cap`. |
+
 | GET    | `/api/v1/executor-types/{type}/discovered-options` | Get adapter options before creating an agent |
 | POST   | `/api/v1/embedded-agents` | Create a direct (embedded-runtime) agent referencing an existing provider entry (`credential_id`); returns identity, profile, health, and initial account session |
 | GET    | `/api/v1/providers/catalog` | Return the authoritative provider capability catalog: methods, support levels, and the runtime-compatibility matrix per credential method |

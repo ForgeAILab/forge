@@ -2785,6 +2785,65 @@ async fn delete_lifecycle_foreign_keys_match_repository_operations() {
     assert_eq!(project.primary_repo_id, None);
 }
 
+/// Regression test for the F11 finding: `workspace.repo_id` used to carry
+/// `ON DELETE CASCADE` to `repo(id)` (V021), so deleting a Repo silently
+/// deleted every Workspace row for it -- destroying exactly the
+/// per-execution repository pin the Unreleased changelog promises Workspaces
+/// retain. V139 rebuilds `workspace` so `repo_id` survives as a plain
+/// historical column while the Repo delete itself keeps succeeding.
+#[tokio::test]
+async fn workspace_survives_repo_delete_with_repo_id_retained() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, _agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        None,
+        "todo".to_owned(),
+        "Workspace survives repo delete",
+    )
+    .await;
+    let now = now_rfc3339();
+    let workspace_id = new_uuid_v4();
+
+    WorkspaceRepo::create(
+        &db,
+        CreateWorkspace {
+            id: workspace_id.clone(),
+            task_id: task_id.clone(),
+            repo_id: repo_id.clone(),
+            worktree_path: "/tmp/forge-workspace-survives-repo-delete".to_owned(),
+            branch: workspace::task_branch_name(&task_id),
+            status: WorkspaceStatus::Ready,
+            before_sha: Some("f9bcd03".to_owned()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("workspace creates");
+
+    RepoRepo::delete(&db, &repo_id)
+        .await
+        .expect("repo delete succeeds without being blocked by its Workspaces");
+
+    let workspace = WorkspaceRepo::get_by_id(&db, &workspace_id)
+        .await
+        .expect("workspace lookup succeeds")
+        .expect("workspace row survives repository deletion");
+    assert_eq!(workspace.repo_id, repo_id);
+    assert_eq!(workspace.before_sha.as_deref(), Some("f9bcd03"));
+    assert_eq!(
+        workspace.worktree_path,
+        "/tmp/forge-workspace-survives-repo-delete"
+    );
+
+    let repo = RepoRepo::get_by_id(&db, &repo_id)
+        .await
+        .expect("repo lookup succeeds");
+    assert!(repo.is_none(), "repo row itself is gone");
+}
+
 #[tokio::test]
 async fn sqlite_repo_create_round_trips_local_path() {
     let db = sqlite_db().await;
@@ -5178,7 +5237,9 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
     assert!(claimed.execution.lease_expires_at.is_some());
     assert!(claimed.execution.hard_deadline_at.is_some());
     assert_eq!(
-        AgentRepo::count_active_tasks(&db, &agent_id).await.unwrap(),
+        AgentRepo::count_active_assigned_tasks(&db, &agent_id)
+            .await
+            .unwrap(),
         1
     );
 
@@ -5242,7 +5303,9 @@ async fn agent_active_task_count_uses_workflow_state_kinds() {
     .await;
 
     assert_eq!(
-        AgentRepo::count_active_tasks(&db, &agent_id).await.unwrap(),
+        AgentRepo::count_active_assigned_tasks(&db, &agent_id)
+            .await
+            .unwrap(),
         2
     );
 }

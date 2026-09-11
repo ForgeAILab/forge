@@ -170,10 +170,52 @@ fn review_ci_steps_finished(step_results_json: &str) -> bool {
         })
 }
 
+/// Whether the newest `role_name` execution for this Task should gate a
+/// fresh dispatch attempt.
+///
+/// Only a genuinely stopped attempt gates: `ExecutionStatus::Failed` or
+/// `ExecutionStatus::Cancelled` with a `resume_policy` of `None` or
+/// `Some(ResumePolicy::Manual)`. Every other combination is exempt:
+///
+/// - `ExecutionStatus::Running` — there is already a live attempt to wait on.
+/// - `ExecutionStatus::Completed` — a successful run is neither a failure nor
+///   a manual stop, so a Task that re-enters this role later (for example
+///   `merge_failed` re-dispatching `coder` after the prior attempt succeeded
+///   and was merged) must be free to run again immediately, not wedge behind
+///   the guard meant for failed/cancelled attempts.
+/// - `Failed`/`Cancelled` with `resume_policy: Some(ResumePolicy::Auto)` —
+///   the executor already opted this attempt into automatic retry.
 pub(super) async fn latest_stopped_execution_blocks_dispatch(
     db: &db::SqliteDb,
     task_id: &str,
     role_name: &str,
+) -> Result<bool> {
+    latest_execution_needs_explicit_decision(db, task_id, role_name, false).await
+}
+
+/// Whether the newest terminal `role_name` execution still needs the workflow
+/// to react to its completion.
+///
+/// This asks a *different* question from
+/// [`latest_stopped_execution_blocks_dispatch`], which answers "may the
+/// dispatcher start a fresh attempt" and deliberately exempts a `Completed`
+/// execution. Reconciliation has to include `Completed`: a reviewer execution
+/// that finished while its review row is still `Running` is exactly the case
+/// that needs its completion cascaded, and it is not a failure. Sharing one
+/// predicate for both silently disabled reviewer reconciliation.
+pub(super) async fn latest_execution_awaits_completion_cascade(
+    db: &db::SqliteDb,
+    task_id: &str,
+    role_name: &str,
+) -> Result<bool> {
+    latest_execution_needs_explicit_decision(db, task_id, role_name, true).await
+}
+
+async fn latest_execution_needs_explicit_decision(
+    db: &db::SqliteDb,
+    task_id: &str,
+    role_name: &str,
+    include_completed: bool,
 ) -> Result<bool> {
     let page = ExecutionRepo::list_by_task_and_role(
         db,
@@ -192,7 +234,15 @@ pub(super) async fn latest_stopped_execution_blocks_dispatch(
     let Some(execution) = page.items.into_iter().next() else {
         return Ok(false);
     };
-    if execution.status == ExecutionStatus::Running {
+    let terminal = matches!(
+        execution.status,
+        ExecutionStatus::Failed | ExecutionStatus::Cancelled
+    ) || (include_completed && execution.status == ExecutionStatus::Completed);
+    if !terminal {
+        // Running: a live attempt is already in flight. Completed: a
+        // successful attempt is not a failure or a manual stop, so it never
+        // requires an explicit *retry* decision — but it does still need its
+        // completion reconciled, which is why callers can opt it back in.
         return Ok(false);
     }
 

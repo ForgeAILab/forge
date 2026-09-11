@@ -1746,9 +1746,13 @@ child wakes the next ordered sibling. Once every child is `done` or
 gate; review and merge remain root-level operations, but they bind CI and
 integration to the latest relevant child implementation execution and the
 root-owned shared workspace. The root may receive a reviewer execution for
-that aggregate gate, but it never receives a root implementation execution. A
-failed or blocked child stops the sequence at that child so the Project Agent
-can inspect evidence, reassign it, or otherwise coordinate recovery.
+that aggregate gate, but it never receives a root implementation execution.
+If the integration target moves after aggregate review and Forge can rebase the
+shared worktree cleanly, it marks another aggregate review as pending and the
+scheduler returns the root there without dispatching a merge-fix Worker on the
+root. A conflicting rebase remains an explicit merge recovery instead. A failed
+or blocked child stops the sequence at that child so the Project Agent can
+inspect evidence, reassign it, or otherwise coordinate recovery.
 
 Child terminal/reassignment cleanup never owns the shared root workspace. A
 root cancellation terminalizes active child executions before scheduling root

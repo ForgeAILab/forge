@@ -228,7 +228,7 @@ async fn daemon_onboarding_shell_task_flow_end_to_end() {
 
     let agent_detail = poll_agent_active(&app, &agent_id).await;
     assert_eq!(agent_detail.effective_status.as_deref(), Some("active"));
-    assert_eq!(agent_detail.active_task_count, Some(0));
+    assert_eq!(agent_detail.active_assigned_task_count, Some(0));
 }
 
 async fn test_app_with_state() -> (Router, Arc<AppState>) {
@@ -340,15 +340,16 @@ async fn poll_agent_active(app: &Router, agent_id: &str) -> AgentResponse {
             StatusCode::OK,
         )
         .await;
-        if agent.effective_status.as_deref() == Some("active") && agent.active_task_count == Some(0)
+        if agent.effective_status.as_deref() == Some("active")
+            && agent.active_assigned_task_count == Some(0)
         {
             return agent;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "agent did not return active with zero tasks; last effective_status={:?} active_task_count={:?}",
+            "agent did not return active with zero tasks; last effective_status={:?} active_assigned_task_count={:?}",
             agent.effective_status,
-            agent.active_task_count
+            agent.active_assigned_task_count
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

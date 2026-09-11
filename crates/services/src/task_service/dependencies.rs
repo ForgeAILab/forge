@@ -196,6 +196,62 @@ impl TaskService {
         Ok(())
     }
 
+    /// Success-path mirror of [`Self::block_dependents_of_cancelled_task`]:
+    /// when a prerequisite Task reaches a terminal, non-cancelled state (i.e.
+    /// it completes normally), every dependent Task's stale dispatch
+    /// disposition and deferred-dispatch cooldown are cleared so the next
+    /// dispatcher scan reconsiders it instead of skipping it forever on a
+    /// disposition keyed to the dependent's own (unchanged) version.
+    ///
+    /// A failure waking one dependent is logged and does not stop the
+    /// others, and never fails the prerequisite's own transition — the
+    /// dependency gate re-checks on the next scan regardless, so a missed
+    /// wake here is a delay, not data loss.
+    pub(super) async fn wake_dependents_of_completed_task(&self, task: &Task) -> Result<()> {
+        for dependent_id in TaskDependencyRepo::list_dependents(&*self.db, &task.id).await? {
+            if let Err(error) = self
+                .wake_one_dependent_of_completed_task(task, &dependent_id)
+                .await
+            {
+                tracing::warn!(
+                    task_id = %dependent_id,
+                    dependency_id = %task.id,
+                    %error,
+                    "failed to wake dependent task after prerequisite completed"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn wake_one_dependent_of_completed_task(
+        &self,
+        task: &Task,
+        dependent_id: &str,
+    ) -> Result<()> {
+        let Some(dependent) = TaskRepo::get_by_id(&*self.db, dependent_id, false).await? else {
+            return Ok(());
+        };
+        let project = ProjectRepo::get_by_id(&*self.db, &dependent.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", dependent.project_id.clone()))?;
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &dependent,
+            &project.workflow_definition,
+            &Actor::system(api_types::SystemComponent::Workflow),
+        );
+        if workflow.state_kind(&dependent.status) == Some(api_types::StateKind::Terminal) {
+            // Already finished or cancelled; nothing to wake.
+            return Ok(());
+        }
+        crate::wake_task_dispatch(
+            &self.db,
+            &dependent.id,
+            &format!("dependency {} reached a terminal success state", task.id),
+        )
+        .await
+    }
+
     async fn clear_resolved_dependency_block(&self, task_id: &str) -> Result<()> {
         let Some(task) = TaskRepo::get_by_id(&*self.db, task_id, false).await? else {
             return Ok(());

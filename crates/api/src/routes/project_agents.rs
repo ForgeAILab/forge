@@ -28,7 +28,10 @@ pub async fn list_project_agents(
 
     let mut responses = Vec::with_capacity(agents.len());
     for agent in agents {
-        let active_task_count = AgentRepo::count_active_tasks(&*state.db, &agent.id).await?;
+        let active_assigned_task_count =
+            AgentRepo::count_active_assigned_tasks(&*state.db, &agent.id).await?;
+        let running_execution_count =
+            AgentRepo::count_running_executions(&*state.db, &agent.id).await?;
         let effective_status = compute_effective_status(&state.db, &agent)
             .await?
             .as_str()
@@ -38,7 +41,8 @@ pub async fn list_project_agents(
             services::usage_projection::usage_aggregate_for_agent(&state.db, &agent.id).await?;
         responses.push(agent_response(
             agent,
-            Some(active_task_count),
+            Some(active_assigned_task_count),
+            Some(running_execution_count),
             Some(effective_status),
             stats,
             usage,

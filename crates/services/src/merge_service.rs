@@ -24,6 +24,18 @@ pub enum MergeOutcome {
     ReviewRequired {
         reason: String,
     },
+    /// The integration target moved while this Task was being reviewed.
+    ///
+    /// Distinct from [`MergeOutcome::ReviewRequired`] because it is not a
+    /// fault: under any concurrency it is *guaranteed* whenever another Task
+    /// merges first. Treating it as a merge failure spent the Task's single
+    /// merge-fix retry on ordinary contention and blocked it dead on the
+    /// second occurrence. The caller rebases onto the new target and asks for
+    /// a fresh review instead of charging the budget.
+    TargetMoved {
+        reason: String,
+        target_branch: String,
+    },
     Done {
         before_sha: String,
         after_sha: String,
@@ -163,10 +175,23 @@ impl MergeService {
             .await
             .map_err(ServiceError::invalid_operation)?;
             let current_sha = git::get_current_sha(worktree_path).await?;
-            if contract.commit_sha != current_sha || contract.base_sha != target_sha.trim() {
+            // Two different situations used to share one outcome. The Task
+            // branch moving out from under its own review is a genuine
+            // problem; the integration target moving is ordinary contention
+            // that the caller can resolve mechanically by rebasing.
+            if contract.commit_sha != current_sha {
                 return Ok(MergeOutcome::ReviewRequired {
-                    reason: "reviewed commit or integration target changed; fresh review required"
-                        .into(),
+                    reason: "reviewed commit changed since review; fresh review required".into(),
+                });
+            }
+            if contract.base_sha != target_sha.trim() {
+                return Ok(MergeOutcome::TargetMoved {
+                    reason: format!(
+                        "{target_branch} advanced to {} since this Task was reviewed against {}",
+                        short_sha(target_sha.trim()),
+                        short_sha(&contract.base_sha)
+                    ),
+                    target_branch: target_branch.clone(),
                 });
             }
         }
@@ -178,7 +203,10 @@ impl MergeService {
             let result =
                 ::review::contract::git_read(repo_path, &["merge", "--ff-only", &sha]).await;
             if result.is_ok() && git::get_current_sha(repo_path).await? != sha {
-                return Ok(MergeOutcome::ReviewRequired { reason: "integration target changed during merge; reviewed content was not integrated".into() });
+                return Ok(MergeOutcome::TargetMoved {
+                    reason: "integration target changed during merge; reviewed content was not integrated".into(),
+                    target_branch: target_branch.clone(),
+                });
             }
             review_guard.release().await?;
             match result {
@@ -440,6 +468,10 @@ async fn read_conflict_paths(worktree_path: &Path) -> Vec<PathBuf> {
             Vec::new()
         }
     }
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
 }
 
 fn target_branch(merge_config: &Option<String>, repo_default_branch: &str) -> Result<String> {
@@ -840,6 +872,15 @@ mod tests {
             if changed == "none" {
                 assert!(matches!(outcome, MergeOutcome::Done { .. }), "{outcome:?}");
                 assert_eq!(git::get_current_sha(&repo).await.unwrap(), accepted_sha);
+            } else if changed == "target" {
+                // A moved integration target is contention, not a fault, and
+                // is reported separately so the caller can rebase instead of
+                // charging the Task's single merge-fix retry.
+                assert!(
+                    matches!(outcome, MergeOutcome::TargetMoved { .. }),
+                    "{changed}: {outcome:?}"
+                );
+                assert_eq!(git::get_current_sha(&repo).await.unwrap(), before);
             } else {
                 assert!(
                     matches!(outcome, MergeOutcome::ReviewRequired { .. }),

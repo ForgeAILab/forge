@@ -42,7 +42,13 @@ pub struct Agent {
     pub status: String,
     pub executor_type: String,
     pub daemon_id: Option<String>,
-    pub active_task_count: i32,
+    /// Tasks assigned to this identity that sit in an active or gate workflow
+    /// state. This is assigned workload, not live concurrency: it is not
+    /// bounded by `max_concurrent_tasks` and routinely exceeds it.
+    pub active_assigned_task_count: i32,
+    /// Executions currently running for this identity. This is the number
+    /// `max_concurrent_tasks` actually gates.
+    pub running_execution_count: i32,
     pub max_concurrent_tasks: i32,
 }
 

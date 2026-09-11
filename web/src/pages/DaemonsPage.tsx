@@ -718,7 +718,7 @@ function DaemonDetail({ daemon, agents }: { daemon: Daemon; agents: Agent[] }) {
                   />
                   <span className="font-medium">{agent.name}</span>
                   <span className="font-mono text-xs text-muted-foreground">
-                    {agent.active_task_count ?? 0}/{agent.max_concurrent_tasks}
+                    {agent.running_execution_count ?? 0}/{agent.max_concurrent_tasks}
                   </span>
                 </div>
               ))}

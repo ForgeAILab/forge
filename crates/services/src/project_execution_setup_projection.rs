@@ -778,7 +778,15 @@ pub async fn load_task_execution_blocker(
     let charter_backed = project.charter_status == "charter_backed"
         && !project.charter_setup_required
         && project.current_charter_revision_id.is_some();
-    if !charter_backed {
+    // Charter-specific blockers are only meaningful for a Charter-backed
+    // Project, but a *missing repository* blocks execution either way: there
+    // is nothing to check out, and `POST /tasks/{id}/launch` already refuses
+    // with `missing_primary_repo`. Returning early here left a Task on a
+    // Project with no repository reporting `workflow_health: idle`, no
+    // blocker, no annotation, and an enabled `manual_launch` action that
+    // cannot succeed. Fall through so the repository requirement is reported;
+    // the read-only exemption below still lets discovery work proceed.
+    if !charter_backed && project.primary_repo_id.is_some() {
         return Ok((evidence, None));
     }
 

@@ -772,18 +772,25 @@ impl TaskService {
             Some(&gate_state),
             Some(&transition_log.id),
         );
-        if gate_state == crate::workflow::default_states::REVIEW {
-            let latest_review = self.latest_review_for_task(&updated.id).await?;
-            if latest_review.status == ReviewStatus::Failed {
+        // `resume_process` exists to move a Task out of the gate it is parked
+        // in. When the gate has already rejected the Task into its reject
+        // target there is nothing left to move: clearing the exhausted-budget
+        // block is the whole recovery, and the version bump from that clear
+        // invalidates any dispatch disposition so the next scan reconsiders it.
+        if task.status == gate_state {
+            if gate_state == crate::workflow::default_states::REVIEW {
+                let latest_review = self.latest_review_for_task(&updated.id).await?;
+                if latest_review.status == ReviewStatus::Failed {
+                    return self
+                        .recover_resume_process(updated, Some(reason), None)
+                        .await;
+                }
+            }
+            if gate_state == crate::workflow::default_states::MERGING {
                 return self
                     .recover_resume_process(updated, Some(reason), None)
                     .await;
             }
-        }
-        if gate_state == crate::workflow::default_states::MERGING {
-            return self
-                .recover_resume_process(updated, Some(reason), None)
-                .await;
         }
         Ok(updated)
     }
@@ -831,7 +838,6 @@ impl TaskService {
                 "proceed_once is not supported for the current exception in state {gate_state}"
             )));
         }
-
         let transition_reason = match &context {
             Some(guidance) => format!("{reason}\n\nGuidance: {guidance}"),
             None => reason.clone(),
@@ -848,6 +854,32 @@ impl TaskService {
             &transition_reason,
         )
         .await?;
+        // The gate may already have rejected the Task into its active target
+        // by the time a user chooses this recovery. In that case there is no
+        // state transition left to perform: preserve the exhausted retry
+        // count, clear only its blocker, and wake the current active attempt.
+        // If that attempt fails review, the unchanged count blocks it again,
+        // which is the promised one-shot behavior.
+        if task.status != gate_state {
+            let updated = self.clear_retry_exhausted_blocking_metadata(&task).await?;
+            crate::wake_task_dispatch(
+                &self.db,
+                &updated.id,
+                "proceed_once cleared an exhausted gate blocker",
+            )
+            .await?;
+            let recovered = TaskRepo::get_by_id(&*self.db, &updated.id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", updated.id.clone()))?;
+            self.publish_recovery_applied(
+                &recovered,
+                "proceed_once",
+                Some(&gate_state),
+                Some(&transition_log.id),
+            );
+            return Ok(recovered);
+        }
+
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -1112,7 +1144,7 @@ impl TaskService {
             &project.workflow_definition,
             &api_types::Actor::user(api_types::UserActionSource::Api),
         );
-        let state = workflow
+        let current = workflow
             .states
             .iter()
             .find(|state| state.name == task.status)
@@ -1122,14 +1154,41 @@ impl TaskService {
                     &workflow,
                 ))
             })?;
-        if state.kind != api_types::StateKind::Gate {
-            return Err(ServiceError::conflict(format!(
-                "state {} is not a retry-budget gate",
-                task.status
-            )));
-        }
+        // A Task sitting *in* a gate is the easy case. A Task the gate has
+        // already rejected is the common one: `review` rejects into
+        // `in_progress` and `merging` into `merge_failed`, so by the time the
+        // retry-budget blocker is visible the Task has usually left the gate.
+        // Refusing to resolve a budget there made `reset_retry_window` and
+        // `proceed_once` return 409 in exactly the window where the Task's own
+        // `recovery_actions` advertise them, so resolve the originating gate
+        // through its `reject_target` as well.
+        let state = if current.kind == api_types::StateKind::Gate {
+            current
+        } else {
+            let mut origins = workflow.states.iter().filter(|state| {
+                state.kind == api_types::StateKind::Gate
+                    && state
+                        .gate_config
+                        .as_ref()
+                        .and_then(|gate_config| gate_config.reject_target.as_deref())
+                        == Some(task.status.as_str())
+            });
+            let Some(origin) = origins.next() else {
+                return Err(ServiceError::conflict(format!(
+                    "state {} is not a retry-budget gate and no gate rejects into it",
+                    task.status
+                )));
+            };
+            if let Some(also) = origins.next() {
+                return Err(ServiceError::conflict(format!(
+                    "state {} is the reject target of more than one gate ({} and {}); recover from the gate itself",
+                    task.status, origin.name, also.name
+                )));
+            }
+            origin
+        };
 
-        let budget = if task.status == crate::workflow::default_states::REVIEW {
+        let budget = if state.name == crate::workflow::default_states::REVIEW {
             crate::task_service::config::runtime_retry_budget(
                 task,
                 crate::task_service::config::RetryBudgetKind::Review,
@@ -1144,8 +1203,8 @@ impl TaskService {
                 .unwrap_or(i32::MAX)
         };
         let entries = TransitionLogRepo::list_by_task(&*self.db, &task.id).await?;
-        let count = gate_rejections_since_recovery_boundary(&entries, &task.status);
-        Ok((task.status.clone(), budget, count))
+        let count = gate_rejections_since_recovery_boundary(&entries, &state.name);
+        Ok((state.name.clone(), budget, count))
     }
 
     async fn clear_retry_exhausted_blocking_metadata(&self, task: &Task) -> Result<Task> {

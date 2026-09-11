@@ -602,7 +602,8 @@ pub fn task_role_assignment_response(assignment: TaskRoleAssignment) -> TaskRole
 
 pub fn agent_response(
     agent: Agent,
-    active_task_count: Option<i64>,
+    active_assigned_task_count: Option<i64>,
+    running_execution_count: Option<i64>,
     effective_status: Option<String>,
     stats: db::AgentExecutionStats,
     usage: UsageAggregate,
@@ -625,7 +626,8 @@ pub fn agent_response(
         daemon_id: agent.daemon_id,
         max_concurrent_tasks: agent.max_concurrent_tasks,
         status: agent_status_response(agent.status),
-        active_task_count,
+        active_assigned_task_count,
+        running_execution_count,
         effective_status,
         avg_duration_ms: stats.avg_duration_ms,
         success_rate: stats.success_rate,
