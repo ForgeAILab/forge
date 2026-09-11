@@ -1047,12 +1047,29 @@ pub(crate) fn orchestration_proposal_schema(operations: &BTreeSet<String>) -> Va
         let summary = orchestration_payload_summary(&orchestration_payload_schema(operation));
         guidance.push(format!("- {operation}: {summary}"));
     }
+    let payload =
+        if operations.len() == 1 && operations.contains(PROJECT_CHARTER_ADOPTION_OPERATION) {
+            let mut schema = orchestration_payload_schema(PROJECT_CHARTER_ADOPTION_OPERATION);
+            let operation_description = schema
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let description = if operation_description.is_empty() {
+                guidance.join("\n")
+            } else {
+                format!("{}\n\n{operation_description}", guidance.join("\n"))
+            };
+            schema["description"] = Value::String(description);
+            schema
+        } else {
+            json!({"type":"object","description":guidance.join("\n")})
+        };
     json!({
         "type":"object",
         "required":["operation","payload","dedupe_key","correlation_id"],
         "properties":{
             "operation":{"type":"string","enum":operations.iter().collect::<Vec<_>>()},
-            "payload":{"type":"object","description":guidance.join("\n")},
+            "payload":payload,
             "dedupe_key":{"type":"string","minLength":1},
             "correlation_id":{"type":"string","minLength":1},
             "causation_id":string_or_null_schema(),
@@ -1385,6 +1402,77 @@ mod tests {
         let properties = select["properties"].as_object().expect("properties");
         assert!(!properties.contains_key("charter_content"));
         assert!(!properties.contains_key("charter_prose"));
+    }
+
+    #[test]
+    fn singleton_adoption_proposal_exposes_nested_payload_contract() {
+        let operations = BTreeSet::from([PROJECT_CHARTER_ADOPTION_OPERATION.to_owned()]);
+        let schema = orchestration_proposal_schema(&operations);
+        let payload = &schema["properties"]["payload"];
+
+        assert_eq!(payload["additionalProperties"], false);
+        assert_eq!(payload["properties"]["action"]["const"], "draft_revision");
+        assert_eq!(payload["properties"]["content"]["type"], "object");
+        for required in [
+            "action",
+            "expected_charter_version",
+            "project_mode",
+            "maturity",
+            "content",
+            "provenance",
+        ] {
+            assert!(
+                payload["required"]
+                    .as_array()
+                    .expect("adoption payload required fields")
+                    .iter()
+                    .any(|value| value == required),
+                "adoption payload must expose required field {required}"
+            );
+        }
+        for required in [
+            "identity",
+            "problem_and_people",
+            "core_experience",
+            "scope",
+            "success",
+            "constraints_and_risks",
+            "knowledge_ledger",
+        ] {
+            assert!(
+                payload["properties"]["content"]["required"]
+                    .as_array()
+                    .expect("Charter content required fields")
+                    .iter()
+                    .any(|value| value == required),
+                "adoption payload content must expose required field {required}"
+            );
+        }
+        assert!(
+            payload["description"]
+                .as_str()
+                .expect("adoption payload description")
+                .contains("Payload shape by operation")
+        );
+    }
+
+    #[test]
+    fn multi_operation_proposal_keeps_provider_portable_payload_envelope() {
+        let operations = BTreeSet::from([
+            PROJECT_CHARTER_ADOPTION_OPERATION.to_owned(),
+            PROJECT_DOCUMENT_OPERATION.to_owned(),
+        ]);
+        let payload = orchestration_proposal_schema(&operations)["properties"]["payload"].clone();
+
+        assert_eq!(
+            payload,
+            json!({
+                "type": "object",
+                "description": payload["description"],
+            })
+        );
+        assert!(payload.get("properties").is_none());
+        assert!(payload.get("required").is_none());
     }
 
     #[test]

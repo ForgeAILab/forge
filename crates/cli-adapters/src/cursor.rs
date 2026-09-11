@@ -252,19 +252,23 @@ impl CodingExecutorAdapter for CursorAdapter {
             });
         }
 
-        let after_sha =
-            if let Ok(false) = git::is_worktree_clean(Path::new(&ctx.worktree_path)).await {
-                crate::commit::commit_execution_changes(&ctx)
+        let after_sha = if crate::commit::auto_commit_enabled(&ctx) {
+            let after_sha =
+                if let Ok(false) = git::is_worktree_clean(Path::new(&ctx.worktree_path)).await {
+                    crate::commit::commit_execution_changes(&ctx)
+                        .await
+                        .unwrap_or(None)
+                } else {
+                    None
+                };
+            match after_sha {
+                Some(sha) => Some(sha),
+                None => git::get_current_sha(Path::new(&ctx.worktree_path))
                     .await
-                    .unwrap_or(None)
-            } else {
-                None
-            };
-        let after_sha = match after_sha {
-            Some(sha) => Some(sha),
-            None => git::get_current_sha(Path::new(&ctx.worktree_path))
-                .await
-                .ok(),
+                    .ok(),
+            }
+        } else {
+            None
         };
 
         Ok(ExecutionResult {
@@ -558,7 +562,9 @@ fn detect_cursor_availability() -> AvailabilityInfo {
 
 fn cursor_status_authenticated() -> bool {
     let mut command = std::process::Command::new("cursor-agent");
-    command.arg("status");
+    // This availability probe runs from the embedded daemon while Solo owns
+    // the terminal. Do not let Cursor inspect or mutate the controlling PTY.
+    command.arg("status").stdin(Stdio::null());
     let Some(output) = command_output_timeout(command, Duration::from_secs(STATUS_TIMEOUT_SECONDS))
     else {
         return false;

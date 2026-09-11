@@ -5,6 +5,14 @@ use tokio::process::Command;
 const COMMIT_PREFIX: &str = "agent: ";
 const SUBJECT_TEXT_LIMIT: usize = 72;
 
+/// Chat snapshots disable Task finalization before entering a CLI adapter.
+pub(crate) fn auto_commit_enabled(ctx: &executors::ExecutionContext) -> bool {
+    ctx.agent_config
+        .get("auto_commit")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+}
+
 pub async fn commit_worktree_changes(
     worktree: &Path,
     message_subject: &str,
@@ -43,7 +51,7 @@ pub async fn commit_worktree_changes(
 pub async fn commit_execution_changes(
     ctx: &executors::ExecutionContext,
 ) -> Result<Option<String>, ExecutorError> {
-    if executors::is_worktree_read_only(&ctx.agent_config) {
+    if !auto_commit_enabled(ctx) || executors::is_worktree_read_only(&ctx.agent_config) {
         return Ok(None);
     }
     let subject = build_commit_subject(Some(&ctx.description), &ctx.task_id);
@@ -209,6 +217,23 @@ mod read_only_tests {
             .expect("git runs");
         assert!(output.status.success(), "git {args:?} failed");
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    #[tokio::test]
+    async fn chat_completion_does_not_require_a_git_repository() {
+        let sandbox = tempfile::tempdir().expect("chat sandbox");
+        let chat = context(sandbox.path(), serde_json::json!({"auto_commit": false}));
+        assert_eq!(
+            commit_execution_changes(&chat)
+                .await
+                .expect("chat skips Git"),
+            None
+        );
+        let task = context(sandbox.path(), serde_json::json!({}));
+        assert!(
+            commit_execution_changes(&task).await.is_err(),
+            "Task finalization still requires its worktree"
+        );
     }
 
     fn context(worktree: &Path, agent_config: serde_json::Value) -> executors::ExecutionContext {

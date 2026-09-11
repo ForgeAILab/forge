@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -119,6 +119,20 @@ pub struct InitializeCapabilities {
 
 pub type InitializeResponse = Value;
 
+/// A function exposed to Codex for a single chat thread.
+///
+/// The adapter keeps this type neutral so the host does not need to depend on
+/// Codex's tagged `DynamicToolSpec` enum. `ThreadStartParams` adds the
+/// protocol-required `type: "function"` discriminator when it serializes the
+/// list for `thread/start`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicToolSpec {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadStartParams {
@@ -134,12 +148,47 @@ pub struct ThreadStartParams {
     pub sandbox: Option<SandboxMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config: Option<HashMap<String, Value>>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_dynamic_tools"
+    )]
+    pub dynamic_tools: Option<Vec<DynamicToolSpec>>,
+    /// An empty list explicitly disables Codex environment access for this
+    /// thread. Omitting the field selects the default environment when
+    /// environment access is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environments: Option<Vec<Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub developer_instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<Value>,
+}
+
+fn serialize_dynamic_tools<S>(
+    tools: &Option<Vec<DynamicToolSpec>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let Some(tools) = tools else {
+        return serializer.serialize_none();
+    };
+
+    let wire_tools = tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "inputSchema": tool.input_schema,
+            })
+        })
+        .collect::<Vec<_>>();
+    wire_tools.serialize(serializer)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

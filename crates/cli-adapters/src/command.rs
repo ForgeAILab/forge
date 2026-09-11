@@ -1,6 +1,7 @@
 use executors::CommandOverrides;
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::process::Stdio;
 use tokio::process::Command;
 
 /// Builds a tokio Command from adapter defaults + user overrides.
@@ -88,6 +89,10 @@ impl CommandBuilder {
         for (k, v) in &env {
             cmd.env(k, v);
         }
+        // Adapter commands are non-interactive by contract.  Keep them away
+        // from the caller's controlling terminal; adapters that need a
+        // protocol stream explicitly replace this with piped stdin.
+        cmd.stdin(Stdio::null());
 
         cmd
     }

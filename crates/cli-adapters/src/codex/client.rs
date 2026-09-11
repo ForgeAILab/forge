@@ -3,14 +3,15 @@ use super::{
     normalize::{is_turn_completed, normalize_event},
     protocol::{
         ApprovalDecision, CancelTurnParams, CancelTurnResponse, CommandExecutionApprovalResponse,
-        DynamicToolCallOutputContentItem, DynamicToolCallResponse, FileChangeApprovalResponse,
-        InitializeCapabilities, InitializeParams, InitializeResponse, McpElicitationAction,
-        McpElicitationResponse, RequestId, ReviewStartParams, ReviewStartResponse, ReviewTarget,
-        ThreadForkParams, ThreadForkResponse, ThreadResumeParams, ThreadResumeResponse,
-        ThreadStartParams, ThreadStartResponse, TurnHandle, TurnStartParams, TurnStartResponse,
-        UserInput,
+        DynamicToolCallOutputContentItem, DynamicToolCallResponse, DynamicToolSpec,
+        FileChangeApprovalResponse, InitializeCapabilities, InitializeParams, InitializeResponse,
+        McpElicitationAction, McpElicitationResponse, RequestId, ReviewStartParams,
+        ReviewStartResponse, ReviewTarget, ThreadForkParams, ThreadForkResponse,
+        ThreadResumeParams, ThreadResumeResponse, ThreadStartParams, ThreadStartResponse,
+        TurnHandle, TurnStartParams, TurnStartResponse, UserInput,
     },
 };
+use async_trait::async_trait;
 use executors::{
     ExecutionOutcome, ExecutorError, LogKind, LogStream, LogWriter, UsageCounters, UsageReport,
 };
@@ -31,6 +32,19 @@ pub struct CodexClient {
     messages: mpsc::Receiver<ServerMessage>,
     worktree_path: PathBuf,
     cancel: CancellationToken,
+    chat_tools: Option<Arc<dyn ChatToolHandler>>,
+    suppress_next_response: bool,
+}
+
+/// Host-owned dynamic tools available to one Codex chat turn.
+///
+/// The adapter advertises only the specs returned by this handler and rejects
+/// every other `item/tool/call` request before invoking the host.
+#[async_trait]
+pub trait ChatToolHandler: Send + Sync {
+    fn specs(&self) -> Vec<DynamicToolSpec>;
+
+    async fn call(&self, name: &str, call_id: &str, arguments: Value) -> Result<Value, String>;
 }
 
 #[derive(Debug, Default)]
@@ -49,12 +63,24 @@ impl CodexClient {
         worktree_path: impl Into<PathBuf>,
         cancel: CancellationToken,
     ) -> Self {
+        Self::spawn_with_chat_tools(stdin, stdout, worktree_path, cancel, None)
+    }
+
+    pub fn spawn_with_chat_tools(
+        stdin: ChildStdin,
+        stdout: ChildStdout,
+        worktree_path: impl Into<PathBuf>,
+        cancel: CancellationToken,
+        chat_tools: Option<Arc<dyn ChatToolHandler>>,
+    ) -> Self {
         let (rpc, messages) = JsonRpcPeer::spawn(stdin, stdout, cancel.clone());
         Self {
             rpc,
             messages,
             worktree_path: normalize_path(worktree_path.into()),
             cancel,
+            chat_tools,
+            suppress_next_response: false,
         }
     }
 
@@ -78,6 +104,27 @@ impl CodexClient {
 
     pub async fn initialized(&self) -> Result<(), ExecutorError> {
         self.rpc.notify::<Value>("initialized", None).await
+    }
+
+    /// Read Codex's effective configuration for a working directory. Chat
+    /// turns use this only to discover inherited MCP server names so they can
+    /// disable each one in the thread-local config overlay.
+    pub async fn config_read(&mut self, cwd: impl Into<String>) -> Result<Value, ExecutorError> {
+        self.suppress_next_response = true;
+        let response = self
+            .rpc
+            .request(
+                "config/read",
+                json!({
+                    "cwd": cwd.into(),
+                    "includeLayers": false,
+                }),
+            )
+            .await;
+        if response.is_err() {
+            self.suppress_next_response = false;
+        }
+        response
     }
 
     pub async fn thread_start(
@@ -202,7 +249,7 @@ impl CodexClient {
     }
 
     async fn handle_server_message(
-        &self,
+        &mut self,
         message: ServerMessage,
         writer: &Arc<AsyncMutex<LogWriter>>,
         result: &mut TurnRunResult,
@@ -224,6 +271,10 @@ impl CodexClient {
                 Ok(completed)
             }
             ServerMessage::Response(raw) => {
+                if self.suppress_next_response {
+                    self.suppress_next_response = false;
+                    return Ok(false);
+                }
                 let diagnostic = set_error_if_present(&raw, result);
                 self.write_normalized(writer, raw, result).await?;
                 write_error_diagnostic(writer, diagnostic).await?;
@@ -302,17 +353,41 @@ impl CodexClient {
             }),
         )
         .await?;
-        self.rpc
-            .respond(
-                id,
-                DynamicToolCallResponse {
-                    content_items: vec![DynamicToolCallOutputContentItem::InputText {
-                        text: "tool not supported by forge adapter".to_owned(),
-                    }],
-                    success: false,
-                },
-            )
-            .await
+
+        let response = match dispatch_chat_tool_response(self.chat_tools.as_deref(), &params).await
+        {
+            Ok(response) => response,
+            Err(message) => DynamicToolCallResponse {
+                content_items: vec![DynamicToolCallOutputContentItem::InputText { text: message }],
+                success: false,
+            },
+        };
+        let success = response.success;
+        let result_text = response
+            .content_items
+            .first()
+            .map(|item| match item {
+                DynamicToolCallOutputContentItem::InputText { text } => text.clone(),
+            })
+            .unwrap_or_default();
+        let result_value = serde_json::from_str::<Value>(&result_text)
+            .unwrap_or_else(|_| Value::String(result_text.clone()));
+
+        write_log(
+            writer,
+            LogKind::ToolResult,
+            json!({
+                "type": "dynamic_tool_result",
+                "tool": tool,
+                "call_id": call_id,
+                "success": success,
+                "text": result_text,
+                "result": result_value,
+            }),
+        )
+        .await?;
+
+        self.rpc.respond(id, response).await
     }
 
     async fn handle_mcp_elicitation_request(
@@ -321,7 +396,7 @@ impl CodexClient {
         params: Value,
         writer: &Arc<AsyncMutex<LogWriter>>,
     ) -> Result<(), ExecutorError> {
-        let allowed = mcp_tool_elicitation_allowed(&params);
+        let allowed = self.chat_tools.is_none() && mcp_tool_elicitation_allowed(&params);
         let response = if allowed {
             McpElicitationResponse {
                 action: McpElicitationAction::Accept,
@@ -358,7 +433,7 @@ impl CodexClient {
         writer: &Arc<AsyncMutex<LogWriter>>,
         kind: ApprovalRequestKind,
     ) -> Result<(), ExecutorError> {
-        let allowed = self.approval_allowed(&params);
+        let allowed = self.chat_tools.is_none() && self.approval_allowed(&params);
         let decision = if allowed {
             ApprovalDecision::Accept
         } else {
@@ -393,7 +468,11 @@ impl CodexClient {
                 LogKind::ToolResult,
                 json!({
                     "type": "approval_denied",
-                    "rationale": "requested path is outside the worktree",
+                    "rationale": if self.chat_tools.is_some() {
+                        "builtin command/file approvals are disabled for chat turns"
+                    } else {
+                        "requested path is outside the worktree"
+                    },
                     "params": params,
                 }),
             )
@@ -419,6 +498,48 @@ impl CodexClient {
             normalize_path(self.worktree_path.join(candidate))
         };
         absolute.starts_with(&self.worktree_path)
+    }
+}
+
+async fn dispatch_chat_tool_response(
+    handler: Option<&dyn ChatToolHandler>,
+    params: &Value,
+) -> Result<DynamicToolCallResponse, String> {
+    let Some(handler) = handler else {
+        return Err("tool not supported by forge adapter".to_owned());
+    };
+    let Some(tool) = string_field(params, &["tool", "name"]) else {
+        return Err("dynamic tool call is missing tool".to_owned());
+    };
+    let Some(call_id) = string_field(params, &["callId", "call_id", "id", "itemId", "item_id"])
+    else {
+        return Err("dynamic tool call is missing callId".to_owned());
+    };
+    if !handler.specs().iter().any(|spec| spec.name == tool) {
+        return Err(format!("dynamic tool is not registered: {tool}"));
+    }
+    if params
+        .get("namespace")
+        .is_some_and(|namespace| !namespace.is_null())
+    {
+        return Err(format!("namespaced dynamic tool is not registered: {tool}"));
+    }
+    let Some(arguments) = params.get("arguments").cloned() else {
+        return Err(format!("dynamic tool call is missing arguments: {tool}"));
+    };
+
+    match handler.call(tool, call_id, arguments).await {
+        Ok(value) => Ok(DynamicToolCallResponse {
+            content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                text: serde_json::to_string(&value)
+                    .map_err(|error| format!("failed to encode dynamic tool result: {error}"))?,
+            }],
+            success: true,
+        }),
+        Err(error) => Ok(DynamicToolCallResponse {
+            content_items: vec![DynamicToolCallOutputContentItem::InputText { text: error }],
+            success: false,
+        }),
     }
 }
 
@@ -657,6 +778,177 @@ fn normalize_path(path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+
+    #[derive(Clone, Default)]
+    struct TestChatToolHandler {
+        calls: Arc<Mutex<Vec<(String, String, Value)>>>,
+    }
+
+    #[async_trait]
+    impl ChatToolHandler for TestChatToolHandler {
+        fn specs(&self) -> Vec<DynamicToolSpec> {
+            vec![DynamicToolSpec {
+                name: "forge_echo".to_owned(),
+                description: "Echo a JSON value".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "value": {} },
+                }),
+            }]
+        }
+
+        async fn call(&self, name: &str, call_id: &str, arguments: Value) -> Result<Value, String> {
+            self.calls.lock().expect("test handler lock").push((
+                name.to_owned(),
+                call_id.to_owned(),
+                arguments.clone(),
+            ));
+            Ok(json!({ "name": name, "call_id": call_id, "arguments": arguments }))
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_tool_call_rejects_unregistered_tool_without_dispatch() {
+        let handler = TestChatToolHandler::default();
+        let result = dispatch_chat_tool_response(
+            Some(&handler),
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": "call-1",
+                "namespace": null,
+                "tool": "forge_delete_everything",
+                "arguments": {},
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            result.expect_err("unknown tool must be rejected"),
+            "dynamic tool is not registered: forge_delete_everything"
+        );
+        assert!(handler.calls.lock().expect("test handler lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn dynamic_tool_call_dispatches_and_encodes_json_result_as_input_text() {
+        let handler = TestChatToolHandler::default();
+        let result = dispatch_chat_tool_response(
+            Some(&handler),
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": "call-1",
+                "namespace": null,
+                "tool": "forge_echo",
+                "arguments": { "value": 42 },
+            }),
+        )
+        .await
+        .expect("registered tool dispatches");
+
+        assert!(result.success);
+        let DynamicToolCallOutputContentItem::InputText { text } = &result.content_items[0];
+        let decoded: Value = serde_json::from_str(text).expect("result is JSON text");
+        assert_eq!(decoded["name"], "forge_echo");
+        assert_eq!(decoded["call_id"], "call-1");
+        assert_eq!(decoded["arguments"]["value"], 42);
+        assert_eq!(
+            handler.calls.lock().expect("test handler lock").as_slice(),
+            &[(
+                "forge_echo".to_owned(),
+                "call-1".to_owned(),
+                json!({ "value": 42 }),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_tool_request_dispatches_and_logs_result() {
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let log_path = dir.path().join("codex.jsonl");
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("cat starts");
+        let stdin = child.stdin.take().expect("cat stdin");
+        let stdout = child.stdout.take().expect("cat stdout");
+        let cancel = CancellationToken::new();
+        let handler = TestChatToolHandler::default();
+        let mut client = CodexClient::spawn_with_chat_tools(
+            stdin,
+            stdout,
+            dir.path(),
+            cancel.clone(),
+            Some(Arc::new(handler)),
+        );
+        let writer = Arc::new(AsyncMutex::new(LogWriter::new(
+            &log_path,
+            "execution-id".to_owned(),
+            1024 * 1024,
+        )));
+
+        client
+            .handle_server_request(
+                RequestId::Number(7),
+                "item/tool/call",
+                json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "callId": "call-1",
+                    "namespace": null,
+                    "tool": "forge_echo",
+                    "arguments": { "value": 42 },
+                }),
+                &writer,
+            )
+            .await
+            .expect("dynamic tool request handled");
+
+        let message =
+            tokio::time::timeout(std::time::Duration::from_secs(1), client.messages.recv())
+                .await
+                .expect("response arrives")
+                .expect("response message");
+        let ServerMessage::Response(raw) = message else {
+            panic!("expected JSON-RPC response, got another message");
+        };
+        assert_eq!(raw["id"], 7);
+        assert_eq!(raw["result"]["success"], true);
+        assert_eq!(raw["result"]["contentItems"][0]["type"], "inputText");
+        let returned: Value = serde_json::from_str(
+            raw["result"]["contentItems"][0]["text"]
+                .as_str()
+                .expect("input text"),
+        )
+        .expect("input text contains JSON");
+        assert_eq!(returned["arguments"]["value"], 42);
+
+        let entries = executors::LogReader::read(&log_path, 0, 20)
+            .await
+            .expect("logs read")
+            .entries;
+        let result_log = entries
+            .iter()
+            .find(|entry| entry.payload["type"] == "dynamic_tool_result")
+            .expect("dynamic tool result logged");
+        assert_eq!(result_log.kind, LogKind::ToolResult);
+        assert_eq!(result_log.payload["success"], true);
+        assert_eq!(result_log.payload["result"]["call_id"], "call-1");
+        assert!(
+            result_log.payload["text"]
+                .as_str()
+                .unwrap()
+                .contains("forge_echo")
+        );
+
+        cancel.cancel();
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
 
     #[test]
     fn allows_forge_mcp_tool_elicitation() {

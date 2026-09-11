@@ -695,6 +695,42 @@ impl CliAgentChatSessionBackend {
     }
 }
 
+struct ScopedCliChatTools {
+    composition: forge_agent_host::ScopeToolComposition,
+    session_id: String,
+    turn_id: String,
+}
+
+#[async_trait]
+impl cli_adapters::codex::client::ChatToolHandler for ScopedCliChatTools {
+    fn specs(&self) -> Vec<cli_adapters::codex::protocol::DynamicToolSpec> {
+        self.composition
+            .tools()
+            .iter()
+            .map(|tool| {
+                let spec = tool.spec();
+                cli_adapters::codex::protocol::DynamicToolSpec {
+                    name: spec.name,
+                    description: spec.description,
+                    input_schema: spec.input_schema,
+                }
+            })
+            .collect()
+    }
+
+    async fn call(
+        &self,
+        name: &str,
+        call_id: &str,
+        arguments: Value,
+    ) -> std::result::Result<Value, String> {
+        self.composition
+            .invoke_denied_chat_tool(&self.session_id, &self.turn_id, call_id, name, arguments)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
 #[derive(Clone)]
 pub struct FederatedAgentChatTurnRunner {
     db: Arc<SqliteDb>,
@@ -2871,6 +2907,7 @@ impl FederatedAgentChatTurnRunner {
                             provider,
                             base_url: config.base_url,
                             model: model.clone(),
+                            reasoning_effort: profile.reasoning_effort.clone(),
                             credential_handle_id: credential_ref.to_owned(),
                             owner_user_id: owner_user_id.to_owned(),
                             provider_account_id,
@@ -3268,8 +3305,29 @@ impl FederatedAgentChatTurnRunner {
             scope_id: job.chat_id.clone(),
             workspace_access: WorkspaceAccess::Deny,
         };
-        let (mut result, duration_ms) = self
-            .cli_backend
+        let scoped_backend = if profile.executor_type == "codex" {
+            let composition = self
+                .embedded_agents
+                .cli_chat_tools(&session.id, &agent.id, &scope)
+                .await?;
+            let handler = Arc::new(ScopedCliChatTools {
+                composition,
+                session_id: session.id.clone(),
+                turn_id: job.id.clone(),
+            });
+            let mut registry = executors::AdapterRegistry::new();
+            registry.register(Box::new(
+                cli_adapters::CodexAdapter::new().with_chat_tools(handler),
+            ));
+            Some(CliAgentChatSessionBackend::new(Arc::new(
+                executors::AdapterExecutor::new(Arc::new(registry)),
+            )))
+        } else {
+            None
+        };
+        let (mut result, duration_ms) = scoped_backend
+            .as_ref()
+            .unwrap_or(&self.cli_backend)
             .run_turn(
                 &scope,
                 &job.id,
@@ -5562,6 +5620,15 @@ fn cli_profile_execution_config(profile: &AgentProfile) -> Result<Value> {
         }
     }
 
+    // Agent Chat runs in a disposable, non-repository sandbox.  The CLI
+    // adapter must never run Task git finalization (including a status probe)
+    // after a successful chat reply; the chat service persists the reply and
+    // any typed Forge proposals separately.
+    config
+        .as_object_mut()
+        .expect("merge_overrides accepted an object")
+        .insert("auto_commit".to_owned(), Value::Bool(false));
+
     Ok(config)
 }
 
@@ -5939,6 +6006,7 @@ mod tests {
         assert_eq!(config["model_reasoning_effort"], "high");
         assert_eq!(config["effort"], "high");
         assert_eq!(config["permission_policy"], "auto");
+        assert_eq!(config["auto_commit"], false);
     }
 
     #[test]

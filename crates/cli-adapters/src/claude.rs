@@ -18,7 +18,7 @@ use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_CLAUDE_VERSION: &str = "2.1.226";
+const DEFAULT_CLAUDE_VERSION: &str = "2.1.267";
 // Router v3 replaced the `ccr code <claude args>` pass-through with
 // `ccr <profile> [-- <agent args>]`; adopting it needs an invocation rework,
 // so stay on the 2.x line until then.
@@ -232,15 +232,21 @@ impl ClaudeCodeAdapter {
             adapter_args.push(session_id.to_owned());
         }
 
-        let mut default_args = vec![
-            "-y".to_owned(),
-            if config.claude_code_router.unwrap_or(false) {
-                format!("@musistudio/claude-code-router@{DEFAULT_CLAUDE_ROUTER_VERSION}")
-            } else {
-                format!("@anthropic-ai/claude-code@{DEFAULT_CLAUDE_VERSION}")
-            },
-        ];
-        if config.claude_code_router.unwrap_or(false) {
+        let use_router = config.claude_code_router.unwrap_or(false);
+        let package = if use_router {
+            format!("@musistudio/claude-code-router@{DEFAULT_CLAUDE_ROUTER_VERSION}")
+        } else {
+            format!("@anthropic-ai/claude-code@{DEFAULT_CLAUDE_VERSION}")
+        };
+        let mut default_args = vec!["-y".to_owned()];
+        if !use_router {
+            // npm 12 blocks dependency install scripts by default. The native
+            // Claude package needs its postinstall to replace the binary stub;
+            // permit only this exact managed package, not every dependency.
+            default_args.push(format!("--allow-scripts={package}"));
+        }
+        default_args.push(package);
+        if use_router {
             default_args.push("code".to_owned());
         }
 
@@ -360,27 +366,28 @@ impl ClaudeCodeAdapter {
             ),
             None => stream.agent_session_id.clone(),
         };
-        let after_sha = if status == ExecutionOutcome::Completed {
-            match crate::commit::commit_execution_changes(&ctx).await {
-                Ok(Some(sha)) => Some(sha),
-                Ok(None) => git::get_current_sha(Path::new(&ctx.worktree_path))
-                    .await
-                    .ok(),
-                Err(error) => {
-                    return Ok(ExecutionResult {
-                        status: ExecutionOutcome::Failed,
-                        after_sha: None,
-                        agent_session_id: agent_session_id.clone(),
-                        summary: stream.summary,
-                        error: Some(error.to_string()),
-                        usage_reports,
-                        ..Default::default()
-                    });
+        let after_sha =
+            if status == ExecutionOutcome::Completed && crate::commit::auto_commit_enabled(&ctx) {
+                match crate::commit::commit_execution_changes(&ctx).await {
+                    Ok(Some(sha)) => Some(sha),
+                    Ok(None) => git::get_current_sha(Path::new(&ctx.worktree_path))
+                        .await
+                        .ok(),
+                    Err(error) => {
+                        return Ok(ExecutionResult {
+                            status: ExecutionOutcome::Failed,
+                            after_sha: None,
+                            agent_session_id: agent_session_id.clone(),
+                            summary: stream.summary,
+                            error: Some(error.to_string()),
+                            usage_reports,
+                            ..Default::default()
+                        });
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         Ok(ExecutionResult {
             status,
@@ -1223,7 +1230,8 @@ mod tests {
             args,
             vec![
                 "-y",
-                "@anthropic-ai/claude-code@2.1.226",
+                "--allow-scripts=@anthropic-ai/claude-code@2.1.267",
+                "@anthropic-ai/claude-code@2.1.267",
                 "-p",
                 "--verbose",
                 "--output-format=stream-json",

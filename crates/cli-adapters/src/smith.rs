@@ -337,7 +337,7 @@ impl CodingExecutorAdapter for SmithAdapter {
             });
         }
 
-        let after_sha =
+        let after_sha = if crate::commit::auto_commit_enabled(&ctx) {
             if let Ok(false) = git::is_worktree_clean(Path::new(&ctx.worktree_path)).await {
                 crate::commit::commit_execution_changes(&ctx)
                     .await
@@ -346,7 +346,10 @@ impl CodingExecutorAdapter for SmithAdapter {
                     })?
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
 
         Ok(ExecutionResult {
             status: ExecutionOutcome::Completed,

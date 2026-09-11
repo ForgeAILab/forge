@@ -5,6 +5,9 @@ use std::{
     time::Duration,
 };
 
+use cli_adapters::codex::codex_reasoning_efforts_for_model;
+#[cfg(test)]
+use cli_adapters::codex::CODEX_REASONING_EFFORTS;
 use config::PublicSearchConfig;
 use db::{
     new_uuid_v4, now_rfc3339, AccountMainAgentBindingRepo, Agent, AgentChatRepo,
@@ -64,6 +67,7 @@ pub struct CreateEmbeddedAgent {
     pub description: Option<String>,
     pub credential_id: String,
     pub model: String,
+    pub reasoning_effort: Option<String>,
     pub system_prompt: Option<String>,
     pub account_permission_ceiling: Value,
     pub tool_policy: Value,
@@ -79,6 +83,7 @@ pub struct ConnectEmbeddedProfile {
     pub expected_identity_version: i64,
     pub credential_id: String,
     pub model: String,
+    pub reasoning_effort: Option<String>,
     pub system_prompt: Option<String>,
     pub permission_policy: Option<String>,
     pub tool_policy: Value,
@@ -262,6 +267,39 @@ impl EmbeddedAgentService {
     /// actions execute inline through the normal Task creation path.
     pub fn set_task_service(&self, task_service: Arc<crate::TaskService>) {
         self.tool_provider.set_task_service(task_service);
+    }
+
+    /// CLI transports use the same persisted scope and domain provider as
+    /// native turns. Neither a model nor a CLI profile can choose authority.
+    pub(crate) async fn cli_chat_tools(
+        &self,
+        session_id: &str,
+        expected_identity: &str,
+        expected_scope: &CanonicalScope,
+    ) -> Result<forge_agent_host::ScopeToolComposition> {
+        let binding = self
+            .protected_store
+            .cli_chat_scope_binding(session_id)
+            .await
+            .map_err(redacted_host_error)?;
+        if binding.identity_id != expected_identity || &binding.scope != expected_scope {
+            return Err(ServiceError::invalid_operation(
+                "CLI Chat session authority does not match the admitted turn",
+            ));
+        }
+        forge_agent_host::ScopeToolComposition::for_scope_with_permissions_and_project_context(
+            binding.identity_id,
+            binding.scope,
+            None,
+            None,
+            &binding.allowed_permissions,
+            forge_agent_host::ProjectChatToolContext {
+                is_project_agent_chat: binding.agent_chat_project_id.is_some(),
+                charter_setup_required: binding.project_charter_setup_required,
+            },
+            Some(self.tool_provider.clone()),
+        )
+        .map_err(redacted_host_error)
     }
 
     /// Attach the inquiry runner so a Main Chat can dispatch ephemeral
@@ -724,6 +762,13 @@ impl EmbeddedAgentService {
         provider_url_addresses(&base_url)
             .await
             .map_err(ServiceError::invalid_operation)?;
+        let reasoning_effort = validate_native_reasoning_effort(
+            &entry.provider,
+            &entry.credential_method,
+            &base_url,
+            &input.model,
+            input.reasoning_effort.as_deref(),
+        )?;
         let system_prompt = validate_public_runtime_text(input.system_prompt.as_deref())?;
         validate_public_runtime_json(&input.account_permission_ceiling)?;
         validate_public_runtime_json(&input.tool_policy)?;
@@ -738,7 +783,7 @@ impl EmbeddedAgentService {
             executor_type: NATIVE_EXECUTOR_TYPE.to_owned(),
             provider: Some(entry.provider.clone()),
             model: Some(input.model.clone()),
-            reasoning_effort: None,
+            reasoning_effort,
             permission_policy: Some("scoped_proposals".to_owned()),
             prompt_template: system_prompt,
             capabilities_json: serde_json::to_string(&capabilities).unwrap_or_else(|_| "{}".into()),
@@ -821,6 +866,13 @@ impl EmbeddedAgentService {
         provider_url_addresses(&base_url)
             .await
             .map_err(ServiceError::invalid_operation)?;
+        let reasoning_effort = validate_native_reasoning_effort(
+            &entry.provider,
+            &entry.credential_method,
+            &base_url,
+            &input.model,
+            input.reasoning_effort.as_deref(),
+        )?;
         let system_prompt = validate_public_runtime_text(input.system_prompt.as_deref())?;
         let account_permission_ceiling = sqlx::query_scalar::<_, String>(
             "SELECT account_permission_ceiling FROM agent_identity WHERE id = ?",
@@ -844,7 +896,7 @@ impl EmbeddedAgentService {
                 executor_type: NATIVE_EXECUTOR_TYPE.to_owned(),
                 provider: Some(entry.provider.clone()),
                 model: Some(input.model),
-                reasoning_effort: None,
+                reasoning_effort,
                 permission_policy: permission_policy
                     .or_else(|| Some("scoped_proposals".to_owned())),
                 prompt_template: system_prompt,
@@ -2023,6 +2075,34 @@ fn is_codex_backend(base_url: &str) -> bool {
     base_url.contains("chatgpt.com/backend-api/codex")
 }
 
+fn validate_native_reasoning_effort(
+    provider: &str,
+    credential_method: &str,
+    base_url: &str,
+    model: &str,
+    reasoning_effort: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(reasoning_effort) = reasoning_effort
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if provider != "openai" || credential_method != "oauth_bundle" || !is_codex_backend(base_url) {
+        return Err(ServiceError::invalid_operation(
+            "reasoning effort is supported only for direct ChatGPT login profiles",
+        ));
+    }
+    let supported_efforts = codex_reasoning_efforts_for_model(model);
+    if !supported_efforts.contains(&reasoning_effort) {
+        return Err(ServiceError::invalid_operation(format!(
+            "direct ChatGPT model `{model}` supports reasoning efforts: {}",
+            supported_efforts.join(", ")
+        )));
+    }
+    Ok(Some(reasoning_effort.to_owned()))
+}
+
 fn default_oauth_base_url(provider: &str) -> Option<&'static str> {
     match provider {
         "openai" => Some("https://chatgpt.com/backend-api/codex"),
@@ -3185,6 +3265,41 @@ mod tests {
         assert!(usage_snapshot_from_wham_json("not json", 1_700_000_000).is_err());
     }
 
+    #[test]
+    fn direct_chatgpt_reasoning_effort_is_bounded_to_runtime_values() {
+        let base_url = "https://chatgpt.com/backend-api/codex";
+        for effort in CODEX_REASONING_EFFORTS {
+            assert_eq!(
+                validate_native_reasoning_effort(
+                    "openai",
+                    "oauth_bundle",
+                    base_url,
+                    "gpt-5.6-terra",
+                    Some(effort)
+                )
+                .expect("supported effort validates")
+                .as_deref(),
+                Some(*effort)
+            );
+        }
+        assert!(validate_native_reasoning_effort(
+            "openai",
+            "oauth_bundle",
+            base_url,
+            "gpt-5.5",
+            Some("max")
+        )
+        .is_err());
+        assert!(validate_native_reasoning_effort(
+            "openai",
+            "api_key",
+            "https://api.openai.com/v1",
+            "gpt-5.6-terra",
+            Some("high")
+        )
+        .is_err());
+    }
+
     async fn test_service_with_owner() -> (EmbeddedAgentService, String) {
         let pool = db::create_sqlite_pool("sqlite::memory:")
             .await
@@ -3283,6 +3398,7 @@ mod tests {
                 description: None,
                 credential_id: entry.id.clone(),
                 model: "gpt-4o".to_owned(),
+                reasoning_effort: None,
                 system_prompt: None,
                 account_permission_ceiling: json!({}),
                 tool_policy: json!({}),
@@ -3493,3 +3609,7 @@ mod tests {
         assert!(!error.to_string().contains("oauth-access-secret"));
     }
 }
+
+#[cfg(test)]
+#[path = "embedded_agent_service_scoped_cli_chat_tests.rs"]
+mod scoped_cli_chat_tests;

@@ -272,19 +272,23 @@ impl CodingExecutorAdapter for OpencodeAdapter {
             });
         }
 
-        let after_sha =
-            if let Ok(false) = git::is_worktree_clean(Path::new(&ctx.worktree_path)).await {
-                crate::commit::commit_execution_changes(&ctx)
+        let after_sha = if crate::commit::auto_commit_enabled(&ctx) {
+            let after_sha =
+                if let Ok(false) = git::is_worktree_clean(Path::new(&ctx.worktree_path)).await {
+                    crate::commit::commit_execution_changes(&ctx)
+                        .await
+                        .unwrap_or(None)
+                } else {
+                    None
+                };
+            match after_sha {
+                Some(sha) => Some(sha),
+                None => git::get_current_sha(Path::new(&ctx.worktree_path))
                     .await
-                    .unwrap_or(None)
-            } else {
-                None
-            };
-        let after_sha = match after_sha {
-            Some(sha) => Some(sha),
-            None => git::get_current_sha(Path::new(&ctx.worktree_path))
-                .await
-                .ok(),
+                    .ok(),
+            }
+        } else {
+            None
         };
 
         Ok(ExecutionResult {

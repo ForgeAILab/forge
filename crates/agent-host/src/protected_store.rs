@@ -213,6 +213,56 @@ impl SqliteProtectedRuntimeStore {
         runtime_session_id: &str,
         workspace_path: Option<&str>,
     ) -> Result<crate::RuntimeScopeBinding, crate::AgentHostError> {
+        self.session_scope_binding(forge_session_id, Some(runtime_session_id), workspace_path)
+            .await
+    }
+
+    /// Resolve a CLI Chat through its persisted identity, profile and scope,
+    /// using the same permission intersection as native sessions.
+    pub async fn cli_chat_scope_binding(
+        &self,
+        forge_session_id: &str,
+    ) -> Result<crate::RuntimeScopeBinding, crate::AgentHostError> {
+        let mut binding = self
+            .session_scope_binding(forge_session_id, None, None)
+            .await?;
+        if binding.scope.scope_type != crate::CanonicalScopeType::AgentChat {
+            return Err(crate::AgentHostError::Authority(
+                "CLI Chat tools require a persisted Agent Chat scope".to_owned(),
+            ));
+        }
+        // Native Agent Chat sessions may be provisioned with a Project
+        // verification checkout or Main account scratch directory. A CLI
+        // transport must never inherit either filesystem boundary: validate
+        // the full persisted binding above, then narrow the transport view to
+        // the same canonical Agent Chat with no workspace before composing
+        // tools. Keep the authenticated identity, owning Project, setup state,
+        // and persisted permission ceiling intact while applying the denied
+        // scope ceiling once more at this boundary.
+        let project_agent_chat = binding.agent_chat_project_id.is_some();
+        if binding.scope.workspace_access != crate::WorkspaceAccess::Deny {
+            binding.scope.workspace_access = crate::WorkspaceAccess::Deny;
+            binding.workspace_path = None;
+        }
+        intersect_permissions(
+            &mut binding.allowed_permissions,
+            &scope_permission_set(
+                crate::CanonicalScopeType::AgentChat,
+                crate::WorkspaceAccess::Deny,
+                project_agent_chat,
+                binding.project_charter_setup_required,
+            ),
+        );
+        binding.scope.validate()?;
+        Ok(binding)
+    }
+
+    async fn session_scope_binding(
+        &self,
+        forge_session_id: &str,
+        runtime_session_id: Option<&str>,
+        workspace_path: Option<&str>,
+    ) -> Result<crate::RuntimeScopeBinding, crate::AgentHostError> {
         let row = sqlx::query(
             "SELECT session.identity_id,
                     identity.account_permission_ceiling,
@@ -257,11 +307,13 @@ impl SqliteProtectedRuntimeStore {
               AND workspace.status IN ('creating', 'ready', 'error')
               AND workspace.worktree_path = ?
              WHERE session.id = ?
-               AND session.runtime_session_id = ?
+               AND session.runtime_session_id IS ?
+               AND (? IS NOT NULL OR (session.backend_kind = 'cli' AND profile.backend_kind = 'cli'))
              LIMIT 1",
         )
         .bind(workspace_path)
         .bind(forge_session_id)
+        .bind(runtime_session_id)
         .bind(runtime_session_id)
         .fetch_optional(self.db.pool())
         .await

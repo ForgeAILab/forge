@@ -80,6 +80,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Let Agent Settings edit an agent's maximum concurrent task executions and
   delete an agent from the roster with an explicit confirmation while
   preserving its run history.
+- Connect Codex Agent Chat to Forge's persisted, scope-derived adoption and
+  orchestration tools through app-server stdio callbacks. Project authority
+  and exact user approval still come from the existing services. Advertise
+  the full nested Charter payload in setup chats so the Agent can draft a
+  valid adoption revision without guessing fields. Return the pending draft
+  through Project state reads so revisions preserve its canonical content.
+- Keep successful CLI Agent Chat replies out of Task Git finalization. Chat
+  sandboxes do not require a repository or produce an implementation commit.
+- Upgrade Forge's managed CLI pins to `@openai/codex` 0.154.0 (from 0.147.0)
+  and `@anthropic-ai/claude-code` 2.1.267 (from 2.1.226). The older managed
+  Codex rejected `gpt-6-astra` even when a newer global Codex CLI was installed.
+- Allow the exact managed Claude Code package's native install script during
+  `npx` launch. npm 12 otherwise installs a placeholder that exits with
+  `claude native binary not installed`, despite valid local authentication.
 
 ## [0.11.0] - 2026-09-08
 

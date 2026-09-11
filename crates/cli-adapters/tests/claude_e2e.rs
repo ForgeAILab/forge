@@ -12,6 +12,36 @@ use std::{
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the managed Claude CLI and an authenticated account"]
+async fn claude_chat_reply_survives_a_non_git_sandbox() -> TestResult {
+    let sandbox = tempfile::tempdir()?;
+    let logs = tempfile::tempdir()?;
+    let adapter = ClaudeCodeAdapter::new();
+    let result = tokio::time::timeout(Duration::from_secs(120), adapter.execute(ExecutionContext {
+        task_id: "chat-smoke".to_owned(),
+        execution_id: "chat-smoke-turn".to_owned(),
+        worktree_path: sandbox.path().to_string_lossy().into_owned(),
+        description: "Reply with exactly CHAT_OK. Do not use any tools or inspect files.".to_owned(),
+        agent_config: json!({"model": "claude-sonnet-4-6", "effort": "medium", "auto_commit": false, "permission_policy": "plan"}),
+        logs_path: logs.path().join("chat.jsonl").to_string_lossy().into_owned(),
+        heartbeat_interval_seconds: 30,
+        max_turns: None,
+        log_sender: None,
+    })).await??;
+    assert_eq!(result.status, ExecutionOutcome::Completed, "{result:?}");
+    assert_eq!(result.after_sha, None);
+    assert!(
+        result
+            .summary
+            .as_deref()
+            .is_some_and(|text| text.contains("CHAT_OK")),
+        "{result:?}"
+    );
+    assert!(!sandbox.path().join(".git").exists());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn claude_adapter_writes_file_in_live_repo() -> TestResult {
     if which::which("npx").is_err() {
@@ -27,8 +57,8 @@ async fn claude_adapter_writes_file_in_live_repo() -> TestResult {
     if !npx_package_available_offline([
         "--offline",
         "-y",
-        "@anthropic-ai/claude-code@2.1.150",
-        "code",
+        "--allow-scripts=@anthropic-ai/claude-code@2.1.267",
+        "@anthropic-ai/claude-code@2.1.267",
         "--version",
     ]) {
         println!(

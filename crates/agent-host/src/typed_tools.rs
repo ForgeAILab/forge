@@ -1,4 +1,4 @@
-//! Scope-derived tools for Forge-hosted native Agent Runtime sessions.
+//! Scope-derived tools for Forge-hosted Agent Runtime and CLI Chat sessions.
 //!
 //! The runtime deliberately knows nothing about Forge identities, Projects,
 //! Agent Chats, or Task roles. This module is the narrow host-owned composition
@@ -18,19 +18,24 @@ use std::{
 
 use agent_runtime::core::{
     cancel::Cancellation,
+    clock::{Clock, SystemClock},
     grant::{
         GrantConstraints, SecurityCheck, SecurityCheckId, SecurityCheckMode, SecurityCheckOutcome,
         SecurityCheckRevision,
     },
+    ids::{RequestId, SessionId, TenantId, TurnId},
     prelude::{
         ActionClass, AuthorizationRequest, Deadline, DecisionCode, InteractionOrigin,
         InteractionRequest, InteractionResponse, InvocationContext, PermissionSet,
         PreparationContext, PreparedToolCall, RuntimeError, SecurityResource, Tool,
         ToolCallDisplay, ToolCallId, ToolEffects, ToolOutcome, ToolSpec,
     },
-    workspace::Workspace,
+    security::{
+        CheckSetRevision, SecurityAction, SecurityContext, SecurityEvidence, SecuritySubject,
+    },
+    workspace::{DenyAllWorkspace, Workspace},
 };
-use agent_runtime::registry::Permission;
+use agent_runtime::registry::{Permission, TrustClass};
 use agent_runtime::runtime::RuntimeBuilder;
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
@@ -688,6 +693,160 @@ impl ScopeToolComposition {
     /// The canonical scope captured by the host composition.
     pub fn scope(&self) -> &CanonicalScope {
         &self.scope
+    }
+
+    /// Invokes one already-composed Forge tool for the CLI chat callback.
+    ///
+    /// CLI chat has no workspace and no interactive approval channel.  Keep
+    /// this path host-owned: the model supplies only the tool name and
+    /// arguments, while identity, tenant, check-set revision, workspace, and
+    /// permission coverage all come from this immutable composition.
+    pub async fn invoke_denied_chat_tool(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        call_id: &str,
+        tool_name: &str,
+        arguments: Value,
+    ) -> Result<Value, AgentHostError> {
+        const MAX_CHAT_TOOL_ERROR_CHARS: usize = 4 * 1024;
+
+        if self.scope.scope_type != CanonicalScopeType::AgentChat
+            || self.scope.workspace_access != WorkspaceAccess::Deny
+        {
+            return Err(AgentHostError::Authority(
+                "CLI chat tool invocation requires a denied Agent Chat scope".to_owned(),
+            ));
+        }
+        if [session_id, turn_id, call_id]
+            .into_iter()
+            .any(|id| id.trim().is_empty())
+        {
+            return Err(AgentHostError::Authority(
+                "CLI chat tool invocation requires server-issued identifiers".to_owned(),
+            ));
+        }
+
+        let tool = self
+            .tools
+            .iter()
+            .find(|tool| tool.spec().name == tool_name)
+            .cloned()
+            .ok_or_else(|| {
+                AgentHostError::Unsupported("Forge chat tool is not available".to_owned())
+            })?;
+        let spec = tool.spec();
+
+        let session = SessionId::new(session_id);
+        let turn = TurnId::new(turn_id);
+        let call = ToolCallId::new(call_id);
+        let request = RequestId::new(format!("forge-chat:{session_id}:{turn_id}:{call_id}"));
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let cancel = Cancellation::new();
+        let deadline = Deadline::never();
+        let workspace: Arc<dyn Workspace> = Arc::new(DenyAllWorkspace);
+
+        let preparation = PreparationContext {
+            session: session.clone(),
+            turn: Some(turn.clone()),
+            call_id: call.clone(),
+            request: request.clone(),
+            workspace: workspace.clone(),
+            clock: clock.clone(),
+            cancel: cancel.clone(),
+            deadline,
+        };
+        let prepared = tool
+            .prepare(arguments, &preparation)
+            .await
+            .map_err(|error| {
+                AgentHostError::Runtime(bound_chat_tool_error(
+                    error.to_string(),
+                    MAX_CHAT_TOOL_ERROR_CHARS,
+                ))
+            })?;
+        if !prepared.verify_fingerprint()
+            || !prepared
+                .required_permissions()
+                .is_subset(&spec.permission_upper_bound)
+            || !prepared.required_permissions().is_subset(&self.coverage)
+        {
+            return Err(AgentHostError::Authority(
+                "Forge chat tool preparation exceeded its composed authority".to_owned(),
+            ));
+        }
+
+        if tool.supports_interaction()
+            || tool
+                .interaction_request(
+                    &prepared,
+                    InteractionOrigin::new(session.clone(), turn.clone(), call.clone()),
+                    deadline,
+                )
+                .map_err(|error| {
+                    AgentHostError::Runtime(bound_chat_tool_error(
+                        error.to_string(),
+                        MAX_CHAT_TOOL_ERROR_CHARS,
+                    ))
+                })?
+                .is_some()
+        {
+            return Err(AgentHostError::Unsupported(
+                "interactive Forge tools are unavailable in CLI chat".to_owned(),
+            ));
+        }
+
+        let security_context = SecurityContext::new(
+            SecuritySubject::new(self.actor_identity_id.clone()),
+            session.clone(),
+            TenantId::new(self.scope.scope_id.clone()),
+            CheckSetRevision::new(self.security_check.revision().as_str()),
+        );
+        let authorization = AuthorizationRequest::new(
+            security_context,
+            SecurityAction::new("tool.invoke"),
+            prepared.resource().clone(),
+            prepared.required_permissions().clone(),
+            deadline,
+            SecurityEvidence::new(TrustClass::ExternalContent, prepared.fingerprint().clone()),
+        );
+        if !matches!(
+            self.security_check.evaluate(&authorization, &cancel).await,
+            SecurityCheckOutcome::Allow { .. }
+        ) {
+            return Err(AgentHostError::Authority(
+                "Forge chat tool authorization was denied".to_owned(),
+            ));
+        }
+
+        let invocation = InvocationContext {
+            session,
+            turn: Some(turn),
+            call_id: call,
+            request,
+            workspace,
+            clock,
+            cancel,
+            deadline,
+            output_limit: 128 * 1024,
+        };
+        let outcome = tool.invoke(prepared, &invocation).await.map_err(|error| {
+            AgentHostError::Runtime(bound_chat_tool_error(
+                error.to_string(),
+                MAX_CHAT_TOOL_ERROR_CHARS,
+            ))
+        })?;
+        if outcome.is_error {
+            let message = match &outcome.value {
+                Value::String(message) if !message.trim().is_empty() => message.clone(),
+                value => value.to_string(),
+            };
+            return Err(AgentHostError::Runtime(bound_chat_tool_error(
+                message,
+                MAX_CHAT_TOOL_ERROR_CHARS,
+            )));
+        }
+        Ok(outcome.value)
     }
 
     /// Wraps every composed tool so `observer` sees the exact call id and
@@ -2657,6 +2816,10 @@ fn host_error_to_runtime(error: AgentHostError) -> RuntimeError {
     }
 }
 
+fn bound_chat_tool_error(message: String, limit: usize) -> String {
+    message.chars().take(limit).collect()
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -3177,6 +3340,126 @@ mod tests {
         assert!(!composition.coverage().contains(&Permission::FsRead));
         assert!(!composition.coverage().contains(&Permission::FsWrite));
         assert!(!composition.coverage().contains(&Permission::ProcessSpawn));
+    }
+
+    #[tokio::test]
+    async fn denied_chat_dispatch_never_admits_filesystem_tools() {
+        let allowed = BTreeSet::from(["read_agent_chat".to_owned()]);
+        let composition = ScopeToolComposition::for_scope_with_permissions(
+            "identity-chat",
+            scope(CanonicalScopeType::AgentChat, WorkspaceAccess::Deny),
+            None,
+            None,
+            &allowed,
+            Some(Arc::new(TestProvider::default())),
+        )
+        .expect("Agent Chat composition");
+
+        assert!(
+            composition
+                .tool_names()
+                .iter()
+                .all(|name| !name.starts_with("forge_task_"))
+        );
+        let error = composition
+            .invoke_denied_chat_tool(
+                "session-chat",
+                "turn-chat",
+                "call-chat",
+                "forge_task_read",
+                json!({"path": "secret.txt"}),
+            )
+            .await
+            .expect_err("denied chat must not dispatch a filesystem tool");
+        assert!(matches!(error, AgentHostError::Unsupported(_)));
+    }
+
+    #[tokio::test]
+    async fn denied_chat_dispatch_rejects_non_denied_scope_bindings() {
+        let allowed = BTreeSet::from(["read_agent_chat".to_owned()]);
+        let composition = ScopeToolComposition::for_scope_with_permissions(
+            "identity-chat",
+            scope(
+                CanonicalScopeType::AgentChat,
+                WorkspaceAccess::ProjectVerify,
+            ),
+            None,
+            Some("/tmp/forge-agent-chat-checkout"),
+            &allowed,
+            Some(Arc::new(TestProvider::default())),
+        )
+        .expect("Agent Chat composition");
+        let error = composition
+            .invoke_denied_chat_tool(
+                "session-chat",
+                "turn-chat",
+                "call-chat",
+                "forge_scope_read",
+                json!({"operation": "agent_chat.summary"}),
+            )
+            .await
+            .expect_err("workspace-bearing chat must be rejected");
+        assert!(matches!(error, AgentHostError::Authority(_)));
+    }
+
+    #[tokio::test]
+    async fn denied_chat_dispatch_rejects_authority_overrides() {
+        let allowed = BTreeSet::from(["read_agent_chat".to_owned()]);
+        let composition = ScopeToolComposition::for_scope_with_permissions_and_project_chat(
+            "identity-chat",
+            scope(CanonicalScopeType::AgentChat, WorkspaceAccess::Deny),
+            None,
+            None,
+            &allowed,
+            true,
+            Some(Arc::new(TestProvider::default())),
+        )
+        .expect("Project Agent Chat composition");
+
+        let error = composition
+            .invoke_denied_chat_tool(
+                "session-chat",
+                "turn-chat",
+                "call-chat",
+                FORGE_PROJECT_ORCHESTRATION_READ_TOOL,
+                json!({
+                    "operation": PROJECT_CURRENT_STATE_OPERATION,
+                    "arguments": {"scope_id": "other-project"}
+                }),
+            )
+            .await
+            .expect_err("model-supplied project scope must be rejected");
+        assert!(
+            matches!(error, AgentHostError::Runtime(ref message) if message.contains("server-derived")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_chat_dispatch_invokes_the_composed_scoped_tool() {
+        let allowed = BTreeSet::from(["read_agent_chat".to_owned()]);
+        let composition = ScopeToolComposition::for_scope_with_permissions(
+            "identity-chat",
+            scope(CanonicalScopeType::AgentChat, WorkspaceAccess::Deny),
+            None,
+            None,
+            &allowed,
+            Some(Arc::new(TestProvider::default())),
+        )
+        .expect("Agent Chat composition");
+
+        let value = composition
+            .invoke_denied_chat_tool(
+                "session-chat",
+                "turn-chat",
+                "call-chat",
+                "forge_scope_read",
+                json!({"operation": "agent_chat.summary"}),
+            )
+            .await
+            .expect("scoped read should be invoked");
+        assert_eq!(value["scope"], "scope-1");
+        assert_eq!(value["operation"], "agent_chat.summary");
     }
 
     #[test]

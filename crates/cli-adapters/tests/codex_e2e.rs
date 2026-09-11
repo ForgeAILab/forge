@@ -11,6 +11,218 @@ use std::{
 
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
 
+struct ChatProbe {
+    called: std::sync::atomic::AtomicBool,
+    arguments: std::sync::Mutex<Vec<Value>>,
+}
+
+#[async_trait::async_trait]
+impl cli_adapters::codex::client::ChatToolHandler for ChatProbe {
+    fn specs(&self) -> Vec<cli_adapters::codex::protocol::DynamicToolSpec> {
+        vec![cli_adapters::codex::protocol::DynamicToolSpec {
+            name: "forge_chat_probe".to_owned(),
+            description: "Record the nested probe request and return a marker.".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "request": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["probe"]},
+                            "payload": {
+                                "type": "object",
+                                "properties": {
+                                    "message": {"type": "string", "enum": ["nested callback"]},
+                                    "metadata": {
+                                        "type": "object",
+                                        "properties": {
+                                            "priority": {"type": "string", "enum": ["high"]}
+                                        },
+                                        "required": ["priority"],
+                                        "additionalProperties": false
+                                    }
+                                },
+                                "required": ["message", "metadata"],
+                                "additionalProperties": false
+                            }
+                        },
+                        "required": ["kind", "payload"],
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["request"],
+                "additionalProperties": false
+            }),
+        }]
+    }
+
+    async fn call(&self, name: &str, call_id: &str, arguments: Value) -> Result<Value, String> {
+        assert_eq!(name, "forge_chat_probe");
+        assert!(!call_id.is_empty());
+        self.arguments
+            .lock()
+            .expect("probe argument lock")
+            .push(arguments);
+        self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(json!({"marker":"FORGE_CHAT_CALLBACK_OK"}))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the managed Codex CLI and an authenticated account"]
+async fn codex_chat_invokes_host_tool_without_a_git_repository() -> TestResult {
+    let sandbox = tempfile::tempdir()?;
+    let logs = tempfile::tempdir()?;
+    let handler = std::sync::Arc::new(ChatProbe {
+        called: std::sync::atomic::AtomicBool::new(false),
+        arguments: std::sync::Mutex::new(Vec::new()),
+    });
+    let adapter = CodexAdapter::new().with_chat_tools(handler.clone());
+    let result = tokio::time::timeout(Duration::from_secs(120), adapter.execute(ExecutionContext {
+        task_id: "chat-probe".to_owned(), execution_id: "chat-probe-turn".to_owned(),
+        worktree_path: sandbox.path().to_string_lossy().into_owned(),
+        description: "Call forge_chat_probe once with arguments that conform to its advertised schema. Then reply with exactly the marker it returns. Use no other tools.".to_owned(),
+        // The host capability must override this Task-style configuration.
+        agent_config: json!({"auto_commit":true,"sandbox":"workspace-write","permission_policy":"auto"}),
+        logs_path: logs.path().join("chat.jsonl").to_string_lossy().into_owned(),
+        heartbeat_interval_seconds: 30, max_turns: None, log_sender: None,
+    })).await??;
+    assert_eq!(result.status, ExecutionOutcome::Completed, "{result:?}");
+    assert!(
+        handler.called.load(std::sync::atomic::Ordering::SeqCst),
+        "host callback did not run: {result:?}"
+    );
+    let arguments = handler.arguments.lock().expect("probe argument lock");
+    assert_eq!(arguments.len(), 1, "expected exactly one probe callback");
+    assert_eq!(arguments[0]["request"]["kind"], "probe");
+    assert_eq!(
+        arguments[0]["request"]["payload"]["message"],
+        "nested callback"
+    );
+    assert_eq!(
+        arguments[0]["request"]["payload"]["metadata"]["priority"],
+        "high"
+    );
+    assert!(
+        result
+            .summary
+            .as_deref()
+            .is_some_and(|text| text.contains("FORGE_CHAT_CALLBACK_OK")),
+        "{result:?}"
+    );
+    assert_eq!(result.after_sha, None);
+    assert!(!sandbox.path().join(".git").exists());
+    Ok(())
+}
+
+struct DescriptionOnlyProbe {
+    called: std::sync::atomic::AtomicBool,
+    arguments: std::sync::Mutex<Vec<Value>>,
+}
+
+#[async_trait::async_trait]
+impl cli_adapters::codex::client::ChatToolHandler for DescriptionOnlyProbe {
+    fn specs(&self) -> Vec<cli_adapters::codex::protocol::DynamicToolSpec> {
+        let guidance =
+            "For operation probe, payload.message must be exactly `description callback`.";
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "operation".to_owned(),
+            json!({"type":"string","enum":["probe"]}),
+        );
+        properties.insert(
+            "payload".to_owned(),
+            json!({
+                "type":"object",
+                "description":guidance,
+                "additionalProperties":true
+            }),
+        );
+        // Force Codex's 0.154 large-schema compaction pass. The payload
+        // guidance is intentionally description-only and must survive via the
+        // dynamic function description that the adapter promotes it to.
+        properties.insert(
+            "padding".to_owned(),
+            json!({"type":"string","description":"padding ".repeat(1500)}),
+        );
+        vec![cli_adapters::codex::protocol::DynamicToolSpec {
+            name: "forge_description_probe".to_owned(),
+            description: "Record the description-guided probe and return a marker.".to_owned(),
+            input_schema: json!({
+                "type":"object",
+                "properties":properties,
+                "required":["operation","payload"],
+                "additionalProperties":false
+            }),
+        }]
+    }
+
+    async fn call(&self, name: &str, call_id: &str, arguments: Value) -> Result<Value, String> {
+        if name != "forge_description_probe" || call_id.is_empty() {
+            return Err(format!("unexpected probe call {name}/{call_id}"));
+        }
+        self.arguments
+            .lock()
+            .expect("description probe argument lock")
+            .push(arguments);
+        self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(json!({"marker":"FORGE_DESCRIPTION_GUIDANCE_OK"}))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the managed Codex CLI and an authenticated account"]
+async fn codex_chat_uses_payload_description_after_large_schema_compaction() -> TestResult {
+    let sandbox = tempfile::tempdir()?;
+    let logs = tempfile::tempdir()?;
+    let handler = std::sync::Arc::new(DescriptionOnlyProbe {
+        called: std::sync::atomic::AtomicBool::new(false),
+        arguments: std::sync::Mutex::new(Vec::new()),
+    });
+    let adapter = CodexAdapter::new().with_chat_tools(handler.clone());
+    let result = tokio::time::timeout(
+        Duration::from_secs(120),
+        adapter.execute(ExecutionContext {
+            task_id: "description-probe".to_owned(),
+            execution_id: "description-probe-turn".to_owned(),
+            worktree_path: sandbox.path().to_string_lossy().into_owned(),
+            description: "Call forge_description_probe once using its advertised contract, then reply with exactly the marker it returns. Use no other tools.".to_owned(),
+            agent_config: json!({"auto_commit":true,"sandbox":"workspace-write","permission_policy":"auto"}),
+            logs_path: logs.path().join("chat.jsonl").to_string_lossy().into_owned(),
+            heartbeat_interval_seconds: 30,
+            max_turns: None,
+            log_sender: None,
+        }),
+    )
+    .await??;
+    assert_eq!(result.status, ExecutionOutcome::Completed, "{result:?}");
+    assert!(
+        handler.called.load(std::sync::atomic::Ordering::SeqCst),
+        "description-guided callback did not run: {result:?}"
+    );
+    let arguments = handler
+        .arguments
+        .lock()
+        .expect("description probe argument lock");
+    assert_eq!(
+        arguments.len(),
+        1,
+        "expected exactly one description probe callback"
+    );
+    assert_eq!(arguments[0]["operation"], "probe");
+    assert_eq!(arguments[0]["payload"]["message"], "description callback");
+    assert!(
+        result
+            .summary
+            .as_deref()
+            .is_some_and(|text| text.contains("FORGE_DESCRIPTION_GUIDANCE_OK")),
+        "{result:?}"
+    );
+    assert_eq!(result.after_sha, None);
+    assert!(!sandbox.path().join(".git").exists());
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn codex_adapter_writes_file_in_live_repo() -> TestResult {
@@ -27,7 +239,7 @@ async fn codex_adapter_writes_file_in_live_repo() -> TestResult {
         return Ok(());
     }
 
-    if !npx_package_available_offline(["--offline", "-y", "@openai/codex@0.133.0", "--version"]) {
+    if !npx_package_available_offline(["--offline", "-y", "@openai/codex@0.154.0", "--version"]) {
         println!("skipping Codex E2E: @openai/codex npx package not available offline");
         return Ok(());
     }

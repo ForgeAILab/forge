@@ -249,27 +249,28 @@ impl CodingExecutorAdapter for GeminiAdapter {
             )
         };
 
-        let after_sha = if outcome == ExecutionOutcome::Completed {
-            match crate::commit::commit_execution_changes(&ctx).await {
-                Ok(Some(sha)) => Some(sha),
-                Ok(None) => git::get_current_sha(Path::new(&ctx.worktree_path))
-                    .await
-                    .ok(),
-                Err(e) => {
-                    return Ok(ExecutionResult {
-                        status: ExecutionOutcome::Failed,
-                        after_sha: None,
-                        agent_session_id: stream.agent_session_id,
-                        summary: stream.summary,
-                        error: Some(e.to_string()),
-                        usage_reports: Vec::new(),
-                        ..Default::default()
-                    });
+        let after_sha =
+            if outcome == ExecutionOutcome::Completed && crate::commit::auto_commit_enabled(&ctx) {
+                match crate::commit::commit_execution_changes(&ctx).await {
+                    Ok(Some(sha)) => Some(sha),
+                    Ok(None) => git::get_current_sha(Path::new(&ctx.worktree_path))
+                        .await
+                        .ok(),
+                    Err(e) => {
+                        return Ok(ExecutionResult {
+                            status: ExecutionOutcome::Failed,
+                            after_sha: None,
+                            agent_session_id: stream.agent_session_id,
+                            summary: stream.summary,
+                            error: Some(e.to_string()),
+                            usage_reports: Vec::new(),
+                            ..Default::default()
+                        });
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         Ok(ExecutionResult {
             status: outcome,
