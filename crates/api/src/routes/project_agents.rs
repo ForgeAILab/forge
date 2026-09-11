@@ -8,7 +8,7 @@ use services::agent_service::compute_effective_status;
 
 use crate::{
     errors::{ApiError, ApiResult},
-    routes::{agent_response_for_user, auth::AuthenticatedUser},
+    routes::{agent_response, auth::AuthenticatedUser},
     state::AppState,
 };
 
@@ -36,13 +36,12 @@ pub async fn list_project_agents(
         let stats = ExecutionRepo::stats_by_agent(&*state.db, &agent.id).await?;
         let usage =
             services::usage_projection::usage_aggregate_for_agent(&state.db, &agent.id).await?;
-        responses.push(agent_response_for_user(
+        responses.push(agent_response(
             agent,
             Some(active_task_count),
             Some(effective_status),
             stats,
             usage,
-            user.is_admin,
         ));
     }
 

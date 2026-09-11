@@ -140,6 +140,7 @@ export interface CreateEmbeddedAgentInput {
   description?: string | null
   credential_id: string
   model: string
+  reasoning_effort?: string | null
   system_prompt?: string | null
   account_permission_ceiling?: JsonObject | null
   tool_policy?: JsonObject | null
@@ -152,6 +153,7 @@ export interface ConnectEmbeddedProfileInput {
   version: number
   credential_id: string
   model: string
+  reasoning_effort?: string | null
   system_prompt?: string | null
   permission_policy?: string | null
   tool_policy?: JsonObject | null

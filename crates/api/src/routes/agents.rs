@@ -19,7 +19,7 @@ use crate::{
     errors::{ApiError, ApiResult},
     routes::auth::AuthenticatedUser,
     routes::{
-        agent_response_for_user, page_request, parse_csv, serialize_json, task_page_request,
+        agent_response, page_request, parse_csv, serialize_json, task_page_request,
         task_response_light, ListParams,
     },
     state::AppState,
@@ -426,11 +426,10 @@ pub async fn agent_discovered_options(
     }))
 }
 
-async fn build_agent_response_for_user(
+async fn build_agent_response(
     state: &AppState,
     agent: Agent,
     active_task_count: Option<i64>,
-    user: &AuthenticatedUser,
 ) -> ApiResult<AgentResponse> {
     let effective_status = compute_effective_status(&state.db, &agent)
         .await?
@@ -438,14 +437,26 @@ async fn build_agent_response_for_user(
         .to_owned();
     let stats = ExecutionRepo::stats_by_agent(&*state.db, &agent.id).await?;
     let usage = services::usage_projection::usage_aggregate_for_agent(&state.db, &agent.id).await?;
-    Ok(agent_response_for_user(
+    Ok(agent_response(
         agent,
         active_task_count,
         Some(effective_status),
         stats,
         usage,
-        user.is_admin,
     ))
+}
+
+async fn build_agent_response_for_user(
+    state: &AppState,
+    agent: Agent,
+    active_task_count: Option<i64>,
+    user: &AuthenticatedUser,
+) -> ApiResult<AgentResponse> {
+    let mut response = build_agent_response(state, agent, active_task_count).await?;
+    if !user.is_admin {
+        response.daemon_id = None;
+    }
+    Ok(response)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -465,6 +476,7 @@ fn can_view_agent(agent: &Agent, user: &AuthenticatedUser) -> bool {
 
 fn can_manage_agent(agent: &Agent, user: &AuthenticatedUser) -> bool {
     agent.owner_id.as_deref() == Some(&user.user_id)
+        || (user.is_admin && agent.owner_id.is_none() && agent.visibility == "global")
 }
 
 fn require_agent_visible(agent: &Agent, user: &AuthenticatedUser, id: &str) -> ApiResult<()> {

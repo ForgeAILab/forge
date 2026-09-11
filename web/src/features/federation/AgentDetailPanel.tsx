@@ -37,7 +37,13 @@ import {
   formatTokens,
 } from '@/components/settings/project-settings-utils'
 import { formatMoneyAmount } from '@/lib/money-format'
-import { DEFAULT_CEILING, humanize, isDirectAgent, runtimeDisplayNames } from './format'
+import {
+  DEFAULT_CEILING,
+  humanize,
+  isDirectAgent,
+  runtimeDisplayNames,
+  supportsDirectReasoningEntry,
+} from './format'
 import { AgentActivationSummary } from './AgentActivationSummary'
 
 export function AgentDetailPanel({
@@ -69,7 +75,9 @@ export function AgentDetailPanel({
 
   const boundChips = chatEntries
     .filter((entry) => entry.identity_id === agent.id)
-    .map((entry) => (entry.kind === 'main' ? 'Main Agent' : (entry.project_name ?? 'Project Agent')))
+    .map((entry) =>
+      entry.kind === 'main' ? 'Main Agent' : (entry.project_name ?? 'Project Agent'),
+    )
 
   return (
     <div className="flex flex-1 flex-col overflow-y-auto">
@@ -80,7 +88,10 @@ export function AgentDetailPanel({
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="truncate text-lg font-semibold text-foreground">{agent.name}</h2>
-            <StateBadge status={agent.effective_status ?? agent.status} label={humanize(agent.effective_status ?? agent.status)} />
+            <StateBadge
+              status={agent.effective_status ?? agent.status}
+              label={humanize(agent.effective_status ?? agent.status)}
+            />
           </div>
           <p className="mt-1 truncate font-mono text-xs text-muted-foreground">
             {runtimeDisplayNames[runtime] ?? humanize(runtime)}
@@ -102,7 +113,10 @@ export function AgentDetailPanel({
       </header>
 
       <div className="flex-1 space-y-6 px-6 py-5">
-        <section className="rounded-md border border-border-subtle bg-card p-3" aria-label="Agent availability">
+        <section
+          className="rounded-md border border-border-subtle bg-card p-3"
+          aria-label="Agent availability"
+        >
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <p className="text-sm font-medium text-foreground">
@@ -142,8 +156,9 @@ export function AgentDetailPanel({
           {confirmingDisable ? (
             <div className="mt-3 rounded-md border border-warning/30 bg-warning/10 p-3 text-xs text-warning">
               <p>
-                Disable this Agent? Existing {boundChips.length > 0 ? boundChips.join(' and ') : 'settings'}
-                {' '}stay in place, but the Agent will not accept new work until re-enabled.
+                Disable this Agent? Existing{' '}
+                {boundChips.length > 0 ? boundChips.join(' and ') : 'settings'} stay in place, but
+                the Agent will not accept new work until re-enabled.
               </p>
               <div className="mt-2 flex gap-2">
                 <Button
@@ -173,7 +188,9 @@ export function AgentDetailPanel({
             </div>
           ) : null}
           {availabilityError ? (
-            <p className="mt-2 text-xs text-destructive" role="alert">{availabilityError}</p>
+            <p className="mt-2 text-xs text-destructive" role="alert">
+              {availabilityError}
+            </p>
           ) : null}
         </section>
         {/* Stat grid */}
@@ -193,7 +210,9 @@ export function AgentDetailPanel({
               label: 'Task executions',
               value: formatTokens(agent.usage.counts.task_execution_count),
               detail:
-                agent.success_rate != null ? `${formatRate(agent.success_rate)} success` : undefined,
+                agent.success_rate != null
+                  ? `${formatRate(agent.success_rate)} success`
+                  : undefined,
             },
             {
               label: 'Tokens used',
@@ -227,11 +246,17 @@ export function AgentDetailPanel({
               value: formatDuration(agent.avg_duration_ms ?? null),
             },
           ].map((stat) => (
-            <div key={stat.label} className="rounded-lg border border-border-subtle bg-muted/40 px-3.5 py-3">
+            <div
+              key={stat.label}
+              className="rounded-lg border border-border-subtle bg-muted/40 px-3.5 py-3"
+            >
               <p className="mb-1.5 font-mono text-micro font-semibold uppercase tracking-[0.8px] text-muted-foreground">
                 {stat.label}
               </p>
-              <p className="truncate font-mono text-lg font-semibold tabular-nums text-foreground" title={String(stat.value)}>
+              <p
+                className="truncate font-mono text-lg font-semibold tabular-nums text-foreground"
+                title={String(stat.value)}
+              >
                 {stat.value}
               </p>
               {'detail' in stat && stat.detail ? (
@@ -399,7 +424,12 @@ function AgentSettingsForm({
 
   const activeEntries = entries.filter((entry) => entry.status === 'configured' && entry.enabled)
   const capabilities = useAgentProviderCapabilitiesQuery()
-  const discovered = useDiscoveredOptions(agent.id, direct ? null : agent.executor_type)
+  const selectedEntry = entries.find((entry) => entry.id === entryId)
+  const directReasoningAvailable = direct && supportsDirectReasoningEntry(selectedEntry)
+  const discovered = useDiscoveredOptions(
+    direct ? null : agent.id,
+    direct ? (directReasoningAvailable ? 'codex' : null) : agent.executor_type,
+  )
 
   const connectProfile = useConnectEmbeddedProfileMutation()
   const updateAgent = useUpdateAgent()
@@ -430,7 +460,8 @@ function AgentSettingsForm({
     model !== (agent.model ?? '') ||
     systemPrompt !== (agent.prompt_template ?? '') ||
     (direct
-      ? entryId !== (agent.credential_handle_id ?? '')
+      ? entryId !== (agent.credential_handle_id ?? '') ||
+        reasoningEffort !== (agent.reasoning_effort ?? '')
       : reasoningEffort !== (agent.reasoning_effort ?? '') ||
         permissionPolicy !== (agent.permission_policy ?? null))
   const dirty = identityDirty || profileDirty
@@ -493,6 +524,7 @@ function AgentSettingsForm({
               version,
               credential_id: entryId,
               model: model.trim(),
+              reasoning_effort: reasoningEffort.trim() ? reasoningEffort.trim() : null,
               system_prompt: systemPrompt.trim() ? systemPrompt.trim() : null,
               permission_policy: agent.permission_policy ?? 'scoped_proposals',
               tool_policy: DEFAULT_CEILING,
@@ -604,7 +636,13 @@ function AgentSettingsForm({
                   id="agent-settings-entry"
                   value={entryId}
                   placeholder={activeEntries.length === 0 ? 'No connected entries' : 'Select entry'}
-                  onChange={setEntryId}
+                  onChange={(next) => {
+                    setEntryId(next)
+                    const nextEntry = entries.find((entry) => entry.id === next)
+                    if (!supportsDirectReasoningEntry(nextEntry)) {
+                      setReasoningEffort('')
+                    }
+                  }}
                   disabled={activeEntries.length === 0}
                   options={activeEntries.map((entry) => ({
                     value: entry.id,
@@ -617,11 +655,25 @@ function AgentSettingsForm({
                 <Input
                   id="agent-settings-model"
                   value={model}
-                  onChange={(event) => setModel(event.target.value)}
+                  onChange={(event) => {
+                    setModel(event.target.value)
+                    setReasoningEffort('')
+                  }}
                   placeholder={selectedEntryCapability?.default_model ?? 'e.g. claude-sonnet-5'}
                   required
                 />
               </div>
+              {directReasoningAvailable ? (
+                <ReasoningSelector
+                  id="agent-settings-reasoning"
+                  options={reasoningOptionsForModel}
+                  value={reasoningEffort.trim() ? reasoningEffort : null}
+                  isLoading={discovered.isFetching}
+                  hasError={discovered.isError}
+                  placeholder="Default (provider setting)"
+                  onChange={(next) => setReasoningEffort(next ?? '')}
+                />
+              ) : null}
             </>
           ) : (
             <>
@@ -679,7 +731,13 @@ function AgentSettingsForm({
               : 'Every scope this agent is bound to follows these settings. Task launches can still override them per execution.'}
           </p>
           {dirty ? (
-            <Button type="button" variant="ghost" size="sm" onClick={syncFromAgent} disabled={pending}>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={syncFromAgent}
+              disabled={pending}
+            >
               Discard
             </Button>
           ) : null}

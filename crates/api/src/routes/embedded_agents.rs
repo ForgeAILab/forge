@@ -25,7 +25,7 @@ use services::{
 
 use crate::{
     errors::{ApiError, ApiResult},
-    routes::{agent_response_for_user, auth::AuthenticatedUser, redact_sensitive_config},
+    routes::{agent_response, auth::AuthenticatedUser, redact_sensitive_config},
     state::AppState,
 };
 
@@ -42,6 +42,7 @@ pub async fn create_embedded_agent(
             description: request.description,
             credential_id: request.credential_id,
             model: request.model,
+            reasoning_effort: request.reasoning_effort,
             system_prompt: request.system_prompt,
             account_permission_ceiling: request
                 .account_permission_ceiling
@@ -54,7 +55,7 @@ pub async fn create_embedded_agent(
             max_output_tokens: request.max_output_tokens,
         })
         .await?;
-    let agent = response_for_agent(&state, connected.agent, user.is_admin).await?;
+    let agent = response_for_agent(&state, connected.agent).await?;
     Ok(Json(ConnectedEmbeddedAgentResponse {
         agent,
         credential_handle: credential_response(connected.credential_handle),
@@ -70,7 +71,6 @@ pub async fn connect_embedded_profile(
     Path(identity_id): Path<String>,
     Json(request): Json<ConnectEmbeddedProfileRequest>,
 ) -> ApiResult<Json<ConnectedEmbeddedProfileResponse>> {
-    let is_admin = user.is_admin;
     let (agent, credential, profile, health) = state
         .embedded_agent_service
         .connect_profile(ConnectEmbeddedProfile {
@@ -79,6 +79,7 @@ pub async fn connect_embedded_profile(
             expected_identity_version: request.version,
             credential_id: request.credential_id,
             model: request.model,
+            reasoning_effort: request.reasoning_effort,
             system_prompt: request.system_prompt,
             permission_policy: request.permission_policy,
             tool_policy: request
@@ -90,7 +91,7 @@ pub async fn connect_embedded_profile(
         })
         .await?;
     Ok(Json(ConnectedEmbeddedProfileResponse {
-        agent: response_for_agent(&state, agent, is_admin).await?,
+        agent: response_for_agent(&state, agent).await?,
         profile: profile_response(profile),
         credential_handle: credential_response(credential),
         health: health_response(health),
@@ -124,9 +125,7 @@ pub async fn select_profile(
         },
     )
     .await?;
-    Ok(Json(
-        response_for_agent(&state, agent, user.is_admin).await?,
-    ))
+    Ok(Json(response_for_agent(&state, agent).await?))
 }
 
 pub async fn create_session(
@@ -312,11 +311,7 @@ async fn set_session_status(
     Ok(Json(session_response(session)))
 }
 
-async fn response_for_agent(
-    state: &AppState,
-    agent: Agent,
-    is_admin: bool,
-) -> ApiResult<api_types::AgentResponse> {
+async fn response_for_agent(state: &AppState, agent: Agent) -> ApiResult<api_types::AgentResponse> {
     let stats = ExecutionRepo::stats_by_agent(&*state.db, &agent.id).await?;
     let usage = services::usage_projection::usage_aggregate_for_agent(&state.db, &agent.id).await?;
     let active_task_count = AgentRepo::count_active_tasks(&*state.db, &agent.id).await?;
@@ -324,13 +319,12 @@ async fn response_for_agent(
         .await?
         .as_str()
         .to_owned();
-    Ok(agent_response_for_user(
+    Ok(agent_response(
         agent,
         Some(active_task_count),
         Some(effective_status),
         stats,
         usage,
-        is_admin,
     ))
 }
 

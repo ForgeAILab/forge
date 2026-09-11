@@ -321,6 +321,7 @@ Your inquiry id is {inquiry_id}."
                 provider,
                 base_url: config.base_url,
                 model,
+                reasoning_effort: profile.reasoning_effort.clone(),
                 credential_handle_id: credential_ref.to_owned(),
                 owner_user_id: request.account_id.clone(),
                 provider_account_id,

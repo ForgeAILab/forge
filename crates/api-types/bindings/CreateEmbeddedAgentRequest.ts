@@ -4,4 +4,4 @@
  * Create a direct (embedded-runtime) agent referencing an existing provider
  * entry. Credentials are never part of this request.
  */
-export type CreateEmbeddedAgentRequest = { name: string, description: string | null, credential_id: string, model: string, system_prompt: string | null, account_permission_ceiling: Record<string, unknown> | null, tool_policy: Record<string, unknown> | null, context_tokens: number | null, max_input_tokens: number | null, max_output_tokens: number | null, };
+export type CreateEmbeddedAgentRequest = { name: string, description: string | null, credential_id: string, model: string, reasoning_effort: string | null, system_prompt: string | null, account_permission_ceiling: Record<string, unknown> | null, tool_policy: Record<string, unknown> | null, context_tokens: number | null, max_input_tokens: number | null, max_output_tokens: number | null, };

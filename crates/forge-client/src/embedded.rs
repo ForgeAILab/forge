@@ -66,6 +66,9 @@ struct ConnectArgs {
     credential_id: String,
     #[arg(long)]
     model: String,
+    /// Model-supported reasoning effort for a direct ChatGPT login.
+    #[arg(long)]
+    reasoning_effort: Option<String>,
     #[arg(long)]
     description: Option<String>,
     #[arg(long)]
@@ -110,6 +113,9 @@ struct ProfileConnectArgs {
     credential_id: String,
     #[arg(long)]
     model: String,
+    /// Model-supported reasoning effort for a direct ChatGPT login.
+    #[arg(long)]
+    reasoning_effort: Option<String>,
     #[arg(long)]
     system_prompt: Option<String>,
     #[arg(long)]
@@ -596,6 +602,7 @@ async fn connect(client: &ForgeClient, output: &OutputFormat, args: &ConnectArgs
         description: args.description.clone(),
         credential_id: args.credential_id.clone(),
         model: args.model.clone(),
+        reasoning_effort: args.reasoning_effort.clone(),
         system_prompt: args.system_prompt.clone(),
         account_permission_ceiling: None,
         tool_policy: args.tool_policy.as_deref().map(parse_json).transpose()?,
@@ -621,6 +628,7 @@ async fn profile(client: &ForgeClient, output: &OutputFormat, args: &ProfileArgs
                 version: args.version,
                 credential_id: args.credential_id.clone(),
                 model: args.model.clone(),
+                reasoning_effort: args.reasoning_effort.clone(),
                 system_prompt: args.system_prompt.clone(),
                 permission_policy: args.permission_policy.clone(),
                 tool_policy: args.tool_policy.as_deref().map(parse_json).transpose()?,

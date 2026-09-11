@@ -12,6 +12,7 @@ export function ReasoningSelector({
   disabled,
   isLoading,
   hasError,
+  placeholder,
   className,
   onChange,
 }: {
@@ -21,6 +22,7 @@ export function ReasoningSelector({
   disabled?: boolean
   isLoading?: boolean
   hasError?: boolean
+  placeholder?: string
   className?: string
   onChange: (reasoningEffort: string | null) => void
 }) {
@@ -36,7 +38,9 @@ export function ReasoningSelector({
         <Select
           id={id}
           value={value ?? ''}
-          placeholder={hasError ? 'Could not load options' : 'Default (agent setting)'}
+          placeholder={
+            hasError ? 'Could not load options' : (placeholder ?? 'Default (agent setting)')
+          }
           disabled={disabled}
           options={options.map((o) => ({ value: o.id, label: o.label }))}
           onChange={(v) => onChange(v || null)}

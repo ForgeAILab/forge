@@ -232,6 +232,7 @@ pub struct NativeProviderConfig {
     pub provider: String,
     pub base_url: String,
     pub model: String,
+    pub reasoning_effort: Option<String>,
     pub credential_handle_id: String,
     pub owner_user_id: String,
     /// The provider-side account the credential belongs to (for OAuth
@@ -250,6 +251,7 @@ impl fmt::Debug for NativeProviderConfig {
             .field("provider", &self.provider)
             .field("base_url", &self.base_url)
             .field("model", &self.model)
+            .field("reasoning_effort", &self.reasoning_effort)
             .field("credential", &"[protected handle]")
             .field("context_tokens", &self.context_tokens)
             .field("max_input_tokens", &self.max_input_tokens)

@@ -1,5 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { CaretRight, Key, MagnifyingGlass, Plus, Robot, ShieldCheck, TerminalWindow } from '@phosphor-icons/react'
+import {
+  CaretRight,
+  Key,
+  MagnifyingGlass,
+  Plus,
+  Robot,
+  ShieldCheck,
+  TerminalWindow,
+} from '@phosphor-icons/react'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -28,12 +36,16 @@ import type { FederatedAgent } from '@/features/federation/types'
 import type { CliRuntimeEntryResponse, ProviderEntryResponse } from '@/types/generated'
 import { EmptyPanel, ErrorPanel, LoadingPanel, StatusDot } from '@/features/federation/components'
 import { AgentDetailPanel } from './AgentDetailPanel'
-import { DEFAULT_CEILING, humanize, runtimeDisplayNames, runtimeOptionsForEntry } from './format'
+import {
+  DEFAULT_CEILING,
+  humanize,
+  runtimeDisplayNames,
+  runtimeOptionsForEntry,
+  supportsDirectReasoningEntry,
+} from './format'
 
 /** The chosen harness: a direct provider entry, or a CLI runtime kind. */
-type HarnessChoice =
-  | { kind: 'direct'; entryId: string }
-  | { kind: 'cli'; runtime: string }
+type HarnessChoice = { kind: 'direct'; entryId: string } | { kind: 'cli'; runtime: string }
 
 /**
  * Two-step creation: choose the harness (direct or CLI), then set the agent's
@@ -87,19 +99,22 @@ export function NewAgentDialog({
       ? (activeEntries.find((entry) => entry.id === harness.entryId) ?? null)
       : null
   const cliRuntime = harness?.kind === 'cli' ? harness.runtime : null
+  const directReasoningAvailable = supportsDirectReasoningEntry(selectedEntry)
+  const discoveryRuntime = cliRuntime ?? (directReasoningAvailable ? 'codex' : null)
   const capability = selectedEntry
     ? capabilities.data?.items.find((item) => item.provider === selectedEntry.provider)
     : undefined
   const step: 1 | 2 = harness ? 2 : 1
-  const discovered = useDiscoveredOptions(null, cliRuntime)
+  const discovered = useDiscoveredOptions(null, discoveryRuntime)
   const reasoningOptionsForModel = useMemo(
     () => getReasoningOptionsForModel(discovered.data, model.trim() ? model : null),
     [discovered.data, model],
   )
   const uniqueCliRuntimes = cliRuntimes.filter(
     (runtimeEntry, index, all) =>
-      runtimeEntry.enabled
-      && all.findIndex((candidate) => candidate.enabled && candidate.kind === runtimeEntry.kind) === index,
+      runtimeEntry.enabled &&
+      all.findIndex((candidate) => candidate.enabled && candidate.kind === runtimeEntry.kind) ===
+        index,
   )
   /** Entries whose provider can power the chosen CLI harness via injection. */
   const harnessCredentialEntries = useMemo(() => {
@@ -137,6 +152,7 @@ export function NewAgentDialog({
           description: description.trim() ? description.trim() : null,
           credential_id: selectedEntry.id,
           model: model.trim(),
+          reasoning_effort: reasoningEffort.trim() ? reasoningEffort.trim() : null,
           system_prompt: systemPrompt.trim() ? systemPrompt.trim() : null,
           account_permission_ceiling: DEFAULT_CEILING,
           tool_policy: DEFAULT_CEILING,
@@ -198,15 +214,18 @@ export function NewAgentDialog({
                     key={entry.id}
                     type="button"
                     className="flex w-full items-center justify-between gap-3 rounded-md border border-border-subtle bg-card px-3 py-2 text-left hover:border-ember-border"
-                    onClick={() => setHarness({ kind: 'direct', entryId: entry.id })}
+                    onClick={() => {
+                      setHarness({ kind: 'direct', entryId: entry.id })
+                      setReasoningEffort('')
+                    }}
                   >
                     <div className="min-w-0">
                       <p className="truncate text-sm font-medium text-foreground">
                         {humanize(entry.provider)} · {entry.label}
                       </p>
                       <p className="mt-0.5 text-xs text-muted-foreground">
-                        {entry.credential_method === 'oauth_bundle' ? 'OAuth login' : 'API key'} · used
-                        by {entry.used_by.length}
+                        {entry.credential_method === 'oauth_bundle' ? 'OAuth login' : 'API key'} ·
+                        used by {entry.used_by.length}
                       </p>
                     </div>
                     <CaretRight size={15} className="shrink-0 text-muted-foreground" aria-hidden />
@@ -224,7 +243,10 @@ export function NewAgentDialog({
                     key={runtimeEntry.kind}
                     type="button"
                     className="flex w-full items-center justify-between gap-3 rounded-md border border-border-subtle bg-card px-3 py-2 text-left hover:border-ember-border"
-                    onClick={() => setHarness({ kind: 'cli', runtime: runtimeEntry.kind })}
+                    onClick={() => {
+                      setHarness({ kind: 'cli', runtime: runtimeEntry.kind })
+                      setReasoningEffort('')
+                    }}
                   >
                     <div className="flex min-w-0 items-center gap-2.5">
                       <TerminalWindow size={16} className="shrink-0 text-primary" aria-hidden />
@@ -296,11 +318,25 @@ export function NewAgentDialog({
                   <Input
                     id="agent-model"
                     value={model}
-                    onChange={(event) => setModel(event.target.value)}
+                    onChange={(event) => {
+                      setModel(event.target.value)
+                      setReasoningEffort('')
+                    }}
                     required
                   />
                 </div>
               )}
+              {directReasoningAvailable ? (
+                <ReasoningSelector
+                  id="agent-reasoning"
+                  options={reasoningOptionsForModel}
+                  value={reasoningEffort.trim() ? reasoningEffort : null}
+                  isLoading={discovered.isFetching}
+                  hasError={discovered.isError}
+                  placeholder="Default (provider setting)"
+                  onChange={(next) => setReasoningEffort(next ?? '')}
+                />
+              ) : null}
               {cliRuntime ? (
                 <>
                   <ReasoningSelector
@@ -363,9 +399,14 @@ export function NewAgentDialog({
               <Button type="button" variant="ghost" onClick={() => setHarness(null)}>
                 Back
               </Button>
-              <Button type="submit" disabled={createEmbedded.isPending || registerHarness.isPending}>
+              <Button
+                type="submit"
+                disabled={createEmbedded.isPending || registerHarness.isPending}
+              >
                 <ShieldCheck size={15} aria-hidden />
-                {createEmbedded.isPending || registerHarness.isPending ? 'Creating…' : 'Create agent'}
+                {createEmbedded.isPending || registerHarness.isPending
+                  ? 'Creating…'
+                  : 'Create agent'}
               </Button>
             </DialogFooter>
           </form>
@@ -483,7 +524,14 @@ export function AgentsTab({
       if (providerFilter !== 'all' && agent.provider !== providerFilter) return false
       if (statusFilter !== 'all' && agent.status !== statusFilter) return false
       if (!normalized) return true
-      return [agent.name, agent.description, agent.executor_type, agent.provider, agent.model, agent.status]
+      return [
+        agent.name,
+        agent.description,
+        agent.executor_type,
+        agent.provider,
+        agent.model,
+        agent.status,
+      ]
         .filter(Boolean)
         .some((value) => String(value).toLowerCase().includes(normalized))
     })

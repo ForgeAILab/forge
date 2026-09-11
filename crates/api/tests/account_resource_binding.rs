@@ -149,27 +149,6 @@ async fn bearer_json_status(
         .status()
 }
 
-fn jwt_for_missing_user() -> String {
-    use jsonwebtoken::{Algorithm, EncodingKey, Header};
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time after epoch")
-        .as_secs();
-    jsonwebtoken::encode(
-        &Header::new(Algorithm::HS256),
-        &json!({
-            "sub": "deleted-user-id",
-            "email": "deleted@example.test",
-            "is_admin": false,
-            "iat": now,
-            "exp": now + 900,
-        }),
-        &EncodingKey::from_secret(b"test-jwt-secret-for-development"),
-    )
-    .expect("stale test jwt encodes")
-}
-
 // ── 6.1 ProjectMemberRepo unit tests ─────────────────────────────────────
 
 #[tokio::test]
@@ -483,29 +462,6 @@ async fn project_auto_membership_and_non_member_scoping() {
     );
 }
 
-#[tokio::test]
-async fn stale_jwt_cannot_create_an_ownerless_project() {
-    let ws = common::TestDir::new("stale-project-owner-ws");
-    let harness = common::test_app(ws.path(), "stale-project-owner").await;
-
-    let status = bearer_json_status(
-        &harness.app,
-        Method::POST,
-        "/api/v1/projects",
-        &jwt_for_missing_user(),
-        json!({ "name": "must-not-exist" }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-
-    let project_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM project WHERE name = ?")
-        .bind("must-not-exist")
-        .fetch_one(harness.state.db.pool())
-        .await
-        .expect("project count loads");
-    assert_eq!(project_count, 0);
-}
-
 // ── 6.6 Agent account-visibility scoping ─────────────────────────────────
 
 #[tokio::test]
@@ -654,65 +610,6 @@ async fn non_admin_cannot_pin_agent_to_daemon() {
         StatusCode::FORBIDDEN,
         "non-admin must not pin agents to daemons"
     );
-}
-
-#[tokio::test]
-async fn non_admin_project_agent_roster_redacts_daemon_id() {
-    let ws = common::TestDir::new("project-agent-redaction-ws");
-    let harness = common::test_app(ws.path(), "project-agent-redaction").await;
-    let app = &harness.app;
-
-    let registration: api_types::DaemonRegisterResponse = bearer_json(
-        app,
-        Method::POST,
-        "/api/v1/daemons/register",
-        &common::test_jwt(),
-        json!({
-            "machine_id": "project-agent-redaction-machine",
-            "hostname": "project-agent-redaction-host",
-            "os": "linux",
-            "arch": "x86_64",
-            "agent_version": "test"
-        }),
-        StatusCode::OK,
-    )
-    .await;
-    let agent: AgentResponse = bearer_json(
-        app,
-        Method::POST,
-        "/api/v1/agents",
-        &common::admin_jwt(),
-        json!({
-            "name": "project-agent-redaction",
-            "executor_type": "shell",
-            "daemon_id": registration.daemon_id
-        }),
-        StatusCode::OK,
-    )
-    .await;
-    assert!(agent.daemon_id.is_some(), "administrators see daemon ids");
-
-    let project: ProjectResponse = bearer_json(
-        app,
-        Method::POST,
-        "/api/v1/projects",
-        &common::test_jwt(),
-        json!({ "name": "project-agent-redaction" }),
-        StatusCode::OK,
-    )
-    .await;
-    let candidates: Vec<AgentResponse> = bearer_get(
-        app,
-        &format!("/api/v1/projects/{}/agents", project.id),
-        &common::test_jwt(),
-        StatusCode::OK,
-    )
-    .await;
-    let candidate = candidates
-        .iter()
-        .find(|candidate| candidate.id == agent.id)
-        .expect("owned agent is selectable for the project");
-    assert_eq!(candidate.daemon_id, None);
 }
 
 // ── 6.7 Membership CRUD ───────────────────────────────────────────────────

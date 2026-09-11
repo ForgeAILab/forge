@@ -423,6 +423,7 @@ impl EmbeddedTaskExecutor {
                             provider: provider.clone(),
                             base_url: config.base_url,
                             model: model.clone(),
+                            reasoning_effort: profile.reasoning_effort.clone(),
                             credential_handle_id: credential_ref.to_owned(),
                             owner_user_id: owner_user_id.clone(),
                             provider_account_id,

@@ -74,8 +74,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Bind agents created through authenticated MCP to that account instead of
   creating unowned global identities. Registration and roster listing now
   require account-scoped MCP, daemon pinning preserves the REST admin check,
-  roster visibility is filtered before pagination, and every REST/MCP Agent
-  response redacts daemon IDs from non-admin users.
+  and roster visibility is filtered before pagination. Account admins may
+  configure legacy unowned global agents so existing records can be repaired
+  without replacing their identity or assignment history.
 - Let Agent Settings edit an agent's maximum concurrent task executions and
   delete an agent from the roster with an explicit confirmation while
   preserving its run history.
@@ -106,6 +107,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Direct agents backed by a ChatGPT browser or device login can select the
+  chosen model's advertised reasoning effort, including `xhigh`, `max`, and
+  `ultra` where supported, in Agent Settings or with the REST/CLI profile
+  inputs. The immutable profile value now reaches every native chat, Task, and
+  inquiry provider request.
 - Server-owned models.dev pricing catalog status, explicit conditional refresh,
   opaque-cursor model rates, exact provider-entry/CLI-runtime bindings, and
   immutable manual per-million-token overrides. Refresh failures retain the

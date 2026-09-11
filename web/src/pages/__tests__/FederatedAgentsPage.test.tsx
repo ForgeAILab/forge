@@ -136,10 +136,26 @@ vi.mock('@/hooks/useDiscoveredOptions', async (importOriginal) => ({
           provider: 'OpenAI',
           reasoningOptions: ['medium', 'high'],
         },
+        {
+          id: 'gpt-6-astra',
+          displayName: 'GPT-6 Astra',
+          provider: 'OpenAI',
+          reasoningOptions: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+        },
+        {
+          id: 'gpt-5.6-terra',
+          displayName: 'GPT-5.6 Terra',
+          provider: 'OpenAI',
+          reasoningOptions: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+        },
       ],
       reasoningOptions: [
+        { id: 'low', label: 'Low' },
         { id: 'medium', label: 'Medium' },
         { id: 'high', label: 'High' },
+        { id: 'xhigh', label: 'XHigh' },
+        { id: 'max', label: 'Max' },
+        { id: 'ultra', label: 'Ultra' },
       ],
       permissionPolicies: ['auto', 'supervised', 'plan'],
     },
@@ -532,7 +548,9 @@ describe('FederatedAgentsPage', () => {
     // The save bar stays disabled until something actually changes.
     const save = screen.getByRole('button', { name: /save settings/i }) as HTMLButtonElement
     expect(save.disabled).toBe(true)
-    fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'gpt-6' } })
+    fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'gpt-6-astra' } })
+    fireEvent.click(screen.getByLabelText('Reasoning'))
+    fireEvent.click(within(screen.getByRole('listbox')).getByRole('option', { name: /Max/ }))
     expect(save.disabled).toBe(false)
     fireEvent.click(save)
     await vi.waitFor(() =>
@@ -540,7 +558,8 @@ describe('FederatedAgentsPage', () => {
         identityId: 'agent-1',
         input: expect.objectContaining({
           credential_id: 'credential-1',
-          model: 'gpt-6',
+          model: 'gpt-6-astra',
+          reasoning_effort: 'max',
           version: 1,
         }),
       }),
@@ -710,23 +729,26 @@ describe('FederatedAgentsPage', () => {
     )
   })
 
-  it('creates a direct agent from a provider entry through the two-step wizard', async () => {
+  it('creates a direct ChatGPT agent with a reasoning effort through the two-step wizard', async () => {
     renderPage()
     fireEvent.click(screen.getAllByRole('button', { name: /new agent/i })[0])
     const wizard = within(screen.getByRole('dialog'))
     // Step 1 groups direct provider entries and CLI harnesses (with versions).
     expect(wizard.getByText('Claude Code harness')).toBeTruthy()
     expect(wizard.getByText('v2.1.0')).toBeTruthy()
-    fireEvent.click(wizard.getByRole('button', { name: /Openai · Work key/i }))
+    fireEvent.click(wizard.getByRole('button', { name: /Openai · Personal ChatGPT/i }))
     fireEvent.change(wizard.getByLabelText('Agent name'), { target: { value: 'Main guide' } })
-    fireEvent.change(wizard.getByLabelText('Model'), { target: { value: 'gpt-5' } })
+    fireEvent.change(wizard.getByLabelText('Model'), { target: { value: 'gpt-5.6-terra' } })
+    fireEvent.click(wizard.getByLabelText('Reasoning'))
+    fireEvent.click(within(screen.getByRole('listbox')).getByRole('option', { name: /Ultra/ }))
     fireEvent.click(wizard.getByRole('button', { name: /create agent/i }))
     await vi.waitFor(() =>
       expect(createEmbeddedAgent).toHaveBeenCalledWith(
         expect.objectContaining({
           name: 'Main guide',
-          credential_id: 'credential-2',
-          model: 'gpt-5',
+          credential_id: 'credential-1',
+          model: 'gpt-5.6-terra',
+          reasoning_effort: 'ultra',
         }),
       ),
     )

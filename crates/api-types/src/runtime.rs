@@ -121,6 +121,7 @@ pub struct CreateEmbeddedAgentRequest {
     pub description: Option<String>,
     pub credential_id: String,
     pub model: String,
+    pub reasoning_effort: Option<String>,
     pub system_prompt: Option<String>,
     #[ts(type = "Record<string, unknown> | null")]
     pub account_permission_ceiling: Option<Value>,
@@ -140,6 +141,7 @@ pub struct ConnectEmbeddedProfileRequest {
     pub version: i64,
     pub credential_id: String,
     pub model: String,
+    pub reasoning_effort: Option<String>,
     pub system_prompt: Option<String>,
     pub permission_policy: Option<String>,
     #[ts(type = "Record<string, unknown> | null")]

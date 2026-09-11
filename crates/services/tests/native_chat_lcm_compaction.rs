@@ -12,7 +12,9 @@
 
 use std::sync::Arc;
 
-use agent_runtime::core::provider::{Capabilities, FinishReason, ProviderStreamEvent};
+use agent_runtime::core::provider::{
+    Capabilities, FinishReason, ProviderStreamEvent, ReasoningSupport,
+};
 use agent_runtime::provider::fake::{usage_event, FakeProvider, ScriptedStream};
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
@@ -143,11 +145,9 @@ async fn inquiry_fixture(
         .await
         .unwrap();
     assert_eq!(session.id, resumed.id, "authority metadata may be reused");
-    let provider = Arc::new(FakeProvider::new(
-        "fake",
-        Capabilities::basic_streaming(),
-        scripts,
-    ));
+    let mut capabilities = Capabilities::basic_streaming();
+    capabilities.reasoning = ReasoningSupport::Controllable;
+    let provider = Arc::new(FakeProvider::new("fake", capabilities, scripts));
     let backend = NativeAgentRuntimeBackend::new(service.protected_store())
         .with_provider_override(provider.clone());
     let request = AgentTurnRequest {
@@ -170,6 +170,7 @@ async fn inquiry_fixture(
             provider: "openai".to_owned(),
             base_url: "https://unused.invalid/v1".to_owned(),
             model: "fake".to_owned(),
+            reasoning_effort: None,
             credential_handle_id: credential_id,
             owner_user_id: "user-1".to_owned(),
             provider_account_id: None,
@@ -240,6 +241,35 @@ async fn native_inquiry_reused_authority_keeps_history_and_usage_fresh() {
     assert_eq!(
         stored, 0,
         "ephemeral inquiries never persist restorable conversation state"
+    );
+}
+
+#[tokio::test]
+async fn native_turn_forwards_the_profile_reasoning_effort() {
+    let scripts = vec![ScriptedStream::new(vec![
+        ProviderStreamEvent::TextDelta {
+            text: "answer".to_owned(),
+        },
+        ProviderStreamEvent::Finish {
+            reason: FinishReason::Stop,
+        },
+    ])];
+    let (_db, backend, provider, mut request, _root) = inquiry_fixture(scripts).await;
+    request.provider.reasoning_effort = Some("ultra".to_owned());
+
+    backend
+        .run_turn(request, Arc::new(NoopSink))
+        .await
+        .expect("native turn succeeds");
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]
+            .reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.effort.as_deref()),
+        Some("ultra")
     );
 }
 
@@ -485,6 +515,7 @@ async fn native_chat_compacts_when_system_prompt_crowds_the_window() {
         provider: "openai".to_owned(),
         base_url: "https://unused.invalid/v1".to_owned(),
         model: "fake".to_owned(),
+        reasoning_effort: None,
         credential_handle_id: credential_id.clone(),
         owner_user_id: "user-1".to_owned(),
         provider_account_id: None,
@@ -645,6 +676,7 @@ async fn native_main_chat_compacts_over_budget_history_through_lcm() {
         provider: "openai".to_owned(),
         base_url: "https://unused.invalid/v1".to_owned(),
         model: "fake".to_owned(),
+        reasoning_effort: None,
         credential_handle_id: credential_id.clone(),
         owner_user_id: "user-1".to_owned(),
         provider_account_id: None,

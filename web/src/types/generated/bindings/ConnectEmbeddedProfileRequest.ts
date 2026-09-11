@@ -4,4 +4,4 @@
  * Publish a replacement profile for an existing embedded identity,
  * referencing an existing provider entry.
  */
-export type ConnectEmbeddedProfileRequest = { version: number, credential_id: string, model: string, system_prompt: string | null, permission_policy: string | null, tool_policy: Record<string, unknown> | null, context_tokens: number | null, max_input_tokens: number | null, max_output_tokens: number | null, };
+export type ConnectEmbeddedProfileRequest = { version: number, credential_id: string, model: string, reasoning_effort: string | null, system_prompt: string | null, permission_policy: string | null, tool_policy: Record<string, unknown> | null, context_tokens: number | null, max_input_tokens: number | null, max_output_tokens: number | null, };

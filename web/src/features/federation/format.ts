@@ -89,6 +89,13 @@ export function isDirectAgent(backendKind: string): boolean {
   return backendKind === 'native' || backendKind === 'embedded'
 }
 
+/** Whether the entry uses the native ChatGPT Responses adapter. */
+export function supportsDirectReasoningEntry(
+  entry: ProviderEntryResponse | null | undefined,
+): boolean {
+  return entry?.provider === 'openai' && entry.credential_method === 'oauth_bundle'
+}
+
 /** Coarse relative time to a future instant: "in 42m", "in 1h 30m", "in 3d", "now". */
 export function formatResetRelative(resetsAt: string | null | undefined): string {
   if (!resetsAt) return 'unknown'

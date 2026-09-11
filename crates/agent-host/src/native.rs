@@ -13,7 +13,7 @@ use agent_runtime::{
         error::RuntimeError,
         event::{RuntimeEvent, TurnFinish},
         ids::{SessionId, ToolCallId},
-        provider::{ModelId, Provider},
+        provider::{ModelId, Provider, ReasoningConfig},
         provider_credential::ProviderCredentialTarget,
         security::SecuritySubject,
         tool::ToolOutcome,
@@ -466,6 +466,12 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
         builder = composition.apply(builder);
         if let Some(prompt) = request.system_prompt.as_deref() {
             builder = builder.system_prompt(prompt);
+        }
+        if let Some(effort) = request.provider.reasoning_effort.as_deref() {
+            builder = builder.reasoning(ReasoningConfig {
+                effort: Some(effort.to_owned()),
+                max_tokens: None,
+            });
         }
         let runtime = builder
             .build()
