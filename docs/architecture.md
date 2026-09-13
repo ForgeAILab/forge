@@ -111,9 +111,13 @@ is narrowed to `Deny` for the CLI chat transport; the original native session
 scope is unchanged. Each invocation is prepared and checked within that
 composition; domain services reauthorize mutations. Setup chats receive the
 adoption catalog with its full nested Charter payload schema, and a later
-turn receives the ready-Project catalog after approval. Chat sandboxes remain filesystem-denied and suppress Task Git
-finalization. CLI transports other than Codex currently retain their text-only
-Agent Chat path.
+turn receives the ready-Project catalog after approval. Solo persists that
+future-ready Project ceiling at Agent selection time, but the canonical
+`charter_setup_required` scope gate withholds Task and operational proposals
+until the approval transaction commits; this lets approval preserve the
+binding without either pre-approval authority or a post-approval gap. Chat
+sandboxes remain filesystem-denied and suppress Task Git finalization. CLI
+transports other than Codex currently retain their text-only Agent Chat path.
 
 Solo owns one runtime process for one repository-scoped data root. Before
 migrations or worker startup it acquires an exclusive
@@ -437,11 +441,51 @@ deny-all filesystem access. Project Agent Task actions go through the existing
 Task Worker/reviewer executions in their Task Workspaces.
 
 The CLI permission policy includes an explicit high-risk `yolo` value. It maps
-to each adapter's strongest local execution mode and disables that adapter's
-approval prompts; Codex receives `danger-full-access` with `never` approval.
-This is an execution-harness setting, not a Forge capability grant. Canonical
-scope, Task assignment, Workspace-lease admission, chat filesystem denial, and
-user-only approval/waiver/release authority are still enforced independently.
+to an adapter's strongest local execution mode only where that cannot cross a
+Forge-owned role boundary. Managed Codex Task executions are the deliberate
+exception: the server-selected runtime role overrides profile configuration to
+`read-only` for read-only work or `workspace-write` otherwise, always with
+approvals set to `never`. This is an execution-harness setting, not a Forge
+capability grant. Canonical scope, Task assignment, Workspace-lease admission,
+chat filesystem denial, and user-only approval/waiver/release authority are
+still enforced independently.
+
+Codex Task execution starts from a Forge-owned per-Task Codex home beside the
+execution logs. It links only the user's existing authentication, excludes
+ambient Codex configuration, rules, hooks, skills, plugins, and connectors,
+disables host skill instructions and account/plugin discovery for the thread,
+enumerates effective local MCP configuration and explicitly disables every
+discovered server, and installs Forge-owned `forbidden` rules for changing
+checkout/branch context or integrating/publishing Git history. The writable
+sandbox excludes both `/tmp` and the inherited `TMPDIR`; the adapter supplies
+one freshly reset Forge-owned `task-scratch` directory as its only extra
+writable root. An unexpected authority-bearing input in that managed home
+fails execution closed. Codex-generated trust configuration and system-skill
+cache are discarded before each attempt and replaced with canonical Forge
+configuration, so a retry cannot reject its own runtime artifacts. The adapter
+also declines every built-in command/file approval request because Forge has no
+user-facing approval bridge for those callbacks. Commands inside the declared
+worktree sandbox proceed normally, while linked Git metadata remains outside
+that write scope; after a completed writable Codex Task turn, Forge performs
+the Task-branch commit from the trusted adapter boundary even if the profile
+set `auto_commit=false`. Every automatic host finalization disables repository
+hooks, filesystem-monitor commands, maintenance, rerere, and partial-clone lazy
+fetches. Status explicitly includes untracked files and ignores dirty submodule
+worktrees while retaining changed-gitlink detection; a staged-delta guard also
+prevents Git's no-op commit fallback from inspecting submodules. Because Git
+clean/process filters are arbitrary subprocesses but may define the
+repository's canonical stored content, Forge does not silently bypass them: it
+detects their effective configuration before status/add and fails closed
+without running the filter.
+Embedded/native workers instead retain their agent-authored commit contract. A
+pre-isolation Codex Task session that is not visible from the managed home
+restarts as a fresh isolated thread without importing ambient history. A
+request to operate on the source checkout cannot inherit a personal allow rule. The
+generated workflow system contract and user request are both persisted into
+the transport-neutral execution input for initial dispatch, follow-up, resume,
+and crash recovery. Worker and Coder contracts explicitly prohibit entering
+another checkout or integrating the target branch; only Forge's post-review
+merge service owns that operation.
 
 Every native Task scope admitted for `task_read` receives both bounded UTF-8
 file reads and `forge_task_list`. The list tool enumerates at most 256 sorted
@@ -817,8 +861,10 @@ Metadata writes do not bump a Task's `version`, so a disposition stays keyed to
 the state it observed. Assignment, source availability, reconciliation
 resolution, and authorized retry changes call `services::wake_task_dispatch`,
 which clears the disposition so exactly one subsequent scan re-attempts that
-Task. Clearing an absent disposition remains a
-safe replay no-op.
+Task. A wake that clears a disposition or deferred-dispatch marker also bumps
+the Task version in the same transaction, fencing a stale dispatcher that
+could otherwise restore the cleared marker. Clearing absent markers remains a
+safe replay no-op without timestamp or version churn.
 
 #### One SSE transport envelope
 
@@ -1144,13 +1190,20 @@ Project deletion is a transactionally guarded teardown. It removes the
 Project-owned immutable graph in dependency order — including Project/Task/
 Project-Chat LCM timelines, entries, operations, and nodes — and then the
 Project itself; the database permits those deletes only while the exact Project
-deletion guard is active. The API first stages Forge-managed repositories that
-are direct children of `<workspace_root>/repos`, each repository's managed
-cache under `<workspace_root>/.repos/<repo_id>`, each Project Task's
-direct-child worktree directory, and the Project Agent directory at
-`<data_dir>/projects/<project_id>`. It restores all staged paths if the database
-transaction fails and removes them after commit. Arbitrary linked repositories
-outside Forge-controlled roots are never removed. Direct attempts to mutate or delete an
+deletion guard is active. Before authoritative deletion, the API requires
+Project owner/admin authorization and, for `?force=true`, provider-acknowledged
+execution cancellation plus Workspace lease revocation. The final
+`BEGIN IMMEDIATE` transaction captures the exact Task IDs, Workspace paths, and
+Project repository paths present at its boundary; it does not rename live paths
+before commit. After commit, the API reacquires `BEGIN IMMEDIATE` immediately
+before each confined cleanup and skips any captured Task, Workspace, Project,
+repository, or cache path that has a live replacement owner. Eligible direct
+children are atomically moved to unique quarantine siblings while that lock is
+held, then recursively removed after commit. It best-effort removes the
+remaining captured paths, managed caches, and the Project Agent directory,
+confined to Forge-controlled direct-child roots. Cleanup failures
+are logged while the already-committed deletion still returns `204`; arbitrary linked repositories outside
+Forge-controlled roots are never removed. Direct attempts to mutate or delete an
 individual immutable Charter, milestone, readiness, release, decision,
 lease, evidence, review-contract, or review-assessment record remain rejected.
 V134 rebuilds the V132 conformance foreign keys and delete guards without losing
@@ -1242,8 +1295,19 @@ the existing Agent `paused` state controls one identity. Effective health
 intersects these layers, so disabling a source makes every dependent identity
 ineligible for Main, Project, Worker, and reviewer selection without deleting
 configuration, credentials, bindings, or history. Re-enabling recomputes health
-normally. Task concurrency counts only Task execution rows; Main and Project
-chat turns never consume Task quota.
+normally. Task concurrency counts only currently Running Task execution rows;
+assigned-but-not-running Tasks and Main/Project Agent chat turns never consume
+the identity's `max_concurrent_tasks` quota. A daemon may independently
+advertise a positive session cap through `labels_json` under
+`max_concurrent_sessions`, `max_sessions`, `active_session_cap`, or the legacy
+`max_concurrent_tasks` key. That daemon cap counts Running Task executions on
+the daemon plus leased/running Agent Chat turns. Both caps are rechecked while
+the `BEGIN IMMEDIATE` transaction that inserts the Running execution holds the
+SQLite writer lock; dispatcher/service prechecks are only early filters. The
+transaction also rejects an identity paused or switched to a newer selected
+profile after dispatch preflight. Profile replacement covers daemon, provider,
+and executor configuration reassignment even when the numeric task cap is
+unchanged.
 
 Harness agents may reference a provider entry (`credential_ref` on the active
 profile). At dispatch, `TaskService` asks `EmbeddedAgentService` to inject the
@@ -1397,6 +1461,17 @@ and a process and captures what its own run did (`task.evidence`,
 `task.worklog`). The Project Agent holds its own verification workspace — a
 durable `forge/` plus a disposable `checkout/` of the repository — and every
 Project Agent Chat turn composes against it (`WorkspaceAccess::ProjectVerify`).
+The workspace root also carries two Forge-owned authority markers:
+`.forge-project-agent-generation` identifies the immutable Project generation
+(the durable provisioning-operation ID, with the original creation timestamp
+as the legacy fallback), while `.forge-project-agent-repository` contains only
+a SHA-256 digest of the selected repository snapshot. The repository marker
+never stores a remote URL or local path. Project-version/settings changes keep
+the generation and durable `forge/` notes; a repository change replaces only
+the disposable checkout. A markerless legacy workspace is adopted so its
+notes survive migration, while its unproven checkout is rebuilt. If a Project
+ID is reused, generation markers quarantine the old workspace before the new
+Project can write there.
 An acceptance check that asserts the whole delivered outcome is settled by the
 Project Agent itself: it exercises the software in `checkout/` (its command
 tool runs there, never at the workspace root, so a build tool's upward
@@ -1712,9 +1787,13 @@ terminal cancellation target. `working` and `merge_failed` explicitly use the
 `worker` role; `review` has no reviewer role and requires human approval.
 Entering review runs the before-work hooks and CI steps as blocking guards.
 Review rejection and merge repair resume the latest worker thread. The worker
-plans internally, implements, self-tests, repairs failures, and reports
-verification evidence, so the preset has no planning state or plan-checklist
-gate.
+plans internally, implements, self-tests, repairs ordinary unfinished-worktree
+failures, and reports verification evidence, so the preset has no planning
+state or plan-checklist gate. A real branch conflict is not dispatched into
+`merge_failed`: Forge parks it for manual Task-worktree repair because managed
+agents cannot rebase or write linked Git metadata. The recovery action creates
+a marked review-refresh transition, clears the old approval, and runs the
+repaired result through fresh checks and human review before merge.
 
 ### Root Tasks and ordered subtasks
 
@@ -1748,11 +1827,15 @@ integration to the latest relevant child implementation execution and the
 root-owned shared workspace. The root may receive a reviewer execution for
 that aggregate gate, but it never receives a root implementation execution.
 If the integration target moves after aggregate review and Forge can rebase the
-shared worktree cleanly, it marks another aggregate review as pending and the
-scheduler returns the root there without dispatching a merge-fix Worker on the
-root. A conflicting rebase remains an explicit merge recovery instead. A failed
-or blocked child stops the sequence at that child so the Project Agent can
-inspect evidence, reassign it, or otherwise coordinate recovery.
+shared worktree cleanly, a durable review-refresh transition returns the root
+directly to aggregate review without notifying or dispatching a merge-fix Worker
+and without spending merge-fix budget. Crash recovery recognizes the same marker
+and completes an interrupted refresh. A conflicting rebase cannot dispatch work
+on the non-executing root, so Forge leaves the root visibly blocked with a manual
+workspace-repair action that returns the repaired branch through aggregate
+review before retrying integration. A failed or
+blocked child stops the sequence at that child so the Project Agent can inspect
+evidence, reassign it, or otherwise coordinate recovery.
 
 Child terminal/reassignment cleanup never owns the shared root workspace. A
 root cancellation terminalizes active child executions before scheduling root
@@ -1872,7 +1955,17 @@ via `POST /projects/{id}/pause` (or any general Project update that sets
 `paused_at`) always clears `system_pause_reason`, so a deliberate pause is
 never auto-resumed or mistaken for automatic setup state. Repository readiness
 does not fabricate Charter governance; a Task missing required current-Charter
-traceability remains separately blocked before lease issuance.
+traceability remains separately blocked before lease issuance. Project pause is
+also checked inside the `BEGIN IMMEDIATE` transaction that creates every running
+Execution and its first owner lease. This is the final admission boundary for
+initial, follow-up, recovery, and reviewer runs, so pausing between a dispatcher's
+preflight and its write cannot launch a new execution. Pause also fences local
+integration. A passed review that reaches the pause boundary retains a durable
+`paused_integration` marker instead of advancing or writing the default branch;
+the review-integration authority lock rechecks `project.paused_at` inside its own
+serialized write transaction immediately before Git integration. After resume,
+the dispatcher consumes the marker and retries the exact `review` or `merging`
+capability without creating another reviewer execution.
 
 `WorkflowEngine::transition` lifecycle for `A → B`:
 
@@ -2035,7 +2128,10 @@ Audit-log derived. Gate states may set `gate_config.max_rejections`;
 `check_retry_budget` counts `transition_log` rows with `from_state = gate` and
 `rejection = true`, then cascades to `blocked` when exhausted. Generic
 user-triggered gate-to-active bounces are logged with `rejection = false` and
-do not consume budget.
+do not consume budget. Both `reset_retry_window` and the stronger
+`reset_to_initial` recovery action establish a new audit boundary, so a full
+Task reset restores every gate's retry window rather than carrying an exhausted
+merge/review budget back to `todo`.
 
 When a reviewer execution fails, Forge first schedules the next bounded execution
 retry and keeps the Review running. Once retries are exhausted or disabled it
@@ -2044,8 +2140,34 @@ execution failures. Startup recovery, daemon disconnect, heartbeat expiry, and
 workspace-lease reaping all enter this settlement path. The periodic dispatcher
 also reconciles a terminal reviewer execution when its completion event was lost,
 including the narrow crash window where the Review row was finalized before the
-Task cascade committed. The Task remains in review with explicit recovery actions;
-an execution failure does not count as a reviewer verdict rejecting the work.
+Task cascade committed. Reconciliation is exact-attempt-lineage-only: a
+reviewer or auditor execution may settle only the Review row whose explicit
+role-specific execution binding matches it, with the exact direct
+`Review.execution_id` relation retained only for legacy rows. A shared
+candidate parent is not an attempt identity, and wall-clock ordering is never
+used to infer lineage. An unbound legacy execution cannot settle a newer
+Review and remains available only for explicit retry/recovery. The dispatcher
+admits a fresh reviewer when
+the current attempt is not exactly bound. Forge allocates the next Review
+attempt and inserts its Running reviewer execution plus owner lease in one
+`BEGIN IMMEDIATE` transaction. The Review row points at the candidate
+implementation execution, while the reviewer and auditor children point at
+that same candidate. Task/Project/workflow, role assignment, selected Agent
+identity/version, and the latest Review snapshot are rechecked at that insert
+boundary; reviewer capacity counts only running executions (plus any
+explicitly configured daemon session cap). The candidate must be a completed
+implementation execution at that insert boundary. Failed or cancelled
+remediation executions do not displace the last completed candidate, but a
+newer running implementation still fences review admission. If Task/Project/workflow
+authority changes after reservation, Forge terminalizes the reviewer execution
+and uses an exact Review status/timestamp CAS to cancel the still-running
+Review, so no stale attempt or lease remains apparent. Saturation cannot leave
+the previous terminal attempt looking current or an orphan Running execution
+behind. A historical passed Review
+row also cannot auto-cascade unless the Task still carries current
+`review_passed_at` authority. The Task remains in review with explicit recovery
+actions; an execution failure does not count as a reviewer verdict rejecting the
+work.
 `resume_session` is exposed only when the stopped execution has a session/config
 snapshot and its agent still owns the exact Task role.
 
@@ -2060,13 +2182,17 @@ scan, while a separate semantic-progress scan emits warnings without
 terminalizing a live owner. Hard deadlines are recovered distinctly from
 ordinary owner-lease expiry.
 
-Both recovery paths annotate a task with a `recovery_required`
-`error_annotation` only when they actually win a terminal CAS for at least one
-running execution, and publish `task.recovered` only in that case. The winning
-CAS also closes the execution's active `WorkspaceLease`; a stale monitor or
-runner cannot annotate, cancel, or cascade a second time. Tasks whose assignee
-is a user are excluded from crash-recovery selection — agent-oriented recovery
-is not meaningful for human-driven tasks.
+Startup crash recovery marks every interrupted implementation execution whose
+terminal CAS it wins with `resume_policy = auto`, regardless of its active
+workflow state or whether the attempt has a reusable runtime session. It leaves
+the Task in its current state without a manual `recovery_required` annotation so
+the normal dispatcher can resume or freshly re-execute it. Heartbeat/owner-timeout
+recovery remains a live failure decision and may publish the manual recovery
+annotation appropriate to that stop reason. In either path, the winning CAS also
+closes the execution's active `WorkspaceLease`; a stale monitor or runner cannot
+annotate, cancel, or cascade a second time. Tasks whose assignee is a user are
+excluded from crash-recovery selection — agent-oriented recovery is not meaningful
+for human-driven tasks.
 
 After the orphan pass, startup runs a sweep that clears stale
 `recovery_required` annotations when `blocked_execution_id` is missing, refers
@@ -2254,8 +2380,11 @@ React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses
   default lists through the versioned, receipt-atomic `project.review_config`
   command and reads them from `project.current_state`. Discovery, planning, and
   explicitly read-only Tasks suppress both implementation lists. Empty steps
-  auto-pass; setup failure stops checks and is retained separately. Creates a `reviewer`-role
-  execution sharing the executor's workspace, with the same owner heartbeat,
+  auto-pass; setup failure stops checks and is retained separately. Creates the
+  Review attempt, reviewer execution, and owner lease atomically at the
+  admission boundary; the Review points to the candidate implementation
+  execution and reviewer/auditor children share that candidate lineage. The
+  `reviewer`-role execution shares the executor's workspace, with the same owner heartbeat,
   semantic-progress, hard-deadline, and terminal-CAS contract as Task
   execution. Depends only on `db`, `events`, `executors` — not on `api` or
   `services`.
@@ -2342,7 +2471,8 @@ contract.
 
 Before an agent review launches, Forge freezes an execution-specific contract
 with Task-scoped requirement IDs, checks, completed pre-review CI results,
-candidate commit and target commit. A result includes its `ci:N` check ID,
+candidate commit, target commit, and the exact repository-relative path manifest
+for `base_sha..commit_sha`. A result includes its `ci:N` check ID,
 exact command, exit code, and bounded output, so the reviewer can use the
 already-recorded outcome as check evidence instead of inferring success from a
 configured command. Missing required pre-review CI results fail admission.
@@ -2360,24 +2490,29 @@ The contract records the count and digest of the other Project requirements as
 deferred. Those requirements remain integrated milestone-readiness obligations;
 an early Task is never failed merely because later Project work does not exist yet.
 
-Policy `forge.review-conformance/2` requires one JSON assessment. Unknown or
+Policy `forge.review-conformance/3` requires one JSON assessment. Unknown or
 duplicate IDs, contradictory verdicts, old verdict markers, and unsupported PASS
 evidence cannot grant acceptance. Structurally valid partial assessments are
 retained and omissions make conformance `unverified`, so the report cannot pass
 but useful findings survive. Universal Project boundaries cannot be allocated
-away. A violated requirement or blocking finding may have no positive
-file citation when it describes an absence; its rationale must state what was
-inspected. `unverified` represents insufficient proof and can never support PASS.
+away. File evidence used to attribute a violated requirement or blocking finding
+must name a path in the frozen candidate manifest; unchanged files may still prove
+that a requirement is already satisfied. A violated requirement or blocking
+finding may have no positive file citation when it describes an absence; its
+rationale must state what was inspected. An empty candidate is reviewed as the
+current Task outcome, never as evidence that pre-existing content was introduced
+by that Task. `unverified` represents insufficient proof and can never support
+PASS.
 
-Forge separates protocol failure from review failure. A response that cannot be
-bound structurally to its frozen contract uses the bounded execution retry budget
-and eventually creates a durable execution blocker. Once a structurally bound
-assessment is available, Forge preserves it even when it is partial or contains
-violations, unverified requirements, or invalid citations. That result becomes a
-normal failed review and follows the
-review-remediation budget instead of re-running the reviewer as though its process
-had failed. Each native reviewer attempt starts with an empty conversation and no
-Task LCM/checkpoint persistence, so a retry cannot accumulate the previous full
+Forge separates a verified review failure from an unverified reviewer result. A
+response that cannot be bound structurally to its frozen contract, or whose
+semantic claims cannot be verified against that contract, uses the bounded
+reviewer execution-retry path and eventually creates a durable execution blocker;
+it never dispatches a coder. Forge still preserves a structurally bound partial or
+unverified assessment for diagnosis. A verified assessment with actual violations
+becomes a normal failed review and follows the review-remediation budget. Each
+native reviewer attempt starts with an empty conversation and no Task
+LCM/checkpoint persistence, so a retry cannot accumulate the previous full
 contract and report. Worker and planner Task continuity remains persistent.
 
 Configured `setup_steps` run first in a detached clean checkout of the frozen
@@ -2404,9 +2539,11 @@ of implementation.
 Acceptance rechecks source provenance inside the SQLite write transaction.
 Direct integration holds the authority write lock during the local git operation,
 compares source and target commits, fast-forwards only the immutable reviewed
-object, and checks the resulting head. Divergence enters bounded merge repair;
-changed content must receive a new semantic review, regardless of
-`review_passed_at`. PR publication pushes the immutable reviewed object and
+object, and checks the resulting head. Stale review authority and a clean target
+rebase enter a marked review-refresh route; they do not consume merge-fix budget
+or dispatch a coder. Actual conflicts enter bounded merge repair. Changed content
+must receive a new semantic review, regardless of `review_passed_at`. PR
+publication pushes the immutable reviewed object and
 rechecks authority; the external provider's final merge remains a human/provider
 operation. Explicit human and no-agent-review workflows remain separate and
 cannot manufacture an automated Charter assessment.

@@ -9,11 +9,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 ### Added
 
 - CLI-harness agents and per-execution overrides now offer an explicit `YOLO`
-  permission policy. It selects the executor's full-access/no-prompt mode
-  (including Codex `danger-full-access` with approvals set to `never`) while
-  preserving Forge's Project/Task scope, Workspace-lease, Chat filesystem, and
-  user-only approval boundaries. Existing `Auto` profiles keep their prior
-  behavior.
+  permission policy. It selects the executor's full-access/no-prompt mode where
+  the transport can honor it without crossing a Forge-owned role boundary;
+  managed Codex Tasks apply the stricter confinement described below. Existing
+  `Auto` profiles keep their prior behavior.
 - `make install-local` and `make install-ctl` install this checkout's binaries
   into `~/.cargo/bin`, and `docs/cli.md` now documents every way to obtain
   `forge-ctl` (Homebrew, npm/npx, install script, source). The distribution
@@ -24,7 +23,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `forge_reorder_sub_tasks`; the latter two report ordered direct children of a
   coordination root.
 - Added the `forge-solo` crate and additive `forge-solo` command: a
-  repository-scoped, chat-first TUI that runs the shared Forge runtime,
+  repository-scoped, Kanban-first TUI that runs the shared Forge runtime,
   workflow, validation, review, merge, cleanup, and recovery services in one
   local process. Solo requires an existing primary Git worktree and an
   authenticated supported local CLI harness (`codex`, `claude_code`, `cursor`,
@@ -41,7 +40,66 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   unsupported in Solo unless an interaction broker is attached; startup crash
   recovery completes before the TUI opens. POSIX owner-only mode checks apply
   on Unix, while published release archives cover Linux and macOS.
+
+### Changed
+
+- Forge Solo now opens on a full-terminal five-lane Kanban and presents its
+  single Main Chat as a separate primary view. Compact terminals show one
+  readable lane with all lane counts retained; Task selection, detail/review
+  cards, Attention, and Approvals are operated directly from the board, and
+  `F2` switches primary views reliably across terminal emulators.
+- The web application now opens around two primary destinations: the selected
+  Project's Kanban and the singular account Main Chat. Project and Workspace
+  administration moved into a contextual `More` menu, the duplicate floating
+  Main Chat launcher was removed, board filters are collapsed until requested,
+  and Kanban task details use a readable single-column layout below 1024px.
+
 ### Breaking
+
+- Managed Codex Task executions no longer inherit the user's Codex rules,
+  hooks, plugins, connectors, or configuration. Forge launches them with a
+  clean per-Task Codex home that shares only the existing authentication and
+  adds Forge-owned deny rules for checkout/branch integration, forces workflow
+  roles to `read-only` or `workspace-write` with approvals set to `never`, and
+  declines every built-in escalation callback. This restriction also overrides
+  a Task profile's `yolo`/`danger-full-access` request. Generated workflow role
+  instructions are now included in the persisted executor input on initial,
+  resumed, and recovered runs; Worker/Coder contracts explicitly reserve
+  target-branch integration for Forge after review. For a managed writable
+  Codex role, profile `auto_commit=false` is no longer honored: the sandboxed
+  agent cannot write linked Git metadata, so Forge always finalizes its file
+  changes from the trusted host boundary. Embedded/native workers retain their
+  agent-authored commit contract. Automatic host finalization disables
+  repository hooks, filesystem-monitor commands, maintenance, rerere, and
+  partial-clone lazy fetches; it suppresses dirty-submodule inspection without
+  hiding changed gitlinks and explicitly discovers untracked files. It now
+  fails closed when an external clean/process filter is configured instead of
+  executing that filter outside the Task sandbox.
+
+- Real merge conflicts no longer enter the managed Worker/Coder merge-fix
+  state. Managed agents cannot rebase or write linked Git metadata, so Forge
+  parks every conflicting Task worktree for explicit manual repair. Retrying
+  after repair routes through fresh automated and human review with the old
+  review authority cleared; it never invokes the merge hook directly against
+  a mutable repaired branch.
+
+- `DELETE /api/v1/projects/{id}` refuses with `409 project_in_use` while the
+  Project still holds a running Execution or an active Workspace lease, and
+  reports how many of each. `?force=true` requests cancellation/revocation and
+  retries the same guard; if work is still live, the request remains `409` and
+  the Project is left intact. Once provider cancellation is acknowledged,
+  deletion removes the captured worktrees and revokes the remaining lease
+  state. The narrower
+  `DELETE /api/v1/repos/{id}` already refuses in the same state, and
+  `ProjectRepo::delete` remains in-use guarded; it has no force bypass.
+
+- Automated review conformance advances to
+  `forge.review-conformance/3`. Contracts now freeze
+  `candidate_changed_paths` for `base_sha..commit_sha`, and blocking file
+  evidence must be attributable to that candidate delta. Existing v2
+  acceptances require a fresh review before integration so pre-existing
+  repository content cannot be misreported as a Task regression and sent to a
+  Worker for deletion.
 
 - Agent responses rename `active_task_count` to `active_assigned_task_count`
   and add `running_execution_count`. The old name described neither of the two
@@ -53,7 +111,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   actually gates; both UI surfaces now use it for the ratio. Scheduling was
   never affected. Clients reading the old field must move to whichever of the
   two they meant; there is no compatibility alias.
-
 
 - Tasks no longer store or expose `repo_id`. Repository selection is owned by
   the Project's current `primary_repo_id`, so Tasks accepted before repository
@@ -89,6 +146,130 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Forge Solo now unlocks the Project Agent's scoped operational proposal
+  catalog after Charter adoption, including `task.propose`. The Charter gate
+  still withholds those permissions before approval, and a narrow migration
+  repairs only the exact setup-only ceiling written by earlier Solo builds;
+  caller-authored restricted Project bindings remain unchanged.
+- Forge Solo now maps every `autonomous_v1` Task state into the TUI instead of
+  rendering live `ready`, `working`, or `merging` Tasks as failed, and review
+  cards select commit evidence from the newest execution after rework rather
+  than the oldest retained attempt. Review cards also derive a completed CI
+  check's marker from its durable exit code when no redundant `success` boolean
+  is present, so a passing check no longer appears pending at the human gate.
+- Managed Codex Task isolation and constrained Codex Agent Chat now also
+  suppress host-discovered skill instructions, account/plugin tools, hooks,
+  ambient profiles, and every MCP server discovered from effective local
+  configuration at thread start. Managed write sandboxes exclude `/tmp` and
+  the inherited `TMPDIR`, expose only a fresh Forge-owned Task scratch root,
+  and no longer receive a doomed in-sandbox commit reminder for linked Git
+  metadata. Forge performs the trusted host-side Task commit once, with its
+  subject derived from the Task title in the combined role/request prompt;
+  repository hooks, filesystem monitors, maintenance, rerere, lazy fetches,
+  and dirty-submodule scans are suppressed, while configured clean/process
+  filters stop automatic finalization before any filter runs. Untracked files
+  remain visible even when ambient status configuration hides them.
+  Codex-generated trust configuration, system-skill cache, and Task scratch
+  are reset safely between attempts, while a pre-isolation session ID that is
+  unavailable inside the managed home starts a fresh isolated thread instead
+  of permanently blocking recovery.
+- `project.current_state` now includes the exact renderer version on governing
+  Charter and approved Document references, so Project Agents can copy a valid
+  `ArtifactRef` instead of confusing the artifact row version with its renderer
+  version during milestone proposals.
+- Project Agent workspace admission now binds durable `forge/` notes to an
+  immutable Project generation and keeps repository identity in a secret-free
+  digest marker. Markerless legacy notes are adopted, while unproven
+  disposable checkouts are rebuilt; Project-ID reuse quarantines the old
+  generation without allowing a stale creator to remove the replacement.
+
+- A Task is no longer parked forever by a slot its own workflow occupies.
+  `ensure_no_running_repository_execution` and its interactive counterpart
+  raised an `InvalidOperation`, which the dispatcher classified as a
+  deterministic refusal and recorded as a dispatch disposition — so the Task
+  waited for a `version` change that nothing was going to make. Both now raise
+  the typed, transient `ExecutionAlreadyRunning`, which is retried on the next
+  scan. Over the API it is `409 execution.already_running` with the occupying
+  execution's id, replacing the prose-matched mapping in the follow-up,
+  re-execute and launch routes.
+- Known MCP tool failures now preserve the safe structured
+  `execution_already_running` code, scope, and occupying execution id in the
+  in-band outcome, so callers do not lose the conflict target behind generic
+  retry guidance.
+- The dispatcher no longer dispatches a role execution for a state the Task has
+  already left. Active recovery decided the role, agent and prompt from the
+  snapshot its scan listed and never re-checked it, so a Task that moved
+  between listing and dispatch — most often because its own execution finished
+  and cascaded — received a second implementation attempt for the previous
+  state, which then held the workspace and blocked the role the Task actually
+  wanted. Dispatch now re-reads the Task and aborts if its version or status
+  moved.
+- `POST /tasks/{id}/resume` re-drives the role the Task's current state is
+  waiting for. It previously relaunched the newest session-bearing execution
+  whatever its role, so resuming a Task parked in `review` started an
+  `interactive` execution that satisfied nothing, returned 200 and left the
+  Task where it was. Candidate executions are now filtered by the state's
+  effective role before falling back to a fresh dispatch of that role.
+- A Task paused with `POST /tasks/{id}/pause` can be resumed again. The
+  `manual_stop` annotation counted as a blocking state, so `resume` was neither
+  advertised nor accepted in `in_progress`, `review` or `merge_failed`, leaving
+  `reexecute` — which discards the paused attempt — as the only way forward.
+  Resuming now clears the user pause and continues.
+- Reviewer settlement now requires exact durable attempt lineage: the Review
+  must be bound directly to the reviewer/auditor execution, with only the
+  exact direct `Review.execution_id` relation retained for legacy rows. A
+  shared candidate parent or timestamp never identifies an attempt, so an old
+  or unbound legacy reviewer cannot settle a newer Review; it remains visible
+  for an explicit retry or recovery action. A bound reviewer whose Review row
+  was written after the execution is still reconciled instead of being left
+  `Running` indefinitely.
+- Task health distinguishes parked from queued from idle. A Task the dispatcher
+  has parked reports `Dispatch Parked` with the recorded blocker, a Task whose
+  interrupted attempt is waiting for a worker slot reports `Retry Queued`, and
+  a Task queued for its first dispatch reports `Queued` with the role it is
+  waiting for. All three previously read `Idle` or a bare `Waiting for Agent`,
+  which is what let a permanently stalled Task hide in a saturated board.
+- `start` is no longer offered on a Task held by an unsatisfied dependency,
+  where it failed through the claim path with the unrelated "role 'coder' is
+  assigned to a different agent".
+- A rejected recovery action names itself in the form the caller sent it and
+  lists what the Task will accept, instead of rendering as
+  `recovery action '"retry_hook"' is not allowed`.
+- A merge-fix commit can no longer reuse the review verdict for the commit it
+  replaced. Forge clears the accepted-review timestamp before the merge-fix
+  completion enters review, treats a passed row without current review
+  authority as inert, and refuses to apply a terminal reviewer execution
+  without exact lineage to the current Review. The new attempt is recorded before
+  reviewer-capacity admission, including when no CI steps are configured. This
+  removes the unbounded
+  `review → merging → merge_failed → review` refresh loop, its synthetic
+  passed-review rows, and the associated Task-version and transition-log
+  inflation under reviewer saturation.
+- Recovery annotations with a non-empty `recovery_actions` list are now a
+  closed authority set for `POST /tasks/{id}/recover`; state-derived recovery
+  cannot silently widen it. Rejected actions leave the annotation untouched,
+  and `GET /tasks/{id}/actions` now returns the typed `recovery_actions` beside
+  ordinary intent actions so coordination-root repair is discoverable without
+  parsing annotation internals.
+- Project pause now gates direct integration as well as execution creation. A
+  passed review is durably deferred while paused, and the integration authority
+  lock rechecks pause in the same serialized database boundary that guards the
+  local Git write. Resuming consumes the marker and continues the exact
+  review/merge step without fabricating another reviewer execution.
+- Startup recovery now marks every interrupted implementation execution it
+  terminalizes as automatically resumable, independent of whether it stopped
+  in `in_progress` or `merge_failed` and whether it had a reusable runtime
+  session. Both states therefore return to normal dispatcher recovery instead
+  of parking one behind a manual-only annotation.
+- Task and Agent projections now distinguish queued recovery from inactivity:
+  scheduled/deferred retries report `Retry Scheduled` or `Retry Queued`, a
+  running interactive execution reports `Interactive`, and an Agent with a
+  running execution projects `status: busy` even when its persisted
+  administrative status is idle. A full `reset_to_initial` establishes a fresh
+  retry-budget boundary, unsupported recovery errors name the Task's actual
+  state, dispatcher race logs include their source/target capability, and
+  `submit` is not offered while agent work is still running or has never
+  completed.
 - Losing an ordinary merge race no longer blocks a Task. When another Task
   merged first, Forge treated the moved integration target as a merge failure,
   spent the Task's single merge-fix retry on it, and blocked the Task outright
@@ -97,18 +278,47 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   distinct outcome: Forge rebases the worktree onto the new target itself
   instead of spending an agent turn on `git rebase`, sends the Task back for a
   fresh review of the rebased commit, and does not charge the merge-fix
-  budget. Rebase conflicts still need the Worker and still count. Repeated
-  contention is bounded separately, and a Task blocked on an exhausted merge
+  budget. Rebase conflicts are parked for manual Task-worktree repair instead
+  of dispatching a Worker that cannot perform the forbidden Git operation.
+  Retrying a repaired conflict goes through a fresh review before integration.
+  Repeated contention is bounded separately, and a Task blocked on an exhausted merge
   budget now carries a real blocking reason and usable recovery actions. For a
   coordination root, a clean rebase queues another aggregate review instead of
-  trying to dispatch the root as a merge-fix Worker.
+  trying to dispatch the root as a merge-fix Worker. Every stale-review bounce,
+  including the commit change produced by Forge's own rebase, now carries one
+  review-refresh marker: it neither counts as a gate rejection nor notifies or
+  launches a coder, and crash recovery completes the same route. A real conflict
+  on any Task, including a non-executing coordination root, is now a visible
+  manual-repair block with a working re-review action instead of an invisible
+  wait for an impossible coder.
 - `reset_retry_window` and `proceed_once` work again on a Task a gate has
   already rejected. Both resolved the retry budget only from the Task's
   current state, but a failed review moves the Task to `in_progress` and a
   failed merge moves it to `merge_failed` — so both were rejected with "state
   … is not a retry-budget gate" in exactly the window where the Task's own
   recovery actions advertise them. They now resolve the originating gate
-  through its reject target.
+  through its reject target. Resetting a Task still parked in `review` or
+  `merging` also validates its reject route before clearing the block and then
+  resumes it against the new retry boundary, rather than clearing the annotation
+  and rejecting its own follow-up as unrecoverable.
+- Pausing a Project now prevents all later execution creation, including role
+  follow-ups and reviewer/recovery runs. The running-Execution insert and owner
+  lease transaction rechecks `project.paused_at`, closing the race after
+  dispatcher preflight.
+- Concurrent claims for one Task serialize the branch check, worktree creation,
+  and Workspace insert under the repository lock. The loser now reuses the
+  winner's Workspace and reports the normal admission conflict instead of a raw
+  `git worktree add` branch error.
+- Repository deletion now returns `409 repo_in_use` while a running Execution or
+  active Workspace lease is bound to it. The primary-repository pointer and Repo
+  delete commit together, while idle historical Workspaces still retain their
+  repository provenance.
+- Tasks with a non-manual blocking annotation no longer advertise the generic
+  `resume` action when only a typed recovery is valid; `manual_stop` remains the
+  explicit pause/resume exception. Exhausted gate projections report zero remaining retries,
+  and every review read or mutation response reports malformed stored detail
+  JSON as server corruption (`500 internal_error`) instead of a client
+  `400` or an all-null/default assessment.
 - A coordination root that cannot enter aggregate review no longer retries and
   re-logs the identical warning on every scheduler scan. It is parked like any
   other deterministic blocker and reconsidered when the Task changes or is
@@ -379,7 +589,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   its auditor execution snapshot without `profile_id`, `provider`,
   `prompt_template`, the claimed task role, or the read-only worktree marker, so
   an embedded reviewer failed immediately with `embedded snapshot has no
-  profile_id`; the runtime then refused the `auditor` execution because only a
+profile_id`; the runtime then refused the `auditor` execution because only a
   literal `reviewer` role was admitted at session authorization. Auditor
   snapshots now carry the same identity a Task execution snapshot does, and the
   reviewer role is served by both its `reviewer` and `auditor` executions.
@@ -396,14 +606,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   retry rebuilds the session with clean context and its first turn reuses the
   previous attempt's turn id under the same reused Forge session row. Every
   re-review after remediation therefore died as `Task runtime context manifest
-  idempotency conflict`. The manifest is now keyed by execution as well, which
+idempotency conflict`. The manifest is now keyed by execution as well, which
   is what its request fingerprint already recorded.
 - A Project's first milestone is adopted as its primary outcome when the Project
   has none. Genesis seeds that pointer for a Charter-created Project, but a
   `standard` Project's Agent creates the milestone itself, so the pointer stayed
   null; once that milestone went active, every Project Agent turn failed
   admission with `Project with active milestones has no explicit primary
-  milestone` — and because admission fails before the Agent runs, it could never
+milestone` — and because admission fails before the Agent runs, it could never
   set the pointer itself. An existing choice is preserved, and a later milestone
   does not steal the pointer.
 - The `project.charter` read now returns `selectable_review_requirements`: the
@@ -450,7 +660,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Project. The effective-state projection and the Project Agent's state context
   treated an absent current definition revision as a conflict, so every Agent
   turn failed with `Active Project milestone has no current definition
-  revision` — including the turn that would have proposed that definition.
+revision` — including the turn that would have proposed that definition.
   Standard-mode Projects hit this on the first milestone their Agent created,
   because only compact Projects are seeded with an approved baseline. The
   milestone is now reported as having no approved definition revision.
@@ -529,7 +739,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `/executions/{id}/logs`. An inquiry that has logged nothing yet reads as an
   empty page, not a `404`.
 - **Cancelling an inquiry stops its provider call.** `POST
-  /api/v1/inquiries/{id}/cancel` now signals the running turn as well as
+/api/v1/inquiries/{id}/cancel` now signals the running turn as well as
   marking the record, so a cancel takes effect immediately instead of at the
   10-minute timeout. Cancelling the calling chat turn also cancels any inquiry
   it was blocked on. If the run finishes in the same instant, the user's
@@ -680,8 +890,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `execution_usage.input_tokens` and the `input` field of an Agent Chat
   message's `token_usage_json` previously meant different things depending on
   which executor produced the row: the Claude Code and Smith adapters
-  reported input *excluding* the cached prefix, while the Codex adapter and
-  the embedded runtime reported it *including* both the cache read and the
+  reported input _excluding_ the cached prefix, while the Codex adapter and
+  the embedded runtime reported it _including_ both the cache read and the
   cache write. A per-project or cross-agent total was therefore
   uninterpretable — summing `input + cache_read + cache_write` double-counted
   the cached prefix for two of the four executors, and using `input` alone
@@ -697,7 +907,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Rows written before this change keep the old mixed semantics; usage
   recorded by the embedded runtime and the Codex adapter reads high on
   `input_tokens` for historical executions and chat turns.
-
 
 ### Added
 
@@ -758,7 +967,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   gains a "Needs your decision" card above the status panel: the milestone
   definition revision the Agent proposed (with its acceptance-check summary)
   and any pending Decision proposals, each with a one-click Approve or
-  Reject. A decision the *user* records — a milestone definition revision
+  Reject. A decision the _user_ records — a milestone definition revision
   approved or rejected, a Decision approved or a candidate rejected, a
   Document revision approved — is now a wake for the Project Agent: the
   Attention projection classifies it as the new `decision_recorded`
@@ -958,7 +1167,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - The coder dispatch prompt's completion-handoff block is replaced by a worklog
   contract. Coders now append entries with `task.worklog` as they work instead
   of ending with a `Summary | Deliverables | Verification | Deviations | Next
-  Step` block; Forge posts the final completion summary itself once the
+Step` block; Forge posts the final completion summary itself once the
   execution is accepted.
 
 - An approved Project Charter now authorizes implementation after the user
@@ -1000,7 +1209,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 ### Fixed
 
 - A Project Agent turn no longer dies when its model wraps a Forge tool call
-  in a `parameters` object *and* omits `dedupe_key`. The envelope admitted
+  in a `parameters` object _and_ omits `dedupe_key`. The envelope admitted
   in the previous fix copied the tool schema verbatim, so the copy still
   carried `required`; a wrapped call missing the key failed the runtime's
   provider validator and ended the attempt (PantryPal's handoff turn lost its
@@ -1489,14 +1698,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   built them, but the read path returned pins ordered by pin id — and pin ids
   are freshly minted UUIDs, so the two orders agreed only by accident. The
   snapshot digest could not reproduce and both `GET /projects/{id}/releases/
-  {release_id}` and the milestone release history answered `400`. The frozen
+{release_id}` and the milestone release history answered `400`. The frozen
   evidence metadata is the immutable record of what was digested, so it now
   defines the read order. Existing single-evidence releases were unaffected,
   which is why release coverage did not catch it.
 
 - A proposed execution baseline can be approved after a reload. The read
   projection picked `proposed_revision` as "any revision that is not the
-  current one", but a revision awaiting approval *becomes* the current
+  current one", but a revision awaiting approval _becomes_ the current
   revision — so it surfaced an older draft, the approval card saw lifecycle
   `draft` and offered no action, and the baseline stayed `proposed` forever.
   That also blocked manual attestation, which requires an active baseline, and
@@ -1563,7 +1772,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   revisions remain frozen on each admitted turn and session. Previously those
   per-turn revisions were duplicated into the reusable scope authority, so the
   first turn after a Profile edit failed with `canonical context scope already
-  exists with different authority` even though its new provenance was valid.
+exists with different authority` even though its new provenance was valid.
 
 - The receipt-backed Main operation `genesis.project_agent.select` is now
   admitted under `propose_discovery`, matching the canonical operation catalog
@@ -1692,7 +1901,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `PrincipalRef` — the optional presentation label included — against an author
   rebuilt from the `*_principal_type`/`*_principal_id` columns, which never carry
   one. Identical provenance was rejected as `immutable evidence authorization
-  principal disagrees with author`, and because evidence rows are immutable the
+principal disagrees with author`, and because evidence rows are immutable the
   milestone could not be repaired. Provenance now compares principal identity,
   not the label the UI happened to show.
 
@@ -1789,7 +1998,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   retried the same rejected shape indefinitely with nothing to correct. The
   reason now travels in the outcome (for example
   `(expected_document_version must be positive)` or `(baseline_id is required
-  when proposing an execution baseline for approval)`). A conflict's prose
+when proposing an execution baseline for approval)`). A conflict's prose
   stays unstructured on purpose: read it, never parse it to infer version or
   digest semantics. Policy denials stay generic: their reason can describe
   authority the caller may not observe.
@@ -1814,7 +2023,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 - An agent can dispatch the execution it was just assigned. Role eligibility
   required `EffectiveStatus::Active`, which requires spare concurrency — but
-  dispatch re-checks eligibility *after* the execution is running, so the
+  dispatch re-checks eligibility _after_ the execution is running, so the
   execution consumed its own agent's capacity. Any agent with
   `max_concurrent_tasks = 1` failed every repository dispatch with "repository
   execution identity is not active and Project-eligible". `Busy` is a
@@ -1848,7 +2057,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   normally retried, and the retry can overlap the original, so this turned an
   ordinary retry into a spurious conflict. The loser now re-resolves exactly
   once against the now-consumed approval; the retry is admitted only when that
-  approval is consumed *and* the committed handoff carries the caller's own
+  approval is consumed _and_ the committed handoff carries the caller's own
   idempotency key, so a genuine conflict is never retried into success.
 
 - Approving a Project adoption Charter now installs the canonical Project-Agent
@@ -2007,7 +2216,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Charter shell exists now decides the path, so review feedback can be
   applied before approval instead of only after it.
 - A server restart no longer signs the web client out. The token-refresh call
-  cleared the session on *any* non-2xx and on transport failure, so every
+  cleared the session on _any_ non-2xx and on transport failure, so every
   restart — routine on a local-first app — discarded a still-valid refresh
   token and bounced to `/login`. Only the server actually rejecting the
   refresh token (400/401/403/422) ends the session; anything else surfaces as
@@ -2035,7 +2244,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
     be stored in Agent Chat content". The `sk-` marker now has to open a word
     and be followed by a key-length token, and `api key` only marks a secret
     when an assignment (`=`/`:`) carries a value after it, so `REST API. Key
-    endpoints` passes.
+endpoints` passes.
   - The new-agent wizard's `DEFAULT_CEILING` omitted `propose_project` and six
     other scopes that seeded agents already had, so no agent created through
     the UI could ever be granted Project orchestration — the ceiling is the
@@ -2560,7 +2769,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Main and Project Agent bindings now name only the agent.
   `PUT /api/v1/account/main-agent` and `PUT /api/v1/projects/{id}/project-agent`
   no longer accept `profile_id`; every turn resolves the bound agent's
-  *current* settings, so editing an agent applies to its next turn in every
+  _current_ settings, so editing an agent applies to its next turn in every
   bound scope without rebinding. The binding row's stored profile reference
   is now a bind-time snapshot reserved for future per-binding overrides.
 - The New agent wizard is harness-first: step 1 picks how the agent runs
@@ -2695,7 +2904,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   (e.g. "turn limit reached", an auth rejection) in the turn job and the
   server log instead of the opaque "native Agent Chat turn failed".
 - Browser OAuth login no longer fails with `redirect_origin is not a
-  configured trusted origin` when the UI is served by Forge itself. The
+configured trusted origin` when the UI is served by Forge itself. The
   trusted-origin list now includes the server's own serving origin (both
   `localhost` and `127.0.0.1` spellings for a loopback bind, and the
   `public_base_url` origin when configured) in addition to the configured
@@ -2767,7 +2976,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   in `server.cors_origins`. They never redirect a browser, so the trusted-origin
   check applied only to browser OAuth; previously any origin outside
   `cors_origins` failed with `redirect_origin is not a configured trusted
-  origin`.
+origin`.
 - The ChatGPT authorization URL now sends `id_token_add_organizations=true` and
   `originator`, and no longer sends Google's `access_type`/`prompt` parameters.
 

@@ -109,6 +109,13 @@ dispatch, validation, review, merge, cleanup, and recovery services in the
 same process as the TUI. It does not require `forge`, a browser, an HTTP
 listener, MCP, OAuth callback transport, or a remote daemon.
 
+The default screen is a terminal-native Kanban with `Queued`, `Active`,
+`Review`, `Blocked`, and `Done` lanes. `F2` opens the one Main Chat tab—the
+repository's scoped Project Agent conversation—as a separate primary view. On
+compact terminals, the board keeps the lane summary visible and draws one
+full-width lane so Task names and blockers remain readable; use Left/Right to
+move between lanes and Up/Down to select a Task.
+
 ### Prerequisites
 
 Before first launch, make sure that:
@@ -200,7 +207,7 @@ repository, shell, or unrestricted filesystem access. Once adoption is
 approved, it coordinates work through the ordinary `autonomous_v1` Task
 workflow: a leased Task Worker, blocking checks, human review, merge, and
 cleanup. The TUI keeps Worker/reviewer identity, checks, commit evidence,
-blockers, and permitted recovery actions visible in the Project rail.
+blockers, and permitted recovery actions visible from Kanban Task details.
 
 Use `--agent codex` for the scoped adoption and Task-coordination flow. Codex
 chat connects to Forge tools through app-server stdio callbacks. The other
@@ -267,18 +274,18 @@ unless a backup exists. Removing neither is required for ordinary upgrades.
 
 ### Troubleshooting
 
-| Symptom | What to do |
-|---|---|
-| `forge-solo` says stdin/stdout is not a terminal | Run it from an interactive terminal; piped/script mode is not part of v1. |
-| No Git repository, linked worktree, or managed worktree | Launch from the primary worktree; a nested directory under it is fine. |
-| No eligible Agent | Install and authenticate one of the six supported CLI harnesses, then retry discovery. Executable presence alone is not authentication. |
-| The selected Agent became unavailable | Re-run that harness's own login/recovery flow and select it again; Solo never silently substitutes a different Agent. |
-| Another Solo process owns the data root | Exit the other process or use the reported root to find it. Do not remove `runtime.lock` while it is live. |
+| Symptom                                                                       | What to do                                                                                                                                                                      |
+| ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `forge-solo` says stdin/stdout is not a terminal                              | Run it from an interactive terminal; piped/script mode is not part of v1.                                                                                                       |
+| No Git repository, linked worktree, or managed worktree                       | Launch from the primary worktree; a nested directory under it is fine.                                                                                                          |
+| No eligible Agent                                                             | Install and authenticate one of the six supported CLI harnesses, then retry discovery. Executable presence alone is not authentication.                                         |
+| The selected Agent became unavailable                                         | Re-run that harness's own login/recovery flow and select it again; Solo never silently substitutes a different Agent.                                                           |
+| Another Solo process owns the data root                                       | Exit the other process or use the reported root to find it. Do not remove `runtime.lock` while it is live.                                                                      |
 | Marker is malformed, insecure, or the data root belongs to another repository | Restore a matching marker/data-root backup or pass an explicit `--data-dir` containing the current repository binding. Do not edit the marker to point at an unrelated Project. |
-| Startup recovery fails before the TUI appears | Read the printed startup error, correct the runtime or data-root issue, and relaunch. Startup recovery is a pre-TUI wait, not an in-TUI progress screen. |
-| A Task is blocked after the TUI appears | Use the displayed typed Attention/review action. Do not infer success from old chat text or bypass the workflow. |
-| A turn is awaiting protected runtime input | Solo currently has no attached interaction broker, so it cannot answer the question; use a broker-backed surface and leave the turn parked until then. |
-| Provider login is requested inside the TUI | Leave Solo, complete the supported CLI's own authentication, and relaunch; provider onboarding is deliberately outside Solo v1. |
+| Startup recovery fails before the TUI appears                                 | Read the printed startup error, correct the runtime or data-root issue, and relaunch. Startup recovery is a pre-TUI wait, not an in-TUI progress screen.                        |
+| A Task is blocked after the TUI appears                                       | Use the displayed typed Attention/review action. Do not infer success from old chat text or bypass the workflow.                                                                |
+| A turn is awaiting protected runtime input                                    | Solo currently has no attached interaction broker, so it cannot answer the question; use a broker-backed surface and leave the turn parked until then.                          |
+| Provider login is requested inside the TUI                                    | Leave Solo, complete the supported CLI's own authentication, and relaunch; provider onboarding is deliberately outside Solo v1.                                                 |
 
 ## Configuration
 
@@ -338,7 +345,7 @@ running create-spark on the Forge host. The default command is pinned:
 
 ```yaml
 scaffold:
-  command: bunx @forgeailab/create-spark@0.4.5   # FORGE_SCAFFOLD_COMMAND
+  command: bunx @forgeailab/create-spark@0.4.5 # FORGE_SCAFFOLD_COMMAND
 ```
 
 `bun` is the only host dependency it needs, and only for scaffolded Projects.
@@ -363,6 +370,16 @@ Forge's managed Codex and Claude Code adapters launch pinned npm packages via
 `npx`: `@openai/codex@0.154.0` and `@anthropic-ai/claude-code@2.1.267`.
 Updating a globally installed CLI does not update these managed versions.
 The packages must be able to install their platform-native dependencies.
+For automatic Task commits, Forge disables repository Git hooks, filesystem
+monitors, maintenance, rerere, and partial-clone lazy fetches. It ignores dirty
+submodule worktrees while still committing changed gitlinks, and explicitly
+includes untracked files even when repository status configuration hides them.
+A configured clean/process filter stops automatic finalization before the
+filter runs. An automatic retry requires removing the effective filter
+configuration, and only when doing so preserves the repository's intended
+storage semantics. Otherwise use the repository's explicit manual recovery
+flow; manually committing alone does not bypass Forge's filter guard on the
+next automatic attempt.
 For npm 12, Forge allows the exact pinned Claude Code package's install script
 so its native binary is installed; other dependency scripts remain subject to
 npm policy. An authenticated local CLI alone does not verify the managed
@@ -622,12 +639,15 @@ new preview.
 ## Main Chat and the Project Agent Workspace
 
 The approved product model has one global Main Agent binding/chat per account
-and exactly one Project Agent binding/chat per operational Project. Main Chat
-appears directly below the Project switcher. Each Project's **Agent Workspace**
-keeps its durable conversation beside Project-record editing controls; on small
-screens, use the Conversation/Project segments without losing either draft. A connected
-but unbound identity stays available for later selection and does not appear as
-an extra chat-switcher entry. The revised binding and chat resources are:
+and exactly one Project Agent binding/chat per operational Project. The application
+keeps **Kanban** and **Main Chat** as its only two primary tabs; Project Agent and
+other Project/Workspace destinations remain reachable from the contextual `More`
+menu. There is no second floating Main Chat launcher. Each Project's **Project
+Agent** workspace keeps its durable conversation beside Project-record editing
+controls; on small screens, use the Conversation/Project segments without losing
+either draft. A connected but unbound identity stays available for later selection
+and does not appear as an extra chat-switcher entry. The revised binding and chat
+resources are:
 
 - Main binding: `/api/v1/account/main-agent`
 - Project binding: `/api/v1/projects/{project_id}/project-agent`
@@ -739,11 +759,11 @@ Open the Project's **Execution readiness** panel or call
 `GET /api/v1/projects/{id}/execution-setup`. Forge deliberately reports three
 independent dimensions:
 
-| Dimension | What it answers | Important states |
-| --- | --- | --- |
-| `coordination_state` | Can the singular Project Chat admit a turn? | `ready`, `setup_required`, `unavailable` |
-| `execution_setup_state` | Is the repository ready? Project Worker/reviewer choices are optional defaults. | `provisioning`, `ready`, `setup_required`, `failed`, `unavailable` |
-| `execution_gate` | Is Charter-backed execution available? | normally `active`; `unavailable` only when the projection cannot be read |
+| Dimension               | What it answers                                                                 | Important states                                                         |
+| ----------------------- | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `coordination_state`    | Can the singular Project Chat admit a turn?                                     | `ready`, `setup_required`, `unavailable`                                 |
+| `execution_setup_state` | Is the repository ready? Project Worker/reviewer choices are optional defaults. | `provisioning`, `ready`, `setup_required`, `failed`, `unavailable`       |
+| `execution_gate`        | Is Charter-backed execution available?                                          | normally `active`; `unavailable` only when the projection cannot be read |
 
 Project creation can therefore succeed while repository setup is
 `provisioning` or `setup_required`. Project Agent coordination is useful but
@@ -918,22 +938,22 @@ conflict; they are the links between chat, Project truth, and repository work.
 
 ### Recovery quick reference
 
-| Symptom | What it means | Safe next action |
-| --- | --- | --- |
-| `coordination_state: setup_required` | Main/Project binding or Chat admission is incomplete | Fix the authorized binding/Profile in Agent Settings, then refresh the Chat; no turn is fabricated. |
-| Missing Worker | The Task's current workflow role has no enabled Agent assignment | Assign any enabled configured Agent on the Task; it may also be Main or Project Agent. |
-| Missing reviewer default | No Project-wide reviewer default is selected | Nothing is blocked until a Task workflow needs the role; assign any enabled Agent on that Task, including its Worker. |
-| `execution_setup_state: provisioning` | Durable setup is still reconciling | Refresh the projection; wait for `ready` or follow the recorded retry action. |
-| `execution_setup_state: failed` | A checkpoint stopped with a typed error | Fix the recorded cause and retry the same provisioning operation with its current version and a new idempotency key. |
-| Repository setup is missing or invalid | The Project has no primary Repo, the pointer does not resolve, or the Repo belongs to another Project | Attach a valid same-Project Repo through Project execution setup, then let normal scheduling reconsider existing Tasks. Do not patch Tasks or select an unlisted Repo row. |
-| A Project is still paused after repository repair | The pause is manual rather than the matching automatic setup pause | Resume the Project explicitly; repository attachment never clears a user pause. |
-| `scaffold_runtime_unavailable` or `repository_scaffold_failed` | The `repository_scaffolded` checkpoint could not run create-spark, or create-spark refused the template or pack set | Install `bun` (or fix `FORGE_SCAFFOLD_COMMAND`) and retry; for a bad pack set, amend the Charter's `scaffold` block, then retry the same provisioning operation. The partial directory is removed before the failure is recorded. |
-| `version_conflict`, `digest_conflict`, or stale projection | Another command changed the authoritative revision | Refetch current state and re-propose/retry with the correct version; do not overwrite immutable history. |
-| Wake `deferred` or `setup_required` | Delivery could not safely admit a turn yet | Follow the durable retry/setup action; the event remains traceable and is reconsidered after state changes. |
-| `execution_gate: reconciliation_required` | Two traceability records disagree, or the active plan is invalid | Open Project Overview, read the one-sentence replacement effect, then choose **Accept** or **Reject**. Task-scoped conflicts remain scoped and do not freeze unrelated work. |
-| An adaptive split/sequence/replace is needed | The Task shape no longer fits the work | The Project Agent can use any of the three operations under the current Charter; optional plan operation lists do not grant or deny them. |
-| `validation_error` naming `adaptive_envelope.allowed_task_operations` | A plan tried to grant something outside `split`, `sequence`, `replace` | Correct the envelope to those verbs. Command names such as `task.propose` are not adaptive verbs. |
-| A blocked Task showing "implementation committed" | Work is committed and waiting on review, not unstarted | Follow the single next action on the Task's blocker; progress language is derived from real attempt/commit evidence and never regresses to "not started". |
+| Symptom                                                               | What it means                                                                                                       | Safe next action                                                                                                                                                                                                                  |
+| --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `coordination_state: setup_required`                                  | Main/Project binding or Chat admission is incomplete                                                                | Fix the authorized binding/Profile in Agent Settings, then refresh the Chat; no turn is fabricated.                                                                                                                               |
+| Missing Worker                                                        | The Task's current workflow role has no enabled Agent assignment                                                    | Assign any enabled configured Agent on the Task; it may also be Main or Project Agent.                                                                                                                                            |
+| Missing reviewer default                                              | No Project-wide reviewer default is selected                                                                        | Nothing is blocked until a Task workflow needs the role; assign any enabled Agent on that Task, including its Worker.                                                                                                             |
+| `execution_setup_state: provisioning`                                 | Durable setup is still reconciling                                                                                  | Refresh the projection; wait for `ready` or follow the recorded retry action.                                                                                                                                                     |
+| `execution_setup_state: failed`                                       | A checkpoint stopped with a typed error                                                                             | Fix the recorded cause and retry the same provisioning operation with its current version and a new idempotency key.                                                                                                              |
+| Repository setup is missing or invalid                                | The Project has no primary Repo, the pointer does not resolve, or the Repo belongs to another Project               | Attach a valid same-Project Repo through Project execution setup, then let normal scheduling reconsider existing Tasks. Do not patch Tasks or select an unlisted Repo row.                                                        |
+| A Project is still paused after repository repair                     | The pause is manual rather than the matching automatic setup pause                                                  | Resume the Project explicitly; repository attachment never clears a user pause.                                                                                                                                                   |
+| `scaffold_runtime_unavailable` or `repository_scaffold_failed`        | The `repository_scaffolded` checkpoint could not run create-spark, or create-spark refused the template or pack set | Install `bun` (or fix `FORGE_SCAFFOLD_COMMAND`) and retry; for a bad pack set, amend the Charter's `scaffold` block, then retry the same provisioning operation. The partial directory is removed before the failure is recorded. |
+| `version_conflict`, `digest_conflict`, or stale projection            | Another command changed the authoritative revision                                                                  | Refetch current state and re-propose/retry with the correct version; do not overwrite immutable history.                                                                                                                          |
+| Wake `deferred` or `setup_required`                                   | Delivery could not safely admit a turn yet                                                                          | Follow the durable retry/setup action; the event remains traceable and is reconsidered after state changes.                                                                                                                       |
+| `execution_gate: reconciliation_required`                             | Two traceability records disagree, or the active plan is invalid                                                    | Open Project Overview, read the one-sentence replacement effect, then choose **Accept** or **Reject**. Task-scoped conflicts remain scoped and do not freeze unrelated work.                                                      |
+| An adaptive split/sequence/replace is needed                          | The Task shape no longer fits the work                                                                              | The Project Agent can use any of the three operations under the current Charter; optional plan operation lists do not grant or deny them.                                                                                         |
+| `validation_error` naming `adaptive_envelope.allowed_task_operations` | A plan tried to grant something outside `split`, `sequence`, `replace`                                              | Correct the envelope to those verbs. Command names such as `task.propose` are not adaptive verbs.                                                                                                                                 |
+| A blocked Task showing "implementation committed"                     | Work is committed and waiting on review, not unstarted                                                              | Follow the single next action on the Task's blocker; progress language is derived from real attempt/commit evidence and never regresses to "not started".                                                                         |
 
 ### After execution: milestones, readiness, and release evidence
 

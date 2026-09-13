@@ -4,6 +4,14 @@
 
 Forge is a focused foundry: calm, compact operational surfaces in warm stone and charcoal, with an ember-orange accent that signals action and live work. Its signature is the ember edge—a restrained orange rail, glow, or focus treatment that makes active work legible without turning the board into a decorative dashboard.
 
+Forge Solo is the primary one-checkout experience and is terminal-native, not
+a reduced web dashboard. Its top-level information architecture has exactly
+two destinations: `Kanban` and one `Main Chat` tab for the repository-scoped
+Project Agent conversation. The label does not grant global Main Agent scope.
+Kanban is the launch default; chat never competes with it in a permanent side
+rail. The web application may mirror this hierarchy for multi-Project
+management, but it does not define the Solo composition.
+
 ## 2. Color
 
 Colors are implemented as HSL component custom properties in `web/src/index.css` and consumed through semantic Tailwind names. Alpha variants of these tokens are allowed; new raw colors are not.
@@ -87,9 +95,30 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 
 ### Shell and board geometry
 
+#### Forge Solo terminal composition
+
+- The first content row after repository/Project/Agent health is a persistent
+  two-item switcher: `Kanban` and `Main Chat`. `F2` switches them in every
+  supported terminal; direct control-key shortcuts are secondary accelerators.
+- Kanban owns the full remaining terminal. Its lifecycle lanes are exactly
+  `Queued`, `Active`, `Review`, `Blocked`, and `Done`; Attention and Approvals
+  are secondary board surfaces rather than primary destinations.
+- At wide dimensions, draw all five lanes as equal peers. At compact
+  dimensions, retain a one-line summary of all lane counts and draw exactly
+  one full-width selected lane. Never squeeze five unreadable columns into an
+  80-column terminal.
+- Arrow keys move between lanes and Tasks. `Enter` opens evidence-rich Task
+  details or the authoritative review card. The overlay occupies the complete
+  compact frame so underlying board borders cannot leak through it.
+- Main Chat contains one timeline and one composer. The Kanban is absent while
+  this view is active; it does not survive as a narrow competing rail.
+- Render mode is derived from the current terminal frame on every draw. Startup
+  must not briefly use a stale default width while waiting for a resize event.
+
 - Viewport shell: `min-height: 100vh` fallback plus `100dvh`; the page itself never owns horizontal overflow.
-- Shell modes: full 240px navigation at `>=1440px`; 56px rail from `1024px` through `1439px`; closed overlay drawer below `1024px`.
-- A user-expanded rail may temporarily render the full navigation without rewriting the persisted wide-desktop preference.
+- Shell hierarchy: one compact top bar owns brand, Project selection, the two primary tabs, and account utilities. There is no persistent sidebar, compact rail, or mobile drawer competing with the work surface.
+- Primary tabs are exactly `Kanban` and `Main Chat`. At desktop they sit inline in the top bar; below 768px they occupy a second, full-width row with equal targets. The selected tab uses the ember edge/surface treatment and remains named in text.
+- Secondary Project and Workspace destinations live in one `More` menu. Account settings remain in the user menu. Removing a destination from primary navigation must never make it unreachable.
 - Board route main: `min-width: 0`, no scrolling, and no generic page padding. Other routes retain the existing 20px content padding and main scroll.
 - Board page: toolbar is fixed above a single `min-height: 0` board viewport. The viewport owns both horizontal and vertical drag scrolling.
 - Columns: `min-width: 220px` at 1280px, a comfortable tablet width that allows at least two columns at 768px, and `min-width: 280px` at 375px. Column/task-list children never establish another scroll container.
@@ -121,11 +150,11 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 
 ### App shell navigation
 
-- **Structure:** skip link, navigation, header, and main landmark.
-- **Variants:** full sidebar, compact rail, overlay drawer.
-- **States:** active item, hover, focus, drawer open/closed, persisted desktop collapse preference.
-- **Accessibility:** drawer traps/contains focus through existing dialog/sheet behavior, closes on Escape and outside click, and returns focus to its menu trigger.
-- **Motion:** drawer/rail transitions use standard timing, transform, and opacity; reduced motion removes non-essential movement.
+- **Structure:** skip link, one responsive top bar, a primary tablist-like navigation containing `Kanban` and `Main Chat`, one Project switcher, a `More` menu for secondary destinations, account utilities, and the main landmark.
+- **Primary hierarchy:** Kanban is the default destination whenever an authorized Project exists. Main Chat is the one account-level chat entry. Overview, Tasks, Project Agent, Project settings, Agent settings, Mission Control, runtimes, operations, and Forge settings are secondary destinations and never appear as peer tabs.
+- **States:** active tab, hover, active press, visible focus, disabled Kanban when no Project exists, open/closed menus, loading Project selection, and compact wrapping below 768px.
+- **Accessibility:** tabs are semantic links with visible labels and `aria-current`; the disabled Kanban target explains that a Project is required. Dropdown menus use the existing keyboard behavior and return focus to their triggers.
+- **Motion:** color, opacity, and transform only using the micro timing token; reduced motion removes non-essential movement.
 
 ### Board toolbar
 
@@ -147,6 +176,13 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 - **Accessibility:** the card body and drag handle are separate targets; the handle is a visible button-like control with an accessible name and at least a 32px target. Keyboard drag uses the DnD library controls.
 - **Motion:** hover/drag uses tokenized shadow plus transform/opacity; active in-progress ember motion respects reduced motion.
 
+### Kanban task detail
+
+- **Structure:** selecting a Kanban card opens one bounded dialog without leaving the board context. The task header and description lead; workflow exceptions, dependencies, runs, and history follow; editable phase, assignees, priority, timestamps, and observability are supporting details.
+- **Responsive:** at 1024px and above, content and the 288px supporting-detail rail may scroll independently. Below 1024px, the dialog becomes one ordered column and one scroll owner: primary task content first, supporting details second. The content column must never remain beside the rail when doing so would make readable text narrower than the card minimum.
+- **States:** loading preserves header/content/detail geometry; empty description and empty run/history sections name the absence; errors stay inline; editing preserves the user's draft. The dialog closes on Escape and restores the board context.
+- **Accessibility:** the task title labels the dialog, close and full-page actions remain visible, headings preserve a logical order, and all identifiers wrap without horizontal overflow.
+
 ### Drag handle
 
 - **Structure:** Phosphor grip icon in a dedicated 32px control; only this control receives `dragHandleProps`.
@@ -162,11 +198,11 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 
 ### Agent scope navigation
 
-- **Structure:** scope is represented only in the application shell. `Main Chat` appears immediately after the Project switcher and before the `Project` section label. The selected Project contributes one `Agent Workspace` entry within that section. `Agent Settings` appears once in `Workspace`; chat pages never render a second global/Project roster.
-- **Order:** Project switcher; Main Chat; Project label and Overview, Board, Tasks, Agent Workspace, Project Settings; Workspace label and Agent Settings, Mission Control, Daemons, Operations, Forge Settings.
-- **States:** active, ready, setup required, loading, unavailable, and empty Project selection. Setup status stays visible on the destination surface rather than adding a duplicate navigation model.
-- **Accessibility:** entries are semantic links with `aria-current="page"`, visible focus rings, and names that include scope where needed. The compact drawer preserves the same order, closes on activation, and restores focus to its trigger.
-- **Responsive:** the full sidebar, compact rail, and overlay drawer expose the same hierarchy. Navigation never creates document-wide horizontal overflow.
+- **Structure:** scope is represented once in the application shell. `Main Chat` is one of two primary tabs; it never gains a second launcher or duplicate roster. The selected Project's Project Agent remains reachable from the contextual `More` menu as `Project Agent`.
+- **Order:** Project switcher; primary `Kanban` and `Main Chat` tabs; secondary Project destinations; secondary Workspace destinations; account utilities.
+- **States:** active, ready, setup required, loading, unavailable, and empty Project selection. Setup status stays visible on the destination surface rather than adding another navigation model.
+- **Accessibility:** primary entries are semantic links with `aria-current="page"` and visible focus rings. Secondary destinations remain keyboard reachable through the named `More` menu.
+- **Responsive:** the same two primary tabs remain visible at every width. Menus and tab rows never create document-wide horizontal overflow.
 
 ### Agent chat timeline and composer
 
@@ -181,7 +217,7 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 
 #### Main Chat topic boundary
 
-- **Structure:** a compact control beside the Main Chat header showing the current topic's label and a `New topic` action. This is a durable, user-owned context epoch *inside* the one account Main Chat (design D21) -- it never renders as, links to, or implies a second chat, binding, or identity. Earlier topics are listed in a disclosure as inspectable/searchable history; opening one never injects it into the live turn's episodic context.
+- **Structure:** a compact control beside the Main Chat header showing the current topic's label and a `New topic` action. This is a durable, user-owned context epoch _inside_ the one account Main Chat (design D21) -- it never renders as, links to, or implies a second chat, binding, or identity. Earlier topics are listed in a disclosure as inspectable/searchable history; opening one never injects it into the live turn's episodic context.
 - **Starting a topic:** `New topic` opens a small dialog with an optional label field and explains, in plain language, that Forge keeps the same Main Chat, rotates what the Main Agent sees on the next message to the new topic plus canonical portfolio state and unresolved obligations, and adds a visible divider. On success the dialog closes and the divider appears in place in the timeline as a real, durable, immutable message rendered as a `TimelineDivider` separator rather than a chat bubble.
 - **Denial:** starting a topic is refused while a Main turn is live or while a Product Genesis session/approval still needs an explicit finish-or-cancel decision (design D21). The dialog stays open, keeps the user's in-progress label, and shows the server's specific reason inline with `role="alert"`; it is never presented as a generic failure.
 - **States:** apply the shared state contract in "Charter, Project Overview, and release primitives" below -- loading (topics not yet fetched, action disabled), disabled (with a truthful reason surfaced via `title` and passed down from the live-turn/Genesis-pending signal), stale (a background refetch badge beside the current label), conflict/denied (inline alert, dialog remains open), error (topic history unavailable, rest of the chat stays usable), and success (dialog closes, current label updates, divider visible).
@@ -196,10 +232,10 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 - **Responsive:** at 1280px, use conversation plus a bounded editing rail; at 768px and 375px, use a labeled `Conversation` / `Project` segmented view. Segment changes preserve drafts and focus context and warn before abandoning unsaved changes.
 - **Accessibility:** the segment control follows the tab pattern, mutation results use polite status announcements, actionable failures use alerts, and saved receipts remain inspectable from the timeline or editing rail.
 
-### Global chat launcher
+### Singular Main Chat entry
 
-- **Structure:** a bottom-right launcher opens the same account-owned Main Agent timeline as `/chat`; it never creates a second chat or local fork.
-- **Accessibility:** the launcher has an accessible name, Escape closes the panel, focus moves into the panel on open, and focus returns to the launcher on close. The panel is responsive to viewport height and keeps the composer reachable above the safe area.
+- **Structure:** `/chat` is reached from the one persistent `Main Chat` primary tab. Do not render a floating launcher, duplicate panel, alternate global-chat button, or local fork of the timeline.
+- **Accessibility:** the tab is visible and keyboard reachable at every breakpoint, uses `aria-current="page"` when selected, and keeps the chat composer reachable above the safe area.
 
 ### Settings tab bar
 
@@ -409,9 +445,9 @@ keyboard reachable at every width.
   internal labels “canonical conflict” or “reconciliation review.” Keep record IDs, revisions,
   digests, field paths, and principal metadata inside a native `Technical details` disclosure.
   A server-recommended historical plan repair uses `Accept update & resume work` and `Reject for
-  now`; accepting is one atomic user gesture that approves and applies the exact correction, while
+now`; accepting is one atomic user gesture that approves and applies the exact correction, while
   rejecting truthfully leaves work paused. Generic choices use plain verbs such as `Keep the
-  current work`, `Cancel the affected work`, and `Discard the conflicting change`; Forge supplies
+current work`, `Cancel the affected work`, and `Discard the conflicting change`; Forge supplies
   the audit reason, so the user is never blocked by an unexplained required textarea or replacement
   identifier field.
 - **Approval-required:** use an ember-edged approval card that says what exact operation is

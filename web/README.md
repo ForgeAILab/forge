@@ -70,11 +70,11 @@ shapes — when a backend response shape changes, update both in the same change
 
 ## Branding assets
 
-| File | Use |
-|---|---|
-| `public/logo.png` | Square mark, used as favicon and in the sidebar header |
-| `public/apple-touch-icon.png` | iOS touch icon (192px) |
-| `public/forge-wordmark.png` | OG image / social share preview |
+| File                          | Use                                                         |
+| ----------------------------- | ----------------------------------------------------------- |
+| `public/logo.png`             | Square mark, used as favicon and in the application top bar |
+| `public/apple-touch-icon.png` | iOS touch icon (192px)                                      |
+| `public/forge-wordmark.png`   | OG image / social share preview                             |
 
 Sources are committed under [`/assets/`](../assets/) at the repo root —
 re-export with `sips` if you need different sizes.

@@ -65,3 +65,4 @@ crates/api-types/bindings/ProjectHook*.ts
 /artifacts/
 /test-archives/
 /test-backup-*/
+/test.*/

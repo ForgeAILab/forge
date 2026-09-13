@@ -78,7 +78,7 @@ see a demo project with a labelled task and a fake daemon report. From here:
 - Wire up Claude Code / Codex / Cursor / Gemini → [docs/getting-started.md#agents](docs/getting-started.md#configuring-agents)
 - Hit the API directly → [docs/api.md](docs/api.md)
 
-Working in one checkout from a terminal? → [Forge Solo](docs/getting-started.md#forge-solo)
+Working in one checkout from a terminal? Open the Kanban-first [Forge Solo](docs/getting-started.md#forge-solo).
 
 Prefer to build from source? `cargo run -p forge-cli -- --demo`.
 

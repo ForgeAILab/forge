@@ -20,7 +20,7 @@ Use this checklist for public beta releases.
 ## Release Steps
 
 - [ ] Update `CHANGELOG.md`.
-- [ ] Confirm the workspace version in `Cargo.toml`, its package entries in `Cargo.lock`, and `web/package.json` match. `forge-client` retains its independent version; the npm bootstrapper receives the release tag version in the release workflow.
+- [ ] Confirm the workspace version in `Cargo.toml`, its package entries in `Cargo.lock`, `web/package.json`, and `npx-cli/package.json` match. Every workspace crate, `forge-client` included, inherits `version.workspace`; the npm bootstrapper also receives the release tag version in the release workflow.
 - [ ] Merge the reviewed release PR and confirm the full CI, security, and code-scanning checks pass on the exact release commit before tagging.
 - [ ] Tag the release with `vX.Y.Z`.
 - [ ] Wait for `.github/workflows/release.yml` to publish artifacts and `SHA256SUMS`.

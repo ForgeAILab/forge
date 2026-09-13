@@ -90,23 +90,29 @@ except for the listed contextual commands. `Enter` submits a non-empty,
 enabled composer draft, or confirms the selected setup/modal option. It never
 treats a word typed in chat as an approval.
 
+Solo opens on the Kanban. `F2` switches between that task workspace and the
+single Main Chat without hiding either inside a side rail. Wide terminals draw
+all five lifecycle lanes; compact terminals draw one readable lane at a time
+and keep the five lane counts visible above it.
+
 | Key | Action |
 |---|---|
 | `Enter` | Submit a non-empty composer draft; confirm the selected setup/question/approval/review/cancellation action. |
 | `Shift+Enter` | Insert a newline in the composer. |
 | `Backspace`, `Delete` | Delete before/after the composer cursor. |
-| `Left`, `Right` | Move the composer cursor. |
+| `Left`, `Right` | Move the composer cursor in Main Chat, or move between non-empty Kanban lanes. |
 | `Home`, `End` | Move the composer cursor when it is focused; otherwise jump to the oldest/latest timeline position. (`Ctrl` does not change this mapping.) |
-| `Tab`, `Shift+Tab` | Move focus forward/backward across the visible composer, timeline, activity, and Project rail. |
-| `Enter` (Project rail, or a narrow Project tab outside the composer) | Open the selected approval or awaiting-review Task card. Opening a card does not execute its action. |
+| `Tab`, `Shift+Tab` | In Main Chat, move focus forward/backward across the composer, timeline, and activity. |
+| `Enter` (Kanban) | Open the selected Task's details, or its authoritative review card when one is available. Opening a card does not execute its action. |
 | `Up`, `Down` | Scroll the focused timeline/activity, move the selected task, or move a setup/modal selection. |
 | `PageUp`, `PageDown` | Scroll the timeline, or move a modal selection when a modal is focused. |
-| `p` | Toggle the Project rail; on a narrow terminal, cycle its tab view. |
-| `a` | Expand/collapse the live activity row when one is present. |
+| `F2` | Switch between Kanban and Main Chat. This is the portable terminal shortcut. |
+| `Ctrl+1`, `Ctrl+2` | Open Kanban or Main Chat directly when the terminal reports control-number keys distinctly. |
+| `Ctrl+[`, `Ctrl+]` | Select the previous/next primary view when the terminal reports those control sequences distinctly. |
+| `t`, `a`, `v` (Kanban) | Open Tasks, Attention, or Approvals. |
+| `a` (Main Chat, outside composer) | Expand/collapse the live activity row when one is present. |
 | `Shift+R` (outside composer) | Expand/collapse ordinary reasoning (collapsed by default). |
 | `r` | Retry the current eligible failed turn; when setup is unavailable and retryable, refresh setup. |
-| `Ctrl+[`, `Ctrl+]` | Select the previous/next Project rail tab. |
-| `1`, `2`, `3` (narrow terminal, outside composer) | Select the Tasks, Attention, or Approvals Project tab. |
 | `?` (outside composer), `F1` | Open help when no other modal is active; close help when it is focused. |
 | `Esc` | Close the focused modal; in the setup picker it returns focus without changing the selected candidate; otherwise it is ignored. It never cancels a live turn by itself. |
 | `Ctrl+C` (when no modal is active) | With a live turn, open cancellation for that exact turn; otherwise request quit. During bounded shutdown, a second `Ctrl+C` forces terminal restoration and leaves durable recovery for the next launch. |
