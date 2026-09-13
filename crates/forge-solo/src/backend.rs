@@ -279,6 +279,8 @@ pub enum TaskState {
     InProgress,
     Blocked,
     Review,
+    Merging,
+    CleaningUp,
     Done,
     Failed,
     Cancelled,

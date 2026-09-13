@@ -70,10 +70,6 @@ export function KanbanTaskCard({
   const blockedReason = task.blocked?.reason ?? pausedAnnotation?.blocking_reason
   const isPaused = task.status !== 'cancelled' && Boolean(blockedReason)
   const hasActiveError = taskHasError(task)
-  const otherAssignments = task.role_assignments.filter(
-    (assignment) => assignment.role_name !== 'coder' && assignment.assignee_id,
-  )
-
   return (
     <Draggable
       draggableId={task.id}
@@ -139,33 +135,6 @@ export function KanbanTaskCard({
                   <WorkflowHealthBadge health={task.workflow_health} compact />
                 ) : null}
               </div>
-              {otherAssignments.length > 0 && (
-                <div className="mt-1 flex flex-wrap items-center gap-1">
-                  {otherAssignments.map((ra) => {
-                    const name =
-                      ra.assignee_type === 'agent' && ra.assignee_id
-                        ? agentNamesById.get(ra.assignee_id)
-                        : undefined
-                    return (
-                      <span
-                        key={ra.role_name}
-                        className="flex items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-micro text-muted-foreground"
-                        title={name ? `${ra.role_name}: ${name}` : ra.role_name}
-                      >
-                        {ra.assignee_type === 'agent' && ra.assignee_id ? (
-                          <Avatar
-                            name={name ?? ra.role_name}
-                            seed={ra.assignee_id}
-                            size="xs"
-                            className="h-3 w-3 rounded text-[7px]"
-                          />
-                        ) : null}
-                        <span className="truncate max-w-[60px]">{ra.role_name}</span>
-                      </span>
-                    )
-                  })}
-                </div>
-              )}
               <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
                 {coderAgentId ? (
                   <button

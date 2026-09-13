@@ -8,14 +8,14 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 
 use crate::app::{
-    ActivityItem, ActivityKind, AppState, AttentionItem, FocusTarget, LayoutMode, LiveActivity,
-    MessageRole, ModalState, ProjectReadiness, ProjectTab, RuntimeState, SetupState, TaskState,
-    TurnState,
+    ActivityItem, ActivityKind, AppState, AttentionItem, FocusTarget, KanbanLane, LayoutMode,
+    LiveActivity, MessageRole, ModalState, PrimaryView, ProjectReadiness, ProjectTab, RuntimeState,
+    SetupState, TaskState, TurnState,
 };
 
 const BG: Color = Color::Rgb(14, 18, 24);
@@ -31,33 +31,50 @@ const DANGER: Color = Color::Rgb(255, 119, 119);
 /// Render the complete Solo screen for the current terminal size.
 pub fn render(frame: &mut Frame<'_>, state: &AppState) {
     let area = frame.area();
+    let layout = LayoutMode::for_size(area.width, area.height);
     if area.width == 0 || area.height == 0 {
         return;
     }
     frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
 
-    let footer_height = 1;
-    let composer_height = composer_height(state, area);
-    let [header, body, composer, footer] = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(1),
-            Constraint::Length(composer_height),
-            Constraint::Length(footer_height),
-        ])
-        .areas(area);
-
-    render_header(frame, header, state);
-    match state.layout {
-        LayoutMode::Wide => render_wide(frame, body, state),
-        LayoutMode::Narrow => render_narrow(frame, body, state),
+    match state.primary_view {
+        PrimaryView::Kanban => {
+            let [header, tabs, board, footer] = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(2),
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                ])
+                .areas(area);
+            render_header(frame, header, state);
+            render_primary_tabs(frame, tabs, state);
+            render_kanban(frame, board, state, layout);
+            render_footer(frame, footer, state);
+        }
+        PrimaryView::MainChat => {
+            let composer_height = composer_height(state, area);
+            let [header, tabs, chat, composer, footer] = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(2),
+                    Constraint::Min(1),
+                    Constraint::Length(composer_height),
+                    Constraint::Length(1),
+                ])
+                .areas(area);
+            render_header(frame, header, state);
+            render_primary_tabs(frame, tabs, state);
+            render_chat(frame, chat, state);
+            render_composer(frame, composer, state);
+            render_footer(frame, footer, state);
+        }
     }
-    render_composer(frame, composer, state);
-    render_footer(frame, footer, state);
 
     if let Some(modal) = &state.modal {
-        render_modal(frame, area, modal, state);
+        render_modal(frame, area, modal);
     } else if matches!(
         state.setup,
         SetupState::AgentPicker { .. } | SetupState::Unavailable { .. }
@@ -135,82 +152,87 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     );
 }
 
-fn render_wide(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    if area.width < 2 {
-        render_chat(frame, area, state);
-        return;
-    }
-    let columns = if state.rail.collapsed {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(1), Constraint::Length(2)])
-            .split(area)
-    } else {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(1), Constraint::Length(34)])
-            .split(area)
-    };
-    render_chat(frame, columns[0], state);
-    if state.rail.collapsed {
-        frame.render_widget(
-            Paragraph::new("P")
-                .alignment(ratatui::layout::Alignment::Center)
-                .block(
-                    Block::default()
-                        .borders(Borders::LEFT)
-                        .border_style(Style::default().fg(PANEL_ALT)),
-                )
-                .style(Style::default().fg(ACCENT).bg(PANEL)),
-            columns[1],
-        );
-    } else {
-        render_rail(frame, columns[1], state);
-    }
-}
-
-fn render_narrow(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let strip_height = 2.min(area.height);
-    let project_height = if area.height >= 12 {
-        6
-    } else {
-        3.min(area.height.saturating_sub(strip_height))
-    };
-    let [tabs, project, chat] = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(strip_height),
-            Constraint::Length(project_height),
-            Constraint::Min(1),
-        ])
-        .areas(area);
-    render_narrow_tabs(frame, tabs, state);
-    render_rail(frame, project, state);
-    render_chat(frame, chat, state);
-}
-
-fn render_narrow_tabs(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let tabs = [
-        ProjectTab::Tasks,
-        ProjectTab::Attention,
-        ProjectTab::Approvals,
-    ];
-    let mut spans = vec![Span::styled(" ", Style::default())];
-    for tab in tabs {
-        let selected = tab == state.rail.tab;
+fn render_primary_tabs(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let mut spans = vec![Span::raw(" ")];
+    for view in [PrimaryView::Kanban, PrimaryView::MainChat] {
+        let selected = view == state.primary_view;
         spans.push(Span::styled(
-            format!("{} {} ", if selected { "▸" } else { "·" }, tab.label()),
+            format!(" {} ", view.label()),
             if selected {
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(BG)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(MUTED)
             },
         ));
+        spans.push(Span::raw("  "));
     }
-    spans.push(Span::styled(
-        "  (Ctrl-[ / Ctrl-])",
-        Style::default().fg(MUTED),
-    ));
+    if area.width >= 68 {
+        spans.push(Span::styled(
+            format!(
+                "{} attention  ·  {} approvals",
+                state.attention.len(),
+                state.approvals.len()
+            ),
+            Style::default().fg(MUTED),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans))
+            .block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .border_style(Style::default().fg(PANEL_ALT)),
+            )
+            .style(Style::default().bg(BG).fg(TEXT)),
+        area,
+    );
+}
+
+fn render_kanban(frame: &mut Frame<'_>, area: Rect, state: &AppState, layout: LayoutMode) {
+    if area.height == 0 {
+        return;
+    }
+    let [subnav, content] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .areas(area);
+    render_kanban_subnav(frame, subnav, state);
+    match state.rail.tab {
+        ProjectTab::Tasks => match layout {
+            LayoutMode::Wide => render_wide_kanban(frame, content, state),
+            LayoutMode::Narrow => render_narrow_kanban(frame, content, state),
+        },
+        ProjectTab::Attention | ProjectTab::Approvals => {
+            render_project_list(frame, content, state);
+        }
+    }
+}
+
+fn render_kanban_subnav(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let tabs = [
+        (ProjectTab::Tasks, "T", state.tasks.len()),
+        (ProjectTab::Attention, "A", state.attention.len()),
+        (ProjectTab::Approvals, "V", state.approvals.len()),
+    ];
+    let mut spans = vec![Span::raw(" ")];
+    for (tab, shortcut, count) in tabs {
+        let selected = tab == state.rail.tab;
+        spans.push(Span::styled(
+            format!(" {shortcut} {} {count} ", tab.label()),
+            if selected {
+                Style::default()
+                    .fg(TEXT)
+                    .bg(PANEL_ALT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(MUTED)
+            },
+        ));
+        spans.push(Span::raw(" "));
+    }
     frame.render_widget(
         Paragraph::new(Line::from(spans))
             .block(
@@ -220,6 +242,137 @@ fn render_narrow_tabs(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             )
             .style(Style::default().bg(PANEL)),
         area,
+    );
+}
+
+fn render_wide_kanban(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .spacing(1)
+        .constraints([
+            Constraint::Ratio(1, 5),
+            Constraint::Ratio(1, 5),
+            Constraint::Ratio(1, 5),
+            Constraint::Ratio(1, 5),
+            Constraint::Ratio(1, 5),
+        ])
+        .split(area);
+    for (column, lane) in columns.iter().zip(KanbanLane::ALL) {
+        render_kanban_lane(frame, *column, state, lane);
+    }
+}
+
+fn render_narrow_kanban(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let [lanes, column] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .areas(area);
+    let mut spans = vec![Span::raw(" ")];
+    for lane in KanbanLane::ALL {
+        let count = state
+            .tasks
+            .iter()
+            .filter(|task| task.state.kanban_lane() == lane)
+            .count();
+        spans.push(Span::styled(
+            format!(" {} {count} ", lane.label()),
+            if lane == state.rail.lane {
+                Style::default()
+                    .fg(BG)
+                    .bg(lane_color(lane))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(MUTED)
+            },
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans))
+            .block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .border_style(Style::default().fg(PANEL_ALT)),
+            )
+            .style(Style::default().bg(BG)),
+        lanes,
+    );
+    render_kanban_lane(frame, column, state, state.rail.lane);
+}
+
+fn render_kanban_lane(frame: &mut Frame<'_>, area: Rect, state: &AppState, lane: KanbanLane) {
+    let task_indexes = state
+        .tasks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, task)| (task.state.kanban_lane() == lane).then_some(index))
+        .collect::<Vec<_>>();
+    let focused = state.focus == FocusTarget::ProjectRail
+        && state.rail.tab == ProjectTab::Tasks
+        && state.rail.lane == lane;
+    let border = if focused { lane_color(lane) } else { PANEL_ALT };
+    let title = format!(" {}  {} ", lane.label(), task_indexes.len());
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .style(Style::default().bg(PANEL));
+    if task_indexes.is_empty() {
+        frame.render_widget(
+            Paragraph::new(" No tasks")
+                .block(block)
+                .style(Style::default().fg(MUTED)),
+            area,
+        );
+        return;
+    }
+
+    let content_width = area.width.saturating_sub(6) as usize;
+    let items = task_indexes
+        .iter()
+        .map(|index| {
+            let task = &state.tasks[*index];
+            let mut lines = vec![Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{} {} ",
+                        if task.selected { "▸" } else { " " },
+                        task.state.marker()
+                    ),
+                    task_state_style(task.state),
+                ),
+                Span::styled(
+                    fit_inline(&task.title, content_width.max(4)),
+                    Style::default().fg(TEXT),
+                ),
+            ])];
+            let detail = if task.worker.is_empty() {
+                task.state.label().to_owned()
+            } else {
+                format!("{} · {}", task.worker, task.state.label())
+            };
+            lines.push(Line::from(Span::styled(
+                format!("    {}", fit_inline(&detail, content_width.max(4))),
+                Style::default().fg(MUTED),
+            )));
+            if let Some(blocker) = &task.blocker {
+                lines.push(Line::from(Span::styled(
+                    format!("    ! {}", fit_inline(blocker, content_width.max(4))),
+                    Style::default().fg(WARNING),
+                )));
+            }
+            ListItem::new(Text::from(lines))
+        })
+        .collect::<Vec<_>>();
+    let selected = task_indexes
+        .iter()
+        .position(|index| *index == state.rail.selected_task);
+    let mut list_state = ListState::default().with_selected(selected);
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(block)
+            .highlight_style(Style::default().bg(PANEL_ALT).add_modifier(Modifier::BOLD)),
+        area,
+        &mut list_state,
     );
 }
 
@@ -422,9 +575,9 @@ fn render_timeline(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         .block(
             Block::default()
                 .title(if state.scroll.follow_tail {
-                    " Chat  ↓ live tail"
+                    " Main Chat  ↓ live tail"
                 } else {
-                    " Chat  ↑ scrollback"
+                    " Main Chat  ↑ scrollback"
                 })
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(border)),
@@ -518,16 +671,16 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             Style::default().fg(MUTED),
         ));
     }
-    spans.push(Span::styled(
-        "? help  Tab focus  ↑↓ scroll/select  P project  Ctrl-C cancel/quit  ",
-        Style::default().fg(MUTED),
-    ));
-    if state.layout == LayoutMode::Narrow {
-        spans.push(Span::styled(
-            "Ctrl-[ / Ctrl-] tabs  ",
-            Style::default().fg(MUTED),
-        ));
-    }
+    let hints = match (state.primary_view, area.width >= 104) {
+        (PrimaryView::Kanban, true) => {
+            "←→ lane  ↑↓ task  Enter details  T board  A attention  V approvals  F2 view  F1 help  "
+        }
+        (PrimaryView::Kanban, false) => "←→ lane  ↑↓ task  Enter details  F2 view  F1 help  ",
+        (PrimaryView::MainChat, _) => {
+            "Tab focus  ↑↓ scroll  F2 view  F1 help  Ctrl-C cancel/quit  "
+        }
+    };
+    spans.push(Span::styled(hints, Style::default().fg(MUTED)));
     spans.push(Span::styled(
         if state.shutdown_requested {
             "shutting down"
@@ -542,17 +695,18 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     );
 }
 
-fn render_rail(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let title = format!(" Project  ·  {}  (P collapse)", state.rail.tab.label());
+fn render_project_list(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let title = format!(" {} ", state.rail.tab.label());
     let border = if state.focus == FocusTarget::ProjectRail {
         ACCENT
     } else {
         PANEL_ALT
     };
+    let content_width = area.width.saturating_sub(6) as usize;
     let items = match state.rail.tab {
-        ProjectTab::Tasks => task_items(state),
-        ProjectTab::Attention => attention_items(&state.attention),
-        ProjectTab::Approvals => approval_items(state),
+        ProjectTab::Attention => attention_items(&state.attention, content_width),
+        ProjectTab::Approvals => approval_items(state, content_width),
+        ProjectTab::Tasks => Vec::new(),
     };
     let list = if items.is_empty() {
         List::new(vec![ListItem::new(Line::from(Span::styled(
@@ -574,36 +728,7 @@ fn render_rail(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     );
 }
 
-fn task_items(state: &AppState) -> Vec<ListItem<'static>> {
-    state
-        .tasks
-        .iter()
-        .map(|task| {
-            let selected = if task.selected { "▸" } else { " " };
-            let title = fit_inline(&task.title, 26);
-            let mut lines = vec![Line::from(vec![
-                Span::styled(
-                    format!("{selected} {} ", task.state.marker()),
-                    task_state_style(task.state),
-                ),
-                Span::styled(title, Style::default().fg(TEXT)),
-            ])];
-            lines.push(Line::from(Span::styled(
-                format!("    {}", task.state.label()),
-                task_state_style(task.state),
-            )));
-            if let Some(blocker) = &task.blocker {
-                lines.push(Line::from(Span::styled(
-                    format!("    ! {}", fit_inline(blocker, 25)),
-                    Style::default().fg(WARNING),
-                )));
-            }
-            ListItem::new(Text::from(lines))
-        })
-        .collect()
-}
-
-fn attention_items(items: &[AttentionItem]) -> Vec<ListItem<'static>> {
+fn attention_items(items: &[AttentionItem], width: usize) -> Vec<ListItem<'static>> {
     items
         .iter()
         .map(|item| {
@@ -618,10 +743,10 @@ fn attention_items(items: &[AttentionItem]) -> Vec<ListItem<'static>> {
                         format!("{} ", item.severity.marker()),
                         severity_style(item.severity),
                     ),
-                    Span::styled(fit_inline(title, 27), Style::default().fg(TEXT)),
+                    Span::styled(fit_inline(title, width), Style::default().fg(TEXT)),
                 ]),
                 Line::from(Span::styled(
-                    format!("  {}", fit_inline(detail, 28)),
+                    format!("  {}", fit_inline(detail, width)),
                     Style::default().fg(MUTED),
                 )),
             ]))
@@ -629,7 +754,7 @@ fn attention_items(items: &[AttentionItem]) -> Vec<ListItem<'static>> {
         .collect()
 }
 
-fn approval_items(state: &AppState) -> Vec<ListItem<'static>> {
+fn approval_items(state: &AppState, width: usize) -> Vec<ListItem<'static>> {
     state
         .approvals
         .iter()
@@ -647,22 +772,23 @@ fn approval_items(state: &AppState) -> Vec<ListItem<'static>> {
             };
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{selected} ? "), Style::default().fg(WARNING)),
-                Span::styled(fit_inline(title, 27), Style::default().fg(TEXT)),
+                Span::styled(fit_inline(title, width), Style::default().fg(TEXT)),
             ]))
         })
         .collect()
 }
 
-fn render_modal(frame: &mut Frame<'_>, area: Rect, modal: &ModalState, state: &AppState) {
-    let width = if state.layout == LayoutMode::Narrow {
-        area.width.saturating_sub(2).max(1)
+fn render_modal(frame: &mut Frame<'_>, area: Rect, modal: &ModalState) {
+    let layout = LayoutMode::for_size(area.width, area.height);
+    let width = if layout == LayoutMode::Narrow {
+        area.width
     } else {
         ((area.width as u32 * 78) / 100)
             .max(40)
             .min(area.width as u32) as u16
     };
-    let height = if state.layout == LayoutMode::Narrow {
-        area.height.saturating_sub(2).max(1)
+    let height = if layout == LayoutMode::Narrow {
+        area.height
     } else {
         ((area.height as u32 * 82) / 100)
             .max(10)
@@ -671,11 +797,15 @@ fn render_modal(frame: &mut Frame<'_>, area: Rect, modal: &ModalState, state: &A
     let popup = centered_rect(width, height, area);
     frame.render_widget(Clear, popup);
     let (text, border) = modal_text(modal);
+    let hint = match modal {
+        ModalState::Task(_) | ModalState::Help | ModalState::Error(_) => "Esc / Enter close",
+        _ => "Esc close · Enter confirm",
+    };
     frame.render_widget(
         Paragraph::new(text)
             .block(
                 Block::default()
-                    .title(format!(" {}  ·  Esc close · Enter confirm ", modal.title()))
+                    .title(format!(" {}  ·  {hint} ", modal.title()))
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(border)),
             )
@@ -686,8 +816,8 @@ fn render_modal(frame: &mut Frame<'_>, area: Rect, modal: &ModalState, state: &A
 }
 
 fn render_setup_overlay(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let width = if state.layout == LayoutMode::Narrow {
-        area.width.saturating_sub(2).max(1)
+    let width = if LayoutMode::for_size(area.width, area.height) == LayoutMode::Narrow {
+        area.width
     } else {
         ((area.width as u32 * 70) / 100)
             .max(44)
@@ -901,6 +1031,7 @@ fn modal_text(modal: &ModalState) -> (Text<'static>, Color) {
         }
         ModalState::Approval(card) => approval_text(card),
         ModalState::Review(card) => review_text(card),
+        ModalState::Task(task) => task_text(task),
         ModalState::Error(error) => {
             let detail = if error.visibility.is_public() && !error.message.is_empty() {
                 error.message.clone()
@@ -1054,34 +1185,120 @@ fn review_text(card: &crate::app::ReviewCard) -> (Text<'static>, Color) {
     (Text::from(lines), WARNING)
 }
 
+fn task_text(task: &crate::app::TaskSummary) -> (Text<'static>, Color) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            task.title.clone(),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(format!("Task: {}", task.id)),
+        Line::from(format!(
+            "State: {}  ·  lane {}  ·  version {}",
+            task.state.label(),
+            task.state.kanban_lane().label(),
+            task.version
+        )),
+        Line::from(format!(
+            "Worker: {}",
+            if task.worker.is_empty() {
+                "unassigned"
+            } else {
+                task.worker.as_str()
+            }
+        )),
+        Line::from(format!(
+            "Reviewer: {}",
+            if task.reviewer.is_empty() {
+                "unassigned"
+            } else {
+                task.reviewer.as_str()
+            }
+        )),
+    ];
+    if let Some(blocker) = &task.blocker {
+        lines.push(Line::from(Span::styled(
+            format!("Blocker: {blocker}"),
+            Style::default().fg(WARNING),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Checks",
+        Style::default().fg(MUTED),
+    )));
+    if task.checks.is_empty() {
+        lines.push(Line::from("  No checks reported"));
+    } else {
+        for check in &task.checks {
+            let detail = if check.visibility.is_public() {
+                check.detail.as_str()
+            } else {
+                "details hidden"
+            };
+            lines.push(Line::from(format!(
+                "  {} {}  {}",
+                check.state.marker(),
+                check.name,
+                detail
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!(
+        "Changed files: {}",
+        if task.changed_files.is_empty() {
+            "none reported".to_owned()
+        } else {
+            task.changed_files.join(", ")
+        }
+    )));
+    lines.push(Line::from(format!(
+        "Commit: {}",
+        task.commit.as_deref().unwrap_or("not recorded")
+    )));
+    lines.push(Line::from(format!(
+        "Merge: {}",
+        task.merge_commit.as_deref().unwrap_or("not recorded")
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Enter or Esc closes details",
+        Style::default().fg(MUTED),
+    )));
+    (Text::from(lines), lane_color(task.state.kanban_lane()))
+}
+
 fn help_text() -> Text<'static> {
     Text::from(vec![
         Line::from(Span::styled(
-            "Navigation",
+            "Views",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from("F2                  switch Kanban / Main Chat"),
+        Line::from("Ctrl+1 / Ctrl+2     open a view directly"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Kanban",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from("←→ lane  ↑↓ task  Enter details / review"),
+        Line::from("T / A / V           tasks / attention / approvals"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Main Chat",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
         Line::from("Tab / Shift+Tab     move focus"),
-        Line::from("↑↓ / PageUp/Down   scroll or select"),
-        Line::from("Home / End          top or live tail"),
-        Line::from("P                   collapse Project rail / switch narrow tab"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Conversation",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )),
-        Line::from("Enter               send message"),
-        Line::from("Shift+Enter         insert newline"),
-        Line::from("a                   expand live activity"),
-        Line::from("Shift+R             show/hide reasoning details"),
-        Line::from("r                   retry a retryable turn"),
+        Line::from("↑↓ / PgUp / PgDn  scroll  ·  Home / End top / tail"),
+        Line::from("Enter send  ·  Shift+Enter newline"),
+        Line::from("a activity  ·  Shift+R reasoning  ·  r retry"),
         Line::from(""),
         Line::from(Span::styled(
             "Safety",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
-        Line::from("Ctrl-C              cancel live turn, or quit when idle"),
-        Line::from("Ctrl-C again         force terminal restoration during shutdown"),
-        Line::from("Esc                 close modal / keep a turn running"),
+        Line::from("Ctrl-C cancel live turn / quit  ·  again force restore"),
+        Line::from("Esc close modal / keep a turn running"),
         Line::from(""),
         Line::from(Span::styled(
             "Esc or Enter closes this help",
@@ -1181,6 +1398,16 @@ fn task_state_style(state: TaskState) -> Style {
     }
 }
 
+fn lane_color(lane: KanbanLane) -> Color {
+    match lane {
+        KanbanLane::Queued => MUTED,
+        KanbanLane::Active => ACCENT,
+        KanbanLane::Review => WARNING,
+        KanbanLane::Blocked => DANGER,
+        KanbanLane::Done => SUCCESS,
+    }
+}
+
 fn severity_style(severity: crate::app::AttentionSeverity) -> Style {
     match severity {
         crate::app::AttentionSeverity::Info => Style::default().fg(ACCENT),
@@ -1213,7 +1440,7 @@ mod tests {
     }
 
     #[test]
-    fn wide_layout_contains_header_chat_composer_and_project_rail() {
+    fn wide_layout_opens_on_full_width_kanban() {
         let mut state = AppState::new();
         state.header.repository = "demo-repo".to_owned();
         state.header.project = "Demo".to_owned();
@@ -1226,14 +1453,66 @@ mod tests {
             "Welcome to Solo",
             "now",
         ));
-        state
-            .tasks
-            .push(TaskSummary::new("t1", "Ship TUI", TaskState::Running));
+        let mut task = TaskSummary::new("t1", "Ship TUI", TaskState::Running);
+        task.selected = true;
+        state.tasks.push(task);
+        state.rail.lane = KanbanLane::Active;
         let text = draw(&state, 140, 40);
         assert!(text.contains("FORGE SOLO"));
+        assert!(text.contains("KANBAN"));
+        assert!(text.contains("QUEUED"));
+        assert!(text.contains("ACTIVE"));
+        assert!(text.contains("REVIEW"));
+        assert!(text.contains("BLOCKED"));
+        assert!(text.contains("DONE"));
+        assert!(text.contains("Ship TUI"));
+        assert!(!text.contains("Welcome to Solo"));
+        assert!(!text.contains("Composer"));
+    }
+
+    #[test]
+    fn main_chat_is_one_separate_timeline_and_composer_view() {
+        let mut state = AppState::new();
+        state.primary_view = PrimaryView::MainChat;
+        state.focus = FocusTarget::Composer;
+        state.timeline.push(ChatMessage::new(
+            "m1",
+            MessageRole::Assistant,
+            "Welcome to Solo",
+            "now",
+        ));
+        let text = draw(&state, 140, 40);
+        assert!(text.contains("MAIN CHAT"));
         assert!(text.contains("Welcome to Solo"));
-        assert!(text.contains("Project"));
         assert!(text.contains("Composer"));
+        assert!(!text.contains("QUEUED  0"));
+    }
+
+    #[test]
+    fn frame_size_selects_narrow_kanban_before_first_resize_event() {
+        let mut state = AppState::new();
+        let mut task = TaskSummary::new(
+            "task",
+            "A task title that remains readable",
+            TaskState::Running,
+        );
+        task.selected = true;
+        state.tasks.push(task);
+        state.rail.lane = KanbanLane::Active;
+        assert_eq!(state.layout, LayoutMode::Wide);
+
+        let text = draw(&state, 80, 24);
+        assert!(text.contains("┌ ACTIVE  1"));
+        assert!(!text.contains("┌ QUEUED"));
+        assert!(text.contains("A task title that remains readable"));
+    }
+
+    #[test]
+    fn terminal_height_is_not_reapplied_after_board_chrome() {
+        let state = AppState::new();
+        let text = draw(&state, 120, 24);
+        assert!(text.contains("┌ QUEUED  0"));
+        assert!(text.contains("┌ DONE  0"));
     }
 
     #[test]
@@ -1286,8 +1565,45 @@ mod tests {
     }
 
     #[test]
+    fn enter_from_kanban_opens_non_review_task_details() {
+        let mut state = AppState::new();
+        let mut task =
+            TaskSummary::new("task-1", "Inspect the delivered task", TaskState::Succeeded);
+        task.worker = "Codex Worker".to_owned();
+        task.commit = Some("abc1234".to_owned());
+        task.selected = true;
+        state.tasks.push(task);
+        state.rail.lane = KanbanLane::Done;
+
+        state.reduce(crate::app::AppAction::Input(
+            crate::app::AppInput::OpenSelected,
+        ));
+        assert!(matches!(state.modal, Some(ModalState::Task(_))));
+        let text = draw(&state, 80, 24);
+        assert!(text.contains("TASK DETAILS"));
+        assert!(text.contains("Inspect the delivered task"));
+        assert!(text.contains("Codex Worker"));
+        assert!(text.contains("abc1234"));
+        assert!(!text.contains("┌│"));
+    }
+
+    #[test]
+    fn narrow_help_keeps_safety_controls_visible() {
+        let mut state = AppState::new();
+        state.modal = Some(ModalState::Help);
+        let text = draw(&state, 80, 24);
+        assert!(text.contains("KEYBOARD HELP"));
+        assert!(text.contains("F2"));
+        assert!(text.contains("Safety"));
+        assert!(text.contains("force restore"));
+        assert!(text.contains("Esc or Enter closes this help"));
+    }
+
+    #[test]
     fn protected_error_body_never_reaches_test_backend() {
         let mut state = AppState::new();
+        state.primary_view = PrimaryView::MainChat;
+        state.focus = FocusTarget::Composer;
         state.header.runtime = RuntimeState::Ready;
         state.header.readiness = ProjectReadiness::Ready;
         state
@@ -1317,6 +1633,8 @@ mod tests {
     #[test]
     fn failed_activity_renders_recovery_affordance_without_live_cancel_state() {
         let mut state = AppState::new();
+        state.primary_view = PrimaryView::MainChat;
+        state.focus = FocusTarget::Composer;
         state.live_activity = Some(LiveActivity {
             turn_id: "failed".to_owned(),
             attempt: 2,

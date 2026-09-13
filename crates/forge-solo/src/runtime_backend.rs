@@ -1099,7 +1099,10 @@ fn to_task_snapshot(task: &SoloTaskSnapshot) -> TaskSnapshot {
                 .collect()
         })
         .unwrap_or_default();
-    let commit = task.executions.iter().rev().find_map(|execution| {
+    // SoloSessionService returns executions newest first. Review evidence must
+    // follow the latest completed attempt after rework, never the oldest SHA
+    // still retained in the bounded history.
+    let commit = task.executions.iter().find_map(|execution| {
         execution.after_sha.clone().map(|sha| CommitEvidence {
             commit: Some(sha),
             changed_files: Vec::new(),
@@ -1139,12 +1142,15 @@ fn to_task_snapshot(task: &SoloTaskSnapshot) -> TaskSnapshot {
 
 fn task_state(status: &str) -> TaskState {
     match status.to_ascii_lowercase().as_str() {
-        "todo" | "pending" | "queued" => TaskState::Todo,
-        "in_progress" | "running" | "claimed" => TaskState::InProgress,
+        "backlog" | "ready" | "todo" | "pending" | "queued" => TaskState::Todo,
+        "planning" | "working" | "in_progress" | "running" | "claimed" => TaskState::InProgress,
         "blocked" => TaskState::Blocked,
         "review" | "awaiting_review" | "awaiting_human" => TaskState::Review,
+        "merging" => TaskState::Merging,
+        "cleaning_up" | "cleanup" => TaskState::CleaningUp,
         "done" | "completed" | "succeeded" => TaskState::Done,
         "cancelled" | "canceled" => TaskState::Cancelled,
+        "failed" | "merge_failed" => TaskState::Failed,
         _ => TaskState::Failed,
     }
 }
@@ -1283,6 +1289,7 @@ fn safe_public_service_detail(detail: String, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use services::solo_session::SoloTaskExecutionSnapshot;
 
     fn approval_target() -> SoloCharterApprovalTarget {
         SoloCharterApprovalTarget {
@@ -1332,6 +1339,76 @@ mod tests {
             action: ApprovalAction::Approve,
             idempotency_key: "approval-1".into(),
         }
+    }
+
+    fn execution(id: &str, after_sha: Option<&str>) -> SoloTaskExecutionSnapshot {
+        SoloTaskExecutionSnapshot {
+            id: id.to_owned(),
+            task_id: "task".to_owned(),
+            role: "worker".to_owned(),
+            agent_id: Some("agent".to_owned()),
+            status: "succeeded".to_owned(),
+            stop_reason: None,
+            agent_session_id: None,
+            before_sha: Some("base".to_owned()),
+            after_sha: after_sha.map(str::to_owned),
+            summary: Some(format!("{id} summary")),
+            error: None,
+            logs_available: false,
+            execution_version: 1,
+            last_activity_at: None,
+            created_at: "2026-09-12T00:00:00Z".to_owned(),
+            updated_at: "2026-09-12T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn task(status: &str, executions: Vec<SoloTaskExecutionSnapshot>) -> SoloTaskSnapshot {
+        SoloTaskSnapshot {
+            id: "task".to_owned(),
+            project_id: "project".to_owned(),
+            title: "Task".to_owned(),
+            status: status.to_owned(),
+            version: 3,
+            assignee_type: None,
+            assignee_id: None,
+            priority: 0,
+            interruption: None,
+            available_actions: Vec::new(),
+            roles: Vec::new(),
+            executions,
+            latest_review: None,
+            created_at: "2026-09-12T00:00:00Z".to_owned(),
+            updated_at: "2026-09-12T00:00:00Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn autonomous_workflow_states_project_without_false_failures() {
+        for (status, expected) in [
+            ("backlog", TaskState::Todo),
+            ("ready", TaskState::Todo),
+            ("working", TaskState::InProgress),
+            ("review", TaskState::Review),
+            ("merging", TaskState::Merging),
+            ("done", TaskState::Done),
+            ("merge_failed", TaskState::Failed),
+        ] {
+            assert_eq!(task_state(status), expected, "{status}");
+        }
+    }
+
+    #[test]
+    fn review_evidence_uses_the_newest_execution_commit_after_rework() {
+        let projected = to_task_snapshot(&task(
+            "review",
+            vec![
+                execution("newest", Some("new-sha")),
+                execution("older", Some("old-sha")),
+            ],
+        ));
+        let commit = projected.commit.expect("commit evidence");
+        assert_eq!(commit.commit.as_deref(), Some("new-sha"));
+        assert_eq!(commit.summary.as_deref(), Some("newest summary"));
     }
 
     fn turn(id: &str, state: TurnState, version: i64, retryable: bool) -> TurnSnapshot {

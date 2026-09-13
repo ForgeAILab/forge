@@ -47,14 +47,12 @@
     "switchProject": "Switch project"
   },
   "appShell": {
-    "collapseSidebar": "Collapse sidebar",
-    "expandSidebar": "Expand sidebar",
     "toggleTheme": "Toggle theme",
     "navigation": {
       "agentSettings": "Agent Settings",
-      "agentWorkspace": "Agent Workspace",
+      "agentWorkspace": "Project Agent",
       "overview": "Overview",
-      "board": "Board",
+      "board": "Kanban",
       "mainChat": "Main Chat",
       "daemons": "Runtimes",
       "mcp": "MCP",

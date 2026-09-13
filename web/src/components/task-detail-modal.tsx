@@ -345,8 +345,8 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
           onTitleKeyDown={onTitleKeyDown}
         />
 
-        <div className="flex min-h-0 flex-1 overflow-hidden">
-          <main className="flex-1 overflow-y-auto p-6">
+        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto lg:flex-row lg:overflow-hidden">
+          <main className="min-w-0 shrink-0 p-4 sm:p-6 lg:flex-1 lg:overflow-y-auto">
             {taskQuery.isLoading ? (
               <div className="space-y-4">
                 <Skeleton className="h-8 w-3/4" />
@@ -398,7 +398,6 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
                   onCancelTask={onCancelTask}
                 />
                 {!task.workflow_exception ? <TaskBlockingBanner task={task} /> : null}
-
 
                 <div>
                   <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">

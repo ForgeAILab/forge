@@ -269,7 +269,7 @@ test('search/filter and incomplete pagination disable only ordering', async ({ p
   }
 })
 
-test('responsive board keeps one scroll owner and adaptive navigation at 375, 768, and 1280', async ({
+test('responsive board keeps one scroll owner and the two primary tabs at 375, 768, and 1280', async ({
   page,
   request,
 }) => {
@@ -290,17 +290,19 @@ test('responsive board keeps one scroll owner and adaptive navigation at 375, 76
   try {
     await mkdir(proofDir, { recursive: true })
     for (const viewport of [
-      { width: 1280, height: 800, name: 'board-1280.png', mode: 'rail' },
-      { width: 768, height: 900, name: 'board-768.png', mode: 'overlay' },
-      { width: 375, height: 812, name: 'board-375.png', mode: 'overlay' },
+      { width: 1280, height: 800, name: 'board-1280.png' },
+      { width: 768, height: 900, name: 'board-768.png' },
+      { width: 375, height: 812, name: 'board-375.png' },
     ]) {
       await page.setViewportSize({ width: viewport.width, height: viewport.height })
       await page.goto(`/projects/${setup.projectId}/board`)
       await expect(page.getByText(setup.tasks[0].title).first()).toBeVisible({ timeout: 15_000 })
-      await expect(page.locator('[data-shell-mode]')).toHaveAttribute(
-        'data-shell-mode',
-        viewport.mode,
-      )
+      await expect(page.locator('[data-shell-mode]')).toHaveAttribute('data-shell-mode', 'topbar')
+      const primaryNavigation = page.getByRole('navigation', { name: 'Primary navigation' })
+      await expect(primaryNavigation).toBeVisible()
+      await expect(primaryNavigation.getByRole('link', { name: 'Kanban' })).toBeVisible()
+      await expect(primaryNavigation.getByRole('link', { name: 'Main Chat' })).toBeVisible()
+      await expect(page.getByRole('button', { name: 'Open navigation' })).toHaveCount(0)
       await expect(page.locator('[data-board-scroll-owner]')).toHaveCount(1)
 
       const documentOverflows = await page.evaluate(
@@ -319,15 +321,6 @@ test('responsive board keeps one scroll owner and adaptive navigation at 375, 76
         expect(secondColumnBox.x + secondColumnBox.width).toBeLessThanOrEqual(viewport.width)
       }
 
-      if (viewport.mode === 'overlay') {
-        const openNavigation = page.getByRole('button', { name: 'Open navigation' })
-        await openNavigation.click()
-        await expect(page.getByRole('complementary', { name: 'Primary navigation' })).toBeVisible()
-        await page.keyboard.press('Escape')
-        await expect(page.getByRole('complementary', { name: 'Primary navigation' })).toBeHidden()
-        await expect(openNavigation).toBeFocused()
-      }
-
       if (viewport.width === 375) {
         await page.getByRole('region', { name: 'Todo column' }).evaluate((column) => {
           column.scrollIntoView({ block: 'nearest', inline: 'start' })
@@ -340,6 +333,74 @@ test('responsive board keeps one scroll owner and adaptive navigation at 375, 76
     expect(
       runtimeWarnings.filter((message) => /nested scroll|drag.*warning/i.test(message)),
     ).toEqual([])
+  } finally {
+    await rm(setup.repoDir, { recursive: true, force: true })
+  }
+})
+
+test('the top bar switches between Kanban and the singular Main Chat', async ({
+  page,
+  request,
+}) => {
+  const run = Date.now()
+  const setup = await setupBoard(request, [`Primary navigation ${run}`])
+  const proofDir = join(process.cwd(), '..', 'test', 'proof-media')
+
+  try {
+    await mkdir(proofDir, { recursive: true })
+    for (const viewport of [
+      { width: 1280, height: 800, name: 'main-chat-1280.png' },
+      { width: 768, height: 900, name: 'main-chat-768.png' },
+      { width: 375, height: 812, name: 'main-chat-375.png' },
+    ]) {
+      await page.setViewportSize({ width: viewport.width, height: viewport.height })
+      await page.goto(`/projects/${setup.projectId}/board`)
+
+      const primaryNavigation = page.getByRole('navigation', { name: 'Primary navigation' })
+      await expect(primaryNavigation.getByRole('link')).toHaveCount(2)
+      await expect(page.getByRole('button', { name: 'Open global chat' })).toHaveCount(0)
+
+      await primaryNavigation.getByRole('link', { name: 'Main Chat' }).click()
+      await expect(page).toHaveURL(/\/chat$/)
+      await expect(page.getByRole('heading', { name: 'Main Agent' })).toBeVisible({
+        timeout: 15_000,
+      })
+      await expect(
+        page
+          .getByRole('navigation', { name: 'Primary navigation' })
+          .getByRole('link', { name: 'Main Chat' }),
+      ).toHaveAttribute('data-status', 'active')
+      await page.screenshot({ path: join(proofDir, viewport.name), animations: 'disabled' })
+
+      await page
+        .getByRole('navigation', { name: 'Primary navigation' })
+        .getByRole('link', { name: 'Kanban' })
+        .click()
+      await expect(page).toHaveURL(new RegExp(`/projects/${setup.projectId}/board`))
+    }
+
+    await page.getByRole('button', { name: 'More navigation' }).click()
+    await expect(page.getByRole('button', { name: 'Project Agent' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Agent Settings' })).toBeVisible()
+    await page.screenshot({
+      path: join(proofDir, 'secondary-navigation-375.png'),
+      animations: 'disabled',
+    })
+    await page.getByRole('button', { name: 'More navigation' }).click()
+
+    const filters = page.getByRole('button', { name: 'Filters' })
+    await filters.focus()
+    await expect(filters).toBeFocused()
+    await filters.click()
+    await expect(page.getByLabel('Minimum priority')).toBeVisible()
+    await page.screenshot({ path: join(proofDir, 'board-filters-375.png'), animations: 'disabled' })
+    await filters.click()
+
+    await page.getByRole('button', { name: `Open ${setup.tasks[0].title}` }).click()
+    await expect(page.getByRole('dialog')).toBeVisible()
+    await page.screenshot({ path: join(proofDir, 'task-detail-375.png'), animations: 'disabled' })
+    await page.keyboard.press('Escape')
+    await expect(page.getByRole('dialog')).toBeHidden()
   } finally {
     await rm(setup.repoDir, { recursive: true, force: true })
   }

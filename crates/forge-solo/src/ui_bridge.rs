@@ -1047,6 +1047,8 @@ pub fn to_app_task_state(state: BackendTaskState) -> AppTaskState {
         BackendTaskState::InProgress => AppTaskState::Running,
         BackendTaskState::Blocked => AppTaskState::Blocked,
         BackendTaskState::Review => AppTaskState::AwaitingReview,
+        BackendTaskState::Merging => AppTaskState::Merging,
+        BackendTaskState::CleaningUp => AppTaskState::CleaningUp,
         BackendTaskState::Done => AppTaskState::Succeeded,
         BackendTaskState::Failed => AppTaskState::Failed,
         BackendTaskState::Cancelled => AppTaskState::Cancelled,
@@ -1572,6 +1574,7 @@ fn nonnegative_u64(value: i64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::{FocusTarget, PrimaryView};
     use crate::backend::{
         ActivityCursor, ActivityEntry, ActivityTarget, ChatSnapshot, CommitEvidence,
         ConflictTarget, FailureSnapshot, InteractionField, MessageStatus, ProjectSnapshot,
@@ -1933,7 +1936,7 @@ mod tests {
             request: SnapshotRequest::default(),
             result: Ok(snapshot),
         });
-        reducer.state_mut().focus = crate::app::FocusTarget::Timeline;
+        reducer.state_mut().focus = crate::app::FocusTarget::ProjectRail;
         reducer.state_mut().layout = crate::app::LayoutMode::Narrow;
         reducer.state_mut().rail.tab = crate::app::ProjectTab::Tasks;
 
@@ -2022,6 +2025,8 @@ mod tests {
         let mut state = AppState::new();
         state.header.runtime = AppRuntimeState::Ready;
         state.header.readiness = ProjectReadiness::Ready;
+        state.primary_view = PrimaryView::MainChat;
+        state.focus = FocusTarget::Composer;
         assert_eq!(
             app_action_from_input(
                 &state,
@@ -2052,6 +2057,8 @@ mod tests {
             let mut state = AppState::new();
             state.header.runtime = AppRuntimeState::Ready;
             state.header.readiness = ProjectReadiness::Ready;
+            state.primary_view = PrimaryView::MainChat;
+            state.focus = FocusTarget::Composer;
             state
         });
         reducer
@@ -2114,6 +2121,8 @@ mod tests {
         let mut state = AppState::new();
         state.header.runtime = AppRuntimeState::Ready;
         state.header.readiness = ProjectReadiness::Ready;
+        state.primary_view = PrimaryView::MainChat;
+        state.focus = FocusTarget::Composer;
         let mut reducer = AppReducer::new(state);
         reducer.reduce(ControllerEvent::Input(InputEvent::Key(
             ControllerKeyEvent::new(ControllerKeyCode::Char('d')),

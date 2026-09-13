@@ -7,7 +7,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::app::{
-    AppInput, AppState, FocusTarget, LayoutMode, ProjectTab, RuntimeState, SetupState,
+    AppInput, AppState, FocusTarget, PrimaryView, ProjectTab, RuntimeState, SetupState,
 };
 
 /// A small configurable keymap.  The defaults are documented by
@@ -18,7 +18,6 @@ pub struct Keymap {
     pub quit: KeyChord,
     pub cancel: KeyChord,
     pub help: KeyChord,
-    pub rail: KeyChord,
     pub activity: KeyChord,
     pub retry: KeyChord,
 }
@@ -45,7 +44,6 @@ impl Default for Keymap {
             quit: KeyChord::new(KeyCode::Char('q'), KeyModifiers::NONE),
             cancel: KeyChord::new(KeyCode::Esc, KeyModifiers::NONE),
             help: KeyChord::new(KeyCode::Char('?'), KeyModifiers::NONE),
-            rail: KeyChord::new(KeyCode::Char('p'), KeyModifiers::NONE),
             activity: KeyChord::new(KeyCode::Char('a'), KeyModifiers::NONE),
             retry: KeyChord::new(KeyCode::Char('r'), KeyModifiers::NONE),
         }
@@ -95,6 +93,14 @@ impl Keymap {
             return self.map_modal(code, modifiers);
         }
 
+        // F2 is the dependable terminal-native view switch. Keep the more
+        // explicit Ctrl shortcuts below for terminals that report them, but
+        // do not make the primary navigation depend on control sequences that
+        // some terminal emulators cannot distinguish from Esc or NUL.
+        if code == KeyCode::F(2) {
+            return Some(AppInput::NextPrimaryView);
+        }
+
         if matches!(state.setup, SetupState::AgentPicker { .. }) {
             match code {
                 KeyCode::Up => return Some(AppInput::SelectSetupPrevious),
@@ -103,6 +109,22 @@ impl Keymap {
                 KeyCode::Esc => return Some(AppInput::Cancel),
                 _ => {}
             }
+        }
+
+        match (code, modifiers) {
+            (KeyCode::Char('1'), mods) if mods.contains(KeyModifiers::CONTROL) => {
+                return Some(AppInput::SelectPrimaryView(PrimaryView::Kanban));
+            }
+            (KeyCode::Char('2'), mods) if mods.contains(KeyModifiers::CONTROL) => {
+                return Some(AppInput::SelectPrimaryView(PrimaryView::MainChat));
+            }
+            (KeyCode::Char('['), mods) if mods.contains(KeyModifiers::CONTROL) => {
+                return Some(AppInput::PreviousPrimaryView);
+            }
+            (KeyCode::Char(']'), mods) if mods.contains(KeyModifiers::CONTROL) => {
+                return Some(AppInput::NextPrimaryView);
+            }
+            _ => {}
         }
 
         // Ctrl-Q remains available while the composer owns focus; `q` itself
@@ -116,10 +138,8 @@ impl Keymap {
             return Some(AppInput::RequestQuit);
         }
 
-        if state.focus != FocusTarget::Composer && self.rail.matches(event) {
-            return Some(AppInput::ToggleRail);
-        }
         if state.focus != FocusTarget::Composer
+            && state.primary_view == PrimaryView::MainChat
             && self.activity.matches(event)
             && state.live_activity.is_some()
         {
@@ -138,6 +158,20 @@ impl Keymap {
         {
             return Some(AppInput::Retry);
         }
+        if state.primary_view == PrimaryView::Kanban && state.focus != FocusTarget::Composer {
+            match (code, modifiers) {
+                (KeyCode::Char('t'), mods) if mods.is_empty() => {
+                    return Some(AppInput::SelectProjectTab(ProjectTab::Tasks));
+                }
+                (KeyCode::Char('a'), mods) if mods.is_empty() => {
+                    return Some(AppInput::SelectProjectTab(ProjectTab::Attention));
+                }
+                (KeyCode::Char('v'), mods) if mods.is_empty() => {
+                    return Some(AppInput::SelectProjectTab(ProjectTab::Approvals));
+                }
+                _ => {}
+            }
+        }
 
         match (code, modifiers) {
             (KeyCode::Tab, mods) if mods.contains(KeyModifiers::SHIFT) => {
@@ -146,11 +180,7 @@ impl Keymap {
             (KeyCode::Tab, _) => Some(AppInput::FocusNext),
             (KeyCode::BackTab, _) => Some(AppInput::FocusPrevious),
             (KeyCode::Enter, mods) if mods.contains(KeyModifiers::SHIFT) => Some(AppInput::NewLine),
-            (KeyCode::Enter, _)
-                if state.focus == FocusTarget::ProjectRail
-                    || (state.layout == LayoutMode::Narrow
-                        && state.focus != FocusTarget::Composer) =>
-            {
+            (KeyCode::Enter, _) if state.focus == FocusTarget::ProjectRail => {
                 Some(AppInput::OpenSelected)
             }
             (KeyCode::Enter, _) => Some(AppInput::Submit),
@@ -172,33 +202,12 @@ impl Keymap {
             (KeyCode::Down, _) => Some(AppInput::Down),
             (KeyCode::PageUp, _) => Some(AppInput::PageUp),
             (KeyCode::PageDown, _) => Some(AppInput::PageDown),
-            (KeyCode::Char('['), mods) if mods.contains(KeyModifiers::CONTROL) => {
-                Some(AppInput::PreviousProjectTab)
-            }
-            (KeyCode::Char(']'), mods) if mods.contains(KeyModifiers::CONTROL) => {
-                Some(AppInput::NextProjectTab)
-            }
             (KeyCode::Char(character), mods)
                 if state.focus != FocusTarget::Composer
                     && mods.contains(KeyModifiers::SHIFT)
                     && character.eq_ignore_ascii_case(&'r') =>
             {
                 Some(AppInput::ToggleReasoning)
-            }
-            (KeyCode::Char('1'), _)
-                if state.focus != FocusTarget::Composer && state.layout == LayoutMode::Narrow =>
-            {
-                Some(AppInput::SelectProjectTab(ProjectTab::Tasks))
-            }
-            (KeyCode::Char('2'), _)
-                if state.focus != FocusTarget::Composer && state.layout == LayoutMode::Narrow =>
-            {
-                Some(AppInput::SelectProjectTab(ProjectTab::Attention))
-            }
-            (KeyCode::Char('3'), _)
-                if state.focus != FocusTarget::Composer && state.layout == LayoutMode::Narrow =>
-            {
-                Some(AppInput::SelectProjectTab(ProjectTab::Approvals))
             }
             (KeyCode::Char(character), mods)
                 if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
@@ -238,7 +247,7 @@ mod tests {
     use crossterm::event::{KeyEvent, KeyEventState};
 
     use super::*;
-    use crate::app::{LiveActivity, ModalState, RuntimeState};
+    use crate::app::{LayoutMode, LiveActivity, ModalState, RuntimeState};
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent {
@@ -270,7 +279,9 @@ mod tests {
 
     #[test]
     fn composer_letters_are_not_approval_shortcuts() {
-        let state = AppState::new();
+        let mut state = AppState::new();
+        state.primary_view = PrimaryView::MainChat;
+        state.focus = FocusTarget::Composer;
         assert_eq!(
             map_key(&state, key(KeyCode::Char('a'), KeyModifiers::NONE)),
             Some(AppInput::Insert('a'))
@@ -313,6 +324,8 @@ mod tests {
     #[test]
     fn composer_keeps_printable_shortcuts_and_narrow_tab_digits() {
         let mut state = AppState::new();
+        state.primary_view = PrimaryView::MainChat;
+        state.focus = FocusTarget::Composer;
         state.layout = LayoutMode::Narrow;
         for (character, modifiers) in [
             ('R', KeyModifiers::SHIFT),
@@ -332,21 +345,40 @@ mod tests {
     }
 
     #[test]
-    fn printable_shortcuts_remain_available_outside_composer() {
+    fn kanban_shortcuts_open_secondary_task_lists() {
         let mut state = AppState::new();
         state.layout = LayoutMode::Narrow;
-        state.focus = FocusTarget::Timeline;
+        state.focus = FocusTarget::ProjectRail;
         assert_eq!(
             map_key(&state, key(KeyCode::Char('?'), KeyModifiers::NONE)),
             Some(AppInput::ToggleHelp)
         );
         assert_eq!(
-            map_key(&state, key(KeyCode::Char('R'), KeyModifiers::SHIFT)),
-            Some(AppInput::ToggleReasoning)
+            map_key(&state, key(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Some(AppInput::SelectProjectTab(ProjectTab::Attention))
         );
         assert_eq!(
-            map_key(&state, key(KeyCode::Char('2'), KeyModifiers::NONE)),
-            Some(AppInput::SelectProjectTab(ProjectTab::Attention))
+            map_key(&state, key(KeyCode::Char('v'), KeyModifiers::NONE)),
+            Some(AppInput::SelectProjectTab(ProjectTab::Approvals))
+        );
+    }
+
+    #[test]
+    fn primary_view_shortcuts_work_even_when_chat_composer_is_focused() {
+        let mut state = AppState::new();
+        state.primary_view = PrimaryView::MainChat;
+        state.focus = FocusTarget::Composer;
+        assert_eq!(
+            map_key(&state, key(KeyCode::Char('1'), KeyModifiers::CONTROL)),
+            Some(AppInput::SelectPrimaryView(PrimaryView::Kanban))
+        );
+        assert_eq!(
+            map_key(&state, key(KeyCode::Char('['), KeyModifiers::CONTROL)),
+            Some(AppInput::PreviousPrimaryView)
+        );
+        assert_eq!(
+            map_key(&state, key(KeyCode::F(2), KeyModifiers::NONE)),
+            Some(AppInput::NextPrimaryView)
         );
     }
 
@@ -358,18 +390,13 @@ mod tests {
             map_key(&state, key(KeyCode::Enter, KeyModifiers::NONE)),
             Some(AppInput::OpenSelected)
         );
-
-        state.layout = LayoutMode::Narrow;
-        state.focus = FocusTarget::Timeline;
-        assert_eq!(
-            map_key(&state, key(KeyCode::Enter, KeyModifiers::NONE)),
-            Some(AppInput::OpenSelected)
-        );
     }
 
     #[test]
     fn enter_still_submits_only_when_composer_owns_focus() {
         let mut state = AppState::new();
+        state.primary_view = PrimaryView::MainChat;
+        state.focus = FocusTarget::Composer;
         state.layout = LayoutMode::Narrow;
         assert_eq!(
             map_key(&state, key(KeyCode::Enter, KeyModifiers::NONE)),

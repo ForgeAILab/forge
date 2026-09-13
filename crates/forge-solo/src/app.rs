@@ -59,6 +59,44 @@ impl LayoutMode {
     }
 }
 
+/// The two top-level Solo work surfaces.
+///
+/// Kanban is intentionally the default: repository work should be legible
+/// before a person chooses to enter the Project Agent conversation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PrimaryView {
+    #[default]
+    Kanban,
+    MainChat,
+}
+
+impl PrimaryView {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Kanban => "KANBAN",
+            Self::MainChat => "MAIN CHAT",
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Kanban => Self::MainChat,
+            Self::MainChat => Self::Kanban,
+        }
+    }
+
+    pub const fn previous(self) -> Self {
+        self.next()
+    }
+
+    pub const fn default_focus(self) -> FocusTarget {
+        match self {
+            Self::Kanban => FocusTarget::ProjectRail,
+            Self::MainChat => FocusTarget::Composer,
+        }
+    }
+}
+
 /// The portion of the interface that receives keyboard focus.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FocusTarget {
@@ -73,39 +111,25 @@ pub enum FocusTarget {
 }
 
 impl FocusTarget {
-    fn next(self, layout: LayoutMode, rail_collapsed: bool) -> Self {
-        match (layout, rail_collapsed, self) {
-            (_, _, Self::Modal) | (_, _, Self::Help) | (_, _, Self::SetupPicker) => self,
-            (LayoutMode::Narrow, _, Self::Composer) => Self::Timeline,
-            (LayoutMode::Narrow, _, Self::Timeline) => Self::Activity,
-            (LayoutMode::Narrow, _, Self::Activity) => Self::Composer,
-            (LayoutMode::Wide, true, Self::Composer) => Self::Timeline,
-            (LayoutMode::Wide, true, Self::Timeline) => Self::Activity,
-            (LayoutMode::Wide, true, Self::Activity) => Self::Composer,
-            (LayoutMode::Wide, false, Self::Composer) => Self::Timeline,
-            (LayoutMode::Wide, false, Self::Timeline) => Self::Activity,
-            (LayoutMode::Wide, false, Self::Activity) => Self::ProjectRail,
-            (LayoutMode::Wide, false, Self::ProjectRail) => Self::Composer,
-            (LayoutMode::Wide, _, Self::ProjectRail) => Self::Composer,
-            (LayoutMode::Narrow, _, Self::ProjectRail) => Self::Timeline,
+    fn next(self, view: PrimaryView) -> Self {
+        match (view, self) {
+            (_, Self::Modal | Self::Help | Self::SetupPicker) => self,
+            (PrimaryView::Kanban, _) => Self::ProjectRail,
+            (PrimaryView::MainChat, Self::Composer) => Self::Timeline,
+            (PrimaryView::MainChat, Self::Timeline) => Self::Activity,
+            (PrimaryView::MainChat, Self::Activity) => Self::Composer,
+            (PrimaryView::MainChat, Self::ProjectRail) => Self::Composer,
         }
     }
 
-    fn previous(self, layout: LayoutMode, rail_collapsed: bool) -> Self {
-        match (layout, rail_collapsed, self) {
-            (_, _, Self::Modal) | (_, _, Self::Help) | (_, _, Self::SetupPicker) => self,
-            (LayoutMode::Narrow, _, Self::Composer) => Self::Activity,
-            (LayoutMode::Narrow, _, Self::Timeline) => Self::Composer,
-            (LayoutMode::Narrow, _, Self::Activity) => Self::Timeline,
-            (LayoutMode::Wide, true, Self::Composer) => Self::Activity,
-            (LayoutMode::Wide, true, Self::Timeline) => Self::Composer,
-            (LayoutMode::Wide, true, Self::Activity) => Self::Timeline,
-            (LayoutMode::Wide, false, Self::Composer) => Self::ProjectRail,
-            (LayoutMode::Wide, false, Self::Timeline) => Self::Composer,
-            (LayoutMode::Wide, false, Self::Activity) => Self::Timeline,
-            (LayoutMode::Wide, false, Self::ProjectRail) => Self::Activity,
-            (LayoutMode::Wide, _, Self::ProjectRail) => Self::Activity,
-            (LayoutMode::Narrow, _, Self::ProjectRail) => Self::Activity,
+    fn previous(self, view: PrimaryView) -> Self {
+        match (view, self) {
+            (_, Self::Modal | Self::Help | Self::SetupPicker) => self,
+            (PrimaryView::Kanban, _) => Self::ProjectRail,
+            (PrimaryView::MainChat, Self::Composer) => Self::Activity,
+            (PrimaryView::MainChat, Self::Timeline) => Self::Composer,
+            (PrimaryView::MainChat, Self::Activity) => Self::Timeline,
+            (PrimaryView::MainChat, Self::ProjectRail) => Self::Activity,
         }
     }
 }
@@ -574,6 +598,55 @@ pub enum TaskState {
     Cancelled,
 }
 
+/// Stable columns used by the Solo Kanban projection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KanbanLane {
+    #[default]
+    Queued,
+    Active,
+    Review,
+    Blocked,
+    Done,
+}
+
+impl KanbanLane {
+    pub const ALL: [Self; 5] = [
+        Self::Queued,
+        Self::Active,
+        Self::Review,
+        Self::Blocked,
+        Self::Done,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Queued => "QUEUED",
+            Self::Active => "ACTIVE",
+            Self::Review => "REVIEW",
+            Self::Blocked => "BLOCKED",
+            Self::Done => "DONE",
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Queued => 0,
+            Self::Active => 1,
+            Self::Review => 2,
+            Self::Blocked => 3,
+            Self::Done => 4,
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+    }
+
+    pub const fn previous(self) -> Self {
+        Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
 impl TaskState {
     pub const fn label(self) -> &'static str {
         match self {
@@ -600,6 +673,16 @@ impl TaskState {
             Self::CleaningUp => "↻",
             Self::Succeeded => "✓",
             Self::Cancelled => "−",
+        }
+    }
+
+    pub const fn kanban_lane(self) -> KanbanLane {
+        match self {
+            Self::Queued => KanbanLane::Queued,
+            Self::Running | Self::Merging | Self::CleaningUp => KanbanLane::Active,
+            Self::AwaitingReview => KanbanLane::Review,
+            Self::Blocked | Self::Failed => KanbanLane::Blocked,
+            Self::Succeeded | Self::Cancelled => KanbanLane::Done,
         }
     }
 }
@@ -909,6 +992,7 @@ pub enum ModalState {
     Question(QuestionCard),
     Approval(ApprovalCard),
     Review(ReviewCard),
+    Task(TaskSummary),
     Cancel(CancelCard),
     Help,
     Error(FailureNotice),
@@ -920,6 +1004,7 @@ impl ModalState {
             Self::Question(_) => "QUESTION",
             Self::Approval(_) => "CONFIRM ACTION",
             Self::Review(_) => "REVIEW TASK",
+            Self::Task(_) => "TASK DETAILS",
             Self::Cancel(_) => "CANCEL TURN",
             Self::Help => "KEYBOARD HELP",
             Self::Error(_) => "ACTION FAILED",
@@ -1074,8 +1159,8 @@ impl ProjectTab {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RailState {
-    pub collapsed: bool,
     pub tab: ProjectTab,
+    pub lane: KanbanLane,
     pub selected_task: usize,
     /// Selected approval row when the approvals tab owns focus.
     pub selected_approval: usize,
@@ -1084,8 +1169,8 @@ pub struct RailState {
 impl Default for RailState {
     fn default() -> Self {
         Self {
-            collapsed: false,
             tab: ProjectTab::Tasks,
+            lane: KanbanLane::Queued,
             selected_task: 0,
             selected_approval: 0,
         }
@@ -1170,6 +1255,7 @@ pub struct AppState {
     pub notifications: Vec<Notification>,
     pub composer: ComposerState,
     pub modal: Option<ModalState>,
+    pub primary_view: PrimaryView,
     pub focus: FocusTarget,
     pub layout: LayoutMode,
     pub terminal_width: u16,
@@ -1216,7 +1302,8 @@ impl AppState {
             notifications: Vec::new(),
             composer: ComposerState::default(),
             modal: None,
-            focus: FocusTarget::Composer,
+            primary_view: PrimaryView::Kanban,
+            focus: FocusTarget::ProjectRail,
             layout: LayoutMode::Wide,
             terminal_width: 120,
             terminal_height: 40,
@@ -1259,7 +1346,9 @@ impl AppState {
     }
 
     pub fn selected_task(&self) -> Option<&TaskSummary> {
-        self.tasks.get(self.rail.selected_task)
+        self.tasks
+            .get(self.rail.selected_task)
+            .filter(|task| task.state.kanban_lane() == self.rail.lane)
     }
 
     pub fn reduce(&mut self, action: AppAction) -> Reduction {
@@ -1460,6 +1549,7 @@ impl AppState {
                 Some(
                     ModalState::Approval(_)
                         | ModalState::Review(_)
+                        | ModalState::Task(_)
                         | ModalState::Cancel(_)
                         | ModalState::Help
                 )
@@ -1472,7 +1562,7 @@ impl AppState {
         if self.modal.is_some() {
             self.focus = FocusTarget::Modal;
         } else if matches!(self.focus, FocusTarget::Modal) {
-            self.focus = FocusTarget::Composer;
+            self.focus = self.primary_view.default_focus();
         }
         if old_live_turn != self.live_turn_id().map(str::to_owned) {
             self.scroll.activity_offset = 0;
@@ -1504,15 +1594,28 @@ impl AppState {
                 self.composer.delete();
             }
             AppInput::MoveLeft if self.focus == FocusTarget::Composer => self.composer.move_left(),
+            AppInput::MoveLeft
+                if self.primary_view == PrimaryView::Kanban
+                    && self.focus == FocusTarget::ProjectRail
+                    && self.rail.tab == ProjectTab::Tasks =>
+            {
+                self.select_lane(-1);
+            }
             AppInput::MoveRight if self.focus == FocusTarget::Composer => {
                 self.composer.move_right();
+            }
+            AppInput::MoveRight
+                if self.primary_view == PrimaryView::Kanban
+                    && self.focus == FocusTarget::ProjectRail
+                    && self.rail.tab == ProjectTab::Tasks =>
+            {
+                self.select_lane(1);
             }
             AppInput::Home if self.focus == FocusTarget::Composer => self.composer.move_home(),
             AppInput::End if self.focus == FocusTarget::Composer => self.composer.move_end(),
             AppInput::Submit => self.submit_message(commands),
             AppInput::Cancel => {
                 self.close_modal();
-                self.focus = FocusTarget::Composer;
             }
             AppInput::RequestQuit => self.request_quit(commands),
             AppInput::ForceQuit => {
@@ -1542,18 +1645,6 @@ impl AppState {
                 self.modal = Some(ModalState::Help);
                 self.focus = FocusTarget::Help;
             }
-            AppInput::ToggleRail => {
-                if self.layout == LayoutMode::Wide {
-                    self.rail.collapsed = !self.rail.collapsed;
-                    self.focus = if self.rail.collapsed {
-                        FocusTarget::Composer
-                    } else {
-                        FocusTarget::ProjectRail
-                    };
-                } else {
-                    self.rail.tab = self.rail.tab.next();
-                }
-            }
             AppInput::ToggleActivity => {
                 if let Some(activity) = self.live_activity.as_mut() {
                     activity.expanded = !activity.expanded;
@@ -1566,10 +1657,10 @@ impl AppState {
                 }
             }
             AppInput::FocusNext => {
-                self.focus = self.focus.next(self.layout, self.rail.collapsed);
+                self.focus = self.focus.next(self.primary_view);
             }
             AppInput::FocusPrevious => {
-                self.focus = self.focus.previous(self.layout, self.rail.collapsed);
+                self.focus = self.focus.previous(self.primary_view);
             }
             AppInput::Up => self.move_up(),
             AppInput::Down => self.move_down(),
@@ -1585,9 +1676,14 @@ impl AppState {
                 self.scroll.timeline_offset = 0;
                 self.scroll.follow_tail = true;
             }
-            AppInput::NextProjectTab => self.rail.tab = self.rail.tab.next(),
-            AppInput::PreviousProjectTab => self.rail.tab = self.rail.tab.previous(),
-            AppInput::SelectProjectTab(tab) => self.rail.tab = tab,
+            AppInput::NextPrimaryView => self.select_primary_view(self.primary_view.next()),
+            AppInput::PreviousPrimaryView => {
+                self.select_primary_view(self.primary_view.previous());
+            }
+            AppInput::SelectPrimaryView(view) => self.select_primary_view(view),
+            AppInput::NextProjectTab => self.select_project_tab(self.rail.tab.next()),
+            AppInput::PreviousProjectTab => self.select_project_tab(self.rail.tab.previous()),
+            AppInput::SelectProjectTab(tab) => self.select_project_tab(tab),
             AppInput::SelectNext => self.select_task(1),
             AppInput::SelectPrevious => self.select_task(-1),
             AppInput::SelectSetupNext => {
@@ -1772,6 +1868,13 @@ impl AppState {
                     self.focus = FocusTarget::Modal;
                 }
             },
+            ModalState::Task(card) => match input {
+                AppInput::Cancel | AppInput::Confirm => self.close_modal(),
+                _ => {
+                    self.modal = Some(ModalState::Task(card));
+                    self.focus = FocusTarget::Modal;
+                }
+            },
             ModalState::Error(notice) => match input {
                 AppInput::Cancel | AppInput::Confirm => self.close_modal(),
                 AppInput::Retry if notice.retryable => {
@@ -1905,17 +2008,18 @@ impl AppState {
                 .cloned()
                 .filter(|card| card.visibility.is_public())
                 .map(ModalState::Approval),
-            ProjectTab::Tasks => self
-                .selected_task()
-                .filter(|task| task.state == TaskState::AwaitingReview)
-                .and_then(|task| {
+            ProjectTab::Tasks => self.selected_task().cloned().map(|task| {
+                if task.state == TaskState::AwaitingReview {
                     self.review_cards
                         .iter()
                         .find(|card| card.task_id == task.id)
                         .cloned()
-                })
-                .filter(|card| card.visibility.is_public())
-                .map(ModalState::Review),
+                        .filter(|card| card.visibility.is_public())
+                        .map_or_else(|| ModalState::Task(task), ModalState::Review)
+                } else {
+                    ModalState::Task(task)
+                }
+            }),
             ProjectTab::Attention => None,
         };
         if let Some(modal) = modal {
@@ -2046,7 +2150,7 @@ impl AppState {
         ) {
             FocusTarget::SetupPicker
         } else {
-            FocusTarget::Composer
+            self.primary_view.default_focus()
         };
     }
 
@@ -2068,24 +2172,50 @@ impl AppState {
     }
 
     fn set_size(&mut self, width: u16, height: u16) {
-        let previous = self.layout;
         self.terminal_width = width;
         self.terminal_height = height;
         self.layout = LayoutMode::for_size(width, height);
-        if previous != self.layout && self.layout == LayoutMode::Narrow {
-            self.focus = match self.focus {
-                FocusTarget::ProjectRail => FocusTarget::Timeline,
-                other => other,
-            };
-        }
         self.clamp_selections();
+    }
+
+    fn select_primary_view(&mut self, view: PrimaryView) {
+        self.primary_view = view;
+        self.focus = if matches!(
+            self.setup,
+            SetupState::AgentPicker { .. } | SetupState::Unavailable { .. }
+        ) {
+            FocusTarget::SetupPicker
+        } else {
+            view.default_focus()
+        };
+    }
+
+    fn select_project_tab(&mut self, tab: ProjectTab) {
+        self.primary_view = PrimaryView::Kanban;
+        self.rail.tab = tab;
+        self.focus = FocusTarget::ProjectRail;
     }
 
     fn clamp_selections(&mut self) {
         if self.tasks.is_empty() {
             self.rail.selected_task = 0;
+            self.rail.lane = KanbanLane::Queued;
         } else {
             self.rail.selected_task = self.rail.selected_task.min(self.tasks.len() - 1);
+            if !self
+                .tasks
+                .iter()
+                .any(|task| task.state.kanban_lane() == self.rail.lane)
+            {
+                self.rail.lane = self.tasks[self.rail.selected_task].state.kanban_lane();
+            }
+            if self.tasks[self.rail.selected_task].state.kanban_lane() != self.rail.lane {
+                self.rail.selected_task = self
+                    .tasks
+                    .iter()
+                    .position(|task| task.state.kanban_lane() == self.rail.lane)
+                    .unwrap_or(0);
+            }
             for (index, task) in self.tasks.iter_mut().enumerate() {
                 task.selected = index == self.rail.selected_task;
             }
@@ -2161,13 +2291,74 @@ impl AppState {
                 (self.rail.selected_approval as isize + delta).rem_euclid(len as isize) as usize;
             return;
         }
-        if self.tasks.is_empty() {
-            self.rail.selected_task = 0;
+        if self.rail.tab != ProjectTab::Tasks {
             return;
         }
-        let len = self.tasks.len();
-        self.rail.selected_task =
-            (self.rail.selected_task as isize + delta).rem_euclid(len as isize) as usize;
+
+        let lane_tasks = self
+            .tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, task)| {
+                (task.state.kanban_lane() == self.rail.lane).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if lane_tasks.is_empty() {
+            return;
+        }
+        let current = lane_tasks
+            .iter()
+            .position(|index| *index == self.rail.selected_task)
+            .unwrap_or(0);
+        let next = (current as isize + delta).rem_euclid(lane_tasks.len() as isize) as usize;
+        self.set_selected_task(lane_tasks[next]);
+    }
+
+    fn select_lane(&mut self, delta: isize) {
+        let current_row = self
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| task.state.kanban_lane() == self.rail.lane)
+            .position(|(index, _)| index == self.rail.selected_task)
+            .unwrap_or(0);
+
+        let mut lane = self.rail.lane;
+        for _ in 0..KanbanLane::ALL.len() {
+            lane = if delta < 0 {
+                lane.previous()
+            } else {
+                lane.next()
+            };
+            let lane_tasks = self
+                .tasks
+                .iter()
+                .enumerate()
+                .filter_map(|(index, task)| (task.state.kanban_lane() == lane).then_some(index))
+                .collect::<Vec<_>>();
+            if !lane_tasks.is_empty() {
+                let next = lane_tasks[current_row.min(lane_tasks.len() - 1)];
+                self.rail.lane = lane;
+                self.set_selected_task(next);
+                return;
+            }
+        }
+
+        self.rail.lane = if delta < 0 {
+            self.rail.lane.previous()
+        } else {
+            self.rail.lane.next()
+        };
+        for task in &mut self.tasks {
+            task.selected = false;
+        }
+    }
+
+    fn set_selected_task(&mut self, selected: usize) {
+        self.rail.selected_task = selected.min(self.tasks.len().saturating_sub(1));
+        if let Some(task) = self.tasks.get(self.rail.selected_task) {
+            self.rail.lane = task.state.kanban_lane();
+        }
         for (index, task) in self.tasks.iter_mut().enumerate() {
             task.selected = index == self.rail.selected_task;
         }
@@ -2206,7 +2397,6 @@ pub enum AppInput {
     RequestCancel,
     Retry,
     ToggleHelp,
-    ToggleRail,
     ToggleActivity,
     ToggleReasoning,
     FocusNext,
@@ -2217,6 +2407,9 @@ pub enum AppInput {
     PageDown,
     TimelineTop,
     TimelineBottom,
+    NextPrimaryView,
+    PreviousPrimaryView,
+    SelectPrimaryView(PrimaryView),
     NextProjectTab,
     PreviousProjectTab,
     SelectProjectTab(ProjectTab),
@@ -2416,6 +2609,10 @@ fn normalize_modal(modal: &mut ModalState, limits: &AppLimits) {
                 .selected_action
                 .min(card.permitted_actions.len().saturating_sub(1));
         }
+        ModalState::Task(task) => {
+            task.checks.truncate(limits.checks_per_task);
+            task.changed_files.truncate(128);
+        }
         ModalState::Cancel(_) | ModalState::Help | ModalState::Error(_) => {}
     }
 }
@@ -2455,7 +2652,58 @@ mod tests {
         let mut state = AppState::new();
         state.header.runtime = RuntimeState::Ready;
         state.header.readiness = ProjectReadiness::Ready;
+        state.primary_view = PrimaryView::MainChat;
+        state.focus = FocusTarget::Composer;
         state
+    }
+
+    #[test]
+    fn solo_opens_on_kanban_and_switches_to_one_chat_view() {
+        let mut state = AppState::new();
+        assert_eq!(state.primary_view, PrimaryView::Kanban);
+        assert_eq!(state.focus, FocusTarget::ProjectRail);
+
+        state.reduce(AppAction::Input(AppInput::SelectPrimaryView(
+            PrimaryView::MainChat,
+        )));
+        assert_eq!(state.primary_view, PrimaryView::MainChat);
+        assert_eq!(state.focus, FocusTarget::Composer);
+
+        state.reduce(AppAction::Input(AppInput::PreviousPrimaryView));
+        assert_eq!(state.primary_view, PrimaryView::Kanban);
+        assert_eq!(state.focus, FocusTarget::ProjectRail);
+    }
+
+    #[test]
+    fn kanban_arrows_move_within_and_between_nonempty_lanes() {
+        let mut state = AppState::new();
+        state.tasks = vec![
+            TaskSummary::new("q1", "Queued one", TaskState::Queued),
+            TaskSummary::new("q2", "Queued two", TaskState::Queued),
+            TaskSummary::new("a1", "Active one", TaskState::Running),
+            TaskSummary::new("d1", "Done one", TaskState::Succeeded),
+        ];
+        state.clamp_selections();
+
+        state.reduce(AppAction::Input(AppInput::Down));
+        assert_eq!(
+            state.selected_task().map(|task| task.id.as_str()),
+            Some("q2")
+        );
+
+        state.reduce(AppAction::Input(AppInput::MoveRight));
+        assert_eq!(state.rail.lane, KanbanLane::Active);
+        assert_eq!(
+            state.selected_task().map(|task| task.id.as_str()),
+            Some("a1")
+        );
+
+        state.reduce(AppAction::Input(AppInput::MoveRight));
+        assert_eq!(state.rail.lane, KanbanLane::Done);
+        assert_eq!(
+            state.selected_task().map(|task| task.id.as_str()),
+            Some("d1")
+        );
     }
 
     #[test]
@@ -2646,17 +2894,18 @@ mod tests {
     }
 
     #[test]
-    fn opening_review_requires_the_cached_authoritative_card() {
+    fn opening_review_uses_authoritative_card_and_otherwise_shows_task_details() {
         let mut state = ready_state();
-        state.tasks.push(TaskSummary::new(
-            "task",
-            "Review task",
-            TaskState::AwaitingReview,
-        ));
+        let mut task = TaskSummary::new("task", "Review task", TaskState::AwaitingReview);
+        task.selected = true;
+        state.tasks.push(task);
+        state.primary_view = PrimaryView::Kanban;
         state.rail.tab = ProjectTab::Tasks;
+        state.rail.lane = KanbanLane::Review;
         state.focus = FocusTarget::ProjectRail;
         state.reduce(AppAction::Input(AppInput::OpenSelected));
-        assert!(state.modal.is_none());
+        assert!(matches!(state.modal, Some(ModalState::Task(_))));
+        state.reduce(AppAction::Input(AppInput::Cancel));
 
         let task = state.tasks[0].clone();
         state

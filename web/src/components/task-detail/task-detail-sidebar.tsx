@@ -14,9 +14,7 @@ import {
   TaskStatusDropdown,
 } from '@/components/task-controls'
 import { TaskExecutionObservabilityPanel } from '@/components/task-execution-observability'
-import {
-  useProjectTasksForSubtasks,
-} from '@/components/task-detail/task-subtasks-panel'
+import { useProjectTasksForSubtasks } from '@/components/task-detail/task-subtasks-panel'
 import { useRolePicker } from '@/components/task-detail/use-role-picker'
 import { productTerm } from '@/lib/i18n'
 import { Badge } from '@/components/ui/badge'
@@ -178,7 +176,7 @@ export function TaskDetailSidebar({
 
   return (
     <>
-      <aside className="w-72 shrink-0 overflow-y-auto border-l bg-muted/30">
+      <aside className="w-full shrink-0 border-t bg-muted/30 lg:w-72 lg:overflow-y-auto lg:border-l lg:border-t-0">
         {isLoading ? (
           <div className="space-y-4 p-5">
             <Skeleton className="h-8 w-full" />
@@ -235,7 +233,9 @@ export function TaskDetailSidebar({
             ) : null}
 
             {(() => {
-              const roles = effectiveWorkflow?.roles ?? [{ name: 'coder', display_name: 'Coder', description: '' }]
+              const roles = effectiveWorkflow?.roles ?? [
+                { name: 'coder', display_name: 'Coder', description: '' },
+              ]
               const orderedRoles = [
                 ...roles.filter((r) => r.name === coderRole),
                 ...roles.filter((r) => r.name !== coderRole),
@@ -314,10 +314,14 @@ export function TaskDetailSidebar({
             {task.workspace ? (
               <>
                 <SidebarField label="Branch">
-                  <p className="font-mono text-xs break-all text-muted-foreground">{task.workspace.branch}</p>
+                  <p className="font-mono text-xs break-all text-muted-foreground">
+                    {task.workspace.branch}
+                  </p>
                 </SidebarField>
                 <SidebarField label="Path">
-                  <p className="font-mono text-xs break-all text-muted-foreground">{task.workspace.worktree_path}</p>
+                  <p className="font-mono text-xs break-all text-muted-foreground">
+                    {task.workspace.worktree_path}
+                  </p>
                 </SidebarField>
               </>
             ) : null}
@@ -352,7 +356,8 @@ export function TaskDetailSidebar({
                   onClick={() => {
                     duplicateTask.mutate(task.id, {
                       onSuccess: () => toast.success('Task duplicated to Todo'),
-                      onError: (error) => toast.error(getApiErrorMessage(error, 'Duplicate failed')),
+                      onError: (error) =>
+                        toast.error(getApiErrorMessage(error, 'Duplicate failed')),
                     })
                   }}
                 >
@@ -539,7 +544,10 @@ function sameSelection(
     return assignment.assignee_type === 'agent' && assignment.assignee_id === selection.agentId
   }
   if (selection.type === 'user') {
-    return assignment.assignee_type === 'user' && (assignment.assignee_id ?? 'manual') === selection.userId
+    return (
+      assignment.assignee_type === 'user' &&
+      (assignment.assignee_id ?? 'manual') === selection.userId
+    )
   }
   return false
 }
@@ -554,9 +562,7 @@ function SubtaskParentField({
   disabled: boolean
 }) {
   const updateTask = useUpdateTask()
-  const rootTasks = allProjectTasks.filter(
-    (t) => t.parent_task_id == null && t.id !== task.id,
-  )
+  const rootTasks = allProjectTasks.filter((t) => t.parent_task_id == null && t.id !== task.id)
   const currentParent = allProjectTasks.find((t) => t.id === task.parent_task_id)
 
   const handleParentChange = (newParentId: string) => {

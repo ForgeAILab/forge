@@ -3,7 +3,8 @@ import {
   useContext,
   useState,
   useRef,
-  useEffect,
+  useLayoutEffect,
+  useMemo,
   useCallback,
   type ButtonHTMLAttributes,
   type ReactNode,
@@ -27,8 +28,9 @@ const Ctx = createContext<DropdownCtx>({
 export function DropdownMenu({ children, className }: { children: ReactNode; className?: string }) {
   const [open, setOpen] = useState(false)
   const triggerRef = useRef<HTMLButtonElement>(null)
+  const contextValue = useMemo(() => ({ open, setOpen, triggerRef }), [open])
   return (
-    <Ctx.Provider value={{ open, setOpen, triggerRef }}>
+    <Ctx.Provider value={contextValue}>
       <div className={cn('relative inline-block', className)}>{children}</div>
     </Ctx.Provider>
   )
@@ -102,9 +104,9 @@ export function DropdownMenuContent({
       newStyle.left = rect.left
     }
     setStyle(newStyle)
-  }, [triggerRef, align, side])
+  }, [triggerRef, align, side, anchor])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!open) return
     updatePosition()
     const handler = (e: globalThis.MouseEvent) => {
