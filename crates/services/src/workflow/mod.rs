@@ -27,6 +27,11 @@ pub struct HookContext {
     pub event_bus: Arc<events::EventBus>,
     pub gate_config: Option<GateConfig>,
     pub workflow: Arc<WorkflowDefinition>,
+    /// Exact Project authority used to resolve this hook's workflow. Hook
+    /// actions that perform nested Task transitions must carry it through to
+    /// the final DB CAS instead of re-reading an unrelated newer workflow.
+    pub project_version: Option<i64>,
+    pub project_workflow_definition: Option<String>,
     pub triggered_by: Actor,
     pub review_runner: Option<Arc<review::ReviewRunner>>,
     pub merge_service: Option<Arc<MergeService>>,
@@ -63,6 +68,56 @@ pub mod registry;
 pub mod template_service;
 pub mod transition_event;
 pub mod validation;
+
+/// Marks a mechanical integration-contention bounce whose only purpose is to
+/// obtain a fresh review. These transitions must never consume a merge-fix
+/// budget or dispatch an implementation agent.
+pub(crate) const REVIEW_REFRESH_MARKER: &str = "[review-refresh]";
+
+/// Additional marker used to bound repeated automatic target rebases.
+pub(crate) const TARGET_MOVED_MARKER: &str = "[target-moved-rebase]";
+
+pub(crate) async fn review_refresh_transition_pending(
+    db: &db::SqliteDb,
+    task_id: &str,
+    current_state: &str,
+) -> db::Result<bool> {
+    let latest = sqlx::query_as::<_, (String, String, String, String)>(
+        "SELECT from_state, to_state, trigger_reason, triggered_by
+         FROM transition_log
+         WHERE task_id = ?
+         ORDER BY created_at DESC, rowid DESC
+         LIMIT 1",
+    )
+    .bind(task_id)
+    .fetch_optional(db.pool())
+    .await?;
+
+    Ok(
+        latest.is_some_and(|(from_state, to_state, reason, triggered_by)| {
+            from_state == default_states::MERGING
+                && to_state == current_state
+                && reason.contains(REVIEW_REFRESH_MARKER)
+                && triggered_by
+                    == api_types::Actor::system(api_types::SystemComponent::Workflow).display()
+        }),
+    )
+}
+
+pub(crate) fn review_refresh_target(
+    workflow: &WorkflowDefinition,
+    current_state: &str,
+) -> Option<String> {
+    workflow
+        .outgoing_trigger_targets(current_state)
+        .find_map(|(_, target)| {
+            workflow.states.iter().find_map(|state| {
+                (state.name == target
+                    && state.canonical_phase == Some(api_types::CanonicalPhase::Review))
+                .then(|| state.name.clone())
+            })
+        })
+}
 
 pub use dispatch::{AgentDispatchContext, AgentPrompt, PromptBuilder};
 pub use inherited_subtask_workflow::inherited_subtask_workflow;

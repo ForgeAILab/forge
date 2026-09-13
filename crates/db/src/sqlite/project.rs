@@ -8,6 +8,25 @@ const PROJECT_VISIBLE_TO_USER: &str = "(owner_id IS NULL OR owner_id = ? OR EXIS
       AND project_member.user_id = ?
 ))";
 
+async fn project_in_use_counts(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    project_id: &str,
+) -> Result<(i64, i64)> {
+    sqlx::query_as(
+        "SELECT
+            (SELECT COUNT(*) FROM execution e
+               JOIN task t ON t.id = e.task_id
+              WHERE t.project_id = ? AND e.status = 'running'),
+            (SELECT COUNT(*) FROM workspace_lease wl
+              WHERE wl.project_id = ? AND wl.status = 'active')",
+    )
+    .bind(project_id)
+    .bind(project_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(Into::into)
+}
+
 #[async_trait]
 impl ProjectRepo for SqliteDb {
     async fn create(&self, input: CreateProject) -> Result<Project> {
@@ -355,12 +374,22 @@ impl ProjectRepo for SqliteDb {
         expected_version: i64,
         project_hooks_json: Option<String>,
     ) -> Result<Project> {
-        let mut project = ProjectRepo::get_by_id(self, &input.id)
-            .await?
-            .ok_or(DbError::NotFound)?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let project_row = sqlx::query(&format!(
+            "SELECT {PROJECT_COLUMNS} FROM project WHERE id = ?"
+        ))
+        .bind(&input.id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(DbError::NotFound)?;
+        let mut project = map_project(project_row)?;
         if project.version != expected_version {
             return Err(DbError::VersionConflict);
         }
+        let original_settings = project.settings.clone();
+        let original_primary_repo_id = project.primary_repo_id.clone();
+        let original_paused_at = project.paused_at.clone();
+        let original_system_pause_reason = project.system_pause_reason.clone();
         if let Some(name) = input.name {
             project.name = name;
         }
@@ -393,14 +422,66 @@ impl ProjectRepo for SqliteDb {
         .bind(&project.updated_at)
         .bind(&project.id)
         .bind(expected_version)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::VersionConflict);
         }
-        ProjectRepo::get_by_id(self, &project.id)
+        let project_authority_changed = original_settings != project.settings
+            || original_primary_repo_id != project.primary_repo_id
+            || original_paused_at != project.paused_at
+            || original_system_pause_reason != project.system_pause_reason;
+        if project_authority_changed {
+            wake_dispatch_for_project_in_tx(&mut transaction, &project.id, &project.updated_at)
+                .await?;
+        }
+        let updated_row = sqlx::query(&format!(
+            "SELECT {PROJECT_COLUMNS} FROM project WHERE id = ?"
+        ))
+        .bind(&project.id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let updated_project = map_project(updated_row)?;
+        transaction.commit().await?;
+        Ok(updated_project)
+    }
+
+    async fn update_workflow(
+        &self,
+        id: &str,
+        workflow_definition: &str,
+        workflow_template_name: Option<&str>,
+        expected_version: i64,
+        updated_at: &str,
+    ) -> Result<()> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let current_version: i64 = sqlx::query_scalar("SELECT version FROM project WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *transaction)
             .await?
-            .ok_or(DbError::NotFound)
+            .ok_or(DbError::NotFound)?;
+        if current_version != expected_version {
+            return Err(DbError::VersionConflict);
+        }
+        let result = sqlx::query(
+            "UPDATE project
+             SET workflow_definition = ?, workflow_template_name = ?, version = version + 1,
+                 updated_at = ?
+             WHERE id = ? AND version = ?",
+        )
+        .bind(workflow_definition)
+        .bind(workflow_template_name)
+        .bind(updated_at)
+        .bind(id)
+        .bind(expected_version)
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound);
+        }
+        wake_dispatch_for_project_in_tx(&mut transaction, id, updated_at).await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     async fn set_project_hooks_json(
@@ -443,37 +524,109 @@ impl ProjectRepo for SqliteDb {
         // external pause/resume, so this always clears any system reason —
         // pausing manually never carries one, and resuming (manual or the
         // dispatcher's own) makes any prior reason moot.
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let updated_at = now_rfc3339();
         let result = sqlx::query(
-            "UPDATE project SET paused_at = ?, system_pause_reason = NULL, updated_at = ? WHERE id = ?",
+            "UPDATE project
+             SET paused_at = ?, system_pause_reason = NULL, version = version + 1,
+                 updated_at = ?
+             WHERE id = ?",
         )
         .bind(paused_at.as_deref())
-        .bind(now_rfc3339())
+        .bind(&updated_at)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
+        wake_dispatch_for_project_in_tx(&mut transaction, id, &updated_at).await?;
+        transaction.commit().await?;
         Ok(())
     }
 
-    async fn set_system_pause_reason(&self, id: &str, paused_at: &str, reason: &str) -> Result<()> {
-        // Guarded on `paused_at IS NULL`: only pauses a currently-active
-        // Project. A concurrent pause (manual or another reconciliation
-        // tick) makes this a benign no-op rather than an error.
-        sqlx::query(
-            "UPDATE project SET paused_at = ?, system_pause_reason = ?, updated_at = ? WHERE id = ? AND paused_at IS NULL",
+    async fn set_system_pause_reason_if_unchanged(
+        &self,
+        id: &str,
+        expected_version: i64,
+        expected_primary_repo_id: Option<&str>,
+        paused_at: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        // Guarded on the complete dispatcher snapshot: only the same active
+        // Project/repository state may be auto-paused. A concurrent pause,
+        // repository attachment/deletion, or another Project mutation makes
+        // this a benign no-op rather than an error.
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let updated_at = now_rfc3339();
+        let result = sqlx::query(
+            "UPDATE project
+             SET paused_at = ?, system_pause_reason = ?, version = version + 1,
+                 updated_at = ?
+             WHERE id = ? AND version = ? AND paused_at IS NULL
+               AND system_pause_reason IS NULL
+               AND primary_repo_id IS ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM repo
+                   WHERE repo.id = project.primary_repo_id
+                     AND repo.project_id = project.id
+               )",
         )
         .bind(paused_at)
         .bind(reason)
-        .bind(now_rfc3339())
+        .bind(&updated_at)
         .bind(id)
-        .execute(&self.pool)
+        .bind(expected_version)
+        .bind(expected_primary_repo_id)
+        .execute(&mut *transaction)
         .await?;
-        Ok(())
+        let paused = result.rows_affected() > 0;
+        if paused {
+            wake_dispatch_for_project_in_tx(&mut transaction, id, &updated_at).await?;
+        }
+        transaction.commit().await?;
+        Ok(paused)
     }
 
-    async fn delete(&self, id: &str) -> Result<()> {
+    async fn clear_system_pause_if_unchanged(
+        &self,
+        id: &str,
+        expected_version: i64,
+        expected_primary_repo_id: &str,
+        expected_paused_at: &str,
+        expected_reason: &str,
+    ) -> Result<bool> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let updated_at = now_rfc3339();
+        let result = sqlx::query(
+            "UPDATE project
+             SET paused_at = NULL, system_pause_reason = NULL, version = version + 1,
+                 updated_at = ?
+             WHERE id = ? AND version = ? AND primary_repo_id = ?
+               AND paused_at = ? AND system_pause_reason = ?
+               AND EXISTS (
+                   SELECT 1 FROM repo
+                   WHERE repo.id = project.primary_repo_id
+                     AND repo.project_id = project.id
+               )",
+        )
+        .bind(&updated_at)
+        .bind(id)
+        .bind(expected_version)
+        .bind(expected_primary_repo_id)
+        .bind(expected_paused_at)
+        .bind(expected_reason)
+        .execute(&mut *transaction)
+        .await?;
+        let cleared = result.rows_affected() > 0;
+        if cleared {
+            wake_dispatch_for_project_in_tx(&mut transaction, id, &updated_at).await?;
+        }
+        transaction.commit().await?;
+        Ok(cleared)
+    }
+
+    async fn ensure_deletable(&self, id: &str) -> Result<()> {
         let mut tx = crate::begin_immediate(&self.pool).await?;
         let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM project WHERE id = ?")
             .bind(id)
@@ -483,6 +636,77 @@ impl ProjectRepo for SqliteDb {
         if !exists {
             return Err(DbError::NotFound);
         }
+
+        let (running_executions, active_leases) = project_in_use_counts(&mut tx, id).await?;
+        if running_executions > 0 || active_leases > 0 {
+            return Err(DbError::ProjectInUse {
+                project_id: id.to_owned(),
+                running_executions,
+                active_leases,
+            });
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn delete(&self, id: &str) -> Result<()> {
+        self.delete_with_workspace_paths(id).await.map(|_| ())
+    }
+
+    async fn delete_with_workspace_paths(&self, id: &str) -> Result<ProjectDeletionPaths> {
+        let mut tx = crate::begin_immediate(&self.pool).await?;
+        let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM project WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+        if !exists {
+            return Err(DbError::NotFound);
+        }
+
+        // Deleting a Project destroys in-flight agent work. Force callers
+        // must obtain provider acknowledgement, terminalize executions, and
+        // revoke leases before reaching this transaction, but the database
+        // boundary remains guarded as the final admission check. Keeping the
+        // guard here prevents any lower-level caller from bypassing the
+        // stop protocol accidentally.
+        let (running_executions, active_leases) = project_in_use_counts(&mut tx, id).await?;
+        if running_executions > 0 || active_leases > 0 {
+            return Err(DbError::ProjectInUse {
+                project_id: id.to_owned(),
+                running_executions,
+                active_leases,
+            });
+        }
+
+        // These snapshots are taken after BEGIN IMMEDIATE, so Task,
+        // Workspace, and repository rows admitted before the teardown lock is
+        // acquired are included. Task IDs also cover an orphan worktree with
+        // no Workspace row. A creator that loses the lock must wait for the
+        // Project/task/repository cascade and then clean its just-created
+        // worktree or cache after its FK failure.
+        let task_ids = sqlx::query_scalar::<_, String>("SELECT id FROM task WHERE project_id = ?")
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+        let workspace_paths = sqlx::query_scalar::<_, String>(
+            "SELECT w.worktree_path
+             FROM workspace w
+             JOIN task t ON t.id = w.task_id
+             WHERE t.project_id = ?",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let repository_paths = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT id, local_path FROM repo WHERE project_id = ?",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|(id, local_path)| ProjectDeletionRepositoryPath { id, local_path })
+        .collect();
 
         // Immutable orchestration rows remain protected from individual
         // deletion. Project deletion is the one bounded teardown operation:
@@ -627,6 +851,10 @@ impl ProjectRepo for SqliteDb {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(ProjectDeletionPaths {
+            task_ids,
+            workspace_paths,
+            repository_paths,
+        })
     }
 }

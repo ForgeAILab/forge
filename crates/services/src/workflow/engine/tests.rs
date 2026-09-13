@@ -359,6 +359,202 @@ async fn lifecycle_ordering() {
 }
 
 #[tokio::test]
+async fn transition_rejects_stale_project_workflow_authority_without_mutation() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let task_id = "task-stale-project-workflow";
+    seed_project_repo_and_task(&db, task_id, default_states::TODO).await;
+    let task_before = TaskRepo::get_by_id(&*db, task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let project = ProjectRepo::get_by_id(&*db, &task_before.project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists");
+    let workflow = default_workflow::default_workflow();
+    ProjectRepo::update_workflow(
+        &*db,
+        &project.id,
+        "{\"workflow\":\"w2\"}",
+        None,
+        project.version,
+        &now_rfc3339(),
+    )
+    .await
+    .expect("workflow update wins the race");
+
+    let result = engine(Arc::clone(&db), event_bus)
+        .transition_with_authority(
+            task_id,
+            default_states::IN_PROGRESS,
+            task_before.version,
+            &workflow,
+            &api_types::Actor::user(api_types::UserActionSource::Test),
+            "stale workflow authority",
+            false,
+            super::WorkflowAuthority {
+                project_version: project.version,
+                workflow_definition: project.workflow_definition.clone(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(result, Err(ServiceError::Db(db::DbError::VersionConflict))),
+        "expected stale workflow authority conflict"
+    );
+
+    let task_after = TaskRepo::get_by_id(&*db, task_id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    assert_eq!(task_after.status, task_before.status);
+    assert_eq!(task_after.version, task_before.version);
+    assert!(
+        TransitionLogRepo::list_by_task(&*db, task_id)
+            .await
+            .expect("transition logs load")
+            .is_empty(),
+        "stale transition must not append a state-change log"
+    );
+    let running_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution WHERE task_id = ? AND status = 'running'",
+    )
+    .bind(task_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("execution count loads");
+    assert_eq!(running_count, 0, "stale transition must not dispatch work");
+}
+
+#[tokio::test]
+async fn retry_entry_barrier_rejects_stale_project_workflow_authority_without_mutation() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let task_id = "task-stale-barrier-workflow";
+    seed_project_repo_and_task(&db, task_id, default_states::TODO).await;
+    let task_before = TaskRepo::get_by_id(&*db, task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let project = ProjectRepo::get_by_id(&*db, &task_before.project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists");
+    let blocked = TaskRepo::set_entry_barrier(
+        &*db,
+        task_id,
+        task_before.version,
+        Some(
+            serde_json::json!({
+                "state": default_states::TODO,
+                "status": "blocked",
+                "started_at": now_rfc3339(),
+            })
+            .to_string(),
+        ),
+        &now_rfc3339(),
+    )
+    .await
+    .expect("entry barrier is seeded");
+    ProjectRepo::update_workflow(
+        &*db,
+        &project.id,
+        "{\"workflow\":\"w2\"}",
+        None,
+        project.version,
+        &now_rfc3339(),
+    )
+    .await
+    .expect("workflow update wins the race");
+
+    let workflow = default_workflow::default_workflow();
+    let result = engine(Arc::clone(&db), event_bus)
+        .retry_entry_barrier_with_authority(
+            task_id,
+            blocked.version,
+            &workflow,
+            &api_types::Actor::user(api_types::UserActionSource::Test),
+            "stale workflow authority",
+            super::WorkflowAuthority {
+                project_version: project.version,
+                workflow_definition: project.workflow_definition.clone(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(result, Err(ServiceError::Db(db::DbError::VersionConflict))),
+        "expected stale workflow authority conflict"
+    );
+
+    let task_after = TaskRepo::get_by_id(&*db, task_id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    assert_eq!(task_after.version, blocked.version);
+    assert_eq!(task_after.entry_barrier_json, blocked.entry_barrier_json);
+}
+
+#[tokio::test]
+async fn reset_to_initial_rejects_stale_project_workflow_authority_without_mutation() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let task_id = "task-stale-reset-workflow";
+    seed_project_repo_and_task(&db, task_id, default_states::TODO).await;
+    let task_before = TaskRepo::get_by_id(&*db, task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let project = ProjectRepo::get_by_id(&*db, &task_before.project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists");
+    ProjectRepo::update_workflow(
+        &*db,
+        &project.id,
+        "{\"workflow\":\"w2\"}",
+        None,
+        project.version,
+        &now_rfc3339(),
+    )
+    .await
+    .expect("workflow update wins the race");
+
+    let result = engine(Arc::clone(&db), event_bus)
+        .reset_to_initial_with_authority(
+            task_id,
+            default_states::TODO,
+            task_before.version,
+            &default_workflow::default_workflow(),
+            &api_types::Actor::user(api_types::UserActionSource::Test),
+            "stale workflow authority",
+            super::WorkflowAuthority {
+                project_version: project.version,
+                workflow_definition: project.workflow_definition.clone(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(result, Err(ServiceError::Db(db::DbError::VersionConflict))),
+        "expected stale workflow authority conflict"
+    );
+
+    let task_after = TaskRepo::get_by_id(&*db, task_id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    assert_eq!(task_after.status, task_before.status);
+    assert_eq!(task_after.version, task_before.version);
+    assert!(
+        TransitionLogRepo::list_by_task(&*db, task_id)
+            .await
+            .expect("transition logs load")
+            .is_empty(),
+        "stale reset must not append a state-change log"
+    );
+}
+
+#[tokio::test]
 async fn default_workflow_allows_user_to_leave_planning() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
@@ -1086,6 +1282,115 @@ async fn seed_custom_workflow_task(
     .await
     .expect("task creates");
     project_id
+}
+
+#[tokio::test]
+async fn review_refresh_bridge_skips_merge_repair_entry_hooks() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let task_id = new_uuid_v4();
+
+    let mut merging = with_trigger(
+        state(
+            default_states::MERGING,
+            StateKind::Gate,
+            None,
+            StateHooks::default(),
+        ),
+        WorkflowTrigger::Reject,
+        default_states::MERGE_FAILED,
+    );
+    merging.canonical_phase = Some(api_types::CanonicalPhase::Review);
+
+    let mut merge_failed = with_trigger(
+        state(
+            default_states::MERGE_FAILED,
+            StateKind::Active,
+            Some(default_roles::CODER),
+            StateHooks {
+                before_enter: vec![hook("run_before_work_hooks", FailurePolicy::Block)],
+                on_enter: vec![hook("dispatch_role_agent", FailurePolicy::Log)],
+                ..StateHooks::default()
+            },
+        ),
+        WorkflowTrigger::Accept,
+        default_states::REVIEW,
+    );
+    merge_failed.canonical_phase = Some(api_types::CanonicalPhase::Review);
+
+    let mut review = state(
+        default_states::REVIEW,
+        StateKind::Gate,
+        Some(default_roles::REVIEWER),
+        StateHooks::default(),
+    );
+    review.canonical_phase = Some(api_types::CanonicalPhase::Review);
+
+    let workflow = WorkflowDefinition {
+        roles: Vec::new(),
+        states: vec![merging, merge_failed, review],
+        configuration: Vec::new(),
+        cancellation_state: None,
+    };
+    let project_id =
+        seed_custom_workflow_task(&db, &task_id, default_states::MERGING, &workflow).await;
+
+    // If the intermediate repair state's entry hook runs, this deliberately
+    // invalid settings payload makes it block before the review cascade.
+    sqlx::query("UPDATE project SET settings = ? WHERE id = ?")
+        .bind("not-json")
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .expect("project settings become invalid");
+
+    let result = engine(Arc::clone(&db), event_bus)
+        .transition(
+            &task_id,
+            default_states::MERGE_FAILED,
+            1,
+            &workflow,
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
+            &format!(
+                "{} reviewed commit changed; fresh review required",
+                crate::workflow::REVIEW_REFRESH_MARKER
+            ),
+            true,
+        )
+        .await
+        .expect("review refresh crosses the repair bridge");
+
+    assert_eq!(result.task.status, default_states::REVIEW);
+    let logs = TransitionLogRepo::list_by_task(&*db, &task_id)
+        .await
+        .expect("transition logs load");
+    let bridge = logs
+        .iter()
+        .find(|entry| {
+            entry.from_state == default_states::MERGING
+                && entry.to_state == default_states::MERGE_FAILED
+        })
+        .expect("review-refresh bridge transition exists");
+    assert!(
+        !bridge.rejection,
+        "review-refresh bridges are not retry rejections"
+    );
+    let results: Vec<HookResultEntry> = serde_json::from_str(
+        bridge
+            .hook_results_json
+            .as_deref()
+            .expect("bridge hook results are recorded"),
+    )
+    .expect("bridge hook results deserialize");
+    assert!(
+        results.iter().all(|entry| entry.phase != "before_enter"),
+        "repair entry hooks must not run for the review-refresh bridge: {results:?}"
+    );
+    assert!(results.iter().any(|entry| {
+        entry.phase == "on_enter"
+            && entry.action == "dispatch_role_agent"
+            && entry.outcome == "cascade"
+    }));
 }
 
 #[tokio::test]

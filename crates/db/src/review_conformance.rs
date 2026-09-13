@@ -48,9 +48,40 @@ pub(crate) async fn review_source_in_tx(
          LEFT JOIN execution e ON e.id = COALESCE(
              ?,
              (SELECT e2.id FROM execution e2
-              WHERE e2.task_id = t.id
-              ORDER BY e2.updated_at DESC, e2.id DESC LIMIT 1)
-         ) AND e.task_id = t.id
+              JOIN task candidate_task ON candidate_task.id = e2.task_id
+              WHERE e2.status IN ('completed', 'running')
+                AND (
+                  (
+                      t.parent_task_id IS NULL
+                      AND EXISTS (
+                          SELECT 1 FROM task direct_child
+                          WHERE direct_child.parent_task_id = t.id
+                            AND direct_child.deleted_at IS NULL
+                      )
+                      AND candidate_task.parent_task_id = t.id
+                  )
+                  OR (
+                      (
+                          t.parent_task_id IS NOT NULL
+                          OR NOT EXISTS (
+                              SELECT 1 FROM task direct_child
+                              WHERE direct_child.parent_task_id = t.id
+                                AND direct_child.deleted_at IS NULL
+                          )
+                      )
+                      AND e2.task_id = t.id
+                  )
+              )
+              ORDER BY e2.created_at DESC, e2.id DESC LIMIT 1)
+         ) AND (
+             e.task_id = t.id
+             OR EXISTS (
+                 SELECT 1 FROM task candidate_task
+                 WHERE candidate_task.id = e.task_id
+                   AND candidate_task.parent_task_id = t.id
+                   AND candidate_task.deleted_at IS NULL
+             )
+         )
          LEFT JOIN workspace w ON w.id = e.workspace_id
          LEFT JOIN repo r ON r.id = CASE
              WHEN e.id IS NULL THEN p.primary_repo_id
@@ -216,6 +247,18 @@ pub(crate) async fn verify_review_source(
 impl ReviewConformanceRepo for SqliteDb {
     async fn lock_review_integration(&self, task_id: &str) -> Result<ReviewIntegrationGuard> {
         let mut tx = crate::begin_immediate(self.pool()).await?;
+        let paused_project_id: Option<String> = sqlx::query_scalar(
+            "SELECT p.id
+             FROM task t
+             JOIN project p ON p.id = t.project_id
+             WHERE t.id = ? AND t.deleted_at IS NULL AND p.paused_at IS NOT NULL",
+        )
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(project_id) = paused_project_id {
+            return Err(DbError::ProjectPaused { project_id });
+        }
         let source = review_source_in_tx(&mut tx, task_id, None).await?;
         let assigned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_role_assignment WHERE task_id = ? AND role_name = 'reviewer' AND assignee_type = 'agent' AND assignee_id IS NOT NULL)")
             .bind(task_id).fetch_one(&mut *tx).await?;
@@ -225,6 +268,22 @@ impl ReviewConformanceRepo for SqliteDb {
             .map(|states| states.iter().any(|s| s["role"] == "reviewer"))
             .unwrap_or(true);
         let contract = if assigned && has_review_role {
+            let review_passed_at: Option<String> = sqlx::query_scalar(
+                "SELECT review_passed_at
+                 FROM task
+                 WHERE id = ? AND deleted_at IS NULL",
+            )
+            .bind(task_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if review_passed_at
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err(DbError::Check(
+                    "current review authority required before integration".into(),
+                ));
+            }
             let raw: Option<String> = sqlx::query_scalar("SELECT CASE WHEN status = 'passed' THEN step_results_json ELSE '{}' END FROM review WHERE task_id = ? ORDER BY attempt_number DESC, id DESC LIMIT 1")
                 .bind(task_id).fetch_optional(&mut *tx).await?;
             let details: Value =

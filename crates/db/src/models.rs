@@ -1222,6 +1222,10 @@ pub struct CompareAndMoveTask {
     pub triggered_by: String,
     pub trigger_reason: String,
     pub rejection: bool,
+    /// Exact Project workflow authority observed before resolving this move.
+    /// Both values are checked inside the board-mutation transaction.
+    pub expected_project_version: Option<i64>,
+    pub expected_workflow_definition: Option<String>,
     pub updated_at: String,
 }
 
@@ -2014,6 +2018,10 @@ pub struct Review {
     pub id: String,
     pub task_id: String,
     pub execution_id: String,
+    /// Reviewer execution durably reserved for this Review attempt.
+    pub reviewer_execution_id: Option<String>,
+    /// Optional conformance auditor execution durably bound to this attempt.
+    pub auditor_execution_id: Option<String>,
     pub attempt_number: i64,
     pub status: ReviewStatus,
     pub step_results_json: String,

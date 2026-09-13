@@ -399,18 +399,17 @@ async fn obsolete_orphan_wakes_recheck_task_and_attempt_before_spending_budget()
                     .unwrap();
             }
             "deferred" => {
-                TaskRepo::set_metadata_json(
+                TaskRepo::mutate_metadata(
                     &*db,
                     &task.id,
-                    Some(
-                        serde_json::json!({
-                            "deferred_dispatch": {
-                                "not_before": (Utc::now() + Duration::minutes(1)).to_rfc3339(),
-                                "reason": "retry scheduled", "target_state": "in_progress"
-                            }
-                        })
-                        .to_string(),
-                    ),
+                    None,
+                    vec![db::TaskMetadataMutation::Set {
+                        key: "deferred_dispatch".to_owned(),
+                        value: serde_json::json!({
+                            "not_before": (Utc::now() + Duration::minutes(1)).to_rfc3339(),
+                            "reason": "retry scheduled", "target_state": "in_progress"
+                        }),
+                    }],
                     &now_rfc3339(),
                 )
                 .await

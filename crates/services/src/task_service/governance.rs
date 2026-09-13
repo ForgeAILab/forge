@@ -728,6 +728,8 @@ impl TaskService {
             principal_id,
             execution_id,
             execution_id,
+            None,
+            None,
         )
         .await
     }
@@ -737,6 +739,7 @@ impl TaskService {
     /// version-derived key because `operation_idempotency_key` is globally
     /// UNIQUE across all lease rows (revoked ones included) and lease rows
     /// are immutable by trigger.
+    #[allow(clippy::too_many_arguments)]
     async fn issue_workspace_lease_with_operation_key(
         &self,
         task: &db::Task,
@@ -745,6 +748,8 @@ impl TaskService {
         principal_id: Option<&str>,
         execution_id: &str,
         operation_key: &str,
+        expected_project_authority: Option<(i64, String, String)>,
+        replacing_lease: Option<(String, i64)>,
     ) -> Result<Option<db::WorkspaceLease>> {
         let canonical_role = canonical_workspace_lease_role(role)?;
         // The dedicated reviewer role is independent read-only review; every
@@ -767,22 +772,26 @@ impl TaskService {
         // of them inserts an authority row after the other has already done
         // so: the unique active-task constraint plus the verification below
         // make the winner authoritative and the loser fail closed.
-        if let Some(existing) = WorkspaceLeaseRepo::get_active_for_task(&*self.db, &task.id).await?
-        {
-            if !workspace_lease_expired(&existing) {
-                return self
-                    .verify_active_workspace_lease(
-                        task,
-                        workspace,
-                        role,
-                        Some(&principal_id),
-                        execution_id,
-                    )
-                    .await
-                    .map(Some);
-            }
-            if let Err(error) = WorkspaceLeaseRepo::expire(&*self.db, &now_rfc3339(), 500).await {
-                tracing::warn!(lease_id = %existing.id, %error, "failed to expire stale WorkspaceLease before reissue");
+        if replacing_lease.is_none() {
+            if let Some(existing) =
+                WorkspaceLeaseRepo::get_active_for_task(&*self.db, &task.id).await?
+            {
+                if !workspace_lease_expired(&existing) {
+                    return self
+                        .verify_active_workspace_lease(
+                            task,
+                            workspace,
+                            role,
+                            Some(&principal_id),
+                            execution_id,
+                        )
+                        .await
+                        .map(Some);
+                }
+                if let Err(error) = WorkspaceLeaseRepo::expire(&*self.db, &now_rfc3339(), 500).await
+                {
+                    tracing::warn!(lease_id = %existing.id, %error, "failed to expire stale WorkspaceLease before reissue");
+                }
             }
         }
 
@@ -816,15 +825,54 @@ impl TaskService {
             created_at: issued_at.clone(),
             updated_at: issued_at,
         };
-        let _lease = match WorkspaceLeaseRepo::issue(&*self.db, input).await {
+        let issue_result = if let Some((
+            expected_version,
+            expected_workflow_definition,
+            expected_effective_role,
+        )) = expected_project_authority.as_ref()
+        {
+            if let Some((replacing_lease_id, replacing_lease_version)) = replacing_lease.as_ref() {
+                WorkspaceLeaseRepo::replace_with_project_authority(
+                    &*self.db,
+                    input,
+                    *expected_version,
+                    expected_workflow_definition,
+                    &task.status,
+                    expected_effective_role,
+                    replacing_lease_id,
+                    *replacing_lease_version,
+                )
+                .await
+            } else {
+                WorkspaceLeaseRepo::issue_with_project_authority(
+                    &*self.db,
+                    input,
+                    *expected_version,
+                    expected_workflow_definition,
+                    &task.status,
+                    expected_effective_role,
+                )
+                .await
+            }
+        } else {
+            WorkspaceLeaseRepo::issue(&*self.db, input).await
+        };
+        let _lease = match issue_result {
             Ok(lease) => lease,
             Err(error) => {
                 // Another scheduler may have won the active-task race.  Only
                 // accept its row after rechecking all bindings; otherwise the
                 // insert error remains a hard admission failure.
-                if WorkspaceLeaseRepo::get_active_for_task(&*self.db, &task.id)
-                    .await?
-                    .is_some()
+                // An authority-bound reissue must not turn a Project
+                // version/workflow mismatch into acceptance of a concurrent
+                // row. The caller can retry against a newly rebuilt
+                // snapshot; accepting here would re-open the very race this
+                // transaction closes.
+                if replacing_lease.is_none()
+                    && expected_project_authority.is_none()
+                    && WorkspaceLeaseRepo::get_active_for_task(&*self.db, &task.id)
+                        .await?
+                        .is_some()
                 {
                     return self
                         .verify_active_workspace_lease(
@@ -1213,34 +1261,62 @@ impl TaskService {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+
+        // `resolve_workflow` intentionally has a forgiving fallback for
+        // general workflow reads.  A WorkspaceLease is different: it is
+        // repository authority, so an invalid Project workflow cannot be
+        // treated as the default workflow and accidentally preserve an old
+        // role admission.
+        let raw_workflow = project.workflow_definition.trim();
+        if !raw_workflow.is_empty() && raw_workflow != "{}" {
+            serde_json::from_str::<api_types::WorkflowDefinition>(raw_workflow).map_err(
+                |error| {
+                    ServiceError::invalid_operation(format!(
+                        "Project workflow definition is invalid for WorkspaceLease admission: {error}"
+                    ))
+                },
+            )?;
+        }
         let workflow = WorkflowEngine::resolve_workflow_for_task(
             task,
             &project.workflow_definition,
             &api_types::Actor::system(api_types::SystemComponent::Executor),
         );
-        if workflow
+        let state = workflow
             .states
             .iter()
-            .any(|state| crate::workflow::effective_role(state) == Some(requested_role))
-        {
-            return Ok(requested_role.to_owned());
-        }
+            .find(|state| state.name == task.status)
+            .ok_or_else(|| {
+                ServiceError::conflict(format!(
+                    "Task '{}' status '{}' is not present in its current workflow",
+                    task.id, task.status
+                ))
+            })?;
+        let current_role = crate::workflow::effective_role(state).ok_or_else(|| {
+            ServiceError::conflict(format!(
+                "Task '{}' status '{}' has no executable workflow role",
+                task.id, task.status
+            ))
+        })?;
 
-        // Interactive/executor launch APIs carry a transport role rather than
-        // a workflow role. Resolve it to the current state before checking the
-        // canonical Project Worker/reviewer assignment.
-        if matches!(requested_role, "interactive" | "executor") {
-            if let Some(state) = workflow
-                .states
-                .iter()
-                .find(|state| state.name == task.status)
-            {
-                if let Some(role) = crate::workflow::effective_role(state) {
-                    return Ok(role.to_owned());
-                }
-            }
+        // `interactive` is a transport role and may be used in any
+        // non-terminal workflow state. `executor` is the historical alias
+        // for the implementation/coder role; it must not become a wildcard
+        // for every role in the workflow. All actual workflow roles must
+        // match the current state, not merely occur in some other state.
+        let requested_current_role = match requested_role {
+            "interactive" => current_role,
+            "executor" => crate::workflow::default_roles::CODER,
+            "auditor" => crate::workflow::default_roles::REVIEWER,
+            role => role,
+        };
+        if requested_current_role != current_role {
+            return Err(ServiceError::conflict(format!(
+                "execution role '{}' is not authorized for Task '{}' in status '{}'; current effective role is '{}'",
+                requested_role, task.id, task.status, current_role
+            )));
         }
-        Ok(requested_role.to_owned())
+        Ok(current_role.to_owned())
     }
 
     pub(super) async fn verify_execution_workspace_authority(
@@ -1315,29 +1391,78 @@ impl TaskService {
             %verify_error,
             "reissuing this execution's WorkspaceLease after the Task row moved during dispatch"
         );
-        self.revoke_workspace_lease(&stale).await;
-        let fresh_task = TaskRepo::get_by_id(&*self.db, &task.id, false)
+        let mut fresh_task = TaskRepo::get_by_id(&*self.db, &task.id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
-        // The reissue keeps the execution binding but must mint a distinct
-        // idempotency key: the key column is globally UNIQUE (revoked rows
-        // included) and lease rows are immutable, so the revoked lease's key
-        // can never be reused. Verification accepts the derived key form.
-        self.issue_workspace_lease_with_operation_key(
-            &fresh_task,
-            workspace,
-            role,
-            principal_id,
-            execution_id,
-            &workspace_lease_reissue_key(execution_id, fresh_task.version),
-        )
-        .await?
-        .ok_or_else(|| {
-            ServiceError::invalid_operation(
-                "WorkspaceLease reissue did not produce an active lease",
-            )
-        })?;
-        Ok(fresh_task)
+        // Rebuild the admission from the fresh Task/Project/workflow
+        // snapshot before reviving authority. In particular, do not let a
+        // stale execution role survive a state handoff merely because the
+        // same role exists in another workflow state. The first replacement
+        // attempt is atomic with retirement of `stale`; a Project/Task write
+        // racing that attempt rolls the retirement back, so one retry can
+        // rebuild against the newer snapshot without stranding the running
+        // execution.
+        for attempt in 0..2 {
+            let expected_effective_role = match self
+                .canonical_execution_role_for_task(&fresh_task, role)
+                .await
+            {
+                Ok(role) => role,
+                Err(error) => {
+                    // The current snapshot proves that this execution's
+                    // role is obsolete (or no longer interpretable). Release
+                    // the old grant before the caller terminalizes the row.
+                    self.revoke_workspace_lease(&stale).await;
+                    return Err(error);
+                }
+            };
+            let project = ProjectRepo::get_by_id(&*self.db, &fresh_task.project_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("project", fresh_task.project_id.clone()))?;
+            let replacement = self
+                .issue_workspace_lease_with_operation_key(
+                    &fresh_task,
+                    workspace,
+                    role,
+                    principal_id,
+                    execution_id,
+                    &workspace_lease_reissue_key(execution_id, fresh_task.version),
+                    Some((
+                        project.version,
+                        project.workflow_definition.clone(),
+                        expected_effective_role,
+                    )),
+                    Some((stale.id.clone(), stale.version)),
+                )
+                .await;
+            match replacement {
+                Ok(Some(_lease)) => return Ok(fresh_task),
+                Ok(None) => {
+                    let error = ServiceError::invalid_operation(
+                        "WorkspaceLease reissue did not produce an active lease",
+                    );
+                    self.revoke_workspace_lease(&stale).await;
+                    return Err(error);
+                }
+                Err(error)
+                    if attempt == 0
+                        && matches!(&error, ServiceError::Db(db::DbError::VersionConflict)) =>
+                {
+                    fresh_task = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                        .await?
+                        .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+                }
+                Err(error) => {
+                    // The replacement transaction leaves `stale` active on
+                    // every failure. Compensate explicitly after the final
+                    // rebuilt admission attempt so a terminalized execution
+                    // cannot retain an occupied Task slot.
+                    self.revoke_workspace_lease(&stale).await;
+                    return Err(error);
+                }
+            }
+        }
+        unreachable!("WorkspaceLease reissue attempts are bounded")
     }
 
     /// `verify_execution_workspace_authority` with the one-shot stale-lease
@@ -1346,7 +1471,7 @@ impl TaskService {
     pub(super) async fn verify_or_reissue_execution_workspace_authority(
         &self,
         execution: &db::Execution,
-    ) -> Result<()> {
+    ) -> Result<db::Task> {
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
@@ -1366,7 +1491,6 @@ impl TaskService {
             &execution.id,
         )
         .await
-        .map(|_task| ())
     }
 
     pub(super) async fn revoke_workspace_lease(&self, lease: &db::WorkspaceLease) {

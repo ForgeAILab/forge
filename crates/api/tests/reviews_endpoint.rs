@@ -82,6 +82,84 @@ async fn review_detail_returns_null_auditor_for_ci_only_results() {
 }
 
 #[tokio::test]
+async fn malformed_persisted_review_details_are_server_errors_for_reads() {
+    let workspace_root = common::TestDir::new("forge-malformed-review-workspaces");
+    let harness = test_app(workspace_root.path()).await;
+    let review_id = seed_review(&harness.state.db, "{not-json".to_owned()).await;
+    let review = ReviewRepo::get_by_id(&*harness.state.db, &review_id)
+        .await
+        .expect("fixture review lookup")
+        .expect("fixture review exists");
+
+    let detail: ErrorResponse = json_empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/reviews/{review_id}"),
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+    .await;
+    assert_eq!(detail.code, "internal_error");
+
+    let list: ErrorResponse = json_empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}/reviews", review.task_id),
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+    .await;
+    assert_eq!(list.code, "internal_error");
+}
+
+#[tokio::test]
+async fn malformed_persisted_review_details_are_server_errors_for_mutations() {
+    let workspace_root = common::TestDir::new("forge-malformed-review-mutations");
+    let harness = test_app(workspace_root.path()).await;
+    let (review_id, task_id) = seed_review_with_status(
+        &harness.state.db,
+        "{not-json".to_owned(),
+        ReviewStatus::AwaitingHuman,
+    )
+    .await;
+
+    let approve: ErrorResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{task_id}/review/approve"),
+        json!({}),
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+    .await;
+    assert_eq!(approve.code, "internal_error");
+
+    let reject: ErrorResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{task_id}/review/reject"),
+        json!({ "reason": "not ready" }),
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+    .await;
+    assert_eq!(reject.code, "internal_error");
+
+    let mark_reviewed: ErrorResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{task_id}/recover"),
+        json!({ "action": "mark_reviewed" }),
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+    .await;
+    assert_eq!(mark_reviewed.code, "internal_error");
+
+    let review = ReviewRepo::get_by_id(&*harness.state.db, &review_id)
+        .await
+        .expect("fixture review lookup")
+        .expect("fixture review exists");
+    assert_eq!(review.status, ReviewStatus::AwaitingHuman);
+    assert_eq!(review.step_results_json, "{not-json");
+}
+
+#[tokio::test]
 async fn unknown_review_returns_standard_not_found() {
     let workspace_root = common::TestDir::new("forge-reviews-workspaces");
     let harness = test_app(workspace_root.path()).await;
@@ -156,6 +234,16 @@ async fn test_app(workspace_root: &Path) -> TestHarness {
 }
 
 async fn seed_review(db: &db::SqliteDb, step_results_json: String) -> String {
+    seed_review_with_status(db, step_results_json, ReviewStatus::Passed)
+        .await
+        .0
+}
+
+async fn seed_review_with_status(
+    db: &db::SqliteDb,
+    step_results_json: String,
+    status: ReviewStatus,
+) -> (String, String) {
     let now = now_rfc3339();
     let project_id = new_uuid_v4();
     let repo_id = new_uuid_v4();
@@ -270,10 +358,10 @@ async fn seed_review(db: &db::SqliteDb, step_results_json: String) -> String {
         db,
         CreateReview {
             id: review_id.clone(),
-            task_id,
+            task_id: task_id.clone(),
             execution_id,
             attempt_number: 1,
-            status: ReviewStatus::Passed,
+            status,
             step_results_json,
             started_at: now.clone(),
             created_at: now.clone(),
@@ -283,7 +371,7 @@ async fn seed_review(db: &db::SqliteDb, step_results_json: String) -> String {
     .await
     .expect("review creates");
 
-    review_id
+    (review_id, task_id)
 }
 
 async fn json_empty_request<T>(

@@ -1,9 +1,13 @@
 #![allow(dead_code, clippy::assertions_on_constants)]
 mod common;
 
-use api_types::{ErrorResponse, ExecutionResponse, LaunchExecutionResponse, TaskResponse};
+use api_types::{
+    ErrorResponse, ExecutionResponse, LaunchExecutionResponse, RecoveryAction, TaskAnnotation,
+    TaskBlockingAnnotation, TaskResponse,
+};
 use axum::http::{Method, StatusCode};
-use db::{ExecutionRepo, ExecutionStatus, TaskRepo};
+use chrono::{Duration, Utc};
+use db::{CreateReview, ExecutionRepo, ExecutionStatus, ReviewRepo, ReviewStatus, TaskRepo};
 use serde_json::{json, Value};
 
 #[tokio::test]
@@ -158,6 +162,505 @@ async fn task_response_includes_execution_observability() {
     assert_eq!(observability["tokens"]["output_tokens"], json!(0));
     assert_eq!(observability["cost"]["coverage"], json!("no_usage"));
     assert_eq!(observability["cost"]["complete_total"], Value::Null);
+}
+
+#[tokio::test]
+async fn task_health_uses_active_execution_when_newer_terminal_row_exists() {
+    let workspace_root = common::TestDir::new("ec-health-active-execution");
+    let harness = common::test_app(
+        workspace_root.path(),
+        "execution-controls-health-active-execution",
+    )
+    .await;
+    let (project_id, _repo_id, agent_id) = setup(&harness, workspace_root.path()).await;
+    let task = create_task(&harness, &project_id, "active execution health").await;
+    let task = TaskRepo::update_status(
+        &*harness.state.db,
+        db::UpdateTaskStatus {
+            id: task.id.clone(),
+            expected_version: task.version,
+            status: "in_progress".to_owned(),
+            assignee_id: None,
+            error_annotation: None,
+            blocked_json: None,
+            failed_json: None,
+            updated_at: db::now_rfc3339(),
+        },
+    )
+    .await
+    .expect("task enters coder state");
+
+    let running_id = db::new_uuid_v4();
+    ExecutionRepo::create(
+        &*harness.state.db,
+        db::CreateExecution {
+            id: running_id.clone(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent_id.clone()),
+            role: "coder".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: Some("coder-session".to_owned()),
+            agent_message_id: None,
+            last_activity_at: Some("2026-04-30T12:00:00+00:00".to_owned()),
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: "2026-04-30T12:00:00+00:00".to_owned(),
+            updated_at: "2026-04-30T12:00:00+00:00".to_owned(),
+        },
+    )
+    .await
+    .expect("running execution creates");
+
+    let newer_terminal_id = db::new_uuid_v4();
+    ExecutionRepo::create(
+        &*harness.state.db,
+        db::CreateExecution {
+            id: newer_terminal_id,
+            task_id: task.id.clone(),
+            agent_id: Some(agent_id),
+            role: "reviewer".to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: Some("2026-04-30T13:00:10+00:00".to_owned()),
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: Some("2026-04-30T13:00:10+00:00".to_owned()),
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: "2026-04-30T13:00:00+00:00".to_owned(),
+            updated_at: "2026-04-30T13:00:10+00:00".to_owned(),
+        },
+    )
+    .await
+    .expect("newer terminal execution creates");
+
+    let response: Value = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", task.id),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        response["execution_observability"]["latest_execution_status"],
+        json!("completed")
+    );
+    assert_eq!(response["workflow_health"]["kind"], json!("running"));
+    assert_eq!(response["workflow_health"]["label"], json!("Running"));
+    assert_eq!(
+        response["workflow_health"]["execution_id"],
+        json!(running_id)
+    );
+}
+
+#[tokio::test]
+async fn mixed_running_roles_keep_interactive_health_and_disable_duplicate_interactive_action() {
+    let workspace_root = common::TestDir::new("ec-health-mixed-running-roles");
+    let harness = common::test_app(
+        workspace_root.path(),
+        "execution-controls-health-mixed-running-roles",
+    )
+    .await;
+    let (project_id, _repo_id, agent_id) = setup(&harness, workspace_root.path()).await;
+    let task = create_task(&harness, &project_id, "mixed running roles").await;
+    let task = TaskRepo::update_status(
+        &*harness.state.db,
+        db::UpdateTaskStatus {
+            id: task.id.clone(),
+            expected_version: task.version,
+            status: "review".to_owned(),
+            assignee_id: None,
+            error_annotation: None,
+            blocked_json: None,
+            failed_json: None,
+            updated_at: db::now_rfc3339(),
+        },
+    )
+    .await
+    .expect("task enters review state");
+
+    let interactive_id = db::new_uuid_v4();
+    ExecutionRepo::create(
+        &*harness.state.db,
+        db::CreateExecution {
+            id: interactive_id,
+            task_id: task.id.clone(),
+            agent_id: Some(agent_id.clone()),
+            role: "interactive".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: Some("interactive-session".to_owned()),
+            agent_message_id: None,
+            last_activity_at: Some("2026-04-30T12:00:00+00:00".to_owned()),
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: "2026-04-30T12:00:00+00:00".to_owned(),
+            updated_at: "2026-04-30T12:00:00+00:00".to_owned(),
+        },
+    )
+    .await
+    .expect("interactive execution creates");
+
+    let reviewer_id = db::new_uuid_v4();
+    ExecutionRepo::create(
+        &*harness.state.db,
+        db::CreateExecution {
+            id: reviewer_id.clone(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent_id),
+            role: "reviewer".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: Some("reviewer-session".to_owned()),
+            agent_message_id: None,
+            last_activity_at: Some("2026-04-30T13:00:00+00:00".to_owned()),
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: "2026-04-30T13:00:00+00:00".to_owned(),
+            updated_at: "2026-04-30T13:00:00+00:00".to_owned(),
+        },
+    )
+    .await
+    .expect("reviewer execution creates");
+
+    ReviewRepo::create(
+        &*harness.state.db,
+        CreateReview {
+            id: db::new_uuid_v4(),
+            task_id: task.id.clone(),
+            execution_id: reviewer_id,
+            attempt_number: 1,
+            status: ReviewStatus::Failed,
+            step_results_json: "{}".to_owned(),
+            started_at: "2026-04-30T13:00:00+00:00".to_owned(),
+            created_at: "2026-04-30T13:00:00+00:00".to_owned(),
+            updated_at: "2026-04-30T13:00:00+00:00".to_owned(),
+        },
+    )
+    .await
+    .expect("failed review creates");
+
+    let response: Value = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", task.id),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(response["workflow_health"]["label"], json!("Interactive"));
+    let open_interactive = response["workflow_exception"]["actions"]
+        .as_array()
+        .expect("workflow exception actions")
+        .iter()
+        .find(|action| action["kind"] == json!("open_interactive"))
+        .expect("open interactive action");
+    assert_eq!(open_interactive["enabled"], json!(false));
+    assert_eq!(
+        open_interactive["disabled_reason"],
+        json!("An interactive execution is already running")
+    );
+}
+
+#[tokio::test]
+async fn open_interactive_targets_current_role_resumable_session_not_newest_reviewer() {
+    let workspace_root = common::TestDir::new("ec-open-interactive-role-target");
+    let harness = common::test_app(
+        workspace_root.path(),
+        "execution-controls-open-interactive-role-target",
+    )
+    .await;
+    let (project_id, _repo_id, agent_id) = setup(&harness, workspace_root.path()).await;
+    let task = create_task(&harness, &project_id, "role-aware interactive target").await;
+    let task = TaskRepo::update_status(
+        &*harness.state.db,
+        db::UpdateTaskStatus {
+            id: task.id.clone(),
+            expected_version: task.version,
+            status: "in_progress".to_owned(),
+            assignee_id: None,
+            error_annotation: None,
+            blocked_json: None,
+            failed_json: None,
+            updated_at: db::now_rfc3339(),
+        },
+    )
+    .await
+    .expect("task enters coder state");
+
+    let coder_execution_id = db::new_uuid_v4();
+    ExecutionRepo::create(
+        &*harness.state.db,
+        db::CreateExecution {
+            id: coder_execution_id.clone(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent_id.clone()),
+            role: "coder".to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: Some("2026-04-30T12:00:10+00:00".to_owned()),
+            parent_execution_id: None,
+            agent_session_id: Some("coder-session".to_owned()),
+            agent_message_id: None,
+            last_activity_at: Some("2026-04-30T12:00:10+00:00".to_owned()),
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: "2026-04-30T12:00:00+00:00".to_owned(),
+            updated_at: "2026-04-30T12:00:10+00:00".to_owned(),
+        },
+    )
+    .await
+    .expect("coder execution creates");
+
+    let reviewer_execution_id = db::new_uuid_v4();
+    ExecutionRepo::create(
+        &*harness.state.db,
+        db::CreateExecution {
+            id: reviewer_execution_id.clone(),
+            task_id: task.id.clone(),
+            // The newest unrelated reviewer row is deliberately agentless;
+            // it must not hide the older current-role resumable session.
+            agent_id: None,
+            role: "reviewer".to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: Some("2026-04-30T13:00:10+00:00".to_owned()),
+            parent_execution_id: None,
+            agent_session_id: Some("reviewer-session".to_owned()),
+            agent_message_id: None,
+            last_activity_at: Some("2026-04-30T13:00:10+00:00".to_owned()),
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: "2026-04-30T13:00:00+00:00".to_owned(),
+            updated_at: "2026-04-30T13:00:10+00:00".to_owned(),
+        },
+    )
+    .await
+    .expect("reviewer execution creates");
+
+    let annotation = TaskAnnotation::Blocking(TaskBlockingAnnotation {
+        annotation_type: api_types::FailureKind::RecoveryRequired,
+        blocking_reason: "open interactive target test".to_owned(),
+        blocked_by: Some("system:test".to_owned()),
+        blocked_at: Some(db::now_rfc3339()),
+        blocked_execution_id: None,
+        artifact: None,
+        message: None,
+        hook: None,
+        recovery_actions: vec![RecoveryAction::OpenInteractive],
+    });
+    TaskRepo::update(
+        &*harness.state.db,
+        db::UpdateTask {
+            id: task.id.clone(),
+            expected_version: task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(Some(
+                serde_json::to_string(&annotation).expect("annotation serializes"),
+            )),
+            blocked_json: Some(None),
+            failed_json: None,
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: db::now_rfc3339(),
+        },
+    )
+    .await
+    .expect("recovery annotation persists");
+
+    let response: Value = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", task.id),
+        StatusCode::OK,
+    )
+    .await;
+    let open_interactive = response["workflow_exception"]["actions"]
+        .as_array()
+        .expect("workflow exception actions")
+        .iter()
+        .find(|action| action["kind"] == json!("open_interactive"))
+        .expect("open interactive action");
+    assert_eq!(
+        response["execution_observability"]["latest_execution_id"],
+        json!(reviewer_execution_id)
+    );
+    assert_eq!(open_interactive["enabled"], json!(true));
+    assert_eq!(
+        open_interactive["target_execution_id"],
+        json!(coder_execution_id),
+        "Open Interactive must target the current-role resumable session"
+    );
+}
+
+#[tokio::test]
+async fn running_interactive_session_outranks_newer_open_interactive_lease_in_health() {
+    let workspace_root = common::TestDir::new("ec-health-interactive-lease");
+    let harness = common::test_app(
+        workspace_root.path(),
+        "execution-controls-health-interactive-lease",
+    )
+    .await;
+    let (project_id, _repo_id, agent_id) = setup(&harness, workspace_root.path()).await;
+    let task = create_task(&harness, &project_id, "interactive lease priority").await;
+    let task = TaskRepo::update_status(
+        &*harness.state.db,
+        db::UpdateTaskStatus {
+            id: task.id.clone(),
+            expected_version: task.version,
+            status: "in_progress".to_owned(),
+            assignee_id: None,
+            error_annotation: None,
+            blocked_json: None,
+            failed_json: None,
+            updated_at: db::now_rfc3339(),
+        },
+    )
+    .await
+    .expect("task enters coder state");
+
+    let running_session_id = db::new_uuid_v4();
+    ExecutionRepo::create(
+        &*harness.state.db,
+        db::CreateExecution {
+            id: running_session_id.clone(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent_id.clone()),
+            role: "interactive".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: Some("live-interactive-session".to_owned()),
+            agent_message_id: None,
+            last_activity_at: Some("2026-04-30T12:00:00+00:00".to_owned()),
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: "2026-04-30T12:00:00+00:00".to_owned(),
+            updated_at: "2026-04-30T12:00:00+00:00".to_owned(),
+        },
+    )
+    .await
+    .expect("running interactive session creates");
+
+    let lease_execution_id = db::new_uuid_v4();
+    ExecutionRepo::create(
+        &*harness.state.db,
+        db::CreateExecution {
+            id: lease_execution_id.clone(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent_id),
+            role: "interactive".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("open_interactive dispatch lease".to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: "2026-04-30T13:00:00+00:00".to_owned(),
+            updated_at: "2026-04-30T13:00:00+00:00".to_owned(),
+        },
+    )
+    .await
+    .expect("open interactive lease creates");
+    let lease_expires_at = (Utc::now() + Duration::seconds(30)).to_rfc3339();
+    sqlx::query(
+        "UPDATE execution
+         SET lease_owner = 'open-interactive:lease', lease_expires_at = ?
+         WHERE id = ?",
+    )
+    .bind(lease_expires_at)
+    .bind(&lease_execution_id)
+    .execute(harness.state.db.pool())
+    .await
+    .expect("open interactive lease records expiry");
+
+    let response: Value = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", task.id),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        response["execution_observability"]["latest_execution_id"],
+        json!(lease_execution_id)
+    );
+    assert_eq!(response["workflow_health"]["label"], json!("Interactive"));
+    assert_eq!(
+        response["workflow_health"]["execution_id"],
+        json!(running_session_id)
+    );
 }
 
 #[tokio::test]

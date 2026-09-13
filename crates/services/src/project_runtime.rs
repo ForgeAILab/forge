@@ -111,6 +111,7 @@ pub struct CharterReferenceProjection {
     pub revision: i64,
     pub version: i64,
     pub content_digest: String,
+    pub render_version: String,
     pub render_digest: String,
 }
 
@@ -125,6 +126,7 @@ pub struct ApprovedDocumentProjection {
     pub version: i64,
     pub lifecycle: String,
     pub content_digest: String,
+    pub render_version: String,
     pub render_digest: String,
 }
 
@@ -393,7 +395,7 @@ pub async fn load_effective_project_state(
 
     let governing_charter = sqlx::query(
         "SELECT c.id, c.version, r.id AS revision_id, r.revision,
-                r.content_digest, r.rendered_digest
+                r.content_digest, r.render_version, r.rendered_digest
          FROM project_charter c
          JOIN project_charter_revision r
            ON r.id = c.current_approved_revision_id
@@ -413,6 +415,7 @@ pub async fn load_effective_project_state(
             revision: row.try_get("revision")?,
             version: row.try_get("version")?,
             content_digest: row.try_get("content_digest")?,
+            render_version: row.try_get("render_version")?,
             render_digest: row.try_get("rendered_digest")?,
         })
     })
@@ -421,7 +424,7 @@ pub async fn load_effective_project_state(
     let approved_documents = sqlx::query(
         "SELECT d.id, d.kind, d.title, d.current_approved_revision_id AS revision_id,
                 d.version, d.lifecycle, r.revision, r.content_digest,
-                r.rendered_digest
+                r.render_version, r.rendered_digest
          FROM project_document d
          JOIN project_document_revision r
            ON r.id = d.current_approved_revision_id AND r.document_id = d.id
@@ -443,6 +446,7 @@ pub async fn load_effective_project_state(
             version: row.try_get("version")?,
             lifecycle: row.try_get("lifecycle")?,
             content_digest: row.try_get("content_digest")?,
+            render_version: row.try_get("render_version")?,
             render_digest: row.try_get("rendered_digest")?,
         })
     })
@@ -1523,6 +1527,18 @@ mod tests {
             .await
             .expect("adoption projection")
             .is_none());
+
+        let effective = load_effective_project_state(&db, "project-adoption-read", None)
+            .await
+            .expect("effective Project state");
+        let governing = effective
+            .governing_charter
+            .expect("approved Charter is governing");
+        assert_eq!(
+            governing.render_version,
+            crate::PROJECT_CHARTER_RENDER_VERSION
+        );
+        assert!(!governing.render_digest.is_empty());
     }
 
     fn milestone(id: &str, lifecycle: &str) -> MilestoneProjection {

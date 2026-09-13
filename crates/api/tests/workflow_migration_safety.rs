@@ -76,6 +76,60 @@ async fn workflow_update_rejects_removing_state_with_active_tasks() {
     .await;
 }
 
+#[tokio::test]
+async fn workflow_update_wakes_parked_dispatch_disposition() {
+    let harness = test_app().await;
+    let (project_id, _repo_id) = create_project_and_repo(&harness.app).await;
+    let task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({ "title": "Workflow wake" }),
+        StatusCode::OK,
+    )
+    .await;
+
+    sqlx::query("UPDATE task SET metadata_json = ? WHERE id = ?")
+        .bind(
+            json!({
+                "dispatch_disposition": {
+                    "task_version": task.version,
+                    "capability": "coder",
+                    "blocker_digest": "digest",
+                    "recorded_at": "2026-01-01T00:00:00Z",
+                    "safe_message": "parked",
+                },
+                "deferred_dispatch": {
+                    "not_before": "2099-01-01T00:00:00Z",
+                    "reason": "parked",
+                    "target_state": "todo",
+                },
+            })
+            .to_string(),
+        )
+        .bind(&task.id)
+        .execute(harness._state.db.pool())
+        .await
+        .expect("parked dispatch metadata writes");
+
+    let _: Value = json_request(
+        &harness.app,
+        Method::PUT,
+        &format!("/api/v1/projects/{project_id}/workflow"),
+        json!({ "definition": workflow(true) }),
+        StatusCode::OK,
+    )
+    .await;
+
+    let metadata: Option<String> =
+        sqlx::query_scalar("SELECT metadata_json FROM task WHERE id = ?")
+            .bind(&task.id)
+            .fetch_one(harness._state.db.pool())
+            .await
+            .expect("task metadata reloads");
+    assert_eq!(metadata, None, "workflow changes must wake parked dispatch");
+}
+
 struct Harness {
     app: Router,
     _state: Arc<AppState>,

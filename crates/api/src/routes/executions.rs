@@ -162,7 +162,7 @@ pub async fn follow_up_execution(
     });
     let launched = state
         .task_service
-        .follow_up_execution(id, request.message, request.agent_id, overrides)
+        .follow_up_interactive_execution(id, request.message, request.agent_id, overrides)
         .await
         .map_err(map_follow_up_error)?;
 
@@ -240,8 +240,6 @@ fn map_follow_up_error(error: ServiceError) -> ApiError {
                 ApiError::conflict_with_code("follow_up.no_session", message)
             } else if message.contains("follow-up requires same executor type") {
                 ApiError::conflict_with_code("follow_up.executor_mismatch", message)
-            } else if message.contains("interactive execution already running") {
-                ApiError::conflict_with_code("execution.already_running", message)
             } else if message.contains("terminal status") {
                 ApiError::conflict_with_code("task.terminal", message)
             } else {
@@ -257,8 +255,6 @@ fn map_re_execute_error(error: ServiceError) -> ApiError {
         ServiceError::InvalidOperation { message } => {
             if message.contains("re-execute requires a completed, failed, or cancelled execution") {
                 ApiError::conflict_with_code("re_execute.execution_active", message)
-            } else if message.contains("execution already running") {
-                ApiError::conflict_with_code("execution.already_running", message)
             } else if message.contains("terminal status") {
                 ApiError::conflict_with_code("task.terminal", message)
             } else {

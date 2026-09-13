@@ -366,6 +366,15 @@ pub enum ServiceError {
     #[error("invalid operation: {message}")]
     InvalidOperation { message: String },
 
+    /// A slot that admits one execution at a time is occupied right now.
+    ///
+    /// This is inherently transient — the named execution will reach a
+    /// terminal state on its own — so it must stay distinguishable from a
+    /// deterministic refusal. Parking a Task on this refusal strands it until
+    /// something unrelated changes its `version`.
+    #[error("{scope} execution already running: {execution_id}")]
+    ExecutionAlreadyRunning { scope: String, execution_id: String },
+
     #[error("authorization denied: {message}")]
     AuthorizationDenied { message: String },
 
@@ -461,6 +470,12 @@ impl From<db::DbError> for ServiceError {
     fn from(error: db::DbError) -> Self {
         match error {
             db::DbError::DependencyGate => Self::DependencyGate,
+            db::DbError::AgentPaused { agent_id } => Self::AgentPaused { agent_id },
+            db::DbError::ProjectPaused { project_id } => Self::ProjectPaused { project_id },
+            db::DbError::ExecutionAlreadyRunning {
+                scope,
+                execution_id,
+            } => Self::execution_already_running(scope, execution_id),
             error => Self::Db(error),
         }
     }
@@ -480,7 +495,19 @@ impl From<git::GitError> for ServiceError {
 
 impl From<review::ReviewError> for ServiceError {
     fn from(error: review::ReviewError) -> Self {
-        Self::Review(error)
+        match error {
+            review::ReviewError::Db(db::DbError::ProjectPaused { project_id }) => {
+                Self::ProjectPaused { project_id }
+            }
+            review::ReviewError::Db(db::DbError::ExecutionAlreadyRunning {
+                scope,
+                execution_id,
+            }) => Self::execution_already_running(scope, execution_id),
+            review::ReviewError::Db(error @ db::DbError::ReviewDetailsCorrupt { .. }) => {
+                Self::Db(error)
+            }
+            error => Self::Review(error),
+        }
     }
 }
 
@@ -503,6 +530,16 @@ impl ServiceError {
     pub(crate) fn invalid_operation(message: impl Into<String>) -> Self {
         Self::InvalidOperation {
             message: message.into(),
+        }
+    }
+
+    pub(crate) fn execution_already_running(
+        scope: impl Into<String>,
+        execution_id: impl Into<String>,
+    ) -> Self {
+        Self::ExecutionAlreadyRunning {
+            scope: scope.into(),
+            execution_id: execution_id.into(),
         }
     }
 
@@ -534,5 +571,40 @@ impl ServiceError {
         Self::ParentWorkspaceRequired {
             parent_task_id: parent_task_id.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod execution_admission_error_tests {
+    use super::ServiceError;
+
+    #[test]
+    fn db_running_execution_conflict_preserves_scope_and_id() {
+        let error: ServiceError = db::DbError::ExecutionAlreadyRunning {
+            scope: "repository".to_owned(),
+            execution_id: "execution-123".to_owned(),
+        }
+        .into();
+
+        assert!(matches!(
+            error,
+            ServiceError::ExecutionAlreadyRunning { scope, execution_id }
+                if scope == "repository" && execution_id == "execution-123"
+        ));
+    }
+
+    #[test]
+    fn review_running_execution_conflict_preserves_scope_and_id() {
+        let error: ServiceError = ::review::ReviewError::Db(db::DbError::ExecutionAlreadyRunning {
+            scope: "repository".to_owned(),
+            execution_id: "execution-456".to_owned(),
+        })
+        .into();
+
+        assert!(matches!(
+            error,
+            ServiceError::ExecutionAlreadyRunning { scope, execution_id }
+                if scope == "repository" && execution_id == "execution-456"
+        ));
     }
 }

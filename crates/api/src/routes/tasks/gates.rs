@@ -127,23 +127,8 @@ async fn ensure_gate_decision_ready(
     let Some(role) = gate_state.role.as_deref() else {
         return Ok(());
     };
-    let page = ExecutionRepo::list_by_task(
-        &*state.db,
-        task_id,
-        PageRequest {
-            cursor: None,
-            limit: 100,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Desc,
-        },
-    )
-    .await?;
-    if page
-        .items
-        .iter()
-        .any(|execution| execution.role == role && execution.status == ExecutionStatus::Running)
-    {
+    let executions = ExecutionRepo::list_running_by_task(&*state.db, task_id).await?;
+    if executions.iter().any(|execution| execution.role == role) {
         return Err(ApiError::invalid_operation_conflict(format!(
             "gate '{}' is still running {role} execution; wait for it to finish before approving or rejecting",
             gate_state.name

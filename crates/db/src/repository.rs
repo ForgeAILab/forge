@@ -28,6 +28,73 @@ pub trait TaskRepo: Send + Sync {
         updated_at: &str,
     ) -> Result<()>;
     async fn update(&self, input: UpdateTask) -> Result<Task>;
+    /// Update Task fields and append a recovery boundary in the same write
+    /// transaction. The marker must not become visible unless the Task CAS
+    /// commits, and a concurrent Task writer must invalidate both together.
+    async fn update_with_recovery_marker(
+        &self,
+        input: UpdateTask,
+        marker: CreateTransitionLog,
+    ) -> Result<Task>;
+    /// Update Task fields only when the exact Project workflow authority used
+    /// to prepare the mutation is still current. The Project check and Task
+    /// CAS share one SQLite writer transaction.
+    async fn update_with_workflow_authority(
+        &self,
+        input: UpdateTask,
+        expected_project_version: i64,
+        expected_workflow_definition: String,
+    ) -> Result<Task>;
+    /// Recovery-marker variant of [`Self::update_with_workflow_authority`].
+    /// The Task update, marker, Project authority check, and Task CAS commit
+    /// as one writer transaction.
+    async fn update_with_workflow_authority_and_recovery_marker(
+        &self,
+        input: UpdateTask,
+        marker: CreateTransitionLog,
+        expected_project_version: i64,
+        expected_workflow_definition: String,
+    ) -> Result<Task>;
+    /// Set a manual-stop annotation only when no newer running execution for
+    /// the same Task (in any workspace) or the same workspace (including a
+    /// shared-root sibling Task) is present. The execution check and Task
+    /// version CAS share one SQLite write transaction, so a cross-role
+    /// replacement cannot start between the check and the annotation write.
+    /// The id of the latest transition log that entered `expected_status`.
+    /// `None` is the explicit initial/no-log state and is checked as such.
+    #[allow(clippy::too_many_arguments)]
+    async fn set_error_annotation_if_no_running_execution(
+        &self,
+        id: &str,
+        expected_version: i64,
+        expected_status: &str,
+        expected_state_entry_token: Option<&str>,
+        expected_workflow_definition: &str,
+        expected_assignment_role: Option<&str>,
+        expected_assignment: Option<TaskRoleAssignment>,
+        annotation: &str,
+        updated_at: &str,
+        stopped_execution_id: &str,
+        workspace_id: Option<&str>,
+        overlapping_roles: Vec<String>,
+    ) -> Result<Task>;
+    /// Restore interruption metadata only when no newer running execution for
+    /// the same Task (in any workspace) or the same workspace (including a
+    /// shared-root sibling Task) is present. Recovery failure paths use this
+    /// boundary so they cannot resurrect a manual-stop annotation over a live
+    /// cross-role replacement admitted after the clear.
+    #[allow(clippy::too_many_arguments)]
+    async fn restore_recovery_metadata_if_no_running_execution(
+        &self,
+        id: &str,
+        expected_version: i64,
+        error_annotation: Option<String>,
+        blocked_json: Option<String>,
+        failed_json: Option<String>,
+        updated_at: &str,
+        workspace_id: Option<&str>,
+        overlapping_roles: Vec<String>,
+    ) -> Result<Task>;
     async fn archive(&self, input: ArchiveTask) -> Result<Task>;
     async fn soft_delete(&self, input: SoftDeleteTask) -> Result<Task>;
     async fn set_review_passed_at(
@@ -36,12 +103,50 @@ pub trait TaskRepo: Send + Sync {
         review_passed_at: Option<String>,
         updated_at: &str,
     ) -> Result<Task>;
-    async fn set_metadata_json(
+    /// Compare-and-set the review authority projection against the Task
+    /// revision that produced the review result.  Successful authority writes
+    /// increment the Task version, so a late reviewer completion cannot
+    /// resurrect the flag after a newer transition has won.
+    async fn set_review_passed_at_cas(
         &self,
         id: &str,
-        metadata_json: Option<String>,
+        expected_version: i64,
+        review_passed_at: Option<String>,
         updated_at: &str,
-    ) -> Result<()>;
+    ) -> Result<Task>;
+    /// Compare-and-set a review authority projection while binding it to the
+    /// exact persisted Review update that produced the pass. `updated_at` is
+    /// the Task write timestamp; the separate review timestamp lets recovery
+    /// repair a missing projection without moving the Task clock backwards.
+    async fn set_review_passed_at_cas_for_review(
+        &self,
+        id: &str,
+        expected_version: i64,
+        review_passed_at: Option<String>,
+        expected_review_updated_at: &str,
+        updated_at: &str,
+    ) -> Result<Task>;
+    /// Apply independent key-level metadata mutations while holding the
+    /// SQLite write lock.  When supplied, `expected_version` rejects a stale
+    /// Task snapshot before applying the mutation. Callers must use this
+    /// boundary for marker updates; a stale snapshot must never replace the
+    /// whole document and erase a marker written by another actor.
+    async fn mutate_metadata(
+        &self,
+        id: &str,
+        expected_version: Option<i64>,
+        mutations: Vec<TaskMetadataMutation>,
+        updated_at: &str,
+    ) -> Result<Task>;
+    /// Clear a Task's dispatch disposition/deferred marker and advance its
+    /// version in one write transaction. The version bump fences off a stale
+    /// dispatcher snapshot that could otherwise re-record the marker.
+    async fn wake_dispatch_for_task(&self, id: &str, updated_at: &str) -> Result<Task>;
+    /// Wake every parked dispatch marker belonging to a Project in one
+    /// transaction. This bumps each affected Task version as a stale-writer
+    /// fence, and intentionally leaves `paused_integration` intact: resume
+    /// handling consumes that marker after the Project pause boundary.
+    async fn wake_dispatch_for_project(&self, project_id: &str, updated_at: &str) -> Result<u64>;
     async fn set_entry_barrier(
         &self,
         id: &str,
@@ -49,12 +154,86 @@ pub trait TaskRepo: Send + Sync {
         entry_barrier_json: Option<String>,
         updated_at: &str,
     ) -> Result<Task>;
+    /// Set or clear an entry barrier only when the exact Project workflow
+    /// authority used to prepare the barrier is still current. The authority
+    /// check and Task CAS share one SQLite writer transaction.
+    async fn set_entry_barrier_with_workflow_authority(
+        &self,
+        id: &str,
+        expected_version: i64,
+        entry_barrier_json: Option<String>,
+        updated_at: &str,
+        expected_project_version: i64,
+        expected_workflow_definition: String,
+    ) -> Result<Task>;
     async fn claim(
         &self,
         transaction: &mut Transaction<'_, Sqlite>,
         input: ClaimTask,
     ) -> Result<ClaimedTask>;
     async fn update_status(&self, input: UpdateTaskStatus) -> Result<Task>;
+    /// Update a Task's status and append a recovery boundary in the same
+    /// write transaction. This closes the reset-to-initial marker race where
+    /// a later transition could commit between two independent writes.
+    async fn update_status_with_recovery_marker(
+        &self,
+        input: UpdateTaskStatus,
+        marker: CreateTransitionLog,
+    ) -> Result<Task>;
+}
+
+/// One atomic key-level mutation against a Task's metadata document.
+///
+/// Metadata is a shared extension point.  A whole-document read/modify/write
+/// is not safe when independent dispatcher, recovery, and workflow paths each
+/// own a different key, so those paths use this operation instead.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TaskMetadataMutation {
+    Set {
+        key: String,
+        value: serde_json::Value,
+    },
+    /// Set `key` only when its current JSON value still equals `expected`.
+    /// This is the write-side counterpart to `RemoveIf`: a stale recovery
+    /// worker must not recreate a marker after another worker cleared it.
+    SetIf {
+        key: String,
+        expected: serde_json::Value,
+        value: serde_json::Value,
+    },
+    /// Set `key` only when it is currently absent. This is useful for a
+    /// first-writer marker whose stale producer must not resurrect a marker
+    /// that a newer consumer already cleared.
+    SetIfAbsent {
+        key: String,
+        value: serde_json::Value,
+    },
+    /// Add `by` to an integer metadata counter while holding the same write
+    /// transaction as the read.  Unlike a caller-side read followed by `Set`,
+    /// concurrent retry workers cannot overwrite one another's increments.
+    Increment {
+        key: String,
+        by: i64,
+    },
+    Remove {
+        key: String,
+    },
+    /// Remove `key` only when its current JSON value still equals `expected`.
+    /// This lets a stale consumer clear the marker it observed without
+    /// deleting a newer marker written by a concurrent producer.
+    RemoveIf {
+        key: String,
+        expected: serde_json::Value,
+    },
+    /// Apply nested mutations only when `key` still contains `expected`.
+    /// This gives grouped marker cleanup one identity precondition: a stale
+    /// clearer cannot remove a newer marker merely because its reason string
+    /// is unchanged.
+    CompareAndMutate {
+        key: String,
+        expected: serde_json::Value,
+        mutations: Vec<Self>,
+    },
 }
 
 #[async_trait]
@@ -67,6 +246,17 @@ pub trait TaskBoardRepo: Send + Sync {
     ) -> Result<Option<MoveTaskResult>>;
     async fn compare_and_move_task(&self, input: CompareAndMoveTask)
         -> Result<MoveTaskPersistence>;
+    /// Compare-and-move with the exact Project workflow authority that was
+    /// used to resolve the target state. The authority is checked while the
+    /// same writer transaction holds SQLite's lock, so a workflow edit that
+    /// wins between the service read and the board mutation rejects the move
+    /// without changing Task or board state.
+    async fn compare_and_move_task_with_workflow_authority(
+        &self,
+        input: CompareAndMoveTask,
+        expected_project_version: i64,
+        expected_workflow_definition: &str,
+    ) -> Result<MoveTaskPersistence>;
     async fn complete_move_operation(
         &self,
         operation_id: &str,
@@ -864,8 +1054,35 @@ pub trait WorkspaceRepo: Send + Sync {
 #[async_trait]
 pub trait WorkspaceLeaseRepo: Send + Sync {
     async fn issue(&self, input: CreateWorkspaceLease) -> Result<WorkspaceLease>;
+    /// Issue a scheduler lease only while the Project authority snapshot that
+    /// selected the execution is still current. The version/workflow compare
+    /// and lease INSERT must share one writer transaction so a workflow edit
+    /// cannot land between the final read and authority grant.
+    async fn issue_with_project_authority(
+        &self,
+        input: CreateWorkspaceLease,
+        expected_project_version: i64,
+        expected_workflow_definition: &str,
+        expected_task_status: &str,
+        expected_effective_role: &str,
+    ) -> Result<WorkspaceLease>;
+    /// Atomically retire the expected active lease and issue its replacement
+    /// while rechecking the Project/Task/workflow authority snapshot. Any
+    /// validation or INSERT failure rolls the retirement back with it.
+    #[allow(clippy::too_many_arguments)]
+    async fn replace_with_project_authority(
+        &self,
+        input: CreateWorkspaceLease,
+        expected_project_version: i64,
+        expected_workflow_definition: &str,
+        expected_task_status: &str,
+        expected_effective_role: &str,
+        replacing_lease_id: &str,
+        replacing_lease_version: i64,
+    ) -> Result<WorkspaceLease>;
     async fn get_by_id(&self, id: &str) -> Result<Option<WorkspaceLease>>;
     async fn get_active_for_task(&self, task_id: &str) -> Result<Option<WorkspaceLease>>;
+    async fn list_active_for_project(&self, project_id: &str) -> Result<Vec<WorkspaceLease>>;
     async fn revoke(
         &self,
         id: &str,
@@ -919,9 +1136,23 @@ pub trait ExecutionRepo: Send + Sync {
         input: CreateExecution,
         lease: ClaimExecutionLease,
     ) -> Result<Execution>;
+    /// Atomically insert a running execution after re-checking the Task
+    /// snapshot that the dispatcher used to choose its role.  The admission
+    /// snapshot is optional for lower-level callers that do not have a
+    /// versioned Task decision; service dispatch paths should always supply it.
+    async fn create_with_lease_and_admission(
+        &self,
+        input: CreateExecution,
+        lease: ClaimExecutionLease,
+        admission: Option<ExecutionAdmission>,
+    ) -> Result<Execution>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Execution>>;
     async fn stats_by_agent(&self, agent_id: &str) -> Result<AgentExecutionStats>;
     async fn list_by_task(&self, task_id: &str, page: PageRequest) -> Result<Page<Execution>>;
+    /// Return the running executions for one Task with one SQL predicate.
+    /// Unlike offset pagination this is safe for admission/stop checks: a
+    /// concurrent insert cannot shift an older running row to another page.
+    async fn list_running_by_task(&self, task_id: &str) -> Result<Vec<Execution>>;
     async fn list_latest_executions_for_tasks(&self, task_ids: &[&str]) -> Result<Vec<Execution>>;
     async fn list_by_task_and_role(
         &self,
@@ -929,6 +1160,78 @@ pub trait ExecutionRepo: Send + Sync {
         role: &str,
         page: PageRequest,
     ) -> Result<Page<Execution>>;
+    /// Return the newest terminal execution for one Task/role pair. The
+    /// terminal predicate belongs in SQL so a newer running row does not make
+    /// a bounded first page hide an older resumable row.
+    async fn latest_non_running_by_task_and_role(
+        &self,
+        task_id: &str,
+        role: &str,
+    ) -> Result<Option<Execution>>;
+    /// Return the newest terminal execution that still carries a resumable
+    /// agent session for one Task/role pair.
+    async fn latest_resumable_by_task_and_role(
+        &self,
+        task_id: &str,
+        role: &str,
+    ) -> Result<Option<Execution>>;
+    /// Return the newest execution with an assigned agent identity for one
+    /// Task. Used only as a fallback when no role assignment identifies an
+    /// agent.
+    async fn latest_agent_execution_by_task(&self, task_id: &str) -> Result<Option<Execution>>;
+    /// Return the newest execution whose role is one of `roles`, with the
+    /// role predicate evaluated in SQL rather than after a capped page.
+    async fn latest_execution_by_task_and_roles(
+        &self,
+        task_id: &str,
+        roles: &[&str],
+    ) -> Result<Option<Execution>>;
+    /// Return the newest implementation execution still relevant to review
+    /// admission. Failed/cancelled attempts are terminal remediation records,
+    /// not review candidates; a newer running row remains visible so callers
+    /// can fail closed until it settles.
+    async fn latest_review_candidate_by_task_and_roles(
+        &self,
+        task_id: &str,
+        roles: &[&str],
+    ) -> Result<Option<Execution>>;
+    /// Check whether one agent has ever supplied the requested role context
+    /// for a dependency Task. This exact EXISTS query is used by the
+    /// dependency gate and must not be approximated by a capped history page.
+    async fn has_execution_by_task_role_and_agent(
+        &self,
+        task_id: &str,
+        role: &str,
+        agent_id: &str,
+    ) -> Result<bool>;
+    /// Find the first execution for a role created at or after a review
+    /// attempt's start boundary.
+    async fn first_by_task_and_role_at_or_after(
+        &self,
+        task_id: &str,
+        role: &str,
+        started_at: &str,
+    ) -> Result<Option<Execution>>;
+    /// Count and test in-flight automatic recovery executions without loading
+    /// the complete execution history into the service process.
+    async fn count_by_task_and_summary_prefix(
+        &self,
+        task_id: &str,
+        summary_prefix: &str,
+    ) -> Result<i64>;
+    async fn has_running_by_task_and_summary_prefix(
+        &self,
+        task_id: &str,
+        summary_prefix: &str,
+    ) -> Result<bool>;
+    /// Duplicate-follow-up detection is an exact parent/status lookup, not a
+    /// first-page history scan.
+    async fn has_active_or_completed_child(
+        &self,
+        task_id: &str,
+        parent_execution_id: &str,
+        role: &str,
+    ) -> Result<bool>;
     async fn count_by_task_and_role(&self, task_id: &str, role: &str) -> Result<i64>;
     /// Metadata-only patch.  `status: Some(_)` is rejected; all terminal
     /// transitions must use `terminalize` so the owner/version CAS also owns
@@ -997,6 +1300,10 @@ pub trait ExecutionRepo: Send + Sync {
         limit: i64,
     ) -> Result<Vec<Execution>>;
     async fn list_running(&self) -> Result<Vec<Execution>>;
+    /// Return only running executions whose Task belongs to one Project.
+    /// Project-scoped administrative operations must not enumerate unrelated
+    /// execution rows just to filter them in memory.
+    async fn list_running_for_project(&self, project_id: &str) -> Result<Vec<Execution>>;
     async fn list_running_for_daemon_not_in(
         &self,
         daemon_id: &str,
@@ -1317,6 +1624,31 @@ pub trait ScopedMemoryRepository: Send + Sync {
 #[async_trait]
 pub trait ReviewRepo: Send + Sync {
     async fn create(&self, input: CreateReview) -> Result<Review>;
+    /// Atomically create a Review attempt only while the Task/project/candidate
+    /// snapshot that selected it is still current. This is the Review-only
+    /// authority boundary used by blocking workflow hooks; unlike a
+    /// read-then-create sequence, the checks and INSERT share SQLite's writer
+    /// transaction.
+    async fn create_with_task_authority(
+        &self,
+        input: CreateReview,
+        expected_task_version: i64,
+        expected_task_status: &str,
+        expected_project_version: Option<i64>,
+        expected_workflow_definition: Option<&str>,
+        expected_candidate_execution_id: Option<&str>,
+    ) -> Result<Review>;
+    /// Atomically reserve the next Review attempt with its Running execution
+    /// and initial lease. The attempt number is allocated under the same
+    /// writer transaction as both inserts, so a failed Review insert cannot
+    /// leave an orphan Running execution or lease behind.
+    async fn create_attempt_with_execution_and_lease(
+        &self,
+        review: CreateReview,
+        execution: CreateExecution,
+        lease: ClaimExecutionLease,
+        admission: Option<ExecutionAdmission>,
+    ) -> Result<(Review, Execution)>;
     async fn update_status(
         &self,
         id: &str,
@@ -1324,6 +1656,109 @@ pub trait ReviewRepo: Send + Sync {
         step_results_json: String,
         finished_at: Option<String>,
         updated_at: &str,
+    ) -> Result<Review>;
+    /// Compensating cancellation for a Review attempt after its execution has
+    /// been reserved.  The status and timestamp are an exact CAS snapshot;
+    /// a concurrent Review writer wins and leaves the row untouched.  This
+    /// intentionally does not update Task.review_passed_at: cancellation only
+    /// revokes the stale Review authority.
+    async fn cancel_if_unchanged(
+        &self,
+        id: &str,
+        expected_status: ReviewStatus,
+        expected_updated_at: &str,
+        step_results_json: String,
+        finished_at: &str,
+        updated_at: &str,
+    ) -> Result<Option<Review>>;
+    /// Atomically settle a Review and its Task review-authority projection.
+    ///
+    /// The expected Task version is part of the same SQLite write transaction
+    /// as the Review transition.  If another Task writer wins first, neither
+    /// row is changed, so a terminal Review can never commit while its
+    /// `review_passed_at` projection is left behind for reconciliation.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_status_with_task_authority(
+        &self,
+        id: &str,
+        status: ReviewStatus,
+        step_results_json: String,
+        finished_at: Option<String>,
+        updated_at: &str,
+        expected_task_version: i64,
+        review_passed_at: Option<String>,
+    ) -> Result<(Review, Task)>;
+    /// Terminal Review settlement variant that also binds the result to the
+    /// exact implementation execution currently selected for the Task.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_status_with_task_authority_and_candidate(
+        &self,
+        id: &str,
+        status: ReviewStatus,
+        step_results_json: String,
+        finished_at: Option<String>,
+        updated_at: &str,
+        expected_task_version: i64,
+        review_passed_at: Option<String>,
+        expected_candidate_execution_id: &str,
+    ) -> Result<(Review, Task)>;
+    /// Workflow-hook variant of terminal settlement that also binds the
+    /// Review write to the exact Project workflow authority that selected the
+    /// hook.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_status_with_task_authority_and_project_candidate(
+        &self,
+        id: &str,
+        status: ReviewStatus,
+        step_results_json: String,
+        finished_at: Option<String>,
+        updated_at: &str,
+        expected_task_version: i64,
+        review_passed_at: Option<String>,
+        expected_project_version: Option<i64>,
+        expected_workflow_definition: Option<&str>,
+        expected_review_status: ReviewStatus,
+        expected_review_updated_at: &str,
+        expected_candidate_execution_id: &str,
+    ) -> Result<(Review, Task)>;
+    /// Atomically update a non-terminal Review state while binding the write
+    /// to the exact Task/Project/candidate snapshot that selected the hook.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_status_with_review_authority(
+        &self,
+        id: &str,
+        status: ReviewStatus,
+        step_results_json: String,
+        finished_at: Option<String>,
+        updated_at: &str,
+        expected_task_version: i64,
+        expected_task_status: &str,
+        expected_project_version: Option<i64>,
+        expected_workflow_definition: Option<&str>,
+        expected_review_status: ReviewStatus,
+        expected_review_updated_at: &str,
+        expected_candidate_execution_id: Option<&str>,
+    ) -> Result<Review>;
+    /// Atomically settle any Review status while binding it to the exact
+    /// Task/Project/workflow/candidate snapshot. `task_projection` is `None`
+    /// when the status change must not mutate Task.review_passed_at; `Some`
+    /// applies the contained value in the same writer transaction.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_status_with_review_authority_and_task_projection(
+        &self,
+        id: &str,
+        status: ReviewStatus,
+        step_results_json: String,
+        finished_at: Option<String>,
+        updated_at: &str,
+        expected_task_version: i64,
+        expected_task_status: &str,
+        expected_project_version: Option<i64>,
+        expected_workflow_definition: Option<&str>,
+        expected_review_status: ReviewStatus,
+        expected_review_updated_at: &str,
+        expected_candidate_execution_id: &str,
+        task_projection: Option<Option<String>>,
     ) -> Result<Review>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Review>>;
     async fn list_by_task(&self, task_id: &str) -> Result<Vec<Review>>;
@@ -1515,6 +1950,19 @@ pub trait TerminalSessionRepo: Send + Sync {
     async fn delete_terminal_sessions_for_workspace(&self, workspace_id: &str) -> Result<u64>;
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectDeletionRepositoryPath {
+    pub id: String,
+    pub local_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectDeletionPaths {
+    pub task_ids: Vec<String>,
+    pub workspace_paths: Vec<String>,
+    pub repository_paths: Vec<ProjectDeletionRepositoryPath>,
+}
+
 #[async_trait]
 pub trait ProjectRepo: Send + Sync {
     async fn create(&self, input: CreateProject) -> Result<Project>;
@@ -1539,6 +1987,16 @@ pub trait ProjectRepo: Send + Sync {
         expected_version: i64,
         project_hooks_json: Option<String>,
     ) -> Result<Project>;
+    /// Update the persisted workflow and clear Project-derived dispatch
+    /// decisions in the same SQLite write transaction.
+    async fn update_workflow(
+        &self,
+        id: &str,
+        workflow_definition: &str,
+        workflow_template_name: Option<&str>,
+        expected_version: i64,
+        updated_at: &str,
+    ) -> Result<()>;
     async fn set_project_hooks_json(
         &self,
         id: &str,
@@ -1552,12 +2010,47 @@ pub trait ProjectRepo: Send + Sync {
         by: i64,
     ) -> Result<i64>;
     async fn set_paused_at(&self, id: &str, paused_at: Option<String>) -> Result<()>;
-    /// Pause a Project the Task dispatcher found with no primary
-    /// repository, recording why. Only an unpaused Project pauses; a
-    /// concurrent pause (manual or another reconciliation tick) is a benign
-    /// no-op.
-    async fn set_system_pause_reason(&self, id: &str, paused_at: &str, reason: &str) -> Result<()>;
+    /// Pause a Project the Task dispatcher found with no valid primary
+    /// repository only when the exact Project/repository snapshot that
+    /// produced that decision is still current. A concurrent repository
+    /// attachment, deletion, or explicit pause makes this a benign no-op.
+    async fn set_system_pause_reason_if_unchanged(
+        &self,
+        id: &str,
+        expected_version: i64,
+        expected_primary_repo_id: Option<&str>,
+        paused_at: &str,
+        reason: &str,
+    ) -> Result<bool>;
+    /// Clear a dispatcher-owned Project pause only when the exact pause
+    /// snapshot that the dispatcher observed is still current.  This is the
+    /// compare-and-set boundary used by repository reconciliation: a manual
+    /// pause/resume or another system writer must win instead of being
+    /// cleared by a stale auto-resume.
+    async fn clear_system_pause_if_unchanged(
+        &self,
+        id: &str,
+        expected_version: i64,
+        expected_primary_repo_id: &str,
+        expected_paused_at: &str,
+        expected_reason: &str,
+    ) -> Result<bool>;
+    /// Check the Project's in-use guard under the SQLite write lock without
+    /// mutating any Project-owned rows. Callers use this before the final
+    /// deletion boundary so a rejected deletion cannot touch live worktrees.
+    async fn ensure_deletable(&self, id: &str) -> Result<()>;
+    /// Tear the Project down. Refuses with [`DbError::ProjectInUse`] while a
+    /// running Execution or an active Workspace lease still belongs to it.
+    /// Callers that need force semantics must complete provider cancellation
+    /// and lease revocation before calling this always-guarded boundary.
     async fn delete(&self, id: &str) -> Result<()>;
+    /// Delete a Project and return the exact Task IDs, task-worktree, and
+    /// repository paths that were present in the same final write transaction.
+    /// Callers use the returned values to clean filesystem state admitted
+    /// after an earlier snapshot but before this transaction acquired
+    /// SQLite's write lock. The boundary is always in-use guarded; force
+    /// callers must stop providers and revoke leases before reaching it.
+    async fn delete_with_workspace_paths(&self, id: &str) -> Result<ProjectDeletionPaths>;
 }
 
 /// Atomic Project execution-setup mutation boundary. The command receipt is
@@ -1652,6 +2145,15 @@ pub trait ProjectHookRunRepo: Send + Sync {
 #[async_trait]
 pub trait RepoRepo: Send + Sync {
     async fn create(&self, input: CreateRepo) -> Result<Repo>;
+    /// Create a primary repository, optional provider configuration, and the
+    /// Project's primary-repository link plus dispatch wake atomically.
+    async fn create_primary_for_project(
+        &self,
+        input: CreateRepo,
+        provider_config: Option<CreatePrProviderConfig>,
+        expected_project_version: i64,
+        project_updated_at: String,
+    ) -> Result<Repo>;
     async fn get_by_id(&self, id: &str) -> Result<Option<Repo>>;
     async fn list_by_project(&self, project_id: &str, page: PageRequest) -> Result<Page<Repo>>;
     async fn update(&self, input: UpdateRepo) -> Result<Repo>;
@@ -2201,13 +2703,19 @@ pub struct ClaimTask {
     pub expected_version: i64,
     pub source_status: String,
     pub target_status: String,
-    pub capacity_statuses: Vec<String>,
     pub execution: CreateExecution,
+    /// The same immutable role/task/Project facts used by scheduler launches.
+    /// Claims create the Task mutation and Running execution together, so the
+    /// admission must be checked before either row is committed.
+    pub execution_admission: Option<ExecutionAdmission>,
+    /// Project workflow authority for user claims, which do not necessarily
+    /// carry an agent execution admission.
+    pub expected_project_version: Option<i64>,
+    pub expected_workflow_definition: Option<String>,
     /// The initial owner lease is part of the claim transaction.  A running
     /// execution may never be inserted first and claimed later, since that
     /// would leave an unrecoverable ownerless window.
     pub execution_lease: ClaimExecutionLease,
-    pub max_concurrent_tasks: i64,
     pub claimed_at: String,
 }
 
@@ -2253,6 +2761,62 @@ pub struct CreateExecution {
     pub workspace_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// The Task facts used to choose a role execution.  These are checked again
+/// in the same SQLite transaction as the execution INSERT so a transition
+/// between the dispatcher's final read and admission fails closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionAdmission {
+    /// Project revision selected with the Task/workflow snapshot. Project
+    /// settings, repository, pause, and workflow edits all advance this
+    /// revision; role launches must not admit a stale prepared execution even
+    /// when the workflow JSON itself is unchanged.
+    pub expected_project_version: Option<i64>,
+    pub expected_task_version: i64,
+    pub expected_task_status: String,
+    pub expected_effective_role: Option<String>,
+    /// Capacity snapshot for the selected agent.  A role dispatch must carry
+    /// the identity version and max observed while it selected the agent; the
+    /// INSERT transaction compares both with the current identity and counts
+    /// running executions under the same writer lock before admitting the new
+    /// row. The identity version covers selected-profile/provider/daemon/config
+    /// reassignment even when the concurrency max is unchanged.
+    pub expected_agent_version: Option<i64>,
+    pub expected_agent_max_concurrent_tasks: Option<i64>,
+    /// For reviewer dispatch, the latest Review row selected as the candidate
+    /// parent for the new execution. `None` is meaningful: it asserts that no
+    /// candidate existed at the dispatch snapshot and is rechecked before
+    /// INSERT.
+    pub expected_reviewer_parent_execution_id: Option<String>,
+    /// Candidate execution recorded by the latest Review snapshot. This is
+    /// intentionally separate from the new execution's parent: a rerun may
+    /// review a fresh candidate while the prior Review still names the old
+    /// candidate.
+    pub expected_latest_review_candidate_execution_id: Option<String>,
+    /// Bind the complete Review snapshot that supplied the candidate. Review
+    /// rows do not advance Task.version, so execution_id alone is not enough
+    /// to detect a changed review authority or conformance payload.
+    pub expected_reviewer_id: Option<String>,
+    pub expected_reviewer_attempt_number: Option<i64>,
+    pub expected_reviewer_status: Option<String>,
+    pub expected_reviewer_updated_at: Option<String>,
+    /// Exact durable execution bindings on the selected Review snapshot.
+    /// These are compared independently of Review.updated_at because a
+    /// binding repair/replacement may intentionally leave the Review payload
+    /// timestamp unchanged.
+    pub expected_reviewer_execution_id: Option<String>,
+    pub expected_auditor_execution_id: Option<String>,
+    /// Identity and update timestamp of the role assignment selected by the
+    /// dispatcher.  The insert transaction compares both so an assignment
+    /// that is removed and recreated (or changed and changed back) cannot
+    /// silently authorize a stale launch.
+    pub expected_assignment_id: Option<String>,
+    pub expected_assignment_updated_at: Option<String>,
+    /// Exact project workflow JSON selected by the service, or `None` when
+    /// the task is governed by the built-in inherited subtask workflow. This
+    /// lets the transaction detect a workflow edit that did not bump Task.
+    pub expected_workflow_definition: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2648,6 +3212,16 @@ pub trait TaskRoleAssignmentRepo: Send + Sync {
         &self,
         input: CreateTaskRoleAssignment,
     ) -> std::result::Result<TaskRoleAssignment, crate::DbError>;
+    /// Confirm an assignment against the exact row observed by the caller (or
+    /// confirm that the row was absent), then upsert it under the SQLite write
+    /// lock. This is used by idempotent/initial assignment paths that must not
+    /// overwrite a newer reassignment which did not itself advance the Task
+    /// version.
+    async fn assign_if_unchanged(
+        &self,
+        input: CreateTaskRoleAssignment,
+        expected_previous: Option<&TaskRoleAssignment>,
+    ) -> std::result::Result<TaskRoleAssignment, crate::DbError>;
     async fn get_by_task_and_role(
         &self,
         task_id: &str,
@@ -2662,6 +3236,28 @@ pub trait TaskRoleAssignmentRepo: Send + Sync {
         task_id: &str,
         role_name: &str,
     ) -> std::result::Result<(), crate::DbError>;
+    /// Replace a role assignment and invalidate the Task's review authority
+    /// projection under one SQLite write transaction.  The expected Task
+    /// revision binds the role change to the caller's snapshot: a concurrent
+    /// status/authority transition rejects the whole operation instead of
+    /// leaving a new assignee next to stale review authority.
+    async fn assign_and_clear_review_authority(
+        &self,
+        input: CreateTaskRoleAssignment,
+        expected_previous: Option<&TaskRoleAssignment>,
+        expected_task_version: i64,
+        updated_at: &str,
+    ) -> std::result::Result<(TaskRoleAssignment, Task), crate::DbError>;
+    /// Remove a role assignment and invalidate the Task's review authority
+    /// projection under one SQLite write transaction.  The expected Task
+    /// revision prevents a stale remover from committing a role change after
+    /// a newer Task transition won.
+    async fn remove_and_clear_review_authority(
+        &self,
+        expected_assignment: &TaskRoleAssignment,
+        expected_task_version: i64,
+        updated_at: &str,
+    ) -> std::result::Result<Task, crate::DbError>;
 }
 
 #[async_trait]

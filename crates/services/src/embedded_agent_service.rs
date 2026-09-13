@@ -14,11 +14,12 @@ use db::{
     AgentConnectionHealth, AgentConnectionHealthRepo, AgentContextScopeRepo, AgentProfile,
     AgentProfileRepo, AgentRepo, AgentSession, AgentSessionRepo, AgentStatus, AssigneeKind,
     CreateAgentContextScope, CreateAgentIdentity, CreateAgentProfile, CreateAgentSession,
-    CredentialHandle, CredentialHandleRepo, ExecutionRepo, ExecutionStatus, PageRequest,
-    ProjectAgentBindingRepo, ProjectMemberRepo, ProjectRepo, RotateAgentSession,
-    SelectAgentProfile, SortBy, SortOrder, SqliteDb, TaskRepo, TaskRoleAssignmentRepo,
-    UpdateAgentSession, UpsertAgentConnectionHealth,
+    CredentialHandle, CredentialHandleRepo, ExecutionRepo, ProjectAgentBindingRepo,
+    ProjectMemberRepo, ProjectRepo, RotateAgentSession, SelectAgentProfile, SqliteDb, TaskRepo,
+    TaskRoleAssignmentRepo, UpdateAgentSession, UpsertAgentConnectionHealth,
 };
+#[cfg(test)]
+use db::{PageRequest, SortBy, SortOrder};
 use forge_agent_host::{
     AgentSessionBackend, BackendCapabilities, CanonicalScope, CanonicalScopeType,
     CreateOAuthCredential, InteractionBrokerHandle, NativeAgentRuntimeBackend,
@@ -1863,25 +1864,13 @@ impl EmbeddedAgentService {
                 // execution must exist for this identity.  This prevents a
                 // caller from creating a durable write-capable Task session
                 // before the normal claim/dispatch transaction runs.
-                let active_execution = ExecutionRepo::list_by_task(
-                    &*self.db,
-                    task_id,
-                    PageRequest {
-                        cursor: None,
-                        limit: 100,
-                        include_total: false,
-                        sort_by: SortBy::CreatedAt,
-                        sort_order: SortOrder::Desc,
-                    },
-                )
-                .await?
-                .items
-                .into_iter()
-                .any(|execution| {
-                    execution.status == ExecutionStatus::Running
-                        && execution.agent_id.as_deref() == Some(identity.id.as_str())
-                        && execution_role_serves_task_role(&execution.role, role.as_str())
-                });
+                let active_execution = ExecutionRepo::list_running_by_task(&*self.db, task_id)
+                    .await?
+                    .into_iter()
+                    .any(|execution| {
+                        execution.agent_id.as_deref() == Some(identity.id.as_str())
+                            && execution_role_serves_task_role(&execution.role, role.as_str())
+                    });
                 // The durable claim marker is either the Task-level assignee
                 // (interactive claim path) or the role-table assignment the
                 // claim/dispatch transaction wrote (dispatcher-initiated

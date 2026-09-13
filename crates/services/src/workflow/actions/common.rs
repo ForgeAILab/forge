@@ -2,16 +2,17 @@ use std::sync::Arc;
 
 use db::{
     new_uuid_v4, now_rfc3339, CommentAuthorType, CreateTaskComment, DbError, Execution,
-    ExecutionRepo, PageRequest, ReviewRepo, ReviewStatus, SortBy, SortOrder, TaskCommentRepo,
-    TaskMetadata, TaskRepo, TaskRoleAssignment, TaskRoleAssignmentRepo, TransitionLog,
-    TransitionLogRepo, UpdateTask, WorkspaceRepo,
+    ExecutionRepo, ProjectRepo, ReviewRepo, ReviewStatus, TaskCommentRepo, TaskRepo,
+    TaskRoleAssignment, TaskRoleAssignmentRepo, TransitionLogRepo, UpdateTask, WorkspaceRepo,
 };
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde_json::{json, Value};
 use tokio::process::Command;
 
 use crate::workflow::{
-    default_states, engine::WorkflowEngine, inherited_subtask_workflow, HookContext, HookResult,
+    default_states,
+    engine::{WorkflowAuthority, WorkflowEngine},
+    inherited_subtask_workflow, HookContext, HookResult,
 };
 
 pub(super) async fn publish_domain_event(ctx: &HookContext, dedupe_key: &str) {
@@ -44,23 +45,12 @@ pub(super) async fn has_running_execution_for_roles(
     ctx: &HookContext,
     roles: &[&str],
 ) -> Result<bool, String> {
-    let page = ExecutionRepo::list_by_task(
-        &*ctx.db,
-        &ctx.task_id,
-        PageRequest {
-            cursor: None,
-            limit: 100,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Desc,
-        },
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    Ok(page.items.iter().any(|execution| {
-        execution.status == db::ExecutionStatus::Running
-            && roles.iter().any(|role| execution.role == *role)
-    }))
+    let executions = ExecutionRepo::list_running_by_task(&*ctx.db, &ctx.task_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(executions
+        .iter()
+        .any(|execution| roles.iter().any(|role| execution.role == *role)))
 }
 
 pub(super) async fn task(ctx: &HookContext) -> Result<db::Task, String> {
@@ -135,6 +125,33 @@ pub(super) async fn cancel_subtask_with_effective_workflow(
         .as_deref()
         .unwrap_or(default_states::CANCELLED)
         .to_owned();
+    let authority = match (
+        ctx.project_version,
+        ctx.project_workflow_definition.as_deref(),
+    ) {
+        (Some(project_version), Some(workflow_definition)) => WorkflowAuthority {
+            project_version,
+            workflow_definition: workflow_definition.to_owned(),
+        },
+        _ => {
+            let project = ProjectRepo::get_by_id(&*ctx.db, &subtask.project_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("project {} not found", subtask.project_id))?;
+            WorkflowAuthority {
+                project_version: project.version,
+                workflow_definition: project.workflow_definition,
+            }
+        }
+    };
+    let current_effective_workflow = WorkflowEngine::resolve_workflow_for_task(
+        &subtask,
+        &authority.workflow_definition,
+        &api_types::Actor::system(api_types::SystemComponent::Workflow),
+    );
+    if current_effective_workflow != workflow {
+        return Err("project workflow authority changed while cancelling subtask".to_owned());
+    }
     let engine = WorkflowEngine {
         db: Arc::clone(&ctx.db),
         event_bus: Arc::clone(&ctx.event_bus),
@@ -149,7 +166,7 @@ pub(super) async fn cancel_subtask_with_effective_workflow(
         repo_cache_locks: ctx.repo_cache_locks.clone(),
     };
     engine
-        .transition(
+        .transition_with_authority(
             &subtask.id,
             &target_state,
             subtask.version,
@@ -157,6 +174,7 @@ pub(super) async fn cancel_subtask_with_effective_workflow(
             &api_types::Actor::system(api_types::SystemComponent::Workflow),
             "root subtask cascade",
             false,
+            authority,
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -209,7 +227,10 @@ pub(super) async fn merge_fix_budget_result(ctx: &HookContext) -> Option<HookRes
         }
     };
     let count = match TransitionLogRepo::list_by_task(&*ctx.db, &ctx.task_id).await {
-        Ok(entries) => merge_fix_rejections_since_boundary(&entries),
+        Ok(entries) => crate::task_diagnostics::count_gate_rejections_since_boundary(
+            &entries,
+            default_states::MERGING,
+        ),
         Err(error) => {
             return Some(HookResult::Failed {
                 reason: error.to_string(),
@@ -238,40 +259,6 @@ pub(super) async fn merge_fix_budget_result(ctx: &HookContext) -> Option<HookRes
     } else {
         None
     }
-}
-
-/// Marker written into the transition reason of every `merging -> merge_failed`
-/// bounce caused by the integration target moving during review.
-///
-/// Those bounces are recorded with `rejection = true` like any other cascade
-/// out of a gate (`cascade_rejection` in `workflow::engine` is derived from the
-/// state being entered), but they are contention rather than a merge-fix
-/// attempt, so they must not be charged to the merge-fix budget — see
-/// `merge_fix_rejections_since_boundary`.
-pub(super) const TARGET_MOVED_MARKER: &str = "[target-moved-rebase]";
-
-pub(super) fn merge_fix_rejections_since_boundary(entries: &[TransitionLog]) -> i64 {
-    let boundary = entries.iter().rposition(|entry| {
-        entry.from_state == default_states::MERGING
-            && !entry.rejection
-            && (entry.to_state != default_states::MERGING
-                || entry.trigger_name.as_deref() == Some("reset_retry_window"))
-    });
-    let entries = boundary
-        .and_then(|index| entries.get(index + 1..))
-        .unwrap_or(entries);
-    entries
-        .iter()
-        .filter(|entry| {
-            entry.from_state == default_states::MERGING
-                && entry.to_state == default_states::MERGE_FAILED
-                && entry.rejection
-                // Losing a merge race is not a merge-fix attempt. Counting it
-                // spent the Task's single merge-fix retry on ordinary
-                // concurrency and blocked it dead on the next one.
-                && !entry.trigger_reason.contains(TARGET_MOVED_MARKER)
-        })
-        .count() as i64
 }
 
 pub(super) fn follow_up_trigger(ctx: &HookContext) -> &'static str {
@@ -462,35 +449,212 @@ pub(super) fn review_ci_steps(value: &Value) -> Result<Vec<String>, String> {
     }
 }
 
-pub(super) async fn create_review_attempt(
+/// Create a Review only for the Task/candidate snapshot that the blocking
+/// review hook captured. Review rows are not themselves versioned with the
+/// Task, so the pre/post checks below turn a raced insert into a cancelled
+/// attempt instead of leaving a stale Running row that controls diagnostics.
+pub(super) async fn create_review_attempt_with_authority(
     ctx: &HookContext,
     execution_id: &str,
+    expected_task_version: i64,
+    expected_candidate_execution_id: &str,
 ) -> Result<db::Review, String> {
-    let attempt_number = ReviewRepo::next_attempt_number(&*ctx.db, &ctx.task_id)
-        .await
-        .map_err(|error| error.to_string())?;
+    ensure_review_authority(ctx, expected_task_version, expected_candidate_execution_id).await?;
     let now = now_rfc3339();
-    ReviewRepo::create(
+    let review = ReviewRepo::create_with_task_authority(
         &*ctx.db,
         db::CreateReview {
             id: new_uuid_v4(),
             task_id: ctx.task_id.clone(),
             execution_id: execution_id.to_string(),
-            attempt_number,
+            attempt_number: 0,
             status: ReviewStatus::Running,
             step_results_json: json!({ "ci_steps": [] }).to_string(),
             started_at: now.clone(),
             created_at: now.clone(),
             updated_at: now,
         },
+        expected_task_version,
+        &ctx.to_state,
+        ctx.project_version,
+        ctx.project_workflow_definition.as_deref(),
+        Some(expected_candidate_execution_id),
     )
     .await
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+
+    if let Err(reason) =
+        ensure_review_authority(ctx, expected_task_version, expected_candidate_execution_id).await
+    {
+        cancel_review_after_authority_loss(ctx, &review, &reason).await;
+        return Err(reason);
+    }
+    Ok(review)
+}
+
+/// Validate the immutable Task/project/candidate facts captured by a review
+/// hook. The check is intentionally repeated after non-transactional Review
+/// writes; a competing Task transition can win between the two repository
+/// calls and must invalidate the new row.
+pub(super) async fn ensure_review_authority(
+    ctx: &HookContext,
+    expected_task_version: i64,
+    expected_candidate_execution_id: &str,
+) -> Result<db::Task, String> {
+    let current_task = task(ctx).await?;
+    if current_task.version != expected_task_version {
+        return Err(format!(
+            "review authority changed: task version {} is no longer {}",
+            current_task.version, expected_task_version
+        ));
+    }
+    if current_task.status != ctx.to_state {
+        return Err(format!(
+            "review authority changed: task is in '{}' instead of '{}'",
+            current_task.status, ctx.to_state
+        ));
+    }
+    let Some(candidate) = latest_executor_execution(ctx).await else {
+        return Err("review authority changed: executor candidate disappeared".to_owned());
+    };
+    if candidate.id != expected_candidate_execution_id {
+        return Err("review authority changed: executor candidate changed".to_owned());
+    }
+    let (Some(expected_project_version), Some(expected_workflow_definition)) = (
+        ctx.project_version,
+        ctx.project_workflow_definition.as_deref(),
+    ) else {
+        return Err("review authority is missing the Project version/workflow snapshot".to_owned());
+    };
+    let project = ProjectRepo::get_by_id(&*ctx.db, &ctx.project_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("project not found: {}", ctx.project_id))?;
+    if project.version != expected_project_version
+        || project.workflow_definition != expected_workflow_definition
+    {
+        return Err("review authority changed: project workflow changed".to_owned());
+    }
+    Ok(current_task)
+}
+
+/// A review that lost its Task authority is not allowed to remain Running or
+/// AwaitingHuman. Reconcile it with a Review-only CAS: the Task/candidate may
+/// already have moved, so cancellation must not require the stale authority
+/// snapshot or mutate the new Task projection. Terminal failures are written
+/// through the atomic task-authority API by the caller and therefore never
+/// need this fallback.
+pub(super) async fn cancel_review_after_authority_loss(
+    ctx: &HookContext,
+    review: &db::Review,
+    reason: &str,
+) {
+    let current_review = match ReviewRepo::get_by_id(&*ctx.db, &review.id).await {
+        Ok(Some(review)) => review,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(
+                review_id = %review.id,
+                %error,
+                "failed to reload review after authority loss"
+            );
+            return;
+        }
+    };
+    if !matches!(
+        current_review.status,
+        ReviewStatus::Running | ReviewStatus::AwaitingHuman
+    ) {
+        return;
+    }
+    let mut details = serde_json::from_str::<Value>(&current_review.step_results_json)
+        .unwrap_or_else(|_| json!({ "ci_steps": [] }));
+    if !details.is_object() {
+        details = json!({ "ci_steps": [] });
+    }
+    details["execution_retry"] = json!({
+        "status": "cancelled_authority_lost",
+        "reason": reason,
+        "cancelled_at": now_rfc3339(),
+    });
+    let now = now_rfc3339();
+    match ReviewRepo::cancel_if_unchanged(
+        &*ctx.db,
+        &current_review.id,
+        current_review.status.clone(),
+        &current_review.updated_at,
+        details.to_string(),
+        &now,
+        &now,
+    )
+    .await
+    {
+        Ok(Some(cancelled)) => {
+            publish_domain_event(
+                ctx,
+                &format!(
+                    "review-status:{}:{}:{}",
+                    cancelled.id, cancelled.status, now
+                ),
+            )
+            .await;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                review_id = %review.id,
+                %error,
+                "failed to cancel review after authority loss"
+            );
+        }
+    }
+}
+
+/// Update a non-terminal Review state while retaining the Task/candidate
+/// authority checks that the atomic terminal-settlement API provides for
+/// Passed/Failed. If the Task changes during the write, reconcile the row to
+/// Cancelled so it cannot remain a stale diagnostic blocker.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn update_review_status_with_authority_checks(
+    ctx: &HookContext,
+    review: &db::Review,
+    status: ReviewStatus,
+    step_results_json: String,
+    finished_at: Option<String>,
+    updated_at: &str,
+    expected_task_version: i64,
+    expected_candidate_execution_id: &str,
+) -> Result<db::Review, String> {
+    let updated = match ReviewRepo::update_status_with_review_authority_and_task_projection(
+        &*ctx.db,
+        &review.id,
+        status,
+        step_results_json,
+        finished_at,
+        updated_at,
+        expected_task_version,
+        &ctx.to_state,
+        ctx.project_version,
+        ctx.project_workflow_definition.as_deref(),
+        review.status.clone(),
+        &review.updated_at,
+        expected_candidate_execution_id,
+        None,
+    )
+    .await
+    {
+        Ok(review) => review,
+        Err(error) => {
+            cancel_review_after_authority_loss(ctx, review, &error.to_string()).await;
+            return Err(error.to_string());
+        }
+    };
+    Ok(updated)
 }
 
 pub(super) async fn ensure_review_record_for_dispatch(
     ctx: &HookContext,
-    execution_id: &str,
+    _execution_id: &str,
 ) -> Result<(), String> {
     if ctx.to_state != default_states::REVIEW {
         return Ok(());
@@ -505,7 +669,59 @@ pub(super) async fn ensure_review_record_for_dispatch(
         {
             Ok(())
         }
-        _ => create_review_attempt(ctx, execution_id).await.map(|_| ()),
+        _ => {
+            let current_task = task(ctx).await?;
+            let Some(candidate) = latest_executor_execution(ctx).await else {
+                return Err(
+                    "review dispatch requires a current implementation candidate".to_owned(),
+                );
+            };
+            create_review_attempt_with_authority(
+                ctx,
+                &candidate.id,
+                current_task.version,
+                &candidate.id,
+            )
+            .await
+            .map(|_| ())
+        }
+    }
+}
+
+/// Establish the review-attempt boundary before reviewer capacity is checked.
+///
+/// A completed review is authority for one candidate only. Re-entering review
+/// after a merge repair or mechanical rebase clears `review_passed_at`, but a
+/// saturated reviewer can prevent dispatch from creating the next execution.
+/// Without a new Running row, recovery sees the old terminal reviewer and can
+/// reconcile its passed assessment into the new review cycle indefinitely.
+pub(super) async fn ensure_review_attempt_for_current_candidate(
+    ctx: &HookContext,
+    task: &db::Task,
+) -> Result<(), String> {
+    if ctx.to_state != default_states::REVIEW || task.review_passed_at.is_some() {
+        return Ok(());
+    }
+
+    let Some(candidate) = latest_executor_execution(ctx).await else {
+        // A review attempt has no authority without an implementation
+        // candidate. The human-review marker may still be used by the caller,
+        // but no Review row is created until a candidate exists.
+        return Ok(());
+    };
+    match latest_review(ctx).await? {
+        Some(review)
+            if review.execution_id == candidate.id
+                && matches!(
+                    review.status,
+                    ReviewStatus::Running | ReviewStatus::AwaitingHuman
+                ) =>
+        {
+            Ok(())
+        }
+        _ => create_review_attempt_with_authority(ctx, &candidate.id, task.version, &candidate.id)
+            .await
+            .map(|_| ()),
     }
 }
 
@@ -514,6 +730,10 @@ pub(super) async fn ensure_review_awaiting_human(ctx: &HookContext) -> Result<()
         return Ok(());
     }
 
+    let task_snapshot = task(ctx).await?;
+    let candidate_execution_id = latest_executor_execution(ctx)
+        .await
+        .map(|execution| execution.id);
     let review = match latest_review(ctx).await? {
         Some(review)
             if matches!(
@@ -524,28 +744,42 @@ pub(super) async fn ensure_review_awaiting_human(ctx: &HookContext) -> Result<()
             review
         }
         _ => {
-            let execution_id = latest_executor_execution(ctx)
-                .await
-                .map(|execution| execution.id)
-                .or_else(|| ctx.execution_id.clone());
-            let Some(execution_id) = execution_id else {
+            let Some(candidate_execution_id) = candidate_execution_id.as_deref() else {
                 set_review_awaiting_human_metadata(ctx).await?;
                 return Ok(());
             };
-            create_review_attempt(ctx, &execution_id).await?
+            create_review_attempt_with_authority(
+                ctx,
+                candidate_execution_id,
+                task_snapshot.version,
+                candidate_execution_id,
+            )
+            .await?
         }
     };
     let now = now_rfc3339();
-    let review = ReviewRepo::update_status(
-        &*ctx.db,
-        &review.id,
+    crate::task_service::strict_review_details(&review).map_err(|error| error.to_string())?;
+    let review_details = review.step_results_json.clone();
+    let Some(candidate_execution_id) = candidate_execution_id.as_deref() else {
+        cancel_review_after_authority_loss(
+            ctx,
+            &review,
+            "review authority has no current implementation candidate",
+        )
+        .await;
+        return Err("review authority has no current implementation candidate".to_owned());
+    };
+    let review = update_review_status_with_authority_checks(
+        ctx,
+        &review,
         ReviewStatus::AwaitingHuman,
-        review.step_results_json,
+        review_details,
         None,
         &now,
+        task_snapshot.version,
+        candidate_execution_id,
     )
-    .await
-    .map_err(|error| error.to_string())?;
+    .await?;
     publish_domain_event(
         ctx,
         &format!("review-status:{}:{}:{}", review.id, review.status, now),
@@ -563,17 +797,28 @@ pub(super) async fn ensure_review_awaiting_human(ctx: &HookContext) -> Result<()
 
 async fn set_review_awaiting_human_metadata(ctx: &HookContext) -> Result<(), String> {
     let task = task(ctx).await?;
-    let mut metadata =
-        TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| error.to_string())?;
-    metadata
-        .extra
-        .insert("awaiting_human".to_owned(), json!(true));
-    metadata
-        .extra
-        .insert("awaiting_human_reason".to_owned(), json!("manual_review"));
-    TaskRepo::set_metadata_json(&*ctx.db, &task.id, metadata.to_json(), &now_rfc3339())
-        .await
-        .map_err(|error| error.to_string())?;
+    TaskRepo::mutate_metadata(
+        &*ctx.db,
+        &task.id,
+        Some(task.version),
+        vec![
+            db::TaskMetadataMutation::Set {
+                key: "awaiting_human".to_owned(),
+                value: json!(true),
+            },
+            db::TaskMetadataMutation::Set {
+                key: "awaiting_human_reason".to_owned(),
+                value: json!("manual_review"),
+            },
+            db::TaskMetadataMutation::Set {
+                key: "awaiting_human_marker_id".to_owned(),
+                value: json!(db::new_uuid_v4()),
+            },
+        ],
+        &now_rfc3339(),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     Ok(())
 }
 

@@ -54,10 +54,95 @@ fn map_workspace_lease(row: SqliteRow) -> Result<WorkspaceLease> {
 
 const WORKSPACE_LEASE_COLUMNS: &str = "id, project_id, task_id, task_version, execution_id, operation_idempotency_key, repository_binding_id, base_ref, role, capabilities_json, assigned_principal_type, assigned_principal_id, capability_profile_revision, capability_profile_digest, issuing_principal_type, issuing_principal_id, status, issued_at, expires_at, revoked_at, version, created_at, updated_at";
 
-#[async_trait]
-impl WorkspaceLeaseRepo for SqliteDb {
-    async fn issue(&self, input: CreateWorkspaceLease) -> Result<WorkspaceLease> {
+impl SqliteDb {
+    async fn issue_inner(
+        &self,
+        input: CreateWorkspaceLease,
+        expected_project_version: Option<i64>,
+        expected_workflow_definition: Option<&str>,
+        expected_task_status: Option<&str>,
+        expected_effective_role: Option<&str>,
+        replacing_lease: Option<(&str, i64)>,
+    ) -> Result<WorkspaceLease> {
         let mut tx = crate::begin_immediate(&self.pool).await?;
+        let mut current_workflow_definition = None;
+        if let Some(expected_project_version) = expected_project_version {
+            let row = sqlx::query(
+                "SELECT version, workflow_definition
+                 FROM project WHERE id = ?",
+            )
+            .bind(&input.project_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(DbError::NotFound)?;
+            let actual_project_version: i64 = row.try_get("version")?;
+            let actual_workflow_definition: String = row.try_get("workflow_definition")?;
+            if actual_project_version != expected_project_version
+                || expected_workflow_definition != Some(actual_workflow_definition.as_str())
+            {
+                return Err(DbError::VersionConflict);
+            }
+            current_workflow_definition = Some(actual_workflow_definition);
+        } else if expected_workflow_definition.is_some() {
+            return Err(DbError::VersionConflict);
+        }
+        match (expected_task_status, expected_effective_role) {
+            (Some(expected_task_status), Some(expected_effective_role)) => {
+                let task = sqlx::query(
+                    "SELECT version, status, parent_task_id
+                     FROM task
+                     WHERE id = ? AND project_id = ? AND deleted_at IS NULL",
+                )
+                .bind(&input.task_id)
+                .bind(&input.project_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(DbError::NotFound)?;
+                let task_version: i64 = task.try_get("version")?;
+                let task_status: String = task.try_get("status")?;
+                if task_version != input.task_version || task_status != expected_task_status {
+                    return Err(DbError::VersionConflict);
+                }
+                let parent_task_id: Option<String> = task.try_get("parent_task_id")?;
+                let workflow_is_inherited =
+                    parent_task_id.is_some() && inherited_subtask_workflow_state(&task_status);
+                let workflow_definition = current_workflow_definition
+                    .as_deref()
+                    .ok_or(DbError::VersionConflict)?;
+                let raw = workflow_definition.trim();
+                let parsed_workflow = if raw.is_empty() || raw == "{}" {
+                    None
+                } else {
+                    Some(
+                        serde_json::from_str::<api_types::WorkflowDefinition>(raw)
+                            .map_err(|_| DbError::VersionConflict)?,
+                    )
+                };
+                let actual_role = if workflow_is_inherited {
+                    inherited_subtask_workflow_role(&task_status).map(str::to_owned)
+                } else if let Some(workflow) = parsed_workflow.as_ref() {
+                    workflow
+                        .states
+                        .iter()
+                        .find(|state| state.name == task_status)
+                        .and_then(|state| {
+                            state.role.as_deref().or_else(|| {
+                                (state.kind == api_types::StateKind::Active).then_some("assignee")
+                            })
+                        })
+                        .map(str::to_owned)
+                } else {
+                    default_workflow_role(&task_status).map(str::to_owned)
+                };
+                if canonical_execution_role(actual_role.as_deref())
+                    != canonical_execution_role(Some(expected_effective_role))
+                {
+                    return Err(DbError::VersionConflict);
+                }
+            }
+            (None, None) => {}
+            _ => return Err(DbError::VersionConflict),
+        }
         if let Some(row) = sqlx::query(&format!(
             "SELECT {WORKSPACE_LEASE_COLUMNS} FROM workspace_lease WHERE id = ?"
         ))
@@ -122,6 +207,44 @@ impl WorkspaceLeaseRepo for SqliteDb {
             tx.commit().await?;
             return Ok(existing);
         }
+        if let Some((replacing_lease_id, replacing_lease_version)) = replacing_lease {
+            let old = sqlx::query(
+                "SELECT project_id, task_id, execution_id
+                 FROM workspace_lease
+                 WHERE id = ? AND status = 'active' AND version = ?",
+            )
+            .bind(replacing_lease_id)
+            .bind(replacing_lease_version)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(DbError::VersionConflict)?;
+            let old_project_id: String = old.try_get("project_id")?;
+            let old_task_id: String = old.try_get("task_id")?;
+            let old_execution_id: String = old.try_get("execution_id")?;
+            if old_project_id != input.project_id
+                || old_task_id != input.task_id
+                || old_execution_id != input.execution_id
+            {
+                return Err(DbError::VersionConflict);
+            }
+            let revoked_at = input.updated_at.clone();
+            let result = sqlx::query(
+                "UPDATE workspace_lease
+                 SET status = 'revoked', revoked_at = ?, version = version + 1,
+                     updated_at = ?
+                 WHERE id = ? AND status = 'active' AND version = ?",
+            )
+            .bind(&revoked_at)
+            .bind(&revoked_at)
+            .bind(replacing_lease_id)
+            .bind(replacing_lease_version)
+            .execute(&mut *tx)
+            .await
+            .map_err(workspace_lease_write_error)?;
+            if result.rows_affected() != 1 {
+                return Err(DbError::VersionConflict);
+            }
+        }
         sqlx::query(
             "INSERT INTO workspace_lease (
                 id, project_id, task_id, task_version, execution_id,
@@ -166,6 +289,54 @@ impl WorkspaceLeaseRepo for SqliteDb {
         tx.commit().await?;
         Ok(lease)
     }
+}
+
+#[async_trait]
+impl WorkspaceLeaseRepo for SqliteDb {
+    async fn issue(&self, input: CreateWorkspaceLease) -> Result<WorkspaceLease> {
+        self.issue_inner(input, None, None, None, None, None).await
+    }
+
+    async fn issue_with_project_authority(
+        &self,
+        input: CreateWorkspaceLease,
+        expected_project_version: i64,
+        expected_workflow_definition: &str,
+        expected_task_status: &str,
+        expected_effective_role: &str,
+    ) -> Result<WorkspaceLease> {
+        self.issue_inner(
+            input,
+            Some(expected_project_version),
+            Some(expected_workflow_definition),
+            Some(expected_task_status),
+            Some(expected_effective_role),
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn replace_with_project_authority(
+        &self,
+        input: CreateWorkspaceLease,
+        expected_project_version: i64,
+        expected_workflow_definition: &str,
+        expected_task_status: &str,
+        expected_effective_role: &str,
+        replacing_lease_id: &str,
+        replacing_lease_version: i64,
+    ) -> Result<WorkspaceLease> {
+        self.issue_inner(
+            input,
+            Some(expected_project_version),
+            Some(expected_workflow_definition),
+            Some(expected_task_status),
+            Some(expected_effective_role),
+            Some((replacing_lease_id, replacing_lease_version)),
+        )
+        .await
+    }
 
     async fn get_by_id(&self, id: &str) -> Result<Option<WorkspaceLease>> {
         sqlx::query(&format!(
@@ -189,6 +360,20 @@ impl WorkspaceLeaseRepo for SqliteDb {
         .await?
         .map(map_workspace_lease)
         .transpose()
+    }
+
+    async fn list_active_for_project(&self, project_id: &str) -> Result<Vec<WorkspaceLease>> {
+        sqlx::query(&format!(
+            "SELECT {WORKSPACE_LEASE_COLUMNS} FROM workspace_lease
+             WHERE project_id = ? AND status = 'active'
+             ORDER BY issued_at ASC, id ASC"
+        ))
+        .bind(project_id)
+        .fetch_all(self.pool())
+        .await?
+        .into_iter()
+        .map(map_workspace_lease)
+        .collect()
     }
 
     async fn revoke(

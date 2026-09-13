@@ -2,8 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use db::{
-    now_rfc3339, ReviewRepo, ReviewStatus, TaskRepo, TransitionLog, TransitionLogRepo,
-    WorkspaceRepo,
+    now_rfc3339, ProjectRepo, ReviewRepo, ReviewStatus, TaskRepo, TransitionLogRepo, WorkspaceRepo,
 };
 use serde_json::json;
 
@@ -12,10 +11,11 @@ use crate::workflow::{
 };
 
 use super::common::{
-    block_task, create_review_attempt, get_role_assignment, latest_executor_execution,
-    latest_review, publish_domain_event, publish_review_failed, publish_review_passed,
-    review_ci_steps, review_has_auditor_verdict, review_is_ci_only, run_ci_steps_in_worktree, task,
-    task_execution_is_read_only, workspace_id,
+    block_task, cancel_review_after_authority_loss, create_review_attempt_with_authority,
+    get_role_assignment, latest_executor_execution, latest_review, publish_domain_event,
+    publish_review_failed, publish_review_passed, review_ci_steps, review_has_auditor_verdict,
+    review_is_ci_only, run_ci_steps_in_worktree, task, task_execution_is_read_only,
+    update_review_status_with_authority_checks, workspace_id,
 };
 
 pub struct RunCiSteps;
@@ -78,7 +78,14 @@ impl HookAction for RunCiSteps {
             }
         };
 
-        let review = match create_review_attempt(ctx, &execution_id).await {
+        let review = match create_review_attempt_with_authority(
+            ctx,
+            &execution_id,
+            task.version,
+            &execution_id,
+        )
+        .await
+        {
             Ok(review) => review,
             Err(reason) => return HookResult::Failed { reason },
         };
@@ -95,7 +102,10 @@ impl HookAction for RunCiSteps {
         let (ci_results, failed_step_index) =
             match run_ci_steps_in_worktree(&workspace.worktree_path, &ci_steps).await {
                 Ok(result) => result,
-                Err(reason) => return HookResult::Failed { reason },
+                Err(reason) => {
+                    cancel_review_after_authority_loss(ctx, &review, &reason).await;
+                    return HookResult::Failed { reason };
+                }
             };
         let mut review_details = json!({ "ci_steps": ci_results });
         let now = now_rfc3339();
@@ -104,21 +114,43 @@ impl HookAction for RunCiSteps {
             gate_requires_user_approval(ctx) || human_review_requested(ctx, reviewer_assigned);
 
         let (status, finished_at) = if let Some(failed_step_index) = failed_step_index {
-            let review = match ReviewRepo::update_status(
+            let review = match ReviewRepo::update_status_with_review_authority_and_task_projection(
                 &*ctx.db,
                 &review.id,
                 ReviewStatus::Failed,
                 review_details.to_string(),
                 Some(now.clone()),
                 &now,
+                task.version,
+                &ctx.to_state,
+                ctx.project_version,
+                ctx.project_workflow_definition.as_deref(),
+                review.status.clone(),
+                &review.updated_at,
+                &execution_id,
+                Some(None),
             )
             .await
             {
                 Ok(review) => review,
                 Err(error) => {
+                    cancel_review_after_authority_loss(ctx, &review, &error.to_string()).await;
                     return HookResult::Failed {
                         reason: error.to_string(),
                     };
+                }
+            };
+            let settled_task = match TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false).await {
+                Ok(Some(task)) => task,
+                Ok(None) => {
+                    return HookResult::Failed {
+                        reason: "task disappeared after review settlement".to_owned(),
+                    };
+                }
+                Err(error) => {
+                    return HookResult::Failed {
+                        reason: error.to_string(),
+                    }
                 }
             };
             publish_domain_event(
@@ -135,16 +167,15 @@ impl HookAction for RunCiSteps {
             }
             publish_review_failed(ctx, &review, failed_step_index);
             if had_review_passed {
-                if let Err(error) =
-                    TaskRepo::set_review_passed_at(&*ctx.db, &ctx.task_id, None, &now).await
-                {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
-                }
                 let reason = "merge-fix follow-up failed: ci";
-                if let Err(error) =
-                    block_task(ctx, &task, reason, api_types::FailureKind::CiFailed, None).await
+                if let Err(error) = block_task(
+                    ctx,
+                    &settled_task,
+                    reason,
+                    api_types::FailureKind::CiFailed,
+                    None,
+                )
+                .await
                 {
                     return HookResult::Failed {
                         reason: error.to_string(),
@@ -180,21 +211,52 @@ impl HookAction for RunCiSteps {
             (ReviewStatus::Passed, Some(now.clone()))
         };
 
-        let review = match ReviewRepo::update_status(
-            &*ctx.db,
-            &review.id,
-            status.clone(),
-            review_details.to_string(),
-            finished_at.clone(),
-            &now,
-        )
-        .await
-        {
-            Ok(review) => review,
-            Err(error) => {
-                return HookResult::Failed {
-                    reason: error.to_string(),
-                };
+        let review = if matches!(status, ReviewStatus::Passed | ReviewStatus::Failed) {
+            match ReviewRepo::update_status_with_review_authority_and_task_projection(
+                &*ctx.db,
+                &review.id,
+                status.clone(),
+                review_details.to_string(),
+                finished_at.clone(),
+                &now,
+                task.version,
+                &ctx.to_state,
+                ctx.project_version,
+                ctx.project_workflow_definition.as_deref(),
+                review.status.clone(),
+                &review.updated_at,
+                &execution_id,
+                Some((status == ReviewStatus::Passed).then_some(now.clone())),
+            )
+            .await
+            {
+                Ok(review) => review,
+                Err(error) => {
+                    cancel_review_after_authority_loss(ctx, &review, &error.to_string()).await;
+                    return HookResult::Failed {
+                        reason: error.to_string(),
+                    };
+                }
+            }
+        } else {
+            match update_review_status_with_authority_checks(
+                ctx,
+                &review,
+                status.clone(),
+                review_details.to_string(),
+                finished_at.clone(),
+                &now,
+                task.version,
+                &execution_id,
+            )
+            .await
+            {
+                Ok(review) => review,
+                Err(error) => {
+                    return HookResult::Failed {
+                        reason: error.to_string(),
+                    };
+                }
             }
         };
         publish_domain_event(
@@ -211,16 +273,6 @@ impl HookAction for RunCiSteps {
         }
 
         if status == ReviewStatus::Passed {
-            if !had_review_passed {
-                if let Err(error) =
-                    TaskRepo::set_review_passed_at(&*ctx.db, &ctx.task_id, Some(now.clone()), &now)
-                        .await
-                {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
-                }
-            }
             publish_review_passed(ctx, &review);
         }
 
@@ -253,9 +305,35 @@ impl HookAction for AutoCascadeOnReviewPass {
         match latest_review {
             Some(review)
                 if review.status == ReviewStatus::Passed
+                    && task.review_passed_at.is_some()
                     && !user_approval_required
                     && (!reviewer_assigned || review_has_auditor_verdict(&review)) =>
             {
+                let project = match ProjectRepo::get_by_id(&*ctx.db, &ctx.project_id).await {
+                    Ok(Some(project)) => project,
+                    Ok(None) => {
+                        return HookResult::Failed {
+                            reason: format!("project {} not found", ctx.project_id),
+                        };
+                    }
+                    Err(error) => {
+                        return HookResult::Failed {
+                            reason: error.to_string(),
+                        };
+                    }
+                };
+                if project.paused_at.is_some() {
+                    if let Err(error) =
+                        crate::deferred_dispatch::defer_integration_for_pause(&ctx.db, &task).await
+                    {
+                        return HookResult::Failed {
+                            reason: error.to_string(),
+                        };
+                    }
+                    return HookResult::Skipped {
+                        reason: "project paused; integration deferred".to_owned(),
+                    };
+                }
                 HookResult::Cascade {
                     to: default_states::MERGING.to_string(),
                     reason: if review_is_ci_only(&review) {
@@ -270,9 +348,14 @@ impl HookAction for AutoCascadeOnReviewPass {
                     && Some(review.execution_id.as_str()) == ctx.execution_id.as_deref() =>
             {
                 if task.review_passed_at.is_some() && !review_has_auditor_verdict(&review) {
-                    if let Err(error) =
-                        TaskRepo::set_review_passed_at(&*ctx.db, &ctx.task_id, None, &now_rfc3339())
-                            .await
+                    if let Err(error) = TaskRepo::set_review_passed_at_cas(
+                        &*ctx.db,
+                        &ctx.task_id,
+                        task.version,
+                        None,
+                        &now_rfc3339(),
+                    )
+                    .await
                     {
                         return HookResult::Failed {
                             reason: error.to_string(),
@@ -301,15 +384,19 @@ impl HookAction for AutoCascadeOnReviewPass {
                         };
                     }
                 };
-                let existing_count =
-                    match TransitionLogRepo::list_by_task(&*ctx.db, &ctx.task_id).await {
-                        Ok(entries) => review_rejections_since_boundary(&entries),
-                        Err(error) => {
-                            return HookResult::Failed {
-                                reason: error.to_string(),
-                            };
-                        }
-                    };
+                let existing_count = match TransitionLogRepo::list_by_task(&*ctx.db, &ctx.task_id)
+                    .await
+                {
+                    Ok(entries) => crate::task_diagnostics::count_gate_rejections_since_boundary(
+                        &entries,
+                        default_states::REVIEW,
+                    ),
+                    Err(error) => {
+                        return HookResult::Failed {
+                            reason: error.to_string(),
+                        };
+                    }
+                };
                 if existing_count + 1 >= i64::from(budget) {
                     let reason = "review retry budget exhausted";
                     if let Err(error) = block_task(
@@ -396,6 +483,32 @@ impl HookAction for AutoCascadeOnUnconfiguredReview {
             return HookResult::Ok;
         }
 
+        let project = match ProjectRepo::get_by_id(&*ctx.db, &ctx.project_id).await {
+            Ok(Some(project)) => project,
+            Ok(None) => {
+                return HookResult::Failed {
+                    reason: format!("project {} not found", ctx.project_id),
+                };
+            }
+            Err(error) => {
+                return HookResult::Failed {
+                    reason: error.to_string(),
+                };
+            }
+        };
+        if project.paused_at.is_some() {
+            if let Err(error) =
+                crate::deferred_dispatch::defer_integration_for_pause(&ctx.db, &task).await
+            {
+                return HookResult::Failed {
+                    reason: error.to_string(),
+                };
+            }
+            return HookResult::Skipped {
+                reason: "project paused; integration deferred".to_owned(),
+            };
+        }
+
         HookResult::Cascade {
             to: default_states::MERGING.to_string(),
             reason: "review skipped: no checks or reviewer assigned".to_string(),
@@ -411,20 +524,4 @@ fn gate_requires_user_approval(ctx: &HookContext) -> bool {
 
 fn human_review_requested(ctx: &HookContext, reviewer_assigned: bool) -> bool {
     ctx.triggered_by.is_user() && ctx.to_state == default_states::REVIEW && !reviewer_assigned
-}
-
-fn review_rejections_since_boundary(entries: &[TransitionLog]) -> i64 {
-    let boundary = entries.iter().rposition(|entry| {
-        entry.from_state == default_states::REVIEW
-            && !entry.rejection
-            && (entry.to_state != default_states::REVIEW
-                || entry.trigger_name.as_deref() == Some("reset_retry_window"))
-    });
-    let entries = boundary
-        .and_then(|index| entries.get(index + 1..))
-        .unwrap_or(entries);
-    entries
-        .iter()
-        .filter(|entry| entry.from_state == default_states::REVIEW && entry.rejection)
-        .count() as i64
 }

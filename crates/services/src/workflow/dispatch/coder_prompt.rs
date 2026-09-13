@@ -58,7 +58,10 @@ impl PromptBuilder for CoderMergeFixPromptBuilder {
 const CODER_ROLE_BOUNDARY: &str = "\
 Coder boundary:
 - Must implement only the requested task in the task worktree.
-- Must inspect supplied plans, comments, and review feedback first, keep scope tight, run relevant verification, and commit completed changes.
+- The task worktree is the only checkout you may modify. Never enter, edit, or run commands against the source checkout or another worktree.
+- Never merge, rebase, cherry-pick, push, or otherwise integrate this task into the target/default branch. Forge alone may integrate an accepted review.
+- Must inspect supplied plans, comments, and review feedback first, keep scope tight, run relevant verification, and complete delivery according to the execution harness contract.
+- Commit completed changes unless higher-priority runtime instructions explicitly say the host finalizes them.
 - Must not change unrelated behavior, ignore failed verification, treat review feedback as optional, or claim success without running verification.
 - Red flags: broad refactors, skipped checks, missing proof media for UI/runtime changes.";
 
@@ -70,7 +73,8 @@ Review-fix boundary:
 
 const MERGE_FIX_ROLE_BOUNDARY: &str = "\
 Merge-fix boundary:
-- Must resolve merge conflicts minimally while preserving implementation intent, then run targeted verification.
+- May finish uncommitted Task-worktree changes, but must not rebase or attempt a real branch conflict repair. Forge parks real merge conflicts for manual workspace repair.
+- Must complete delivery according to the execution harness contract, then run targeted verification.
 - Must not rewrite the feature or add unrelated cleanup.
 - Red flags: redesigns, formatting churn outside conflicted areas, unrelated fixes.";
 
@@ -86,7 +90,7 @@ fn coder_system(ctx: &AgentDispatchContext, extra_role_boundary: Option<&str>) -
         .plan
         .as_deref()
         .is_some_and(|plan| !plan.trim().is_empty());
-    let mut system = "You are the coder agent for this Forge workflow task. Your job is to implement code changes in the worktree. Once you finish, the task moves to the reviewer agent for verification. Keep the scope tight, verify the result compiles and passes locally, and commit your changes.".to_string();
+    let mut system = "You are the coder agent for this Forge workflow task. Your job is to implement code changes in the worktree. Once you finish, the task moves to the reviewer agent for verification. Keep the scope tight, verify the result compiles and passes locally, and complete delivery according to the execution harness contract.".to_string();
     system.push_str("\n\n");
     system.push_str(MANAGED_EXECUTION_CONTRACT);
     system.push_str("\n\n");
@@ -129,7 +133,7 @@ fn implementation_user(ctx: &AgentDispatchContext) -> String {
         user.push_str("\nMerge failed on the prior attempt:\n");
         user.push_str(&reason);
         user.push_str(
-            "\nRebase your worktree onto the latest main and resolve the conflict before re-submitting.\n",
+            "\nInspect only the current task-worktree files and do not rebase or integrate branches. If a real branch conflict remains, report the manual repair blocker; Forge handles integration outside the managed sandbox.\n",
         );
     }
 
@@ -156,7 +160,7 @@ fn review_fix_user(ctx: &AgentDispatchContext) -> String {
     if let Some(reason) = latest_ci_failure_reason(ctx) {
         let mut user = format!("Task: {}\n", ctx.task.title);
         user.push_str(
-            "\nCI failed during review. Fix only the failing check below, keep the existing implementation direction, and commit the minimal correction.\n",
+            "\nCI failed during review. Fix only the failing check below, keep the existing implementation direction, and complete the minimal correction according to the execution harness contract.\n",
         );
         user.push_str("\nCI failure:\n");
         user.push_str(&reason);
@@ -186,7 +190,7 @@ fn review_fix_user(ctx: &AgentDispatchContext) -> String {
         user.push('\n');
     }
     user.push_str(
-        "\nThe reviewer agent flagged the previous implementation. Inspect the current worktree diff, address only the review findings, and commit your fixes. The task will return to the reviewer agent for re-verification.\n",
+        "\nThe reviewer agent flagged the previous implementation. Inspect the current worktree diff, address only the review findings, and complete delivery according to the execution harness contract. The task will return to the reviewer agent for re-verification.\n",
     );
     if let Some(reason) = review_feedback(ctx) {
         user.push_str("\nReview feedback:\n");
@@ -241,11 +245,29 @@ fn latest_ci_failure_reason(ctx: &AgentDispatchContext) -> Option<String> {
 
 fn merge_fix_user(ctx: &AgentDispatchContext) -> String {
     let mut user = String::new();
-    if ctx.task.review_passed_at.is_some() {
-        user.push_str("merge-conflict re-review: the reviewer already approved this task, but the merge failed due to conflicts. Since the review already passed, only CI checks will run after your fix — the reviewer will not re-review. Focus solely on resolving the merge conflicts without redesigning the change.\n\n");
+    if matches!(
+        merge_failure_kind(ctx),
+        Some(api_types::FailureKind::DirtyWorktree)
+    ) {
+        if ctx.task.review_passed_at.is_some() {
+            user.push_str("The task previously passed review, but integration found uncommitted changes in the task worktree, not a merge conflict. Preserve the approved intent and the existing work; do not rebase or discard it. The repaired commit will receive a fresh review before Forge retries integration.\n\n");
+        } else {
+            user.push_str("Integration found uncommitted changes in the task worktree, not a merge conflict. Preserve the existing work; do not rebase or discard it.\n\n");
+        }
+        user.push_str("Inspect the worktree changes, finish the intended implementation, complete delivery according to the execution harness contract, and verify the focused checks pass.");
+    } else {
+        if ctx.task.review_passed_at.is_some() {
+            user.push_str("The task previously passed review, but integration found a real merge conflict. That conflict requires manual workspace repair and a fresh review before Forge retries integration.\n\n");
+        }
+        user.push_str("Do not rebase or attempt integration from this managed sandbox. Report that manual task-worktree repair is required and stop without changing unrelated files.");
     }
-    user.push_str("Rebase your worktree branch onto the latest default branch, resolve the merge conflicts, and verify CI passes.");
     user
+}
+
+fn merge_failure_kind(ctx: &AgentDispatchContext) -> Option<api_types::FailureKind> {
+    let annotation = ctx.task.error_annotation.as_deref()?;
+    let value = serde_json::from_str::<serde_json::Value>(annotation).ok()?;
+    serde_json::from_value(value.get("type")?.clone()).ok()
 }
 
 fn last_merge_failed_reason(ctx: &AgentDispatchContext) -> Option<String> {

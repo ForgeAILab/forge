@@ -400,6 +400,7 @@ async fn seed_completed_reviewer_execution(
     db: &db::SqliteDb,
     task_id: &str,
     agent_id: &str,
+    parent_execution_id: Option<&str>,
 ) -> db::Execution {
     let now = now_rfc3339();
     ExecutionRepo::create(
@@ -414,7 +415,7 @@ async fn seed_completed_reviewer_execution(
             stopped_by: Some("system:executor".to_owned()),
             resume_policy: None,
             stopped_at: Some(now.clone()),
-            parent_execution_id: None,
+            parent_execution_id: parent_execution_id.map(str::to_owned),
             agent_session_id: Some("reviewer-session".to_owned()),
             agent_message_id: None,
             last_activity_at: None,
@@ -851,6 +852,155 @@ async fn dispatcher_leaves_a_deliberately_paused_project_alone() {
         .expect("project loads")
         .expect("project exists");
     assert_eq!(untouched.paused_at.as_deref(), Some(paused_at.as_str()));
+}
+
+#[tokio::test]
+async fn stale_repository_resume_cannot_clear_a_later_manual_pause() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let project_id = seed_unprovisioned_project(&db, "stale repository resume").await;
+    let (dispatcher, _rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    dispatcher
+        .check_once()
+        .await
+        .expect("dispatcher pauses project");
+    let auto_paused = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("auto-paused Project loads")
+        .expect("Project exists");
+    let auto_pause_reason = auto_paused
+        .system_pause_reason
+        .clone()
+        .expect("dispatcher records its pause reason");
+    let auto_pause_at = auto_paused
+        .paused_at
+        .clone()
+        .expect("dispatcher records its pause timestamp");
+
+    // Attaching a repository makes the stale snapshot eligible for an
+    // automatic resume, but deliberately keep that snapshot in hand while a
+    // user pause wins the race.
+    let default_branch = setup_git_repo(repo_dir.path());
+    let repo_id = new_uuid_v4();
+    RepoRepo::create(
+        &*db,
+        CreateRepo {
+            id: repo_id.clone(),
+            project_id: project_id.clone(),
+            name: "stale-resume-repo".to_owned(),
+            remote_url: repo_dir.path().to_string_lossy().into_owned(),
+            local_path: Some(repo_dir.path().to_string_lossy().into_owned()),
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("repository creates");
+    let attached = ProjectRepo::update_at_version(
+        &*db,
+        UpdateProject {
+            id: project_id.clone(),
+            name: None,
+            settings: None,
+            primary_repo_id: Some(Some(repo_id)),
+            paused_at: None,
+            updated_at: now_rfc3339(),
+        },
+        auto_paused.version,
+        None,
+    )
+    .await
+    .expect("repository attaches");
+    assert_eq!(attached.version, auto_paused.version + 1);
+    assert_eq!(attached.paused_at.as_deref(), Some(auto_pause_at.as_str()));
+    assert_eq!(
+        attached.system_pause_reason.as_deref(),
+        Some(auto_pause_reason.as_str())
+    );
+
+    let manual_pause_at = "2099-01-01T00:00:00Z".to_owned();
+    ProjectRepo::set_paused_at(&*db, &project_id, Some(manual_pause_at.clone()))
+        .await
+        .expect("manual pause wins race");
+
+    // The dispatcher still has the exact post-attachment snapshot, but its
+    // CAS must reject the now-stale system pause rather than clearing the
+    // user's pause.
+    assert!(!dispatcher
+        .sync_repository_pause(&attached)
+        .await
+        .expect("stale auto-resume is benign"));
+    let current = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("Project reloads")
+        .expect("Project exists");
+    assert_eq!(current.paused_at.as_deref(), Some(manual_pause_at.as_str()));
+    assert!(current.system_pause_reason.is_none());
+    assert_eq!(current.version, attached.version + 1);
+}
+
+#[tokio::test]
+async fn stale_repository_pause_cannot_pause_after_repository_attachment() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let project_id = seed_unprovisioned_project(&db, "stale repository pause").await;
+    let stale_active = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("Project loads")
+        .expect("Project exists");
+    let (dispatcher, _rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    let default_branch = setup_git_repo(repo_dir.path());
+    let repo_id = new_uuid_v4();
+    RepoRepo::create(
+        &*db,
+        CreateRepo {
+            id: repo_id.clone(),
+            project_id: project_id.clone(),
+            name: "stale-pause-repo".to_owned(),
+            remote_url: repo_dir.path().to_string_lossy().into_owned(),
+            local_path: Some(repo_dir.path().to_string_lossy().into_owned()),
+            work_mode: db::WorkMode::DirectMerge,
+            default_branch,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("repository creates");
+    ProjectRepo::update_at_version(
+        &*db,
+        UpdateProject {
+            id: project_id.clone(),
+            name: None,
+            settings: None,
+            primary_repo_id: Some(Some(repo_id)),
+            paused_at: None,
+            updated_at: now_rfc3339(),
+        },
+        stale_active.version,
+        None,
+    )
+    .await
+    .expect("repository attaches");
+
+    // This is the old scanner snapshot: it observed no primary repository,
+    // but the repository authority changed before its write boundary.
+    assert!(!dispatcher
+        .sync_repository_pause(&stale_active)
+        .await
+        .expect("stale auto-pause is benign"));
+    let current = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("Project reloads")
+        .expect("Project exists");
+    assert!(current.paused_at.is_none());
+    assert!(current.system_pause_reason.is_none());
 }
 
 #[tokio::test]
@@ -1368,8 +1518,23 @@ async fn dispatcher_reconciles_completed_reviewer_and_launches_its_retry() {
         &agent_id,
     )
     .await;
-    let execution = seed_completed_reviewer_execution(&db, &task.id, &agent_id).await;
-    seed_running_review(&db, &task.id, &execution.id, r#"{"ci_steps":[]}"#).await;
+    let candidate_execution = seed_completed_coder_execution(&db, &task.id).await;
+    seed_running_review(&db, &task.id, &candidate_execution, r#"{"ci_steps":[]}"#).await;
+    let execution =
+        seed_completed_reviewer_execution(&db, &task.id, &agent_id, Some(&candidate_execution))
+            .await;
+    let review = ReviewRepo::list_by_task(&*db, &task.id)
+        .await
+        .expect("review loads")
+        .into_iter()
+        .next()
+        .expect("review exists");
+    sqlx::query("UPDATE review SET reviewer_execution_id = ? WHERE id = ?")
+        .bind(&execution.id)
+        .bind(&review.id)
+        .execute(db.pool())
+        .await
+        .expect("reviewer attempt binding records");
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
 
     let first = dispatcher
@@ -1424,6 +1589,233 @@ async fn dispatcher_reconciles_completed_reviewer_and_launches_its_retry() {
         .expect("reviewer execution count loads"),
         2
     );
+}
+
+#[tokio::test]
+async fn dispatcher_never_reuses_reviewer_execution_for_newer_review_attempt() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let task = seed_task(&db, &project_id, "fresh review", "review", 0).await;
+    sqlx::query("UPDATE task SET task_type = 'discovery' WHERE id = ?")
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .expect("task becomes read-only");
+    assign_role(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::REVIEWER,
+        &agent_id,
+    )
+    .await;
+    let stale_candidate_execution = seed_completed_coder_execution(&db, &task.id).await;
+    let stale = seed_completed_reviewer_execution(
+        &db,
+        &task.id,
+        &agent_id,
+        Some(&stale_candidate_execution),
+    )
+    .await;
+    sqlx::query("UPDATE execution SET created_at = ?, updated_at = ?, stopped_at = ? WHERE id = ?")
+        .bind("2000-01-01T00:00:00Z")
+        .bind("2000-01-01T00:00:01Z")
+        .bind("2000-01-01T00:00:01Z")
+        .bind(&stale.id)
+        .execute(db.pool())
+        .await
+        .expect("stale reviewer parent binding moves behind current review");
+    let candidate_execution = seed_completed_coder_execution(&db, &task.id).await;
+    seed_running_review(&db, &task.id, &candidate_execution, r#"{"ci_steps":[]}"#).await;
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+
+    assert_eq!(dispatched, 1);
+    let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("fresh reviewer spawned in time")
+        .expect("reviewer execution context received");
+    assert_eq!(ctx.task_id, task.id);
+    assert_ne!(ctx.execution_id, stale.id);
+    let reviews = ReviewRepo::list_by_task(&*db, &task.id)
+        .await
+        .expect("reviews load");
+    assert_eq!(reviews.len(), 1, "no synthetic review row is created");
+    assert_eq!(reviews[0].status, ReviewStatus::Running);
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(
+            &*db,
+            &task.id,
+            crate::workflow::default_roles::REVIEWER,
+        )
+        .await
+        .expect("reviewer execution count loads"),
+        2
+    );
+}
+
+#[tokio::test]
+async fn reviewer_completion_guard_fails_closed_without_exact_binding() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let task = seed_task(&db, &project_id, "ambiguous review", "review", 0).await;
+    let candidate_execution = seed_completed_coder_execution(&db, &task.id).await;
+    seed_running_review(&db, &task.id, &candidate_execution, r#"{"ci_steps":[]}"#).await;
+    let stale = seed_completed_reviewer_execution(&db, &task.id, &agent_id, None).await;
+
+    // The reviewer is intentionally newer by wall-clock time, but it has no
+    // exact Review-attempt binding. Candidate parentage and timestamps cannot
+    // repair that missing identity.
+    sqlx::query("UPDATE execution SET created_at = ? WHERE id = ?")
+        .bind("2026-01-01T00:00:01Z")
+        .bind(&stale.id)
+        .execute(db.pool())
+        .await
+        .expect("execution timestamp updates");
+    sqlx::query("UPDATE review SET started_at = ? WHERE task_id = ?")
+        .bind("2026-01-01T00:00:00Z")
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .expect("review timestamp updates");
+    let execution = ExecutionRepo::get_by_id(&*db, &stale.id)
+        .await
+        .expect("execution loads")
+        .expect("execution exists");
+    let review = ReviewRepo::list_by_task(&*db, &task.id)
+        .await
+        .expect("reviews load")
+        .into_iter()
+        .next()
+        .expect("review exists");
+    assert!(
+        crate::task_service::execution::reviewer_execution_lacks_exact_review_binding(
+            &execution, &review,
+        )
+    );
+
+    let mut rebound = review.clone();
+    rebound.reviewer_execution_id = Some("replacement-reviewer".to_owned());
+    assert!(
+        crate::task_service::execution::reviewer_execution_lacks_exact_review_binding(
+            &execution, &rebound,
+        ),
+        "replacing a Review attempt binding must reject the old execution"
+    );
+
+    sqlx::query("UPDATE execution SET created_at = ? WHERE id = ?")
+        .bind("not-an-rfc3339-timestamp")
+        .bind(&stale.id)
+        .execute(db.pool())
+        .await
+        .expect("malformed execution timestamp updates");
+    let execution = ExecutionRepo::get_by_id(&*db, &stale.id)
+        .await
+        .expect("execution reloads")
+        .expect("execution exists");
+    assert!(
+        crate::task_service::execution::reviewer_execution_lacks_exact_review_binding(
+            &execution, &review,
+        )
+    );
+
+    sqlx::query("UPDATE execution SET created_at = ? WHERE id = ?")
+        .bind("2026-01-01T00:00:01Z")
+        .bind(&stale.id)
+        .execute(db.pool())
+        .await
+        .expect("execution timestamp restores");
+    sqlx::query("UPDATE review SET started_at = ? WHERE task_id = ?")
+        .bind("not-an-rfc3339-timestamp")
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .expect("malformed review timestamp updates");
+    let execution = ExecutionRepo::get_by_id(&*db, &stale.id)
+        .await
+        .expect("execution reloads")
+        .expect("execution exists");
+    let review = ReviewRepo::list_by_task(&*db, &task.id)
+        .await
+        .expect("reviews reload")
+        .into_iter()
+        .next()
+        .expect("review exists");
+    assert!(
+        crate::task_service::execution::reviewer_execution_lacks_exact_review_binding(
+            &execution, &review,
+        )
+    );
+}
+
+#[tokio::test]
+async fn dispatcher_resumes_integration_deferred_by_project_pause() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let workspace_dir = TempDir::new().expect("workspace dir creates");
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let task = seed_task(&db, &project_id, "accepted review", "review", 0).await;
+    crate::deferred_dispatch::defer_integration_for_pause(&db, &task)
+        .await
+        .expect("paused integration marker records");
+    let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+
+    let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
+
+    // This fixture has no workspace, so the resumed merge hook is skipped.
+    // Success-atomic recovery must keep the marker for a later retry instead
+    // of reporting a dispatched integration that never ran.
+    assert_eq!(dispatched, 0);
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    assert_eq!(current.status, crate::workflow::default_states::MERGING);
+    assert!(crate::deferred_dispatch::paused_integration(&current).is_some());
+    assert!(tokio::time::timeout(Duration::from_millis(100), rx.recv())
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn losing_paused_integration_refresh_cannot_resurrect_after_clear() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().expect("repo dir creates");
+    let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
+    let task = seed_task(&db, &project_id, "accepted review", "review", 0).await;
+    let stale_before_marker = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("pre-marker task loads")
+        .expect("pre-marker task exists");
+    crate::deferred_dispatch::defer_integration_for_pause(&db, &task)
+        .await
+        .expect("paused integration marker records");
+    let stale = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("stale task loads")
+        .expect("stale task exists");
+    let marker = crate::deferred_dispatch::paused_integration(&stale).expect("stale marker exists");
+
+    crate::deferred_dispatch::clear_paused_integration(&db, &task.id, &marker)
+        .await
+        .expect("successful worker clears marker");
+    crate::deferred_dispatch::defer_integration_for_pause(&db, &stale_before_marker)
+        .await
+        .expect("stale producer is conditionally ignored");
+    crate::deferred_dispatch::refresh_paused_integration_for_pause(&db, &stale)
+        .await
+        .expect("losing worker refreshes conditionally");
+
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("current task loads")
+        .expect("current task exists");
+    assert!(crate::deferred_dispatch::paused_integration(&current).is_none());
 }
 
 #[tokio::test]
@@ -1551,11 +1943,27 @@ async fn coordination_root_target_moved_rebase_returns_to_aggregate_review() {
     )
     .await
     .expect("completed child creates");
-    assert!(
-        crate::task_service::mark_coordination_review_pending_if_root(&db, &root)
-            .await
-            .expect("clean target-moved rebase marks aggregate review pending")
-    );
+    TransitionLogRepo::insert(
+        &*db,
+        db::CreateTransitionLog {
+            id: new_uuid_v4(),
+            task_id: root.id.clone(),
+            from_state: crate::workflow::default_states::MERGING.to_owned(),
+            to_state: crate::workflow::default_states::MERGE_FAILED.to_owned(),
+            trigger_name: Some("retry".to_owned()),
+            triggered_by: api_types::Actor::system(api_types::SystemComponent::Workflow).display(),
+            trigger_reason: format!(
+                "{} {} target advanced; re-review required",
+                crate::workflow::REVIEW_REFRESH_MARKER,
+                crate::workflow::TARGET_MOVED_MARKER
+            ),
+            hook_results_json: None,
+            rejection: false,
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("review-refresh transition records");
 
     let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
     let dispatched = dispatcher.check_once().await.expect("dispatcher runs");
@@ -2606,4 +3014,33 @@ async fn wake_does_not_duplicate_already_dispatched_charter_work() {
         1,
         "exactly one execution exists after wake + restart"
     );
+}
+
+#[test]
+fn a_running_execution_slot_is_not_a_deterministic_dispatch_refusal() {
+    // A slot held by a concurrently running execution frees itself when that
+    // execution terminalises, and nothing about that touches the Task row. If
+    // this were classified as deterministic, the dispatcher would record a
+    // disposition and never reconsider the Task — the wedge this guards.
+    assert!(!helpers::is_deterministic_dispatch_refusal(
+        &crate::ServiceError::ExecutionAlreadyRunning {
+            scope: "repository".to_owned(),
+            execution_id: new_uuid_v4(),
+        }
+    ));
+    assert!(!helpers::is_deterministic_dispatch_refusal(
+        &crate::ServiceError::ExecutionAlreadyRunning {
+            scope: crate::workflow::default_roles::REVIEWER.to_owned(),
+            execution_id: new_uuid_v4(),
+        }
+    ));
+
+    // The contrast that must keep working: a governance refusal is durable and
+    // still earns a disposition.
+    assert!(helpers::is_deterministic_dispatch_refusal(
+        &crate::ServiceError::GuardRejection {
+            guard: "dependency_gate".to_owned(),
+            reason: "task has 1 unsatisfied dependency".to_owned(),
+        }
+    ));
 }

@@ -883,7 +883,7 @@ pub(super) async fn forge_follow_up_execution(
 
     let launched = state
         .task_service
-        .follow_up_execution(execution_id, message, agent_id, overrides)
+        .follow_up_interactive_execution(execution_id, message, agent_id, overrides)
         .await?;
 
     Ok(json!({

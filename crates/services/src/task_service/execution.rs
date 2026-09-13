@@ -4,7 +4,7 @@ use crate::workflow::dispatch::{
     build_effective_prompt, dispatch_intent_from_workflow_dispatch, effective_prompt_selection,
     loader::load_agent_dispatch_context,
 };
-use db::{CreateReview, UpdateTask, UpdateTaskStatus};
+use db::{UpdateTask, UpdateTaskStatus};
 
 mod cascade;
 mod follow_up;
@@ -18,6 +18,10 @@ mod runner;
 pub(super) use runner::{bounded_lease_expiry, execution_deadline_seconds, rfc3339_after};
 
 pub(super) use cascade::should_block_task_for_failed_execution;
+pub(crate) use cascade::{
+    exact_review_for_execution, reviewer_execution_lacks_exact_review_binding,
+    terminal_review_is_bound_to_execution,
+};
 
 pub(super) fn publish_terminal_execution_event(service: &TaskService, execution: &Execution) {
     match execution.status {
@@ -73,19 +77,39 @@ async fn clear_execution_retry_metadata_inner(
     task: &Task,
     clear_deferred_dispatch: bool,
 ) -> Result<()> {
-    let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
+    let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
         ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
     })?;
-    let mut changed = false;
-    let mut keys = vec!["execution_retry_count", "last_execution_failure_at"];
-    if clear_deferred_dispatch {
-        keys.push("deferred_dispatch");
+    let mut mutations = Vec::new();
+    if let Some(expected_count) = metadata.extra.get("execution_retry_count").cloned() {
+        let mut nested = vec![
+            db::TaskMetadataMutation::Remove {
+                key: "execution_retry_count".to_owned(),
+            },
+            db::TaskMetadataMutation::Remove {
+                key: "last_execution_failure_at".to_owned(),
+            },
+        ];
+        if clear_deferred_dispatch {
+            nested.push(db::TaskMetadataMutation::Remove {
+                key: "deferred_dispatch".to_owned(),
+            });
+        }
+        mutations.push(db::TaskMetadataMutation::CompareAndMutate {
+            key: "execution_retry_count".to_owned(),
+            expected: expected_count,
+            mutations: nested,
+        });
+    } else if clear_deferred_dispatch {
+        if let Some(expected) = metadata.extra.get("deferred_dispatch").cloned() {
+            mutations.push(db::TaskMetadataMutation::RemoveIf {
+                key: "deferred_dispatch".to_owned(),
+                expected,
+            });
+        }
     }
-    for key in keys {
-        changed |= metadata.extra.remove(key).is_some();
-    }
-    if changed {
-        TaskRepo::set_metadata_json(db, &task.id, metadata.to_json(), &now_rfc3339()).await?;
+    if !mutations.is_empty() {
+        TaskRepo::mutate_metadata(db, &task.id, None, mutations, &now_rfc3339()).await?;
     }
     Ok(())
 }
@@ -96,42 +120,88 @@ pub(super) async fn set_planning_awaiting_review_metadata(
     execution_id: Option<&str>,
     awaiting: bool,
 ) -> Result<Task> {
-    let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
+    let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
         ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
     })?;
+    let mutations;
     if awaiting {
-        metadata
-            .extra
-            .insert("awaiting_human".to_owned(), json!(true));
-        metadata
-            .extra
-            .insert("awaiting_human_reason".to_owned(), json!("plan_review"));
-        metadata.extra.insert(
-            "planning_completed_at".to_owned(),
-            Value::String(now_rfc3339()),
-        );
+        let completed_at = now_rfc3339();
+        let marker_id = new_uuid_v4();
+        let mut next = vec![
+            db::TaskMetadataMutation::Set {
+                key: "awaiting_human".to_owned(),
+                value: json!(true),
+            },
+            db::TaskMetadataMutation::Set {
+                key: "awaiting_human_reason".to_owned(),
+                value: json!("plan_review"),
+            },
+            db::TaskMetadataMutation::Set {
+                key: "planning_completed_at".to_owned(),
+                value: Value::String(completed_at),
+            },
+            db::TaskMetadataMutation::Set {
+                key: "awaiting_human_marker_id".to_owned(),
+                value: Value::String(marker_id),
+            },
+        ];
         if let Some(execution_id) = execution_id {
-            metadata.extra.insert(
-                "planning_execution_id".to_owned(),
-                Value::String(execution_id.to_owned()),
-            );
+            next.push(db::TaskMetadataMutation::Set {
+                key: "planning_execution_id".to_owned(),
+                value: Value::String(execution_id.to_owned()),
+            });
         }
+        mutations = next;
     } else if metadata
         .extra
         .get("awaiting_human_reason")
         .and_then(Value::as_str)
         == Some("plan_review")
     {
-        metadata.extra.remove("awaiting_human");
-        metadata.extra.remove("awaiting_human_reason");
-        metadata.extra.remove("planning_completed_at");
-        metadata.extra.remove("planning_execution_id");
+        let Some((identity_key, expected)) = metadata
+            .extra
+            .get("awaiting_human_marker_id")
+            .cloned()
+            .map(|value| ("awaiting_human_marker_id", value))
+            .or_else(|| {
+                metadata
+                    .extra
+                    .get("planning_execution_id")
+                    .cloned()
+                    .map(|value| ("planning_execution_id", value))
+            })
+        else {
+            // Legacy markers have no stable identity. Leaving one in place is
+            // safer than allowing a stale transition to clear a newer marker
+            // with the same reason.
+            return Ok(task.clone());
+        };
+        mutations = vec![db::TaskMetadataMutation::CompareAndMutate {
+            key: identity_key.to_owned(),
+            expected,
+            mutations: vec![
+                db::TaskMetadataMutation::Remove {
+                    key: "awaiting_human".to_owned(),
+                },
+                db::TaskMetadataMutation::Remove {
+                    key: "awaiting_human_reason".to_owned(),
+                },
+                db::TaskMetadataMutation::Remove {
+                    key: "planning_completed_at".to_owned(),
+                },
+                db::TaskMetadataMutation::Remove {
+                    key: "planning_execution_id".to_owned(),
+                },
+                db::TaskMetadataMutation::Remove {
+                    key: "awaiting_human_marker_id".to_owned(),
+                },
+            ],
+        }];
     } else {
         return Ok(task.clone());
     }
 
-    TaskRepo::set_metadata_json(db, &task.id, metadata.to_json(), &now_rfc3339()).await?;
-    TaskRepo::get_by_id(db, &task.id, false)
-        .await?
-        .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))
+    TaskRepo::mutate_metadata(db, &task.id, Some(task.version), mutations, &now_rfc3339())
+        .await
+        .map_err(Into::into)
 }

@@ -2,8 +2,8 @@ use crate::{DomainEventService, Result, ServiceError};
 use async_trait::async_trait;
 use db::{
     new_uuid_v4, now_rfc3339, CreatePrMetadata, PrMetadata, PrMetadataRepo, PrProviderConfig,
-    PrProviderConfigRepo, Repo, RepoRepo, SqliteDb, Task, TaskMetadata, TaskRepo, UpdatePrMetadata,
-    UpdateTaskStatus, WorkspaceRepo,
+    PrProviderConfigRepo, Repo, RepoRepo, SqliteDb, Task, TaskMetadata, TaskMetadataMutation,
+    TaskRepo, UpdatePrMetadata, UpdateTaskStatus, WorkspaceRepo,
 };
 use events::EventBus;
 use serde_json::json;
@@ -463,20 +463,69 @@ fn resolve_token_secret(config: &PrProviderConfig) -> Result<Option<String>> {
 }
 
 async fn set_task_awaiting_human(db: &SqliteDb, task: &Task, awaiting_human: bool) -> Result<()> {
-    let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
-        ServiceError::invalid_operation(format!("invalid task metadata: {error}"))
-    })?;
-    metadata
-        .extra
-        .insert("awaiting_human".to_owned(), json!(awaiting_human));
     if awaiting_human {
-        metadata.extra.insert(
-            "awaiting_human_reason".to_owned(),
-            json!("pull_request_merge"),
-        );
-    } else {
-        metadata.extra.remove("awaiting_human_reason");
+        return TaskRepo::mutate_metadata(
+            db,
+            &task.id,
+            Some(task.version),
+            vec![
+                TaskMetadataMutation::Set {
+                    key: "awaiting_human".to_owned(),
+                    value: json!(true),
+                },
+                TaskMetadataMutation::Set {
+                    key: "awaiting_human_reason".to_owned(),
+                    value: json!("pull_request_merge"),
+                },
+                TaskMetadataMutation::Set {
+                    key: "awaiting_human_marker_id".to_owned(),
+                    value: json!(new_uuid_v4()),
+                },
+            ],
+            &now_rfc3339(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| match error {
+            db::DbError::Check(reason) => ServiceError::invalid_operation(reason),
+            error => error.into(),
+        });
     }
-    TaskRepo::set_metadata_json(db, &task.id, metadata.to_json(), &now_rfc3339()).await?;
+
+    let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
+        ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
+    })?;
+    let Some(expected) = metadata.extra.get("awaiting_human_marker_id").cloned() else {
+        // Legacy markers have no identity that can distinguish this clear
+        // from a newer pull-request marker with the same reason.
+        return Ok(());
+    };
+    TaskRepo::mutate_metadata(
+        db,
+        &task.id,
+        None,
+        vec![TaskMetadataMutation::CompareAndMutate {
+            key: "awaiting_human_marker_id".to_owned(),
+            expected,
+            mutations: vec![
+                TaskMetadataMutation::Remove {
+                    key: "awaiting_human".to_owned(),
+                },
+                TaskMetadataMutation::Remove {
+                    key: "awaiting_human_reason".to_owned(),
+                },
+                TaskMetadataMutation::Remove {
+                    key: "awaiting_human_marker_id".to_owned(),
+                },
+            ],
+        }],
+        &now_rfc3339(),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| match error {
+        db::DbError::Check(reason) => ServiceError::invalid_operation(reason),
+        error => error.into(),
+    })?;
     Ok(())
 }

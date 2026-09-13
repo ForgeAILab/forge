@@ -2,8 +2,8 @@ use std::{path::Path, path::PathBuf, sync::Arc};
 
 use api_types::{LifecycleHookDef, LifecycleHooks, ProjectSettings, StateKind, WorkflowDefinition};
 use db::{
-    Execution, ExecutionRepo, PageRequest, ProjectRepo, RepoRepo, SortBy, SortOrder, Task,
-    TaskRepo, TransitionLogRepo, Workspace, WorkspaceRepo,
+    Execution, ExecutionRepo, ProjectRepo, RepoRepo, Task, TaskRepo, TransitionLogRepo, Workspace,
+    WorkspaceRepo,
 };
 use events::{EventContext, ForgeEvent};
 use tokio::sync::{broadcast, watch};
@@ -332,26 +332,14 @@ impl LifecycleEventEmitter {
             }
         }
 
-        let page = ExecutionRepo::list_by_task(
-            &*self.db,
-            task_id,
-            PageRequest {
-                cursor: None,
-                limit: 500,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Desc,
-            },
-        )
-        .await?;
-
-        let executions = page.items;
-        let fallback = executions.first().cloned();
-
-        Ok(executions
+        let fallback = ExecutionRepo::list_latest_executions_for_tasks(&*self.db, &[task_id])
+            .await?
             .into_iter()
-            .find(|execution| execution.role == "executor")
-            .or(fallback))
+            .next();
+        let executor =
+            ExecutionRepo::latest_execution_by_task_and_roles(&*self.db, task_id, &["executor"])
+                .await?;
+        Ok(executor.or(fallback))
     }
 
     async fn resolve_workspace(

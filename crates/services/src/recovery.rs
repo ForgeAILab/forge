@@ -3,13 +3,15 @@ use crate::{
     workflow::engine::WorkflowEngine, DomainEventService, Result, ServiceError, TaskService,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+#[cfg(test)]
+use db::UpdateExecution;
 use db::{
     now_rfc3339, Agent, AgentListQuery, AgentRepo, AgentSessionRepo, AgentStatus, Daemon,
     DaemonRepo, Execution, ExecutionLeaseDisposition, ExecutionProgressWarningOutcome,
     ExecutionRepo, ExecutionStatus, ExecutionTerminalOutcome, MarkUsageInvocationUnsettled,
     PageRequest, Project, ProjectRepo, RecordExecutionProgressWarning, ResumePolicy, SortBy,
     SortOrder, SqliteDb, StopReason, Task, TaskListQuery, TaskRepo, TerminalizeExecution,
-    UpdateAgent, UpdateExecution, UpdateTaskStatus, UsageLedgerRepo, WorkspaceLeaseRepo,
+    UpdateAgent, UpdateTaskStatus, UsageLedgerRepo, WorkspaceLeaseRepo,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::TaskExecutor;
@@ -149,12 +151,14 @@ impl CrashRecovery {
                         "blocking_reason": "crash recovery: before_enter was interrupted",
                     })
                     .to_string();
-                    match TaskRepo::set_entry_barrier(
+                    match TaskRepo::set_entry_barrier_with_workflow_authority(
                         &*self.db,
                         &task.id,
                         task.version,
                         Some(blocked_barrier),
                         &db::now_rfc3339(),
+                        project.version,
+                        project.workflow_definition.clone(),
                     )
                     .await
                     {
@@ -1092,12 +1096,17 @@ async fn recover_task(
             task.status
         )));
     }
+    let should_auto_resume = stop_reason == StopReason::CrashRecovery;
     let cancelled = cancel_running_executions_for_recovery(
         db,
         &task.id,
         stop_reason.clone(),
         stopped_by,
-        ResumePolicy::Manual,
+        if should_auto_resume {
+            ResumePolicy::Auto
+        } else {
+            ResumePolicy::Manual
+        },
         stop_reason == StopReason::AgentTimeout,
     )
     .await?;
@@ -1114,38 +1123,21 @@ async fn recover_task(
         });
     }
 
-    let mut has_resumable_execution = false;
-    let should_auto_resume = stop_reason == StopReason::CrashRecovery;
-    for execution in cancelled
-        .iter()
-        .filter(|execution| execution.agent_session_id.is_some())
-    {
-        has_resumable_execution = true;
-        if should_auto_resume {
-            ExecutionRepo::update(
-                db,
-                UpdateExecution {
-                    id: execution.execution_id.clone(),
-                    status: None,
-                    stop_reason: None,
-                    stopped_by: None,
-                    resume_policy: Some(Some(ResumePolicy::Auto)),
-                    stopped_at: None,
-                    agent_session_id: None,
-                    agent_message_id: None,
-                    last_activity_at: None,
-                    summary: None,
-                    logs_path: None,
-                    before_sha: None,
-                    after_sha: None,
-                    error: None,
-                    executor_config_snapshot_json: None,
-                    updated_at: now_rfc3339(),
-                },
-            )
-            .await?;
-        }
+    if should_auto_resume {
+        tracing::warn!(
+            task_id = %task.id,
+            execution_count = cancelled.len(),
+            "recovered task left in current state for automatic redispatch"
+        );
+        return Ok(RecoverTaskOutcome {
+            task,
+            annotated: false,
+        });
     }
+
+    let has_resumable_execution = cancelled
+        .iter()
+        .any(|execution| execution.agent_session_id.is_some());
     if has_resumable_execution {
         tracing::warn!(
             task_id = %task.id,
@@ -1336,24 +1328,10 @@ async fn cancel_running_executions_for_recovery(
     resume_policy: ResumePolicy,
     preserve_healthy_owner: bool,
 ) -> Result<Vec<CancelledExecution>> {
-    let page = ExecutionRepo::list_by_task(
-        db,
-        task_id,
-        PageRequest {
-            cursor: None,
-            limit: 100,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Desc,
-        },
-    )
-    .await?;
+    let executions = ExecutionRepo::list_running_by_task(db, task_id).await?;
     let mut cancelled = Vec::new();
     let now = now_rfc3339();
-    for execution in page.items {
-        if execution.status != ExecutionStatus::Running {
-            continue;
-        }
+    for execution in executions {
         if preserve_healthy_owner && execution_owner_lease_is_healthy(&execution, &now) {
             // Legacy AgentStatus heartbeat timeout is not authoritative for
             // an attempt that still has a live execution owner lease. The
@@ -2960,42 +2938,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crash_recovery_cancels_running_executions() {
+    async fn crash_recovery_auto_redispatches_running_executions_in_any_active_state() {
         let db = Arc::new(sqlite_db().await);
         let event_bus = Arc::new(EventBus::new(16));
         let (project_id, _repo_id) = seed_project_repo(&db).await;
-        let agent = seed_agent(&db, AgentStatus::Busy, Some(now_rfc3339())).await;
-        let task = seed_task(
+        let in_progress_agent = seed_agent(&db, AgentStatus::Busy, Some(now_rfc3339())).await;
+        let merge_failed_agent = seed_agent(&db, AgentStatus::Busy, Some(now_rfc3339())).await;
+        let in_progress = seed_task(
             &db,
-            project_id,
+            project_id.clone(),
             "in_progress".to_owned(),
-            Some(agent.id.clone()),
+            Some(in_progress_agent.id.clone()),
         )
         .await;
-        let execution = seed_running_execution(&db, task.id.clone(), agent.id, None).await;
+        let merge_failed = seed_task(
+            &db,
+            project_id,
+            "merge_failed".to_owned(),
+            Some(merge_failed_agent.id.clone()),
+        )
+        .await;
+        let in_progress_execution =
+            seed_running_execution(&db, in_progress.id.clone(), in_progress_agent.id, None).await;
+        let merge_failed_execution =
+            seed_running_execution(&db, merge_failed.id.clone(), merge_failed_agent.id, None).await;
 
         let recovery = CrashRecovery::new(Arc::clone(&db), event_bus);
         let recovered = recovery.run_recovery().await.expect("recovery runs");
-        assert_eq!(recovered, 1);
+        assert_eq!(recovered, 0);
 
-        let updated_task = TaskRepo::get_by_id(&*db, &task.id, false)
-            .await
-            .expect("task loads")
-            .expect("task exists");
-        assert_eq!(updated_task.status, "in_progress");
-        let annotation: Value =
-            serde_json::from_str(updated_task.error_annotation.as_deref().unwrap()).unwrap();
-        assert_eq!(annotation["blocked_execution_id"], execution.id);
-        assert_eq!(annotation["artifact"]["kind"], "execution");
-        assert_eq!(annotation["artifact"]["id"], execution.id);
+        for (task, execution, expected_status) in [
+            (in_progress, in_progress_execution, "in_progress"),
+            (merge_failed, merge_failed_execution, "merge_failed"),
+        ] {
+            let updated_task = TaskRepo::get_by_id(&*db, &task.id, false)
+                .await
+                .expect("task loads")
+                .expect("task exists");
+            assert_eq!(updated_task.status, expected_status);
+            assert!(updated_task.error_annotation.is_none());
 
-        let updated = ExecutionRepo::get_by_id(&*db, &execution.id)
-            .await
-            .expect("execution loads")
-            .expect("execution exists");
-        assert_eq!(updated.status, ExecutionStatus::Cancelled);
-        assert!(updated.error.as_deref().unwrap().contains("Recovered"));
-        assert_eq!(updated.resume_policy, Some(ResumePolicy::Manual));
+            let updated = ExecutionRepo::get_by_id(&*db, &execution.id)
+                .await
+                .expect("execution loads")
+                .expect("execution exists");
+            assert_eq!(updated.status, ExecutionStatus::Cancelled);
+            assert!(updated.error.as_deref().unwrap().contains("Recovered"));
+            assert_eq!(updated.resume_policy, Some(ResumePolicy::Auto));
+        }
     }
 
     #[tokio::test]
@@ -3141,13 +3131,13 @@ mod tests {
         );
         let first = first.expect("first recovery race call");
         let second = second.expect("second recovery race call");
-        assert_eq!(
-            [first.annotated, second.annotated]
-                .into_iter()
-                .filter(|annotated| *annotated)
-                .count(),
-            1,
-            "only the terminal-CAS winner cascades Task recovery"
+        // An interrupted implementation execution is now left for automatic
+        // redispatch, so neither caller annotates the Task. The race invariant
+        // this test exists for is the one below: the loser must not touch the
+        // successor's lease.
+        assert!(
+            !first.annotated && !second.annotated,
+            "an auto-resumable recovery does not park the Task behind an annotation"
         );
 
         let cancelled = ExecutionRepo::get_by_id(&*db, &stale_execution.id)

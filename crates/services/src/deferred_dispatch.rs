@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use db::{now_rfc3339, Task, TaskMetadata, TaskRepo};
+use db::{now_rfc3339, Task, TaskMetadata, TaskMetadataMutation, TaskRepo};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -7,12 +7,25 @@ use sha2::{Digest, Sha256};
 use crate::{Result, ServiceError};
 
 const METADATA_KEY: &str = "deferred_dispatch";
+const PAUSED_INTEGRATION_METADATA_KEY: &str = "paused_integration";
+// Ordinary metadata mutations intentionally do not advance Task.version.
+// Project-level dispatch wakes do advance it for affected rows, forming a
+// causal fence against stale disposition writers. This separate generation
+// is the paused-integration marker's own fence: clear increments it, and a
+// stale producer/retainer carrying the prior generation becomes a no-op.
+const PAUSED_INTEGRATION_GENERATION_KEY: &str = "paused_integration_generation";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct DeferredDispatch {
     pub not_before: String,
     pub reason: String,
     pub target_state: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct PausedIntegration {
+    pub state: String,
+    pub deferred_at: String,
 }
 
 pub(crate) async fn set(
@@ -22,25 +35,42 @@ pub(crate) async fn set(
     not_before: &str,
     reason: &str,
 ) -> Result<()> {
-    let mut metadata = parse_metadata(task)?;
-    metadata.extra.insert(
-        METADATA_KEY.to_owned(),
-        json!({
-            "not_before": not_before,
-            "reason": reason,
-            "target_state": target_state,
-        }),
-    );
-    TaskRepo::set_metadata_json(db, &task.id, metadata.to_json(), &now_rfc3339()).await?;
+    TaskRepo::mutate_metadata(
+        db,
+        &task.id,
+        Some(task.version),
+        vec![TaskMetadataMutation::Set {
+            key: METADATA_KEY.to_owned(),
+            value: json!({
+                "not_before": not_before,
+                "reason": reason,
+                "target_state": target_state,
+            }),
+        }],
+        &now_rfc3339(),
+    )
+    .await?;
     Ok(())
 }
 
 pub(crate) async fn clear(db: &db::SqliteDb, task: &Task) -> Result<()> {
-    let mut metadata = parse_metadata(task)?;
-    if metadata.extra.remove(METADATA_KEY).is_none() {
+    let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
+        ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
+    })?;
+    let Some(expected) = metadata.extra.get(METADATA_KEY).cloned() else {
         return Ok(());
-    }
-    TaskRepo::set_metadata_json(db, &task.id, metadata.to_json(), &now_rfc3339()).await?;
+    };
+    TaskRepo::mutate_metadata(
+        db,
+        &task.id,
+        None,
+        vec![TaskMetadataMutation::RemoveIf {
+            key: METADATA_KEY.to_owned(),
+            expected,
+        }],
+        &now_rfc3339(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -60,10 +90,157 @@ pub(crate) fn is_pending(task: &Task, now: DateTime<Utc>) -> bool {
     now < not_before.with_timezone(&Utc)
 }
 
-fn parse_metadata(task: &Task) -> Result<TaskMetadata> {
-    TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
+/// Record an integration transition that reached a Project pause boundary.
+///
+/// The Task may still be in `review` (a passed review was prevented from
+/// entering integration) or already in `merging` (the pause won the final
+/// database write race immediately before Git integration). The dispatcher
+/// consumes this marker after Project resume and retries the exact state
+/// capability without manufacturing another reviewer attempt.
+pub(crate) async fn defer_integration_for_pause(db: &db::SqliteDb, task: &Task) -> Result<()> {
+    let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
         ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
-    })
+    })?;
+    let generation = metadata
+        .extra
+        .get(PAUSED_INTEGRATION_GENERATION_KEY)
+        .cloned()
+        .unwrap_or_else(|| json!(0));
+    if generation.as_i64().is_none() {
+        return Err(ServiceError::invalid_operation(format!(
+            "invalid paused-integration generation for {}",
+            task.id
+        )));
+    }
+    TaskRepo::mutate_metadata(
+        db,
+        &task.id,
+        Some(task.version),
+        vec![
+            // Legacy rows may not have a generation yet. Establish zero in
+            // the same transaction before the conditional marker write.
+            TaskMetadataMutation::SetIfAbsent {
+                key: PAUSED_INTEGRATION_GENERATION_KEY.to_owned(),
+                value: generation.clone(),
+            },
+            TaskMetadataMutation::CompareAndMutate {
+                key: PAUSED_INTEGRATION_GENERATION_KEY.to_owned(),
+                expected: generation,
+                mutations: vec![TaskMetadataMutation::SetIfAbsent {
+                    key: PAUSED_INTEGRATION_METADATA_KEY.to_owned(),
+                    value: json!({
+                        "state": task.status.clone(),
+                        "deferred_at": now_rfc3339(),
+                    }),
+                }],
+            },
+        ],
+        &now_rfc3339(),
+    )
+    .await
+    .map_err(|error| match error {
+        db::DbError::NotFound => ServiceError::not_found("task", task.id.clone()),
+        error => error.into(),
+    })?;
+    Ok(())
+}
+
+pub(crate) fn paused_integration(task: &Task) -> Option<PausedIntegration> {
+    let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).ok()?;
+    serde_json::from_value(metadata.extra.get(PAUSED_INTEGRATION_METADATA_KEY)?.clone()).ok()
+}
+
+/// Refresh a paused-integration marker only if the exact marker observed in
+/// `task` is still present. A recovery worker can otherwise read the marker,
+/// lose a race to a successful worker's conditional clear, and then recreate
+/// it with an unconditional metadata write.
+pub(crate) async fn refresh_paused_integration_for_pause(
+    db: &db::SqliteDb,
+    task: &Task,
+) -> Result<()> {
+    let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
+        ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
+    })?;
+    let Some(expected) = metadata.extra.get(PAUSED_INTEGRATION_METADATA_KEY).cloned() else {
+        return Ok(());
+    };
+    let generation = metadata
+        .extra
+        .get(PAUSED_INTEGRATION_GENERATION_KEY)
+        .cloned()
+        .unwrap_or_else(|| json!(0));
+    if generation.as_i64().is_none() {
+        return Err(ServiceError::invalid_operation(format!(
+            "invalid paused-integration generation for {}",
+            task.id
+        )));
+    }
+    if serde_json::from_value::<PausedIntegration>(expected.clone()).is_err() {
+        return Ok(());
+    }
+    TaskRepo::mutate_metadata(
+        db,
+        &task.id,
+        Some(task.version),
+        vec![
+            TaskMetadataMutation::SetIfAbsent {
+                key: PAUSED_INTEGRATION_GENERATION_KEY.to_owned(),
+                value: generation.clone(),
+            },
+            TaskMetadataMutation::CompareAndMutate {
+                key: PAUSED_INTEGRATION_GENERATION_KEY.to_owned(),
+                expected: generation,
+                mutations: vec![TaskMetadataMutation::SetIf {
+                    key: PAUSED_INTEGRATION_METADATA_KEY.to_owned(),
+                    expected,
+                    value: json!({
+                        "state": task.status.clone(),
+                        "deferred_at": now_rfc3339(),
+                    }),
+                }],
+            },
+        ],
+        &now_rfc3339(),
+    )
+    .await
+    .map_err(|error| match error {
+        db::DbError::NotFound => ServiceError::not_found("task", task.id.clone()),
+        error => error.into(),
+    })?;
+    Ok(())
+}
+
+pub(crate) async fn clear_paused_integration(
+    db: &db::SqliteDb,
+    task_id: &str,
+    expected: &PausedIntegration,
+) -> Result<()> {
+    TaskRepo::mutate_metadata(
+        db,
+        task_id,
+        None,
+        vec![TaskMetadataMutation::CompareAndMutate {
+            key: PAUSED_INTEGRATION_METADATA_KEY.to_owned(),
+            expected: serde_json::to_value(expected)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+            mutations: vec![
+                TaskMetadataMutation::Remove {
+                    key: PAUSED_INTEGRATION_METADATA_KEY.to_owned(),
+                },
+                TaskMetadataMutation::Increment {
+                    key: PAUSED_INTEGRATION_GENERATION_KEY.to_owned(),
+                    by: 1,
+                },
+            ],
+        }],
+        &now_rfc3339(),
+    )
+    .await
+    .map_err(|error| match error {
+        db::DbError::NotFound => ServiceError::not_found("task", task_id.to_owned()),
+        error => error.into(),
+    })?;
+    Ok(())
 }
 
 // --- Dispatch disposition (F11: quiescent, capability-aware dispatch) ---
@@ -120,6 +297,16 @@ pub(crate) fn dispatch_disposition_is_current(task: &Task, capability: &str) -> 
     })
 }
 
+/// The disposition still in force for this Task, if any.
+///
+/// A recorded disposition means the dispatcher has stopped attempting this
+/// capability and will not reconsider until the Task changes or something
+/// wakes it — which is exactly the state a user needs to see, rather than the
+/// Task reading as ordinary queueing.
+pub(crate) fn current_dispatch_disposition(task: &Task) -> Option<DispatchDisposition> {
+    dispatch_disposition(task).filter(|disposition| disposition.task_version == task.version)
+}
+
 /// Persist the disposition observed for a dispatch attempt that just failed
 /// deterministically. Callers reach this only after
 /// `dispatch_disposition_is_current` established there was nothing current to
@@ -130,28 +317,45 @@ pub(crate) async fn record_dispatch_disposition(
     capability: &str,
     safe_message: &str,
 ) -> Result<()> {
-    let mut metadata = parse_metadata(task)?;
-    metadata.extra.insert(
-        DISPOSITION_METADATA_KEY.to_owned(),
-        json!({
-            "task_version": task.version,
-            "capability": capability,
-            "blocker_digest": dispatch_blocker_digest(safe_message),
-            "recorded_at": now_rfc3339(),
-            "safe_message": bounded_safe_message(safe_message),
-        }),
-    );
-    TaskRepo::set_metadata_json(db, &task.id, metadata.to_json(), &now_rfc3339()).await?;
+    TaskRepo::mutate_metadata(
+        db,
+        &task.id,
+        Some(task.version),
+        vec![TaskMetadataMutation::Set {
+            key: DISPOSITION_METADATA_KEY.to_owned(),
+            value: json!({
+                "task_version": task.version,
+                "capability": capability,
+                "blocker_digest": dispatch_blocker_digest(safe_message),
+                "recorded_at": now_rfc3339(),
+                "safe_message": bounded_safe_message(safe_message),
+            }),
+        }],
+        &now_rfc3339(),
+    )
+    .await?;
     Ok(())
 }
 
 /// Clear a stored disposition, e.g. once dispatch succeeds again.
 pub(crate) async fn clear_dispatch_disposition(db: &db::SqliteDb, task: &Task) -> Result<()> {
-    let mut metadata = parse_metadata(task)?;
-    if metadata.extra.remove(DISPOSITION_METADATA_KEY).is_none() {
+    let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
+        ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
+    })?;
+    let Some(expected) = metadata.extra.get(DISPOSITION_METADATA_KEY).cloned() else {
         return Ok(());
-    }
-    TaskRepo::set_metadata_json(db, &task.id, metadata.to_json(), &now_rfc3339()).await?;
+    };
+    TaskRepo::mutate_metadata(
+        db,
+        &task.id,
+        None,
+        vec![TaskMetadataMutation::RemoveIf {
+            key: DISPOSITION_METADATA_KEY.to_owned(),
+            expected,
+        }],
+        &now_rfc3339(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -188,13 +392,11 @@ fn bounded_safe_message(message: &str) -> String {
 /// commits one of those must call this afterward, or the previously observed
 /// denial keeps the Task quiesced forever.
 pub async fn wake_task_dispatch(db: &db::SqliteDb, task_id: &str, reason: &str) -> Result<()> {
-    let Some(task) = TaskRepo::get_by_id(db, task_id, false).await? else {
+    let result = TaskRepo::wake_dispatch_for_task(db, task_id, &now_rfc3339()).await;
+    if let Err(db::DbError::NotFound) = &result {
         return Ok(());
-    };
-    clear_dispatch_disposition(db, &task).await?;
-    if pending_until(&task).is_some() {
-        clear(db, &task).await?;
     }
+    result?;
     tracing::info!(task_id = %task_id, %reason, "task dispatch woken");
     Ok(())
 }

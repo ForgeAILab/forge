@@ -1610,6 +1610,10 @@ impl ProjectOrchestrationRepo for SqliteDb {
         }
         let task = TaskRepo::create_in_tx(self, &mut transaction, create_task).await?;
         if let Some(metadata_json) = input.metadata_json.as_deref() {
+            // This is create-time initialization: the Task was inserted in
+            // this same transaction and is not visible to any independent
+            // metadata writer until commit. Keep the caller's complete
+            // initial document here; existing Tasks use `mutate_metadata`.
             sqlx::query(
                 "UPDATE task SET metadata_json = ?, updated_at = ? WHERE id = ? AND project_id = ?",
             )

@@ -218,9 +218,13 @@ async fn remaining_review_retries(db: &SqliteDb, task_id: &str) -> i64 {
         .as_ref()
         .and_then(|config| config.max_rejections)
         .expect("review retry budget exists");
-    let used = TransitionLogRepo::count_gate_rejections(db, task_id, default_states::REVIEW)
+    let logs = TransitionLogRepo::list_by_task(db, task_id)
         .await
-        .expect("rejection count loads");
+        .expect("transition logs load");
+    let used = services::task_diagnostics::count_gate_rejections_since_boundary(
+        &logs,
+        default_states::REVIEW,
+    );
     (i64::from(max_rejections) - used).max(0)
 }
 

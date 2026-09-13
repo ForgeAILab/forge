@@ -1,4 +1,5 @@
 use super::*;
+use crate::routes::reviews::review_response_server_checked;
 use api_types::{Actor, UserActionSource};
 
 pub async fn transition_task(
@@ -23,7 +24,10 @@ pub async fn transition_task(
         task_response_with_awaiting_human(&state.db, result.task, awaiting_human).await?;
     Ok(Json(TransitionTaskResponse {
         task: response,
-        review: result.review.map(review_response),
+        review: result
+            .review
+            .map(review_response_server_checked)
+            .transpose()?,
     }))
 }
 

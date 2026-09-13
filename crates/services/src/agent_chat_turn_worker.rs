@@ -5328,11 +5328,12 @@ fn effective_state_context(
     Ok(EffectiveProjectStateContext {
         governing_charter: projection.governing_charter.as_ref().map(|charter| {
             format!(
-                "{}@{}#r{}:content:{}:render:{}:v{}",
+                "{}@{}#r{}:content:{}:renderer:{}:render:{}:v{}",
                 charter.id,
                 charter.revision_id,
                 charter.revision,
                 charter.content_digest,
+                charter.render_version,
                 charter.render_digest,
                 charter.version
             )
@@ -5342,11 +5343,12 @@ fn effective_state_context(
             .iter()
             .map(|document| {
                 format!(
-                    "{}:{}@{}:content:{}:render:{}",
+                    "{}:{}@{}:content:{}:renderer:{}:render:{}",
                     document.kind,
                     document.id,
                     document.revision_id,
                     document.content_digest,
+                    document.render_version,
                     document.render_digest
                 )
             })

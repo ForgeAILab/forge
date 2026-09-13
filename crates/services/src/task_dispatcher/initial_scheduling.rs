@@ -183,7 +183,13 @@ impl TaskDispatcher {
                 }
                 Ok(false) => {}
                 Err(ServiceError::Db(DbError::VersionConflict)) => {
-                    tracing::debug!(task_id = %task.id, "task dispatcher initial transition lost version race");
+                    tracing::debug!(
+                        task_id = %task.id,
+                        from_state = %task.status,
+                        to_state = %target.transition_to,
+                        target_role = %target.role,
+                        "task dispatcher initial transition lost version race"
+                    );
                 }
                 Err(error) if helpers::is_deterministic_dispatch_refusal(&error) => {
                     deferred_dispatch::record_dispatch_disposition(
@@ -195,6 +201,9 @@ impl TaskDispatcher {
                     .await?;
                     tracing::warn!(
                         task_id = %task.id,
+                        from_state = %task.status,
+                        to_state = %target.transition_to,
+                        target_role = %target.role,
                         %error,
                         "task dispatch blocked; parked until Task/governance state changes or an explicit wake"
                     );
@@ -202,7 +211,14 @@ impl TaskDispatcher {
                 Err(error) => {
                     // Potentially transient: no disposition, so the next scan
                     // retries instead of stalling on a momentary failure.
-                    tracing::warn!(task_id = %task.id, %error, "task dispatcher initial dispatch failed");
+                    tracing::warn!(
+                        task_id = %task.id,
+                        from_state = %task.status,
+                        to_state = %target.transition_to,
+                        target_role = %target.role,
+                        %error,
+                        "task dispatcher initial dispatch failed"
+                    );
                 }
             }
         }

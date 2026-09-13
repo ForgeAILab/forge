@@ -50,14 +50,23 @@ impl TaskDispatcher {
             {
                 return Ok(false);
             }
-            ProjectRepo::set_system_pause_reason(&*self.db, &project.id, &now_rfc3339(), reason)
-                .await?;
-            tracing::info!(
-                project_id = %project.id,
-                system_pause_reason = reason,
-                "paused Project automatically: primary repository setup is not valid"
-            );
-            return Ok(true);
+            let paused = ProjectRepo::set_system_pause_reason_if_unchanged(
+                &*self.db,
+                &project.id,
+                project.version,
+                project.primary_repo_id.as_deref(),
+                &now_rfc3339(),
+                reason,
+            )
+            .await?;
+            if paused {
+                tracing::info!(
+                    project_id = %project.id,
+                    system_pause_reason = reason,
+                    "paused Project automatically: primary repository setup is not valid"
+                );
+            }
+            return Ok(paused);
         }
         if project.paused_at.is_some()
             && matches!(
@@ -65,12 +74,36 @@ impl TaskDispatcher {
                 Some(MISSING_REPOSITORY | INVALID_REPOSITORY)
             )
         {
-            ProjectRepo::set_paused_at(&*self.db, &project.id, None).await?;
-            tracing::info!(
-                project_id = %project.id,
-                "resumed Project automatically: its primary repository is now attached"
-            );
-            return Ok(true);
+            // The repository lookup above and the Project snapshot are both
+            // staleable.  In particular, a user can manually pause/resume
+            // this Project after this scan listed it but before the automatic
+            // resume write.  Clear the pause only if every authority-bearing
+            // field still matches the snapshot that caused this decision.
+            let Some(expected_paused_at) = project.paused_at.as_deref() else {
+                return Ok(false);
+            };
+            let Some(expected_primary_repo_id) = project.primary_repo_id.as_deref() else {
+                return Ok(false);
+            };
+            let Some(expected_reason) = project.system_pause_reason.as_deref() else {
+                return Ok(false);
+            };
+            let cleared = ProjectRepo::clear_system_pause_if_unchanged(
+                &*self.db,
+                &project.id,
+                project.version,
+                expected_primary_repo_id,
+                expected_paused_at,
+                expected_reason,
+            )
+            .await?;
+            if cleared {
+                tracing::info!(
+                    project_id = %project.id,
+                    "resumed Project automatically: its primary repository is now attached"
+                );
+            }
+            return Ok(cleared);
         }
         Ok(false)
     }

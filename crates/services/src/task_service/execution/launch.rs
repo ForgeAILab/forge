@@ -20,6 +20,46 @@ impl TaskService {
         prompt: String,
         dispatch_metadata: Option<Value>,
     ) -> Result<Execution> {
+        self.dispatch_initial_role_execution_with_optional_admission(
+            task_id,
+            agent_id,
+            role,
+            prompt,
+            dispatch_metadata,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn dispatch_initial_role_execution_with_metadata_and_admission(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        role: &str,
+        prompt: String,
+        dispatch_metadata: Option<Value>,
+        admission: db::ExecutionAdmission,
+    ) -> Result<Execution> {
+        self.dispatch_initial_role_execution_with_optional_admission(
+            task_id,
+            agent_id,
+            role,
+            prompt,
+            dispatch_metadata,
+            Some(admission),
+        )
+        .await
+    }
+
+    async fn dispatch_initial_role_execution_with_optional_admission(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        role: &str,
+        prompt: String,
+        dispatch_metadata: Option<Value>,
+        admission: Option<db::ExecutionAdmission>,
+    ) -> Result<Execution> {
         validate_required("task_id", task_id)?;
         validate_required("agent_id", agent_id)?;
         validate_required("role", role)?;
@@ -27,6 +67,37 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+        let agent = AgentRepo::get_by_id(&*self.db, agent_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
+        // Capture the admission facts from the same snapshot that selects the
+        // role, prompt, and executor config.  Deriving these after workspace
+        // preparation would allow a Task edit with the same status/role to
+        // mint an execution carrying stale prompt/config data.
+        let admission = match admission {
+            Some(admission) => admission,
+            None if role == crate::workflow::default_roles::REVIEWER => {
+                return Err(ServiceError::conflict(
+                    "reviewer dispatch requires a review-bound execution admission",
+                ));
+            }
+            None => {
+                let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+                let admission = crate::task_service::execution_admission_for_task(
+                    &self.db,
+                    &task,
+                    &project.workflow_definition,
+                    role,
+                    Some(&agent),
+                    project.version,
+                )
+                .await?;
+                admission
+            }
+        };
+        let reviewer_parent_execution_id = admission.expected_reviewer_parent_execution_id.clone();
         let coordination_root =
             super::super::subtask::coordination_root_has_subtasks(&self.db, &task).await?;
         self.ensure_ordered_execution_admission(&task, role).await?;
@@ -37,9 +108,6 @@ impl TaskService {
         }
         self.ensure_no_running_repository_execution(&task).await?;
         self.check_dependency_gate(&task, agent_id).await?;
-        let agent = AgentRepo::get_by_id(&*self.db, agent_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
         let (workspace, workspace_created_by_attempt) =
             super::super::workspace::prepare_workspace_owned(
                 &self.db,
@@ -54,33 +122,35 @@ impl TaskService {
             dispatch_metadata,
         )?;
         let now = now_rfc3339();
+        let create_input = CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            agent_id: Some(agent.id.clone()),
+            role: role.to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: reviewer_parent_execution_id,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some(prompt),
+            logs_path: None,
+            before_sha: workspace.before_sha.clone(),
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json,
+            workspace_id: Some(workspace.id.clone()),
+            created_at: now.clone(),
+            updated_at: now,
+        };
         let execution = self
-            .create_running_execution(
-                CreateExecution {
-                    id: new_uuid_v4(),
-                    task_id: task.id.clone(),
-                    agent_id: Some(agent.id.clone()),
-                    role: role.to_owned(),
-                    status: ExecutionStatus::Running,
-                    stop_reason: None,
-                    stopped_by: None,
-                    resume_policy: None,
-                    stopped_at: None,
-                    parent_execution_id: None,
-                    agent_session_id: None,
-                    agent_message_id: None,
-                    last_activity_at: None,
-                    summary: Some(prompt),
-                    logs_path: None,
-                    before_sha: workspace.before_sha.clone(),
-                    after_sha: None,
-                    error: None,
-                    executor_config_snapshot_json,
-                    workspace_id: Some(workspace.id.clone()),
-                    created_at: now.clone(),
-                    updated_at: now,
-                },
+            .create_running_execution_with_admission(
+                create_input,
                 workspace_created_by_attempt,
+                Some(admission),
             )
             .await?;
 
@@ -161,10 +231,18 @@ impl TaskService {
         self.check_dependency_gate(&task, &agent_id).await?;
         self.ensure_no_running_interactive_execution(&task.id)
             .await?;
-
         let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
+        let admission = crate::task_service::execution_admission_for_task(
+            &self.db,
+            &task,
+            "",
+            crate::workflow::default_roles::INTERACTIVE,
+            Some(&agent),
+            project.version,
+        )
+        .await?;
         let (workspace, workspace_created_by_attempt) =
             super::super::workspace::prepare_workspace_owned(
                 &self.db,
@@ -180,7 +258,7 @@ impl TaskService {
             build_executor_config_snapshot(&self.db, &task, &agent, overrides).await?;
         let now = now_rfc3339();
         let execution = self
-            .create_running_execution(
+            .create_running_execution_with_admission(
                 CreateExecution {
                     id: new_uuid_v4(),
                     task_id: task.id.clone(),
@@ -206,6 +284,7 @@ impl TaskService {
                     updated_at: now,
                 },
                 workspace_created_by_attempt,
+                Some(admission),
             )
             .await?;
 
@@ -242,6 +321,38 @@ impl TaskService {
         agent_id: Option<String>,
         overrides: Option<ExecutionOverrides>,
     ) -> Result<LaunchExecutionResult> {
+        self.follow_up_execution_with_role(parent_execution_id, message, agent_id, overrides, None)
+            .await
+    }
+
+    /// Launch a genuinely interactive session follow-up. Public transport
+    /// callers use this explicit form; workflow recovery uses
+    /// [`Self::follow_up_execution`] so a coder/reviewer role is preserved.
+    pub async fn follow_up_interactive_execution(
+        &self,
+        parent_execution_id: impl Into<String>,
+        message: String,
+        agent_id: Option<String>,
+        overrides: Option<ExecutionOverrides>,
+    ) -> Result<LaunchExecutionResult> {
+        self.follow_up_execution_with_role(
+            parent_execution_id,
+            message,
+            agent_id,
+            overrides,
+            Some(crate::workflow::default_roles::INTERACTIVE),
+        )
+        .await
+    }
+
+    async fn follow_up_execution_with_role(
+        &self,
+        parent_execution_id: impl Into<String>,
+        message: String,
+        agent_id: Option<String>,
+        overrides: Option<ExecutionOverrides>,
+        requested_role: Option<&str>,
+    ) -> Result<LaunchExecutionResult> {
         let parent_execution_id = parent_execution_id.into();
         validate_required("parent_execution_id", &parent_execution_id)?;
 
@@ -275,7 +386,17 @@ impl TaskService {
             &project.workflow_definition,
             &api_types::Actor::system(api_types::SystemComponent::Executor),
         );
-        self.ensure_ordered_execution_admission(&task, "interactive")
+        // `interactive` and the historical `executor` transport role are
+        // genuine user follow-ups. A workflow role (for example `coder` or
+        // `reviewer`) must remain that role so resuming it can satisfy the
+        // current state and participate in the normal cascade.
+        let follow_up_role = requested_role.map(str::to_owned).unwrap_or_else(|| {
+            match parent_execution.role.as_str() {
+                "interactive" | "executor" => "interactive".to_owned(),
+                role => role.to_owned(),
+            }
+        });
+        self.ensure_ordered_execution_admission(&task, &follow_up_role)
             .await?;
         if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal) {
             return Err(ServiceError::invalid_operation(format!(
@@ -349,9 +470,53 @@ impl TaskService {
             }
         }
 
-        self.ensure_no_running_interactive_execution(&task.id)
-            .await?;
-        self.ensure_task_runnable(&task).await?;
+        if follow_up_role == crate::workflow::default_roles::REVIEWER {
+            self.ensure_task_reviewable(&task).await?;
+        } else {
+            self.ensure_task_runnable(&task).await?;
+        }
+        if follow_up_role == crate::workflow::default_roles::INTERACTIVE {
+            self.ensure_no_running_interactive_execution(&task.id)
+                .await?;
+        }
+        let reviewer_snapshot = if follow_up_role == crate::workflow::default_roles::REVIEWER {
+            Some(
+                ReviewRepo::list_by_task(&*self.db, &task.id)
+                    .await?
+                    .into_iter()
+                    .max_by_key(|review| (review.attempt_number, review.id.clone()))
+                    .ok_or_else(|| {
+                        ServiceError::conflict(
+                            "reviewer follow-up requires a current review candidate",
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+        let mut admission = crate::task_service::execution_admission_for_task(
+            &self.db,
+            &task,
+            &project.workflow_definition,
+            &follow_up_role,
+            Some(&agent),
+            project.version,
+        )
+        .await?;
+        let durable_parent_execution_id = if let Some(review) = reviewer_snapshot.as_ref() {
+            admission.expected_reviewer_parent_execution_id = Some(review.execution_id.clone());
+            admission.expected_latest_review_candidate_execution_id =
+                Some(review.execution_id.clone());
+            admission.expected_reviewer_id = Some(review.id.clone());
+            admission.expected_reviewer_attempt_number = Some(review.attempt_number);
+            admission.expected_reviewer_status = Some(review.status.to_string());
+            admission.expected_reviewer_updated_at = Some(review.updated_at.clone());
+            admission.expected_reviewer_execution_id = review.reviewer_execution_id.clone();
+            admission.expected_auditor_execution_id = review.auditor_execution_id.clone();
+            review.execution_id.clone()
+        } else {
+            parent_execution_id.clone()
+        };
         let (workspace, workspace_created_by_attempt) =
             super::super::workspace::prepare_workspace_owned(
                 &self.db,
@@ -382,18 +547,18 @@ impl TaskService {
 
         let now = now_rfc3339();
         let execution = self
-            .create_running_execution(
+            .create_running_execution_with_admission(
                 CreateExecution {
                     id: new_uuid_v4(),
                     task_id: task.id.clone(),
                     agent_id: Some(resolved_agent_id.clone()),
-                    role: "interactive".to_owned(),
+                    role: follow_up_role.clone(),
                     status: ExecutionStatus::Running,
                     stop_reason: None,
                     stopped_by: None,
                     resume_policy: None,
                     stopped_at: None,
-                    parent_execution_id: Some(parent_execution_id),
+                    parent_execution_id: Some(durable_parent_execution_id.clone()),
                     agent_session_id: None,
                     agent_message_id: None,
                     last_activity_at: None,
@@ -408,6 +573,7 @@ impl TaskService {
                     updated_at: now,
                 },
                 workspace_created_by_attempt,
+                Some(admission),
             )
             .await?;
 
@@ -415,8 +581,8 @@ impl TaskService {
             task_id = %task.id,
             agent_id = %resolved_agent_id,
             execution_id = %execution.id,
-            parent_execution_id = %parent_execution.id,
-            role = "interactive",
+            parent_execution_id = %durable_parent_execution_id,
+            role = %follow_up_role,
             "follow-up execution launched"
         );
 
@@ -489,29 +655,6 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &parent_execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", parent_execution.task_id.clone()))?;
-        let page = ExecutionRepo::list_by_task(
-            &*self.db,
-            &task.id,
-            PageRequest {
-                cursor: None,
-                limit: 20,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Desc,
-            },
-        )
-        .await?;
-        if page
-            .items
-            .into_iter()
-            .any(|execution| execution.status == ExecutionStatus::Running)
-        {
-            return Err(ServiceError::invalid_operation(format!(
-                "execution already running for role {}",
-                parent_execution.role
-            )));
-        }
-
         let agent_id = parent_execution.agent_id.clone().ok_or_else(|| {
             ServiceError::invalid_operation(format!(
                 "parent execution {} missing agent_id",
@@ -578,17 +721,80 @@ impl TaskService {
             self.ensure_task_runnable(&task).await?;
         }
 
+        let original_recovery_task = clear_recovery_metadata.then(|| task.clone());
+        // Recovery metadata is part of the Task revision used for this
+        // launch. Clear it before deriving admission and before building the
+        // prompt/config so every downstream artifact comes from one final
+        // snapshot rather than a stale pre-clear read.
+        let task = if clear_recovery_metadata {
+            self.clear_recovery_metadata_at_version(&task).await?
+        } else {
+            task
+        };
+        let mut admission = match crate::task_service::execution_admission_for_task(
+            &self.db,
+            &task,
+            &project.workflow_definition,
+            &parent_execution.role,
+            Some(&agent),
+            project.version,
+        )
+        .await
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                if let Some(original) = original_recovery_task.as_ref() {
+                    self.restore_recovery_metadata_after_failed_resume(
+                        &task,
+                        original,
+                        None,
+                        &parent_execution.role,
+                    )
+                    .await;
+                }
+                return Err(error);
+            }
+        };
         let (workspace, workspace_created_by_attempt) =
-            super::super::workspace::prepare_workspace_owned(
+            match super::super::workspace::prepare_workspace_owned(
                 &self.db,
                 &self.workspace_root,
                 &task,
                 &task.id,
                 self.repo_cache_locks.clone(),
             )
-            .await?;
+            .await
+            {
+                Ok(workspace) => workspace,
+                Err(error) => {
+                    if let Some(original) = original_recovery_task.as_ref() {
+                        self.restore_recovery_metadata_after_failed_resume(
+                            &task,
+                            original,
+                            None,
+                            &parent_execution.role,
+                        )
+                        .await;
+                    }
+                    return Err(error);
+                }
+            };
         let executor_config_snapshot_json =
-            build_executor_config_snapshot(&self.db, &task, &agent, None).await?;
+            match build_executor_config_snapshot(&self.db, &task, &agent, None).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    if let Some(original) = original_recovery_task.as_ref() {
+                        self.restore_recovery_metadata_after_failed_resume(
+                            &task,
+                            original,
+                            None,
+                            &parent_execution.role,
+                        )
+                        .await;
+                    }
+                    return Err(error);
+                }
+            };
         let role_name = &parent_execution.role;
         let state = workflow
             .states
@@ -600,7 +806,7 @@ impl TaskService {
         let state_dispatch =
             dispatch_intent_from_workflow_dispatch(state.and_then(|state| state.dispatch.as_ref()));
         let selection = effective_prompt_selection(role_name, None, state_dispatch.as_ref());
-        let dispatch_ctx = load_agent_dispatch_context(
+        let dispatch_ctx = match load_agent_dispatch_context(
             Arc::clone(&self.db),
             &task.id,
             role_name,
@@ -609,24 +815,68 @@ impl TaskService {
             Some(selection.execution_policy.as_str()),
             &workflow,
         )
-        .await?;
+        .await
+        {
+            Ok(dispatch_ctx) => dispatch_ctx,
+            Err(error) => {
+                if let Some(original) = original_recovery_task.as_ref() {
+                    self.restore_recovery_metadata_after_failed_resume(
+                        &task,
+                        original,
+                        None,
+                        &parent_execution.role,
+                    )
+                    .await;
+                }
+                return Err(error);
+            }
+        };
+        let reviewer_snapshot = if parent_execution.role == crate::workflow::default_roles::REVIEWER
+        {
+            dispatch_ctx
+                .prior_reviews
+                .iter()
+                .max_by_key(|review| (review.attempt_number, review.id.clone()))
+                .map(|review| {
+                    (
+                        review.id.clone(),
+                        review.execution_id.clone(),
+                        review.attempt_number,
+                        review.status.to_string(),
+                        review.updated_at.clone(),
+                        review.reviewer_execution_id.clone(),
+                        review.auditor_execution_id.clone(),
+                    )
+                })
+        } else {
+            None
+        };
+        if let Some((
+            id,
+            execution_id,
+            attempt_number,
+            status,
+            updated_at,
+            reviewer_execution_id,
+            auditor_execution_id,
+        )) = reviewer_snapshot
+        {
+            admission.expected_reviewer_parent_execution_id = Some(execution_id.clone());
+            admission.expected_latest_review_candidate_execution_id = Some(execution_id);
+            admission.expected_reviewer_id = Some(id);
+            admission.expected_reviewer_attempt_number = Some(attempt_number);
+            admission.expected_reviewer_status = Some(status);
+            admission.expected_reviewer_updated_at = Some(updated_at);
+            admission.expected_reviewer_execution_id = reviewer_execution_id;
+            admission.expected_auditor_execution_id = auditor_execution_id;
+        }
         let (prompt, _selection) =
             build_effective_prompt(&dispatch_ctx, None, state_dispatch.as_ref());
-        let summary = match context {
-            Some(ctx) => format!("[User context: {ctx}]\n\n{}", prompt.user),
-            None => prompt.user,
-        };
-        // A WorkspaceLease is pinned to the exact Task version. Recovery
-        // metadata must therefore be cleared before the execution and lease
-        // are created, never after authority has already been minted.
-        let task = if clear_recovery_metadata {
-            self.clear_blocking_metadata(&task.id).await?
-        } else {
-            task
-        };
+        let summary = prompt.execution_input(context.as_deref());
+        let reviewer_parent_execution_id = admission.expected_reviewer_parent_execution_id.clone();
         let now = now_rfc3339();
-        let execution = self
-            .create_running_execution(
+        let execution = match self
+            .create_running_execution_with_admission(
                 CreateExecution {
                     id: new_uuid_v4(),
                     task_id: task.id.clone(),
@@ -637,7 +887,7 @@ impl TaskService {
                     stopped_by: None,
                     resume_policy: None,
                     stopped_at: None,
-                    parent_execution_id: None,
+                    parent_execution_id: reviewer_parent_execution_id,
                     agent_session_id: None,
                     agent_message_id: None,
                     last_activity_at: None,
@@ -652,8 +902,34 @@ impl TaskService {
                     updated_at: now,
                 },
                 workspace_created_by_attempt,
+                Some(admission),
             )
-            .await?;
+            .await
+        {
+            Ok(execution) => execution,
+            Err(error) => {
+                if let Some(original) = original_recovery_task.as_ref() {
+                    self.restore_recovery_metadata_after_failed_resume(
+                        &task,
+                        original,
+                        None,
+                        &parent_execution.role,
+                    )
+                    .await;
+                }
+                return Err(error);
+            }
+        };
+
+        if clear_recovery_metadata {
+            if let Err(error) = super::clear_execution_retry_metadata(&self.db, &task).await {
+                tracing::warn!(
+                    task_id = %task.id,
+                    %error,
+                    "failed to clear execution retry metadata after re-execute"
+                );
+            }
+        }
 
         tracing::info!(
             task_id = %task.id,
@@ -730,6 +1006,34 @@ impl TaskService {
                 execution.status
             )));
         }
+        // Keep the state/role snapshot from before terminalization. A Task
+        // transition may race the execution CAS; in that case a late manual
+        // stop must not attach its recovery annotation to the next workflow
+        // state or role.
+        let task_at_stop_request = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
+        let expected_stop_status = task_at_stop_request.status.clone();
+        let expected_stop_state_entry_token = self
+            .state_entry_token_for_stop_snapshot(&task_at_stop_request)
+            .await?;
+        let (expected_stop_role, expected_workflow_definition) = self
+            .effective_role_for_stop_snapshot(&task_at_stop_request)
+            .await?;
+        // Role assignments are a separate authority domain from Tasks. Keep
+        // the exact assignment that selected this execution so a same-role
+        // reassignment cannot inherit this stop's manual blocker while the
+        // execution is being terminalized.
+        let expected_stop_assignment =
+            if execution.role == crate::workflow::default_roles::INTERACTIVE {
+                None
+            } else {
+                self.role_assignment_for_stop_snapshot(
+                    &task_at_stop_request,
+                    expected_stop_role.as_deref(),
+                )
+                .await?
+            };
         let now = now_rfc3339();
         let cancellation_committed = self
             .cancel_active_execution(
@@ -791,29 +1095,221 @@ impl TaskService {
                 "failed to serialize manual-stop annotation: {error}"
             ))
         })?;
-        let _ = TaskRepo::update(
-            &*self.db,
-            UpdateTask {
-                id: task.id.clone(),
-                expected_version: task.version,
-                title: None,
-                description: None,
-                priority: None,
-                merge_config: None,
-                plan: None,
-                error_annotation: Some(Some(annotation)),
-                blocked_json: None,
-                failed_json: None,
-                task_state_config: None,
-                parent_task_id: None,
-                updated_at: now.clone(),
-            },
+        self.persist_manual_stop_annotation(
+            &execution,
+            &task_at_stop_request,
+            &expected_stop_status,
+            expected_stop_state_entry_token,
+            expected_stop_role.as_deref(),
+            &expected_workflow_definition,
+            expected_stop_assignment,
+            annotation,
+            now,
         )
         .await?;
         ExecutionRepo::get_by_id(&*self.db, &execution_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", execution_id))
     }
+
+    /// Return the exact transition-log token for the current state entry.
+    /// This uses the same `(created_at, insertion order)` ordering as action
+    /// authority and the Task CAS. No matching log is the explicit initial/no-log epoch
+    /// rather than an unknown value.
+    async fn state_entry_token_for_stop_snapshot(&self, task: &Task) -> Result<Option<String>> {
+        Ok(
+            crate::task_service::action_resolver::latest_state_entry_authority(
+                &self.db,
+                &task.id,
+                &task.status,
+            )
+            .await?
+            .map(|entry| entry.id),
+        )
+    }
+
+    async fn effective_role_for_stop_snapshot(
+        &self,
+        task: &Task,
+    ) -> Result<(Option<String>, String)> {
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            task,
+            &project.workflow_definition,
+            &api_types::Actor::user(api_types::UserActionSource::Api),
+        );
+        Ok((
+            workflow
+                .states
+                .iter()
+                .find(|state| state.name == task.status)
+                .and_then(crate::workflow::effective_role)
+                .map(str::to_owned),
+            project.workflow_definition,
+        ))
+    }
+
+    async fn role_assignment_for_stop_snapshot(
+        &self,
+        task: &Task,
+        role: Option<&str>,
+    ) -> Result<Option<TaskRoleAssignment>> {
+        let Some(role) = role else {
+            return Ok(None);
+        };
+        TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role)
+            .await
+            .map_err(Into::into)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn persist_manual_stop_annotation(
+        &self,
+        execution: &Execution,
+        initial_task: &Task,
+        expected_status: &str,
+        expected_state_entry_token: Option<String>,
+        expected_role: Option<&str>,
+        expected_workflow_definition: &str,
+        expected_assignment: Option<TaskRoleAssignment>,
+        annotation: String,
+        initial_updated_at: String,
+    ) -> Result<()> {
+        let initial_error_annotation = initial_task.error_annotation.clone();
+        let mut candidate = initial_task.clone();
+        let mut updated_at = initial_updated_at;
+        for _ in 0..4 {
+            if candidate.status != expected_status {
+                tracing::debug!(
+                    task_id = %candidate.id,
+                    execution_id = %execution.id,
+                    expected_status,
+                    current_status = %candidate.status,
+                    "skipping stale manual-stop annotation after Task transition"
+                );
+                return Ok(());
+            }
+            if candidate.error_annotation != initial_error_annotation {
+                tracing::debug!(
+                    task_id = %candidate.id,
+                    execution_id = %execution.id,
+                    "skipping stale manual-stop annotation after newer annotation"
+                );
+                return Ok(());
+            }
+            let (current_role, current_workflow_definition) =
+                self.effective_role_for_stop_snapshot(&candidate).await?;
+            let current_state_entry_token =
+                self.state_entry_token_for_stop_snapshot(&candidate).await?;
+            if current_role.as_deref() != expected_role
+                || current_workflow_definition != expected_workflow_definition
+                || current_state_entry_token != expected_state_entry_token
+                || !stop_execution_role_matches(execution.role.as_str(), current_role.as_deref())
+            {
+                tracing::debug!(
+                    task_id = %candidate.id,
+                    execution_id = %execution.id,
+                    execution_role = %execution.role,
+                    expected_role = ?expected_role,
+                    current_role = ?current_role,
+                    "skipping stale manual-stop annotation after Task role change"
+                );
+                return Ok(());
+            }
+            let overlapping_roles = overlapping_execution_roles(execution.role.as_str());
+            let expected_assignment_role = (execution.role
+                != crate::workflow::default_roles::INTERACTIVE)
+                .then_some(expected_role)
+                .flatten();
+            let current_assignment = self
+                .role_assignment_for_stop_snapshot(&candidate, expected_assignment_role)
+                .await?;
+            if !role_assignment_snapshots_match(
+                expected_assignment.as_ref(),
+                current_assignment.as_ref(),
+            ) {
+                tracing::debug!(
+                    task_id = %candidate.id,
+                    execution_id = %execution.id,
+                    execution_role = %execution.role,
+                    expected_role = ?expected_role,
+                    "skipping stale manual-stop annotation after role reassignment"
+                );
+                return Ok(());
+            }
+            match TaskRepo::set_error_annotation_if_no_running_execution(
+                &*self.db,
+                &candidate.id,
+                candidate.version,
+                expected_status,
+                expected_state_entry_token.as_deref(),
+                expected_workflow_definition,
+                expected_assignment_role,
+                expected_assignment.clone(),
+                &annotation,
+                &updated_at,
+                &execution.id,
+                execution.workspace_id.as_deref(),
+                overlapping_roles,
+            )
+            .await
+            {
+                Ok(_) => return Ok(()),
+                Err(db::DbError::ExecutionAlreadyRunning { .. }) => return Ok(()),
+                Err(db::DbError::VersionConflict) => {
+                    candidate = TaskRepo::get_by_id(&*self.db, &candidate.id, false)
+                        .await?
+                        .ok_or_else(|| ServiceError::not_found("task", candidate.id.clone()))?;
+                    updated_at = now_rfc3339();
+                }
+                Err(error) => return Err(ServiceError::Db(error)),
+            }
+        }
+        Err(ServiceError::Db(db::DbError::VersionConflict))
+    }
+}
+
+fn stop_execution_role_matches(execution_role: &str, current_role: Option<&str>) -> bool {
+    // Interactive executions are deliberately outside the workflow role
+    // contract, but still belong to the current Task state. Their manual-stop
+    // annotation must survive a concurrent Task write just like a role run.
+    if execution_role == crate::workflow::default_roles::INTERACTIVE {
+        return current_role.is_some();
+    }
+    current_role.is_some_and(|role| {
+        execution_role == role
+            || (role == crate::workflow::default_roles::CODER && execution_role == "executor")
+    })
+}
+
+fn role_assignment_snapshots_match(
+    expected: Option<&TaskRoleAssignment>,
+    actual: Option<&TaskRoleAssignment>,
+) -> bool {
+    match (expected, actual) {
+        (None, None) => true,
+        (Some(expected), Some(actual)) => {
+            expected.id == actual.id
+                && expected.task_id == actual.task_id
+                && expected.role_name == actual.role_name
+                && expected.assignee_type == actual.assignee_type
+                && expected.assignee_id == actual.assignee_id
+                && expected.created_at == actual.created_at
+                && expected.updated_at == actual.updated_at
+        }
+        _ => false,
+    }
+}
+
+fn overlapping_execution_roles(role: &str) -> Vec<String> {
+    // Manual-stop annotation is a Task/workspace boundary. A replacement in
+    // any workflow role must win over a late stop, so the DB helper's empty
+    // list deliberately means “all roles”. Keep the argument for the call
+    // sites' role-specific intent/documentation.
+    let _ = role;
+    Vec::new()
 }
 
 fn with_dispatch_metadata(

@@ -1,4 +1,5 @@
 use super::super::*;
+use db::{PageRequest, SortBy, SortOrder};
 
 #[tokio::test]
 async fn project_agent_identity_can_claim_a_task_role() {
@@ -81,6 +82,61 @@ async fn project_agent_identity_can_claim_a_task_role() {
             .await
             .expect("branch lookup"),
         "Task role claim creates the Task branch"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_claims_share_workspace_creation_and_lose_at_task_cas() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let workspace_root = TempDir::new().expect("workspace root creates");
+    let repo_locks = Arc::new(RepoCacheLockManager::new());
+    let service = TaskService::new(Arc::clone(&db), event_bus)
+        .with_workspace_root(workspace_root.path().to_path_buf())
+        .with_repo_cache_locks(repo_locks);
+    let (project_id, _repo_id, repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = service
+        .create_task(
+            project_id,
+            "Concurrent workspace claim",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("task creates");
+
+    let (left, right) = tokio::join!(
+        service.claim_task(task.id.clone(), Assignee::Agent(agent_id.clone()), None),
+        service.claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
+    );
+    let outcomes = [left, right];
+    assert_eq!(
+        outcomes.iter().filter(|result| result.is_ok()).count(),
+        1,
+        "exactly one concurrent claim wins"
+    );
+    let error = outcomes
+        .into_iter()
+        .find_map(Result::err)
+        .expect("one claim loses");
+    assert!(
+        !error.to_string().contains("branch named") && !error.to_string().contains("worktree add"),
+        "the loser must report an admission conflict, not raw Git workspace failure: {error}"
+    );
+    assert!(WorkspaceRepo::get_by_task_id(&*db, &task.id)
+        .await
+        .expect("workspace lookup")
+        .is_some());
+    assert!(
+        git::branch_exists(repo_dir.path(), &::workspace::task_branch_name(&task.id))
+            .await
+            .expect("branch lookup")
     );
 }
 

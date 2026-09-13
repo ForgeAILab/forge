@@ -34,6 +34,7 @@ describe('ReviewConformancePanel', () => {
         policy: 'forge.review-conformance/1',
         commit_sha: 'reviewed-sha',
         base_sha: 'base',
+        candidate_changed_paths: [],
         check_results: [],
         digest: 'contract-digest',
         context: {
@@ -63,7 +64,47 @@ describe('ReviewConformancePanel', () => {
 
     render(<ReviewConformancePanel conformance={result} />)
     expect(screen.getByText(/previous whole-Project scope \(106 requirements\)/)).toBeTruthy()
-    expect(screen.getByText(/fresh review to use Task-scoped v2/)).toBeTruthy()
+    expect(screen.getByText(/fresh review to use the current Task-scoped policy/)).toBeTruthy()
+  })
+
+  it('marks a v2 contract as obsolete and requiring a fresh review', () => {
+    const result: ReviewConformance = {
+      status: 'passed',
+      reason: null,
+      checks: [],
+      assessment: null,
+      contract: {
+        execution_id: 'execution',
+        policy: 'forge.review-conformance/2',
+        commit_sha: 'reviewed-sha',
+        base_sha: 'base',
+        candidate_changed_paths: [],
+        check_results: [],
+        digest: 'contract-digest',
+        context: {
+          project_id: 'project',
+          task_id: 'task',
+          repo_id: 'repo',
+          charter_revision_id: 'charter-r1',
+          charter_digest: 'charter-digest',
+          charter: {},
+          task_scope: {},
+          linked_documents: [],
+          setup_steps: [],
+          source_digest: 'source',
+          required_checks: [],
+          deferred_requirement_count: 0,
+          deferred_requirements_digest: null,
+          requirements: [],
+        },
+      },
+    }
+
+    render(<ReviewConformancePanel conformance={result} />)
+    expect(screen.getByText(/obsolete conformance policy/)).toBeTruthy()
+    expect(screen.getByText('forge.review-conformance/2')).toBeTruthy()
+    expect(screen.getByText(/fresh review to use the current Task-scoped policy/)).toBeTruthy()
+    expect(screen.queryByText(/This review covered/)).not.toBeTruthy()
   })
 
   it('shows the exact Charter and commit with requirement evidence', () => {
@@ -73,9 +114,10 @@ describe('ReviewConformancePanel', () => {
       checks: [],
       contract: {
         execution_id: 'execution',
-        policy: 'forge.review-conformance/2',
+        policy: 'forge.review-conformance/3',
         commit_sha: 'reviewed-sha',
         base_sha: 'base',
+        candidate_changed_paths: ['src/lib.rs'],
         check_results: [],
         digest: 'contract-digest',
         context: {

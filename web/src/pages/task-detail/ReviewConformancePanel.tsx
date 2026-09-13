@@ -11,7 +11,7 @@ const STATUS_LABELS = {
 export function ReviewConformancePanel({ conformance }: { conformance?: ReviewConformance }) {
   const status = conformance?.status ?? 'not_assessed'
   const contract = conformance?.contract
-  const usesTaskScopedPolicy = contract?.policy === 'forge.review-conformance/2'
+  const usesCurrentTaskScopedPolicy = contract?.policy === 'forge.review-conformance/3'
   return (
     <section
       aria-label="Task review conformance"
@@ -31,7 +31,7 @@ export function ReviewConformancePanel({ conformance }: { conformance?: ReviewCo
         </p>
       )}
       {conformance?.reason && <p className="break-words text-sm">{conformance.reason}</p>}
-      {contract && usesTaskScopedPolicy && (
+      {contract && usesCurrentTaskScopedPolicy && (
         <p className="text-xs text-muted-foreground">
           This review covered {contract.context.requirements.length} Task-scoped{' '}
           {contract.context.requirements.length === 1 ? 'requirement' : 'requirements'}.
@@ -47,12 +47,22 @@ export function ReviewConformancePanel({ conformance }: { conformance?: ReviewCo
           )}
         </p>
       )}
-      {contract && !usesTaskScopedPolicy && (
+      {contract && !usesCurrentTaskScopedPolicy && (
         <p className="text-xs text-muted-foreground">
-          This historical review used the previous whole-Project scope (
-          {contract.context.requirements.length}{' '}
-          {contract.context.requirements.length === 1 ? 'requirement' : 'requirements'}). Run a
-          fresh review to use Task-scoped v2.
+          {contract.policy === 'forge.review-conformance/1' ? (
+            <>
+              This historical review used the previous whole-Project scope (
+              {contract.context.requirements.length}{' '}
+              {contract.context.requirements.length === 1 ? 'requirement' : 'requirements'}).{' '}
+            </>
+          ) : (
+            <>
+              This review used obsolete conformance policy{' '}
+              <code className="font-mono">{contract.policy}</code>. Its result is retained for
+              history.{' '}
+            </>
+          )}
+          Run a fresh review to use the current Task-scoped policy.
         </p>
       )}
       {contract && (

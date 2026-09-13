@@ -51,14 +51,19 @@ impl TaskService {
                 "latest review is not awaiting_human",
             ));
         }
+        // Approval must never repair or default malformed persisted review
+        // details. Validate the stored row before attempting the transition.
+        super::strict_review_details(&latest_review)?;
         let finished_at = now_rfc3339();
-        let review = ReviewRepo::update_status(
+        let (review, task) = ReviewRepo::update_status_with_task_authority(
             &*self.db,
             &latest_review.id,
             ReviewStatus::Passed,
             latest_review.step_results_json.clone(),
             Some(finished_at.clone()),
             &finished_at,
+            task.version,
+            Some(finished_at.clone()),
         )
         .await?;
         self.publish_domain_event_by_dedupe(&format!(
@@ -73,13 +78,6 @@ impl TaskService {
         {
             tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
         }
-        TaskRepo::set_review_passed_at(
-            &*self.db,
-            &task_id,
-            Some(finished_at.clone()),
-            &finished_at,
-        )
-        .await?;
         self.create_system_comment(
             &task_id,
             format!("Review passed (attempt {})", review.attempt_number),
@@ -142,18 +140,23 @@ impl TaskService {
                 "latest review is not awaiting_human",
             ));
         }
+        // Rejection also preserves the corruption signal; it must not mutate
+        // a malformed persisted review into a valid-looking result.
+        super::strict_review_details(&latest_review)?;
         let reason = reason
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "manual review rejected".to_owned());
         let finished_at = now_rfc3339();
-        let review = ReviewRepo::update_status(
+        let (review, task) = ReviewRepo::update_status_with_task_authority(
             &*self.db,
             &latest_review.id,
             ReviewStatus::Failed,
             latest_review.step_results_json.clone(),
             Some(finished_at.clone()),
             &finished_at,
+            task.version,
+            None,
         )
         .await?;
         self.publish_domain_event_by_dedupe(&format!(
@@ -168,7 +171,6 @@ impl TaskService {
         {
             tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
         }
-        TaskRepo::set_review_passed_at(&*self.db, &task_id, None, &finished_at).await?;
         self.create_system_comment(
             &task_id,
             format!(
@@ -201,28 +203,13 @@ impl TaskService {
         )
         .await?;
         let remaining_retries = self.remaining_retries(&task_id).await?;
-        let follow_up_already_dispatched = ExecutionRepo::list_by_task_and_role(
+        let follow_up_already_dispatched = ExecutionRepo::has_active_or_completed_child(
             &*self.db,
             &task_id,
+            &review.execution_id,
             crate::workflow::default_roles::CODER,
-            PageRequest {
-                cursor: None,
-                limit: 20,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Desc,
-            },
         )
-        .await?
-        .items
-        .into_iter()
-        .any(|execution| {
-            execution.parent_execution_id.as_deref() == Some(review.execution_id.as_str())
-                && matches!(
-                    execution.status,
-                    ExecutionStatus::Running | ExecutionStatus::Completed
-                )
-        });
+        .await?;
         if remaining_retries > 0 && !follow_up_already_dispatched {
             self.dispatch_follow_up(
                 &task_id,
@@ -251,17 +238,6 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
         let review_config = review_config_from_json(task.task_state_config.as_deref())?;
-        let reviewer_assignment = TaskRoleAssignmentRepo::get_by_task_and_role(
-            &*self.db,
-            &task.id,
-            crate::workflow::default_roles::REVIEWER,
-        )
-        .await?;
-        let reviewer_agent_id = reviewer_assignment.and_then(|assignment| {
-            (assignment.assignee_type == Some(db::AssigneeKind::Agent))
-                .then_some(assignment.assignee_id)
-                .flatten()
-        });
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -270,6 +246,40 @@ impl TaskService {
             &project.workflow_definition,
             &Actor::system(api_types::SystemComponent::Workflow),
         );
+        let effective_review_role = workflow
+            .states
+            .iter()
+            .find(|state| state.name == task.status)
+            .and_then(crate::workflow::effective_role);
+        let reviewer_assignment = if effective_review_role
+            .map(|role| role == crate::workflow::default_roles::REVIEWER)
+            .unwrap_or(false)
+        {
+            TaskRoleAssignmentRepo::get_by_task_and_role(
+                &*self.db,
+                &task.id,
+                crate::workflow::default_roles::REVIEWER,
+            )
+            .await?
+        } else {
+            None
+        };
+        let reviewer_agent_id = reviewer_assignment.and_then(|assignment| {
+            (assignment.assignee_type == Some(db::AssigneeKind::Agent))
+                .then_some(assignment.assignee_id)
+                .flatten()
+        });
+        // The Task-role assignment is the sole reviewer/auditor authority.
+        // A configured auditor id without that materialized assignment is a
+        // stale legacy configuration, not permission to synthesize a
+        // reviewer principal at rerun time.  Assignment materialization is
+        // therefore a prerequisite for the configured-auditor path.
+        if review_config.auditor_agent_id.is_some() && reviewer_agent_id.is_none() {
+            return Err(ServiceError::conflict(
+                "configured auditor requires a reviewer role assignment",
+            ));
+        }
+        let auditor_agent_id = reviewer_agent_id;
         let requires_user_approval = workflow
             .states
             .iter()
@@ -295,7 +305,7 @@ impl TaskService {
                 workspace_path: workspace.worktree_path.into(),
                 ci_steps: review_config.ci_steps,
                 logs_path,
-                auditor_agent_id: reviewer_agent_id,
+                auditor_agent_id,
                 review_prompt: review_config.review_prompt,
                 executor_thread_id: execution.agent_session_id,
                 requires_user_approval,
@@ -344,9 +354,18 @@ impl TaskService {
             ::review::ReviewOutcome::AuditorFailed { .. }
             | ::review::ReviewOutcome::CiFailed { .. }
             | ::review::ReviewOutcome::MergeConflict { .. } => {
-                let current =
-                    TaskRepo::set_review_passed_at(&*self.db, &current.id, None, &now_rfc3339())
-                        .await?;
+                let current = if current.review_passed_at.is_some() {
+                    TaskRepo::set_review_passed_at_cas(
+                        &*self.db,
+                        &current.id,
+                        current.version,
+                        None,
+                        &now_rfc3339(),
+                    )
+                    .await?
+                } else {
+                    current
+                };
                 let (current, target, reason) = self
                     .review_failure_target(&current, Some(&review.execution_id))
                     .await?;

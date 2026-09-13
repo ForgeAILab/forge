@@ -153,11 +153,10 @@ impl MergeService {
 
         let review_guard = match self.db.lock_review_integration(&task_id).await {
             Ok(guard) => guard,
-            Err(error) => {
-                return Ok(MergeOutcome::ReviewRequired {
-                    reason: error.to_string(),
-                });
+            Err(db::DbError::Check(reason)) => {
+                return Ok(MergeOutcome::ReviewRequired { reason });
             }
+            Err(error) => return Err(error.into()),
         };
         let reviewed_sha = review_guard
             .contract
@@ -302,11 +301,10 @@ impl MergeService {
         let _integration_lock = self.integration_locks.acquire(repo_id).await;
         let guard = match self.db.lock_review_integration(&task_id).await {
             Ok(guard) => guard,
-            Err(error) => {
-                return Ok(MergeOutcome::ReviewRequired {
-                    reason: error.to_string(),
-                });
+            Err(db::DbError::Check(reason)) => {
+                return Ok(MergeOutcome::ReviewRequired { reason });
             }
+            Err(error) => return Err(error.into()),
         };
         let candidate = if let Some(contract) = &guard.contract {
             let head = git::get_current_sha(worktree_path).await?;
@@ -328,11 +326,10 @@ impl MergeService {
         push_branch(worktree_path, refspec.as_deref().unwrap_or(&source_branch)).await?;
         let guard = match self.db.lock_review_integration(&task_id).await {
             Ok(guard) => guard,
-            Err(error) => {
-                return Ok(MergeOutcome::ReviewRequired {
-                    reason: error.to_string(),
-                });
+            Err(db::DbError::Check(reason)) => {
+                return Ok(MergeOutcome::ReviewRequired { reason });
             }
+            Err(error) => return Err(error.into()),
         };
         guard.release().await?;
         let pr_service = crate::pr_service::PrService::new(Arc::clone(&self.db));
@@ -775,6 +772,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paused_project_cannot_write_the_integration_branch() {
+        let db = sqlite_db().await;
+        let event_bus = Arc::new(EventBus::new(16));
+        let temp = TempDir::new().expect("temp creates");
+        let repo_path = setup_repo(&temp).await;
+        let task_id = new_uuid_v4();
+        let worktree_path = temp.path().join("worktrees").join(&task_id).join("repo");
+        git::create_worktree(
+            &repo_path,
+            &workspace::task_branch_name(&task_id),
+            &worktree_path,
+        )
+        .await
+        .expect("worktree creates");
+        std::fs::write(worktree_path.join("feature.txt"), "hello\n").expect("feature writes");
+        git::commit_all(&worktree_path, "feature")
+            .await
+            .expect("feature commits");
+        seed_merge_rows(&db, &repo_path, &worktree_path, &task_id).await;
+        let task = TaskRepo::get_by_id(&*db, &task_id, false)
+            .await
+            .expect("task loads")
+            .expect("task exists");
+        ProjectRepo::set_paused_at(&*db, &task.project_id, Some(now_rfc3339()))
+            .await
+            .expect("project pauses");
+        let before_sha = git::get_current_sha(&repo_path).await.expect("head reads");
+        let service = MergeService::new(Arc::clone(&db), event_bus, temp.path().to_path_buf());
+
+        let result = service.merge(task_id).await;
+
+        assert!(matches!(
+            result,
+            Err(ServiceError::ProjectPaused { project_id }) if project_id == task.project_id
+        ));
+        assert_eq!(
+            git::get_current_sha(&repo_path)
+                .await
+                .expect("head reloads"),
+            before_sha
+        );
+    }
+
+    #[tokio::test]
     async fn conformance_merge_refuses_changed_candidate_target_policy_and_legacy_pass() {
         for changed in ["none", "candidate", "target", "policy", "legacy"] {
             let db = sqlite_db().await;
@@ -846,6 +887,12 @@ mod tests {
             )
             .await
             .unwrap();
+            if changed != "legacy" && changed != "none" {
+                let now = now_rfc3339();
+                TaskRepo::set_review_passed_at(&*db, &task_id, Some(now.clone()), &now)
+                    .await
+                    .unwrap();
+            }
             match changed {
                 "candidate" => {
                     std::fs::write(worktree.join("feature.txt"), "unreviewed\n").unwrap();
@@ -868,11 +915,20 @@ mod tests {
             let before = git::get_current_sha(&repo).await.unwrap();
             let service =
                 MergeService::new(db.clone(), Arc::new(EventBus::new(16)), temp.path().into());
-            let outcome = service.merge(task_id).await.unwrap();
             if changed == "none" {
+                let without_authority = service.merge(task_id.clone()).await.unwrap();
+                assert!(
+                    matches!(&without_authority, MergeOutcome::ReviewRequired { reason } if reason.contains("current review authority"))
+                );
+                let now = now_rfc3339();
+                TaskRepo::set_review_passed_at(&*db, &task_id, Some(now.clone()), &now)
+                    .await
+                    .unwrap();
+                let outcome = service.merge(task_id).await.unwrap();
                 assert!(matches!(outcome, MergeOutcome::Done { .. }), "{outcome:?}");
                 assert_eq!(git::get_current_sha(&repo).await.unwrap(), accepted_sha);
             } else if changed == "target" {
+                let outcome = service.merge(task_id).await.unwrap();
                 // A moved integration target is contention, not a fault, and
                 // is reported separately so the caller can rebase instead of
                 // charging the Task's single merge-fix retry.
@@ -882,6 +938,7 @@ mod tests {
                 );
                 assert_eq!(git::get_current_sha(&repo).await.unwrap(), before);
             } else {
+                let outcome = service.merge(task_id).await.unwrap();
                 assert!(
                     matches!(outcome, MergeOutcome::ReviewRequired { .. }),
                     "{changed}: {outcome:?}"

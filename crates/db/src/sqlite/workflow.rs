@@ -23,6 +23,19 @@ fn map_task_role_assignment_row(
     })
 }
 
+fn assignment_snapshot_matches(
+    current: &TaskRoleAssignment,
+    expected: &TaskRoleAssignment,
+) -> bool {
+    current.id == expected.id
+        && current.task_id == expected.task_id
+        && current.role_name == expected.role_name
+        && current.assignee_type == expected.assignee_type
+        && current.assignee_id == expected.assignee_id
+        && current.created_at == expected.created_at
+        && current.updated_at == expected.updated_at
+}
+
 fn map_transition_log_row(row: SqliteRow) -> TransitionLog {
     TransitionLog {
         id: row.get(0),
@@ -77,6 +90,83 @@ impl TaskRoleAssignmentRepo for SqliteDb {
         map_task_role_assignment_row(row)
     }
 
+    async fn assign_if_unchanged(
+        &self,
+        input: CreateTaskRoleAssignment,
+        expected_previous: Option<&TaskRoleAssignment>,
+    ) -> std::result::Result<TaskRoleAssignment, DbError> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let current_row = sqlx::query(
+            "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at
+             FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
+        )
+        .bind(&input.task_id)
+        .bind(&input.role_name)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(map_workflow_sqlx_error)?;
+        let current = current_row.map(map_task_role_assignment_row).transpose()?;
+        let expected_matches = match expected_previous {
+            Some(expected) => current
+                .as_ref()
+                .is_some_and(|current| assignment_snapshot_matches(current, expected)),
+            None => current.is_none(),
+        };
+        if !expected_matches {
+            return Err(DbError::VersionConflict);
+        }
+
+        if let Some(expected_previous) = expected_previous {
+            let result = sqlx::query(
+                "UPDATE task_role_assignment
+                 SET assignee_type = ?, assignee_id = ?, updated_at = ?
+                 WHERE task_id = ? AND role_name = ? AND id = ? AND updated_at = ?",
+            )
+            .bind(input.assignee_type.as_ref().map(ToString::to_string))
+            .bind(input.assignee_id.as_deref())
+            .bind(&input.updated_at)
+            .bind(&input.task_id)
+            .bind(&input.role_name)
+            .bind(&expected_previous.id)
+            .bind(&expected_previous.updated_at)
+            .execute(&mut *transaction)
+            .await
+            .map_err(map_workflow_sqlx_error)?;
+            if result.rows_affected() == 0 {
+                return Err(DbError::VersionConflict);
+            }
+        } else {
+            sqlx::query(
+                "INSERT INTO task_role_assignment
+                    (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&input.id)
+            .bind(&input.task_id)
+            .bind(&input.role_name)
+            .bind(input.assignee_type.as_ref().map(ToString::to_string))
+            .bind(input.assignee_id.as_deref())
+            .bind(&input.created_at)
+            .bind(&input.updated_at)
+            .execute(&mut *transaction)
+            .await
+            .map_err(map_workflow_sqlx_error)?;
+        }
+
+        let row = sqlx::query(
+            "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at
+             FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
+        )
+        .bind(&input.task_id)
+        .bind(&input.role_name)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(map_workflow_sqlx_error)?;
+        let assignment = map_task_role_assignment_row(row)?;
+        transaction.commit().await?;
+        Ok(assignment)
+    }
+
     async fn get_by_task_and_role(
         &self,
         task_id: &str,
@@ -119,6 +209,151 @@ impl TaskRoleAssignmentRepo for SqliteDb {
             .await
             .map_err(map_workflow_sqlx_error)?;
         Ok(())
+    }
+
+    async fn assign_and_clear_review_authority(
+        &self,
+        input: CreateTaskRoleAssignment,
+        expected_previous: Option<&TaskRoleAssignment>,
+        expected_task_version: i64,
+        updated_at: &str,
+    ) -> std::result::Result<(TaskRoleAssignment, Task), DbError> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let current_row = sqlx::query(
+            "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at
+             FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
+        )
+        .bind(&input.task_id)
+        .bind(&input.role_name)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(map_workflow_sqlx_error)?;
+        let current = current_row.map(map_task_role_assignment_row).transpose()?;
+        let expected_matches = match expected_previous {
+            Some(expected) => current
+                .as_ref()
+                .is_some_and(|current| assignment_snapshot_matches(current, expected)),
+            None => current.is_none(),
+        };
+        if !expected_matches {
+            return Err(DbError::VersionConflict);
+        }
+        sqlx::query(
+            "INSERT INTO task_role_assignment
+                (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(task_id, role_name) DO UPDATE SET
+                assignee_type = excluded.assignee_type,
+                assignee_id = excluded.assignee_id,
+                updated_at = excluded.updated_at",
+        )
+        .bind(&input.id)
+        .bind(&input.task_id)
+        .bind(&input.role_name)
+        .bind(input.assignee_type.as_ref().map(ToString::to_string))
+        .bind(input.assignee_id.as_deref())
+        .bind(&input.created_at)
+        .bind(&input.updated_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_workflow_sqlx_error)?;
+
+        let result = sqlx::query(
+            "UPDATE task
+             SET review_passed_at = NULL, updated_at = ?, version = version + 1
+             WHERE id = ? AND deleted_at IS NULL AND version = ?",
+        )
+        .bind(updated_at)
+        .bind(&input.task_id)
+        .bind(expected_task_version)
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_workflow_sqlx_error)?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::VersionConflict);
+        }
+
+        let assignment = sqlx::query(
+            "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at
+             FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
+        )
+        .bind(&input.task_id)
+        .bind(&input.role_name)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(map_workflow_sqlx_error)
+        .and_then(map_task_role_assignment_row)?;
+        let task = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
+            .bind(&input.task_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(map_workflow_sqlx_error)
+            .and_then(map_task)?;
+        transaction.commit().await?;
+        Ok((assignment, task))
+    }
+
+    async fn remove_and_clear_review_authority(
+        &self,
+        expected_assignment: &TaskRoleAssignment,
+        expected_task_version: i64,
+        updated_at: &str,
+    ) -> std::result::Result<Task, DbError> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let current_row = sqlx::query(
+            "SELECT id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at
+             FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
+        )
+        .bind(&expected_assignment.task_id)
+        .bind(&expected_assignment.role_name)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(map_workflow_sqlx_error)?;
+        let current = current_row.map(map_task_role_assignment_row).transpose()?;
+        let Some(current) = current else {
+            return Err(DbError::VersionConflict);
+        };
+        if !assignment_snapshot_matches(&current, expected_assignment) {
+            return Err(DbError::VersionConflict);
+        }
+        let result = sqlx::query(
+            "DELETE FROM task_role_assignment
+             WHERE task_id = ? AND role_name = ? AND id = ? AND updated_at = ?",
+        )
+        .bind(&expected_assignment.task_id)
+        .bind(&expected_assignment.role_name)
+        .bind(&expected_assignment.id)
+        .bind(&expected_assignment.updated_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_workflow_sqlx_error)?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::VersionConflict);
+        }
+
+        let result = sqlx::query(
+            "UPDATE task
+             SET review_passed_at = NULL, updated_at = ?, version = version + 1
+             WHERE id = ? AND deleted_at IS NULL AND version = ?",
+        )
+        .bind(updated_at)
+        .bind(&expected_assignment.task_id)
+        .bind(expected_task_version)
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_workflow_sqlx_error)?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::VersionConflict);
+        }
+
+        let task = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
+            .bind(&expected_assignment.task_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(map_workflow_sqlx_error)
+            .and_then(map_task)?;
+        transaction.commit().await?;
+        Ok(task)
     }
 }
 
@@ -184,7 +419,7 @@ impl TransitionLogRepo for SqliteDb {
         task_id: &str,
     ) -> std::result::Result<Vec<TransitionLog>, DbError> {
         let rows = sqlx::query(
-            "SELECT id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at FROM transition_log WHERE task_id = ? ORDER BY created_at",
+            "SELECT id, task_id, from_state, to_state, trigger_name, triggered_by, trigger_reason, hook_results_json, rejection, created_at FROM transition_log WHERE task_id = ? ORDER BY created_at, rowid",
         )
         .bind(task_id)
         .fetch_all(&self.pool)
@@ -200,15 +435,28 @@ impl TransitionLogRepo for SqliteDb {
         gate_state: &str,
     ) -> std::result::Result<i64, DbError> {
         sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM transition_log WHERE task_id = ? AND from_state = ? AND rejection = 1 AND (NOT EXISTS (SELECT 1 FROM transition_log t2 WHERE t2.task_id = ? AND t2.from_state = ? AND t2.to_state = ? AND t2.trigger_name = 'reset_retry_window') OR created_at > (SELECT MAX(created_at) FROM transition_log t2 WHERE t2.task_id = ? AND t2.from_state = ? AND t2.to_state = ? AND t2.trigger_name = 'reset_retry_window'))",
+            "SELECT COUNT(*)
+             FROM transition_log AS rejection
+             WHERE rejection.task_id = ?
+               AND rejection.from_state = ?
+               AND rejection.rejection = 1
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM transition_log AS boundary
+                   WHERE boundary.task_id = rejection.task_id
+                     AND boundary.from_state = rejection.from_state
+                     AND boundary.rejection = 0
+                     AND boundary.trigger_name IN ('reset_retry_window', 'reset_to_initial')
+                     AND (
+                         boundary.created_at > rejection.created_at
+                         OR (
+                             boundary.created_at = rejection.created_at
+                             AND boundary.rowid > rejection.rowid
+                         )
+                     )
+               )",
         )
         .bind(task_id)
-        .bind(gate_state)
-        .bind(task_id)
-        .bind(gate_state)
-        .bind(gate_state)
-        .bind(task_id)
-        .bind(gate_state)
         .bind(gate_state)
         .fetch_one(&self.pool)
         .await

@@ -102,6 +102,166 @@ async fn file_backed_migrations_apply_cleanly() {
 }
 
 #[tokio::test]
+async fn solo_ready_permission_migration_repairs_only_the_exact_legacy_ceiling() {
+    const LEGACY: &str = r#"{"permissions":["read_project","read_agent_chat","read_memory","propose_message","propose_project"]}"#;
+    const READY: &str = r#"{"permissions":["read_project","read_agent_chat","read_task","read_memory","propose_task","propose_project","propose_message","propose_review","propose_commitment","propose_memory","propose_decision","propose_session"]}"#;
+
+    let migration_dir = unique_temp_path("solo-ready-permission-migration");
+    fs::create_dir_all(&migration_dir).expect("temp migration dir creates");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("migrations/V141__solo_project_agent_ready_permissions.sql");
+    fs::copy(
+        source,
+        migration_dir.join("V141__solo_project_agent_ready_permissions.sql"),
+    )
+    .expect("Solo migration copies");
+
+    let db_path = unique_temp_path("solo-ready-permission-db").with_extension("db");
+    let url = format!("sqlite://{}", db_path.display());
+    let pool = create_sqlite_pool(&url).await.expect("pool");
+    sqlx::query(
+        "CREATE TABLE project (
+             id TEXT PRIMARY KEY,
+             settings TEXT NOT NULL,
+             charter_status TEXT NOT NULL,
+             charter_setup_required INTEGER NOT NULL
+         );
+         CREATE TABLE project_agent_binding (
+             id TEXT PRIMARY KEY,
+             project_id TEXT NOT NULL,
+             state TEXT NOT NULL,
+             charter_setup_required INTEGER NOT NULL,
+             permission_ceiling_json TEXT NOT NULL,
+             version INTEGER NOT NULL,
+             updated_at TEXT NOT NULL
+         );",
+    )
+    .execute(&pool)
+    .await
+    .expect("minimal pre-V141 schema creates");
+
+    for (project_id, settings, project_setup, binding_state, binding_setup, ceiling) in [
+        (
+            "solo-ready",
+            r#"{"forge_solo":{"contract_revision":"forge.solo.bootstrap/v1"}}"#,
+            0,
+            "active",
+            0,
+            LEGACY,
+        ),
+        ("ordinary-ready", "{}", 0, "active", 0, LEGACY),
+        ("solo-setup", r#"{"forge_solo":{}}"#, 1, "active", 1, LEGACY),
+        (
+            "solo-setup-mismatched-binding",
+            r#"{"forge_solo":{}}"#,
+            1,
+            "active",
+            0,
+            LEGACY,
+        ),
+        (
+            "solo-ready-mismatched-binding",
+            r#"{"forge_solo":{}}"#,
+            0,
+            "active",
+            1,
+            LEGACY,
+        ),
+        (
+            "solo-replaced",
+            r#"{"forge_solo":{}}"#,
+            1,
+            "replaced",
+            1,
+            LEGACY,
+        ),
+        (
+            "solo-custom",
+            r#"{"forge_solo":{}}"#,
+            0,
+            "active",
+            0,
+            r#"{"permissions":["read_project"]}"#,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO project (
+                 id, settings, charter_status, charter_setup_required
+             ) VALUES (?, ?, ?, ?)",
+        )
+        .bind(project_id)
+        .bind(settings)
+        .bind(if project_setup == 0 {
+            "charter_backed"
+        } else {
+            "legacy_unverified"
+        })
+        .bind(project_setup)
+        .execute(&pool)
+        .await
+        .expect("migration fixture Project inserts");
+        sqlx::query(
+            "INSERT INTO project_agent_binding (
+                 id, project_id, state, charter_setup_required,
+                 permission_ceiling_json, version, updated_at
+             ) VALUES (?, ?, ?, ?, ?, 7, '2026-09-10T00:00:00Z')",
+        )
+        .bind(format!("binding-{project_id}"))
+        .bind(project_id)
+        .bind(binding_state)
+        .bind(binding_setup)
+        .bind(ceiling)
+        .execute(&pool)
+        .await
+        .expect("migration fixture binding inserts");
+    }
+
+    run_migrations_from(&pool, &migration_dir)
+        .await
+        .expect("V141 applies");
+
+    let repaired: (String, i64) = sqlx::query_as(
+        "SELECT permission_ceiling_json, version
+         FROM project_agent_binding WHERE project_id = 'solo-ready'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("repaired Solo binding reads");
+    assert_eq!(repaired, (READY.to_owned(), 8));
+
+    let repaired_setup: (String, i64) = sqlx::query_as(
+        "SELECT permission_ceiling_json, version
+         FROM project_agent_binding WHERE project_id = 'solo-setup'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("repaired in-flight Solo adoption binding reads");
+    assert_eq!(repaired_setup, (READY.to_owned(), 8));
+
+    for (project_id, expected) in [
+        ("ordinary-ready", LEGACY),
+        ("solo-setup-mismatched-binding", LEGACY),
+        ("solo-ready-mismatched-binding", LEGACY),
+        ("solo-replaced", LEGACY),
+        ("solo-custom", r#"{"permissions":["read_project"]}"#),
+    ] {
+        let unchanged: (String, i64) = sqlx::query_as(
+            "SELECT permission_ceiling_json, version
+             FROM project_agent_binding WHERE project_id = ?",
+        )
+        .bind(project_id)
+        .fetch_one(&pool)
+        .await
+        .expect("unmatched binding reads");
+        assert_eq!(unchanged, (expected.to_owned(), 7), "{project_id}");
+    }
+
+    pool.close().await;
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(migration_dir);
+}
+
+#[tokio::test]
 async fn project_owner_membership_backfill_preserves_existing_memberships() {
     let migration_dir = unique_temp_path("project-owner-membership-migrations");
     fs::create_dir_all(&migration_dir).expect("temp migration dir creates");

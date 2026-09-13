@@ -236,14 +236,6 @@ impl TaskService {
             None
         };
 
-        let metadata_json = if is_subtask {
-            let metadata = TaskMetadata {
-                ..TaskMetadata::default()
-            };
-            metadata.to_json()
-        } else {
-            None
-        };
         let create_task = CreateTask {
             id: new_uuid_v4(),
             project_id: project_id.clone(),
@@ -289,7 +281,7 @@ impl TaskService {
                 ));
             }
         }
-        let mut task = TaskRepo::create_in_tx(&*self.db, &mut transaction, create_task).await?;
+        let task = TaskRepo::create_in_tx(&*self.db, &mut transaction, create_task).await?;
         if let Some(parent_task_id) = task.parent_task_id.as_deref() {
             // Creating the first child atomically converts its parent into a
             // coordination container. Preserve only aggregate-review roles;
@@ -322,6 +314,7 @@ impl TaskService {
             .bind(parent_task_id)
             .fetch_all(&mut *transaction)
             .await?;
+            let mut removed_parent_role = false;
             for role_name in parent_roles {
                 if !aggregate_review_roles.contains(role_name.as_str()) {
                     sqlx::query(
@@ -331,7 +324,38 @@ impl TaskService {
                     .bind(role_name)
                     .execute(&mut *transaction)
                     .await?;
+                    removed_parent_role = true;
                 }
+            }
+            if removed_parent_role {
+                // Converting a Task into a coordination root changes its
+                // authority surface. Invalidate review authority and wake
+                // parked dispatch in the same transaction as role pruning.
+                sqlx::query(
+                    "UPDATE task
+                     SET review_passed_at = NULL,
+                         version = version + CASE WHEN review_passed_at IS NOT NULL THEN 1 ELSE 0 END,
+                         metadata_json = CASE
+                             WHEN json_valid(COALESCE(metadata_json, '{}'))
+                             THEN NULLIF(json_remove(COALESCE(metadata_json, '{}'), '$.dispatch_disposition', '$.deferred_dispatch'), '{}')
+                             ELSE metadata_json
+                         END,
+                         updated_at = CASE
+                             WHEN review_passed_at IS NOT NULL
+                                  OR (json_valid(COALESCE(metadata_json, '{}'))
+                                      AND (json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
+                                           OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL))
+                             THEN ? ELSE updated_at END
+                     WHERE id = ? AND deleted_at IS NULL
+                       AND (review_passed_at IS NOT NULL
+                            OR (json_valid(COALESCE(metadata_json, '{}'))
+                                AND (json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
+                                     OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL)))",
+                )
+                .bind(&now)
+                .bind(parent_task_id)
+                .execute(&mut *transaction)
+                .await?;
             }
         }
         if !task.is_automation {
@@ -364,14 +388,10 @@ impl TaskService {
             .await?;
         }
         transaction.commit().await?;
-        if is_subtask {
-            TaskRepo::set_metadata_json(&*self.db, &task.id, metadata_json.clone(), &now).await?;
-            task.metadata_json = metadata_json;
-        }
 
         if let Some(assignments) = validated_assignments {
             for (role_name, assignee_type, assignee_id) in assignments {
-                TaskRoleAssignmentRepo::assign(
+                TaskRoleAssignmentRepo::assign_if_unchanged(
                     &*self.db,
                     CreateTaskRoleAssignment {
                         id: new_uuid_v4(),
@@ -382,6 +402,7 @@ impl TaskService {
                         created_at: now.clone(),
                         updated_at: now.clone(),
                     },
+                    None,
                 )
                 .await?;
             }
@@ -633,11 +654,33 @@ impl TaskService {
             .into_iter()
             .map(|assignment| assignment.role_name)
             .collect::<HashSet<_>>();
+        let mut current = task.clone();
         for assignment in self
             .project_default_role_assignments(task, covered_roles)
             .await?
         {
-            TaskRoleAssignmentRepo::assign(&*self.db, assignment).await?;
+            let task_id = assignment.task_id.clone();
+            let (_assignment, _updated) =
+                TaskRoleAssignmentRepo::assign_and_clear_review_authority(
+                    &*self.db,
+                    assignment,
+                    None,
+                    current.version,
+                    &now_rfc3339(),
+                )
+                .await?;
+            crate::wake_task_dispatch(
+                &self.db,
+                &task_id,
+                "Project default role assignment changed",
+            )
+            .await?;
+            // Waking a parked Task advances its dispatch generation. Reload
+            // before the next default-role CAS so multiple missing roles do
+            // not reuse the pre-wake version from `current`.
+            current = TaskRepo::get_by_id(&*self.db, &task_id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
         }
         Ok(())
     }

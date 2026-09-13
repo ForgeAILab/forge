@@ -1201,18 +1201,6 @@ async fn validate_write_capable_delivery(
     Ok(after_sha)
 }
 
-/// Marker used by the Task runner when it invokes the executor.  Keeping this
-/// helper in services avoids exposing an executor-specific authority field to
-/// API callers or persisted profile JSON.
-pub(crate) fn set_task_role_marker(config: &mut serde_json::Value, role: &str) {
-    if let Some(object) = config.as_object_mut() {
-        object.insert(
-            TASK_ROLE_MARKER.to_owned(),
-            serde_json::Value::String(role.to_owned()),
-        );
-    }
-}
-
 /// Routes embedded snapshots to the Forge-native Task adapter while keeping
 /// every existing CLI/fallback executor on its original path.
 #[derive(Clone)]
@@ -1357,7 +1345,7 @@ mod tests {
             "executor_type": "embedded",
             TASK_ROLE_MARKER: "reviewer",
         });
-        set_task_role_marker(&mut config, "coder");
+        executors::mark_task_role(&mut config, "coder");
         assert_eq!(config[TASK_ROLE_MARKER], "coder");
     }
 

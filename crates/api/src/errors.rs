@@ -254,6 +254,14 @@ impl From<ServiceError> for ApiError {
             },
             ServiceError::NotFound { entity, id } => Self::not_found(entity, id),
             ServiceError::InvalidOperation { message } => Self::invalid_operation(message),
+            ServiceError::ExecutionAlreadyRunning {
+                scope,
+                execution_id,
+            } => Self::conflict_with_code_and_details(
+                "execution.already_running",
+                format!("{scope} execution already running: {execution_id}"),
+                json!({ "scope": scope, "execution_id": execution_id }),
+            ),
             ServiceError::AuthorizationDenied { message } => {
                 Self::forbidden_with_code("authorization.invalid", message)
             }
@@ -499,6 +507,46 @@ impl From<DbError> for ApiError {
                 message: "agent is at capacity".to_owned(),
                 details: None,
             },
+            DbError::AgentPaused { agent_id } => Self::conflict_with_code_and_details(
+                "agent_paused",
+                format!("agent {agent_id} is paused and cannot accept new work"),
+                json!({ "agent_id": agent_id }),
+            ),
+            DbError::ExecutionAlreadyRunning {
+                scope,
+                execution_id,
+            } => Self::conflict_with_code_and_details(
+                "execution.already_running",
+                format!("{scope} execution already running: {execution_id}"),
+                json!({ "scope": scope, "execution_id": execution_id }),
+            ),
+            DbError::ProjectPaused { project_id } => Self::conflict_with_code_and_details(
+                "project_paused",
+                format!("project {project_id} is paused"),
+                json!({ "project_id": project_id }),
+            ),
+            DbError::RepoInUse { repo_id } => Self::conflict_with_code_and_details(
+                "repo_in_use",
+                format!("repo {repo_id} has active executions or workspace leases"),
+                json!({ "repo_id": repo_id }),
+            ),
+            DbError::ProjectInUse {
+                project_id,
+                running_executions,
+                active_leases,
+            } => Self::conflict_with_code_and_details(
+                "project_in_use",
+                format!(
+                    "project {project_id} has {running_executions} running execution(s) and \
+                     {active_leases} active workspace lease(s); retry with ?force=true to \
+                     request cancellation before deletion"
+                ),
+                json!({
+                    "project_id": project_id,
+                    "running_executions": running_executions,
+                    "active_leases": active_leases,
+                }),
+            ),
             DbError::CycleDetected => Self {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 code: "cycle_detected",
@@ -517,6 +565,9 @@ impl From<DbError> for ApiError {
                 message,
                 details: None,
             },
+            DbError::ReviewDetailsCorrupt { review_id, .. } => Self::internal(format!(
+                "persisted review {review_id} has invalid step_results_json"
+            )),
             DbError::InvalidSoftDelete => Self {
                 status: StatusCode::BAD_REQUEST,
                 code: "invalid_soft_delete",

@@ -23,7 +23,7 @@ impl TaskService {
             return Ok(());
         }
 
-        let task = match TaskRepo::get_by_id(&*self.db, &execution.task_id, false).await? {
+        let mut task = match TaskRepo::get_by_id(&*self.db, &execution.task_id, false).await? {
             Some(task) => task,
             None => return Ok(()),
         };
@@ -61,6 +61,18 @@ impl TaskService {
         else {
             return Ok(());
         };
+        if task.review_passed_at.is_some()
+            && workflow.canonical_phase_for_state(&target) == api_types::CanonicalPhase::Review
+        {
+            task = TaskRepo::set_review_passed_at_cas(
+                &*self.db,
+                &task.id,
+                task.version,
+                None,
+                &now_rfc3339(),
+            )
+            .await?;
+        }
         if let Some(summary) = execution.summary.as_deref().map(str::trim) {
             if !summary.is_empty() {
                 let content = format!("Agent completed execution: {summary}");
@@ -146,7 +158,7 @@ impl TaskService {
             Some(&current_state.config),
             current_state.gate_config.as_ref(),
         )?;
-        let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
+        let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
             ServiceError::invalid_operation(format!(
                 "invalid task metadata for {}: {error}",
                 task.id
@@ -168,28 +180,57 @@ impl TaskService {
                 .await;
         }
 
-        let attempt = retry_count + 1;
-        metadata.extra.insert(
-            "workflow_guard_retry_count".to_owned(),
-            Value::Number(serde_json::Number::from(attempt)),
-        );
-        metadata.extra.insert(
-            "last_workflow_guard_rejection_at".to_owned(),
-            Value::String(now_rfc3339()),
-        );
-        metadata.extra.insert(
-            "last_workflow_guard_name".to_owned(),
-            Value::String(guard.to_owned()),
-        );
-        metadata.extra.insert(
-            "last_workflow_guard_reason".to_owned(),
-            Value::String(reason.to_owned()),
-        );
-        TaskRepo::set_metadata_json(&*self.db, &task.id, metadata.to_json(), &now_rfc3339())
-            .await?;
+        let now = now_rfc3339();
+        let updated_task = TaskRepo::mutate_metadata(
+            &*self.db,
+            &task.id,
+            Some(task.version),
+            vec![
+                db::TaskMetadataMutation::Increment {
+                    key: "workflow_guard_retry_count".to_owned(),
+                    by: 1,
+                },
+                db::TaskMetadataMutation::Set {
+                    key: "last_workflow_guard_rejection_at".to_owned(),
+                    value: Value::String(now.clone()),
+                },
+                db::TaskMetadataMutation::Set {
+                    key: "last_workflow_guard_name".to_owned(),
+                    value: Value::String(guard.to_owned()),
+                },
+                db::TaskMetadataMutation::Set {
+                    key: "last_workflow_guard_reason".to_owned(),
+                    value: Value::String(reason.to_owned()),
+                },
+            ],
+            &now,
+        )
+        .await?;
+        let updated_metadata =
+            TaskMetadata::parse(updated_task.metadata_json.as_deref()).map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "invalid task metadata for {}: {error}",
+                    task.id
+                ))
+            })?;
+        let attempt = updated_metadata
+            .extra
+            .get("workflow_guard_retry_count")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(format!(
+                    "workflow guard retry counter missing for task {}",
+                    task.id
+                ))
+            })?;
+        if attempt > budget as u64 {
+            return self
+                .annotate_workflow_guard_block(execution, &updated_task, guard, reason)
+                .await;
+        }
 
         let prompt = render_workflow_guard_follow_up_prompt(guard, reason, attempt, budget as u64);
-        self.resume_execution_for_workflow_guard(execution, task, prompt)
+        self.resume_execution_for_workflow_guard(execution, &updated_task, prompt)
             .await?;
         Ok(())
     }
@@ -365,25 +406,40 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
-        let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
+        let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
             ServiceError::invalid_operation(format!(
                 "invalid task metadata for {}: {error}",
                 task.id
             ))
         })?;
-        let mut changed = false;
-        for key in [
-            "workflow_guard_retry_count",
-            "last_workflow_guard_rejection_at",
-            "last_workflow_guard_name",
-            "last_workflow_guard_reason",
-        ] {
-            changed |= metadata.extra.remove(key).is_some();
-        }
-        if changed {
-            TaskRepo::set_metadata_json(&*self.db, &task.id, metadata.to_json(), &now_rfc3339())
-                .await?;
-        }
+        let Some(expected_count) = metadata.extra.get("workflow_guard_retry_count").cloned() else {
+            return Ok(());
+        };
+        TaskRepo::mutate_metadata(
+            &*self.db,
+            &task.id,
+            None,
+            vec![db::TaskMetadataMutation::CompareAndMutate {
+                key: "workflow_guard_retry_count".to_owned(),
+                expected: expected_count,
+                mutations: vec![
+                    db::TaskMetadataMutation::Remove {
+                        key: "workflow_guard_retry_count".to_owned(),
+                    },
+                    db::TaskMetadataMutation::Remove {
+                        key: "last_workflow_guard_rejection_at".to_owned(),
+                    },
+                    db::TaskMetadataMutation::Remove {
+                        key: "last_workflow_guard_name".to_owned(),
+                    },
+                    db::TaskMetadataMutation::Remove {
+                        key: "last_workflow_guard_reason".to_owned(),
+                    },
+                ],
+            }],
+            &now_rfc3339(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -579,17 +635,28 @@ impl TaskService {
         if workflow.state_kind(&task.status) == Some(api_types::StateKind::Terminal) {
             return Ok(());
         }
-        let current_state = workflow
+        let Some(current_state) = workflow
             .states
             .iter()
-            .find(|state| state.name == task.status);
+            .find(|state| state.name == task.status)
+        else {
+            return Ok(());
+        };
+        let current_role = crate::workflow::effective_role(current_state);
+        let execution_still_owns_current_role = execution.role == "interactive"
+            || current_role == Some(execution.role.as_str())
+            || (current_role == Some(crate::workflow::default_roles::CODER)
+                && execution.role == "executor");
+        if !execution_still_owns_current_role {
+            return Ok(());
+        }
         if allow_retry
             && self
                 .maybe_schedule_execution_retry(
                     execution,
                     &task,
-                    current_state.map(|state| &state.config),
-                    current_state.and_then(|state| state.gate_config.as_ref()),
+                    Some(&current_state.config),
+                    current_state.gate_config.as_ref(),
                 )
                 .await?
         {
@@ -707,6 +774,15 @@ impl TaskService {
         task: &Task,
         execution: &Execution,
     ) -> Result<bool> {
+        // A reviewer/auditor execution is part of a durable Review attempt.
+        // Once that exact attempt is terminal, its session cannot be resumed:
+        // admission only accepts a Running Review and a fresh attempt must be
+        // created instead.  Keep the impossible recovery action out of new
+        // annotations (and manual-stop annotations) at the source.
+        if terminal_review_is_bound_to_execution(&self.db, execution).await? {
+            return Ok(false);
+        }
+
         let (Some(agent_id), Some(_session_id), Some(_snapshot)) = (
             execution.agent_id.as_deref(),
             execution.agent_session_id.as_deref(),
@@ -751,7 +827,7 @@ impl TaskService {
             return Ok(false);
         }
 
-        let mut metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
+        let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
             ServiceError::invalid_operation(format!(
                 "invalid task metadata for {}: {error}",
                 task.id
@@ -766,23 +842,48 @@ impl TaskService {
             return Ok(false);
         }
 
-        let attempt = retry_count + 1;
-        let delay_seconds =
-            (10_u64.saturating_mul(2_u64.saturating_pow(retry_count as u32))).min(300);
+        let now = now_rfc3339();
+        let task = TaskRepo::mutate_metadata(
+            &*self.db,
+            &task.id,
+            Some(task.version),
+            vec![
+                db::TaskMetadataMutation::Increment {
+                    key: "execution_retry_count".to_owned(),
+                    by: 1,
+                },
+                db::TaskMetadataMutation::Set {
+                    key: "last_execution_failure_at".to_owned(),
+                    value: Value::String(now.clone()),
+                },
+            ],
+            &now,
+        )
+        .await?;
+        let updated_metadata =
+            TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "invalid task metadata for {}: {error}",
+                    task.id
+                ))
+            })?;
+        let attempt = updated_metadata
+            .extra
+            .get("execution_retry_count")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(format!(
+                    "execution retry counter missing for task {}",
+                    task.id
+                ))
+            })?;
+        if attempt > budget as u64 {
+            return Ok(false);
+        }
+        let delay_seconds = (10_u64
+            .saturating_mul(2_u64.saturating_pow(attempt.saturating_sub(1) as u32)))
+        .min(300);
         let next_dispatch_at = chrono::Utc::now() + chrono::Duration::seconds(delay_seconds as i64);
-        metadata.extra.insert(
-            "execution_retry_count".to_owned(),
-            Value::Number(serde_json::Number::from(attempt)),
-        );
-        metadata.extra.insert(
-            "last_execution_failure_at".to_owned(),
-            Value::String(now_rfc3339()),
-        );
-        TaskRepo::set_metadata_json(&*self.db, &task.id, metadata.to_json(), &now_rfc3339())
-            .await?;
-        let task = TaskRepo::get_by_id(&*self.db, &task.id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
         crate::deferred_dispatch::set(
             &self.db,
             &task,
@@ -846,10 +947,37 @@ impl TaskService {
             return Ok(());
         }
 
-        let review = self
-            .ensure_current_review_for_reviewer(&task.id, &execution.id)
-            .await?;
-        if review.execution_id == execution.id && review.status != ReviewStatus::Running {
+        let reviews = ReviewRepo::list_by_task(&*self.db, &task.id).await?;
+        let Some(review) = exact_review_for_execution(execution, &reviews).cloned() else {
+            tracing::warn!(
+                task_id = %task.id,
+                execution_id = %execution.id,
+                "ignoring reviewer completion without an explicit Review binding"
+            );
+            return Ok(());
+        };
+        let Some(latest_review) = reviews
+            .iter()
+            .max_by_key(|review| (review.attempt_number, review.id.clone()))
+        else {
+            return Ok(());
+        };
+        if latest_review.id != review.id {
+            tracing::debug!(
+                task_id = %task.id,
+                execution_id = %execution.id,
+                review_id = %review.id,
+                latest_review_id = %latest_review.id,
+                "ignoring reviewer completion bound to a superseded review attempt"
+            );
+            return Ok(());
+        }
+
+        // Reuse the exact Review attempt on duplicate terminal delivery. No
+        // synthetic Review is created when the execution has no durable
+        // attempt identity, and a bound older attempt cannot settle the
+        // current newer Review merely because it shares the candidate parent.
+        if review.status != ReviewStatus::Running {
             if review.status == ReviewStatus::Failed
                 && (task.blocked_json.is_some()
                     || task.failed_json.is_some()
@@ -907,24 +1035,23 @@ impl TaskService {
             None => Err("review execution has no workspace evidence".to_owned()),
         };
         let conformance = match conformance {
-            // A structurally valid assessment is a terminal review outcome even
-            // when some claims remain unverified. Preserve it and route the
-            // Task through normal review remediation. Only a response that
-            // could not be bound to the contract is an execution/protocol
-            // failure eligible for reviewer retry.
-            Ok(result)
-                if result.status != api_types::ConformanceStatus::Unverified
-                    || result.assessment.is_some() =>
-            {
-                result
+            Ok(result) if result.status != api_types::ConformanceStatus::Unverified => result,
+            Ok(result) => {
+                // An Unverified assessment is retained as diagnostic evidence,
+                // but it is still a reviewer execution/protocol failure. Keep
+                // it on the bounded reviewer retry/block path so an evidence
+                // gap can never route the coder into remediation or grant the
+                // current review authority.
+                let reason = result
+                    .reason
+                    .unwrap_or_else(|| "review conformance is unverified".to_owned());
+                let mut failed = execution.clone();
+                failed.error = Some(reason);
+                return self
+                    .fail_review_for_reviewer_execution_exit(&task, &failed, review)
+                    .await;
             }
-            result => {
-                let reason = match result {
-                    Ok(result) => result
-                        .reason
-                        .unwrap_or_else(|| "review conformance is unverified".to_owned()),
-                    Err(reason) => reason,
-                };
+            Err(reason) => {
                 let mut failed = execution.clone();
                 failed.error = Some(reason);
                 return self
@@ -944,7 +1071,7 @@ impl TaskService {
         let comment = reviewer_comment(status.clone(), review.attempt_number, &final_message);
 
         let finished_at = now_rfc3339();
-        let mut review_details = normalize_review_details(&review.step_results_json);
+        let mut review_details = strict_review_details(&review)?;
         review_details["auditor"] = auditor_details;
         review_details["conformance"] = serde_json::to_value(&conformance)
             .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
@@ -954,15 +1081,40 @@ impl TaskService {
                 "reason": "gate requires user approval",
             });
         }
-        let updated_review = ReviewRepo::update_status(
-            &*self.db,
-            &review.id,
-            status.clone(),
-            review_details.to_string(),
-            (status != ReviewStatus::AwaitingHuman).then_some(finished_at.clone()),
-            &finished_at,
-        )
-        .await?;
+        let task_authority = match &status {
+            // The terminal Review and its Task authority projection are one
+            // admission decision. Even when an old projection is already
+            // present, bind this new terminal attempt to the exact Task
+            // version and replace the projection in the same transaction.
+            ReviewStatus::Passed => Some(Some(finished_at.clone())),
+            ReviewStatus::Failed => Some(None),
+            _ => None,
+        };
+        let (updated_review, task) = if let Some(review_passed_at) = task_authority {
+            let (updated_review, task) = ReviewRepo::update_status_with_task_authority(
+                &*self.db,
+                &review.id,
+                status.clone(),
+                review_details.to_string(),
+                (status != ReviewStatus::AwaitingHuman).then_some(finished_at.clone()),
+                &finished_at,
+                task.version,
+                review_passed_at,
+            )
+            .await?;
+            (updated_review, task)
+        } else {
+            let updated_review = ReviewRepo::update_status(
+                &*self.db,
+                &review.id,
+                status.clone(),
+                review_details.to_string(),
+                (status != ReviewStatus::AwaitingHuman).then_some(finished_at.clone()),
+                &finished_at,
+            )
+            .await?;
+            (updated_review, task)
+        };
         self.publish_domain_event_by_dedupe(&format!(
             "review-status:{}:{}:{}",
             updated_review.id, updated_review.status, finished_at
@@ -978,17 +1130,6 @@ impl TaskService {
 
         match status {
             ReviewStatus::Passed => {
-                let task = if task.review_passed_at.is_some() {
-                    task
-                } else {
-                    TaskRepo::set_review_passed_at(
-                        &*self.db,
-                        &task.id,
-                        Some(finished_at.clone()),
-                        &finished_at,
-                    )
-                    .await?
-                };
                 self.publish(ForgeEvent {
                     event_type: "review.passed".to_owned(),
                     entity_id: updated_review.id.clone(),
@@ -1025,8 +1166,6 @@ impl TaskService {
                 });
             }
             ReviewStatus::Failed => {
-                let task =
-                    TaskRepo::set_review_passed_at(&*self.db, &task.id, None, &finished_at).await?;
                 self.publish(ForgeEvent {
                     event_type: "review.failed".to_owned(),
                     entity_id: updated_review.id.clone(),
@@ -1066,10 +1205,12 @@ impl TaskService {
                 let task = if task.review_passed_at.is_some() {
                     task.clone()
                 } else {
-                    TaskRepo::set_review_passed_at(
+                    TaskRepo::set_review_passed_at_cas_for_review(
                         &*self.db,
                         &task.id,
+                        task.version,
                         Some(review.finished_at.clone().unwrap_or_else(|| now.clone())),
+                        &review.updated_at,
                         &now,
                     )
                     .await?
@@ -1086,7 +1227,14 @@ impl TaskService {
                 let task = if task.review_passed_at.is_none() {
                     task.clone()
                 } else {
-                    TaskRepo::set_review_passed_at(&*self.db, &task.id, None, &now).await?
+                    TaskRepo::set_review_passed_at_cas(
+                        &*self.db,
+                        &task.id,
+                        task.version,
+                        None,
+                        &now,
+                    )
+                    .await?
                 };
                 let (task, target, reason) = self
                     .review_failure_target(&task, Some(&execution.id))
@@ -1109,7 +1257,7 @@ impl TaskService {
     ) -> Result<()> {
         let finished_at = now_rfc3339();
         let reason = execution_failure_reason(execution);
-        let mut review_details = normalize_review_details(&review.step_results_json);
+        let mut review_details = strict_review_details(&review)?;
         review_details["auditor"] = json!({
             "verdict": "fail",
             "reason": reason,
@@ -1191,13 +1339,15 @@ impl TaskService {
             return Ok(());
         }
 
-        let updated_review = ReviewRepo::update_status(
+        let (updated_review, task) = ReviewRepo::update_status_with_task_authority(
             &*self.db,
             &review.id,
             ReviewStatus::Failed,
             review_details.to_string(),
             Some(finished_at.clone()),
             &finished_at,
+            task.version,
+            None,
         )
         .await?;
         self.publish_domain_event_by_dedupe(&format!(
@@ -1212,8 +1362,6 @@ impl TaskService {
         {
             tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
         }
-        let task = TaskRepo::set_review_passed_at(&*self.db, &task.id, None, &finished_at).await?;
-
         self.publish(ForgeEvent {
             event_type: "review.failed".to_owned(),
             entity_id: updated_review.id.clone(),
@@ -1237,53 +1385,6 @@ impl TaskService {
 
         self.block_task_after_executor_failure(&task, execution)
             .await
-    }
-
-    async fn ensure_current_review_for_reviewer(
-        &self,
-        task_id: &str,
-        execution_id: &str,
-    ) -> Result<Review> {
-        let reviews = ReviewRepo::list_by_task(&*self.db, task_id).await?;
-        if let Some(review) = reviews
-            .iter()
-            .find(|review| review.execution_id == execution_id)
-            .cloned()
-        {
-            return Ok(review);
-        }
-        let latest = reviews
-            .into_iter()
-            .max_by_key(|review| review.attempt_number);
-        match latest {
-            Some(review)
-                if matches!(
-                    review.status,
-                    ReviewStatus::Running | ReviewStatus::AwaitingHuman
-                ) =>
-            {
-                Ok(review)
-            }
-            _ => {
-                let now = now_rfc3339();
-                ReviewRepo::create(
-                    &*self.db,
-                    CreateReview {
-                        id: new_uuid_v4(),
-                        task_id: task_id.to_owned(),
-                        execution_id: execution_id.to_owned(),
-                        attempt_number: ReviewRepo::next_attempt_number(&*self.db, task_id).await?,
-                        status: ReviewStatus::Running,
-                        step_results_json: json!({ "ci_steps": [] }).to_string(),
-                        started_at: now.clone(),
-                        created_at: now.clone(),
-                        updated_at: now,
-                    },
-                )
-                .await
-                .map_err(Into::into)
-            }
-        }
     }
 
     async fn publish_reviewer_comment(
@@ -1323,7 +1424,10 @@ impl TaskService {
             review_state.and_then(|state| state.gate_config.as_ref()),
         )?;
         let entries = TransitionLogRepo::list_by_task(&*self.db, &task.id).await?;
-        let existing_count = review_rejections_since_boundary(&entries);
+        let existing_count = crate::task_diagnostics::count_gate_rejections_since_boundary(
+            &entries,
+            crate::workflow::default_states::REVIEW,
+        );
         if existing_count + 1 >= i64::from(budget) {
             let reason = "review retry budget exhausted";
             if let Some((task, recovery_reason)) = self
@@ -1469,35 +1573,22 @@ impl TaskService {
         };
 
         let max_attempts = recovery.max_attempts.max(1) as usize;
-        let page = ExecutionRepo::list_by_task(
+        let recovery_attempts = ExecutionRepo::count_by_task_and_summary_prefix(
             &*self.db,
             &task.id,
-            PageRequest {
-                cursor: None,
-                limit: 100,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Desc,
-            },
+            AUTOMATIC_REVIEW_RECOVERY_PROMPT_PREFIX,
         )
-        .await?;
-        let is_automatic_recovery = |execution: &Execution| {
-            execution
-                .summary
-                .as_deref()
-                .is_some_and(|summary| summary.starts_with(AUTOMATIC_REVIEW_RECOVERY_PROMPT_PREFIX))
-        };
-        let recovery_attempts = page
-            .items
-            .iter()
-            .filter(|execution| is_automatic_recovery(execution))
-            .count();
+        .await? as usize;
         if recovery_attempts >= max_attempts {
             return Ok(None);
         }
-        if page.items.iter().any(|execution| {
-            execution.status == ExecutionStatus::Running && is_automatic_recovery(execution)
-        }) {
+        if ExecutionRepo::has_running_by_task_and_summary_prefix(
+            &*self.db,
+            &task.id,
+            AUTOMATIC_REVIEW_RECOVERY_PROMPT_PREFIX,
+        )
+        .await?
+        {
             return Ok(Some((
                 task.clone(),
                 "automatic review recovery already running".to_owned(),
@@ -1561,6 +1652,22 @@ impl TaskService {
         reason: &str,
         rejection: bool,
     ) -> Result<()> {
+        if target == crate::workflow::default_states::MERGING {
+            let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+            if project.paused_at.is_some() {
+                crate::deferred_dispatch::defer_integration_for_pause(&self.db, task).await?;
+                tracing::info!(
+                    task_id = %task.id,
+                    project_id = %project.id,
+                    from_state = %task.status,
+                    to_state = %target,
+                    "review passed while project was paused; integration deferred"
+                );
+                return Ok(());
+            }
+        }
         let from = task.status.clone();
         match self
             .transition(
@@ -1619,6 +1726,62 @@ impl TaskService {
     }
 }
 
+pub(crate) fn reviewer_execution_lacks_exact_review_binding(
+    execution: &Execution,
+    review: &Review,
+) -> bool {
+    !exact_review_binding_matches(execution, review)
+}
+
+/// Return the one Review attempt explicitly bound to an execution. Candidate
+/// parentage is intentionally excluded: several attempts may inspect the same
+/// candidate, so it cannot distinguish an old reviewer from the current one.
+pub(crate) fn exact_review_for_execution<'a>(
+    execution: &Execution,
+    reviews: &'a [Review],
+) -> Option<&'a Review> {
+    let mut matches = reviews
+        .iter()
+        .filter(|review| exact_review_binding_matches(execution, review));
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
+/// Return whether the exact Review attempt bound to this execution has
+/// already settled.  Candidate parentage is intentionally not considered:
+/// multiple reviewer attempts may inspect the same candidate, while only the
+/// durable reviewer/auditor execution binding identifies the attempt whose
+/// session a recovery request would resume.
+pub(crate) async fn terminal_review_is_bound_to_execution(
+    db: &SqliteDb,
+    execution: &Execution,
+) -> Result<bool> {
+    if !matches!(
+        execution.role.as_str(),
+        crate::workflow::default_roles::REVIEWER | crate::workflow::default_roles::AUDITOR
+    ) {
+        return Ok(false);
+    }
+    let reviews = ReviewRepo::list_by_task(db, &execution.task_id).await?;
+    Ok(
+        exact_review_for_execution(execution, &reviews).is_some_and(|review| {
+            matches!(
+                review.status,
+                ReviewStatus::Passed | ReviewStatus::Failed | ReviewStatus::Cancelled
+            )
+        }),
+    )
+}
+
+fn exact_review_binding_matches(execution: &Execution, review: &Review) -> bool {
+    if review.reviewer_execution_id.is_some() || review.auditor_execution_id.is_some() {
+        review.reviewer_execution_id.as_deref() == Some(execution.id.as_str())
+            || review.auditor_execution_id.as_deref() == Some(execution.id.as_str())
+    } else {
+        review.execution_id == execution.id
+    }
+}
+
 fn render_workflow_guard_follow_up_prompt(
     guard: &str,
     reason: &str,
@@ -1653,24 +1816,6 @@ fn render_automatic_review_recovery_prompt(
         status = task.status,
         rejections = existing_rejections + 1,
     )
-}
-
-fn review_rejections_since_boundary(entries: &[db::TransitionLog]) -> i64 {
-    let boundary = entries.iter().rposition(|entry| {
-        entry.from_state == crate::workflow::default_states::REVIEW
-            && !entry.rejection
-            && (entry.to_state != crate::workflow::default_states::REVIEW
-                || entry.trigger_name.as_deref() == Some("reset_retry_window"))
-    });
-    let entries = boundary
-        .and_then(|index| entries.get(index + 1..))
-        .unwrap_or(entries);
-    entries
-        .iter()
-        .filter(|entry| {
-            entry.from_state == crate::workflow::default_states::REVIEW && entry.rejection
-        })
-        .count() as i64
 }
 
 async fn reviewer_final_message(execution: &Execution) -> Result<String> {
@@ -1777,19 +1922,6 @@ fn execution_failure_reason(execution: &Execution) -> String {
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| format!("ended with status {}", execution.status))
-}
-
-fn normalize_review_details(step_results_json: &str) -> Value {
-    match serde_json::from_str::<Value>(step_results_json) {
-        Ok(Value::Array(ci_steps)) => json!({ "ci_steps": ci_steps }),
-        Ok(Value::Object(mut object)) => {
-            if !object.contains_key("ci_steps") {
-                object.insert("ci_steps".to_owned(), Value::Array(Vec::new()));
-            }
-            Value::Object(object)
-        }
-        _ => json!({ "ci_steps": [] }),
-    }
 }
 
 fn reviewer_comment(status: ReviewStatus, attempt_number: i64, final_message: &str) -> String {

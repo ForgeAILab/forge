@@ -53,6 +53,7 @@ impl TaskService {
             prompt,
             trigger.to_owned(),
             None,
+            None,
         )
         .await
     }
@@ -73,6 +74,33 @@ impl TaskService {
             prompt,
             trigger.to_owned(),
             None,
+            None,
+        )
+        .await
+    }
+
+    /// Dispatch a role follow-up using the admission snapshot captured by the
+    /// workflow hook that selected its prompt and review candidate. Reviewer
+    /// hooks must use this boundary so follow-up creation cannot silently
+    /// rebuild admission from a newer Task/Project/Review read.
+    pub(crate) async fn dispatch_role_follow_up_with_admission(
+        &self,
+        task_id: &str,
+        role: &str,
+        parent_execution_id: String,
+        prompt: String,
+        trigger: &str,
+        admission: db::ExecutionAdmission,
+    ) -> Result<Execution> {
+        dispatch_role_follow_up_impl(
+            self.clone(),
+            task_id.to_owned(),
+            role.to_owned(),
+            parent_execution_id,
+            prompt,
+            trigger.to_owned(),
+            None,
+            Some(admission),
         )
         .await
     }
@@ -94,6 +122,7 @@ impl TaskService {
             prompt,
             trigger.to_owned(),
             Some(agent_id),
+            None,
         )
         .await
     }
@@ -131,6 +160,7 @@ impl TaskService {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_role_follow_up_impl(
     service: TaskService,
     task_id: String,
@@ -139,6 +169,7 @@ fn dispatch_role_follow_up_impl(
     prompt: String,
     trigger: String,
     agent_override: Option<String>,
+    admission_override: Option<db::ExecutionAdmission>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Execution>> + Send>> {
     Box::pin(async move {
         validate_required("task_id", &task_id)?;
@@ -170,33 +201,6 @@ fn dispatch_role_follow_up_impl(
                     "no assigned agent available for follow-up role {role}"
                 ))
             })?;
-        let agent = AgentRepo::get_by_id(&*service.db, &agent_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
-        let executor_config_snapshot_json = if role_parent.is_some()
-            && lineage_parent.agent_id.as_deref() == Some(agent_id.as_str())
-            && lineage_parent.agent_session_id.is_some()
-        {
-            let agent_session_id = lineage_parent
-                .agent_session_id
-                .as_deref()
-                .expect("checked agent_session_id exists");
-            let snapshot_json = lineage_parent
-                .executor_config_snapshot_json
-                .as_deref()
-                .ok_or_else(|| {
-                    ServiceError::invalid_operation(format!(
-                        "parent execution {} missing executor config snapshot",
-                        lineage_parent.id
-                    ))
-                })?;
-            Some(executor_snapshot_with_resume_thread(
-                snapshot_json,
-                agent_session_id,
-            )?)
-        } else {
-            build_executor_config_snapshot(&service.db, &task, &agent, None).await?
-        };
         let execution_id = new_uuid_v4();
         let logs_path = execution_logs_path(
             &service.workspace_root,
@@ -246,9 +250,111 @@ fn dispatch_role_follow_up_impl(
             task
         };
         service.ensure_task_runnable(&task).await?;
+        let project = ProjectRepo::get_by_id(&*service.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        let agent = AgentRepo::get_by_id(&*service.db, &agent_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
+        let admission = if let Some(admission) = admission_override {
+            // The dispatch action can pass the same Task/assignment/Review
+            // snapshot that produced its prompt. Never replace those facts
+            // with a later repository read here.
+            admission
+        } else {
+            let reviewer_snapshot = if role == crate::workflow::default_roles::REVIEWER {
+                Some(
+                    ReviewRepo::list_by_task(&*service.db, &task.id)
+                        .await?
+                        .into_iter()
+                        .max_by_key(|review| (review.attempt_number, review.id.clone()))
+                        .ok_or_else(|| {
+                            ServiceError::conflict(
+                                "reviewer follow-up requires a current review candidate",
+                            )
+                        })
+                        .map(|review| {
+                            (
+                                review.id,
+                                review.execution_id,
+                                review.attempt_number,
+                                review.status.to_string(),
+                                review.updated_at,
+                                review.reviewer_execution_id,
+                                review.auditor_execution_id,
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
+            let mut admission = crate::task_service::execution_admission_for_task(
+                &service.db,
+                &task,
+                &project.workflow_definition,
+                &role,
+                Some(&agent),
+                project.version,
+            )
+            .await?;
+            if let Some((
+                id,
+                execution_id,
+                attempt_number,
+                status,
+                updated_at,
+                reviewer_execution_id,
+                auditor_execution_id,
+            )) = reviewer_snapshot
+            {
+                admission.expected_reviewer_parent_execution_id = Some(execution_id.clone());
+                admission.expected_latest_review_candidate_execution_id = Some(execution_id);
+                admission.expected_reviewer_id = Some(id);
+                admission.expected_reviewer_attempt_number = Some(attempt_number);
+                admission.expected_reviewer_status = Some(status);
+                admission.expected_reviewer_updated_at = Some(updated_at);
+                admission.expected_reviewer_execution_id = reviewer_execution_id;
+                admission.expected_auditor_execution_id = auditor_execution_id;
+            }
+            admission
+        };
+        let durable_parent_execution_id = if role == crate::workflow::default_roles::REVIEWER {
+            admission
+                .expected_reviewer_parent_execution_id
+                .clone()
+                .ok_or_else(|| {
+                    ServiceError::conflict("reviewer follow-up requires a current review candidate")
+                })?
+        } else {
+            lineage_parent.id.clone()
+        };
+        let executor_config_snapshot_json = if role_parent.is_some()
+            && lineage_parent.agent_id.as_deref() == Some(agent_id.as_str())
+            && lineage_parent.agent_session_id.is_some()
+        {
+            let agent_session_id = lineage_parent
+                .agent_session_id
+                .as_deref()
+                .expect("checked agent_session_id exists");
+            let snapshot_json = lineage_parent
+                .executor_config_snapshot_json
+                .as_deref()
+                .ok_or_else(|| {
+                    ServiceError::invalid_operation(format!(
+                        "parent execution {} missing executor config snapshot",
+                        lineage_parent.id
+                    ))
+                })?;
+            Some(executor_snapshot_with_resume_thread(
+                snapshot_json,
+                agent_session_id,
+            )?)
+        } else {
+            build_executor_config_snapshot(&service.db, &task, &agent, None).await?
+        };
         let now = now_rfc3339();
         let execution = service
-            .create_running_execution(
+            .create_running_execution_with_admission(
                 CreateExecution {
                     id: execution_id.clone(),
                     task_id: task_id.clone(),
@@ -259,7 +365,7 @@ fn dispatch_role_follow_up_impl(
                     stopped_by: None,
                     resume_policy: None,
                     stopped_at: None,
-                    parent_execution_id: Some(lineage_parent.id.clone()),
+                    parent_execution_id: Some(durable_parent_execution_id.clone()),
                     agent_session_id: None,
                     agent_message_id: None,
                     last_activity_at: None,
@@ -274,6 +380,7 @@ fn dispatch_role_follow_up_impl(
                     updated_at: now,
                 },
                 false,
+                Some(admission),
             )
             .await?;
 
@@ -281,7 +388,7 @@ fn dispatch_role_follow_up_impl(
             task_id = %task_id,
             role = %role,
             execution_id = %execution.id,
-            parent_execution_id = %lineage_parent.id,
+            parent_execution_id = %durable_parent_execution_id,
             trigger = %trigger,
             "role follow-up dispatched"
         );
@@ -292,7 +399,7 @@ fn dispatch_role_follow_up_impl(
             timestamp: event_timestamp(),
             context: EventContext::FollowUpDispatched {
                 task_id: task_id.clone(),
-                parent_execution_id: lineage_parent.id.clone(),
+                parent_execution_id: durable_parent_execution_id,
                 execution_id: execution.id.clone(),
                 trigger: trigger.clone(),
             },
@@ -337,23 +444,9 @@ async fn latest_terminal_execution_for_exact_role(
     task_id: &str,
     role: &str,
 ) -> Result<Option<Execution>> {
-    let page = ExecutionRepo::list_by_task_and_role(
-        db,
-        task_id,
-        role,
-        PageRequest {
-            cursor: None,
-            limit: 20,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Desc,
-        },
-    )
-    .await?;
-    Ok(page
-        .items
-        .into_iter()
-        .find(|execution| execution.status != ExecutionStatus::Running))
+    ExecutionRepo::latest_non_running_by_task_and_role(db, task_id, role)
+        .await
+        .map_err(Into::into)
 }
 
 fn execution_role_matches(execution: &Execution, role: &str) -> bool {

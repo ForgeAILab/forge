@@ -69,6 +69,23 @@ pub struct AgentPrompt {
     pub tools: Vec<String>,
 }
 
+impl AgentPrompt {
+    /// Render the complete workflow prompt into the transport-neutral input
+    /// persisted on an execution. CLI adapters expose one turn-text channel,
+    /// so dropping `system` here would silently discard the role boundary.
+    #[must_use]
+    pub fn execution_input(&self, user_context: Option<&str>) -> String {
+        let user = match user_context {
+            Some(context) => format!("[User context: {context}]\n\n{}", self.user),
+            None => self.user.clone(),
+        };
+        format!(
+            "Forge role contract (authoritative):\n{}\n\nExecution request:\n{user}",
+            self.system
+        )
+    }
+}
+
 pub trait PromptBuilder: Send + Sync {
     fn id(&self) -> &'static str;
     fn build(&self, ctx: &AgentDispatchContext) -> AgentPrompt;
@@ -206,7 +223,7 @@ pub fn prompt_builder_registry_entries() -> Vec<PromptBuilderRegistryEntry> {
             id: BUILDER_ID_CODER_MERGE_FIX_V2,
             label: "Coder (Merge Fix)",
             compatible_role_hints: &[default_roles::CODER],
-            description: "Merge-conflict fix prompt for merge retry loops.",
+            description: "Dirty Task-worktree completion prompt for integration retry loops.",
         },
         PromptBuilderRegistryEntry {
             id: BUILDER_ID_WORKER_AUTONOMOUS_V1,
@@ -226,7 +243,7 @@ pub fn prompt_builder_registry_entries() -> Vec<PromptBuilderRegistryEntry> {
             label: "Worker (Merge Fix)",
             compatible_role_hints: &[default_roles::WORKER],
             description:
-                "Same-worker prompt for resolving merge conflicts and revalidating the delivery.",
+                "Same-worker prompt for finishing dirty Task-worktree changes and revalidating delivery.",
         },
         PromptBuilderRegistryEntry {
             id: BUILDER_ID_REVIEWER_CONFORMANCE_V1,

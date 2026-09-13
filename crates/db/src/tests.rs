@@ -9,20 +9,22 @@ use crate::{
     CreateProjectMember, CreateProviderAuthorizationOperation, CreateRepo, CreateReview,
     CreateSkill, CreateTask, CreateTaskRoleAssignment, CreateTerminalSession, CreateWorkspace,
     CreateWorkspaceLease, CredentialHandleRepo, DaemonRepo, DaemonStatus, DbError, DomainEventRepo,
-    ExecutionLeaseDisposition, ExecutionLeaseMutation, ExecutionProgressWarningOutcome,
-    ExecutionRepo, ExecutionStatus, MemoryAccessQuery, MemoryConfidence, MemoryGetQuery,
-    MemoryItem, MemoryKind, MemoryRepository, MemoryScopeGrant, MemorySourceType, MoveTaskIdentity,
-    MoveTaskPersistence, NotificationListQuery, NotificationRepo, PageRequest,
-    ProjectAgentBindingRepo, ProjectMemberRepo, ProjectOrchestrationRepo, ProjectRepo,
-    ProviderAuthorizationRepo, RecordExecutionProgress, RenewExecutionLease, RepoRepo, ReviewRepo,
-    ReviewStatus, RotateAgentSession, ScopedMemoryRepository, SelectAgentProfile, SkillRepo,
-    SortBy, SortOrder, SqliteDb, Task, TaskBoardRepo, TaskDependencyRepo, TaskListQuery, TaskRepo,
+    ExecutionAdmission, ExecutionLeaseDisposition, ExecutionLeaseMutation,
+    ExecutionProgressWarningOutcome, ExecutionRepo, ExecutionStatus, MemoryAccessQuery,
+    MemoryConfidence, MemoryGetQuery, MemoryItem, MemoryKind, MemoryRepository, MemoryScopeGrant,
+    MemorySourceType, MoveTaskIdentity, MoveTaskPersistence, NotificationListQuery,
+    NotificationRepo, PageRequest, ProjectAgentBindingRepo, ProjectMemberRepo,
+    ProjectOrchestrationRepo, ProjectRepo, ProviderAuthorizationRepo, RecordExecutionProgress,
+    RenewExecutionLease, RepoRepo, ReviewConformanceRepo, ReviewRepo, ReviewStatus,
+    RotateAgentSession, ScopedMemoryRepository, SelectAgentProfile, SkillRepo, SortBy, SortOrder,
+    SqliteDb, Task, TaskBoardRepo, TaskDependencyRepo, TaskListQuery, TaskRepo,
     TaskRoleAssignmentRepo, TerminalSessionRepo, TerminalSessionStatus, TerminalizeExecution,
     UpdateAgent, UpdateExecution, UpdateProject, UpdateProviderAuthorizationOperation, UpdateRepo,
     UpdateSkill, UpdateTask, UpdateTaskStatus, UpdateTerminalSessionStatus, UpsertDaemon, WorkMode,
     WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
 };
 use crate::{RefreshToken, RefreshTokenRepo, User, UserRepo};
+use api_types::{CanonicalPhase, StateDefinition, StateHooks, StateKind, WorkflowDefinition};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
 fn page(limit: i64) -> PageRequest {
@@ -153,6 +155,88 @@ async fn sqlite_db() -> SqliteDb {
         .expect("pool creates");
     run_migrations(&pool).await.expect("migrations run");
     SqliteDb::new(pool)
+}
+
+#[tokio::test]
+async fn latest_non_running_finds_terminal_after_100_newer_running_rows() {
+    let db = sqlite_db().await;
+    let (project_id, _repo_id, _agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(&db, &project_id, None, "review".to_owned(), "history task").await;
+    let old_now = "2026-09-11T00:00:00Z";
+    let now = "2026-09-12T00:00:00Z";
+
+    ExecutionRepo::create(
+        &db,
+        CreateExecution {
+            id: "recovery-history-000".to_owned(),
+            task_id: task_id.clone(),
+            agent_id: None,
+            role: "executor".to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("[Forge automatic review recovery] older attempt".to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: old_now.to_owned(),
+            updated_at: old_now.to_owned(),
+        },
+    )
+    .await
+    .expect("automatic recovery execution creates");
+
+    for index in 1..=100 {
+        ExecutionRepo::create(
+            &db,
+            CreateExecution {
+                id: format!("history-execution-{index:03}"),
+                task_id: task_id.clone(),
+                agent_id: None,
+                role: "executor".to_owned(),
+                status: ExecutionStatus::Running,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: Some(format!("unrelated execution {index}")),
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                workspace_id: None,
+                created_at: now.to_owned(),
+                updated_at: now.to_owned(),
+            },
+        )
+        .await
+        .expect("history execution creates");
+    }
+
+    let latest_terminal =
+        ExecutionRepo::latest_non_running_by_task_and_role(&db, &task_id, "executor")
+            .await
+            .expect("latest terminal execution loads")
+            .expect("older terminal execution remains discoverable");
+    assert_eq!(latest_terminal.id, "recovery-history-000");
+    assert!(latest_terminal
+        .summary
+        .as_deref()
+        .is_some_and(|summary| summary.starts_with("[Forge automatic review recovery]")));
 }
 
 fn pending_claim_lease(execution_id: &str, now: &str) -> ClaimExecutionLease {
@@ -2845,6 +2929,69 @@ async fn workspace_survives_repo_delete_with_repo_id_retained() {
 }
 
 #[tokio::test]
+async fn repo_delete_rejects_a_running_execution_without_partial_changes() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "Active repo delete guard",
+    )
+    .await;
+    let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
+    let now = now_rfc3339();
+    ExecutionRepo::create(
+        &db,
+        CreateExecution {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            agent_id: Some(agent_id),
+            role: "executor".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace_id),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("running execution creates");
+
+    assert!(matches!(
+        RepoRepo::delete(&db, &repo_id).await,
+        Err(DbError::RepoInUse { repo_id: blocked }) if blocked == repo_id
+    ));
+    assert!(RepoRepo::get_by_id(&db, &repo_id)
+        .await
+        .expect("repo reloads")
+        .is_some());
+    assert_eq!(
+        ProjectRepo::get_by_id(&db, &project_id)
+            .await
+            .expect("project reloads")
+            .expect("project remains")
+            .primary_repo_id
+            .as_deref(),
+        Some(repo_id.as_str())
+    );
+}
+
+#[tokio::test]
 async fn sqlite_repo_create_round_trips_local_path() {
     let db = sqlite_db().await;
     let now = now_rfc3339();
@@ -3224,6 +3371,2190 @@ async fn execution_liveness_migration_preserves_history_and_does_not_fabricate_o
     std::fs::remove_file(format!("{}-wal", database_path.display())).ok();
     std::fs::remove_file(format!("{}-shm", database_path.display())).ok();
     std::fs::remove_dir_all(&migration_root).expect("migration temp directory removes");
+}
+
+#[tokio::test]
+async fn running_execution_creation_is_rejected_after_project_pause() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "Paused execution guard",
+    )
+    .await;
+    let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
+    let now = "2026-09-11T19:25:46Z";
+    sqlx::query("UPDATE project SET paused_at = ?, updated_at = ? WHERE id = ?")
+        .bind(now)
+        .bind(now)
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .expect("project pauses");
+    let execution_id = new_uuid_v4();
+
+    let result = ExecutionRepo::create_with_lease(
+        &db,
+        CreateExecution {
+            id: execution_id.clone(),
+            task_id,
+            agent_id: Some(agent_id),
+            role: "executor".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace_id),
+            created_at: now.to_owned(),
+            updated_at: now.to_owned(),
+        },
+        ClaimExecutionLease {
+            execution_id: execution_id.clone(),
+            expected_version: 1,
+            owner: "embedded:paused-test".to_owned(),
+            lease_expires_at: "2026-09-11T19:26:16Z".to_owned(),
+            hard_deadline_at: "2026-09-11T20:25:46Z".to_owned(),
+            now: now.to_owned(),
+        },
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(DbError::ProjectPaused { project_id: blocked }) if blocked == project_id
+    ));
+    assert!(ExecutionRepo::get_by_id(&db, &execution_id)
+        .await
+        .expect("execution lookup succeeds")
+        .is_none());
+}
+
+#[tokio::test]
+async fn execution_admission_reports_occupant_and_rejects_stale_task_snapshot() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "Execution admission CAS",
+    )
+    .await;
+    let task = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(&db, &task_id, "coder")
+        .await
+        .expect("task assignment loads")
+        .expect("task assignment exists");
+    let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
+    let now = now_rfc3339();
+    let make_execution = |id: String| CreateExecution {
+        id,
+        task_id: task_id.clone(),
+        agent_id: Some(agent_id.clone()),
+        role: "coder".to_owned(),
+        status: ExecutionStatus::Running,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: None,
+        agent_session_id: None,
+        agent_message_id: None,
+        last_activity_at: None,
+        summary: None,
+        logs_path: None,
+        before_sha: None,
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: None,
+        workspace_id: Some(workspace_id.clone()),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let make_lease = |execution_id: String| ClaimExecutionLease {
+        execution_id,
+        expected_version: 1,
+        owner: "embedded:admission-test".to_owned(),
+        lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        now: now.clone(),
+    };
+    let occupant = new_uuid_v4();
+    ExecutionRepo::create_with_lease(
+        &db,
+        make_execution(occupant.clone()),
+        make_lease(occupant.clone()),
+    )
+    .await
+    .expect("occupying execution creates");
+
+    let competing = new_uuid_v4();
+    let result = ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        make_execution(competing.clone()),
+        make_lease(competing.clone()),
+        Some(ExecutionAdmission {
+            expected_project_version: None,
+            expected_task_version: task.version,
+            expected_task_status: task.status.clone(),
+            expected_effective_role: Some("coder".to_owned()),
+            expected_agent_max_concurrent_tasks: Some(1),
+            expected_agent_version: Some(1),
+            expected_reviewer_parent_execution_id: None,
+            expected_latest_review_candidate_execution_id: None,
+            expected_reviewer_id: None,
+            expected_reviewer_attempt_number: None,
+            expected_reviewer_status: None,
+            expected_reviewer_updated_at: None,
+            expected_reviewer_execution_id: None,
+            expected_auditor_execution_id: None,
+            expected_assignment_id: Some(assignment.id.clone()),
+            expected_assignment_updated_at: Some(assignment.updated_at.clone()),
+            expected_workflow_definition: Some("{}".to_owned()),
+        }),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(DbError::ExecutionAlreadyRunning {
+                ref scope,
+                ref execution_id,
+            }) if scope == "repository" && execution_id == &occupant
+        ),
+        "execution admission result: {result:?}"
+    );
+
+    let interactive_id = new_uuid_v4();
+    let mut interactive_execution = make_execution(interactive_id.clone());
+    interactive_execution.role = "interactive".to_owned();
+    let interactive_result =
+        ExecutionRepo::create_with_lease(&db, interactive_execution, make_lease(interactive_id))
+            .await;
+    assert!(matches!(
+        interactive_result,
+        Err(DbError::ExecutionAlreadyRunning {
+            scope,
+            execution_id,
+        }) if scope == "repository" && execution_id == occupant
+    ));
+
+    TaskRepo::update(
+        &db,
+        UpdateTask {
+            id: task.id.clone(),
+            expected_version: task.version,
+            title: Some("changed after dispatch read".to_owned()),
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: None,
+            blocked_json: None,
+            failed_json: None,
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("task version advances");
+    let stale = new_uuid_v4();
+    let stale_result = ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        make_execution(stale.clone()),
+        make_lease(stale),
+        Some(ExecutionAdmission {
+            expected_project_version: None,
+            expected_task_version: task.version,
+            expected_task_status: task.status.clone(),
+            expected_effective_role: Some("coder".to_owned()),
+            expected_agent_max_concurrent_tasks: Some(1),
+            expected_agent_version: Some(1),
+            expected_reviewer_parent_execution_id: None,
+            expected_latest_review_candidate_execution_id: None,
+            expected_reviewer_id: None,
+            expected_reviewer_attempt_number: None,
+            expected_reviewer_status: None,
+            expected_reviewer_updated_at: None,
+            expected_reviewer_execution_id: None,
+            expected_auditor_execution_id: None,
+            expected_assignment_id: Some(assignment.id),
+            expected_assignment_updated_at: Some(assignment.updated_at),
+            expected_workflow_definition: Some("{}".to_owned()),
+        }),
+    )
+    .await;
+    assert!(matches!(stale_result, Err(DbError::VersionConflict)));
+    assert!(ExecutionRepo::get_by_id(&db, &competing)
+        .await
+        .expect("competing execution lookup succeeds")
+        .is_none());
+
+    let interactive_task_id = seed_task(
+        &db,
+        &project_id,
+        None,
+        "in_progress".to_owned(),
+        "Interactive execution admission",
+    )
+    .await;
+    let interactive_workspace_id =
+        seed_workspace_for_task(&db, &interactive_task_id, &repo_id).await;
+    let make_interactive_slot_execution = |id: String, role: &str| CreateExecution {
+        id,
+        task_id: interactive_task_id.clone(),
+        agent_id: None,
+        role: role.to_owned(),
+        status: ExecutionStatus::Running,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: None,
+        agent_session_id: None,
+        agent_message_id: None,
+        last_activity_at: None,
+        summary: None,
+        logs_path: None,
+        before_sha: None,
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: None,
+        workspace_id: Some(interactive_workspace_id.clone()),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let interactive_occupant = new_uuid_v4();
+    ExecutionRepo::create_with_lease(
+        &db,
+        make_interactive_slot_execution(interactive_occupant.clone(), "interactive"),
+        make_lease(interactive_occupant.clone()),
+    )
+    .await
+    .expect("interactive occupying execution creates");
+    let interactive_competing = new_uuid_v4();
+    let interactive_slot_result = ExecutionRepo::create_with_lease(
+        &db,
+        make_interactive_slot_execution(interactive_competing.clone(), "coder"),
+        make_lease(interactive_competing.clone()),
+    )
+    .await;
+    assert!(matches!(
+        interactive_slot_result,
+        Err(DbError::ExecutionAlreadyRunning {
+            scope,
+            execution_id,
+        }) if scope == "interactive" && execution_id == interactive_occupant
+    ));
+}
+
+#[tokio::test]
+async fn recovery_execution_conflict_uses_canonical_slot_scope() {
+    let db = sqlite_db().await;
+    let (project_id, _repo_id, _agent_id) = seed_project_repo_agent(&db).await;
+    let now = now_rfc3339();
+
+    let make_running = |task_id: String, role: &str| CreateExecution {
+        id: new_uuid_v4(),
+        task_id,
+        agent_id: None,
+        role: role.to_owned(),
+        status: ExecutionStatus::Running,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: None,
+        agent_session_id: None,
+        agent_message_id: None,
+        last_activity_at: None,
+        summary: None,
+        logs_path: None,
+        before_sha: None,
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: None,
+        workspace_id: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+
+    let repository_task_id = seed_task(
+        &db,
+        &project_id,
+        None,
+        "in_progress".to_owned(),
+        "Repository recovery scope",
+    )
+    .await;
+    let repository_execution = make_running(repository_task_id.clone(), "coder");
+    let repository_execution_id = repository_execution.id.clone();
+    ExecutionRepo::create(&db, repository_execution)
+        .await
+        .expect("repository execution creates");
+    let repository_task = TaskRepo::get_by_id(&db, &repository_task_id, false)
+        .await
+        .expect("repository task loads")
+        .expect("repository task exists");
+    let repository_result = TaskRepo::restore_recovery_metadata_if_no_running_execution(
+        &db,
+        &repository_task.id,
+        repository_task.version,
+        Some("stale repository recovery".to_owned()),
+        None,
+        None,
+        &now,
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert!(matches!(
+        repository_result,
+        Err(DbError::ExecutionAlreadyRunning {
+            scope,
+            execution_id,
+        }) if scope == "repository" && execution_id == repository_execution_id
+    ));
+
+    let interactive_task_id = seed_task(
+        &db,
+        &project_id,
+        None,
+        "in_progress".to_owned(),
+        "Interactive recovery scope",
+    )
+    .await;
+    let interactive_execution = make_running(interactive_task_id.clone(), "interactive");
+    let interactive_execution_id = interactive_execution.id.clone();
+    ExecutionRepo::create(&db, interactive_execution)
+        .await
+        .expect("interactive execution creates");
+    let interactive_task = TaskRepo::get_by_id(&db, &interactive_task_id, false)
+        .await
+        .expect("interactive task loads")
+        .expect("interactive task exists");
+    let interactive_result = TaskRepo::restore_recovery_metadata_if_no_running_execution(
+        &db,
+        &interactive_task.id,
+        interactive_task.version,
+        Some("stale interactive recovery".to_owned()),
+        None,
+        None,
+        &now,
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert!(matches!(
+        interactive_result,
+        Err(DbError::ExecutionAlreadyRunning {
+            scope,
+            execution_id,
+        }) if scope == "interactive" && execution_id == interactive_execution_id
+    ));
+}
+
+#[tokio::test]
+async fn execution_admission_rejects_agent_profile_reassignment_without_capacity_change() {
+    let db = sqlite_db().await;
+    let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "Agent profile admission CAS",
+    )
+    .await;
+    let task = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(&db, &task_id, "coder")
+        .await
+        .expect("task assignment loads")
+        .expect("task assignment exists");
+    let agent = AgentRepo::get_by_id(&db, &agent_id)
+        .await
+        .expect("agent loads")
+        .expect("agent exists");
+    assert!(
+        agent.daemon_id.is_some(),
+        "fixture starts with a daemon route"
+    );
+
+    let updated_agent = AgentRepo::update(
+        &db,
+        UpdateAgent {
+            id: agent.id.clone(),
+            expected_version: agent.version,
+            name: None,
+            description: None,
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: None,
+            config_json: None,
+            daemon_id: Some(None),
+            max_concurrent_tasks: None,
+            heartbeat_interval_seconds: None,
+            max_missed_heartbeats: None,
+            status: None,
+            last_heartbeat_at: None,
+            is_default: None,
+            paused: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("agent daemon route changes");
+    assert!(updated_agent.daemon_id.is_none());
+    assert_eq!(
+        updated_agent.max_concurrent_tasks,
+        agent.max_concurrent_tasks
+    );
+    assert_eq!(updated_agent.version, agent.version + 1);
+
+    let execution_id = new_uuid_v4();
+    let now = "2099-01-01T00:00:00Z";
+    let result = ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        CreateExecution {
+            id: execution_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: Some(agent_id.clone()),
+            role: "coder".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.to_owned(),
+            updated_at: now.to_owned(),
+        },
+        ClaimExecutionLease {
+            execution_id: execution_id.clone(),
+            expected_version: 1,
+            owner: "embedded:agent-profile-admission-test".to_owned(),
+            lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+            hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+            now: now.to_owned(),
+        },
+        Some(ExecutionAdmission {
+            expected_project_version: None,
+            expected_task_version: task.version,
+            expected_task_status: task.status,
+            expected_effective_role: Some("coder".to_owned()),
+            expected_agent_version: Some(agent.version),
+            expected_agent_max_concurrent_tasks: Some(agent.max_concurrent_tasks),
+            expected_reviewer_parent_execution_id: None,
+            expected_latest_review_candidate_execution_id: None,
+            expected_reviewer_id: None,
+            expected_reviewer_attempt_number: None,
+            expected_reviewer_status: None,
+            expected_reviewer_updated_at: None,
+            expected_reviewer_execution_id: None,
+            expected_auditor_execution_id: None,
+            expected_assignment_id: Some(assignment.id),
+            expected_assignment_updated_at: Some(assignment.updated_at),
+            expected_workflow_definition: Some("{}".to_owned()),
+        }),
+    )
+    .await;
+    assert!(matches!(result, Err(DbError::VersionConflict)));
+    assert!(ExecutionRepo::get_by_id(&db, &execution_id)
+        .await
+        .expect("rejected execution lookup succeeds")
+        .is_none());
+}
+
+#[tokio::test]
+async fn execution_admission_uses_custom_root_and_inherited_subtask_workflows() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let custom_workflow = WorkflowDefinition {
+        roles: Vec::new(),
+        states: vec![StateDefinition {
+            name: "in_progress".to_owned(),
+            kind: StateKind::Active,
+            column: "In Progress".to_owned(),
+            display_name: "In Progress".to_owned(),
+            role: Some("reviewer".to_owned()),
+            hooks: StateHooks::default(),
+            cleanup: None,
+            canonical_phase: Some(CanonicalPhase::Working),
+            gate_config: None,
+            dispatch: None,
+            triggers: std::collections::BTreeMap::new(),
+            config: serde_json::json!({}),
+        }],
+        configuration: Vec::new(),
+        cancellation_state: None,
+    };
+    let custom_workflow_definition =
+        serde_json::to_string(&custom_workflow).expect("custom workflow serializes");
+    sqlx::query("UPDATE project SET workflow_definition = ?, updated_at = ? WHERE id = ?")
+        .bind(&custom_workflow_definition)
+        .bind(now_rfc3339())
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .expect("custom workflow updates");
+    sqlx::query("UPDATE agent_identity SET max_concurrent_tasks = ?, updated_at = ? WHERE id = ?")
+        .bind(2_i64)
+        .bind(now_rfc3339())
+        .bind(&agent_id)
+        .execute(db.pool())
+        .await
+        .expect("agent capacity updates");
+
+    let root_id = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "Custom workflow root",
+    )
+    .await;
+    let child = TaskRepo::create(
+        &db,
+        crate::CreateTask {
+            id: new_uuid_v4(),
+            project_id: project_id.clone(),
+            parent_task_id: Some(root_id.clone()),
+            subtask_order: Some(0),
+            assignee_type: None,
+            assignee_id: None,
+            title: "Inherited workflow child".to_owned(),
+            description: None,
+            task_type: "task".to_owned(),
+            status: "in_progress".to_owned(),
+            is_automation: false,
+            priority: 0,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("subtask creates");
+    let assignment_now = now_rfc3339();
+    let reviewer_assignment = TaskRoleAssignmentRepo::assign(
+        &db,
+        CreateTaskRoleAssignment {
+            id: new_uuid_v4(),
+            task_id: root_id.clone(),
+            role_name: "reviewer".to_owned(),
+            assignee_type: Some(crate::AssigneeKind::Agent),
+            assignee_id: Some(agent_id.clone()),
+            created_at: assignment_now.clone(),
+            updated_at: assignment_now.clone(),
+        },
+    )
+    .await
+    .expect("reviewer assignment creates");
+    let child_assignment = TaskRoleAssignmentRepo::assign(
+        &db,
+        CreateTaskRoleAssignment {
+            id: new_uuid_v4(),
+            task_id: child.id.clone(),
+            role_name: "coder".to_owned(),
+            assignee_type: Some(crate::AssigneeKind::Agent),
+            assignee_id: Some(agent_id.clone()),
+            created_at: assignment_now.clone(),
+            updated_at: assignment_now,
+        },
+    )
+    .await
+    .expect("child assignment creates");
+    let root = TaskRepo::get_by_id(&db, &root_id, false)
+        .await
+        .expect("root loads")
+        .expect("root exists");
+    let root_workspace = seed_workspace_for_task(&db, &root_id, &repo_id).await;
+    let child_workspace = seed_workspace_for_task(&db, &child.id, &repo_id).await;
+    let now = now_rfc3339();
+    let make_execution =
+        |id: String, task_id: &str, role: &str, workspace_id: &str| CreateExecution {
+            id,
+            task_id: task_id.to_owned(),
+            agent_id: Some(agent_id.clone()),
+            role: role.to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace_id.to_owned()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+    let make_lease = |execution_id: String, owner: &str| ClaimExecutionLease {
+        execution_id,
+        expected_version: 1,
+        owner: owner.to_owned(),
+        lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        now: now.clone(),
+    };
+
+    let candidate_execution_id = new_uuid_v4();
+    ExecutionRepo::create(
+        &db,
+        CreateExecution {
+            id: candidate_execution_id.clone(),
+            task_id: child.id.clone(),
+            agent_id: Some(agent_id.clone()),
+            role: "coder".to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(child_workspace.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("completed child candidate creates");
+    let review = ReviewRepo::create(
+        &db,
+        CreateReview {
+            id: new_uuid_v4(),
+            task_id: root.id.clone(),
+            execution_id: candidate_execution_id.clone(),
+            attempt_number: 1,
+            status: ReviewStatus::Running,
+            step_results_json: "[]".to_owned(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("root Review creates");
+
+    let root_execution_id = new_uuid_v4();
+    let mut root_execution_input = make_execution(
+        root_execution_id.clone(),
+        &root.id,
+        "reviewer",
+        &root_workspace,
+    );
+    root_execution_input.parent_execution_id = Some(candidate_execution_id.clone());
+    let root_execution = ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        root_execution_input,
+        make_lease(root_execution_id, "embedded:custom-root"),
+        Some(ExecutionAdmission {
+            expected_project_version: None,
+            expected_task_version: root.version,
+            expected_task_status: root.status.clone(),
+            expected_effective_role: Some("reviewer".to_owned()),
+            expected_agent_max_concurrent_tasks: Some(2),
+            expected_agent_version: Some(1),
+            expected_reviewer_parent_execution_id: Some(candidate_execution_id.clone()),
+            expected_latest_review_candidate_execution_id: Some(candidate_execution_id),
+            expected_reviewer_id: Some(review.id),
+            expected_reviewer_attempt_number: Some(review.attempt_number),
+            expected_reviewer_status: Some(review.status.to_string()),
+            expected_reviewer_updated_at: Some(review.updated_at),
+            expected_reviewer_execution_id: review.reviewer_execution_id,
+            expected_auditor_execution_id: review.auditor_execution_id,
+            expected_assignment_id: Some(reviewer_assignment.id),
+            expected_assignment_updated_at: Some(reviewer_assignment.updated_at),
+            expected_workflow_definition: Some(custom_workflow_definition.clone()),
+        }),
+    )
+    .await
+    .expect("custom root role admission succeeds");
+    assert_eq!(root_execution.role, "reviewer");
+
+    let child_execution_id = new_uuid_v4();
+    let child_execution = ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        make_execution(
+            child_execution_id.clone(),
+            &child.id,
+            "coder",
+            &child_workspace,
+        ),
+        make_lease(child_execution_id, "embedded:inherited-child"),
+        Some(ExecutionAdmission {
+            expected_project_version: None,
+            expected_task_version: child.version,
+            expected_task_status: child.status.clone(),
+            expected_effective_role: Some("coder".to_owned()),
+            expected_agent_max_concurrent_tasks: Some(2),
+            expected_agent_version: Some(1),
+            expected_reviewer_parent_execution_id: None,
+            expected_latest_review_candidate_execution_id: None,
+            expected_reviewer_id: None,
+            expected_reviewer_attempt_number: None,
+            expected_reviewer_status: None,
+            expected_reviewer_updated_at: None,
+            expected_reviewer_execution_id: None,
+            expected_auditor_execution_id: None,
+            expected_assignment_id: Some(child_assignment.id),
+            expected_assignment_updated_at: Some(child_assignment.updated_at),
+            expected_workflow_definition: None,
+        }),
+    )
+    .await
+    .expect("inherited subtask role admission succeeds");
+    assert_eq!(child_execution.role, "coder");
+}
+
+#[tokio::test]
+async fn reviewer_execution_admission_binds_latest_review_candidate() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    sqlx::query("UPDATE agent_identity SET max_concurrent_tasks = ?, updated_at = ? WHERE id = ?")
+        .bind(2_i64)
+        .bind(now_rfc3339())
+        .bind(&agent_id)
+        .execute(db.pool())
+        .await
+        .expect("agent capacity updates");
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "review".to_owned(),
+        "Reviewer admission candidate",
+    )
+    .await;
+    let task = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let assignment = TaskRoleAssignmentRepo::assign(
+        &db,
+        CreateTaskRoleAssignment {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            role_name: "reviewer".to_owned(),
+            assignee_type: Some(crate::AssigneeKind::Agent),
+            assignee_id: Some(agent_id.clone()),
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("reviewer assignment creates");
+    let first_workspace = seed_workspace_for_task(&db, &task_id, &repo_id).await;
+    let now = now_rfc3339();
+    let make_execution =
+        |id: String, status: ExecutionStatus, workspace_id: Option<String>| CreateExecution {
+            id,
+            task_id: task_id.clone(),
+            agent_id: Some(agent_id.clone()),
+            role: "reviewer".to_owned(),
+            status,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+    let first_parent_id = new_uuid_v4();
+    let mut first_parent =
+        make_execution(first_parent_id.clone(), ExecutionStatus::Completed, None);
+    first_parent.role = "executor".to_owned();
+    ExecutionRepo::create(&db, first_parent)
+        .await
+        .expect("first review parent creates");
+    let first_review = ReviewRepo::create(
+        &db,
+        crate::CreateReview {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            execution_id: first_parent_id.clone(),
+            attempt_number: 1,
+            status: ReviewStatus::Running,
+            step_results_json: "[]".to_owned(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("first review creates");
+    let make_admission = |parent_execution_id: Option<String>| ExecutionAdmission {
+        expected_project_version: None,
+        expected_task_version: task.version,
+        expected_task_status: task.status.clone(),
+        expected_effective_role: Some("reviewer".to_owned()),
+        expected_agent_max_concurrent_tasks: Some(2),
+        expected_agent_version: Some(1),
+        expected_reviewer_parent_execution_id: parent_execution_id,
+        expected_latest_review_candidate_execution_id: Some(first_parent_id.clone()),
+        expected_reviewer_id: Some(first_review.id.clone()),
+        expected_reviewer_attempt_number: Some(first_review.attempt_number),
+        expected_reviewer_status: Some(first_review.status.to_string()),
+        expected_reviewer_updated_at: Some(first_review.updated_at.clone()),
+        expected_reviewer_execution_id: first_review.reviewer_execution_id.clone(),
+        expected_auditor_execution_id: first_review.auditor_execution_id.clone(),
+        expected_assignment_id: Some(assignment.id.clone()),
+        expected_assignment_updated_at: Some(assignment.updated_at.clone()),
+        expected_workflow_definition: Some("{}".to_owned()),
+    };
+    let first_id = new_uuid_v4();
+    let first_lease = ClaimExecutionLease {
+        execution_id: first_id.clone(),
+        expected_version: 1,
+        owner: "embedded:review-admission-1".to_owned(),
+        lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        now: now.clone(),
+    };
+    ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        {
+            let mut execution = make_execution(
+                first_id.clone(),
+                ExecutionStatus::Running,
+                Some(first_workspace.clone()),
+            );
+            execution.parent_execution_id = Some(first_parent_id.clone());
+            execution
+        },
+        first_lease,
+        Some(make_admission(Some(first_parent_id.clone()))),
+    )
+    .await
+    .expect("first reviewer admission succeeds");
+    sqlx::query("UPDATE execution SET status = 'completed', updated_at = ? WHERE id = ?")
+        .bind(now_rfc3339())
+        .bind(&first_id)
+        .execute(db.pool())
+        .await
+        .expect("first reviewer execution settles");
+    let bound_first_id: String =
+        sqlx::query_scalar("SELECT reviewer_execution_id FROM review WHERE id = ?")
+            .bind(&first_review.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("first reviewer binding persists");
+    assert_eq!(bound_first_id, first_id, "first reviewer binds atomically");
+
+    // A terminal reviewer may be replaced, but the admission must carry the
+    // exact binding it observed so a stale retry cannot steal a live slot.
+    let replacement_id = new_uuid_v4();
+    let replacement_lease = ClaimExecutionLease {
+        execution_id: replacement_id.clone(),
+        expected_version: 1,
+        owner: "embedded:review-admission-replacement".to_owned(),
+        lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        now: now.clone(),
+    };
+    let mut replacement_admission = make_admission(Some(first_parent_id.clone()));
+    replacement_admission.expected_reviewer_execution_id = Some(first_id.clone());
+    let mut replacement_execution = make_execution(
+        replacement_id.clone(),
+        ExecutionStatus::Running,
+        Some(first_workspace.clone()),
+    );
+    replacement_execution.parent_execution_id = Some(first_parent_id.clone());
+    ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        replacement_execution,
+        replacement_lease,
+        Some(replacement_admission),
+    )
+    .await
+    .expect("terminal reviewer replacement succeeds");
+    let rebound_id: String =
+        sqlx::query_scalar("SELECT reviewer_execution_id FROM review WHERE id = ?")
+            .bind(&first_review.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("replacement reviewer binding persists");
+    assert_eq!(rebound_id, replacement_id);
+    sqlx::query("UPDATE execution SET status = 'completed', updated_at = ? WHERE id = ?")
+        .bind(now_rfc3339())
+        .bind(&replacement_id)
+        .execute(db.pool())
+        .await
+        .expect("replacement reviewer execution settles");
+
+    let auditor_id = new_uuid_v4();
+    let auditor_lease = ClaimExecutionLease {
+        execution_id: auditor_id.clone(),
+        expected_version: 1,
+        owner: "embedded:review-admission-auditor".to_owned(),
+        lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        now: now.clone(),
+    };
+    let mut auditor_execution = make_execution(
+        auditor_id.clone(),
+        ExecutionStatus::Running,
+        Some(first_workspace.clone()),
+    );
+    auditor_execution.role = "auditor".to_owned();
+    auditor_execution.parent_execution_id = Some(first_parent_id.clone());
+    let mut auditor_admission = make_admission(Some(first_parent_id.clone()));
+    auditor_admission.expected_reviewer_execution_id = Some(replacement_id.clone());
+    auditor_admission.expected_auditor_execution_id = None;
+    ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        auditor_execution,
+        auditor_lease,
+        Some(auditor_admission),
+    )
+    .await
+    .expect("first auditor binding succeeds");
+    let bound_auditor_id: String =
+        sqlx::query_scalar("SELECT auditor_execution_id FROM review WHERE id = ?")
+            .bind(&first_review.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("first auditor binding persists");
+    assert_eq!(bound_auditor_id, auditor_id);
+
+    // A live auditor remains the owner; the failed insert must roll back its
+    // execution row instead of stealing the Review binding.
+    let live_replacement_id = new_uuid_v4();
+    let mut live_replacement =
+        make_execution(live_replacement_id.clone(), ExecutionStatus::Running, None);
+    live_replacement.role = "auditor".to_owned();
+    live_replacement.parent_execution_id = Some(first_parent_id.clone());
+    let live_result = ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        live_replacement,
+        ClaimExecutionLease {
+            execution_id: live_replacement_id.clone(),
+            expected_version: 1,
+            owner: "embedded:review-admission-auditor-live-retry".to_owned(),
+            lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+            hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+            now: now.clone(),
+        },
+        Some({
+            let mut admission = make_admission(Some(first_parent_id.clone()));
+            admission.expected_reviewer_execution_id = Some(replacement_id.clone());
+            admission.expected_auditor_execution_id = Some(auditor_id.clone());
+            admission
+        }),
+    )
+    .await;
+    assert!(matches!(
+        live_result,
+        Err(DbError::VersionConflict) | Err(DbError::ExecutionAlreadyRunning { .. })
+    ));
+    assert!(ExecutionRepo::get_by_id(&db, &live_replacement_id)
+        .await
+        .expect("live retry lookup succeeds")
+        .is_none());
+
+    sqlx::query("UPDATE execution SET status = 'completed', updated_at = ? WHERE id = ?")
+        .bind(now_rfc3339())
+        .bind(&auditor_id)
+        .execute(db.pool())
+        .await
+        .expect("auditor execution settles");
+    let auditor_retry_id = new_uuid_v4();
+    let mut auditor_retry = make_execution(
+        auditor_retry_id.clone(),
+        ExecutionStatus::Running,
+        Some(first_workspace.clone()),
+    );
+    auditor_retry.role = "auditor".to_owned();
+    auditor_retry.parent_execution_id = Some(first_parent_id.clone());
+    let mut auditor_retry_admission = make_admission(Some(first_parent_id.clone()));
+    auditor_retry_admission.expected_reviewer_execution_id = Some(replacement_id);
+    auditor_retry_admission.expected_auditor_execution_id = Some(auditor_id);
+    ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        auditor_retry,
+        ClaimExecutionLease {
+            execution_id: auditor_retry_id.clone(),
+            expected_version: 1,
+            owner: "embedded:review-admission-auditor-retry".to_owned(),
+            lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+            hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+            now: now.clone(),
+        },
+        Some(auditor_retry_admission),
+    )
+    .await
+    .expect("terminal auditor replacement succeeds");
+    let rebound_auditor_id: String =
+        sqlx::query_scalar("SELECT auditor_execution_id FROM review WHERE id = ?")
+            .bind(&first_review.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("replacement auditor binding persists");
+    assert_eq!(rebound_auditor_id, auditor_retry_id);
+    sqlx::query("UPDATE execution SET status = 'completed', updated_at = ? WHERE id = ?")
+        .bind(now_rfc3339())
+        .bind(&auditor_retry_id)
+        .execute(db.pool())
+        .await
+        .expect("auditor retry settles");
+
+    let second_parent_id = new_uuid_v4();
+    let mut second_parent =
+        make_execution(second_parent_id.clone(), ExecutionStatus::Completed, None);
+    second_parent.role = "executor".to_owned();
+    ExecutionRepo::create(&db, second_parent)
+        .await
+        .expect("second review parent creates");
+    let second_review = ReviewRepo::create(
+        &db,
+        crate::CreateReview {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            execution_id: second_parent_id.clone(),
+            attempt_number: 2,
+            status: ReviewStatus::Failed,
+            step_results_json: "[]".to_owned(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("second review creates");
+    let terminal_id = new_uuid_v4();
+    let mut terminal_execution = make_execution(
+        terminal_id.clone(),
+        ExecutionStatus::Running,
+        Some(first_workspace.clone()),
+    );
+    terminal_execution.parent_execution_id = Some(second_parent_id.clone());
+    let mut terminal_admission = make_admission(Some(second_parent_id.clone()));
+    terminal_admission.expected_latest_review_candidate_execution_id =
+        Some(second_parent_id.clone());
+    terminal_admission.expected_reviewer_id = Some(second_review.id.clone());
+    terminal_admission.expected_reviewer_attempt_number = Some(second_review.attempt_number);
+    terminal_admission.expected_reviewer_status = Some(second_review.status.to_string());
+    terminal_admission.expected_reviewer_updated_at = Some(second_review.updated_at.clone());
+    terminal_admission.expected_reviewer_execution_id = second_review.reviewer_execution_id;
+    terminal_admission.expected_auditor_execution_id = second_review.auditor_execution_id;
+    let terminal_result = ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        terminal_execution,
+        ClaimExecutionLease {
+            execution_id: terminal_id.clone(),
+            expected_version: 1,
+            owner: "embedded:review-admission-terminal-review".to_owned(),
+            lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+            hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+            now: now.clone(),
+        },
+        Some(terminal_admission),
+    )
+    .await;
+    assert!(matches!(terminal_result, Err(DbError::VersionConflict)));
+    assert!(ExecutionRepo::get_by_id(&db, &terminal_id)
+        .await
+        .expect("terminal Review execution lookup succeeds")
+        .is_none());
+    let stale_id = new_uuid_v4();
+    let stale_lease = ClaimExecutionLease {
+        execution_id: stale_id.clone(),
+        expected_version: 1,
+        owner: "embedded:review-admission-2".to_owned(),
+        lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        now: now.clone(),
+    };
+    let mut stale_execution =
+        make_execution(stale_id, ExecutionStatus::Running, Some(first_workspace));
+    stale_execution.parent_execution_id = Some(first_parent_id.clone());
+    let stale = ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        stale_execution,
+        stale_lease,
+        Some(make_admission(Some(first_parent_id.clone()))),
+    )
+    .await;
+    assert!(matches!(stale, Err(DbError::VersionConflict)));
+
+    // A stale Task must not make a failed implementation reviewable: the
+    // candidate status is checked in the same transaction before the child
+    // reviewer execution, lease, and Review row can be inserted.
+    let failed_candidate_id = new_uuid_v4();
+    let mut failed_candidate =
+        make_execution(failed_candidate_id.clone(), ExecutionStatus::Failed, None);
+    failed_candidate.role = "executor".to_owned();
+    failed_candidate.created_at = "2099-01-01T00:00:00Z".to_owned();
+    failed_candidate.updated_at = failed_candidate.created_at.clone();
+    ExecutionRepo::create(&db, failed_candidate)
+        .await
+        .expect("failed candidate creates");
+    let failed_review_id = new_uuid_v4();
+    let failed_review = ReviewRepo::create(
+        &db,
+        crate::CreateReview {
+            id: failed_review_id.clone(),
+            task_id: task_id.clone(),
+            execution_id: failed_candidate_id.clone(),
+            attempt_number: 3,
+            status: ReviewStatus::Running,
+            step_results_json: "[]".to_owned(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("failed candidate Review creates");
+    let failed_binding_id = new_uuid_v4();
+    let mut failed_binding_execution =
+        make_execution(failed_binding_id.clone(), ExecutionStatus::Running, None);
+    failed_binding_execution.parent_execution_id = Some(failed_candidate_id.clone());
+    let mut failed_binding_admission = make_admission(Some(failed_candidate_id.clone()));
+    failed_binding_admission.expected_reviewer_id = Some(failed_review.id.clone());
+    failed_binding_admission.expected_latest_review_candidate_execution_id =
+        Some(failed_candidate_id.clone());
+    failed_binding_admission.expected_reviewer_attempt_number = Some(failed_review.attempt_number);
+    failed_binding_admission.expected_reviewer_status = Some(failed_review.status.to_string());
+    failed_binding_admission.expected_reviewer_updated_at = Some(failed_review.updated_at.clone());
+    let failed_binding = ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        failed_binding_execution,
+        ClaimExecutionLease {
+            execution_id: failed_binding_id.clone(),
+            expected_version: 1,
+            owner: "embedded:failed-candidate-binding".to_owned(),
+            lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+            hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+            now: now.clone(),
+        },
+        Some(failed_binding_admission),
+    )
+    .await;
+    assert!(matches!(failed_binding, Err(DbError::VersionConflict)));
+    assert!(ExecutionRepo::get_by_id(&db, &failed_binding_id)
+        .await
+        .expect("failed candidate binding lookup succeeds")
+        .is_none());
+    let failed_reviewer_id = new_uuid_v4();
+    let mut failed_reviewer =
+        make_execution(failed_reviewer_id.clone(), ExecutionStatus::Running, None);
+    failed_reviewer.parent_execution_id = Some(failed_candidate_id.clone());
+    let failed_attempt = ReviewRepo::create_attempt_with_execution_and_lease(
+        &db,
+        crate::CreateReview {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            execution_id: failed_candidate_id,
+            attempt_number: 0,
+            status: ReviewStatus::Running,
+            step_results_json: "[]".to_owned(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        failed_reviewer,
+        ClaimExecutionLease {
+            execution_id: failed_reviewer_id.clone(),
+            expected_version: 1,
+            owner: "embedded:failed-candidate-review".to_owned(),
+            lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+            hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+            now,
+        },
+        None,
+    )
+    .await;
+    assert!(matches!(failed_attempt, Err(DbError::VersionConflict)));
+    assert!(ExecutionRepo::get_by_id(&db, &failed_reviewer_id)
+        .await
+        .expect("failed candidate reviewer lookup succeeds")
+        .is_none());
+    assert!(ReviewRepo::get_by_id(&db, &failed_review_id)
+        .await
+        .expect("failed candidate Review lookup succeeds")
+        .is_some());
+}
+
+#[tokio::test]
+async fn review_attempt_accepts_completed_direct_child_candidate_but_rejects_unrelated_task() {
+    let db = sqlite_db().await;
+    let (project_id, _repo_id, _agent_id) = seed_project_repo_agent(&db).await;
+    let root_id = seed_task(
+        &db,
+        &project_id,
+        None,
+        "in_progress".to_owned(),
+        "coordination review root",
+    )
+    .await;
+    let child_id = new_uuid_v4();
+    TaskRepo::create(
+        &db,
+        CreateTask {
+            id: child_id.clone(),
+            project_id: project_id.clone(),
+            parent_task_id: Some(root_id.clone()),
+            subtask_order: Some(0),
+            assignee_type: None,
+            assignee_id: None,
+            title: "completed child candidate".to_owned(),
+            description: None,
+            task_type: "task".to_owned(),
+            status: "in_progress".to_owned(),
+            is_automation: false,
+            priority: 0,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("child task creates");
+    let unrelated_task_id = seed_task(
+        &db,
+        &project_id,
+        None,
+        "in_progress".to_owned(),
+        "unrelated candidate task",
+    )
+    .await;
+    let now = now_rfc3339();
+    let make_candidate = |id: String, task_id: &str| CreateExecution {
+        id,
+        task_id: task_id.to_owned(),
+        agent_id: None,
+        role: "executor".to_owned(),
+        status: ExecutionStatus::Completed,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: None,
+        agent_session_id: None,
+        agent_message_id: None,
+        last_activity_at: None,
+        summary: None,
+        logs_path: None,
+        before_sha: None,
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: None,
+        workspace_id: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let make_reviewer = |id: String, candidate_id: &str| CreateExecution {
+        id,
+        task_id: root_id.clone(),
+        agent_id: None,
+        role: "reviewer".to_owned(),
+        status: ExecutionStatus::Running,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: Some(candidate_id.to_owned()),
+        agent_session_id: None,
+        agent_message_id: None,
+        last_activity_at: None,
+        summary: None,
+        logs_path: None,
+        before_sha: None,
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: None,
+        workspace_id: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let make_lease = |execution_id: String| ClaimExecutionLease {
+        execution_id,
+        expected_version: 1,
+        owner: "embedded:root-review-candidate".to_owned(),
+        lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        now: now.clone(),
+    };
+
+    // A coordination root can retain an older implementation execution, but
+    // once non-deleted direct children exist the child execution set is the
+    // authoritative candidate scope.
+    let root_history_id = new_uuid_v4();
+    ExecutionRepo::create(&db, make_candidate(root_history_id, &root_id))
+        .await
+        .expect("root history candidate creates");
+    let child_candidate_id = new_uuid_v4();
+    ExecutionRepo::create(&db, make_candidate(child_candidate_id.clone(), &child_id))
+        .await
+        .expect("completed child candidate creates");
+    let reviewer_id = new_uuid_v4();
+    let (review, reviewer) = ReviewRepo::create_attempt_with_execution_and_lease(
+        &db,
+        CreateReview {
+            id: new_uuid_v4(),
+            task_id: root_id.clone(),
+            execution_id: child_candidate_id.clone(),
+            attempt_number: 0,
+            status: ReviewStatus::Running,
+            step_results_json: "[]".to_owned(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        make_reviewer(reviewer_id.clone(), &child_candidate_id),
+        make_lease(reviewer_id),
+        None,
+    )
+    .await
+    .expect("root review accepts direct child candidate");
+    assert_eq!(review.task_id, root_id);
+    assert_eq!(review.execution_id, child_candidate_id);
+    assert_eq!(reviewer.parent_execution_id, Some(child_candidate_id));
+
+    let unrelated_candidate_id = new_uuid_v4();
+    ExecutionRepo::create(
+        &db,
+        make_candidate(unrelated_candidate_id.clone(), &unrelated_task_id),
+    )
+    .await
+    .expect("unrelated completed candidate creates");
+    let orphan_reviewer_id = new_uuid_v4();
+    let unrelated_result = ReviewRepo::create_attempt_with_execution_and_lease(
+        &db,
+        CreateReview {
+            id: new_uuid_v4(),
+            task_id: root_id.clone(),
+            execution_id: unrelated_candidate_id.clone(),
+            attempt_number: 0,
+            status: ReviewStatus::Running,
+            step_results_json: "[]".to_owned(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        make_reviewer(orphan_reviewer_id.clone(), &unrelated_candidate_id),
+        make_lease(orphan_reviewer_id.clone()),
+        None,
+    )
+    .await;
+    assert!(matches!(unrelated_result, Err(DbError::VersionConflict)));
+    assert!(ExecutionRepo::get_by_id(&db, &orphan_reviewer_id)
+        .await
+        .expect("unrelated reviewer lookup succeeds")
+        .is_none());
+    assert_eq!(
+        ReviewRepo::list_by_task(&db, &root_id).await.unwrap().len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn review_source_accepts_direct_child_execution_for_coordination_root() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, _agent_id) = seed_project_repo_agent(&db).await;
+    let root_id = seed_task(
+        &db,
+        &project_id,
+        None,
+        "review".to_owned(),
+        "review source root",
+    )
+    .await;
+    let child_id = new_uuid_v4();
+    TaskRepo::create(
+        &db,
+        CreateTask {
+            id: child_id.clone(),
+            project_id: project_id.clone(),
+            parent_task_id: Some(root_id.clone()),
+            subtask_order: Some(0),
+            assignee_type: None,
+            assignee_id: None,
+            title: "review source child".to_owned(),
+            description: None,
+            task_type: "task".to_owned(),
+            status: "in_progress".to_owned(),
+            is_automation: false,
+            priority: 0,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("review source child creates");
+    let workspace_id = seed_workspace_for_task(&db, &child_id, &repo_id).await;
+    let candidate_id = new_uuid_v4();
+    let now = now_rfc3339();
+    ExecutionRepo::create(
+        &db,
+        CreateExecution {
+            id: candidate_id.clone(),
+            task_id: child_id,
+            agent_id: None,
+            role: "executor".to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace_id),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("direct child candidate creates");
+
+    let explicit = ReviewConformanceRepo::review_source(&db, &root_id, Some(&candidate_id))
+        .await
+        .expect("explicit direct child source loads");
+    assert_eq!(explicit["task_id"], root_id);
+    assert_eq!(explicit["repo_id"], repo_id);
+    let implicit = ReviewConformanceRepo::review_source(&db, &root_id, None)
+        .await
+        .expect("latest direct child source loads");
+    assert_eq!(implicit["repo_id"], repo_id);
+}
+
+#[tokio::test]
+async fn review_authority_rejects_stale_candidate_when_newer_running_candidate_exists() {
+    let db = sqlite_db().await;
+    let (project_id, _repo_id, _agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        None,
+        "review".to_owned(),
+        "review candidate authority",
+    )
+    .await;
+    let task = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let project = ProjectRepo::get_by_id(&db, &project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists");
+    let make_candidate = |id: String, status: ExecutionStatus, created_at: &str| CreateExecution {
+        id,
+        task_id: task_id.clone(),
+        agent_id: None,
+        role: "executor".to_owned(),
+        status,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: None,
+        agent_session_id: None,
+        agent_message_id: None,
+        last_activity_at: None,
+        summary: None,
+        logs_path: None,
+        before_sha: None,
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: None,
+        workspace_id: None,
+        created_at: created_at.to_owned(),
+        updated_at: created_at.to_owned(),
+    };
+    let old_candidate_id = new_uuid_v4();
+    ExecutionRepo::create(
+        &db,
+        make_candidate(
+            old_candidate_id.clone(),
+            ExecutionStatus::Completed,
+            "2020-01-01T00:00:00Z",
+        ),
+    )
+    .await
+    .expect("completed candidate creates");
+    let now = now_rfc3339();
+    ReviewRepo::create_with_task_authority(
+        &db,
+        CreateReview {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            execution_id: old_candidate_id.clone(),
+            attempt_number: 0,
+            status: ReviewStatus::Running,
+            step_results_json: "[]".to_owned(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        task.version,
+        task.status.as_str(),
+        Some(project.version),
+        Some(project.workflow_definition.as_str()),
+        Some(&old_candidate_id),
+    )
+    .await
+    .expect("review creates for completed candidate");
+
+    // Failed/cancelled remediation executions are not review candidates. A
+    // retry may still review the last completed implementation, while a
+    // newer running execution below must continue to fence that stale retry.
+    for (status, created_at) in [
+        (ExecutionStatus::Failed, "2050-01-01T00:00:00Z"),
+        (ExecutionStatus::Cancelled, "2051-01-01T00:00:00Z"),
+    ] {
+        ExecutionRepo::create(&db, make_candidate(new_uuid_v4(), status, created_at))
+            .await
+            .expect("terminal remediation candidate creates");
+    }
+    let retry_review = ReviewRepo::create_with_task_authority(
+        &db,
+        CreateReview {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            execution_id: old_candidate_id.clone(),
+            attempt_number: 0,
+            status: ReviewStatus::Running,
+            step_results_json: "[]".to_owned(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        task.version,
+        task.status.as_str(),
+        Some(project.version),
+        Some(project.workflow_definition.as_str()),
+        Some(&old_candidate_id),
+    )
+    .await
+    .expect("terminal remediation rows do not obscure completed candidate");
+    assert_eq!(retry_review.execution_id, old_candidate_id);
+
+    let newer_candidate_id = new_uuid_v4();
+    ExecutionRepo::create(
+        &db,
+        make_candidate(
+            newer_candidate_id,
+            ExecutionStatus::Running,
+            "2099-01-01T00:00:00Z",
+        ),
+    )
+    .await
+    .expect("newer running candidate creates");
+    let stale_review = ReviewRepo::create_with_task_authority(
+        &db,
+        CreateReview {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            execution_id: old_candidate_id.clone(),
+            attempt_number: 0,
+            status: ReviewStatus::Running,
+            step_results_json: "[]".to_owned(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+        task.version,
+        task.status.as_str(),
+        Some(project.version),
+        Some(project.workflow_definition.as_str()),
+        Some(&old_candidate_id),
+    )
+    .await;
+    assert!(matches!(stale_review, Err(DbError::VersionConflict)));
+    assert_eq!(
+        ReviewRepo::list_by_task(&db, &task_id).await.unwrap().len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn execution_admission_rechecks_assignment_and_dependency_edges() {
+    let db = sqlite_db().await;
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "Admission edge rechecks",
+    )
+    .await;
+    let task = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(&db, &task_id, "coder")
+        .await
+        .expect("task assignment loads")
+        .expect("task assignment exists");
+    let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
+    let now = now_rfc3339();
+    let make_execution = |id: String| CreateExecution {
+        id,
+        task_id: task_id.clone(),
+        agent_id: Some(agent_id.clone()),
+        role: "coder".to_owned(),
+        status: ExecutionStatus::Running,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: None,
+        agent_session_id: None,
+        agent_message_id: None,
+        last_activity_at: None,
+        summary: None,
+        logs_path: None,
+        before_sha: None,
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: None,
+        workspace_id: Some(workspace_id.clone()),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let make_lease = |execution_id: String| ClaimExecutionLease {
+        execution_id,
+        expected_version: 1,
+        owner: "embedded:admission-edge-test".to_owned(),
+        lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        now: now.clone(),
+    };
+    let stale_admission = ExecutionAdmission {
+        expected_project_version: None,
+        expected_task_version: task.version,
+        expected_task_status: task.status.clone(),
+        expected_effective_role: Some("coder".to_owned()),
+        expected_agent_max_concurrent_tasks: Some(1),
+        expected_agent_version: Some(1),
+        expected_reviewer_parent_execution_id: None,
+        expected_latest_review_candidate_execution_id: None,
+        expected_reviewer_id: None,
+        expected_reviewer_attempt_number: None,
+        expected_reviewer_status: None,
+        expected_reviewer_updated_at: None,
+        expected_reviewer_execution_id: None,
+        expected_auditor_execution_id: None,
+        expected_assignment_id: Some(assignment.id.clone()),
+        expected_assignment_updated_at: Some(assignment.updated_at.clone()),
+        expected_workflow_definition: Some("{}".to_owned()),
+    };
+
+    TaskRoleAssignmentRepo::assign(
+        &db,
+        CreateTaskRoleAssignment {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            role_name: "coder".to_owned(),
+            assignee_type: Some(crate::AssigneeKind::Agent),
+            assignee_id: Some(agent_id.clone()),
+            created_at: "2099-01-01T00:00:00Z".to_owned(),
+            updated_at: "2099-01-01T00:00:01Z".to_owned(),
+        },
+    )
+    .await
+    .expect("assignment changes");
+    let changed_id = new_uuid_v4();
+    let changed_result = ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        make_execution(changed_id.clone()),
+        make_lease(changed_id),
+        Some(stale_admission),
+    )
+    .await;
+    assert!(
+        matches!(changed_result, Err(DbError::VersionConflict)),
+        "unexpected assignment race result: {changed_result:?}"
+    );
+
+    let current_assignment = TaskRoleAssignmentRepo::get_by_task_and_role(&db, &task_id, "coder")
+        .await
+        .expect("changed assignment loads")
+        .expect("changed assignment exists");
+    let prerequisite_id = seed_task(
+        &db,
+        &project_id,
+        None,
+        "todo".to_owned(),
+        "New prerequisite",
+    )
+    .await;
+    TaskDependencyRepo::add_dependency(&db, &task_id, &prerequisite_id, &now)
+        .await
+        .expect("dependency adds");
+    let dependency_id = new_uuid_v4();
+    let dependency_result = ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        make_execution(dependency_id.clone()),
+        make_lease(dependency_id),
+        Some(ExecutionAdmission {
+            expected_project_version: None,
+            expected_task_version: task.version,
+            expected_task_status: task.status.clone(),
+            expected_effective_role: Some("coder".to_owned()),
+            expected_agent_max_concurrent_tasks: Some(1),
+            expected_agent_version: Some(1),
+            expected_reviewer_parent_execution_id: None,
+            expected_latest_review_candidate_execution_id: None,
+            expected_reviewer_id: None,
+            expected_reviewer_attempt_number: None,
+            expected_reviewer_status: None,
+            expected_reviewer_updated_at: None,
+            expected_reviewer_execution_id: None,
+            expected_auditor_execution_id: None,
+            expected_assignment_id: Some(current_assignment.id),
+            expected_assignment_updated_at: Some(current_assignment.updated_at),
+            expected_workflow_definition: Some("{}".to_owned()),
+        }),
+    )
+    .await;
+    assert!(matches!(dependency_result, Err(DbError::DependencyGate)));
+
+    let interactive_id = new_uuid_v4();
+    let mut interactive_execution = make_execution(interactive_id.clone());
+    interactive_execution.role = "interactive".to_owned();
+    let interactive_result = ExecutionRepo::create_with_lease_and_admission(
+        &db,
+        interactive_execution,
+        make_lease(interactive_id),
+        Some(ExecutionAdmission {
+            expected_project_version: None,
+            expected_task_version: task.version,
+            expected_task_status: task.status.clone(),
+            expected_effective_role: None,
+            expected_agent_max_concurrent_tasks: Some(1),
+            expected_agent_version: Some(1),
+            expected_reviewer_parent_execution_id: None,
+            expected_latest_review_candidate_execution_id: None,
+            expected_reviewer_id: None,
+            expected_reviewer_attempt_number: None,
+            expected_reviewer_status: None,
+            expected_reviewer_updated_at: None,
+            expected_reviewer_execution_id: None,
+            expected_auditor_execution_id: None,
+            expected_assignment_id: None,
+            expected_assignment_updated_at: None,
+            expected_workflow_definition: Some("{}".to_owned()),
+        }),
+    )
+    .await;
+    assert!(
+        matches!(interactive_result, Err(DbError::DependencyGate)),
+        "interactive admission result: {interactive_result:?}"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_execution_admission_has_one_winner_and_typed_loser() {
+    // `sqlite::memory:` uses a single pooled connection, which serializes
+    // callers before they can contend on BEGIN IMMEDIATE. Use a temporary
+    // file-backed pool so both spawned admissions can reach the transaction
+    // boundary concurrently and let SQLite choose the winner.
+    let database_path = std::env::temp_dir().join(format!(
+        "forge-execution-admission-{}.sqlite",
+        new_uuid_v4()
+    ));
+    let database_url = format!("sqlite://{}", database_path.display());
+    let pool = create_sqlite_pool(&database_url)
+        .await
+        .expect("concurrent admission pool creates");
+    run_migrations(&pool)
+        .await
+        .expect("concurrent admission migrations run");
+    let db = std::sync::Arc::new(SqliteDb::new(pool));
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "Concurrent execution admission",
+    )
+    .await;
+    let task = TaskRepo::get_by_id(&*db, &task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(&*db, &task_id, "coder")
+        .await
+        .expect("task assignment loads")
+        .expect("task assignment exists");
+    let workspace_id = seed_workspace_for_task(&db, &task_id, &repo_id).await;
+    let now = "2099-01-01T00:00:00Z".to_owned();
+    let make_execution = |id: String, role: &str| CreateExecution {
+        id,
+        task_id: task_id.clone(),
+        agent_id: Some(agent_id.clone()),
+        role: role.to_owned(),
+        status: ExecutionStatus::Running,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: None,
+        agent_session_id: None,
+        agent_message_id: None,
+        last_activity_at: None,
+        summary: None,
+        logs_path: None,
+        before_sha: None,
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: None,
+        workspace_id: Some(workspace_id.clone()),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let make_lease = |execution_id: String, owner: &str| ClaimExecutionLease {
+        execution_id,
+        expected_version: 1,
+        owner: owner.to_owned(),
+        lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        now: now.clone(),
+    };
+    let first_id = new_uuid_v4();
+    let second_id = new_uuid_v4();
+    let first_execution = make_execution(first_id.clone(), "coder");
+    let second_execution = make_execution(second_id.clone(), "coder");
+    let first_lease = make_lease(first_id.clone(), "embedded:concurrent-1");
+    let second_lease = make_lease(second_id.clone(), "embedded:concurrent-2");
+    let first_db = std::sync::Arc::clone(&db);
+    let second_db = std::sync::Arc::clone(&db);
+    let first_admission = ExecutionAdmission {
+        expected_project_version: None,
+        expected_task_version: task.version,
+        expected_task_status: task.status.clone(),
+        expected_effective_role: Some("coder".to_owned()),
+        expected_agent_max_concurrent_tasks: Some(1),
+        expected_agent_version: Some(1),
+        expected_reviewer_parent_execution_id: None,
+        expected_latest_review_candidate_execution_id: None,
+        expected_reviewer_id: None,
+        expected_reviewer_attempt_number: None,
+        expected_reviewer_status: None,
+        expected_reviewer_updated_at: None,
+        expected_reviewer_execution_id: None,
+        expected_auditor_execution_id: None,
+        expected_assignment_id: Some(assignment.id),
+        expected_assignment_updated_at: Some(assignment.updated_at),
+        expected_workflow_definition: Some("{}".to_owned()),
+    };
+    let second_admission = first_admission.clone();
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+    let first_barrier = std::sync::Arc::clone(&barrier);
+    let second_barrier = std::sync::Arc::clone(&barrier);
+    let first = tokio::spawn(async move {
+        first_barrier.wait().await;
+        ExecutionRepo::create_with_lease_and_admission(
+            &*first_db,
+            first_execution,
+            first_lease,
+            Some(first_admission),
+        )
+        .await
+    });
+    let second = tokio::spawn(async move {
+        second_barrier.wait().await;
+        ExecutionRepo::create_with_lease_and_admission(
+            &*second_db,
+            second_execution,
+            second_lease,
+            Some(second_admission),
+        )
+        .await
+    });
+    barrier.wait().await;
+    let first_result = first.await.expect("first admission task joins");
+    let second_result = second.await.expect("second admission task joins");
+    let (winner, loser) = match (first_result, second_result) {
+        (Ok(winner), Err(error)) => (winner, error),
+        (Err(error), Ok(winner)) => (winner, error),
+        (first, second) => panic!("expected one winner and one loser: {first:?}, {second:?}"),
+    };
+    assert!(matches!(
+        loser,
+        DbError::ExecutionAlreadyRunning {
+            scope,
+            execution_id,
+        } if scope == "repository" && execution_id == winner.id
+    ));
+    drop(db);
+    std::fs::remove_file(&database_path).expect("concurrent admission database removes");
+    std::fs::remove_file(format!("{}-wal", database_path.display())).ok();
+    std::fs::remove_file(format!("{}-shm", database_path.display())).ok();
+}
+
+#[tokio::test]
+async fn concurrent_execution_admission_respects_agent_capacity() {
+    let database_path = std::env::temp_dir().join(format!(
+        "forge-execution-agent-capacity-{}.sqlite",
+        new_uuid_v4()
+    ));
+    let database_url = format!("sqlite://{}", database_path.display());
+    let pool = create_sqlite_pool(&database_url)
+        .await
+        .expect("capacity pool creates");
+    run_migrations(&pool)
+        .await
+        .expect("capacity migrations run");
+    let db = std::sync::Arc::new(SqliteDb::new(pool));
+    let (project_id, repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let first_task_id = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "First capacity task",
+    )
+    .await;
+    let second_task_id = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "Second capacity task",
+    )
+    .await;
+    let first_task = TaskRepo::get_by_id(&*db, &first_task_id, false)
+        .await
+        .expect("first task loads")
+        .expect("first task exists");
+    let second_task = TaskRepo::get_by_id(&*db, &second_task_id, false)
+        .await
+        .expect("second task loads")
+        .expect("second task exists");
+    let first_assignment =
+        TaskRoleAssignmentRepo::get_by_task_and_role(&*db, &first_task_id, "coder")
+            .await
+            .expect("first assignment loads")
+            .expect("first assignment exists");
+    let second_assignment =
+        TaskRoleAssignmentRepo::get_by_task_and_role(&*db, &second_task_id, "coder")
+            .await
+            .expect("second assignment loads")
+            .expect("second assignment exists");
+    let first_workspace = seed_workspace_for_task(&db, &first_task_id, &repo_id).await;
+    let second_workspace = seed_workspace_for_task(&db, &second_task_id, &repo_id).await;
+    let now = "2099-01-01T00:00:00Z".to_owned();
+    let make_execution = |id: String, task_id: &str, workspace_id: &str| CreateExecution {
+        id,
+        task_id: task_id.to_owned(),
+        agent_id: Some(agent_id.clone()),
+        role: "coder".to_owned(),
+        status: ExecutionStatus::Running,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: None,
+        agent_session_id: None,
+        agent_message_id: None,
+        last_activity_at: None,
+        summary: None,
+        logs_path: None,
+        before_sha: None,
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: None,
+        workspace_id: Some(workspace_id.to_owned()),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let make_lease = |execution_id: String, owner: &str| ClaimExecutionLease {
+        execution_id,
+        expected_version: 1,
+        owner: owner.to_owned(),
+        lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        now: now.clone(),
+    };
+    let first_id = new_uuid_v4();
+    let second_id = new_uuid_v4();
+    let first_db = std::sync::Arc::clone(&db);
+    let second_db = std::sync::Arc::clone(&db);
+    let first_admission = ExecutionAdmission {
+        expected_project_version: None,
+        expected_task_version: first_task.version,
+        expected_task_status: first_task.status.clone(),
+        expected_effective_role: Some("coder".to_owned()),
+        expected_agent_max_concurrent_tasks: Some(1),
+        expected_agent_version: Some(1),
+        expected_reviewer_parent_execution_id: None,
+        expected_latest_review_candidate_execution_id: None,
+        expected_reviewer_id: None,
+        expected_reviewer_attempt_number: None,
+        expected_reviewer_status: None,
+        expected_reviewer_updated_at: None,
+        expected_reviewer_execution_id: None,
+        expected_auditor_execution_id: None,
+        expected_assignment_id: Some(first_assignment.id),
+        expected_assignment_updated_at: Some(first_assignment.updated_at),
+        expected_workflow_definition: Some("{}".to_owned()),
+    };
+    let second_admission = ExecutionAdmission {
+        expected_project_version: None,
+        expected_task_version: second_task.version,
+        expected_task_status: second_task.status.clone(),
+        expected_effective_role: Some("coder".to_owned()),
+        expected_agent_max_concurrent_tasks: Some(1),
+        expected_agent_version: Some(1),
+        expected_reviewer_parent_execution_id: None,
+        expected_latest_review_candidate_execution_id: None,
+        expected_reviewer_id: None,
+        expected_reviewer_attempt_number: None,
+        expected_reviewer_status: None,
+        expected_reviewer_updated_at: None,
+        expected_reviewer_execution_id: None,
+        expected_auditor_execution_id: None,
+        expected_assignment_id: Some(second_assignment.id),
+        expected_assignment_updated_at: Some(second_assignment.updated_at),
+        expected_workflow_definition: Some("{}".to_owned()),
+    };
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+    let first_execution = make_execution(first_id.clone(), &first_task_id, &first_workspace);
+    let second_execution = make_execution(second_id.clone(), &second_task_id, &second_workspace);
+    let first_lease = make_lease(first_id.clone(), "embedded:capacity-1");
+    let second_lease = make_lease(second_id.clone(), "embedded:capacity-2");
+    let first_barrier = std::sync::Arc::clone(&barrier);
+    let second_barrier = std::sync::Arc::clone(&barrier);
+    let first = tokio::spawn(async move {
+        first_barrier.wait().await;
+        ExecutionRepo::create_with_lease_and_admission(
+            &*first_db,
+            first_execution,
+            first_lease,
+            Some(first_admission),
+        )
+        .await
+    });
+    let second = tokio::spawn(async move {
+        second_barrier.wait().await;
+        ExecutionRepo::create_with_lease_and_admission(
+            &*second_db,
+            second_execution,
+            second_lease,
+            Some(second_admission),
+        )
+        .await
+    });
+    barrier.wait().await;
+    let first_result = first.await.expect("first capacity task joins");
+    let second_result = second.await.expect("second capacity task joins");
+    let successes = usize::from(first_result.is_ok()) + usize::from(second_result.is_ok());
+    assert_eq!(successes, 1, "exactly one agent slot may be admitted");
+    let errors = [first_result.err(), second_result.err()];
+    assert!(errors
+        .iter()
+        .flatten()
+        .any(|error| matches!(error, DbError::AgentAtCapacity)));
+    drop(db);
+    std::fs::remove_file(&database_path).expect("capacity database removes");
+    std::fs::remove_file(format!("{}-wal", database_path.display())).ok();
+    std::fs::remove_file(format!("{}-shm", database_path.display())).ok();
+}
+
+#[tokio::test]
+async fn review_integration_lock_is_rejected_after_project_pause() {
+    let db = sqlite_db().await;
+    let (project_id, _repo_id, _agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        None,
+        "merging".to_owned(),
+        "Paused integration guard",
+    )
+    .await;
+    ProjectRepo::set_paused_at(&db, &project_id, Some(now_rfc3339()))
+        .await
+        .expect("project pauses");
+
+    let result = ReviewConformanceRepo::lock_review_integration(&db, &task_id).await;
+
+    assert!(matches!(
+        result,
+        Err(DbError::ProjectPaused { project_id: blocked }) if blocked == project_id
+    ));
 }
 
 #[tokio::test]
@@ -3814,6 +6145,8 @@ async fn compare_and_move_is_atomic_versioned_and_idempotent() {
         triggered_by: "user:board_drag".to_owned(),
         trigger_reason: "board reorder".to_owned(),
         rejection: false,
+        expected_project_version: None,
+        expected_workflow_definition: None,
         updated_at: now_rfc3339(),
     };
 
@@ -3879,6 +6212,81 @@ async fn compare_and_move_is_atomic_versioned_and_idempotent() {
 }
 
 #[tokio::test]
+async fn compare_and_move_rejects_stale_project_workflow_authority_without_mutation() {
+    let db = sqlite_db().await;
+    let (project_id, _repo_id, _) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        None,
+        "todo".to_owned(),
+        "stale workflow move",
+    )
+    .await;
+    let project = ProjectRepo::get_by_id(&db, &project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists");
+    let task_before = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let board_revision = TaskBoardRepo::board_revision(&db, &project_id)
+        .await
+        .expect("board revision loads");
+    let input = CompareAndMoveTask {
+        operation_id: new_uuid_v4(),
+        project_id: project_id.clone(),
+        task_id: task_id.clone(),
+        task_version: task_before.version,
+        board_revision,
+        target_status: "todo".to_owned(),
+        target_column_statuses: vec!["todo".to_owned()],
+        before_id: None,
+        after_id: None,
+        entry_barrier_json: None,
+        transition_log_id: new_uuid_v4(),
+        workflow_snapshot: serde_json::Value::Null,
+        trigger_name: None,
+        triggered_by: "user:board_drag".to_owned(),
+        trigger_reason: "stale workflow authority".to_owned(),
+        rejection: false,
+        expected_project_version: Some(project.version),
+        expected_workflow_definition: Some(project.workflow_definition.clone()),
+        updated_at: now_rfc3339(),
+    };
+
+    ProjectRepo::update_workflow(
+        &db,
+        &project_id,
+        "{\"workflow\":\"w2\"}",
+        None,
+        project.version,
+        &now_rfc3339(),
+    )
+    .await
+    .expect("workflow update wins the race");
+
+    assert!(matches!(
+        TaskBoardRepo::compare_and_move_task(&db, input).await,
+        Err(DbError::VersionConflict)
+    ));
+    let task_after = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    assert_eq!(task_after.status, task_before.status);
+    assert_eq!(task_after.version, task_before.version);
+    assert_eq!(task_after.board_position, task_before.board_position);
+    assert_eq!(
+        TaskBoardRepo::board_revision(&db, &project_id)
+            .await
+            .expect("board revision reloads"),
+        board_revision
+    );
+}
+
+#[tokio::test]
 async fn compare_and_move_emits_interruption_resolution_with_the_task_update() {
     let db = sqlite_db().await;
     let (project_id, _repo_id, _) = seed_project_repo_agent(&db).await;
@@ -3930,6 +6338,8 @@ async fn compare_and_move_emits_interruption_resolution_with_the_task_update() {
             triggered_by: "user:board_drag".to_owned(),
             trigger_reason: "resolve the block by moving the task".to_owned(),
             rejection: false,
+            expected_project_version: None,
+            expected_workflow_definition: None,
             updated_at: now_rfc3339(),
         },
     )
@@ -4008,6 +6418,8 @@ async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
             triggered_by: "user:board_drag".to_owned(),
             trigger_reason: "board reorder".to_owned(),
             rejection: false,
+            expected_project_version: None,
+            expected_workflow_definition: None,
             updated_at: now_rfc3339(),
         },
     )
@@ -4047,6 +6459,8 @@ async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
             triggered_by: "user:board_drag".to_owned(),
             trigger_reason: "board move".to_owned(),
             rejection: false,
+            expected_project_version: None,
+            expected_workflow_definition: None,
             updated_at: now_rfc3339(),
         },
     )
@@ -4081,6 +6495,8 @@ async fn compare_and_move_validates_empty_columns_neighbors_and_renormalizes() {
             triggered_by: "user:board_drag".to_owned(),
             trigger_reason: "board move".to_owned(),
             rejection: false,
+            expected_project_version: None,
+            expected_workflow_definition: None,
             updated_at: now_rfc3339(),
         },
     )
@@ -4820,6 +7236,145 @@ async fn sqlite_repositories_create_update_list_and_get_logs() {
 }
 
 #[tokio::test]
+async fn review_task_authority_settlement_is_atomic_with_task_cas() {
+    let db = sqlite_db().await;
+    let (project_id, _repo_id, _agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(&db, &project_id, None, "review".to_owned(), "review task").await;
+    let now = now_rfc3339();
+    let execution_id = new_uuid_v4();
+    ExecutionRepo::create(
+        &db,
+        CreateExecution {
+            id: execution_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: None,
+            role: "reviewer".to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("review execution creates");
+    let review = ReviewRepo::create(
+        &db,
+        CreateReview {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            execution_id,
+            attempt_number: 1,
+            status: ReviewStatus::Running,
+            step_results_json: "{}".to_owned(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("review creates");
+    let task = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+
+    let stale = ReviewRepo::update_status_with_task_authority(
+        &db,
+        &review.id,
+        ReviewStatus::Passed,
+        "{}".to_owned(),
+        Some(now.clone()),
+        &now,
+        task.version + 1,
+        Some(now.clone()),
+    )
+    .await;
+    assert!(matches!(stale, Err(DbError::VersionConflict)));
+    assert_eq!(
+        ReviewRepo::get_by_id(&db, &review.id)
+            .await
+            .expect("review reloads")
+            .expect("review exists")
+            .status,
+        ReviewStatus::Running
+    );
+    let task_after_stale = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    assert_eq!(task_after_stale.version, task.version);
+    assert!(task_after_stale.review_passed_at.is_none());
+    assert!(!DomainEventRepo::list_events_after(&db, 0, 100)
+        .await
+        .expect("events list after stale settlement")
+        .iter()
+        .any(|event| event.entity_id == review.id && event.event_type == "review.status_changed"));
+
+    let (settled_review, settled_task) = ReviewRepo::update_status_with_task_authority(
+        &db,
+        &review.id,
+        ReviewStatus::Passed,
+        "{}".to_owned(),
+        Some(now.clone()),
+        &now,
+        task.version,
+        Some(now.clone()),
+    )
+    .await
+    .expect("review and task authority settle together");
+    assert_eq!(settled_review.status, ReviewStatus::Passed);
+    assert_eq!(settled_task.version, task.version + 1);
+    assert_eq!(settled_task.review_passed_at.as_deref(), Some(now.as_str()));
+
+    let replay = ReviewRepo::update_status_with_task_authority(
+        &db,
+        &review.id,
+        ReviewStatus::Passed,
+        "{}".to_owned(),
+        Some(now.clone()),
+        &now,
+        settled_task.version,
+        Some(now.clone()),
+    )
+    .await;
+    assert!(matches!(replay, Err(DbError::InvalidTransition)));
+    let task_after_replay = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task reloads after replay")
+        .expect("task exists after replay");
+    assert_eq!(task_after_replay.version, settled_task.version);
+    assert_eq!(
+        task_after_replay.review_passed_at,
+        settled_task.review_passed_at
+    );
+    assert_eq!(
+        DomainEventRepo::list_events_after(&db, 0, 100)
+            .await
+            .expect("events list after replay")
+            .iter()
+            .filter(
+                |event| event.entity_id == review.id && event.event_type == "review.status_changed"
+            )
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn workspace_task_id_unique_is_preserved() {
     let db = sqlite_db().await;
     let now = now_rfc3339();
@@ -5187,15 +7742,9 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
             expected_version: 1,
             source_status: "todo".to_owned(),
             target_status: "in_progress".to_owned(),
-            capacity_statuses: vec![
-                // The task being claimed may already be role-assigned in a
-                // source state that participates in capacity accounting.
-                // It must not consume a slot before its own first claim.
-                "todo".to_owned(),
-                "in_progress".to_owned(),
-                "review".to_owned(),
-                "merging".to_owned(),
-            ],
+            execution_admission: None,
+            expected_project_version: None,
+            expected_workflow_definition: None,
             execution: CreateExecution {
                 id: execution_id.clone(),
                 task_id: task_id.clone(),
@@ -5221,7 +7770,6 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
                 updated_at: now.clone(),
             },
             execution_lease: pending_claim_lease(&execution_id, &now),
-            max_concurrent_tasks: 1,
             claimed_at: now.clone(),
         },
     )
@@ -5255,6 +7803,360 @@ async fn sqlite_repositories_enforce_versions_transitions_claims_and_cursors() {
     )
     .await;
     assert!(matches!(invalid_cursor, Err(DbError::InvalidCursor)));
+}
+
+#[tokio::test]
+async fn claim_capacity_ignores_assigned_but_not_running_tasks() {
+    let db = sqlite_db().await;
+    let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let assigned_task_id = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "Assigned without execution",
+    )
+    .await;
+    let claim_task_id = seed_task(
+        &db,
+        &project_id,
+        None,
+        "todo".to_owned(),
+        "Claim despite assigned work",
+    )
+    .await;
+    let now = now_rfc3339();
+    let execution_id = new_uuid_v4();
+    let mut transaction = crate::begin_immediate(db.pool())
+        .await
+        .expect("claim transaction starts");
+    let claimed = TaskRepo::claim(
+        &db,
+        &mut transaction,
+        ClaimTask {
+            task_id: claim_task_id.clone(),
+            assignee_type: "agent".to_owned(),
+            assignee_id: Some(agent_id.clone()),
+            expected_version: 1,
+            source_status: "todo".to_owned(),
+            target_status: "in_progress".to_owned(),
+            execution_admission: None,
+            expected_project_version: None,
+            expected_workflow_definition: None,
+            execution: CreateExecution {
+                id: execution_id.clone(),
+                task_id: claim_task_id.clone(),
+                agent_id: Some(agent_id.clone()),
+                role: "executor".to_owned(),
+                status: ExecutionStatus::Running,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                workspace_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            execution_lease: pending_claim_lease(&execution_id, &now),
+            claimed_at: now.clone(),
+        },
+    )
+    .await
+    .expect("assigned work without a running execution leaves capacity");
+    transaction
+        .commit()
+        .await
+        .expect("claim transaction commits");
+
+    assert_eq!(claimed.task.id, claim_task_id);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM execution WHERE task_id = ? AND status = 'running'",
+        )
+        .bind(&assigned_task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("assigned task execution count reads"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM execution WHERE agent_id = ? AND status = 'running'",
+        )
+        .bind(&agent_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("running execution count reads"),
+        1
+    );
+}
+
+#[tokio::test]
+async fn claim_rejects_stale_project_workflow_authority_without_mutation() {
+    let db = sqlite_db().await;
+    let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(&db, &project_id, None, "todo".to_owned(), "stale claim").await;
+    let project = ProjectRepo::get_by_id(&db, &project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists");
+    let task = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+
+    ProjectRepo::update_workflow(
+        &db,
+        &project_id,
+        r#"{"stale":true}"#,
+        None,
+        project.version,
+        &now_rfc3339(),
+    )
+    .await
+    .expect("workflow update commits");
+
+    let execution_id = new_uuid_v4();
+    let mut tx = crate::begin_immediate(db.pool())
+        .await
+        .expect("claim transaction starts");
+    let result = TaskRepo::claim(
+        &db,
+        &mut tx,
+        ClaimTask {
+            task_id: task_id.clone(),
+            assignee_type: "agent".to_owned(),
+            assignee_id: Some(agent_id.clone()),
+            expected_version: task.version,
+            source_status: task.status.clone(),
+            target_status: "in_progress".to_owned(),
+            execution_admission: None,
+            expected_project_version: Some(project.version),
+            expected_workflow_definition: Some(project.workflow_definition.clone()),
+            execution: CreateExecution {
+                id: execution_id.clone(),
+                task_id: task_id.clone(),
+                agent_id: Some(agent_id),
+                role: "executor".to_owned(),
+                status: ExecutionStatus::Running,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                workspace_id: None,
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+            execution_lease: pending_claim_lease(&execution_id, &now_rfc3339()),
+            claimed_at: now_rfc3339(),
+        },
+    )
+    .await;
+    assert!(matches!(result, Err(DbError::VersionConflict)));
+    drop(tx);
+
+    let unchanged_task = TaskRepo::get_by_id(&db, &task_id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    assert_eq!(unchanged_task.status, task.status);
+    assert_eq!(unchanged_task.version, task.version);
+    assert!(ExecutionRepo::get_by_id(&db, &execution_id)
+        .await
+        .expect("execution lookup succeeds")
+        .is_none());
+}
+
+#[tokio::test]
+async fn daemon_session_cap_rejects_running_execution_at_daemon_limit() {
+    let db = sqlite_db().await;
+    let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let daemon_id: String = sqlx::query_scalar("SELECT daemon_id FROM agent_current WHERE id = ?")
+        .bind(&agent_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("agent daemon loads");
+    sqlx::query("UPDATE agent_identity SET max_concurrent_tasks = 2, updated_at = ? WHERE id = ?")
+        .bind(now_rfc3339())
+        .bind(&agent_id)
+        .execute(db.pool())
+        .await
+        .expect("agent task capacity expands");
+    sqlx::query("UPDATE daemon SET labels_json = ?, updated_at = ? WHERE id = ?")
+        .bind(r#"{"max_concurrent_sessions":1}"#)
+        .bind(now_rfc3339())
+        .bind(&daemon_id)
+        .execute(db.pool())
+        .await
+        .expect("daemon session cap sets");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT max_concurrent_tasks FROM agent_current WHERE id = ?",
+        )
+        .bind(&agent_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("expanded task capacity reads"),
+        2
+    );
+
+    let first_task_id = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "Daemon cap first task",
+    )
+    .await;
+    let second_task_id = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "Daemon cap second task",
+    )
+    .await;
+    let now = "2099-01-01T00:00:00Z";
+    let make_execution = |id: String, task_id: &str| CreateExecution {
+        id,
+        task_id: task_id.to_owned(),
+        agent_id: Some(agent_id.clone()),
+        role: "executor".to_owned(),
+        status: ExecutionStatus::Running,
+        stop_reason: None,
+        stopped_by: None,
+        resume_policy: None,
+        stopped_at: None,
+        parent_execution_id: None,
+        agent_session_id: None,
+        agent_message_id: None,
+        last_activity_at: None,
+        summary: None,
+        logs_path: None,
+        before_sha: None,
+        after_sha: None,
+        error: None,
+        executor_config_snapshot_json: None,
+        workspace_id: None,
+        created_at: now.to_owned(),
+        updated_at: now.to_owned(),
+    };
+    let make_lease = |execution_id: String| ClaimExecutionLease {
+        execution_id,
+        expected_version: 1,
+        owner: "embedded:daemon-cap-test".to_owned(),
+        lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+        hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+        now: now.to_owned(),
+    };
+    let first_id = new_uuid_v4();
+    ExecutionRepo::create_with_lease(
+        &db,
+        make_execution(first_id.clone(), &first_task_id),
+        make_lease(first_id),
+    )
+    .await
+    .expect("first daemon session admits");
+
+    let second_id = new_uuid_v4();
+    let second_result = ExecutionRepo::create_with_lease(
+        &db,
+        make_execution(second_id.clone(), &second_task_id),
+        make_lease(second_id.clone()),
+    )
+    .await;
+    assert!(matches!(second_result, Err(DbError::AgentAtCapacity)));
+    assert!(ExecutionRepo::get_by_id(&db, &second_id)
+        .await
+        .expect("rejected execution lookup succeeds")
+        .is_none());
+}
+
+#[tokio::test]
+async fn paused_agent_is_rejected_at_running_execution_insert() {
+    let db = sqlite_db().await;
+    let (project_id, _repo_id, agent_id) = seed_project_repo_agent(&db).await;
+    let task_id = seed_task(
+        &db,
+        &project_id,
+        Some(&agent_id),
+        "in_progress".to_owned(),
+        "Paused agent task",
+    )
+    .await;
+    sqlx::query("UPDATE agent_identity SET paused = 1, updated_at = ? WHERE id = ?")
+        .bind(now_rfc3339())
+        .bind(&agent_id)
+        .execute(db.pool())
+        .await
+        .expect("agent pauses");
+
+    let execution_id = new_uuid_v4();
+    let now = "2099-01-01T00:00:00Z";
+    let result = ExecutionRepo::create_with_lease(
+        &db,
+        CreateExecution {
+            id: execution_id.clone(),
+            task_id,
+            agent_id: Some(agent_id.clone()),
+            role: "executor".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: now.to_owned(),
+            updated_at: now.to_owned(),
+        },
+        ClaimExecutionLease {
+            execution_id: execution_id.clone(),
+            expected_version: 1,
+            owner: "embedded:paused-agent-test".to_owned(),
+            lease_expires_at: "2099-01-01T00:00:30Z".to_owned(),
+            hard_deadline_at: "2099-01-01T01:00:00Z".to_owned(),
+            now: now.to_owned(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(DbError::AgentPaused { agent_id: ref rejected }) if rejected == &agent_id
+    ));
+    assert!(ExecutionRepo::get_by_id(&db, &execution_id)
+        .await
+        .expect("rejected execution lookup succeeds")
+        .is_none());
 }
 
 #[tokio::test]
@@ -5435,7 +8337,9 @@ async fn task_claim_rejects_active_entry_barrier() {
             expected_version: task.version,
             source_status: "todo".to_owned(),
             target_status: "in_progress".to_owned(),
-            capacity_statuses: vec!["in_progress".to_owned()],
+            execution_admission: None,
+            expected_project_version: None,
+            expected_workflow_definition: None,
             execution: CreateExecution {
                 id: execution_id.clone(),
                 task_id,
@@ -5461,7 +8365,6 @@ async fn task_claim_rejects_active_entry_barrier() {
                 updated_at: now,
             },
             execution_lease: pending_claim_lease(&execution_id, "2026-08-21T00:00:00Z"),
-            max_concurrent_tasks: 1,
             claimed_at: now_rfc3339(),
         },
     )
@@ -5619,11 +8522,9 @@ async fn test_dependency_gate_blocks_non_context_holder() {
             expected_version: 1,
             source_status: "todo".to_owned(),
             target_status: "in_progress".to_owned(),
-            capacity_statuses: vec![
-                "in_progress".to_owned(),
-                "review".to_owned(),
-                "merging".to_owned(),
-            ],
+            execution_admission: None,
+            expected_project_version: None,
+            expected_workflow_definition: None,
             execution: CreateExecution {
                 id: execution_id.clone(),
                 task_id,
@@ -5649,13 +8550,147 @@ async fn test_dependency_gate_blocks_non_context_holder() {
                 updated_at: now.clone(),
             },
             execution_lease: pending_claim_lease(&execution_id, &now),
-            max_concurrent_tasks: 1,
             claimed_at: now,
         },
     )
     .await;
 
     assert!(matches!(result, Err(DbError::DependencyGate)));
+}
+
+#[tokio::test]
+async fn dependency_gate_finds_context_holder_behind_100_newer_attempts() {
+    let db = sqlite_db().await;
+    let context_at = "2026-09-11T00:00:00Z";
+    let newer_at = "2026-09-12T00:00:00Z";
+    let (project_id, _repo_id, context_agent_id) = seed_project_repo_agent(&db).await;
+    let dependency_id = seed_task(
+        &db,
+        &project_id,
+        Some(&context_agent_id),
+        "review".to_owned(),
+        "Dependency",
+    )
+    .await;
+    let task_id = seed_task(&db, &project_id, None, "todo".to_owned(), "Dependent").await;
+
+    ExecutionRepo::create(
+        &db,
+        CreateExecution {
+            id: "dependency-context-holder-000".to_owned(),
+            task_id: dependency_id.clone(),
+            agent_id: Some(context_agent_id.clone()),
+            role: "executor".to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: None,
+            created_at: context_at.to_owned(),
+            updated_at: context_at.to_owned(),
+        },
+    )
+    .await
+    .expect("context-holder execution creates");
+
+    for index in 1..=100 {
+        ExecutionRepo::create(
+            &db,
+            CreateExecution {
+                id: format!("dependency-newer-attempt-{index:03}"),
+                task_id: dependency_id.clone(),
+                agent_id: None,
+                role: "executor".to_owned(),
+                status: ExecutionStatus::Completed,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                workspace_id: None,
+                created_at: newer_at.to_owned(),
+                updated_at: newer_at.to_owned(),
+            },
+        )
+        .await
+        .expect("newer dependency execution creates");
+    }
+
+    TaskDependencyRepo::add_dependency(&db, &task_id, &dependency_id, newer_at)
+        .await
+        .expect("dependency adds");
+
+    let mut transaction = crate::begin_immediate(db.pool())
+        .await
+        .expect("transaction starts");
+    let execution_id = "dependent-context-holder-000".to_owned();
+    let result = TaskRepo::claim(
+        &db,
+        &mut transaction,
+        ClaimTask {
+            task_id: task_id.clone(),
+            assignee_type: "agent".to_owned(),
+            assignee_id: Some(context_agent_id.clone()),
+            expected_version: 1,
+            source_status: "todo".to_owned(),
+            target_status: "in_progress".to_owned(),
+            execution_admission: None,
+            expected_project_version: None,
+            expected_workflow_definition: None,
+            execution: CreateExecution {
+                id: execution_id.clone(),
+                task_id: task_id.clone(),
+                agent_id: Some(context_agent_id),
+                role: "executor".to_owned(),
+                status: ExecutionStatus::Running,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: None,
+                workspace_id: None,
+                created_at: newer_at.to_owned(),
+                updated_at: newer_at.to_owned(),
+            },
+            execution_lease: pending_claim_lease(&execution_id, newer_at),
+            claimed_at: newer_at.to_owned(),
+        },
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "older context-holder execution must satisfy dependency gate"
+    );
 }
 
 #[tokio::test]
@@ -6660,7 +9695,9 @@ async fn legacy_non_runnable_governance_flag_does_not_block_current_charter_exec
             expected_version: task_before.version,
             source_status: "todo".to_owned(),
             target_status: "in_progress".to_owned(),
-            capacity_statuses: vec!["in_progress".to_owned()],
+            execution_admission: None,
+            expected_project_version: None,
+            expected_workflow_definition: None,
             execution: CreateExecution {
                 id: execution_id.clone(),
                 task_id: task_id.clone(),
@@ -6686,7 +9723,6 @@ async fn legacy_non_runnable_governance_flag_does_not_block_current_charter_exec
                 updated_at: now.clone(),
             },
             execution_lease: pending_claim_lease(&execution_id, &now),
-            max_concurrent_tasks: 1,
             claimed_at: now.clone(),
         },
     )

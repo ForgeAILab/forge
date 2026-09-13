@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use api_types::{StateKind, WorkflowDefinition};
 use db::{
-    ExecutionRepo, ExecutionStatus, PageRequest, ReviewRepo, SortBy, SortOrder, TaskCommentRepo,
-    TaskRepo, TransitionLogRepo,
+    ExecutionRepo, PageRequest, ReviewRepo, SortBy, SortOrder, TaskCommentRepo, TaskRepo,
+    TransitionLogRepo,
 };
 use executors::{LogEntry, LogKind};
 use serde_json::Value;
@@ -140,26 +140,9 @@ async fn latest_terminal_execution_for_exact_role(
     task_id: &str,
     role: &str,
 ) -> Result<Option<db::Execution>> {
-    let page = ExecutionRepo::list_by_task_and_role(
-        db,
-        task_id,
-        role,
-        PageRequest {
-            cursor: None,
-            limit: 1,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Desc,
-        },
-    )
-    .await?;
-
-    Ok(page.items.into_iter().next().filter(|execution| {
-        matches!(
-            execution.status,
-            ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled
-        )
-    }))
+    ExecutionRepo::latest_non_running_by_task_and_role(db, task_id, role)
+        .await
+        .map_err(Into::into)
 }
 
 #[derive(Debug, Default)]
@@ -213,33 +196,62 @@ async fn latest_failed_review_context(
 
 /// The reviewer execution that produced one review attempt's verdict.
 ///
-/// A review attempt row is written when the attempt starts and its reviewer
-/// execution is dispatched immediately after, so the attempt owns the first
-/// reviewing execution created at or after its start.
+/// Current attempts carry explicit reviewer/auditor execution identities.
+/// Historical direct rows are accepted only when `Review.execution_id` names
+/// an actual reviewer/auditor execution. Candidate parentage and timestamps
+/// are not sufficient to associate an execution with an attempt.
 async fn reviewer_execution_for_review(
     db: &db::SqliteDb,
     review: &db::Review,
 ) -> Result<Option<db::Execution>> {
-    let mut candidates: Vec<db::Execution> = Vec::new();
-    for role in [crate::workflow::default_roles::REVIEWER, "auditor"] {
-        let page = ExecutionRepo::list_by_task_and_role(
-            db,
-            &review.task_id,
-            role,
-            PageRequest {
-                cursor: None,
-                limit: 50,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Asc,
-            },
-        )
-        .await?;
-        candidates.extend(page.items);
+    if let Some((execution_id, expected_role)) = exact_review_execution_binding(review) {
+        return exact_review_execution(db, &review.task_id, execution_id, expected_role).await;
     }
-    candidates.retain(|execution| execution.created_at >= review.started_at);
-    candidates.sort_by(|left, right| left.created_at.cmp(&right.created_at));
-    Ok(candidates.into_iter().next())
+
+    // Historical rows may have stored a direct reviewer execution in the
+    // candidate-shaped `execution_id` column. Preserve only that exact
+    // identity, and reject ordinary candidate executions.
+    let Some(execution) = ExecutionRepo::get_by_id(db, &review.execution_id).await? else {
+        return Ok(None);
+    };
+    if execution.task_id == review.task_id
+        && matches!(
+            execution.role.as_str(),
+            crate::workflow::default_roles::REVIEWER | "auditor"
+        )
+    {
+        Ok(Some(execution))
+    } else {
+        Ok(None)
+    }
+}
+
+fn exact_review_execution_binding(review: &db::Review) -> Option<(&str, &str)> {
+    // An audited Review's actionable feedback is the auditor's verdict, so
+    // prefer that exact execution when both role-specific bindings exist.
+    if let Some(execution_id) = review.auditor_execution_id.as_deref() {
+        return Some((execution_id, "auditor"));
+    }
+    review
+        .reviewer_execution_id
+        .as_deref()
+        .map(|execution_id| (execution_id, crate::workflow::default_roles::REVIEWER))
+}
+
+async fn exact_review_execution(
+    db: &db::SqliteDb,
+    task_id: &str,
+    execution_id: &str,
+    expected_role: &str,
+) -> Result<Option<db::Execution>> {
+    let Some(execution) = ExecutionRepo::get_by_id(db, execution_id).await? else {
+        return Ok(None);
+    };
+    if execution.task_id == task_id && execution.role == expected_role {
+        Ok(Some(execution))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Renders the frozen conformance assessment as coder-actionable feedback:
@@ -421,6 +433,29 @@ mod tests {
         assert!(should_resume_latest_target_role_thread(Some(
             EXECUTION_POLICY_RESUME_LATEST_TARGET_ROLE_THREAD
         )));
+    }
+
+    #[test]
+    fn audited_review_feedback_prefers_exact_auditor_binding() {
+        let review = db::Review {
+            id: "review".to_owned(),
+            task_id: "task".to_owned(),
+            execution_id: "candidate".to_owned(),
+            reviewer_execution_id: Some("reviewer".to_owned()),
+            auditor_execution_id: Some("auditor".to_owned()),
+            attempt_number: 1,
+            status: db::ReviewStatus::Failed,
+            step_results_json: "[]".to_owned(),
+            started_at: "now".to_owned(),
+            finished_at: None,
+            created_at: "now".to_owned(),
+            updated_at: "now".to_owned(),
+        };
+
+        assert_eq!(
+            exact_review_execution_binding(&review),
+            Some(("auditor", "auditor"))
+        );
     }
 
     #[tokio::test]

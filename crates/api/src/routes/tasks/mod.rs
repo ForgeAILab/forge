@@ -15,9 +15,9 @@ use axum::{
     Json,
 };
 use db::{
-    now_rfc3339, CommentAuthorType, CreateTaskRoleAssignment, ExecutionRepo, ExecutionStatus,
-    PageRequest, ProjectRepo, ReviewRepo, ReviewStatus, SharedMediaRepo, SortBy, SortOrder,
-    TaskBoardRepo, TaskCommentRepo, TaskDependencyRepo, TaskListQuery, TaskMediaRepo, TaskRepo,
+    now_rfc3339, CommentAuthorType, CreateTaskRoleAssignment, ExecutionRepo, PageRequest,
+    ProjectRepo, ReviewRepo, ReviewStatus, SharedMediaRepo, SortBy, SortOrder, TaskBoardRepo,
+    TaskCommentRepo, TaskDependencyRepo, TaskListQuery, TaskMediaRepo, TaskRepo,
     TaskRoleAssignmentRepo, TransitionLogRepo, WorkspaceRepo,
 };
 use executors::ExecutionOverrides;
@@ -33,10 +33,9 @@ use uuid::Uuid;
 use crate::{
     errors::{ApiError, ApiResult},
     routes::{
-        execution_response, paginated, parse_csv, review_response, serialize_json,
-        task_page_request, task_response, task_response_light_with_latest,
-        task_response_with_awaiting_human, task_role_assignment_response, workspace_response,
-        ListParams,
+        execution_response, paginated, parse_csv, serialize_json, task_page_request, task_response,
+        task_response_light_with_latest, task_response_with_awaiting_human,
+        task_role_assignment_response, workspace_response, ListParams,
     },
     state::AppState,
 };
@@ -96,8 +95,6 @@ fn map_launch_error(error: ServiceError) -> ApiError {
         ServiceError::InvalidOperation { message } => {
             if message.contains("terminal status") {
                 ApiError::conflict_with_code("task.terminal", message)
-            } else if message.contains("interactive execution already running") {
-                ApiError::conflict_with_code("execution.already_running", message)
             } else {
                 ApiError::invalid_operation_conflict(message)
             }

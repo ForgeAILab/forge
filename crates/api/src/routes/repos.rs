@@ -7,8 +7,8 @@ use axum::{
     Json,
 };
 use db::{
-    new_uuid_v4, now_rfc3339, CreatePrProviderConfig, CreateRepo, PrProviderConfigRepo,
-    ProjectRepo, RepoRepo, UpdateProject, UpdateRepo, WorkMode,
+    new_uuid_v4, now_rfc3339, CreatePrProviderConfig, CreateRepo, ProjectRepo, RepoRepo,
+    UpdateRepo, WorkMode,
 };
 
 use crate::{
@@ -37,56 +37,42 @@ pub async fn create_repo(
         .name
         .unwrap_or_else(|| repo_name_from_remote_url(&request.remote_url));
     let now = now_rfc3339();
-    let repo = RepoRepo::create(
-        &*state.db,
-        CreateRepo {
-            id: new_uuid_v4(),
-            project_id: project_id.clone(),
-            name,
-            local_path,
-            remote_url: request.remote_url,
-            work_mode: request
-                .work_mode
-                .map(work_mode_domain)
-                .unwrap_or(WorkMode::DirectMerge),
-            default_branch: request.default_branch.unwrap_or_else(|| "main".to_owned()),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await?;
-    if let Some(pr_provider) = &request.pr_provider {
+    let repo_id = new_uuid_v4();
+    let repo = CreateRepo {
+        id: repo_id.clone(),
+        project_id: project_id.clone(),
+        name,
+        local_path,
+        remote_url: request.remote_url,
+        work_mode: request
+            .work_mode
+            .map(work_mode_domain)
+            .unwrap_or(WorkMode::DirectMerge),
+        default_branch: request.default_branch.unwrap_or_else(|| "main".to_owned()),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let provider_config = request.pr_provider.map(|provider_type| {
         let pr_config = request.pr_provider_config.as_ref();
-        let now = now_rfc3339();
-        PrProviderConfigRepo::create(
-            &*state.db,
-            CreatePrProviderConfig {
-                id: new_uuid_v4(),
-                repo_id: repo.id.clone(),
-                provider_type: pr_provider.clone(),
-                base_url: pr_config.and_then(|c| c.base_url.clone()),
-                polling_interval_seconds: pr_config
-                    .and_then(|c| c.polling_interval_seconds)
-                    .unwrap_or(300),
-                token_secret_ref: pr_config.and_then(|c| c.token.clone()),
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        )
-        .await?;
-    }
-    ProjectRepo::update_at_version(
+        CreatePrProviderConfig {
+            id: new_uuid_v4(),
+            repo_id,
+            provider_type,
+            base_url: pr_config.and_then(|config| config.base_url.clone()),
+            polling_interval_seconds: pr_config
+                .and_then(|config| config.polling_interval_seconds)
+                .unwrap_or(300),
+            token_secret_ref: pr_config.and_then(|config| config.token.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        }
+    });
+    let repo = RepoRepo::create_primary_for_project(
         &*state.db,
-        UpdateProject {
-            id: project_id,
-            name: None,
-            settings: None,
-            primary_repo_id: Some(Some(repo.id.clone())),
-            paused_at: None,
-            updated_at: now_rfc3339(),
-        },
+        repo,
+        provider_config,
         project.version,
-        None,
+        now_rfc3339(),
     )
     .await?;
     Ok(Json(repo_response(repo)))

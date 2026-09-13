@@ -58,9 +58,11 @@ impl PromptBuilder for WorkerMergeFixPromptBuilder {
 const WORKER_ROLE_BOUNDARY: &str = "\
 Worker boundary:
 - Own planning, implementation, self-validation, and routine repair for this task in the task worktree.
+- The task worktree is the only checkout you may modify. Never enter, edit, or run commands against the source checkout or another worktree.
+- Never merge, rebase, cherry-pick, push, or otherwise integrate this task into the target/default branch. Forge alone may integrate an accepted review.
 - Inspect the task contract, repository, existing plan, comments, and prior evidence before acting.
-- Keep the plan updated as understanding changes, keep scope tight, and commit completed changes.
-- Before finishing, run `git add -A && git commit` in the worktree with a message naming the task; the merge gate rejects uncommitted worktrees, so an uncommitted result is an incomplete task.
+- Keep the plan updated as understanding changes, keep scope tight, and leave all completed changes in the task worktree.
+- Complete delivery according to the execution harness contract. Commit completed changes unless higher-priority runtime instructions explicitly say the host finalizes them.
 - When a safe decision cannot be inferred, stop and ask one structured question instead of guessing.
 - Red flags: unrelated refactors, skipped verification, hidden failures, or completion claims without evidence.";
 
@@ -72,8 +74,8 @@ Review-fix boundary:
 
 const MERGE_FIX_ROLE_BOUNDARY: &str = "\
 Merge-fix boundary:
-- Resolve merge conflicts minimally while preserving the already-reviewed implementation intent.
-- Re-run relevant validation after repair and report the exact conflict and verification evidence.
+- May finish uncommitted Task-worktree changes, but must not rebase or attempt a real branch conflict repair. Forge parks real merge conflicts for manual workspace repair.
+- Complete delivery according to the execution harness contract, re-run relevant validation, and report the verification evidence.
 - Do not redesign the task or add unrelated cleanup.";
 
 const WORKER_HANDOFF_CONTRACT: &str = "\
@@ -147,10 +149,15 @@ fn review_fix_user(ctx: &AgentDispatchContext) -> String {
 }
 
 fn merge_fix_user(ctx: &AgentDispatchContext) -> String {
-    let mut user = format!(
-        "Task: {}\n\nMerge repair is required. Rebase onto the latest target branch, resolve conflicts with the smallest safe change, run validation, and leave the task ready to return through review.\n",
-        ctx.task.title
-    );
+    let mut user = format!("Task: {}\n\n", ctx.task.title);
+    if matches!(
+        merge_failure_kind(ctx),
+        Some(api_types::FailureKind::DirtyWorktree)
+    ) {
+        user.push_str("Integration found unfinished or uncommitted changes in the Task worktree. Preserve the existing work, finish only the intended implementation, run validation, and complete delivery according to the execution harness contract. Do not rebase or discard changes.\n");
+    } else {
+        user.push_str("Integration found a real branch conflict. Do not rebase or attempt integration from this managed sandbox. Report that manual task-worktree repair is required and stop without changing unrelated files.\n");
+    }
     if let Some(reason) = last_merge_failed_reason(ctx) {
         user.push_str("\nMerge failure evidence:\n");
         user.push_str(&reason);
@@ -161,6 +168,12 @@ fn merge_fix_user(ctx: &AgentDispatchContext) -> String {
     }
     append_continuation_context(ctx, &mut user);
     user
+}
+
+fn merge_failure_kind(ctx: &AgentDispatchContext) -> Option<api_types::FailureKind> {
+    let annotation = ctx.task.error_annotation.as_deref()?;
+    let value = serde_json::from_str::<serde_json::Value>(annotation).ok()?;
+    serde_json::from_value(value.get("type")?.clone()).ok()
 }
 
 fn append_task_context(ctx: &AgentDispatchContext, user: &mut String) {

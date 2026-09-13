@@ -278,7 +278,10 @@ impl TaskService {
                     .await?
                     .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?
             }
-            TaskAction::Resume => self.resume_task_execution(&task, &workflow, reason).await?,
+            TaskAction::Resume => {
+                self.resume_task_execution(&task, &workflow, reason, transition_version)
+                    .await?
+            }
             TaskAction::Submit => {
                 let target = trigger_target(&workflow, &task.status, WorkflowTrigger::Accept)
                     .expect("submit capability guarantees an Accept target");
@@ -372,32 +375,111 @@ impl TaskService {
         task: &Task,
         workflow: &api_types::WorkflowDefinition,
     ) -> Result<Vec<TaskAction>> {
-        let executions = self.task_executions(&task.id).await?;
-        let latest_review = self.latest_review(&task.id).await?;
         let state = workflow
             .states
             .iter()
             .find(|state| state.name == task.status);
+        let current_role = state.and_then(crate::workflow::effective_role);
+        // This is an authority projection, not a history endpoint. The SQL
+        // resolver selects the newest representative for each predicate so
+        // action availability remains exact without scanning or offset-paging
+        // the complete execution history.
+        let executions = crate::task_service::action_resolver::list_execution_action_authority(
+            &self.db,
+            &task.id,
+            current_role,
+            None,
+        )
+        .await?;
+        let latest_review = self.latest_review(&task.id).await?;
         let is_terminal = state.is_some_and(|state| state.kind == StateKind::Terminal);
         let running = executions
             .iter()
             .any(|execution| execution.status == ExecutionStatus::Running);
+        let current_effective_role = state.and_then(crate::workflow::effective_role);
+        let execution_matches_current_role = |execution: &Execution| {
+            current_effective_role.is_some_and(|role| {
+                execution.role == role
+                    || (role == crate::workflow::default_roles::CODER
+                        && execution.role == "executor")
+            })
+        };
         let resumable = executions.iter().any(|execution| {
-            execution.status != ExecutionStatus::Running && execution.agent_session_id.is_some()
+            execution.status != ExecutionStatus::Running
+                && execution.agent_session_id.is_some()
+                && execution_matches_current_role(execution)
         });
         let has_previous_execution = executions.iter().any(|execution| {
-            execution.status != ExecutionStatus::Running && execution.agent_id.is_some()
+            execution.status != ExecutionStatus::Running
+                && execution.agent_id.is_some()
+                && execution_matches_current_role(execution)
         });
         let has_agent = self.action_agent_id(task, workflow).await.is_ok();
+        // A completed execution from an earlier workflow pass is not evidence
+        // that the current active state has work ready to submit. In
+        // particular, review remediation re-enters the coder state while the
+        // old coder attempt remains completed. Only the newest execution for
+        // the Task may satisfy the current role's submit gate.
+        let latest_current_role_execution = executions
+            .iter()
+            .filter(|execution| execution_matches_current_role(execution))
+            .max_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+        let latest_state_entry = if state.and_then(crate::workflow::effective_role).is_some() {
+            crate::task_service::action_resolver::latest_state_entry_authority(
+                &self.db,
+                &task.id,
+                &task.status,
+            )
+            .await?
+        } else {
+            None
+        };
+        let has_completed_current_role_execution = current_effective_role.is_some_and(|role| {
+            latest_current_role_execution.is_some_and(|execution| {
+                execution.status == ExecutionStatus::Completed
+                    && latest_state_entry
+                        .as_ref()
+                        .is_none_or(|entry| execution.created_at > entry.created_at)
+                    && (execution.role == role
+                        || (role == crate::workflow::default_roles::CODER
+                            && execution.role == "executor"))
+            })
+        });
+        // A user pause is not a failure, and `resume` is its inverse: it must
+        // stay offered, or the advertised `pause` becomes a one-way door whose
+        // only exits discard the paused attempt.
+        let has_blocking_state = task.failed_json.is_some()
+            || task.blocked_json.is_some()
+            || task.error_annotation.as_deref().is_some_and(|raw| {
+                matches!(
+                    serde_json::from_str::<api_types::TaskAnnotation>(raw),
+                    Ok(api_types::TaskAnnotation::Blocking(annotation))
+                        if annotation.annotation_type != api_types::FailureKind::ManualStop
+                )
+            });
 
         let mut actions = Vec::new();
-        if can_start(workflow, task) && has_agent {
+        if can_start(workflow, task)
+            && has_agent
+            // An unmet dependency is the Task's real reason for sitting in an
+            // Initial state. Offering `start` there sends the caller into the
+            // claim path, which refuses with a role-assignment conflict that
+            // names neither the dependency nor anything the caller can act on.
+            && db::TaskDependencyRepo::unsatisfied_dependencies(&*self.db, &task.id)
+                .await?
+                .is_empty()
+        {
             actions.push(TaskAction::Start);
         }
         if running {
             actions.push(TaskAction::Pause);
         }
         if !is_terminal
+            && !has_blocking_state
             && (resumable
                 || has_previous_execution
                 || (state.is_some_and(|state| state.kind == StateKind::Active) && has_agent))
@@ -405,6 +487,11 @@ impl TaskService {
             actions.push(TaskAction::Resume);
         }
         if state.is_some_and(|state| state.kind == StateKind::Active)
+            && !running
+            && task.failed_json.is_none()
+            && task.blocked_json.is_none()
+            && task.error_annotation.is_none()
+            && has_completed_current_role_execution
             && trigger_target(workflow, &task.status, WorkflowTrigger::Accept).is_some()
         {
             actions.push(TaskAction::Submit);
@@ -421,7 +508,10 @@ impl TaskService {
             .and_then(crate::workflow::effective_role)
             .is_some_and(|role| {
                 executions.iter().any(|execution| {
-                    execution.role == role && execution.status == ExecutionStatus::Running
+                    execution.status == ExecutionStatus::Running
+                        && (execution.role == role
+                            || (role == crate::workflow::default_roles::CODER
+                                && execution.role == "executor"))
                 })
             });
         let has_reject = trigger_target(workflow, &task.status, WorkflowTrigger::Reject).is_some();
@@ -466,27 +556,44 @@ impl TaskService {
         task: &Task,
         workflow: &api_types::WorkflowDefinition,
         reason: Option<String>,
+        expected_version: i64,
     ) -> Result<Task> {
+        let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+        if current.version != expected_version {
+            return Err(ServiceError::Db(db::DbError::TaskVersionConflict {
+                expected: expected_version,
+                actual: current.version,
+            }));
+        }
+        if current.failed_json.is_some() {
+            return Err(ServiceError::TaskActionUnavailable {
+                available_actions: Vec::new(),
+                reason: "failed tasks cannot be resumed; restart or cancel required".to_owned(),
+            });
+        }
         let context = reason.filter(|value| !value.trim().is_empty());
-        if let Some(annotation) = task
+        let blocking_annotation = task
             .error_annotation
             .as_deref()
             .and_then(|raw| serde_json::from_str::<api_types::TaskAnnotation>(raw).ok())
             .and_then(|annotation| match annotation {
                 api_types::TaskAnnotation::Blocking(annotation) => Some(annotation),
                 api_types::TaskAnnotation::Legacy(_) => None,
-            })
-        {
+            });
+        if let Some(annotation) = blocking_annotation.as_ref() {
             if annotation
                 .recovery_actions
                 .contains(&api_types::RecoveryAction::ResumeSession)
             {
                 match self
-                    .recover_task(
+                    .recover_task_at_version(
                         task.id.clone(),
                         api_types::RecoveryAction::ResumeSession,
                         Some("resumed by user".to_owned()),
                         context.clone(),
+                        expected_version,
                     )
                     .await
                 {
@@ -498,11 +605,48 @@ impl TaskService {
             }
         }
 
-        let executions = self.task_executions(&task.id).await?;
-        if let Some(execution) = executions.iter().find(|execution| {
-            execution.status != ExecutionStatus::Running && execution.agent_session_id.is_some()
-        }) {
-            let launched = self
+        // Resume means "carry on with the work this Task is waiting for". The
+        // state's own role decides that: resuming an unrelated older session —
+        // a finished coder while the Task sits in `review` — launches an
+        // `interactive` execution that satisfies nothing, answers 200, and
+        // leaves the Task exactly where it was.
+        let expected_role = workflow
+            .states
+            .iter()
+            .find(|state| state.name == task.status)
+            .and_then(crate::workflow::effective_role);
+        let role_matches = |execution: &Execution| {
+            expected_role.is_none_or(|role| {
+                execution.role == role
+                    || (role == crate::workflow::default_roles::CODER
+                        && execution.role == "executor")
+            })
+        };
+
+        let executions = crate::task_service::action_resolver::list_execution_action_authority(
+            &self.db,
+            &task.id,
+            expected_role,
+            None,
+        )
+        .await?;
+        if let Some(execution) = executions
+            .iter()
+            .filter(|execution| {
+                execution.status != ExecutionStatus::Running
+                    && execution.agent_session_id.is_some()
+                    && role_matches(execution)
+            })
+            .max_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            })
+        {
+            let recovery_clear = self
+                .prepare_manual_stop_resume_clear(&current, blocking_annotation.as_ref())
+                .await?;
+            let launched = match self
                 .follow_up_execution(
                     execution.id.clone(),
                     context.clone().unwrap_or_else(|| {
@@ -511,39 +655,123 @@ impl TaskService {
                     execution.agent_id.clone(),
                     None,
                 )
-                .await?;
-            self.start_execution(launched.execution.id).await?;
+                .await
+            {
+                Ok(launched) => launched,
+                Err(error) => {
+                    self.restore_manual_stop_resume_clear(recovery_clear.as_ref(), &execution.role)
+                        .await;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.start_execution(launched.execution.id.clone()).await {
+                self.restore_manual_stop_resume_clear(recovery_clear.as_ref(), &execution.role)
+                    .await;
+                return Err(error);
+            }
+            self.clear_resume_retry_metadata(&launched.task).await;
             return Ok(launched.task);
         }
 
-        if let Some(execution) = executions.iter().find(|execution| {
-            execution.status != ExecutionStatus::Running && execution.agent_id.is_some()
-        }) {
-            let launched = self
-                .re_execute_execution_with_context(execution.id.clone(), context.clone())
+        if let Some(execution) = executions
+            .iter()
+            .filter(|execution| {
+                execution.status != ExecutionStatus::Running
+                    && execution.agent_id.is_some()
+                    && role_matches(execution)
+            })
+            .max_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            })
+        {
+            let recovery_clear = self
+                .prepare_manual_stop_resume_clear(&current, blocking_annotation.as_ref())
                 .await?;
-            self.start_execution(launched.execution.id).await?;
+            let launched = match self
+                .re_execute_execution_with_context(execution.id.clone(), context.clone())
+                .await
+            {
+                Ok(launched) => launched,
+                Err(error) => {
+                    self.restore_manual_stop_resume_clear(recovery_clear.as_ref(), &execution.role)
+                        .await;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.start_execution(launched.execution.id.clone()).await {
+                self.restore_manual_stop_resume_clear(recovery_clear.as_ref(), &execution.role)
+                    .await;
+                return Err(error);
+            }
+            self.clear_resume_retry_metadata(&launched.task).await;
             return Ok(launched.task);
         }
 
         let agent_id = self.action_agent_id(task, workflow).await?;
-        let role = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-            .and_then(crate::workflow::effective_role)
-            .unwrap_or(crate::workflow::default_roles::WORKER);
-        let _launched = self
+        let role = expected_role.unwrap_or(crate::workflow::default_roles::WORKER);
+        let recovery_clear = self
+            .prepare_manual_stop_resume_clear(&current, blocking_annotation.as_ref())
+            .await?;
+        let _launched = match self
             .dispatch_initial_role_execution(
                 &task.id,
                 &agent_id,
                 role,
                 context.unwrap_or_else(|| "Resume task work.".to_owned()),
             )
-            .await?;
-        TaskRepo::get_by_id(&*self.db, &task.id, false)
+            .await
+        {
+            Ok(launched) => launched,
+            Err(error) => {
+                self.restore_manual_stop_resume_clear(recovery_clear.as_ref(), role)
+                    .await;
+                return Err(error);
+            }
+        };
+        let resumed_task = TaskRepo::get_by_id(&*self.db, &task.id, false)
             .await?
-            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))
+            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+        self.clear_resume_retry_metadata(&resumed_task).await;
+        Ok(resumed_task)
+    }
+
+    async fn prepare_manual_stop_resume_clear(
+        &self,
+        task: &Task,
+        annotation: Option<&api_types::TaskBlockingAnnotation>,
+    ) -> Result<Option<(Task, Task)>> {
+        if annotation.is_some_and(|annotation| {
+            annotation.annotation_type == api_types::FailureKind::ManualStop
+        }) {
+            let cleared = self.clear_recovery_metadata_at_version(task).await?;
+            Ok(Some((cleared, task.clone())))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn restore_manual_stop_resume_clear(
+        &self,
+        recovery_clear: Option<&(Task, Task)>,
+        execution_role: &str,
+    ) {
+        if let Some((cleared, original)) = recovery_clear {
+            self.restore_recovery_metadata_after_failed_resume(
+                cleared,
+                original,
+                None,
+                execution_role,
+            )
+            .await;
+        }
+    }
+
+    async fn clear_resume_retry_metadata(&self, task: &Task) {
+        if let Err(error) = super::execution::clear_execution_retry_metadata(&self.db, task).await {
+            tracing::warn!(task_id = %task.id, %error, "failed to clear execution retry metadata after resume");
+        }
     }
 
     async fn action_agent_id(
@@ -597,11 +825,8 @@ impl TaskService {
             }
         }
 
-        if let Some(execution) = self
-            .task_executions(&task.id)
-            .await?
-            .into_iter()
-            .find(|execution| execution.agent_id.is_some())
+        if let Some(execution) =
+            ExecutionRepo::latest_agent_execution_by_task(&*self.db, &task.id).await?
         {
             if let Some(agent_id) = execution.agent_id {
                 return Ok(agent_id);
@@ -648,35 +873,21 @@ impl TaskService {
             .ok_or_else(|| ServiceError::invalid_operation("no available agent to start task"))
     }
 
-    async fn task_executions(&self, task_id: &str) -> Result<Vec<Execution>> {
-        Ok(ExecutionRepo::list_by_task(
-            &*self.db,
-            task_id,
-            PageRequest {
-                cursor: None,
-                limit: 100,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Desc,
-            },
-        )
-        .await?
-        .items)
-    }
-
     async fn latest_running_execution(&self, task_id: &str) -> Result<Option<Execution>> {
-        Ok(self
-            .task_executions(task_id)
+        Ok(ExecutionRepo::list_running_by_task(&*self.db, task_id)
             .await?
             .into_iter()
-            .find(|execution| execution.status == ExecutionStatus::Running))
+            .next())
     }
 
     async fn latest_review(&self, task_id: &str) -> Result<Option<Review>> {
-        Ok(ReviewRepo::list_by_task(&*self.db, task_id)
-            .await?
-            .into_iter()
-            .max_by_key(|review| review.attempt_number))
+        let task_ids = [task_id];
+        Ok(
+            ReviewRepo::list_latest_reviews_for_tasks(&*self.db, &task_ids)
+                .await?
+                .into_iter()
+                .next(),
+        )
     }
 }
 

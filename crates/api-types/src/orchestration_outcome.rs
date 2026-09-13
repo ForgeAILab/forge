@@ -295,6 +295,12 @@ pub struct OrchestrationOutcome {
     pub current_version_or_revision: Option<CurrentVersionOrRevision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetryInstruction>,
+    /// Optional typed, redacted discriminator-specific details. MCP known
+    /// tools use this for safe conflict targets such as an execution id;
+    /// arbitrary internal error payloads never belong here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "unknown | null")]
+    pub details: Option<Value>,
     pub safe_message: String,
     pub correlation_id: String,
     pub replayed: bool,
@@ -323,6 +329,7 @@ impl OrchestrationOutcome {
             setup_requirements: None,
             current_version_or_revision: None,
             retry: None,
+            details: None,
             safe_message: String::new(),
             correlation_id: correlation_id.into(),
             replayed: false,
@@ -441,7 +448,7 @@ impl ToolResultSummary {
     ///
     /// Every other `OrchestrationOutcome` field (`result`, `approval_target`,
     /// `setup_requirements`, `current_version_or_revision`, `receipt_id`,
-    /// `event_id`) is deliberately dropped: those carry command-specific
+    /// `details`, `receipt_id`, `event_id`) is deliberately dropped: those carry command-specific
     /// payload data that a tool-result summary never needs and must not
     /// widen into.
     #[must_use]

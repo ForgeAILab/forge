@@ -1,11 +1,12 @@
 use crate::auditor;
 use chrono::{Duration as ChronoDuration, Utc};
 use db::{
-    new_uuid_v4, now_rfc3339, Agent, AgentRepo, AgentStatus, ClaimExecutionLease, CreateExecution,
-    CreateReview, Execution, ExecutionLeaseDisposition, ExecutionLeaseMutation, ExecutionRepo,
-    ExecutionStatus, ExecutionTerminalOutcome, RenewExecutionLease, RepoRepo, Review,
-    ReviewConformanceRepo, ReviewRepo, ReviewStatus, SqliteDb, TaskRepo, TerminalizeExecution,
-    WorkspaceRepo,
+    new_uuid_v4, now_rfc3339, Agent, AgentRepo, AgentStatus, AssigneeKind, ClaimExecutionLease,
+    CreateExecution, CreateReview, Execution, ExecutionAdmission, ExecutionLeaseDisposition,
+    ExecutionLeaseMutation, ExecutionRepo, ExecutionStatus, ExecutionTerminalOutcome, Project,
+    ProjectRepo, RenewExecutionLease, RepoRepo, Review, ReviewConformanceRepo, ReviewRepo,
+    ReviewStatus, SqliteDb, Task, TaskRepo, TaskRoleAssignment, TaskRoleAssignmentRepo,
+    TerminalizeExecution, WorkspaceRepo,
 };
 use events::{event_timestamp, EventBus, EventContext, ForgeEvent};
 use executors::{
@@ -156,18 +157,72 @@ impl ReviewRunner {
     pub async fn run(&self, req: ReviewRequest) -> Result<(Review, ReviewOutcome), ReviewError> {
         let task_id = req.task_id.to_string();
         let executor_execution_id = req.executor_execution_id.to_string();
-        let attempt_number = ReviewRepo::next_attempt_number(&*self.db, &task_id).await?;
         let executor_execution = ExecutionRepo::get_by_id(&*self.db, &executor_execution_id)
             .await?
             .ok_or(ReviewError::ExecutorExecutionNotFound(
                 req.executor_execution_id,
             ))?;
-        let workspace_id = executor_execution.workspace_id.clone().ok_or(
-            ReviewError::ExecutorExecutionMissingWorkspace(req.executor_execution_id),
-        )?;
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or(db::DbError::NotFound)?;
+        let candidate_belongs_to_task = if executor_execution.task_id == task_id {
+            true
+        } else {
+            TaskRepo::get_by_id(&*self.db, &executor_execution.task_id, false)
+                .await?
+                .is_some_and(|candidate_task| {
+                    candidate_task.parent_task_id.as_deref() == Some(task_id.as_str())
+                })
+        };
+        if !candidate_belongs_to_task {
+            return Err(ReviewError::Db(db::DbError::Check(
+                "review candidate execution belongs to another Task or coordination child"
+                    .to_owned(),
+            )));
+        }
+        let workspace_id = executor_execution.workspace_id.clone().ok_or(
+            ReviewError::ExecutorExecutionMissingWorkspace(req.executor_execution_id),
+        )?;
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or(db::DbError::NotFound)?;
+        // A configured workflow role is authoritative.  Built-in `no-review`
+        // and `human-required` workflows deliberately have no reviewer role;
+        // their rerun still executes bounded CI as a server-owned check, but
+        // must not accidentally borrow a stale Agent assignment.
+        let effective_review_role = effective_review_role(&task, &project);
+        let reviewer_assignment = if effective_review_role.as_deref() == Some("reviewer") {
+            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task_id, "reviewer").await?
+        } else {
+            None
+        };
+        let reviewer_agent = self
+            .load_assigned_agent(reviewer_assignment.as_ref())
+            .await?;
+        if req.auditor_agent_id.is_some() && reviewer_agent.is_none() {
+            return Err(ReviewError::Db(db::DbError::VersionConflict));
+        }
+        let auditor_agent = match req.auditor_agent_id.as_deref() {
+            Some(agent_id) => self.load_auditor_agent(agent_id).await?,
+            None => None,
+        };
+        let latest_review = ReviewRepo::list_by_task(&*self.db, &task_id)
+            .await?
+            .into_iter()
+            .max_by_key(|review| (review.attempt_number, review.id.clone()));
+        // Review rows point at the candidate execution being reviewed.  Each
+        // reviewer/auditor child carries that same candidate as its durable
+        // parent, allowing the admission transaction to reject a stale
+        // rerun without relying on a racy MAX(attempt_number) preflight.
+        let candidate_execution_id = executor_execution_id.clone();
+        let reviewer_admission = review_execution_admission(
+            &task,
+            &project,
+            reviewer_assignment.as_ref(),
+            reviewer_agent.as_ref(),
+            latest_review.as_ref(),
+            &candidate_execution_id,
+        );
         let ci_only_review = task.review_passed_at.is_some() && req.auditor_agent_id.is_none();
         let state_config = read_review_state_config(task.task_state_config.as_deref())?;
         let review_source = self
@@ -177,22 +232,42 @@ impl ReviewRunner {
         let ci_steps = if crate::contract::task_scope_is_read_only(&review_source) {
             Vec::new()
         } else {
-            read_ci_steps(&state_config)
+            read_ci_steps(&state_config)?
         };
         let review_prompt = read_review_prompt(&state_config);
 
-        let (reviewer_execution, reviewer_owner) = self
-            .create_reviewer_execution(&task_id, &executor_execution_id, workspace_id.clone(), &req)
+        let (mut review, reviewer_execution) = self
+            .create_reviewer_attempt(
+                &task_id,
+                &candidate_execution_id,
+                workspace_id.clone(),
+                &req,
+                reviewer_agent.as_ref(),
+                reviewer_admission,
+            )
             .await?;
-        let review = self
-            .create_review(&task_id, &reviewer_execution.id, attempt_number)
-            .await?;
+        let reviewer_owner = match reviewer_execution.lease_owner.clone() {
+            Some(owner) => owner,
+            None => {
+                let error = ReviewError::ExecutionLeaseUnavailable {
+                    execution_id: reviewer_execution.id.clone(),
+                };
+                cancel_review_if_unchanged(&self.db, &review, &error.to_string()).await;
+                return Err(error);
+            }
+        };
 
-        let reviewer_lease = ReviewExecutionLease::start(
+        let reviewer_lease = match ReviewExecutionLease::start(
             Arc::clone(&self.db),
             reviewer_execution.clone(),
             reviewer_owner.clone(),
-        )?;
+        ) {
+            Ok(lease) => lease,
+            Err(error) => {
+                cancel_review_if_unchanged(&self.db, &review, &error.to_string()).await;
+                return Err(error);
+            }
+        };
         let reviewer_steps = if ci_steps.is_empty() {
             reviewer_lease
                 .run(async {
@@ -213,7 +288,7 @@ impl ReviewRunner {
         };
         let (mut status, mut outcome, step_results, mut failed_step_index) = match reviewer_steps {
             Ok(result) => {
-                let terminalized = terminalize_review_execution(
+                let terminalized = match terminalize_review_execution(
                     &self.db,
                     &reviewer_execution,
                     &reviewer_owner,
@@ -222,11 +297,20 @@ impl ReviewRunner {
                     None,
                     ReviewTerminalPolicy::default(),
                 )
-                .await?;
+                .await
+                {
+                    Ok(terminalized) => terminalized,
+                    Err(error) => {
+                        cancel_review_if_unchanged(&self.db, &review, &error.to_string()).await;
+                        return Err(error);
+                    }
+                };
                 if !terminalized {
-                    return Err(ReviewError::ExecutionLeaseLost {
+                    let error = ReviewError::ExecutionLeaseLost {
                         execution_id: reviewer_execution.id.clone(),
-                    });
+                    };
+                    cancel_review_if_unchanged(&self.db, &review, &error.to_string()).await;
+                    return Err(error);
                 }
                 result
             }
@@ -240,11 +324,46 @@ impl ReviewRunner {
                     Some(error.to_string()),
                     review_terminal_policy(&error),
                 )
-                .await?;
+                .await
+                .unwrap_or_else(|terminalize_error| {
+                    tracing::warn!(
+                        review_id = %review.id,
+                        %terminalize_error,
+                        "failed to terminalize reviewer execution after execution failure"
+                    );
+                    false
+                });
+                let cleanup_now = now_rfc3339();
+                let cleanup = update_review_with_authority(
+                    &self.db,
+                    &task,
+                    &project,
+                    &review,
+                    ReviewStatus::Failed,
+                    json!({"error": error.to_string()}).to_string(),
+                    Some(cleanup_now.clone()),
+                    &cleanup_now,
+                    if task.review_passed_at.is_some() {
+                        Some(None)
+                    } else {
+                        None
+                    },
+                )
+                .await;
+                if let Err(cleanup_error) = cleanup {
+                    tracing::warn!(
+                        review_id = %review.id,
+                        %cleanup_error,
+                        "failed to settle Review after reviewer execution failure"
+                    );
+                    cancel_review_if_unchanged(&self.db, &review, &cleanup_error.to_string()).await;
+                }
                 if !terminalized {
-                    return Err(ReviewError::ExecutionLeaseLost {
+                    let error = ReviewError::ExecutionLeaseLost {
                         execution_id: reviewer_execution.id.clone(),
-                    });
+                    };
+                    cancel_review_if_unchanged(&self.db, &review, &error.to_string()).await;
+                    return Err(error);
                 }
                 return Err(error);
             }
@@ -257,20 +376,35 @@ impl ReviewRunner {
         } else if status == ReviewStatus::Passed {
             if req.auditor_agent_id.is_some() {
                 let now = now_rfc3339();
-                ReviewRepo::update_status(
-                    &*self.db,
-                    &review.id,
+                review = match update_review_with_authority(
+                    &self.db,
+                    &task,
+                    &project,
+                    &review,
                     ReviewStatus::Running,
                     json!({"ci_steps": step_results_value(&step_results)}).to_string(),
                     None,
                     &now,
+                    None,
                 )
-                .await?;
+                .await
+                {
+                    Ok(review) => review,
+                    Err(error) => {
+                        cancel_review_if_unchanged(&self.db, &review, &error.to_string()).await;
+                        return Err(error);
+                    }
+                };
             }
             let audit = self
                 .run_auditor(
                     &req,
                     &executor_execution,
+                    &task,
+                    &project,
+                    &review,
+                    reviewer_assignment.as_ref(),
+                    auditor_agent.as_ref(),
                     workspace_id,
                     review_prompt.as_deref(),
                 )
@@ -280,8 +414,20 @@ impl ReviewRunner {
                 Err(error) => {
                     let conformance = if let ReviewError::Conformance { execution_id, .. } = &error
                     {
-                        db::ReviewConformanceRepo::review_conformance(&*self.db, execution_id)
-                            .await?
+                        match db::ReviewConformanceRepo::review_conformance(&*self.db, execution_id)
+                            .await
+                        {
+                            Ok(conformance) => conformance,
+                            Err(conformance_error) => {
+                                cancel_review_if_unchanged(
+                                    &self.db,
+                                    &review,
+                                    &conformance_error.to_string(),
+                                )
+                                .await;
+                                return Err(ReviewError::Db(conformance_error));
+                            }
+                        }
                     } else {
                         None
                     }
@@ -292,15 +438,26 @@ impl ReviewRunner {
                     });
                     let details = json!({"ci_steps": step_results_value(&step_results), "conformance": conformance});
                     let now = now_rfc3339();
-                    ReviewRepo::update_status(
-                        &*self.db,
-                        &review.id,
+                    if let Err(update_error) = update_review_with_authority(
+                        &self.db,
+                        &task,
+                        &project,
+                        &review,
                         ReviewStatus::Failed,
                         details.to_string(),
                         Some(now.clone()),
                         &now,
+                        if task.review_passed_at.is_some() {
+                            Some(None)
+                        } else {
+                            None
+                        },
                     )
-                    .await?;
+                    .await
+                    {
+                        cancel_review_if_unchanged(&self.db, &review, &update_error.to_string())
+                            .await;
+                    }
                     return Err(error);
                 }
             };
@@ -318,106 +475,154 @@ impl ReviewRunner {
         }
 
         let finished_at = now_rfc3339();
-        let step_results_json = review_details_json(&step_results, auditor_details.as_ref())?;
+        let step_results_json = match review_details_json(&step_results, auditor_details.as_ref()) {
+            Ok(details) => details,
+            Err(error) => {
+                cancel_review_if_unchanged(&self.db, &review, &error.to_string()).await;
+                return Err(error.into());
+            }
+        };
         let review_finished_at =
             (status != ReviewStatus::AwaitingHuman).then_some(finished_at.clone());
-        let review = ReviewRepo::update_status(
-            &*self.db,
-            &review.id,
+        let task_projection = match &status {
+            ReviewStatus::Passed if !ci_only_review => Some(Some(finished_at.clone())),
+            ReviewStatus::Failed if task.review_passed_at.is_some() => Some(None),
+            _ => None,
+        };
+        let review = match update_review_with_authority(
+            &self.db,
+            &task,
+            &project,
+            &review,
             status,
             step_results_json,
             review_finished_at,
             &finished_at,
+            task_projection,
         )
-        .await?;
-
-        match (&outcome, ci_only_review) {
-            (ReviewOutcome::Passed, false) => {
-                TaskRepo::set_review_passed_at(
-                    &*self.db,
-                    &task_id,
-                    Some(finished_at.clone()),
-                    &finished_at,
-                )
-                .await?;
+        .await
+        {
+            Ok(review) => review,
+            Err(error) => {
+                cancel_review_if_unchanged(&self.db, &review, &error.to_string()).await;
+                return Err(error);
             }
-            (ReviewOutcome::CiFailed { .. }, true) => {
-                TaskRepo::set_review_passed_at(&*self.db, &task_id, None, &finished_at).await?;
-            }
-            _ => {}
-        }
+        };
 
         self.publish_review_event(&task_id, &review, outcome.clone(), failed_step_index);
 
         Ok((review, outcome))
     }
 
-    async fn create_reviewer_execution(
+    async fn create_reviewer_attempt(
         &self,
         task_id: &str,
-        executor_execution_id: &str,
+        candidate_execution_id: &str,
         workspace_id: String,
         req: &ReviewRequest,
-    ) -> Result<(Execution, String), ReviewError> {
+        reviewer_agent: Option<&Agent>,
+        admission: ExecutionAdmission,
+    ) -> Result<(Review, Execution), ReviewError> {
         let execution_id = new_uuid_v4().to_string();
         let lease_claim = ReviewExecutionLease::new_claim(&execution_id);
         let now = lease_claim.claim.now.clone();
-        let execution = ExecutionRepo::create_with_lease(
+        let execution = CreateExecution {
+            id: execution_id,
+            task_id: task_id.to_owned(),
+            agent_id: reviewer_agent.map(|agent| agent.id.clone()),
+            role: "reviewer".to_string(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: Some(candidate_execution_id.to_owned()),
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: Some(req.logs_path.clone()),
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace_id),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        let review_input = CreateReview {
+            id: new_uuid_v4(),
+            task_id: task_id.to_owned(),
+            // The Review is bound to the candidate, not to the synthetic
+            // reviewer execution. The child execution's parent is validated
+            // against this value by the same transaction.
+            execution_id: candidate_execution_id.to_owned(),
+            // The repository allocates the next attempt while holding the
+            // writer lock; this placeholder is intentionally ignored.
+            attempt_number: 0,
+            status: ReviewStatus::Running,
+            step_results_json: "[]".to_owned(),
+            started_at: lease_claim.claim.now.clone(),
+            created_at: lease_claim.claim.now.clone(),
+            updated_at: lease_claim.claim.now.clone(),
+        };
+        let (review, execution) = ReviewRepo::create_attempt_with_execution_and_lease(
             &*self.db,
-            CreateExecution {
-                id: execution_id,
-                task_id: task_id.to_owned(),
-                agent_id: None,
-                role: "reviewer".to_string(),
-                status: ExecutionStatus::Running,
-                stop_reason: None,
-                stopped_by: None,
-                resume_policy: None,
-                stopped_at: None,
-                parent_execution_id: Some(executor_execution_id.to_owned()),
-                agent_session_id: None,
-                agent_message_id: None,
-                last_activity_at: None,
-                summary: None,
-                logs_path: Some(req.logs_path.clone()),
-                before_sha: None,
-                after_sha: None,
-                error: None,
-                executor_config_snapshot_json: None,
-                workspace_id: Some(workspace_id),
-                created_at: now.clone(),
-                updated_at: now,
-            },
+            review_input,
+            execution,
             lease_claim.claim,
+            Some(admission),
         )
         .await
         .map_err(ReviewError::from)?;
-        Ok((execution, lease_claim.owner))
+        Ok((review, execution))
     }
 
-    async fn create_review(
+    #[cfg(test)]
+    async fn create_reviewer_execution(
         &self,
         task_id: &str,
-        execution_id: &str,
-        attempt_number: i64,
-    ) -> Result<Review, ReviewError> {
-        let now = now_rfc3339();
-        ReviewRepo::create(
-            &*self.db,
-            CreateReview {
-                id: new_uuid_v4(),
-                task_id: task_id.to_owned(),
-                execution_id: execution_id.to_owned(),
-                attempt_number,
-                status: ReviewStatus::Running,
-                step_results_json: "[]".to_owned(),
-                started_at: now.clone(),
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        )
-        .await
-        .map_err(Into::into)
+        candidate_execution_id: &str,
+        workspace_id: String,
+        req: &ReviewRequest,
+    ) -> Result<(Execution, String), ReviewError> {
+        let task = TaskRepo::get_by_id(&*self.db, task_id, false)
+            .await?
+            .ok_or(db::DbError::NotFound)?;
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or(db::DbError::NotFound)?;
+        let assignment =
+            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, task_id, "reviewer").await?;
+        let agent = self.load_assigned_agent(assignment.as_ref()).await?;
+        let latest_review = ReviewRepo::list_by_task(&*self.db, task_id)
+            .await?
+            .into_iter()
+            .max_by_key(|review| (review.attempt_number, review.id.clone()));
+        let admission = review_execution_admission(
+            &task,
+            &project,
+            assignment.as_ref(),
+            agent.as_ref(),
+            latest_review.as_ref(),
+            candidate_execution_id,
+        );
+        let (_, execution) = self
+            .create_reviewer_attempt(
+                task_id,
+                candidate_execution_id,
+                workspace_id,
+                req,
+                agent.as_ref(),
+                admission,
+            )
+            .await?;
+        let owner = execution.lease_owner.clone().ok_or_else(|| {
+            ReviewError::ExecutionLeaseUnavailable {
+                execution_id: execution.id.clone(),
+            }
+        })?;
+        Ok((execution, owner))
     }
 
     async fn run_steps(
@@ -489,21 +694,24 @@ impl ReviewRunner {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_auditor(
         &self,
         req: &ReviewRequest,
         executor_execution: &Execution,
+        task: &Task,
+        project: &Project,
+        review: &Review,
+        reviewer_assignment: Option<&TaskRoleAssignment>,
+        auditor_agent: Option<&Agent>,
         workspace_id: String,
         review_prompt: Option<&str>,
     ) -> Result<Option<AuditorRunResult>, ReviewError> {
-        let Some(auditor_agent_id) = req.auditor_agent_id.as_deref() else {
+        if req.auditor_agent_id.is_none() {
             return Ok(None);
-        };
+        }
 
         let task_id = req.task_id.to_string();
-        let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-            .await?
-            .ok_or(db::DbError::NotFound)?;
         let workspace = WorkspaceRepo::get_by_id(&*self.db, &workspace_id)
             .await?
             .ok_or(db::DbError::NotFound)?;
@@ -511,7 +719,7 @@ impl ReviewRunner {
             .await?
             .filter(|repo| repo.project_id == task.project_id)
             .ok_or(db::DbError::NotFound)?;
-        let Some(auditor_agent) = self.load_auditor_agent(auditor_agent_id).await? else {
+        let Some(auditor_agent) = auditor_agent else {
             return Ok(Some(AuditorRunResult::failed("auditor_agent_unavailable")));
         };
 
@@ -529,12 +737,20 @@ impl ReviewRunner {
         let extra_config = auditor_resume_thread_extra_config(
             executor_execution,
             executor_type.as_deref(),
-            &auditor_agent,
+            auditor_agent,
         );
-        let snapshot = build_auditor_config_snapshot(&auditor_agent, extra_config).await?;
+        let snapshot = build_auditor_config_snapshot(auditor_agent, extra_config).await?;
         let lease_claim = ReviewExecutionLease::new_claim(&auditor_execution_id.to_string());
         let now = lease_claim.claim.now.clone();
-        let auditor_execution = ExecutionRepo::create_with_lease(
+        let admission = review_execution_admission(
+            task,
+            project,
+            reviewer_assignment,
+            Some(auditor_agent),
+            Some(review),
+            &review.execution_id,
+        );
+        let auditor_execution = ExecutionRepo::create_with_lease_and_admission(
             &*self.db,
             CreateExecution {
                 id: auditor_execution_id.to_string(),
@@ -546,7 +762,10 @@ impl ReviewRunner {
                 stopped_by: None,
                 resume_policy: None,
                 stopped_at: None,
-                parent_execution_id: Some(executor_execution.id.clone()),
+                // Keep the auditor bound to the same candidate as the
+                // reviewer/Review row. The admission transaction checks this
+                // lineage together with the Task/Project/assignment snapshot.
+                parent_execution_id: Some(review.execution_id.clone()),
                 agent_session_id: None,
                 agent_message_id: None,
                 last_activity_at: None,
@@ -561,6 +780,7 @@ impl ReviewRunner {
                 updated_at: now,
             },
             lease_claim.claim,
+            Some(admission),
         )
         .await?;
 
@@ -608,7 +828,7 @@ impl ReviewRunner {
                 description: prompt,
                 agent_config: serde_json::from_str(&snapshot)?,
                 logs_path: auditor_logs_path.clone(),
-                heartbeat_interval_seconds: heartbeat_interval(&auditor_agent),
+                heartbeat_interval_seconds: heartbeat_interval(auditor_agent),
                 max_turns: None,
                 log_sender: None,
             }))
@@ -762,6 +982,31 @@ impl ReviewRunner {
         Ok(Some(agent))
     }
 
+    async fn load_assigned_agent(
+        &self,
+        assignment: Option<&TaskRoleAssignment>,
+    ) -> Result<Option<Agent>, ReviewError> {
+        let Some(assignment) = assignment else {
+            return Ok(None);
+        };
+        if assignment.assignee_type != Some(AssigneeKind::Agent) {
+            return Ok(None);
+        }
+        let agent_id = assignment.assignee_id.as_deref().ok_or_else(|| {
+            ReviewError::Db(db::DbError::Check(
+                "reviewer assignment has no agent identity".to_owned(),
+            ))
+        })?;
+        self.load_auditor_agent(agent_id)
+            .await?
+            .ok_or_else(|| {
+                ReviewError::Db(db::DbError::Check(
+                    "assigned reviewer agent is unavailable".to_owned(),
+                ))
+            })
+            .map(Some)
+    }
+
     fn publish_review_event(
         &self,
         task_id: &str,
@@ -809,6 +1054,167 @@ impl ReviewRunner {
             timestamp: event_timestamp(),
             context,
         });
+    }
+}
+
+fn review_execution_admission(
+    task: &Task,
+    project: &Project,
+    assignment: Option<&TaskRoleAssignment>,
+    agent: Option<&Agent>,
+    latest_review: Option<&Review>,
+    candidate_execution_id: &str,
+) -> ExecutionAdmission {
+    let inherited_workflow = task.parent_task_id.is_some()
+        && matches!(
+            task.status.as_str(),
+            "todo" | "in_progress" | "done" | "cancelled"
+        );
+    let expected_effective_role = effective_review_role(task, project);
+    ExecutionAdmission {
+        expected_project_version: Some(project.version),
+        expected_task_version: task.version,
+        expected_task_status: task.status.clone(),
+        expected_effective_role,
+        expected_agent_version: agent.map(|agent| agent.version),
+        expected_agent_max_concurrent_tasks: agent.map(|agent| agent.max_concurrent_tasks),
+        // This is always the candidate that the new reviewer/auditor child
+        // will parent to. A rerun may use a fresh candidate while the latest
+        // Review snapshot still names an older one; that prior candidate is
+        // carried separately below.
+        expected_reviewer_parent_execution_id: Some(candidate_execution_id.to_owned()),
+        expected_latest_review_candidate_execution_id: latest_review
+            .map(|review| review.execution_id.clone()),
+        expected_reviewer_id: latest_review.map(|review| review.id.clone()),
+        expected_reviewer_attempt_number: latest_review.map(|review| review.attempt_number),
+        expected_reviewer_status: latest_review.map(|review| review.status.to_string()),
+        expected_reviewer_updated_at: latest_review.map(|review| review.updated_at.clone()),
+        expected_reviewer_execution_id: latest_review
+            .and_then(|review| review.reviewer_execution_id.clone()),
+        expected_auditor_execution_id: latest_review
+            .and_then(|review| review.auditor_execution_id.clone()),
+        expected_assignment_id: assignment.map(|assignment| assignment.id.clone()),
+        expected_assignment_updated_at: assignment.map(|assignment| assignment.updated_at.clone()),
+        expected_workflow_definition: (!inherited_workflow)
+            .then(|| project.workflow_definition.clone()),
+    }
+}
+
+/// Resolve the effective role for a Task's current workflow state without
+/// depending on the services crate (which would create a dependency cycle).
+/// The database admission layer repeats this calculation under its writer
+/// lock; this snapshot only selects the expected value for that CAS.
+fn effective_review_role(task: &Task, project: &Project) -> Option<String> {
+    if task.parent_task_id.is_some()
+        && matches!(
+            task.status.as_str(),
+            "todo" | "in_progress" | "done" | "cancelled"
+        )
+    {
+        return match task.status.as_str() {
+            "in_progress" => Some("coder".to_owned()),
+            _ => None,
+        };
+    }
+
+    let raw = project.workflow_definition.trim();
+    if raw.is_empty() || raw == "{}" {
+        return match task.status.as_str() {
+            "planning" => Some("planner".to_owned()),
+            "in_progress" | "merge_failed" => Some("coder".to_owned()),
+            "review" => Some("reviewer".to_owned()),
+            _ => None,
+        };
+    }
+    let Ok(workflow) = serde_json::from_str::<api_types::WorkflowDefinition>(raw) else {
+        // The database admission will fail closed for malformed workflow
+        // definitions.  Returning no role here avoids manufacturing an Agent
+        // assignment during the preflight phase.
+        return None;
+    };
+    workflow
+        .states
+        .iter()
+        .find(|state| state.name == task.status)
+        .and_then(|state| {
+            state.role.clone().or_else(|| {
+                (state.kind == api_types::StateKind::Active).then_some("assignee".to_owned())
+            })
+        })
+}
+
+fn review_workflow_definition<'a>(task: &Task, project: &'a Project) -> Option<&'a str> {
+    let inherited_workflow = task.parent_task_id.is_some()
+        && matches!(
+            task.status.as_str(),
+            "todo" | "in_progress" | "done" | "cancelled"
+        );
+    (!inherited_workflow).then_some(project.workflow_definition.as_str())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn update_review_with_authority(
+    db: &SqliteDb,
+    task: &Task,
+    project: &Project,
+    review: &Review,
+    status: ReviewStatus,
+    details: String,
+    finished_at: Option<String>,
+    updated_at: &str,
+    task_projection: Option<Option<String>>,
+) -> Result<Review, ReviewError> {
+    let review = ReviewRepo::update_status_with_review_authority_and_task_projection(
+        db,
+        &review.id,
+        status,
+        details,
+        finished_at,
+        updated_at,
+        task.version,
+        &task.status,
+        Some(project.version),
+        review_workflow_definition(task, project),
+        review.status.clone(),
+        &review.updated_at,
+        &review.execution_id,
+        task_projection,
+    )
+    .await?;
+    Ok(review)
+}
+
+/// Once the reviewer execution/lease has been reserved, every later failure
+/// must revoke the still-running Review unless another writer has already
+/// changed that exact Review row.  This is deliberately a Review-only CAS:
+/// authority invalidation must not guess at or overwrite the Task projection.
+async fn cancel_review_if_unchanged(db: &SqliteDb, review: &Review, reason: &str) {
+    let now = now_rfc3339();
+    match ReviewRepo::cancel_if_unchanged(
+        db,
+        &review.id,
+        review.status.clone(),
+        &review.updated_at,
+        json!({"error": reason}).to_string(),
+        &now,
+        &now,
+    )
+    .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            tracing::debug!(
+                review_id = %review.id,
+                "Review compensation skipped because its snapshot is stale"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                review_id = %review.id,
+                %error,
+                "failed to cancel Review after post-reservation failure"
+            );
+        }
     }
 }
 
@@ -1454,21 +1860,44 @@ fn read_review_state_config(task_state_config: Option<&str>) -> Result<Value, Re
     }
 
     let value: Value = serde_json::from_str(raw_config)?;
-    Ok(value.get("review").cloned().unwrap_or(value))
+    let value = value.get("review").cloned().unwrap_or(value);
+    if !value.is_object() {
+        return Err(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "review configuration must be an object",
+        ))
+        .into());
+    }
+    Ok(value)
 }
 
-fn read_ci_steps(state_config: &Value) -> Vec<String> {
-    state_config
-        .get("ci_steps")
-        .and_then(Value::as_array)
-        .map(|steps| {
-            steps
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect()
+fn read_ci_steps(state_config: &Value) -> Result<Vec<String>, ReviewError> {
+    let Some(value) = state_config.get("ci_steps") else {
+        return Ok(Vec::new());
+    };
+    let Some(steps) = value.as_array() else {
+        return Err(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "review ci_steps must be an array",
+        ))
+        .into());
+    };
+    steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| {
+            let command = step
+                .as_str()
+                .filter(|command| !command.trim().is_empty())
+                .ok_or_else(|| {
+                    serde_json::Error::io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("review ci_steps[{index}] must be a nonblank string"),
+                    ))
+                })?;
+            Ok(command.to_owned())
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 fn read_review_prompt(state_config: &Value) -> Option<String> {

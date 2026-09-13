@@ -52,39 +52,34 @@ impl TaskService {
         } else {
             self.ensure_task_runnable(&task).await?;
         }
-        let capacity_statuses = workflow_capacity_statuses(&workflow);
-        let (assignee_type, agent, assignee_id, max_concurrent_tasks, event_assignee_id) =
-            match assignee {
-                Assignee::Agent(agent_id) => {
-                    validate_required("agent_id", &agent_id)?;
-                    let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
-                        .await?
-                        .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
-                    if agent.paused {
-                        return Err(ServiceError::AgentPaused {
-                            agent_id: agent.id.clone(),
-                        });
-                    }
-                    let max_concurrent_tasks = agent.max_concurrent_tasks;
-                    (
-                        "agent".to_owned(),
-                        Some(agent),
-                        Some(agent_id.clone()),
-                        max_concurrent_tasks,
-                        agent_id,
-                    )
+        let (assignee_type, agent, assignee_id, event_assignee_id) = match assignee {
+            Assignee::Agent(agent_id) => {
+                validate_required("agent_id", &agent_id)?;
+                let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
+                if agent.paused {
+                    return Err(ServiceError::AgentPaused {
+                        agent_id: agent.id.clone(),
+                    });
                 }
-                Assignee::User(user_handle) => {
-                    validate_required("user_handle", &user_handle)?;
-                    (
-                        "user".to_owned(),
-                        None,
-                        Some(user_handle.clone()),
-                        i64::MAX,
-                        user_handle,
-                    )
-                }
-            };
+                (
+                    "agent".to_owned(),
+                    Some(agent),
+                    Some(agent_id.clone()),
+                    agent_id,
+                )
+            }
+            Assignee::User(user_handle) => {
+                validate_required("user_handle", &user_handle)?;
+                (
+                    "user".to_owned(),
+                    None,
+                    Some(user_handle.clone()),
+                    user_handle,
+                )
+            }
+        };
         if let Some(claiming_agent) = agent.as_ref() {
             self.ensure_repository_worker_identity(&task.project_id, &claiming_agent.id)
                 .await?;
@@ -104,6 +99,78 @@ impl TaskService {
                     .await?;
             }
         }
+        let claim_execution_role = target_role
+            .clone()
+            .unwrap_or_else(|| crate::workflow::default_roles::CODER.to_owned());
+        let claim_assignment = if agent.is_some()
+            && claim_execution_role != crate::workflow::default_roles::INTERACTIVE
+        {
+            let assignment_role = if claim_execution_role == "executor" {
+                crate::workflow::default_roles::CODER
+            } else {
+                claim_execution_role.as_str()
+            };
+            TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, assignment_role)
+                .await?
+        } else {
+            None
+        };
+        let inherited_target_workflow = task.parent_task_id.is_some()
+            && WorkflowEngine::resolve_subtask_workflow()
+                .states
+                .iter()
+                .any(|state| state.name == target_status);
+        let reviewer_snapshot = if claim_execution_role == crate::workflow::default_roles::REVIEWER
+        {
+            ReviewRepo::list_by_task(&*self.db, &task.id)
+                .await?
+                .into_iter()
+                .max_by_key(|review| (review.attempt_number, review.id.clone()))
+        } else {
+            None
+        };
+        let mut execution_admission = agent.as_ref().map(|claiming_agent| {
+            let mut admission = db::ExecutionAdmission {
+                expected_project_version: Some(project.version),
+                expected_task_version: task.version,
+                expected_task_status: task.status.clone(),
+                expected_effective_role: (claim_execution_role
+                    != crate::workflow::default_roles::INTERACTIVE)
+                    .then(|| claim_execution_role.clone()),
+                expected_agent_version: Some(claiming_agent.version),
+                expected_agent_max_concurrent_tasks: Some(claiming_agent.max_concurrent_tasks),
+                expected_reviewer_parent_execution_id: None,
+                expected_latest_review_candidate_execution_id: None,
+                expected_reviewer_id: None,
+                expected_reviewer_attempt_number: None,
+                expected_reviewer_status: None,
+                expected_reviewer_updated_at: None,
+                expected_reviewer_execution_id: None,
+                expected_auditor_execution_id: None,
+                expected_assignment_id: claim_assignment
+                    .as_ref()
+                    .map(|assignment| assignment.id.clone()),
+                expected_assignment_updated_at: claim_assignment
+                    .as_ref()
+                    .map(|assignment| assignment.updated_at.clone()),
+                expected_workflow_definition: (claim_execution_role
+                    != crate::workflow::default_roles::INTERACTIVE
+                    && !inherited_target_workflow)
+                    .then(|| project.workflow_definition.clone()),
+            };
+            if let Some(review) = reviewer_snapshot.as_ref() {
+                admission.expected_reviewer_parent_execution_id = Some(review.execution_id.clone());
+                admission.expected_latest_review_candidate_execution_id =
+                    Some(review.execution_id.clone());
+                admission.expected_reviewer_id = Some(review.id.clone());
+                admission.expected_reviewer_attempt_number = Some(review.attempt_number);
+                admission.expected_reviewer_status = Some(review.status.to_string());
+                admission.expected_reviewer_updated_at = Some(review.updated_at.clone());
+                admission.expected_reviewer_execution_id = review.reviewer_execution_id.clone();
+                admission.expected_auditor_execution_id = review.auditor_execution_id.clone();
+            }
+            admission
+        });
         let previous_status = task.status.clone();
         let (workspace, workspace_created_by_attempt) = prepare_workspace_owned(
             &self.db,
@@ -146,7 +213,9 @@ impl TaskService {
             stopped_by: None,
             resume_policy: None,
             stopped_at: None,
-            parent_execution_id: None,
+            parent_execution_id: reviewer_snapshot
+                .as_ref()
+                .map(|review| review.execution_id.clone()),
             agent_session_id: None,
             agent_message_id: None,
             last_activity_at: None,
@@ -183,10 +252,11 @@ impl TaskService {
                 expected_version: task.version,
                 source_status: task.status.clone(),
                 target_status: target_status.clone(),
-                capacity_statuses,
                 execution,
+                execution_admission: execution_admission.take(),
+                expected_project_version: Some(project.version),
+                expected_workflow_definition: Some(project.workflow_definition.clone()),
                 execution_lease,
-                max_concurrent_tasks,
                 claimed_at: now,
             },
         )
@@ -399,6 +469,8 @@ impl TaskService {
             event_bus: Arc::clone(&self.event_bus),
             gate_config,
             workflow: Arc::new(workflow),
+            project_version: Some(project.version),
+            project_workflow_definition: Some(project.workflow_definition.clone()),
             triggered_by: Actor::Agent {
                 agent_id: task.assignee_id.clone().unwrap_or_default(),
                 execution_id: Some(execution_id.to_owned()),
@@ -488,13 +560,4 @@ fn resolve_claim_target(workflow: &WorkflowDefinition, current_status: &str) -> 
             "task in state '{current_status}' has no claimable active transition"
         ))
     })
-}
-
-fn workflow_capacity_statuses(workflow: &WorkflowDefinition) -> Vec<String> {
-    workflow
-        .states
-        .iter()
-        .filter(|state| matches!(state.kind, StateKind::Active | StateKind::Gate))
-        .map(|state| state.name.clone())
-        .collect()
 }

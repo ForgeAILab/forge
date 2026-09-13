@@ -269,6 +269,10 @@ mod subtask_hook_test_support {
             .expect("subtask creates");
             subtask_ids.push(subtask_id);
         }
+        let project = ProjectRepo::get_by_id(&*db, &project_id)
+            .await
+            .expect("project reloads")
+            .expect("project exists");
 
         (
             HookContext {
@@ -280,6 +284,8 @@ mod subtask_hook_test_support {
                 event_bus: Arc::new(EventBus::new(16)),
                 gate_config: None,
                 workflow: Arc::new(default_workflow::default_workflow()),
+                project_version: Some(project.version),
+                project_workflow_definition: Some(project.workflow_definition),
                 triggered_by: api_types::Actor::system(api_types::SystemComponent::Test),
                 review_runner: None,
                 merge_service: None,
@@ -392,6 +398,29 @@ mod cancel_pending_subtasks {
         assert!(matches!(result, HookResult::Ok));
         assert_status(&ctx, &subtask_ids[0], CANCELLED).await;
         assert_status(&ctx, &subtask_ids[1], CANCELLED).await;
+        assert_status(&ctx, &subtask_ids[2], DONE).await;
+    }
+
+    #[tokio::test]
+    async fn rejects_nested_cancellation_after_project_workflow_race() {
+        let (ctx, subtask_ids) =
+            build_ctx(IN_PROGRESS, CANCELLED, &[TODO, IN_PROGRESS, DONE]).await;
+        db::ProjectRepo::update_workflow(
+            &*ctx.db,
+            &ctx.project_id,
+            "{\"workflow\":\"w2\"}",
+            None,
+            ctx.project_version.expect("hook authority version"),
+            &db::now_rfc3339(),
+        )
+        .await
+        .expect("workflow update wins the race");
+
+        let result = CancelPendingSubtasks.execute(&ctx).await;
+
+        assert!(matches!(result, HookResult::Failed { .. }));
+        assert_status(&ctx, &subtask_ids[0], TODO).await;
+        assert_status(&ctx, &subtask_ids[1], IN_PROGRESS).await;
         assert_status(&ctx, &subtask_ids[2], DONE).await;
     }
 }

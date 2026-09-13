@@ -249,7 +249,7 @@ async fn done_prerequisite_wakes_dependent_with_stale_dispatch_disposition() {
     )
     .await
     .expect("dispatch disposition records");
-    // `record_dispatch_disposition` persists through `set_metadata_json`; it
+    // `record_dispatch_disposition` persists through key-level metadata; it
     // does not mutate the snapshot passed to it, so re-read before asserting.
     let dependent_parked = TaskRepo::get_by_id(&*db, &dependent.id, false)
         .await
@@ -280,16 +280,16 @@ async fn done_prerequisite_wakes_dependent_with_stale_dispatch_disposition() {
         .expect("prerequisite completes");
     assert_eq!(done.task.status, "done");
 
-    // The dependent's own version never changed, so before the fix its
-    // stale disposition would make `dispatch_disposition_is_current` return
-    // true forever and the dispatcher would skip it on every scan (F6).
+    // Completing the prerequisite wakes the dependent and advances its own
+    // version, fencing any in-flight stale disposition writer (F6).
     let dependent_after = TaskRepo::get_by_id(&*db, &dependent.id, false)
         .await
         .expect("dependent reloads")
         .expect("dependent exists");
     assert_eq!(
-        dependent_after.version, dependent_before.version,
-        "the dependent's own version is not expected to change"
+        dependent_after.version,
+        dependent_before.version + 1,
+        "the dependency wake advances the dependent's dispatch generation"
     );
     assert!(
         crate::deferred_dispatch::dispatch_disposition_for_test(&dependent_after).is_none(),

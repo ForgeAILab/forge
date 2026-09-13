@@ -19,8 +19,9 @@ use crate::{
 };
 
 use super::common::{
-    ensure_review_awaiting_human, ensure_review_record_for_dispatch, execution_guard_roles,
-    follow_up_trigger, get_role_assignment, has_running_execution_for_roles, latest_review,
+    ensure_review_attempt_for_current_candidate, ensure_review_awaiting_human,
+    ensure_review_record_for_dispatch, execution_guard_roles, follow_up_trigger,
+    get_role_assignment, has_running_execution_for_roles, latest_executor_execution, latest_review,
     review_is_ci_only, task,
 };
 
@@ -40,13 +41,66 @@ impl HookAction for DispatchRoleAgent {
             };
         };
 
+        let project = match db::ProjectRepo::get_by_id(&*ctx.db, &ctx.project_id).await {
+            Ok(Some(project)) if project.paused_at.is_some() => {
+                return HookResult::Skipped {
+                    reason: "project paused".to_string(),
+                };
+            }
+            Ok(Some(project)) => project,
+            Ok(None) => {
+                return HookResult::Failed {
+                    reason: format!("project not found: {}", ctx.project_id),
+                };
+            }
+            Err(error) => {
+                return HookResult::Failed {
+                    reason: error.to_string(),
+                };
+            }
+        };
+
+        match crate::workflow::review_refresh_transition_pending(
+            &ctx.db,
+            &ctx.task_id,
+            &ctx.to_state,
+        )
+        .await
+        {
+            Ok(true) => {
+                let Some(target) =
+                    crate::workflow::review_refresh_target(&ctx.workflow, &ctx.to_state)
+                else {
+                    return HookResult::Failed {
+                        reason: format!(
+                            "review refresh from {} has no reviewer target",
+                            ctx.to_state
+                        ),
+                    };
+                };
+                return HookResult::Cascade {
+                    to: target,
+                    reason: format!(
+                        "{} mechanical merge contention resolved; fresh review required",
+                        crate::workflow::REVIEW_REFRESH_MARKER
+                    ),
+                };
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return HookResult::Failed {
+                    reason: error.to_string(),
+                };
+            }
+        }
+
         let Some(role_name) = effective_role(state) else {
             return HookResult::Skipped {
                 reason: "state has no role".to_string(),
             };
         };
 
-        let current_task = match task(ctx).await {
+        let mut current_task = match task(ctx).await {
             Ok(task) => task,
             Err(reason) => return HookResult::Failed { reason },
         };
@@ -87,12 +141,51 @@ impl HookAction for DispatchRoleAgent {
             Err(reason) => return HookResult::Failed { reason },
         };
 
+        if role_name == crate::workflow::default_roles::REVIEWER
+            && assignment.as_ref().is_some_and(|assignment| {
+                assignment.assignee_type == Some(db::AssigneeKind::Agent)
+                    && assignment.assignee_id.is_some()
+            })
+        {
+            // A CI hook that just failed is still in the same transition and
+            // must not immediately mint a replacement reviewer attempt. On
+            // the next review cycle the implementation candidate differs (or
+            // the caller has a new execution context), so the helper below
+            // creates a fresh Running Review while leaving this terminal row
+            // immutable.
+            if let Some(review) = match latest_review(ctx).await {
+                Ok(review) => review,
+                Err(reason) => return HookResult::Failed { reason },
+            } {
+                if review.status == ReviewStatus::Failed
+                    && ctx.execution_id.as_deref() == Some(review.execution_id.as_str())
+                {
+                    return HookResult::Skipped {
+                        reason: "review already failed".to_string(),
+                    };
+                }
+            }
+            if let Err(reason) =
+                ensure_review_attempt_for_current_candidate(ctx, &current_task).await
+            {
+                return HookResult::Failed { reason };
+            }
+            // The review-attempt helper may have created a fresh candidate.
+            // Reload the Task and the exact Review row before constructing the
+            // execution admission; a reviewer must never launch against a
+            // stale implementation/review pair selected before the hook ran.
+            current_task = match task(ctx).await {
+                Ok(task) => task,
+                Err(reason) => return HookResult::Failed { reason },
+            };
+        }
+
         match assignment {
             Some(assignment)
                 if assignment.assignee_type == Some(db::AssigneeKind::Agent)
                     && assignment.assignee_id.is_some() =>
             {
-                if role_name == crate::workflow::default_roles::REVIEWER {
+                let reviewer_snapshot = if role_name == crate::workflow::default_roles::REVIEWER {
                     match latest_review(ctx).await {
                         Ok(Some(review))
                             if review.status == ReviewStatus::Failed
@@ -111,10 +204,12 @@ impl HookAction for DispatchRoleAgent {
                                 reason: "review already passed CI-only".to_string(),
                             };
                         }
-                        Ok(_) => {}
+                        Ok(review) => review,
                         Err(reason) => return HookResult::Failed { reason },
                     }
-                }
+                } else {
+                    None
+                };
                 let agent_id = assignment.assignee_id.expect("checked by match guard");
                 let state_dispatch =
                     dispatch_intent_from_workflow_dispatch(state.dispatch.as_ref());
@@ -221,6 +316,68 @@ impl HookAction for DispatchRoleAgent {
                         };
                     }
                 }
+
+                let reviewer_admission = if role_name == crate::workflow::default_roles::REVIEWER {
+                    let Some(review) = reviewer_snapshot.as_ref() else {
+                        return HookResult::Failed {
+                            reason: "reviewer dispatch requires a current review candidate"
+                                .to_owned(),
+                        };
+                    };
+                    let Some(candidate) = latest_executor_execution(ctx).await else {
+                        return HookResult::Failed {
+                            reason: "reviewer dispatch requires an executor candidate".to_owned(),
+                        };
+                    };
+                    if review.execution_id != candidate.id {
+                        return HookResult::Failed {
+                            reason: "reviewer dispatch review candidate changed".to_owned(),
+                        };
+                    }
+                    let expected_project_version = ctx.project_version.unwrap_or(project.version);
+                    let workflow_definition = ctx
+                        .project_workflow_definition
+                        .as_deref()
+                        .unwrap_or(project.workflow_definition.as_str());
+                    if expected_project_version != project.version
+                        || workflow_definition != project.workflow_definition
+                    {
+                        return HookResult::Failed {
+                            reason: "project workflow authority changed before reviewer dispatch"
+                                .to_owned(),
+                        };
+                    }
+                    let mut admission = match crate::task_service::execution_admission_for_task(
+                        &ctx.db,
+                        &current_task,
+                        workflow_definition,
+                        role_name,
+                        Some(&agent),
+                        expected_project_version,
+                    )
+                    .await
+                    {
+                        Ok(admission) => admission,
+                        Err(error) => {
+                            return HookResult::Failed {
+                                reason: error.to_string(),
+                            }
+                        }
+                    };
+                    admission.expected_reviewer_parent_execution_id =
+                        Some(review.execution_id.clone());
+                    admission.expected_latest_review_candidate_execution_id =
+                        Some(review.execution_id.clone());
+                    admission.expected_reviewer_id = Some(review.id.clone());
+                    admission.expected_reviewer_attempt_number = Some(review.attempt_number);
+                    admission.expected_reviewer_status = Some(review.status.to_string());
+                    admission.expected_reviewer_updated_at = Some(review.updated_at.clone());
+                    admission.expected_reviewer_execution_id = review.reviewer_execution_id.clone();
+                    admission.expected_auditor_execution_id = review.auditor_execution_id.clone();
+                    Some(admission)
+                } else {
+                    None
+                };
                 if let Some(parent_execution_id) = dispatch_ctx.continuation_of_execution_id.clone()
                 {
                     let Some(task_executor) = ctx.task_executor.as_ref().cloned() else {
@@ -257,16 +414,29 @@ impl HookAction for DispatchRoleAgent {
                         service = service.with_terminal_activity_tracker(terminal_activity);
                     }
                     let trigger = follow_up_trigger(ctx);
-                    return match service
-                        .dispatch_role_follow_up(
-                            &ctx.task_id,
-                            role_name,
-                            parent_execution_id,
-                            prompt.user,
-                            trigger,
-                        )
-                        .await
-                    {
+                    let follow_up_result = if let Some(admission) = reviewer_admission.clone() {
+                        service
+                            .dispatch_role_follow_up_with_admission(
+                                &ctx.task_id,
+                                role_name,
+                                parent_execution_id,
+                                prompt.execution_input(None),
+                                trigger,
+                                admission,
+                            )
+                            .await
+                    } else {
+                        service
+                            .dispatch_role_follow_up(
+                                &ctx.task_id,
+                                role_name,
+                                parent_execution_id,
+                                prompt.execution_input(None),
+                                trigger,
+                            )
+                            .await
+                    };
+                    return match follow_up_result {
                         Ok(execution) => {
                             if let Err(reason) =
                                 ensure_review_record_for_dispatch(ctx, &execution.id).await
@@ -275,30 +445,14 @@ impl HookAction for DispatchRoleAgent {
                             }
                             HookResult::Ok
                         }
+                        Err(crate::ServiceError::ProjectPaused { .. }) => HookResult::Skipped {
+                            reason: "project paused".to_string(),
+                        },
                         Err(error) => HookResult::Failed {
                             reason: error.to_string(),
                         },
                     };
                 }
-
-                match db::ProjectRepo::get_by_id(&*ctx.db, &ctx.project_id).await {
-                    Ok(Some(project)) if project.paused_at.is_some() => {
-                        return HookResult::Skipped {
-                            reason: "project paused".to_string(),
-                        };
-                    }
-                    Ok(Some(_)) => {}
-                    Ok(None) => {
-                        return HookResult::Failed {
-                            reason: format!("project not found: {}", ctx.project_id),
-                        };
-                    }
-                    Err(error) => {
-                        return HookResult::Failed {
-                            reason: error.to_string(),
-                        };
-                    }
-                };
 
                 let Some(task_executor) = ctx.task_executor.as_ref().cloned() else {
                     return HookResult::Failed {
@@ -331,16 +485,33 @@ impl HookAction for DispatchRoleAgent {
                     service = service.with_terminal_activity_tracker(terminal_activity);
                 }
 
-                match service
-                    .dispatch_initial_role_execution_with_metadata(
-                        &ctx.task_id,
-                        &agent.id,
-                        role_name,
-                        prompt.user,
-                        Some(dispatch_metadata),
-                    )
-                    .await
-                {
+                let dispatch_result = match reviewer_admission {
+                    Some(admission) => {
+                        service
+                            .dispatch_initial_role_execution_with_metadata_and_admission(
+                                &ctx.task_id,
+                                &agent.id,
+                                role_name,
+                                prompt.execution_input(None),
+                                Some(dispatch_metadata),
+                                admission,
+                            )
+                            .await
+                    }
+                    None => {
+                        service
+                            .dispatch_initial_role_execution_with_metadata(
+                                &ctx.task_id,
+                                &agent.id,
+                                role_name,
+                                prompt.execution_input(None),
+                                Some(dispatch_metadata),
+                            )
+                            .await
+                    }
+                };
+
+                match dispatch_result {
                     Ok(execution) => {
                         if let Err(reason) =
                             ensure_review_record_for_dispatch(ctx, &execution.id).await
@@ -349,6 +520,9 @@ impl HookAction for DispatchRoleAgent {
                         }
                         HookResult::Ok
                     }
+                    Err(crate::ServiceError::ProjectPaused { .. }) => HookResult::Skipped {
+                        reason: "project paused".to_string(),
+                    },
                     Err(error) => HookResult::Failed {
                         reason: error.to_string(),
                     },
@@ -424,6 +598,26 @@ pub struct NotifyRoleHolder;
 #[async_trait]
 impl HookAction for NotifyRoleHolder {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
+        match crate::workflow::review_refresh_transition_pending(
+            &ctx.db,
+            &ctx.task_id,
+            &ctx.to_state,
+        )
+        .await
+        {
+            Ok(true) => {
+                return HookResult::Skipped {
+                    reason: "mechanical merge contention requires review, not coder notification"
+                        .to_string(),
+                };
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return HookResult::Failed {
+                    reason: error.to_string(),
+                };
+            }
+        }
         let role_name = ctx
             .workflow
             .states

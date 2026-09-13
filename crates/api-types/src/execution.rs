@@ -5,9 +5,9 @@ use ts_rs::TS;
 use crate::{
     AgentStatus, CanonicalPhase, ExecutionAction, ExecutionBehavior, ExecutionBlockerProjection,
     ExecutionEvidenceSummary, ExecutionRole, ExecutionStatus, InterruptionMetadata,
-    PlanArtifactDetail, PlanProgressSummary, ResumePolicy, StopReason, TaskAnnotation,
-    TaskRoleAssignmentResponse, TaskStatus, TaskType, UsageAggregate, UsageBreakdown,
-    WorkflowExceptionSummary, WorkflowHealthSummary, WorkspaceResponse,
+    PlanArtifactDetail, PlanProgressSummary, RecoveryAction, ResumePolicy, StopReason,
+    TaskAnnotation, TaskRoleAssignmentResponse, TaskStatus, TaskType, UsageAggregate,
+    UsageBreakdown, WorkflowExceptionSummary, WorkflowHealthSummary, WorkspaceResponse,
 };
 
 /// Public owner state for a running execution.  This is deliberately
@@ -55,6 +55,7 @@ pub enum TaskAction {
 #[ts(export)]
 pub struct TaskActionsResponse {
     pub available_actions: Vec<TaskAction>,
+    pub recovery_actions: Vec<RecoveryAction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

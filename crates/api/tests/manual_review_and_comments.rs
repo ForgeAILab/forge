@@ -20,11 +20,12 @@ use axum::{
     Router,
 };
 use db::{
-    new_uuid_v4, now_rfc3339, AgentRepo, AgentStatus, CommentAuthorType, CreateAgent,
+    new_uuid_v4, now_rfc3339, AgentRepo, AgentStatus, AssigneeKind, CommentAuthorType, CreateAgent,
     CreateExecution, CreateProject, CreateRepo, CreateReview, CreateTask, CreateTaskComment,
-    CreateWorkspace, DaemonRepo, DaemonStatus, ExecutionRepo, ExecutionStatus, ProjectRepo,
-    RepoRepo, ReviewRepo, ReviewStatus, TaskCommentRepo, TaskRepo, UpdateProject, UpdateTask,
-    UpsertDaemon, WorkspaceStatus,
+    CreateTaskRoleAssignment, CreateTransitionLog, CreateWorkspace, DaemonRepo, DaemonStatus,
+    ExecutionRepo, ExecutionStatus, ProjectRepo, RepoRepo, ReviewRepo, ReviewStatus,
+    TaskCommentRepo, TaskRepo, TaskRoleAssignmentRepo, TransitionLogRepo, UpdateProject,
+    UpdateTask, UpsertDaemon, WorkspaceStatus,
 };
 use events::EventBus;
 use executors::{
@@ -133,6 +134,96 @@ async fn reject_review_without_reason_uses_default() {
 
     assert_eq!(result.review.status, api_types::ReviewStatus::Failed);
     assert_eq!(result.task.status, "in_progress".to_owned());
+}
+
+#[tokio::test]
+async fn reset_retry_window_allows_human_rejection_to_schedule_fresh_follow_up() {
+    let workspace_root = common::TestDir::new("forge-manual-review-reset-retry-window");
+    let harness = test_app(workspace_root.path()).await;
+
+    let (task_id, _review_id) = seed_awaiting_human_review(
+        &harness.state.db,
+        r#"{"retry_budgets":{"review":2,"merge_fix":1}}"#,
+        workspace_root.path(),
+    )
+    .await;
+
+    for reason in ["first rejection", "second rejection"] {
+        TransitionLogRepo::insert(
+            &*harness.state.db,
+            CreateTransitionLog {
+                id: new_uuid_v4(),
+                task_id: task_id.clone(),
+                from_state: "review".to_owned(),
+                to_state: "in_progress".to_owned(),
+                trigger_name: Some("reject".to_owned()),
+                triggered_by: "test".to_owned(),
+                trigger_reason: reason.to_owned(),
+                hook_results_json: None,
+                rejection: true,
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("historical rejection log inserts");
+    }
+
+    let exhausted = harness
+        .state
+        .task_service
+        .remaining_retries(&task_id)
+        .await
+        .expect("retry budget resolves");
+    assert_eq!(
+        exhausted, 0,
+        "the historical review rejections exhaust the window"
+    );
+
+    harness
+        .state
+        .task_service
+        .recover_task(
+            task_id.clone(),
+            api_types::RecoveryAction::ResetRetryWindow,
+            Some("start a fresh review window".to_owned()),
+            None,
+        )
+        .await
+        .expect("retry window reset succeeds");
+
+    let result: ReviewDecisionResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{task_id}/review/reject"),
+        json!({ "reason": "request one more pass" }),
+        StatusCode::OK,
+    )
+    .await;
+
+    assert_eq!(result.review.status, api_types::ReviewStatus::Failed);
+    assert_eq!(result.task.status, "in_progress");
+    assert_eq!(
+        result.task.remaining_retries.get("review"),
+        Some(&1),
+        "the API projection must share the fresh retry window with runtime admission"
+    );
+    assert_eq!(
+        harness
+            .state
+            .task_service
+            .remaining_retries(&task_id)
+            .await
+            .expect("post-rejection retry budget resolves"),
+        1,
+        "the rejection after an explicit reset consumes only the fresh window"
+    );
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(&*harness.state.db, &task_id, "coder")
+            .await
+            .expect("coder execution count loads"),
+        2,
+        "human rejection after reset must dispatch a fresh coder follow-up"
+    );
 }
 
 #[tokio::test]
@@ -752,6 +843,21 @@ async fn seed_awaiting_human_review(
     )
     .await
     .expect("task creates");
+
+    TaskRoleAssignmentRepo::assign(
+        db,
+        CreateTaskRoleAssignment {
+            id: new_uuid_v4(),
+            task_id: task_id.clone(),
+            role_name: "coder".to_owned(),
+            assignee_type: Some(AssigneeKind::Agent),
+            assignee_id: Some(agent_id.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("coder assignment creates");
 
     db::WorkspaceRepo::create(
         db,

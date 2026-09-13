@@ -34,7 +34,7 @@ pub fn render_merge_conflict_prompt(conflict_paths: &[PathBuf], conflict_summary
         .join("\n");
 
     let mut prompt = format!(
-        "Merge conflict encountered on prior attempt. This is a merge-conflict re-review. Your changes conflict with main. Rebase onto main, resolve conflicts, and commit the resolution. Conflict summary:\n{paths}"
+        "Merge conflict encountered on prior attempt. This is a merge-conflict re-review. Do not rebase or attempt integration from a managed execution. Manual Task-worktree repair is required before a fresh review. Conflict summary:\n{paths}"
     );
 
     if !conflict_summary.is_empty() {

@@ -19,22 +19,9 @@ impl TaskService {
         if parent.parent_task_id.is_some() {
             return Err(ServiceError::nested_subtask_unsupported());
         }
-        let executions = ExecutionRepo::list_by_task(
-            &*self.db,
-            &parent.id,
-            PageRequest {
-                cursor: None,
-                limit: 100,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Desc,
-            },
-        )
-        .await?;
-        if executions
-            .items
-            .iter()
-            .any(|execution| execution.status == ExecutionStatus::Running)
+        if !ExecutionRepo::list_running_by_task(&*self.db, &parent.id)
+            .await?
+            .is_empty()
         {
             return Err(ServiceError::invalid_operation(
                 "cannot convert a running task into a coordination root; stop its implementation execution first",
@@ -103,10 +90,26 @@ impl TaskService {
             .filter_map(|state| state.role.as_deref())
             .filter(|role| Some(*role) != implementation_role)
             .collect::<std::collections::HashSet<_>>();
+        let mut current_parent = result.source_task.clone();
         for assignment in TaskRoleAssignmentRepo::list_by_task(&*self.db, &parent.id).await? {
             if !aggregate_review_roles.contains(assignment.role_name.as_str()) {
-                TaskRoleAssignmentRepo::remove(&*self.db, &parent.id, &assignment.role_name)
-                    .await?;
+                current_parent = TaskRoleAssignmentRepo::remove_and_clear_review_authority(
+                    &*self.db,
+                    &assignment,
+                    current_parent.version,
+                    &now_rfc3339(),
+                )
+                .await?;
+                let current_parent_id = current_parent.id.clone();
+                crate::wake_task_dispatch(
+                    &self.db,
+                    &current_parent_id,
+                    "coordination root role assignment removed",
+                )
+                .await?;
+                current_parent = TaskRepo::get_by_id(&*self.db, &current_parent_id, false)
+                    .await?
+                    .ok_or_else(|| ServiceError::not_found("task", current_parent_id.clone()))?;
             }
         }
         Ok(result.tasks)

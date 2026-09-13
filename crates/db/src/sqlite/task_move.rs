@@ -110,6 +110,22 @@ impl TaskBoardRepo for SqliteDb {
             });
         }
 
+        if let Some(expected_project_version) = input.expected_project_version {
+            let project_authority = sqlx::query_as::<_, (i64, String)>(
+                "SELECT version, workflow_definition FROM project WHERE id = ?",
+            )
+            .bind(&input.project_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(DbError::NotFound)?;
+            if project_authority.0 != expected_project_version
+                || input.expected_workflow_definition.as_deref()
+                    != Some(project_authority.1.as_str())
+            {
+                return Err(DbError::VersionConflict);
+            }
+        }
+
         let task_row = sqlx::query(&format!(
             "SELECT {TASK_COLUMNS} FROM task WHERE id = ? AND deleted_at IS NULL AND archived_at IS NULL",
         ))
@@ -273,6 +289,17 @@ impl TaskBoardRepo for SqliteDb {
                 created_at: transition_input.created_at,
             }),
         })
+    }
+
+    async fn compare_and_move_task_with_workflow_authority(
+        &self,
+        mut input: CompareAndMoveTask,
+        expected_project_version: i64,
+        expected_workflow_definition: &str,
+    ) -> Result<MoveTaskPersistence> {
+        input.expected_project_version = Some(expected_project_version);
+        input.expected_workflow_definition = Some(expected_workflow_definition.to_owned());
+        self.compare_and_move_task(input).await
     }
 
     async fn complete_move_operation(

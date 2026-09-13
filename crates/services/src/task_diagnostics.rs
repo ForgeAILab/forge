@@ -1,14 +1,14 @@
-use std::collections::HashMap;
+use std::{cmp::Ordering, collections::HashMap};
 
 use api_types::{
     FailingStepSummary, FailureKind, HealthSeverity, RecoveryAction, RelatedEvidence, StateKind,
     TaskAnnotation, TaskBlockingAnnotation, WorkflowDefinition, WorkflowExceptionAction,
     WorkflowExceptionSummary, WorkflowHealthKind, WorkflowHealthSummary,
 };
-// use chrono::{DateTime, Utc};
+use chrono::{DateTime, Utc};
 use db::{
     AssigneeKind, Execution, ExecutionStatus, ResumePolicy, Review, ReviewStatus, Task,
-    TaskMetadata, TaskRoleAssignment,
+    TaskMetadata, TaskRoleAssignment, TransitionLog, TransitionLogRepo,
 };
 use serde_json::Value;
 
@@ -16,6 +16,31 @@ use crate::workflow::effective_role;
 
 // pub const DISPATCH_GRACE_SECONDS: i64 = 120;
 // pub const STALE_DWELL_SECONDS: i64 = 3600;
+
+/// Order rows that are already admitted to the running execution set for a
+/// Task. A newly opened interactive attempt can be `Running` while it still
+/// only owns its short-lived dispatch lease and has not received a provider
+/// session yet. If an older interactive execution is already carrying a
+/// session, that is the live user work the health projection must identify;
+/// the lease-only row must not hide it merely because it was created later.
+///
+/// Callers must filter to `ExecutionStatus::Running` before using this
+/// comparator. The final timestamp/id tie-break keeps the projection stable
+/// when two rows have the same session state.
+pub fn compare_running_execution_authority(left: &Execution, right: &Execution) -> Ordering {
+    let left_has_session = left
+        .agent_session_id
+        .as_deref()
+        .is_some_and(|session_id| !session_id.trim().is_empty());
+    let right_has_session = right
+        .agent_session_id
+        .as_deref()
+        .is_some_and(|session_id| !session_id.trim().is_empty());
+    left_has_session
+        .cmp(&right_has_session)
+        .then_with(|| left.created_at.cmp(&right.created_at))
+        .then_with(|| left.id.cmp(&right.id))
+}
 
 pub fn derive_workflow_health(
     task: &Task,
@@ -34,6 +59,28 @@ pub fn derive_workflow_health(
     let awaiting_human = awaiting_human
         || task_metadata_awaiting_human(task)
         || latest_review.is_some_and(|review| review.status == ReviewStatus::AwaitingHuman);
+
+    // An interactive recovery session is live work, even when the Task row
+    // still carries a stale blocker/failure/retry projection from the event
+    // that opened that session. Surface the live execution first so the board
+    // does not tell the user that the Task is failed or waiting while their
+    // recovery session is actively running.
+    if let Some(execution) = latest_execution.filter(|execution| {
+        execution.role == "interactive" && execution.status == ExecutionStatus::Running
+    }) {
+        return health(
+            WorkflowHealthKind::Running,
+            HealthSeverity::Info,
+            "Interactive",
+            Some("Interactive execution is running".to_owned()),
+            task,
+            Some("interactive".to_owned()),
+            Some(execution.id.clone()),
+            latest_review.map(|review| review.id.clone()),
+            execution.created_at.clone(),
+            None,
+        );
+    }
 
     if task.failed_json.is_some() {
         return health(
@@ -82,6 +129,57 @@ pub fn derive_workflow_health(
         }
     }
 
+    if let Some(deferred) = crate::deferred_dispatch::pending_until(task) {
+        // `is_pending` is the dispatcher's admission check. In particular, a
+        // malformed timestamp is treated as no deferral and the dispatcher
+        // proceeds with the current role. Do not project such metadata as a
+        // scheduled retry, or the board will claim that work is delayed when
+        // the next scan is actually eligible to dispatch it. A malformed
+        // target_state cannot reach this point because `pending_until` only
+        // deserializes the required string fields, matching the dispatcher.
+        if let Some(eligible_at) = DateTime::parse_from_rfc3339(&deferred.not_before)
+            .ok()
+            .map(|value| value.with_timezone(&Utc))
+        {
+            let waiting_for_capacity = eligible_at <= Utc::now();
+            let role_label = role.as_deref().unwrap_or("agent");
+            return health(
+                WorkflowHealthKind::WaitingForAgent,
+                HealthSeverity::Info,
+                if waiting_for_capacity {
+                    "Retry Queued"
+                } else {
+                    "Retry Scheduled"
+                },
+                Some(if waiting_for_capacity {
+                    format!(
+                        "Automatic {role_label} retry has been eligible since {} and is waiting for capacity ({})",
+                        deferred.not_before, deferred.reason
+                    )
+                } else {
+                    format!(
+                        "Automatic {role_label} retry is scheduled for {} ({})",
+                        deferred.not_before, deferred.reason
+                    )
+                }),
+                task,
+                role,
+                latest_execution.map(|execution| execution.id.clone()),
+                latest_review.map(|review| review.id.clone()),
+                if waiting_for_capacity {
+                    deferred.not_before
+                } else {
+                    task.updated_at.clone()
+                },
+                Some(if waiting_for_capacity {
+                    "execution_retry_waiting_for_capacity".to_owned()
+                } else {
+                    "execution_retry_scheduled".to_owned()
+                }),
+            );
+        }
+    }
+
     if awaiting_human {
         return health(
             WorkflowHealthKind::AwaitingHuman,
@@ -94,6 +192,29 @@ pub fn derive_workflow_health(
             latest_review.map(|review| review.id.clone()),
             task.updated_at.clone(),
             None,
+        );
+    }
+
+    // The dispatcher has parked this Task: it recorded the refusal and will
+    // not attempt the capability again until the Task changes or something
+    // wakes it. That is not queueing, and reporting it as "Waiting for Agent"
+    // or "Idle" is how a Task that will never move on its own hides in a
+    // saturated board.
+    if let Some(disposition) = crate::deferred_dispatch::current_dispatch_disposition(task) {
+        return health(
+            WorkflowHealthKind::Stuck,
+            HealthSeverity::Warning,
+            "Dispatch Parked",
+            Some(format!(
+                "{} dispatch is parked until this Task changes or is woken: {}",
+                disposition.capability, disposition.safe_message
+            )),
+            task,
+            role,
+            latest_execution.map(|execution| execution.id.clone()),
+            latest_review.map(|review| review.id.clone()),
+            disposition.recorded_at,
+            Some("dispatch_parked".to_owned()),
         );
     }
 
@@ -182,6 +303,59 @@ pub fn derive_workflow_health(
                 None,
             );
         }
+
+        // The role's own attempt stopped in a way that does not need a human
+        // decision — the commonest case is an execution terminalised by crash
+        // recovery on restart. The Task is waiting for a free slot to run the
+        // replacement, which is a different thing from having nothing to do.
+        if let Some(execution) = latest_execution.filter(|execution| {
+            execution_matches_role(execution, role_name)
+                && matches!(
+                    execution.status,
+                    ExecutionStatus::Failed | ExecutionStatus::Cancelled
+                )
+                && matches!(execution.resume_policy, Some(ResumePolicy::Auto))
+        }) {
+            return health(
+                WorkflowHealthKind::WaitingForAgent,
+                HealthSeverity::Info,
+                "Retry Queued",
+                Some(format!(
+                    "The {role_name} attempt stopped ({}) and a replacement is waiting for capacity",
+                    execution
+                        .stop_reason
+                        .as_ref()
+                        .map(|reason| reason.to_string())
+                        .or_else(|| execution.error.clone())
+                        .unwrap_or_else(|| "no reason recorded".to_owned())
+                )),
+                task,
+                Some(role_name.to_owned()),
+                Some(execution.id.clone()),
+                latest_review.map(|review| review.id.clone()),
+                execution.updated_at.clone(),
+                Some("dispatch_waiting_for_capacity".to_owned()),
+            );
+        }
+    } else if current_state.is_some_and(|state| state.kind == StateKind::Initial) {
+        // An Initial state carries no role of its own, so everything above is
+        // skipped and a Task queued behind Worker capacity reports "Idle" —
+        // indistinguishable from one that nothing will ever pick up. Name the
+        // role it is queued for when an Agent actually holds it.
+        if let Some(role_name) = initial_dispatch_role(workflow, task, role_assignments) {
+            return health(
+                WorkflowHealthKind::WaitingForAgent,
+                HealthSeverity::Info,
+                "Queued",
+                Some(format!("Queued for {role_name} dispatch")),
+                task,
+                Some(role_name.to_owned()),
+                None,
+                latest_review.map(|review| review.id.clone()),
+                task.updated_at.clone(),
+                Some("queued_for_dispatch".to_owned()),
+            );
+        }
     }
 
     // Disabled: stale_dwell produced false "Stuck" labels for tasks
@@ -224,6 +398,52 @@ pub fn derive_workflow_exception(
     latest_execution: Option<&Execution>,
     remaining_retries: &HashMap<String, i64>,
 ) -> Option<WorkflowExceptionSummary> {
+    let running_interactive_execution = latest_execution.filter(|execution| {
+        execution.role == "interactive" && execution.status == ExecutionStatus::Running
+    });
+    let effective_role = workflow
+        .states
+        .iter()
+        .find(|state| state.name == task.status)
+        .and_then(effective_role);
+    let open_interactive_launch_authority = latest_execution
+        .is_some_and(|execution| execution.agent_id.is_some())
+        || effective_role.is_some_and(|role| {
+            role_assignments.iter().any(|assignment| {
+                assignment.role_name == role
+                    && assignment.assignee_type == Some(AssigneeKind::Agent)
+                    && assignment.assignee_id.is_some()
+            })
+        });
+    derive_workflow_exception_with_running_interactive(
+        task,
+        workflow,
+        role_assignments,
+        latest_review,
+        latest_execution,
+        running_interactive_execution,
+        latest_execution,
+        open_interactive_launch_authority,
+        remaining_retries,
+    )
+}
+
+/// Derive exception actions with the live interactive execution selected
+/// independently from the newest execution row. The latter is still used for
+/// review/error evidence; the former controls whether opening another
+/// interactive session is currently allowed.
+#[allow(clippy::too_many_arguments)]
+pub fn derive_workflow_exception_with_running_interactive(
+    task: &Task,
+    workflow: &WorkflowDefinition,
+    role_assignments: &[TaskRoleAssignment],
+    latest_review: Option<&Review>,
+    latest_execution: Option<&Execution>,
+    running_interactive_execution: Option<&Execution>,
+    open_interactive_target: Option<&Execution>,
+    open_interactive_launch_authority: bool,
+    remaining_retries: &HashMap<String, i64>,
+) -> Option<WorkflowExceptionSummary> {
     let current_state = workflow
         .states
         .iter()
@@ -243,6 +463,25 @@ pub fn derive_workflow_exception(
         ));
     }
 
+    let blocking_annotation = active_blocking_annotation(task);
+    if let Some(annotation) = blocking_annotation
+        .as_ref()
+        .filter(|annotation| !annotation.recovery_actions.is_empty())
+    {
+        return Some(blocking_annotation_exception(
+            task,
+            workflow,
+            role_assignments,
+            latest_review,
+            latest_execution,
+            annotation,
+            role,
+            running_interactive_execution,
+            open_interactive_target,
+            open_interactive_launch_authority,
+        ));
+    }
+
     // Interruption-era blocked metadata with a recoverable structured kind is
     // classified directly from the typed kind — no synthesized annotation
     // intermediate, no prose matching.
@@ -253,6 +492,9 @@ pub fn derive_workflow_exception(
                 workflow,
                 role.clone(),
                 latest_execution,
+                running_interactive_execution,
+                open_interactive_target,
+                open_interactive_launch_authority,
             );
             return Some(blocked_metadata_exception(
                 task,
@@ -267,8 +509,15 @@ pub fn derive_workflow_exception(
         if task.status == crate::workflow::default_states::MERGING
             && metadata.kind == FailureKind::TargetRepoDirty
         {
-            let actions =
-                merge_gate_annotation_actions(task, workflow, role.clone(), latest_execution);
+            let actions = merge_gate_annotation_actions(
+                task,
+                workflow,
+                role.clone(),
+                latest_execution,
+                running_interactive_execution,
+                open_interactive_target,
+                open_interactive_launch_authority,
+            );
             return Some(blocked_metadata_exception(
                 task,
                 &metadata,
@@ -282,7 +531,14 @@ pub fn derive_workflow_exception(
         if task.status == crate::workflow::default_states::MERGE_FAILED
             && metadata.kind.is_merge_recoverable()
         {
-            let actions = merge_fix_annotation_actions(task, role.clone(), latest_execution);
+            let actions = merge_fix_annotation_actions(
+                task,
+                role.clone(),
+                latest_execution,
+                running_interactive_execution,
+                open_interactive_target,
+                open_interactive_launch_authority,
+            );
             return Some(blocked_metadata_exception(
                 task,
                 &metadata,
@@ -295,55 +551,19 @@ pub fn derive_workflow_exception(
         }
     }
 
-    if let Some(annotation) = active_blocking_annotation(task) {
-        let actions = annotation_actions(
-            &annotation,
-            workflow,
+    if let Some(annotation) = blocking_annotation.as_ref() {
+        return Some(blocking_annotation_exception(
             task,
+            workflow,
             role_assignments,
+            latest_review,
             latest_execution,
-        );
-        let actions = if actions.is_empty() && is_retry_budget_exhausted(&annotation) {
-            retry_budget_exhausted_annotation_actions(
-                task,
-                workflow,
-                role.clone(),
-                latest_execution,
-            )
-        } else if actions.is_empty() && is_recoverable_merge_gate_annotation(task, &annotation) {
-            merge_gate_annotation_actions(task, workflow, role.clone(), latest_execution)
-        } else if actions.is_empty() && is_recoverable_merge_fix_annotation(task, &annotation) {
-            merge_fix_annotation_actions(task, role.clone(), latest_execution)
-        } else {
-            actions
-        };
-        let mut summary = WorkflowExceptionSummary {
-            exception_type: annotation.annotation_type.to_string(),
-            message: annotation
-                .message
-                .clone()
-                .unwrap_or_else(|| annotation.blocking_reason.clone()),
-            review_id: latest_failed_review(latest_review).map(|review| review.id.clone()),
-            execution_id: annotation
-                .blocked_execution_id
-                .clone()
-                .or_else(|| latest_execution.map(|execution| execution.id.clone())),
-            state: Some(task.status.clone()),
-            role: role.clone(),
-            target_state: None,
-            target_role: role.clone(),
-            failing_step: latest_failed_review(latest_review)
-                .and_then(parse_failing_step)
-                .or_else(|| annotation_hook_failing_step(&annotation)),
-            related_evidence: related_failed_review(latest_review),
-            actions,
-        };
-        if summary.actions.is_empty() {
-            summary
-                .actions
-                .push(cancel_action(false, task_is_terminal(workflow, task)));
-        }
-        return Some(summary);
+            annotation,
+            role,
+            running_interactive_execution,
+            open_interactive_target,
+            open_interactive_launch_authority,
+        ));
     }
 
     let is_gate_state = current_state.is_some_and(|state| state.kind == StateKind::Gate);
@@ -456,7 +676,9 @@ pub fn derive_workflow_exception(
                 actions.push(open_interactive_action(
                     task,
                     role.clone(),
-                    latest_execution,
+                    open_interactive_target,
+                    running_interactive_execution,
+                    open_interactive_launch_authority,
                 ));
             }
 
@@ -481,6 +703,92 @@ pub fn derive_workflow_exception(
     }
 
     recovery_unavailable(task, workflow, role, latest_execution)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn blocking_annotation_exception(
+    task: &Task,
+    workflow: &WorkflowDefinition,
+    role_assignments: &[TaskRoleAssignment],
+    latest_review: Option<&Review>,
+    latest_execution: Option<&Execution>,
+    annotation: &TaskBlockingAnnotation,
+    role: Option<String>,
+    running_interactive_execution: Option<&Execution>,
+    open_interactive_target: Option<&Execution>,
+    open_interactive_launch_authority: bool,
+) -> WorkflowExceptionSummary {
+    let actions = annotation_actions(
+        annotation,
+        workflow,
+        task,
+        role_assignments,
+        latest_review,
+        latest_execution,
+        role.clone(),
+        running_interactive_execution,
+        open_interactive_target,
+        open_interactive_launch_authority,
+    );
+    let actions = if actions.is_empty() && is_retry_budget_exhausted(annotation) {
+        retry_budget_exhausted_annotation_actions(
+            task,
+            workflow,
+            role.clone(),
+            latest_execution,
+            running_interactive_execution,
+            open_interactive_target,
+            open_interactive_launch_authority,
+        )
+    } else if actions.is_empty() && is_recoverable_merge_gate_annotation(task, annotation) {
+        merge_gate_annotation_actions(
+            task,
+            workflow,
+            role.clone(),
+            latest_execution,
+            running_interactive_execution,
+            open_interactive_target,
+            open_interactive_launch_authority,
+        )
+    } else if actions.is_empty() && is_recoverable_merge_fix_annotation(task, annotation) {
+        merge_fix_annotation_actions(
+            task,
+            role.clone(),
+            latest_execution,
+            running_interactive_execution,
+            open_interactive_target,
+            open_interactive_launch_authority,
+        )
+    } else {
+        actions
+    };
+    let mut summary = WorkflowExceptionSummary {
+        exception_type: annotation.annotation_type.to_string(),
+        message: annotation
+            .message
+            .clone()
+            .unwrap_or_else(|| annotation.blocking_reason.clone()),
+        review_id: latest_failed_review(latest_review).map(|review| review.id.clone()),
+        execution_id: annotation
+            .blocked_execution_id
+            .clone()
+            .or_else(|| latest_execution.map(|execution| execution.id.clone())),
+        state: Some(task.status.clone()),
+        role: role.clone(),
+        target_state: None,
+        target_role: role,
+        failing_step: latest_failed_review(latest_review)
+            .and_then(parse_failing_step)
+            .or_else(|| annotation_hook_failing_step(annotation)),
+        related_evidence: related_failed_review(latest_review),
+        actions,
+    };
+    if summary.actions.is_empty() {
+        summary
+            .actions
+            .push(cancel_action(false, task_is_terminal(workflow, task)));
+    }
+    summary
 }
 
 fn task_failed_exception(
@@ -582,7 +890,7 @@ fn task_metadata_awaiting_human(task: &Task) -> bool {
 
 fn stopped_execution_blocks_progress(execution: &Execution) -> bool {
     execution.status != ExecutionStatus::Running
-        && matches!(execution.resume_policy, None | Some(ResumePolicy::Manual))
+        && !matches!(execution.resume_policy, Some(ResumePolicy::Auto))
 }
 
 fn stopped_execution_health(
@@ -663,6 +971,64 @@ pub fn is_retry_budget_exhausted(annotation: &TaskBlockingAnnotation) -> bool {
     annotation.annotation_type.is_budget_exhausted_annotation()
 }
 
+/// Return the audit-log suffix after the latest explicit retry-window reset.
+///
+/// A normal non-rejection transition — including a review-refresh bridge — is
+/// not a reset; only an explicit recovery marker establishes a new boundary.
+/// `gate_state = None` is used by the separate target-moved contention budget,
+/// whose reset marker may be emitted while the Task is in a reject target.
+pub fn entries_since_retry_window_boundary<'a>(
+    entries: &'a [TransitionLog],
+    gate_state: Option<&str>,
+) -> &'a [TransitionLog] {
+    let boundary = entries.iter().rposition(|entry| {
+        !entry.rejection
+            && gate_state.is_none_or(|state| entry.from_state == state)
+            && matches!(
+                entry.trigger_name.as_deref(),
+                Some("reset_retry_window" | "reset_to_initial")
+            )
+    });
+    boundary
+        .and_then(|index| entries.get(index + 1..))
+        .unwrap_or(entries)
+}
+
+/// Count gate rejections in the current retry window.
+///
+/// Merge-refresh rejection rows written by older engine versions are
+/// mechanical contention, not merge-fix attempts.  Excluding them here keeps
+/// recovery, runtime admission, and API diagnostics on the same policy even
+/// while the current engine normalizes new bridge rows to `rejection = false`.
+pub fn count_gate_rejections_since_boundary(entries: &[TransitionLog], gate_state: &str) -> i64 {
+    let entries = entries_since_retry_window_boundary(entries, Some(gate_state));
+    let workflow_actor = api_types::Actor::system(api_types::SystemComponent::Workflow).display();
+    entries
+        .iter()
+        .filter(|entry| {
+            entry.from_state == gate_state
+                && entry.rejection
+                && !(gate_state == crate::workflow::default_states::MERGING
+                    && entry.to_state == crate::workflow::default_states::MERGE_FAILED
+                    && entry
+                        .trigger_reason
+                        .contains(crate::workflow::REVIEW_REFRESH_MARKER)
+                    && entry.triggered_by == workflow_actor)
+        })
+        .count() as i64
+}
+
+/// Load and count one Task's gate rejections using the same boundary policy
+/// as the in-memory API projection and recovery admission checks.
+pub async fn count_gate_rejections_for_task(
+    db: &db::SqliteDb,
+    task_id: &str,
+    gate_state: &str,
+) -> db::Result<i64> {
+    let entries = TransitionLogRepo::list_by_task(db, task_id).await?;
+    Ok(count_gate_rejections_since_boundary(&entries, gate_state))
+}
+
 fn active_blocking_annotation(task: &Task) -> Option<TaskBlockingAnnotation> {
     match serde_json::from_str::<TaskAnnotation>(task.error_annotation.as_deref()?).ok()? {
         TaskAnnotation::Blocking(annotation) => Some(annotation),
@@ -728,6 +1094,9 @@ fn retry_budget_exhausted_annotation_actions(
     workflow: &WorkflowDefinition,
     role: Option<String>,
     latest_execution: Option<&Execution>,
+    running_interactive_execution: Option<&Execution>,
+    open_interactive_target: Option<&Execution>,
+    open_interactive_launch_authority: bool,
 ) -> Vec<WorkflowExceptionAction> {
     let resume_target = gate_reject_target(workflow, task);
     let resume_role = resume_target
@@ -808,7 +1177,13 @@ fn retry_budget_exhausted_annotation_actions(
             role.clone(),
             None,
         ),
-        open_interactive_action(task, role, latest_execution),
+        open_interactive_action(
+            task,
+            role,
+            open_interactive_target,
+            running_interactive_execution,
+            open_interactive_launch_authority,
+        ),
     ]
 }
 
@@ -835,6 +1210,9 @@ fn merge_gate_annotation_actions(
     _workflow: &WorkflowDefinition,
     role: Option<String>,
     latest_execution: Option<&Execution>,
+    running_interactive_execution: Option<&Execution>,
+    open_interactive_target: Option<&Execution>,
+    open_interactive_launch_authority: bool,
 ) -> Vec<WorkflowExceptionAction> {
     vec![
         action(
@@ -861,7 +1239,13 @@ fn merge_gate_annotation_actions(
             role.clone(),
             None,
         ),
-        open_interactive_action(task, role, latest_execution),
+        open_interactive_action(
+            task,
+            role,
+            open_interactive_target,
+            running_interactive_execution,
+            open_interactive_launch_authority,
+        ),
     ]
 }
 
@@ -869,6 +1253,9 @@ fn merge_fix_annotation_actions(
     task: &Task,
     role: Option<String>,
     latest_execution: Option<&Execution>,
+    running_interactive_execution: Option<&Execution>,
+    open_interactive_target: Option<&Execution>,
+    open_interactive_launch_authority: bool,
 ) -> Vec<WorkflowExceptionAction> {
     vec![
         action(
@@ -895,16 +1282,28 @@ fn merge_fix_annotation_actions(
             role.clone(),
             latest_execution.map(|execution| execution.id.clone()),
         ),
-        open_interactive_action(task, role, latest_execution),
+        open_interactive_action(
+            task,
+            role,
+            open_interactive_target,
+            running_interactive_execution,
+            open_interactive_launch_authority,
+        ),
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn annotation_actions(
     annotation: &TaskBlockingAnnotation,
     workflow: &WorkflowDefinition,
     task: &Task,
     role_assignments: &[TaskRoleAssignment],
+    latest_review: Option<&Review>,
     latest_execution: Option<&Execution>,
+    role: Option<String>,
+    running_interactive_execution: Option<&Execution>,
+    open_interactive_target: Option<&Execution>,
+    open_interactive_launch_authority: bool,
 ) -> Vec<WorkflowExceptionAction> {
     annotation
         .recovery_actions
@@ -912,34 +1311,62 @@ fn annotation_actions(
         .copied()
         .map(|kind| {
             let terminal = task_is_terminal(workflow, task);
-            let resume_unavailable = matches!(kind, RecoveryAction::ResumeSession)
-                && !latest_execution.is_some_and(|execution| {
-                    annotation
-                        .blocked_execution_id
-                        .as_deref()
-                        .is_none_or(|id| id == execution.id)
-                        && execution.agent_id.is_some()
-                        && execution.agent_session_id.is_some()
-                        && execution.executor_config_snapshot_json.is_some()
-                        && execution.agent_id.as_deref().is_some_and(|agent_id| {
-                            role_assignments
-                                .iter()
-                                .find(|assignment| assignment.role_name == execution.role)
-                                .map_or_else(
-                                    || {
-                                        task.assignee_type.as_deref() == Some("agent")
-                                            && task.assignee_id.as_deref() == Some(agent_id)
-                                    },
-                                    |assignment| {
-                                        assignment.assignee_type == Some(AssigneeKind::Agent)
-                                            && assignment.assignee_id.as_deref() == Some(agent_id)
-                                    },
-                                )
+            let terminal_review = matches!(kind, RecoveryAction::ResumeSession)
+                && annotation
+                    .blocked_execution_id
+                    .as_deref()
+                    .is_some_and(|execution_id| {
+                        latest_execution.is_some_and(|execution| {
+                            matches!(
+                                execution.role.as_str(),
+                                crate::workflow::default_roles::REVIEWER
+                                    | crate::workflow::default_roles::AUDITOR
+                            ) && execution.id == execution_id
+                                && latest_review.is_some_and(|review| {
+                                    matches!(
+                                        review.status,
+                                        ReviewStatus::Passed
+                                            | ReviewStatus::Failed
+                                            | ReviewStatus::Cancelled
+                                    ) && review_binds_execution_id(review, execution_id)
+                                })
                         })
-                });
+                    });
+            let resume_unavailable = matches!(kind, RecoveryAction::ResumeSession)
+                && (terminal_review
+                    || !latest_execution.is_some_and(|execution| {
+                        annotation
+                            .blocked_execution_id
+                            .as_deref()
+                            .is_none_or(|id| id == execution.id)
+                            && execution.agent_id.is_some()
+                            && execution.agent_session_id.is_some()
+                            && execution.executor_config_snapshot_json.is_some()
+                            && execution.agent_id.as_deref().is_some_and(|agent_id| {
+                                role_assignments
+                                    .iter()
+                                    .find(|assignment| assignment.role_name == execution.role)
+                                    .map_or_else(
+                                        || {
+                                            task.assignee_type.as_deref() == Some("agent")
+                                                && task.assignee_id.as_deref() == Some(agent_id)
+                                        },
+                                        |assignment| {
+                                            assignment.assignee_type == Some(AssigneeKind::Agent)
+                                                && assignment.assignee_id.as_deref()
+                                                    == Some(agent_id)
+                                        },
+                                    )
+                            })
+                    }));
             let enabled = !terminal && !resume_unavailable;
             let disabled_reason = if terminal {
                 Some("Task is in terminal state".to_owned())
+            } else if terminal_review {
+                Some(
+                    "The bound reviewer Review attempt is terminal; start a fresh review attempt"
+                        .to_owned(),
+                )
             } else if resume_unavailable {
                 Some("The stopped execution has no resumable assigned session".to_owned())
             } else {
@@ -964,6 +1391,15 @@ fn annotation_actions(
             } else {
                 None
             };
+            if kind == RecoveryAction::OpenInteractive {
+                return open_interactive_action(
+                    task,
+                    role.clone(),
+                    open_interactive_target,
+                    running_interactive_execution,
+                    open_interactive_launch_authority,
+                );
+            }
             action(
                 kind,
                 recovery_label(kind),
@@ -1008,6 +1444,14 @@ fn review_failed_by_reviewer_execution(review: &Review) -> bool {
         .is_some()
 }
 
+fn review_binds_execution_id(review: &Review, execution_id: &str) -> bool {
+    review.reviewer_execution_id.as_deref() == Some(execution_id)
+        || review.auditor_execution_id.as_deref() == Some(execution_id)
+        || (review.reviewer_execution_id.is_none()
+            && review.auditor_execution_id.is_none()
+            && review.execution_id == execution_id)
+}
+
 fn execution_retry_window_exhausted(
     task: &Task,
     current_state: Option<&api_types::StateDefinition>,
@@ -1038,25 +1482,34 @@ fn execution_retry_window_exhausted(
 fn open_interactive_action(
     task: &Task,
     role: Option<String>,
-    latest_execution: Option<&Execution>,
+    open_interactive_target: Option<&Execution>,
+    running_interactive_execution: Option<&Execution>,
+    open_interactive_launch_authority: bool,
 ) -> WorkflowExceptionAction {
-    let has_target = latest_execution
-        .and_then(|execution| execution.agent_id.as_ref())
-        .is_some();
+    // A role-aware resumable session is enough for recovery to follow up,
+    // even when the newest unrelated history row has no agent identity. Keep
+    // the latest-row agent fallback for a fresh launch, which recovery also
+    // accepts when no resumable session is available.
+    let has_target = open_interactive_target.is_some() || open_interactive_launch_authority;
+    let has_running_interactive = running_interactive_execution.is_some();
     action(
         RecoveryAction::OpenInteractive,
         "Open Interactive",
-        has_target,
-        disabled_unless(
-            has_target,
-            "Open interactive requires an assigned agent or previous execution",
-        ),
+        has_target && !has_running_interactive,
+        if has_running_interactive {
+            Some("An interactive execution is already running".to_owned())
+        } else {
+            disabled_unless(
+                has_target,
+                "Open interactive requires an assigned agent or previous execution",
+            )
+        },
         false,
         false,
         false,
         Some(task.status.clone()),
         role,
-        latest_execution.map(|execution| execution.id.clone()),
+        open_interactive_target.map(|execution| execution.id.clone()),
     )
 }
 
@@ -1283,4 +1736,144 @@ fn gate_reject_target(workflow: &WorkflowDefinition, task: &Task) -> Option<Stri
 fn execution_matches_role(execution: &Execution, role: &str) -> bool {
     execution.role == role
         || (role == crate::workflow::default_roles::CODER && execution.role == "executor")
+}
+
+/// The role an Initial-state Task is queued to be dispatched into.
+///
+/// This mirrors the dispatcher's own `resolve_initial_schedule_target`: follow
+/// non-system triggers to the first Active/Gate state, and keep walking
+/// through any gate that is configured to cascade when its role is unassigned
+/// — a Project with no planner reaches `in_progress`/`coder` that way. It
+/// names what the Task is waiting for; it does not predict that dispatch will
+/// succeed.
+fn initial_dispatch_role<'a>(
+    workflow: &'a WorkflowDefinition,
+    task: &Task,
+    role_assignments: &[TaskRoleAssignment],
+) -> Option<&'a str> {
+    let mut cursor = task.status.clone();
+    let mut target_kinds = vec![StateKind::Active, StateKind::Gate];
+    let mut visited = std::collections::HashSet::new();
+    loop {
+        if !visited.insert(cursor.clone()) {
+            return None;
+        }
+        let target = workflow
+            .outgoing_trigger_targets(&cursor)
+            .filter(|(trigger, _)| !trigger.system_only())
+            .find_map(|(_, target)| {
+                workflow
+                    .states
+                    .iter()
+                    .find(|state| state.name == target && target_kinds.contains(&state.kind))
+            })?;
+        let role = effective_role(target)?;
+        match role_assignments
+            .iter()
+            .find(|assignment| assignment.role_name == role)
+        {
+            // Keep this in lockstep with the dispatcher's initial scheduler:
+            // an Agent assignment is dispatchable, while a User assignment is
+            // an explicit human-owned boundary and must stop the cascade even
+            // when a later role has an Agent assignment.
+            Some(assignment)
+                if assignment.assignee_type == Some(AssigneeKind::Agent)
+                    && assignment.assignee_id.is_some() =>
+            {
+                return Some(role);
+            }
+            Some(assignment) if assignment.assignee_type == Some(AssigneeKind::User) => {
+                return None;
+            }
+            Some(assignment)
+                if (assignment.assignee_type.is_none() || assignment.assignee_id.is_none())
+                    && cascades_when_role_unassigned(target) =>
+            {
+                cursor = target.name.clone();
+                target_kinds = vec![StateKind::Active];
+            }
+            Some(_) | None => {
+                if cascades_when_role_unassigned(target) {
+                    cursor = target.name.clone();
+                    target_kinds = vec![StateKind::Active];
+                } else {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// Whether this gate is skipped when nobody holds its role, which is how a
+/// Project without a planner reaches the implementation state directly.
+fn cascades_when_role_unassigned(state: &api_types::StateDefinition) -> bool {
+    state
+        .gate_config
+        .as_ref()
+        .is_some_and(api_types::GateConfig::optional_when_unassigned)
+        && state
+            .hooks
+            .after_enter
+            .iter()
+            .any(|hook| hook.action == "auto_cascade_on_unassigned_role")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::count_gate_rejections_since_boundary;
+    use db::TransitionLog;
+
+    fn log(
+        from_state: &str,
+        to_state: &str,
+        trigger_name: Option<&str>,
+        rejection: bool,
+    ) -> TransitionLog {
+        TransitionLog {
+            id: db::new_uuid_v4(),
+            task_id: "task".to_owned(),
+            from_state: from_state.to_owned(),
+            to_state: to_state.to_owned(),
+            trigger_name: trigger_name.map(str::to_owned),
+            triggered_by: "system:test".to_owned(),
+            trigger_reason: "test".to_owned(),
+            hook_results_json: None,
+            rejection,
+            created_at: db::now_rfc3339(),
+        }
+    }
+
+    #[test]
+    fn refresh_bridge_does_not_reset_gate_rejection_window() {
+        let entries = vec![
+            log("merging", "merge_failed", Some("reject"), true),
+            log("merging", "review", Some("review_refresh"), false),
+        ];
+
+        assert_eq!(count_gate_rejections_since_boundary(&entries, "merging"), 1);
+    }
+
+    #[test]
+    fn legacy_rejected_refresh_bridge_does_not_spend_merge_fix_budget() {
+        let workflow_actor =
+            api_types::Actor::system(api_types::SystemComponent::Workflow).display();
+        let mut bridge = log("merging", "merge_failed", Some("retry"), true);
+        bridge.triggered_by = workflow_actor;
+        bridge.trigger_reason =
+            format!("{} target advanced", crate::workflow::REVIEW_REFRESH_MARKER);
+        let entries = vec![log("merging", "merge_failed", Some("reject"), true), bridge];
+
+        assert_eq!(count_gate_rejections_since_boundary(&entries, "merging"), 1);
+    }
+
+    #[test]
+    fn only_explicit_recovery_markers_reset_gate_rejection_window() {
+        let entries = vec![
+            log("review", "in_progress", Some("reject"), true),
+            log("review", "review", Some("reset_retry_window"), false),
+            log("review", "in_progress", Some("reject"), true),
+        ];
+
+        assert_eq!(count_gate_rejections_since_boundary(&entries, "review"), 1);
+    }
 }

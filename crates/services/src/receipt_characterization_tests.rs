@@ -890,6 +890,14 @@ async fn document_shell_replays_frozen_response_before_membership_and_rejects_ch
         .execute(fixture.db.pool())
         .await
         .expect("remove owner after the receipt committed");
+    // Project creation also materializes the owner in project_member; remove
+    // that row so the fresh idempotency key really exercises authorization.
+    sqlx::query("DELETE FROM project_member WHERE project_id = ? AND user_id = ?")
+        .bind(&fixture.project_id)
+        .bind(USER_ID)
+        .execute(fixture.db.pool())
+        .await
+        .expect("remove owner membership after the receipt committed");
     sqlx::query(
         "UPDATE project_document
          SET lifecycle = 'approved', current_draft_revision_id = 'later-revision',

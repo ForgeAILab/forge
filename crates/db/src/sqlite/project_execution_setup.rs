@@ -36,6 +36,12 @@ impl ProjectExecutionSetupCommandRepo for SqliteDb {
         let project = map_project(project_row)?;
 
         if let Some(receipt) = existing {
+            wake_dispatch_for_project_in_tx(
+                &mut transaction,
+                &input.project_id,
+                &input.receipt.committed_at,
+            )
+            .await?;
             transaction.commit().await?;
             return Ok(AppliedProjectExecutionSetupCommand {
                 project,
@@ -216,6 +222,18 @@ impl ProjectExecutionSetupCommandRepo for SqliteDb {
                 return Err(DbError::VersionConflict);
             }
         }
+
+        // Project repository/default-role changes are dispatch-governance
+        // inputs. Clear parked decisions before the receipt commits so a
+        // process crash cannot leave a committed setup mutation quiescing a
+        // Task forever. The service-level wake remains an idempotent repair
+        // for callers that use this boundary through older replay paths.
+        wake_dispatch_for_project_in_tx(
+            &mut transaction,
+            &input.project_id,
+            &input.receipt.committed_at,
+        )
+        .await?;
 
         DomainEventRepo::append_event_in_tx(
             self,

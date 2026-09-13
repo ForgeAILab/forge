@@ -1,4 +1,5 @@
 use super::*;
+use crate::workflow::engine::WorkflowAuthority;
 use api_types::{Actor, SystemComponent, UserActionSource};
 use db::UpdateTask;
 
@@ -99,7 +100,7 @@ impl TaskService {
             .map(|seconds| (chrono::Utc::now() + chrono::Duration::seconds(seconds)).to_rfc3339());
         let preserve_deferred_dispatch = defer_dispatch_until.is_some();
         let result = engine
-            .transition_with_deferred_dispatch(
+            .transition_with_deferred_dispatch_and_authority(
                 &task_id,
                 &new_status,
                 options.version,
@@ -108,6 +109,10 @@ impl TaskService {
                 &trigger_reason,
                 options.rejection,
                 defer_dispatch_until,
+                Some(WorkflowAuthority {
+                    project_version: project.version,
+                    workflow_definition: project.workflow_definition.clone(),
+                }),
             )
             .await?;
         // Entry/after-enter hooks can update metadata without changing the
@@ -142,8 +147,14 @@ impl TaskService {
             options.rejection,
             &options.triggered_by,
         ) {
-            task =
-                TaskRepo::set_review_passed_at(&*self.db, &task.id, None, &now_rfc3339()).await?;
+            task = TaskRepo::set_review_passed_at_cas(
+                &*self.db,
+                &task.id,
+                task.version,
+                None,
+                &now_rfc3339(),
+            )
+            .await?;
         }
         if previous_status == crate::workflow::default_states::PLANNING
             && (task.status != crate::workflow::default_states::PLANNING || options.rejection)
@@ -220,6 +231,147 @@ impl TaskService {
             task,
             review: result.review,
         })
+    }
+
+    /// Retry an integration step that was durably deferred by Project pause.
+    ///
+    /// A passed review remains in `review`; a pause that wins immediately
+    /// before the integration authority lock may leave the Task in `merging`.
+    /// Resume consumes the same marker in either state without creating a new
+    /// reviewer execution or accepting any unreviewed content.
+    pub(crate) async fn retry_paused_integration(&self, task: &Task) -> Result<bool> {
+        let Some(deferred) = crate::deferred_dispatch::paused_integration(task) else {
+            return Ok(false);
+        };
+        if deferred.state != task.status {
+            crate::deferred_dispatch::clear_paused_integration(&self.db, &task.id, &deferred)
+                .await?;
+            return Ok(false);
+        }
+
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        if project.paused_at.is_some() {
+            return Ok(false);
+        }
+        let actor = Actor::system(SystemComponent::TaskDispatcher);
+        let workflow =
+            WorkflowEngine::resolve_workflow_for_task(task, &project.workflow_definition, &actor);
+        let state = workflow
+            .states
+            .iter()
+            .find(|state| state.name == task.status)
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(WorkflowEngine::undefined_state_message(
+                    &task.status,
+                    &workflow,
+                ))
+            })?;
+
+        // The workflow engine deliberately returns a successful transition even
+        // when a log-policy hook reports `HookResult::Failed`; the failure is
+        // persisted in the transition log for diagnosis. Keep the pause marker
+        // until both the transition and its hook outcomes prove that the
+        // integration attempt actually completed. Clearing it before the hook
+        // runs strands a Task in `merging` after a transient Git/daemon error.
+        let prior_transition_ids = TransitionLogRepo::list_by_task(&*self.db, &task.id)
+            .await?
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect::<std::collections::HashSet<_>>();
+        let result = if state
+            .hooks
+            .on_enter
+            .iter()
+            .any(|hook| hook.action == "run_merge")
+        {
+            let engine = WorkflowEngine {
+                db: Arc::clone(&self.db),
+                event_bus: Arc::clone(&self.event_bus),
+                review_runner: self.review_runner.clone(),
+                merge_service: self.merge_service.clone(),
+                cleanup_scheduler: self.cleanup_scheduler.clone(),
+                task_executor: self.task_executor.clone(),
+                daemon_connections: self.daemon_connections.clone(),
+                workspace_exec_locks: self.workspace_exec_locks.clone(),
+                terminal_activity: self.terminal_activity.clone(),
+                workspace_root: self.workspace_root.clone(),
+                repo_cache_locks: self.repo_cache_locks.clone(),
+            };
+            engine
+                .manual_override_transition_with_authority(
+                    &task.id,
+                    &task.status,
+                    task.version,
+                    &workflow,
+                    actor,
+                    "resuming integration after project pause",
+                    false,
+                    Some(crate::workflow::engine::WorkflowAuthority {
+                        project_version: project.version,
+                        workflow_definition: project.workflow_definition.clone(),
+                    }),
+                )
+                .await
+                .map(|_| ())
+        } else if let Some(target) = workflow.auto_transition_target(&task.status) {
+            self.transition(
+                task.id.clone(),
+                target.to_owned(),
+                TransitionOptions {
+                    version: task.version,
+                    reason: Some("resuming integration after project pause".to_owned()),
+                    triggered_by: actor,
+                    rejection: false,
+                    defer_dispatch_seconds: None,
+                },
+            )
+            .await
+            .map(|_| ())
+        } else {
+            Err(ServiceError::invalid_operation(format!(
+                "state {} has no integration capability to resume",
+                task.status
+            )))
+        };
+
+        if let Err(error) = result {
+            // The marker is intentionally left in place for every failed
+            // admission/transition, not only the pause/version-conflict cases.
+            // A failed hook can be a transient workspace or provider failure,
+            // and the next active-recovery scan is the retry boundary.
+            if let Err(retain_error) = self.retain_paused_integration_marker(&task.id).await {
+                tracing::warn!(
+                    task_id = %task.id,
+                    %retain_error,
+                    "failed to refresh paused-integration marker after retry failure"
+                );
+            }
+            return Err(error);
+        }
+
+        if paused_integration_transition_failed(&self.db, &task.id, &prior_transition_ids).await? {
+            // The transition may have advanced `review -> merging` before its
+            // `run_merge` hook failed. Move the marker to the committed state
+            // so the next scan retries that exact integration capability.
+            self.retain_paused_integration_marker(&task.id).await?;
+            return Ok(false);
+        }
+
+        // Success is the only point at which the durable pause marker may be
+        // consumed. If this metadata update fails, the marker remains and the
+        // retry is harmlessly idempotent.
+        crate::deferred_dispatch::clear_paused_integration(&self.db, &task.id, &deferred).await?;
+        Ok(true)
+    }
+
+    async fn retain_paused_integration_marker(&self, task_id: &str) -> Result<()> {
+        if let Some(current) = TaskRepo::get_by_id(&*self.db, task_id, false).await? {
+            crate::deferred_dispatch::refresh_paused_integration_for_pause(&self.db, &current)
+                .await?;
+        }
+        Ok(())
     }
 
     pub(super) async fn ensure_planning_plan_ready_before_leaving(
@@ -464,19 +616,28 @@ impl TaskService {
             &project.workflow_definition,
             &Actor::system(SystemComponent::General),
         );
-        let state = workflow
+        // Manual rejection is recorded while the task is being bounced to
+        // `in_progress`, but its budget belongs to the review gate that
+        // produced the rejection.  Resolving the current active state here
+        // would select `in_progress` and count a different/empty budget.
+        let review_state = workflow
             .states
             .iter()
-            .find(|state| state.name == task.status);
+            .find(|state| state.name == default_states::REVIEW);
         let max_retries = super::config::runtime_retry_budget(
             &task,
             super::config::RetryBudgetKind::Review,
-            state.map(|state| &state.config),
-            state.and_then(|state| state.gate_config.as_ref()),
+            review_state.map(|state| &state.config),
+            review_state.and_then(|state| state.gate_config.as_ref()),
         )?;
 
-        let attempts = self.executor_attempt_count(task_id).await?;
-        let remaining = i64::from(max_retries) + 1 - attempts;
+        let used = crate::task_diagnostics::count_gate_rejections_for_task(
+            &self.db,
+            task_id,
+            default_states::REVIEW,
+        )
+        .await?;
+        let remaining = i64::from(max_retries) - used;
         Ok(remaining.clamp(0, i64::from(i32::MAX)) as i32)
     }
 
@@ -657,7 +818,7 @@ impl TaskService {
             repo_cache_locks: self.repo_cache_locks.clone(),
         };
         let result = engine
-            .manual_override_transition(
+            .manual_override_transition_with_authority(
                 &task_id,
                 &target,
                 task.version,
@@ -665,6 +826,10 @@ impl TaskService {
                 Actor::user(UserActionSource::ManualAdvance),
                 "manual advance",
                 false,
+                Some(crate::workflow::engine::WorkflowAuthority {
+                    project_version: project.version,
+                    workflow_definition: project.workflow_definition.clone(),
+                }),
             )
             .await?;
         let task = clear_manual_advance_error_annotation(&self.db, &task, result.task).await?;
@@ -758,6 +923,36 @@ impl TaskService {
     }
 }
 
+async fn paused_integration_transition_failed(
+    db: &db::SqliteDb,
+    task_id: &str,
+    prior_transition_ids: &std::collections::HashSet<String>,
+) -> Result<bool> {
+    let entries = TransitionLogRepo::list_by_task(db, task_id).await?;
+    Ok(entries
+        .into_iter()
+        .filter(|entry| !prior_transition_ids.contains(&entry.id))
+        .any(|entry| {
+            let Some(raw_results) = entry.hook_results_json.as_deref() else {
+                // The engine normally persists `[]` even for a transition
+                // without hooks. A missing result payload means the outcome is
+                // unknown, so retain the marker rather than falsely consuming
+                // a deferred integration.
+                return true;
+            };
+            let Ok(results) = serde_json::from_str::<Vec<api_types::HookResultEntry>>(raw_results)
+            else {
+                return true;
+            };
+            results.iter().any(|result| {
+                result.outcome == "failed"
+                    // `run_merge` uses Skipped for the pause/no-worktree
+                    // boundary; neither outcome completed integration.
+                    || (result.action == "run_merge" && result.outcome == "skipped")
+            })
+        }))
+}
+
 impl TaskService {
     pub(super) async fn cancel_active_execution_for_user_transition(
         &self,
@@ -782,23 +977,8 @@ impl TaskService {
             return Ok(());
         }
 
-        let page = ExecutionRepo::list_by_task(
-            &*self.db,
-            &task.id,
-            PageRequest {
-                cursor: None,
-                limit: 20,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Desc,
-            },
-        )
-        .await?;
-        for execution in page
-            .items
-            .into_iter()
-            .filter(|execution| execution.status == ExecutionStatus::Running)
-        {
+        let executions = ExecutionRepo::list_running_by_task(&*self.db, &task.id).await?;
+        for execution in executions {
             self.cancel_active_execution(
                 &execution,
                 "cancelled by user transition",
@@ -826,23 +1006,8 @@ impl TaskService {
         reason: &str,
         actor: Actor,
     ) -> Result<()> {
-        let page = ExecutionRepo::list_by_task(
-            &*self.db,
-            &task.id,
-            PageRequest {
-                cursor: None,
-                limit: 100,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Desc,
-            },
-        )
-        .await?;
-        for execution in page
-            .items
-            .into_iter()
-            .filter(|execution| execution.status == ExecutionStatus::Running)
-        {
+        let executions = ExecutionRepo::list_running_by_task(&*self.db, &task.id).await?;
+        for execution in executions {
             self.cancel_active_execution(
                 &execution,
                 reason,
@@ -954,24 +1119,43 @@ pub(super) async fn clear_manual_review_awaiting_metadata(
     let current = TaskRepo::get_by_id(db, &task.id, false)
         .await?
         .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
-    let mut metadata = TaskMetadata::parse(current.metadata_json.as_deref()).map_err(|error| {
+    let metadata = TaskMetadata::parse(current.metadata_json.as_deref()).map_err(|error| {
         ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
     })?;
-    if metadata
+    let Some(reason) = metadata
         .extra
         .get("awaiting_human_reason")
         .and_then(Value::as_str)
-        != Some("manual_review")
-    {
+    else {
+        return Ok(current);
+    };
+    if reason != "manual_review" {
         return Ok(current);
     }
 
-    metadata.extra.remove("awaiting_human");
-    metadata.extra.remove("awaiting_human_reason");
-    TaskRepo::set_metadata_json(db, &task.id, metadata.to_json(), &now_rfc3339()).await?;
-    TaskRepo::get_by_id(db, &task.id, false)
-        .await?
-        .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))
+    let Some(expected) = metadata.extra.get("awaiting_human_marker_id").cloned() else {
+        // Legacy markers have no identity that can distinguish this clear
+        // from a newer manual-review marker with the same reason.
+        return Ok(current);
+    };
+    let mutations = vec![db::TaskMetadataMutation::CompareAndMutate {
+        key: "awaiting_human_marker_id".to_owned(),
+        expected,
+        mutations: vec![
+            db::TaskMetadataMutation::Remove {
+                key: "awaiting_human".to_owned(),
+            },
+            db::TaskMetadataMutation::Remove {
+                key: "awaiting_human_reason".to_owned(),
+            },
+            db::TaskMetadataMutation::Remove {
+                key: "awaiting_human_marker_id".to_owned(),
+            },
+        ],
+    }];
+    TaskRepo::mutate_metadata(db, &task.id, None, mutations, &now_rfc3339())
+        .await
+        .map_err(Into::into)
 }
 
 pub(super) fn should_clear_transient_error_annotation(task: &Task) -> bool {

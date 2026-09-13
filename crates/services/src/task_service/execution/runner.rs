@@ -380,7 +380,7 @@ impl TaskService {
         // clear, concurrent transition) fails the exact-match verify; recover
         // once through the normal issuance path instead of hard-failing, and
         // keep working against the fresh Task row.
-        let task = self
+        let task = match self
             .verify_or_reissue_active_workspace_lease(
                 task,
                 &workspace,
@@ -388,7 +388,24 @@ impl TaskService {
                 execution.agent_id.as_deref(),
                 &execution.id,
             )
-            .await?;
+            .await
+        {
+            Ok(task) => task,
+            Err(error) => {
+                let failure_message = error.to_string();
+                if let Err(mark_error) = self
+                    .fail_execution_before_dispatch(&execution.id, failure_message)
+                    .await
+                {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        %mark_error,
+                        "failed to terminalize execution after initial WorkspaceLease reissue failure"
+                    );
+                }
+                return Err(error);
+            }
+        };
         let snapshot = execution
             .executor_config_snapshot_json
             .as_deref()
@@ -401,9 +418,10 @@ impl TaskService {
         {
             executors::mark_worktree_read_only(&mut agent_config);
         }
-        if agent_config.get("executor_type").and_then(Value::as_str) == Some("embedded") {
-            crate::embedded_task_executor::set_task_role_marker(&mut agent_config, &execution.role);
-        }
+        // The role is runtime authority selected by the workflow. Stamp it
+        // after loading the immutable profile snapshot so every local CLI,
+        // fallback candidate, and embedded runtime receives the same scope.
+        executors::mark_task_role(&mut agent_config, &execution.role);
         // Provider-entry-backed harness agents get their API key injected into
         // the in-memory snapshot only; the stored snapshot never holds it.
         if let Some(credential_env) = self.credential_env.as_ref() {
@@ -512,23 +530,26 @@ impl TaskService {
         // bindings and acknowledge the lease immediately before handing
         // control to an executor.  A stale lease left behind by a Task-row
         // mutation is reissued once through the normal issuance path.
-        if let Err(error) = self
+        let task = match self
             .verify_or_reissue_execution_workspace_authority(&execution_before_launch)
             .await
         {
-            let failure_message = error.to_string();
-            if let Err(mark_error) = self
-                .fail_execution_before_dispatch(&execution_before_launch.id, failure_message)
-                .await
-            {
-                tracing::warn!(
-                    execution_id = %execution_before_launch.id,
-                    %mark_error,
-                    "failed to terminalize execution after final WorkspaceLease verification failure"
-                );
+            Ok(task) => task,
+            Err(error) => {
+                let failure_message = error.to_string();
+                if let Err(mark_error) = self
+                    .fail_execution_before_dispatch(&execution_before_launch.id, failure_message)
+                    .await
+                {
+                    tracing::warn!(
+                        execution_id = %execution_before_launch.id,
+                        %mark_error,
+                        "failed to terminalize execution after final WorkspaceLease verification failure"
+                    );
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
 
         // Freeze one pricing selection for every candidate before handing
         // control to an executor. The neutral executor hook below starts an
@@ -1028,12 +1049,21 @@ impl TaskService {
                 noop_completion_baseline.as_ref()
             {
                 let worktree_path = std::path::Path::new(&workspace.worktree_path);
-                let clean = git::is_worktree_clean(worktree_path).await.unwrap_or(false);
                 // Nothing committed on this branch at all, not merely nothing
-                // committed by this pass.
+                // committed by this pass. Check HEAD first so a successfully
+                // finalized run never invokes another repository status
+                // command. The remaining no-op diagnostic uses the same
+                // fail-closed Git policy as host-side finalization.
                 let branch_empty = git::get_current_sha(worktree_path).await.ok().as_deref()
                     == Some(branch_point.as_str());
-                if clean && branch_empty {
+                let clean = if branch_empty {
+                    cli_adapters::commit::is_worktree_clean_for_finalization(worktree_path)
+                        .await
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                if branch_empty && clean {
                     let task_after = TaskRepo::get_by_id(&*self.db, &task.id, false)
                         .await?
                         .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
@@ -1791,6 +1821,7 @@ impl TaskService {
         {
             executors::mark_worktree_read_only(&mut executor_config);
         }
+        executors::mark_task_role(&mut executor_config, &execution.role);
         let executor_type = executor_config
             .get("executor_type")
             .and_then(Value::as_str)

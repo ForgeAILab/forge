@@ -1,4 +1,4 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{collections::HashSet, path::Path as FsPath};
 
 use api_types::{
     parse_project_hooks_json, CiStepAnalytics, CostCoverage,
@@ -17,8 +17,8 @@ use axum::{
 };
 use db::{
     new_uuid_v4, now_rfc3339, AgentProfileRepo, AgentRepo, CiStepStats, CreateProject, PageRequest,
-    ProjectAnalyticsRepo, ProjectHookRun, ProjectHookRunRepo, ProjectRepo, ProjectReviewSummary,
-    RepoRepo, SortBy, SortOrder, UpdateProject, UsageAnalyticsRepo,
+    ProjectAnalyticsRepo, ProjectDeletionPaths, ProjectHookRun, ProjectHookRunRepo, ProjectRepo,
+    ProjectReviewSummary, SortBy, SortOrder, UpdateProject, UsageAnalyticsRepo,
 };
 use events::{event_timestamp, EventContext, ForgeEvent};
 use serde::Deserialize;
@@ -33,7 +33,7 @@ use services::{
 use crate::{
     errors::{ApiError, ApiResult},
     routes::auth::AuthenticatedUser,
-    routes::{page_request, project_response, ListParams},
+    routes::{page_request, project_agents::require_project_admin, project_response, ListParams},
     state::AppState,
 };
 
@@ -347,265 +347,499 @@ pub async fn update_project_workflow(
 
     let workflow_definition = serde_json::to_string(&definition)?;
     let updated_at = now_rfc3339();
-    let result = sqlx::query(
-        "UPDATE project SET workflow_definition = ?, workflow_template_name = ?, updated_at = ? WHERE id = ?",
+    // Workflow edits change the role/capability decision for every parked
+    // Task. Persist the edit, clear stale deterministic refusals, and bump
+    // each affected Task version in one DB transaction so neither a crash nor
+    // a stale dispatcher can restore the old refusal.
+    ProjectRepo::update_workflow(
+        &*state.db,
+        &id,
+        &workflow_definition,
+        workflow_template_name.as_deref(),
+        project.version,
+        &updated_at,
     )
-    .bind(&workflow_definition)
-    .bind(&workflow_template_name)
-    .bind(&updated_at)
-    .bind(&id)
-    .execute(state.db.pool())
-    .await
-    .map_err(db::DbError::from)?;
-
-    if result.rows_affected() == 0 {
-        return Err(ApiError::not_found("project", id));
-    }
+    .await?;
 
     Ok(Json(definition))
 }
 
+/// `?force=true` is the caller's explicit decision to destroy in-flight agent
+/// work. Without it, a Project holding a running Execution or an active
+/// Workspace lease is refused with `409 project_in_use`.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct DeleteProjectQuery {
+    #[serde(default)]
+    pub force: bool,
+}
+
 pub async fn delete_project(
     State(state): State<AppState>,
+    user: AuthenticatedUser,
     Path(id): Path<String>,
+    Query(query): Query<DeleteProjectQuery>,
 ) -> ApiResult<StatusCode> {
-    ProjectRepo::get_by_id(&*state.db, &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", id.clone()))?;
-    let staged_paths = stage_project_owned_paths(&state, &id).await?;
-    if let Err(error) = ProjectRepo::delete(&*state.db, &id).await {
-        restore_staged_paths(&staged_paths).await;
-        return Err(error.into());
-    }
-    let mut cleanup_failed = false;
-    for staged in &staged_paths {
-        if let Err(error) = tokio::fs::remove_dir_all(&staged.staged).await {
-            cleanup_failed = true;
-            tracing::error!(
-                project_id = %id,
-                path = %staged.staged.display(),
-                error = %error,
-                "Project database teardown committed but a staged Project-owned path could not be removed"
-            );
+    // Authorization must precede both the in-use counts and filesystem
+    // cleanup. `require_project_admin` intentionally returns a project-scoped
+    // 404 for callers who are not members, avoiding an existence/count oracle.
+    require_project_admin(&state, &id, &user.user_id).await?;
+
+    const MAX_FORCE_DELETE_ATTEMPTS: usize = 3;
+    let mut attempt = 0;
+    let late_project_paths = loop {
+        // Force retries are bounded so a continuously-admitted execution or
+        // lease produces a truthful 409 instead of an unbounded cancellation
+        // loop.
+        if query.force {
+            // Force is an active cancellation request, not merely permission
+            // to cascade away a still-live execution row. Provider failures
+            // leave the Project intact and are surfaced to the caller.
+            state.task_service.prepare_project_deletion(&id).await?;
+        } else {
+            // Run the guarded DB decision before touching any path. The final
+            // delete below repeats this check to close the admission race.
+            ProjectRepo::ensure_deletable(&*state.db, &id).await?;
         }
-    }
+
+        if query.force {
+            // Re-check immediately before the final DB boundary. A new
+            // execution or lease admitted after the first cancellation pass
+            // is handled by this pass or by the final in-use CAS below.
+            state.task_service.prepare_project_deletion(&id).await?;
+        }
+
+        // The service has already terminalized/revoked force-mode activity.
+        // The DB method repeats the in-use guard under BEGIN IMMEDIATE for
+        // both modes, so a new execution or lease cannot be silently deleted.
+        match ProjectRepo::delete_with_workspace_paths(&*state.db, &id).await {
+            Ok(project_paths) => break project_paths,
+            Err(db::DbError::ProjectInUse { .. })
+                if query.force && attempt + 1 < MAX_FORCE_DELETE_ATTEMPTS =>
+            {
+                attempt += 1;
+                continue;
+            }
+            Err(db::DbError::ProjectInUse {
+                project_id,
+                running_executions,
+                active_leases,
+            }) if query.force => {
+                return Err(ApiError::conflict_with_code_and_details(
+                    "project_in_use",
+                    format!(
+                        "project {project_id} remains in use after force-delete cancellation; deletion was not performed"
+                    ),
+                    serde_json::json!({
+                        "project_id": project_id,
+                        "running_executions": running_executions,
+                        "active_leases": active_leases,
+                        "force_cancellation_incomplete": true,
+                    }),
+                ));
+            }
+            Err(error) => {
+                return Err(error.into());
+            }
+        }
+    };
+    // No Project-owned filesystem path is mutated before the authoritative DB
+    // commit. The final transaction returns exact workspace/repository paths
+    // (and Task IDs for orphan worktree directories) so this pass can clean
+    // only the deleted Project's confined targets after commit.
+    cleanup_project_owned_paths(&state, &id, &late_project_paths).await;
     state.event_bus.publish(ForgeEvent {
         event_type: "project.deleted".to_owned(),
         entity_id: id.clone(),
         timestamp: event_timestamp(),
         context: EventContext::ProjectDeleted {},
     });
-    if cleanup_failed {
-        return Err(ApiError::internal(
-            "Project was deleted, but staged Project-owned filesystem cleanup failed",
-        ));
-    }
+    // The authoritative DB deletion already committed. Returning a 500 here
+    // would invite an unsafe retry even though the Project no longer exists;
+    // failed filesystem cleanup is recorded in the error log for recovery.
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Debug)]
-struct StagedPathRemoval {
-    original: PathBuf,
-    staged: PathBuf,
-}
-
-async fn stage_project_owned_paths(
+async fn cleanup_project_owned_paths(
     state: &AppState,
     project_id: &str,
-) -> ApiResult<Vec<StagedPathRemoval>> {
-    let mut staged = Vec::new();
-    let mut seen = HashSet::new();
-
-    if let Err(error) =
-        stage_managed_project_repositories(state, project_id, &mut staged, &mut seen).await
-    {
-        restore_staged_paths(&staged).await;
-        return Err(error);
-    }
-    if let Err(error) = stage_task_workspaces(state, project_id, &mut staged, &mut seen).await {
-        restore_staged_paths(&staged).await;
-        return Err(error);
-    }
-    if let Err(error) =
-        stage_project_agent_workspace(state, project_id, &mut staged, &mut seen).await
-    {
-        restore_staged_paths(&staged).await;
-        return Err(error);
-    }
-
-    Ok(staged)
-}
-
-async fn stage_managed_project_repositories(
-    state: &AppState,
-    project_id: &str,
-    staged: &mut Vec<StagedPathRemoval>,
-    seen: &mut HashSet<PathBuf>,
-) -> ApiResult<()> {
-    let managed_root = state.effective_config.workspace.root.join("repos");
-    let cache_root = state.effective_config.workspace.root.join(".repos");
-    let canonical_managed_root = canonicalize_optional(&managed_root).await?;
-    let canonical_cache_root = canonicalize_optional(&cache_root).await?;
-    if canonical_managed_root.is_none() && canonical_cache_root.is_none() {
-        return Ok(());
-    }
-    let mut cursor = None;
-    loop {
-        let repos = RepoRepo::list_by_project(
-            &*state.db,
-            project_id,
-            PageRequest {
-                cursor,
-                limit: 500,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Asc,
-            },
-        )
-        .await?;
-        for repo in repos.items {
-            if let (Some(canonical_root), Some(local_path)) = (
-                canonical_managed_root.as_deref(),
-                repo.local_path.as_deref(),
-            ) {
-                stage_direct_child(
-                    canonical_root,
-                    &PathBuf::from(local_path),
-                    staged,
-                    seen,
-                    "managed Project repository",
-                )
-                .await?;
-            }
-            if let Some(canonical_root) = canonical_cache_root.as_deref() {
-                stage_direct_child(
-                    canonical_root,
-                    &canonical_root.join(&repo.id),
-                    staged,
-                    seen,
-                    "managed repository cache",
-                )
-                .await?;
-            }
-        }
-        let Some(next_cursor) = repos.next_cursor else {
-            break;
-        };
-        cursor = Some(next_cursor);
-    }
-    Ok(())
-}
-
-async fn stage_task_workspaces(
-    state: &AppState,
-    project_id: &str,
-    staged: &mut Vec<StagedPathRemoval>,
-    seen: &mut HashSet<PathBuf>,
-) -> ApiResult<()> {
-    let Some(canonical_root) =
-        canonicalize_optional(&state.effective_config.workspace.root).await?
-    else {
-        return Ok(());
-    };
-    let task_ids = sqlx::query_scalar::<_, String>("SELECT id FROM task WHERE project_id = ?")
-        .bind(project_id)
-        .fetch_all(state.db.pool())
-        .await
-        .map_err(db::DbError::from)?;
-    for task_id in task_ids {
-        stage_direct_child(
-            &canonical_root,
-            &canonical_root.join(task_id),
-            staged,
-            seen,
+    project_paths: &ProjectDeletionPaths,
+) {
+    let workspace_root = state.effective_config.workspace.root.clone();
+    for task_id in &project_paths.task_ids {
+        // A new Task may reuse the captured task ID after the Project delete
+        // commits. The ownership check and quarantine rename share the DB
+        // write lock, so a creator cannot claim the ID between the check and
+        // reservation.
+        match remove_confined_direct_child_if_unowned(
+            state,
+            "SELECT 1 FROM task WHERE id = ? LIMIT 1",
+            task_id,
+            &workspace_root,
+            &workspace_root.join(task_id),
             "Task workspace",
         )
-        .await?;
+        .await
+        {
+            Ok(true) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    task_id,
+                    "skipping Project task-path cleanup because the Task ID is live again"
+                );
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(
+                    project_id = %project_id,
+                    task_id,
+                    ?error,
+                    "skipping Project task-path cleanup because ownership could not be rechecked"
+                );
+                continue;
+            }
+        }
     }
-    Ok(())
-}
+    for path in &project_paths.workspace_paths {
+        // Worktree paths are not globally unique in SQLite. A different live
+        // Workspace may have claimed this path while the deleted Project's
+        // cleanup was pending. The live-row check and quarantine rename are
+        // serialized under BEGIN IMMEDIATE, so never remove it after a claim
+        // wins.
+        match remove_confined_direct_child_if_unowned(
+            state,
+            "SELECT 1 FROM workspace WHERE worktree_path = ? LIMIT 1",
+            path,
+            &workspace_root,
+            FsPath::new(path),
+            "Task workspace",
+        )
+        .await
+        {
+            Ok(true) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    path,
+                    "skipping Project workspace cleanup because the path is live again"
+                );
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(
+                    project_id = %project_id,
+                    path,
+                    ?error,
+                    "skipping Project workspace cleanup because ownership could not be rechecked"
+                );
+                continue;
+            }
+        }
+    }
 
-async fn stage_project_agent_workspace(
-    state: &AppState,
-    project_id: &str,
-    staged: &mut Vec<StagedPathRemoval>,
-    seen: &mut HashSet<PathBuf>,
-) -> ApiResult<()> {
-    let projects_root = state.effective_config.forge.data_dir.join("projects");
-    let Some(canonical_root) = canonicalize_optional(&projects_root).await? else {
-        return Ok(());
-    };
-    stage_direct_child(
-        &canonical_root,
-        &canonical_root.join(project_id),
-        staged,
-        seen,
+    let managed_root = workspace_root.join("repos");
+    for repository in &project_paths.repository_paths {
+        if let Some(local_path) = repository.local_path.as_deref() {
+            // `repo.local_path` is not unique. Another Project can attach the
+            // same directory after this deletion commits; the live-row check
+            // and quarantine rename are serialized under BEGIN IMMEDIATE.
+            match remove_confined_direct_child_if_unowned(
+                state,
+                "SELECT 1 FROM repo WHERE local_path = ? LIMIT 1",
+                local_path,
+                &managed_root,
+                FsPath::new(local_path),
+                "managed Project repository",
+            )
+            .await
+            {
+                Ok(true) => {
+                    tracing::warn!(
+                        project_id = %project_id,
+                        repo_id = %repository.id,
+                        path = local_path,
+                        "skipping managed repository cleanup because the path is live again"
+                    );
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(
+                        project_id = %project_id,
+                        repo_id = %repository.id,
+                        path = local_path,
+                        ?error,
+                        "skipping managed repository cleanup because ownership could not be rechecked"
+                    );
+                    continue;
+                }
+            }
+        }
+    }
+
+    let cache_root = workspace_root.join(".repos");
+    for repository in &project_paths.repository_paths {
+        // Cache directories are keyed by repository ID. Do not remove a
+        // cache that has already been reintroduced under a live Repo row; the
+        // ownership check and quarantine rename share the DB write lock.
+        match remove_confined_direct_child_if_unowned(
+            state,
+            "SELECT 1 FROM repo WHERE id = ? LIMIT 1",
+            &repository.id,
+            &cache_root,
+            &cache_root.join(&repository.id),
+            "managed repository cache",
+        )
+        .await
+        {
+            Ok(true) => {
+                tracing::warn!(
+                    project_id = %project_id,
+                    repo_id = %repository.id,
+                    "skipping repository-cache cleanup because the Repo ID is live again"
+                );
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(
+                    project_id = %project_id,
+                    repo_id = %repository.id,
+                    ?error,
+                    "skipping repository-cache cleanup because ownership could not be rechecked"
+                );
+                continue;
+            }
+        }
+    }
+
+    let project_root = state.effective_config.forge.data_dir.join("projects");
+    // A Project ID can be explicitly reused after deletion. Preserve a live
+    // replacement's Agent workspace rather than deleting it as stale cleanup;
+    // the check and quarantine rename share the DB write lock.
+    match remove_confined_direct_child_if_unowned(
+        state,
+        "SELECT 1 FROM project WHERE id = ? LIMIT 1",
+        project_id,
+        &project_root,
+        &project_root.join(project_id),
         "Project Agent workspace",
     )
     .await
-}
-
-async fn canonicalize_optional(path: &std::path::Path) -> ApiResult<Option<PathBuf>> {
-    match tokio::fs::canonicalize(path).await {
-        Ok(path) => Ok(Some(path)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(ApiError::internal(format!(
-            "resolve Project-owned filesystem root: {error}"
-        ))),
+    {
+        Ok(true) => {
+            tracing::warn!(
+                project_id = %project_id,
+                "skipping Project Agent workspace cleanup because the Project ID is live again"
+            );
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::error!(
+                project_id = %project_id,
+                ?error,
+                "skipping Project Agent workspace cleanup because ownership could not be rechecked"
+            );
+        }
     }
 }
 
-async fn stage_direct_child(
-    canonical_root: &std::path::Path,
+/// Re-check a captured filesystem target against live authoritative rows and
+/// reserve it while holding SQLite's write lock. Paths are not globally unique,
+/// so a later Project/Task/Workspace may have claimed the same path after the
+/// deletion transaction captured it. The ownership check and an O(1) rename to
+/// a unique quarantine child share `BEGIN IMMEDIATE`, preventing a creator
+/// from claiming the target between the check and reservation. The recursive
+/// removal runs only after the transaction commits, so SQLite's writer lock is
+/// not held for the duration of filesystem cleanup. Any read/lock/rename or
+/// removal failure is returned so callers can skip cleanup rather than risk
+/// deleting another owner's path.
+async fn remove_confined_direct_child_if_unowned(
+    state: &AppState,
+    ownership_query: &str,
+    ownership_value: &str,
+    root: &std::path::Path,
     candidate: &std::path::Path,
-    staged: &mut Vec<StagedPathRemoval>,
-    seen: &mut HashSet<PathBuf>,
+    kind: &str,
+) -> ApiResult<bool> {
+    let mut transaction = db::begin_immediate(state.db.pool())
+        .await
+        .map_err(|error| ApiError::internal(format!("lock Project cleanup ownership: {error}")))?;
+    let live = sqlx::query_scalar::<_, i64>(ownership_query)
+        .bind(ownership_value)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|error| ApiError::internal(format!("recheck Project cleanup ownership: {error}")))?
+        .is_some();
+    if live {
+        transaction.commit().await.map_err(|error| {
+            ApiError::internal(format!("release Project cleanup lock: {error}"))
+        })?;
+        return Ok(true);
+    }
+
+    let quarantine = quarantine_confined_direct_child(root, candidate, kind).await?;
+    if let Err(error) = transaction.commit().await {
+        if let Some(quarantine) = quarantine {
+            // The ownership reservation did not commit. Preserve the bytes:
+            // restore the original name when it is still free, otherwise
+            // leave the unique quarantine in place for operator recovery.
+            let candidate_is_free = match tokio::fs::symlink_metadata(candidate).await {
+                Err(candidate_error) if candidate_error.kind() == std::io::ErrorKind::NotFound => {
+                    true
+                }
+                Ok(_) => false,
+                Err(candidate_error) => {
+                    tracing::error!(
+                        path = %candidate.display(),
+                        error = %candidate_error,
+                        "failed to inspect Project cleanup target after lock commit failure"
+                    );
+                    false
+                }
+            };
+            if candidate_is_free {
+                if let Err(restore_error) = tokio::fs::rename(&quarantine, candidate).await {
+                    tracing::error!(
+                        quarantine = %quarantine.display(),
+                        path = %candidate.display(),
+                        error = %restore_error,
+                        "failed to restore Project cleanup quarantine after lock commit failure"
+                    );
+                }
+            } else {
+                tracing::error!(
+                    quarantine = %quarantine.display(),
+                    path = %candidate.display(),
+                    "preserving Project cleanup quarantine because the original path is occupied"
+                );
+            }
+        }
+        return Err(ApiError::internal(format!(
+            "commit Project cleanup lock: {error}"
+        )));
+    }
+    if let Some(quarantine) = quarantine {
+        tokio::fs::remove_dir_all(&quarantine)
+            .await
+            .map_err(|error| {
+                ApiError::internal(format!("remove {kind} cleanup quarantine: {error}"))
+            })?;
+    }
+    Ok(false)
+}
+
+/// Atomically move an eligible direct child to a unique quarantine sibling.
+/// The caller must hold the DB ownership lock while invoking this function;
+/// the rename is deliberately separate from recursive removal so the lock is
+/// held only for the short path reservation.
+async fn quarantine_confined_direct_child(
+    root: &std::path::Path,
+    candidate: &std::path::Path,
+    kind: &str,
+) -> ApiResult<Option<std::path::PathBuf>> {
+    let canonical_root = match tokio::fs::canonicalize(root).await {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ApiError::internal(format!(
+                "resolve Project-owned root after deletion: {error}"
+            )));
+        }
+    };
+    let metadata = match tokio::fs::symlink_metadata(candidate).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ApiError::internal(format!(
+                "inspect {kind} after Project deletion: {error}"
+            )));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(None);
+    }
+    let canonical = tokio::fs::canonicalize(candidate).await.map_err(|error| {
+        ApiError::internal(format!("resolve {kind} after Project deletion: {error}"))
+    })?;
+    if canonical.parent() != Some(canonical_root.as_path()) {
+        return Ok(None);
+    }
+    let metadata = match tokio::fs::symlink_metadata(candidate).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ApiError::internal(format!(
+                "re-inspect {kind} after Project deletion: {error}"
+            )));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(None);
+    }
+    let quarantine = canonical_root.join(format!(".forge-project-delete-{}", new_uuid_v4()));
+    tokio::fs::rename(candidate, &quarantine)
+        .await
+        .map_err(|error| ApiError::internal(format!("quarantine {kind}: {error}")))?;
+    Ok(Some(quarantine))
+}
+
+/// Remove a directory only when it is an existing, non-symlink direct child
+/// of the supplied Forge-controlled root. This runs after the DB commit, so
+/// there is no rollback rename and no live worktree is exposed to an
+/// execution while a deletion is still provisional.
+#[cfg(test)]
+async fn remove_confined_direct_child(
+    root: &std::path::Path,
+    candidate: &std::path::Path,
     kind: &str,
 ) -> ApiResult<()> {
-    let candidate_metadata = match tokio::fs::symlink_metadata(candidate).await {
+    let canonical_root = match tokio::fs::canonicalize(root).await {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(ApiError::internal(format!(
+                "resolve Project-owned root after deletion: {error}"
+            )));
+        }
+    };
+    let metadata = match tokio::fs::symlink_metadata(candidate).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
             return Err(ApiError::internal(format!(
-                "inspect {kind} before Project deletion: {error}"
+                "inspect {kind} after Project deletion: {error}"
             )));
         }
     };
-    // Never follow a persisted or corrupted symlink, even when it resolves to
-    // another direct child of a Forge-controlled root.
-    if candidate_metadata.file_type().is_symlink() || !candidate_metadata.is_dir() {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Ok(());
     }
-    let Some(canonical) = canonicalize_optional(candidate).await? else {
-        return Ok(());
-    };
-    // Project deletion owns only direct children of Forge-controlled roots.
-    // A linked repository elsewhere on disk is never followed.
-    if canonical.parent() != Some(canonical_root) || !seen.insert(canonical.clone()) {
+    let canonical = tokio::fs::canonicalize(candidate).await.map_err(|error| {
+        ApiError::internal(format!("resolve {kind} after Project deletion: {error}"))
+    })?;
+    if canonical.parent() != Some(canonical_root.as_path()) {
         return Ok(());
     }
-    let tombstone = canonical_root.join(format!(".forge-project-delete-{}", new_uuid_v4()));
-    tokio::fs::rename(&canonical, &tombstone)
-        .await
-        .map_err(|error| ApiError::internal(format!("stage {kind} for deletion: {error}")))?;
-    staged.push(StagedPathRemoval {
-        original: canonical,
-        staged: tombstone,
-    });
-    Ok(())
-}
-
-async fn restore_staged_paths(staged: &[StagedPathRemoval]) {
-    for path in staged.iter().rev() {
-        if let Err(error) = tokio::fs::rename(&path.staged, &path.original).await {
-            tracing::error!(
-                path = %path.staged.display(),
-                restore_path = %path.original.display(),
-                error = %error,
-                "failed to restore a Project-owned path after Project teardown rolled back"
-            );
+    // Resolve only for the confinement check, then remove through the
+    // original direct-child path.  `remove_dir_all` does not follow a
+    // top-level symlink, so a concurrent replacement cannot redirect this
+    // cleanup to a different canonical target between these two operations.
+    let metadata = match tokio::fs::symlink_metadata(candidate).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(ApiError::internal(format!(
+                "re-inspect {kind} after Project deletion: {error}"
+            )));
         }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(());
     }
+    tokio::fs::remove_dir_all(candidate).await.map_err(|error| {
+        ApiError::internal(format!("remove {kind} after Project deletion: {error}"))
+    })
 }
 
 pub async fn pause_project(
@@ -1140,16 +1374,14 @@ fn review_summary_analytics(summary: ProjectReviewSummary) -> ReviewSummaryAnaly
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use api_types::{
         CostCoverage, CostKind, CostSummary, MoneyAmount, OutcomeEligibility,
         OutcomeIneligibilityReason, TokenCounters, UsageCostCoverage,
     };
 
     use super::{
-        is_legacy_manual_default_assignee, released_milestone_outcome, restore_staged_paths,
-        stage_direct_child, validate_analytics_window, StagedPathRemoval,
+        is_legacy_manual_default_assignee, released_milestone_outcome,
+        remove_confined_direct_child, validate_analytics_window,
     };
 
     fn cost_summary(coverage: CostCoverage, complete_total: Option<&str>) -> CostSummary {
@@ -1294,37 +1526,9 @@ mod tests {
         assert_eq!(eligible.amount_per_outcome.unwrap().decimal, "1.5");
     }
 
-    #[tokio::test]
-    async fn staged_path_restore_reverses_each_rename() {
-        let root = std::env::temp_dir().join(format!(
-            "forge-project-delete-restore-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let original = root.join("repo");
-        let staged = root.join(".forge-project-delete-test");
-        tokio::fs::create_dir_all(&staged)
-            .await
-            .expect("staged repository fixture");
-        tokio::fs::write(staged.join("tracked"), b"preserved")
-            .await
-            .expect("repository content");
-
-        restore_staged_paths(&[StagedPathRemoval {
-            original: original.clone(),
-            staged: staged.clone(),
-        }])
-        .await;
-
-        assert!(original.join("tracked").is_file());
-        assert!(!staged.exists());
-        tokio::fs::remove_dir_all(&root)
-            .await
-            .expect("remove temporary managed repo root");
-    }
-
     #[cfg(unix)]
     #[tokio::test]
-    async fn staged_path_never_follows_a_symlink_to_a_sibling() {
+    async fn post_commit_cleanup_never_follows_a_symlink_to_a_sibling() {
         use std::os::unix::fs::symlink;
 
         let root = std::env::temp_dir().join(format!(
@@ -1343,20 +1547,10 @@ mod tests {
         let canonical_root = tokio::fs::canonicalize(&root)
             .await
             .expect("canonical workspace root");
-        let mut staged = Vec::new();
-        let mut seen = HashSet::new();
+        remove_confined_direct_child(&canonical_root, &candidate, "Task workspace")
+            .await
+            .expect("symlink candidate is safely ignored");
 
-        stage_direct_child(
-            &canonical_root,
-            &candidate,
-            &mut staged,
-            &mut seen,
-            "Task workspace",
-        )
-        .await
-        .expect("symlink candidate is safely ignored");
-
-        assert!(staged.is_empty());
         assert!(candidate
             .symlink_metadata()
             .expect("candidate symlink remains")

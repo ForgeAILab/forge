@@ -1,6 +1,7 @@
 use super::*;
 use events::RoleAssignmentSnapshot;
 use sqlx::{Row, Sqlite, Transaction};
+use std::collections::HashSet;
 
 impl TaskService {
     pub async fn on_agent_deleted(&self, agent_id: &str) -> Result<()> {
@@ -62,6 +63,40 @@ impl TaskService {
         .bind(agent_id)
         .execute(&mut **transaction)
         .await?;
+
+        // Agent archival changes the effective authority of every affected
+        // Task.  Keep that invalidation and dispatch wake in the same write
+        // transaction as the assignment sweep so a crash cannot leave a
+        // parked Task with either stale review authority or a stale denial.
+        let affected_task_ids: HashSet<&str> =
+            events.iter().map(|event| event.task_id.as_str()).collect();
+        for task_id in affected_task_ids {
+            sqlx::query(
+                "UPDATE task
+                 SET review_passed_at = NULL,
+                     version = version + CASE WHEN review_passed_at IS NOT NULL THEN 1 ELSE 0 END,
+                     metadata_json = CASE
+                         WHEN json_valid(COALESCE(metadata_json, '{}'))
+                         THEN NULLIF(json_remove(COALESCE(metadata_json, '{}'), '$.dispatch_disposition', '$.deferred_dispatch'), '{}')
+                         ELSE metadata_json
+                     END,
+                     updated_at = CASE
+                         WHEN review_passed_at IS NOT NULL
+                              OR (json_valid(COALESCE(metadata_json, '{}'))
+                                  AND (json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
+                                       OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL))
+                         THEN ? ELSE updated_at END
+                 WHERE id = ? AND deleted_at IS NULL
+                   AND (review_passed_at IS NOT NULL
+                        OR (json_valid(COALESCE(metadata_json, '{}'))
+                            AND (json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
+                                 OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL)))",
+            )
+            .bind(now_rfc3339())
+            .bind(task_id)
+            .execute(&mut **transaction)
+            .await?;
+        }
 
         Ok(events)
     }
@@ -150,7 +185,7 @@ impl TaskService {
         reset_worktree: bool,
         cancel_active_execution: bool,
     ) -> Result<TaskRoleAssignment> {
-        let task = self.validate_reassignable_task(&input.task_id).await?;
+        let mut task = self.validate_reassignable_task(&input.task_id).await?;
         self.ensure_coordination_root_role_allowed(&task, &input.role_name)
             .await?;
         if input.assignee_type == Some(AssigneeKind::Agent) {
@@ -167,8 +202,16 @@ impl TaskService {
 
         let is_coder_role =
             self.active_work_role(&task).await?.as_deref() == Some(input.role_name.as_str());
+        let previous = TaskRoleAssignmentRepo::get_by_task_and_role(
+            &*self.db,
+            &input.task_id,
+            &input.role_name,
+        )
+        .await?;
         if is_coder_role && !cancel_active_execution {
-            let (previous, assignment, changed) = self.assign_coder_role_if_idle(input).await?;
+            let (previous, assignment, changed) = self
+                .assign_coder_role_if_idle(input, previous.as_ref(), task.version)
+                .await?;
             if changed {
                 self.publish_role_reassigned(
                     &assignment.task_id,
@@ -191,14 +234,13 @@ impl TaskService {
             return Ok(assignment);
         }
 
-        let previous = TaskRoleAssignmentRepo::get_by_task_and_role(
-            &*self.db,
-            &input.task_id,
-            &input.role_name,
-        )
-        .await?;
         if same_assignment(previous.as_ref(), Some(&input)) {
-            let assignment = TaskRoleAssignmentRepo::assign(&*self.db, input).await?;
+            let previous = previous.as_ref().ok_or_else(|| {
+                ServiceError::conflict("role assignment changed while confirming it")
+            })?;
+            let assignment =
+                TaskRoleAssignmentRepo::assign_if_unchanged(&*self.db, input, Some(previous))
+                    .await?;
             crate::wake_task_dispatch(
                 &self.db,
                 &assignment.task_id,
@@ -209,7 +251,16 @@ impl TaskService {
         }
 
         if !is_coder_role {
-            let assignment = TaskRoleAssignmentRepo::assign(&*self.db, input).await?;
+            let now = now_rfc3339();
+            let (assignment, _updated_task) =
+                TaskRoleAssignmentRepo::assign_and_clear_review_authority(
+                    &*self.db,
+                    input,
+                    previous.as_ref(),
+                    task.version,
+                    &now,
+                )
+                .await?;
             self.publish_role_reassigned(
                 &assignment.task_id,
                 &assignment.role_name,
@@ -230,8 +281,15 @@ impl TaskService {
             .active_execution_for_role(&task, &input.role_name)
             .await?;
         let Some(active_execution) = active_execution else {
-            let assignment = TaskRoleAssignmentRepo::assign(&*self.db, input).await?;
-            TaskRepo::set_review_passed_at(&*self.db, &assignment.task_id, None, &now_rfc3339())
+            let now = now_rfc3339();
+            let (assignment, _updated_task) =
+                TaskRoleAssignmentRepo::assign_and_clear_review_authority(
+                    &*self.db,
+                    input,
+                    previous.as_ref(),
+                    task.version,
+                    &now,
+                )
                 .await?;
             self.publish_role_reassigned(
                 &assignment.task_id,
@@ -265,20 +323,28 @@ impl TaskService {
         )
         .await?;
 
-        let assignment = TaskRoleAssignmentRepo::assign(&*self.db, input).await?;
-        TaskRepo::set_review_passed_at(&*self.db, &assignment.task_id, None, &now_rfc3339())
-            .await?;
+        let now = now_rfc3339();
+        let (assignment, updated_task) = TaskRoleAssignmentRepo::assign_and_clear_review_authority(
+            &*self.db,
+            input,
+            previous.as_ref(),
+            task.version,
+            &now,
+        )
+        .await?;
+        task = updated_task;
 
-        let workflow = self.workflow_for_task(&task).await?;
+        let (workflow, workflow_authority) = self.workflow_and_authority_for_task(&task).await?;
         let initial_state = workflow_initial_state(&workflow)?;
         self.workflow_engine()
-            .reset_to_initial(
+            .reset_to_initial_with_authority(
                 &task.id,
                 &initial_state,
                 task.version,
                 &workflow,
                 &api_types::Actor::user(api_types::UserActionSource::Reassignment),
                 "coder reassigned",
+                workflow_authority,
             )
             .await?;
 
@@ -314,7 +380,7 @@ impl TaskService {
         reset_workspace: bool,
         reset_worktree: bool,
     ) -> Result<()> {
-        let task = self.validate_reassignable_task(task_id).await?;
+        let mut task = self.validate_reassignable_task(task_id).await?;
         let previous =
             TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, task_id, role_name).await?;
         let Some(previous) = previous else {
@@ -323,7 +389,13 @@ impl TaskService {
 
         let is_coder_role = self.active_work_role(&task).await?.as_deref() == Some(role_name);
         if !is_coder_role {
-            TaskRoleAssignmentRepo::remove(&*self.db, task_id, role_name).await?;
+            let _updated_task = TaskRoleAssignmentRepo::remove_and_clear_review_authority(
+                &*self.db,
+                &previous,
+                task.version,
+                &now_rfc3339(),
+            )
+            .await?;
             self.publish_role_reassigned(
                 task_id,
                 role_name,
@@ -337,8 +409,13 @@ impl TaskService {
 
         let active_execution = self.active_execution_for_role(&task, role_name).await?;
         let Some(active_execution) = active_execution else {
-            TaskRoleAssignmentRepo::remove(&*self.db, task_id, role_name).await?;
-            TaskRepo::set_review_passed_at(&*self.db, task_id, None, &now_rfc3339()).await?;
+            let _updated_task = TaskRoleAssignmentRepo::remove_and_clear_review_authority(
+                &*self.db,
+                &previous,
+                task.version,
+                &now_rfc3339(),
+            )
+            .await?;
             self.publish_role_reassigned(
                 task_id,
                 role_name,
@@ -358,19 +435,25 @@ impl TaskService {
             db::ResumePolicy::None,
         )
         .await?;
-        TaskRoleAssignmentRepo::remove(&*self.db, task_id, role_name).await?;
-        TaskRepo::set_review_passed_at(&*self.db, task_id, None, &now_rfc3339()).await?;
+        task = TaskRoleAssignmentRepo::remove_and_clear_review_authority(
+            &*self.db,
+            &previous,
+            task.version,
+            &now_rfc3339(),
+        )
+        .await?;
 
-        let workflow = self.workflow_for_task(&task).await?;
+        let (workflow, workflow_authority) = self.workflow_and_authority_for_task(&task).await?;
         let initial_state = workflow_initial_state(&workflow)?;
         self.workflow_engine()
-            .reset_to_initial(
+            .reset_to_initial_with_authority(
                 &task.id,
                 &initial_state,
                 task.version,
                 &workflow,
                 &api_types::Actor::user(api_types::UserActionSource::Reassignment),
                 "coder reassigned",
+                workflow_authority,
             )
             .await?;
 
@@ -418,13 +501,27 @@ impl TaskService {
     }
 
     async fn workflow_for_task(&self, task: &Task) -> Result<api_types::WorkflowDefinition> {
+        Ok(self.workflow_and_authority_for_task(task).await?.0)
+    }
+
+    async fn workflow_and_authority_for_task(
+        &self,
+        task: &Task,
+    ) -> Result<(api_types::WorkflowDefinition, WorkflowAuthority)> {
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
-        Ok(WorkflowEngine::resolve_workflow_for_task(
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
             task,
             &project.workflow_definition,
             &api_types::Actor::system(api_types::SystemComponent::TaskDispatcher),
+        );
+        Ok((
+            workflow,
+            WorkflowAuthority {
+                project_version: project.version,
+                workflow_definition: project.workflow_definition,
+            },
         ))
     }
 
@@ -467,13 +564,16 @@ impl TaskService {
         ))
     }
 
-    /// Assignment-only writes share SQLite's immediate transaction boundary
-    /// with Running execution creation. Whichever mutation wins first is
-    /// authoritative: a changed assignment rejects an already-running worker,
-    /// while execution insertion rechecks the resulting role binding.
+    /// Assignment writes share SQLite's immediate transaction boundary with
+    /// Running execution creation and review-authority invalidation. Whichever
+    /// mutation wins first is authoritative: a changed assignment rejects an
+    /// already-running worker, while execution insertion rechecks the
+    /// resulting role binding.
     async fn assign_coder_role_if_idle(
         &self,
         input: CreateTaskRoleAssignment,
+        expected_previous: Option<&TaskRoleAssignment>,
+        expected_task_version: i64,
     ) -> Result<(Option<TaskRoleAssignment>, TaskRoleAssignment, bool)> {
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
         let is_coordination_root = sqlx::query_scalar::<_, i64>(
@@ -527,6 +627,22 @@ impl TaskService {
                 })
             })
             .transpose()?;
+
+        let expected_matches = match expected_previous {
+            Some(expected) => previous.as_ref().is_some_and(|current| {
+                current.id == expected.id
+                    && current.task_id == expected.task_id
+                    && current.role_name == expected.role_name
+                    && current.assignee_type == expected.assignee_type
+                    && current.assignee_id == expected.assignee_id
+                    && current.created_at == expected.created_at
+                    && current.updated_at == expected.updated_at
+            }),
+            None => previous.is_none(),
+        };
+        if !expected_matches {
+            return Err(db::DbError::VersionConflict.into());
+        }
 
         if same_assignment(previous.as_ref(), Some(&input)) {
             // Confirming the already-assigned agent is still an explicit
@@ -586,6 +702,20 @@ impl TaskService {
         .execute(&mut *transaction)
         .await?;
 
+        let result = sqlx::query(
+            "UPDATE task
+             SET review_passed_at = NULL, updated_at = ?, version = version + 1
+             WHERE id = ? AND deleted_at IS NULL AND version = ?",
+        )
+        .bind(&input.updated_at)
+        .bind(&input.task_id)
+        .bind(expected_task_version)
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(db::DbError::VersionConflict.into());
+        }
+
         let assignment = TaskRoleAssignment {
             id: previous
                 .as_ref()
@@ -631,22 +761,10 @@ impl TaskService {
         if self.role_for_state(task, &task.status).await?.as_deref() != Some(role_name) {
             return Ok(None);
         }
-        let page = ExecutionRepo::list_by_task(
-            &*self.db,
-            &task.id,
-            PageRequest {
-                cursor: None,
-                limit: 20,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Desc,
-            },
-        )
-        .await?;
-        Ok(page.items.into_iter().find(|execution| {
-            execution.status == ExecutionStatus::Running
-                && (execution.role == role_name || execution.role == "executor")
-        }))
+        let executions = ExecutionRepo::list_running_by_task(&*self.db, &task.id).await?;
+        Ok(executions
+            .into_iter()
+            .find(|execution| execution.role == role_name || execution.role == "executor"))
     }
 
     pub(super) async fn cancel_active_execution(
@@ -657,16 +775,58 @@ impl TaskService {
         actor: &api_types::Actor,
         resume_policy: db::ResumePolicy,
     ) -> Result<bool> {
+        self.cancel_active_execution_with_provider_policy(
+            execution,
+            reason,
+            stop_reason,
+            actor,
+            resume_policy,
+            false,
+        )
+        .await
+    }
+
+    /// Cancel an execution as part of a forced Project teardown. Unlike the
+    /// ordinary user/workflow cancellation path, a provider failure is
+    /// returned to the caller so the Project's authoritative rows cannot be
+    /// deleted while remote work may still be running.
+    pub(super) async fn cancel_active_execution_for_project_deletion(
+        &self,
+        execution: &Execution,
+    ) -> Result<bool> {
+        let actor = api_types::Actor::system(api_types::SystemComponent::General);
+        self.cancel_active_execution_with_provider_policy(
+            execution,
+            "Project deletion requested",
+            db::StopReason::TaskCancelled,
+            &actor,
+            db::ResumePolicy::None,
+            true,
+        )
+        .await
+    }
+
+    async fn cancel_active_execution_with_provider_policy(
+        &self,
+        execution: &Execution,
+        reason: &str,
+        stop_reason: db::StopReason,
+        actor: &api_types::Actor,
+        resume_policy: db::ResumePolicy,
+        provider_before_terminalization: bool,
+    ) -> Result<bool> {
         let reconciliation_reason = match &stop_reason {
             db::StopReason::RoleReassigned => "stopped because task moved".to_owned(),
             _ => reason.to_owned(),
         };
         let preserve_resume_context = resume_policy == db::ResumePolicy::Manual;
 
-        // Terminalization is the authority boundary.  Claiming the terminal
-        // state before touching the provider is important: a stale role/task
-        // caller must not cancel a newer owner or perform any live/runtime
-        // side effect after losing the execution CAS.
+        // Ordinary cancellation claims the terminal state before touching the
+        // provider so a stale role/task caller cannot perform a live/runtime
+        // side effect after losing the execution CAS. Project deletion is the
+        // deliberate exception: it must obtain provider acknowledgement first
+        // so a failed stop cannot make the next deletion retry believe that
+        // the provider has already stopped.
         let actor_type = if actor.is_user() {
             "user".to_owned()
         } else if actor.is_agent() {
@@ -677,6 +837,14 @@ impl TaskService {
         let mut terminal_candidate = execution.clone();
         let mut outcome = None;
         for _ in 0..3 {
+            if provider_before_terminalization {
+                // This is intentionally before the durable CAS. If the
+                // provider rejects the exact execution ID, the row remains
+                // running and every later force attempt is forced to retry
+                // the stop request instead of deleting the Project.
+                self.cancel_execution_with_provider(&terminal_candidate, reason)
+                    .await?;
+            }
             let terminalized_at = now_rfc3339();
             let attempt = ExecutionRepo::terminalize_with_ledger(
                 &*self.db,
@@ -747,10 +915,13 @@ impl TaskService {
             }
         };
 
-        // The provider is only contacted after this caller has won the
-        // execution CAS.  A provider-side failure is safe to recover from:
-        // durable execution/event/lease truth is already committed.
-        if self.daemon_connections.is_some() || self.task_executor.is_some() {
+        // Ordinary cancellation contacts the provider only after winning the
+        // execution CAS. Provider failures there are recoverable because the
+        // durable row is already terminal. Project deletion uses the branch
+        // above, which requires acknowledgement before this row changes.
+        if !provider_before_terminalization
+            && (self.daemon_connections.is_some() || self.task_executor.is_some())
+        {
             if let Err(error) = self
                 .cancel_execution_with_provider(&committed_execution, reason)
                 .await

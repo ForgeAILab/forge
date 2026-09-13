@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 pub use api_types::{
     ApprovalTarget, CanonicalScopeRef, CurrentVersionOrRevision, OrchestrationOutcome, OutcomeCode,
@@ -409,6 +410,7 @@ pub fn outcome_for_service_error_with_correction(
         | ServiceError::DaemonTimeout { .. }
         | ServiceError::TerminalDaemonUnavailable { .. }
         | ServiceError::TerminalActiveExecution { .. }
+        | ServiceError::ExecutionAlreadyRunning { .. }
         | ServiceError::PrSyncFailure { .. } => (
             OutcomeCode::TransientFailure,
             "the command could not complete right now; retry later",
@@ -449,6 +451,17 @@ pub fn outcome_for_service_error_with_correction(
     outcome.safe_message = safe_message.to_owned();
     outcome.retry = default_retry;
     outcome.setup_requirements = setup_requirements;
+    if let ServiceError::ExecutionAlreadyRunning {
+        scope,
+        execution_id,
+    } = error
+    {
+        outcome.details = Some(json!({
+            "code": "execution_already_running",
+            "scope": scope,
+            "execution_id": execution_id,
+        }));
+    }
 
     let allows_correction = matches!(
         code,
@@ -556,6 +569,27 @@ mod tests {
         assert_eq!(outcome.code, OutcomeCode::InternalFailure);
         assert_eq!(outcome.correlation_id, "correlation-1");
         assert!(!outcome.safe_message.contains("secret"));
+    }
+
+    #[test]
+    fn running_execution_outcome_preserves_safe_conflict_details() {
+        let outcome = outcome_for_service_error(
+            &ServiceError::ExecutionAlreadyRunning {
+                scope: "repository".to_owned(),
+                execution_id: "execution-123".to_owned(),
+            },
+            &outcome_context(),
+        );
+
+        assert_eq!(outcome.code, OutcomeCode::TransientFailure);
+        assert_eq!(
+            outcome.details,
+            Some(json!({
+                "code": "execution_already_running",
+                "scope": "repository",
+                "execution_id": "execution-123",
+            }))
+        );
     }
 
     #[test]

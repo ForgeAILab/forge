@@ -1,8 +1,5 @@
 use async_trait::async_trait;
-use db::{
-    TaskDependencyRepo, TaskRepo, TaskRoleAssignmentRepo, TransitionLog, TransitionLogRepo,
-    WorkspaceRepo,
-};
+use db::{TaskDependencyRepo, TaskRepo, TaskRoleAssignmentRepo, TransitionLogRepo, WorkspaceRepo};
 
 use crate::workflow::{
     default_states, effective_role, engine::WorkflowEngine, HookAction, HookContext, HookResult,
@@ -102,12 +99,15 @@ impl HookAction for CheckRetryBudget {
             let entries = match TransitionLogRepo::list_by_task(&*ctx.db, &ctx.task_id).await {
                 Ok(entries) => entries,
                 Err(error) => {
-                    return HookResult::Skipped {
+                    return HookResult::Failed {
                         reason: format!("retry budget unavailable: {error}"),
                     };
                 }
             };
-            let count = review_rejections_since_boundary(&entries);
+            let count = crate::task_diagnostics::count_gate_rejections_since_boundary(
+                &entries,
+                default_states::REVIEW,
+            );
             (budget, count)
         } else {
             let Some(gate_config) = &ctx.gate_config else {
@@ -116,8 +116,8 @@ impl HookAction for CheckRetryBudget {
             let Some(max_rejections) = gate_config.max_rejections else {
                 return HookResult::Ok;
             };
-            let count = match TransitionLogRepo::count_gate_rejections(
-                &*ctx.db,
+            let count = match crate::task_diagnostics::count_gate_rejections_for_task(
+                &ctx.db,
                 &ctx.task_id,
                 &ctx.to_state,
             )
@@ -125,7 +125,7 @@ impl HookAction for CheckRetryBudget {
             {
                 Ok(count) => count,
                 Err(error) => {
-                    return HookResult::Skipped {
+                    return HookResult::Failed {
                         reason: format!("retry budget unavailable: {error}"),
                     };
                 }
@@ -268,22 +268,6 @@ impl HookAction for RequirePlanChecklistComplete {
             ),
         }
     }
-}
-
-fn review_rejections_since_boundary(entries: &[TransitionLog]) -> i64 {
-    let boundary = entries.iter().rposition(|entry| {
-        entry.from_state == default_states::REVIEW
-            && !entry.rejection
-            && (entry.to_state != default_states::REVIEW
-                || entry.trigger_name.as_deref() == Some("reset_retry_window"))
-    });
-    let entries = boundary
-        .and_then(|index| entries.get(index + 1..))
-        .unwrap_or(entries);
-    entries
-        .iter()
-        .filter(|entry| entry.from_state == default_states::REVIEW && entry.rejection)
-        .count() as i64
 }
 
 pub struct RequireCleanWorktree;

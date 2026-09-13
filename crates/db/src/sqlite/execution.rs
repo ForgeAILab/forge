@@ -1,4 +1,5 @@
 use super::*;
+use crate::ExecutionAdmission;
 use crate::MarkUsageInvocationUnsettled;
 use crate::{AgentExecutionStats, StartUsageInvocation};
 use std::collections::HashSet;
@@ -7,7 +8,7 @@ use std::collections::HashSet;
 impl ExecutionRepo for SqliteDb {
     async fn create(&self, input: CreateExecution) -> Result<Execution> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
-        let execution = Self::create_execution_in_tx(&mut transaction, &input).await?;
+        let execution = Self::create_execution_in_tx(&mut transaction, &input, None).await?;
         transaction.commit().await?;
         Ok(execution)
     }
@@ -16,6 +17,16 @@ impl ExecutionRepo for SqliteDb {
         &self,
         input: CreateExecution,
         lease: ClaimExecutionLease,
+    ) -> Result<Execution> {
+        self.create_with_lease_and_admission(input, lease, None)
+            .await
+    }
+
+    async fn create_with_lease_and_admission(
+        &self,
+        input: CreateExecution,
+        lease: ClaimExecutionLease,
+        admission: Option<ExecutionAdmission>,
     ) -> Result<Execution> {
         if input.status != ExecutionStatus::Running
             || lease.execution_id != input.id
@@ -29,7 +40,13 @@ impl ExecutionRepo for SqliteDb {
             ));
         }
         let mut transaction = crate::begin_immediate(&self.pool).await?;
-        Self::create_execution_in_tx(&mut transaction, &input).await?;
+        Self::create_execution_in_tx(&mut transaction, &input, admission.as_ref()).await?;
+        // Reviewer/auditor executions are durably owned by the exact Review
+        // attempt selected by the admission snapshot. Keep this binding in
+        // the same writer transaction as the execution row and lease
+        // reservation.
+        SqliteDb::bind_role_execution_to_review_in_tx(&mut transaction, &input, admission.as_ref())
+            .await?;
         let result = sqlx::query(
             "UPDATE execution
              SET lease_owner = ?,
@@ -132,6 +149,18 @@ impl ExecutionRepo for SqliteDb {
         page_from_items(items, &page, offset, total)
     }
 
+    async fn list_running_by_task(&self, task_id: &str) -> Result<Vec<Execution>> {
+        let rows = sqlx::query(
+            "SELECT * FROM execution
+             WHERE task_id = ? AND status = 'running'
+             ORDER BY created_at DESC, id DESC",
+        )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(map_execution).collect()
+    }
+
     async fn list_latest_executions_for_tasks(&self, task_ids: &[&str]) -> Result<Vec<Execution>> {
         if task_ids.is_empty() {
             return Ok(Vec::new());
@@ -196,6 +225,203 @@ impl ExecutionRepo for SqliteDb {
             None
         };
         page_from_items(items, &page, offset, total)
+    }
+
+    async fn latest_non_running_by_task_and_role(
+        &self,
+        task_id: &str,
+        role: &str,
+    ) -> Result<Option<Execution>> {
+        sqlx::query(
+            "SELECT * FROM execution
+             WHERE task_id = ? AND role = ? AND status != 'running'
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(role)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(map_execution)
+        .transpose()
+    }
+
+    async fn latest_resumable_by_task_and_role(
+        &self,
+        task_id: &str,
+        role: &str,
+    ) -> Result<Option<Execution>> {
+        sqlx::query(
+            "SELECT * FROM execution
+             WHERE task_id = ? AND role = ? AND status != 'running'
+               AND agent_session_id IS NOT NULL
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(role)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(map_execution)
+        .transpose()
+    }
+
+    async fn latest_agent_execution_by_task(&self, task_id: &str) -> Result<Option<Execution>> {
+        sqlx::query(
+            "SELECT * FROM execution
+             WHERE task_id = ? AND agent_id IS NOT NULL
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(map_execution)
+        .transpose()
+    }
+
+    async fn latest_execution_by_task_and_roles(
+        &self,
+        task_id: &str,
+        roles: &[&str],
+    ) -> Result<Option<Execution>> {
+        if roles.is_empty() {
+            return Ok(None);
+        }
+        let mut query =
+            sqlx::QueryBuilder::<Sqlite>::new("SELECT * FROM execution WHERE task_id = ");
+        query.push_bind(task_id).push(" AND role IN (");
+        let mut separated = query.separated(", ");
+        for role in roles {
+            separated.push_bind(*role);
+        }
+        separated.push_unseparated(") ORDER BY created_at DESC, id DESC LIMIT 1");
+        query
+            .build()
+            .fetch_optional(&self.pool)
+            .await?
+            .map(map_execution)
+            .transpose()
+    }
+
+    async fn latest_review_candidate_by_task_and_roles(
+        &self,
+        task_id: &str,
+        roles: &[&str],
+    ) -> Result<Option<Execution>> {
+        if roles.is_empty() {
+            return Ok(None);
+        }
+        let mut query =
+            sqlx::QueryBuilder::<Sqlite>::new("SELECT * FROM execution WHERE task_id = ");
+        query
+            .push_bind(task_id)
+            .push(" AND status IN ('completed', 'running') AND role IN (");
+        let mut separated = query.separated(", ");
+        for role in roles {
+            separated.push_bind(*role);
+        }
+        separated.push_unseparated(") ORDER BY created_at DESC, id DESC LIMIT 1");
+        query
+            .build()
+            .fetch_optional(&self.pool)
+            .await?
+            .map(map_execution)
+            .transpose()
+    }
+
+    async fn has_execution_by_task_role_and_agent(
+        &self,
+        task_id: &str,
+        role: &str,
+        agent_id: &str,
+    ) -> Result<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM execution
+                 WHERE task_id = ? AND role = ? AND agent_id = ?
+             )",
+        )
+        .bind(task_id)
+        .bind(role)
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn first_by_task_and_role_at_or_after(
+        &self,
+        task_id: &str,
+        role: &str,
+        started_at: &str,
+    ) -> Result<Option<Execution>> {
+        sqlx::query(
+            "SELECT * FROM execution
+             WHERE task_id = ? AND role = ? AND created_at >= ?
+             ORDER BY created_at ASC, id ASC LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(role)
+        .bind(started_at)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(map_execution)
+        .transpose()
+    }
+
+    async fn count_by_task_and_summary_prefix(
+        &self,
+        task_id: &str,
+        summary_prefix: &str,
+    ) -> Result<i64> {
+        let pattern = format!("{summary_prefix}%");
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution
+             WHERE task_id = ? AND summary LIKE ?",
+        )
+        .bind(task_id)
+        .bind(pattern)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn has_running_by_task_and_summary_prefix(
+        &self,
+        task_id: &str,
+        summary_prefix: &str,
+    ) -> Result<bool> {
+        let pattern = format!("{summary_prefix}%");
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM execution
+                 WHERE task_id = ? AND status = 'running' AND summary LIKE ?
+             )",
+        )
+        .bind(task_id)
+        .bind(pattern)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn has_active_or_completed_child(
+        &self,
+        task_id: &str,
+        parent_execution_id: &str,
+        role: &str,
+    ) -> Result<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM execution
+                 WHERE task_id = ? AND parent_execution_id = ? AND role = ?
+                   AND status IN ('running', 'completed')
+             )",
+        )
+        .bind(task_id)
+        .bind(parent_execution_id)
+        .bind(role)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
     }
 
     async fn count_by_task_and_role(&self, task_id: &str, role: &str) -> Result<i64> {
@@ -1574,6 +1800,20 @@ impl ExecutionRepo for SqliteDb {
              WHERE status = 'running'
              ORDER BY created_at ASC, id ASC",
         )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(map_execution).collect()
+    }
+
+    async fn list_running_for_project(&self, project_id: &str) -> Result<Vec<Execution>> {
+        let rows = sqlx::query(
+            "SELECT e.* FROM execution e
+             INNER JOIN task t ON t.id = e.task_id
+             WHERE e.status = 'running' AND t.project_id = ?
+             ORDER BY e.created_at ASC, e.id ASC",
+        )
+        .bind(project_id)
         .fetch_all(&self.pool)
         .await?;
 

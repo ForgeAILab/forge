@@ -183,6 +183,11 @@ impl McpToolError {
     }
 
     fn into_outcome(self) -> Value {
+        let execution_already_running_details = self
+            .details
+            .data
+            .as_ref()
+            .and_then(safe_execution_already_running_details);
         let (outcome_code, safe_message, retry_action, retryable) = self.outcome_classification();
         let mut outcome = OrchestrationOutcome::new(
             outcome_code,
@@ -213,6 +218,7 @@ impl McpToolError {
             }
             outcome.retry = Some(retry);
         }
+        outcome.details = execution_already_running_details;
         serde_json::to_value(outcome).unwrap_or_else(|_| {
             json!({
                 "code": "internal_failure",
@@ -321,6 +327,19 @@ impl McpToolError {
     }
 }
 
+fn safe_execution_already_running_details(data: &Value) -> Option<Value> {
+    if data.get("code").and_then(Value::as_str) != Some("execution_already_running") {
+        return None;
+    }
+    let scope = data.get("scope").and_then(Value::as_str)?;
+    let execution_id = data.get("execution_id").and_then(Value::as_str)?;
+    Some(json!({
+        "code": "execution_already_running",
+        "scope": scope,
+        "execution_id": execution_id,
+    }))
+}
+
 impl From<ServiceError> for McpToolError {
     fn from(error: ServiceError) -> Self {
         let protected_cause = error.to_string();
@@ -357,6 +376,14 @@ impl From<ServiceError> for McpToolError {
             // A generic service conflict does not identify a versioned target;
             // do not infer a version conflict by parsing its prose.
             ServiceError::Conflict(_message) => Self::new(-32602, "operation conflict"),
+            ServiceError::ExecutionAlreadyRunning {
+                scope,
+                execution_id,
+            } => Self::new(-32029, "execution already running").with_data(json!({
+                "code": "execution_already_running",
+                "scope": scope,
+                "execution_id": execution_id,
+            })),
             ServiceError::ProductGenesisActiveSession { .. } => {
                 Self::new(-32602, "Product Genesis session already active")
             }
@@ -530,6 +557,15 @@ impl From<DbError> for McpToolError {
             DbError::InvalidTransition => Self::new(-32010, "invalid transition"),
             DbError::InvalidSoftDelete => Self::new(-32010, "invalid soft delete"),
             DbError::AgentAtCapacity => Self::new(-32029, "agent at capacity"),
+            DbError::ExecutionAlreadyRunning {
+                scope,
+                execution_id,
+            } => Self::new(-32029, "execution already running").with_data(json!({
+                "code": "execution_already_running",
+                "scope": scope,
+                "execution_id": execution_id,
+            })),
+            DbError::ReviewDetailsCorrupt { .. } => Self::new(-32603, "internal error"),
             DbError::InvalidCursor => Self::new(-32602, "invalid cursor"),
             DbError::DependencyGate => Self::new(-32029, "dependency gate").with_data(json!({
                 "code": "setup_required"

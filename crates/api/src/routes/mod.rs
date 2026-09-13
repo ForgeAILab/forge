@@ -17,8 +17,14 @@ use serde_json::Value;
 use services::workflow::engine::WorkflowEngine;
 use services::{
     plan_artifact::{read_plan_for_workspace, PlanArtifactError},
-    task_diagnostics::{derive_workflow_exception, derive_workflow_health},
-    task_service::action_resolver::resolve_execution_actions,
+    task_diagnostics::{
+        compare_running_execution_authority, count_gate_rejections_since_boundary,
+        derive_workflow_exception_with_running_interactive, derive_workflow_health,
+    },
+    task_service::action_resolver::{
+        has_open_interactive_launch_authority, list_execution_action_authority,
+        resolve_execution_actions, select_open_interactive_target,
+    },
 };
 use sqlx::Row;
 
@@ -292,7 +298,38 @@ async fn task_response_inner(
         &project.workflow_definition,
         &api_types::Actor::system(api_types::SystemComponent::General),
     );
+    let error_annotation = task.error_annotation.as_deref().map(|s| {
+        serde_json::from_str::<TaskAnnotation>(s)
+            .unwrap_or_else(|_| TaskAnnotation::Legacy(parse_json_value(s)))
+    });
+    let blocked_metadata_annotation = blocked_metadata_annotation(&task);
+    let error_blocking_annotation = match error_annotation.as_ref() {
+        Some(TaskAnnotation::Blocking(annotation)) => Some(annotation),
+        _ => None,
+    };
+    // A populated typed annotation is the current recovery contract. Legacy
+    // blocked metadata only fills the gap for old/empty annotations; it must
+    // never override or widen the explicit action set used by the recovery
+    // service and workflow-exception projection.
+    let blocking_annotation = blocking_annotation_for_projection(
+        &task,
+        blocked_metadata_annotation.as_ref(),
+        error_blocking_annotation,
+    );
     let canonical_phase = workflow.canonical_phase_for_state(&task.status);
+    let has_retry_budget = workflow.states.iter().any(|state| {
+        state.kind == StateKind::Gate
+            && state
+                .gate_config
+                .as_ref()
+                .and_then(|config| config.max_rejections)
+                .is_some()
+    });
+    let transition_logs = if has_retry_budget {
+        TransitionLogRepo::list_by_task(db, &task.id).await?
+    } else {
+        Vec::new()
+    };
     let mut remaining_retries = HashMap::new();
     for state in &workflow.states {
         if state.kind != StateKind::Gate {
@@ -305,10 +342,17 @@ async fn task_response_inner(
         else {
             continue;
         };
-        let count = TransitionLogRepo::count_gate_rejections(db, &task.id, &state.name).await?;
+        let count = count_gate_rejections_since_boundary(&transition_logs, &state.name);
+        let exhausted = blocking_annotation.is_some_and(|annotation| {
+            retry_budget_exhausted_for_state(&task.status, state, annotation)
+        });
         remaining_retries.insert(
             state.name.clone(),
-            (i64::from(max_rejections) - count).max(0),
+            if exhausted {
+                0
+            } else {
+                (i64::from(max_rejections) - count).max(0)
+            },
         );
     }
     let workspace_model = WorkspaceRepo::get_by_task_id(db, &task.id).await?;
@@ -321,42 +365,82 @@ async fn task_response_inner(
         (None, None)
     };
     let workspace = workspace_model.map(workspace_response);
-    let error_annotation = task.error_annotation.as_deref().map(|s| {
-        serde_json::from_str::<TaskAnnotation>(s)
-            .unwrap_or_else(|_| TaskAnnotation::Legacy(parse_json_value(s)))
-    });
+    let current_role = workflow
+        .states
+        .iter()
+        .find(|state| state.name == task.status)
+        .and_then(services::workflow::effective_role);
+    let blocked_execution_id =
+        blocking_annotation.and_then(|annotation| annotation.blocked_execution_id.as_deref());
+    // Load the same bounded role-aware execution authority used by the
+    // execution-action resolver even for light Task responses: workflow
+    // exceptions still expose Open Interactive, whose follow-up target must
+    // not come from the arbitrary newest history row.
+    let execution_authority =
+        list_execution_action_authority(db, &task.id, current_role, blocked_execution_id).await?;
+    let open_interactive_target =
+        select_open_interactive_target(&execution_authority, current_role, blocked_execution_id);
+    let open_interactive_launch_authority = has_open_interactive_launch_authority(
+        &execution_authority,
+        &task_role_assignments,
+        current_role,
+        blocked_execution_id,
+    );
     let execution_actions = if include_actions {
-        let executions = db::ExecutionRepo::list_by_task(
-            db,
-            &task.id,
-            PageRequest {
-                cursor: None,
-                limit: 100,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Desc,
-            },
+        resolve_execution_actions(
+            &task,
+            &workflow,
+            &execution_authority,
+            blocking_annotation,
+            latest_review.as_ref(),
         )
-        .await?
-        .items;
-        let blocked_metadata_annotation = blocked_metadata_annotation(&task);
-        let error_blocking_annotation = match error_annotation.as_ref() {
-            Some(TaskAnnotation::Blocking(annotation)) => Some(annotation),
-            _ => None,
-        };
-        let blocking_annotation = blocked_metadata_annotation
-            .as_ref()
-            .or(error_blocking_annotation);
-        resolve_execution_actions(&task, &workflow, &executions, blocking_annotation)
     } else {
         Vec::new()
     };
-    let workflow_exception = derive_workflow_exception(
+    let execution_observability = task_execution_observability(db, &task.id).await?;
+    // The latest execution is a history projection, not a live-occupancy
+    // projection. Keep the interactive and current-role running rows
+    // separate so a newer unrelated role cannot hide either authority.
+    let running_executions = db::ExecutionRepo::list_running_by_task(db, &task.id).await?;
+    let running_interactive_execution = running_executions
+        .iter()
+        .filter(|execution| execution.role == "interactive")
+        .max_by(|left, right| compare_running_execution_authority(left, right))
+        .cloned();
+    let running_current_role_execution = current_role.and_then(|role| {
+        running_executions
+            .iter()
+            .filter(|execution| {
+                execution.role == role
+                    || (role == services::workflow::default_roles::CODER
+                        && execution.role == "executor")
+            })
+            .max_by(|left, right| compare_running_execution_authority(left, right))
+            .cloned()
+    });
+    let active_execution = execution_observability
+        .active_execution_id
+        .as_deref()
+        .and_then(|execution_id| {
+            running_executions
+                .iter()
+                .find(|execution| execution.id == execution_id)
+                .cloned()
+        });
+    let health_execution = running_interactive_execution
+        .clone()
+        .or(running_current_role_execution)
+        .or(active_execution)
+        .or_else(|| latest_execution.clone());
+    let workflow_exception = derive_workflow_exception_with_running_interactive(
         &task,
         &workflow,
         &task_role_assignments,
         latest_review.as_ref(),
         latest_execution.as_ref(),
+        running_interactive_execution.as_ref(),
+        open_interactive_target,
+        open_interactive_launch_authority,
         &remaining_retries,
     );
     let workflow_health = Some(derive_workflow_health(
@@ -364,11 +448,10 @@ async fn task_response_inner(
         &workflow,
         &task_role_assignments,
         latest_review.as_ref(),
-        latest_execution.as_ref(),
+        health_execution.as_ref(),
         awaiting_human,
         workflow_exception.as_ref(),
     ));
-    let execution_observability = task_execution_observability(db, &task.id).await?;
     let external_link = db::ExternalLinkRepo::get_by_task_id(db, &task.id).await?;
     // Canonical execution evidence/blocker (D16/D17, F12): computed once here
     // so Task detail, banner, and chat context all render the same server-
@@ -423,6 +506,237 @@ async fn task_response_inner(
     })
 }
 
+/// Resolve the blocker authority shared by the Task response projections.
+/// RecoveryService and `derive_workflow_exception` both treat a non-empty
+/// typed annotation as authoritative; blocked metadata is only a legacy
+/// fallback when that annotation is absent or empty.
+fn blocking_annotation_for_projection<'a>(
+    task: &Task,
+    blocked_metadata: Option<&'a TaskBlockingAnnotation>,
+    error_annotation: Option<&'a TaskBlockingAnnotation>,
+) -> Option<&'a TaskBlockingAnnotation> {
+    // A hard failure is the highest-precedence recovery authority. The
+    // recovery service closes the annotation-derived actions in this state
+    // and exposes only reset/cancel, so execution controls must not revive a
+    // stale interruption annotation here.
+    if task.failed_json.is_some() {
+        return None;
+    }
+    if error_annotation.is_some_and(|annotation| !annotation.recovery_actions.is_empty()) {
+        return error_annotation;
+    }
+
+    // Keep the legacy fallback in lockstep with TaskService::recovery_annotation:
+    // only the known retry/merge blocker shapes override an empty typed
+    // annotation. A generic blocked row must not widen an explicit empty
+    // annotation into actions that recovery will reject.
+    let blocked_is_recoverable_legacy = blocked_metadata.is_some_and(|annotation| {
+        annotation.annotation_type.is_retry_exhausted_metadata()
+            || (task.status == services::workflow::default_states::MERGING
+                && annotation.annotation_type == api_types::FailureKind::TargetRepoDirty)
+            || (task.status == services::workflow::default_states::MERGE_FAILED
+                && annotation.annotation_type.is_merge_recoverable())
+    });
+    if blocked_is_recoverable_legacy {
+        return blocked_metadata;
+    }
+
+    error_annotation.or(blocked_metadata)
+}
+
+fn retry_budget_exhausted_for_state(
+    task_status: &str,
+    state: &api_types::StateDefinition,
+    annotation: &TaskBlockingAnnotation,
+) -> bool {
+    match annotation.annotation_type {
+        api_types::FailureKind::ReviewBudgetExhausted => {
+            state.name == services::workflow::default_states::REVIEW
+        }
+        api_types::FailureKind::MergeFixBudgetExhausted => {
+            state.name == services::workflow::default_states::MERGING
+        }
+        api_types::FailureKind::RetryExhausted => {
+            task_status == state.name
+                || state
+                    .gate_config
+                    .as_ref()
+                    .and_then(|config| config.reject_target.as_deref())
+                    == Some(task_status)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod retry_projection_tests {
+    use super::{
+        blocked_metadata_annotation, blocking_annotation_for_projection,
+        retry_budget_exhausted_for_state,
+    };
+
+    fn annotation(actions: Vec<api_types::RecoveryAction>) -> api_types::TaskBlockingAnnotation {
+        api_types::TaskBlockingAnnotation {
+            annotation_type: api_types::FailureKind::RecoveryRequired,
+            blocking_reason: "test blocker".to_owned(),
+            blocked_by: None,
+            blocked_at: None,
+            blocked_execution_id: None,
+            artifact: None,
+            message: None,
+            hook: None,
+            recovery_actions: actions,
+        }
+    }
+
+    #[test]
+    fn populated_typed_annotation_wins_over_legacy_blocked_metadata() {
+        let task = db::Task {
+            status: services::workflow::default_states::IN_PROGRESS.to_owned(),
+            ..test_task()
+        };
+        let mut legacy = annotation(vec![api_types::RecoveryAction::CancelTask]);
+        legacy.annotation_type = api_types::FailureKind::TargetRepoDirty;
+        let typed = annotation(vec![api_types::RecoveryAction::ResetToInitial]);
+
+        let selected = blocking_annotation_for_projection(&task, Some(&legacy), Some(&typed))
+            .expect("one blocker selected");
+
+        assert_eq!(selected.recovery_actions, typed.recovery_actions);
+    }
+
+    #[test]
+    fn legacy_blocked_metadata_fills_an_empty_typed_annotation() {
+        let task = db::Task {
+            status: services::workflow::default_states::MERGING.to_owned(),
+            ..test_task()
+        };
+        let mut legacy = annotation(vec![api_types::RecoveryAction::CancelTask]);
+        legacy.annotation_type = api_types::FailureKind::TargetRepoDirty;
+        let empty_typed = annotation(Vec::new());
+
+        let selected = blocking_annotation_for_projection(&task, Some(&legacy), Some(&empty_typed))
+            .expect("one blocker selected");
+
+        assert_eq!(selected.recovery_actions, legacy.recovery_actions);
+    }
+
+    #[test]
+    fn generic_legacy_blocker_does_not_override_empty_typed_annotation() {
+        let task = test_task();
+        let legacy = annotation(vec![api_types::RecoveryAction::CancelTask]);
+        let empty_typed = annotation(Vec::new());
+
+        let selected = blocking_annotation_for_projection(&task, Some(&legacy), Some(&empty_typed))
+            .expect("typed annotation remains authoritative");
+
+        assert!(selected.recovery_actions.is_empty());
+    }
+
+    #[test]
+    fn unknown_legacy_blocker_cannot_advertise_recovery_actions() {
+        let task = db::Task {
+            blocked_json: Some(
+                serde_json::json!({
+                    "kind": "future_failure_kind",
+                    "recovery_actions": ["cancel_task"]
+                })
+                .to_string(),
+            ),
+            ..test_task()
+        };
+
+        let parsed = blocked_metadata_annotation(&task).expect("legacy blocker parses");
+        assert_eq!(parsed.annotation_type, api_types::FailureKind::Unknown);
+        assert!(parsed.recovery_actions.is_empty());
+    }
+
+    #[test]
+    fn legacy_retry_blocker_uses_the_service_allowlist() {
+        let task = db::Task {
+            blocked_json: Some(
+                serde_json::json!({
+                    "kind": "retry_exhausted",
+                    "recovery_actions": ["resume_session"]
+                })
+                .to_string(),
+            ),
+            ..test_task()
+        };
+
+        let parsed = blocked_metadata_annotation(&task).expect("legacy blocker parses");
+        assert_eq!(
+            parsed.recovery_actions,
+            vec![
+                api_types::RecoveryAction::RetryHook,
+                api_types::RecoveryAction::ResumeProcess,
+                api_types::RecoveryAction::ResetRetryWindow,
+                api_types::RecoveryAction::OpenInteractive,
+                api_types::RecoveryAction::CancelTask,
+            ]
+        );
+    }
+
+    fn test_task() -> db::Task {
+        db::Task {
+            id: "task".to_owned(),
+            project_id: "project".to_owned(),
+            parent_task_id: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "task".to_owned(),
+            description: None,
+            task_type: "task".to_owned(),
+            status: services::workflow::default_states::IN_PROGRESS.to_owned(),
+            is_automation: false,
+            priority: 0,
+            board_position: 0.0,
+            subtask_order: None,
+            task_state_config: None,
+            merge_config: None,
+            metadata_json: None,
+            plan: None,
+            error_annotation: None,
+            blocked_json: None,
+            failed_json: None,
+            entry_barrier_json: None,
+            review_passed_at: None,
+            archived_at: None,
+            deleted_at: None,
+            version: 1,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn exhausted_merge_annotation_forces_zero_retry_projection() {
+        let workflow = services::workflow::default_workflow::default_workflow();
+        let merging = workflow
+            .states
+            .iter()
+            .find(|state| state.name == services::workflow::default_states::MERGING)
+            .expect("default workflow has merging gate");
+        let annotation = api_types::TaskBlockingAnnotation {
+            annotation_type: api_types::FailureKind::MergeFixBudgetExhausted,
+            blocking_reason: "merge-fix retry budget exhausted".to_owned(),
+            blocked_by: None,
+            blocked_at: None,
+            blocked_execution_id: None,
+            artifact: None,
+            message: None,
+            hook: None,
+            recovery_actions: vec![],
+        };
+
+        assert!(retry_budget_exhausted_for_state(
+            services::workflow::default_states::MERGING,
+            merging,
+            &annotation
+        ));
+    }
+}
+
 fn blocked_metadata_annotation(task: &Task) -> Option<TaskBlockingAnnotation> {
     let metadata: Value = serde_json::from_str(task.blocked_json.as_deref()?).ok()?;
     let kind = metadata
@@ -439,11 +753,45 @@ fn blocked_metadata_annotation(task: &Task) -> Option<TaskBlockingAnnotation> {
         .get("execution_id")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let recovery_actions = metadata
-        .get("recovery_actions")
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_default();
+    // Match TaskService::recovery_annotation's fixed legacy allowlists. The
+    // persisted list is historical data, not an authority source: trusting it
+    // here can advertise ResumeSession or retry actions that recovery will
+    // reject for the same metadata row.
+    let recovery_actions = if kind == api_types::FailureKind::Unknown {
+        Vec::new()
+    } else if kind.is_retry_exhausted_metadata() {
+        vec![
+            api_types::RecoveryAction::RetryHook,
+            api_types::RecoveryAction::ResumeProcess,
+            api_types::RecoveryAction::ResetRetryWindow,
+            api_types::RecoveryAction::OpenInteractive,
+            api_types::RecoveryAction::CancelTask,
+        ]
+    } else if task.status == services::workflow::default_states::MERGING
+        && kind == api_types::FailureKind::TargetRepoDirty
+    {
+        vec![
+            api_types::RecoveryAction::RetryHook,
+            api_types::RecoveryAction::OpenInteractive,
+            api_types::RecoveryAction::CancelTask,
+        ]
+    } else if task.status == services::workflow::default_states::MERGE_FAILED
+        && kind.is_merge_recoverable()
+    {
+        vec![
+            api_types::RecoveryAction::RetryHook,
+            api_types::RecoveryAction::Reexecute,
+            api_types::RecoveryAction::OpenInteractive,
+            api_types::RecoveryAction::CancelTask,
+        ]
+    } else {
+        vec![
+            api_types::RecoveryAction::ResumeSession,
+            api_types::RecoveryAction::Reexecute,
+            api_types::RecoveryAction::ResetToInitial,
+            api_types::RecoveryAction::CancelTask,
+        ]
+    };
 
     Some(TaskBlockingAnnotation {
         annotation_type: kind,
@@ -608,6 +956,7 @@ pub fn agent_response(
     stats: db::AgentExecutionStats,
     usage: UsageAggregate,
 ) -> AgentResponse {
+    let status = projected_agent_status(&agent.status, running_execution_count);
     AgentResponse {
         id: agent.id,
         name: agent.name,
@@ -625,7 +974,7 @@ pub fn agent_response(
         credential_handle_id: agent.credential_ref,
         daemon_id: agent.daemon_id,
         max_concurrent_tasks: agent.max_concurrent_tasks,
-        status: agent_status_response(agent.status),
+        status,
         active_assigned_task_count,
         running_execution_count,
         effective_status,
@@ -639,6 +988,17 @@ pub fn agent_response(
         version: agent.version,
         created_at: agent.created_at,
         updated_at: agent.updated_at,
+    }
+}
+
+fn projected_agent_status(
+    persisted: &db::AgentStatus,
+    running_execution_count: Option<i64>,
+) -> api_types::AgentStatus {
+    if *persisted == db::AgentStatus::Idle && running_execution_count.unwrap_or(0) > 0 {
+        api_types::AgentStatus::Busy
+    } else {
+        agent_status_response(persisted.clone())
     }
 }
 
@@ -887,18 +1247,6 @@ async fn plan_artifact_response(
     }
 }
 
-pub fn review_response(review: db::Review) -> ReviewResponse {
-    let details = parse_review_details(&review.step_results_json).unwrap_or_default();
-    review_response_with_details(review, details)
-}
-
-pub fn review_response_strict(review: db::Review) -> ApiResult<ReviewResponse> {
-    let details = parse_review_details(&review.step_results_json).map_err(|error| {
-        ApiError::bad_request(format!("invalid review step_results_json: {error}"))
-    })?;
-    Ok(review_response_with_details(review, details))
-}
-
 fn review_response_with_details(review: db::Review, details: ReviewDetails) -> ReviewResponse {
     let step_results = details.ci_steps.iter().map(step_result_response).collect();
 
@@ -925,6 +1273,47 @@ fn parse_review_details(value: &str) -> serde_json::Result<ReviewDetails> {
             ci_steps: serde_json::from_value(value)?,
             auditor: None,
         });
+    }
+    let Some(object) = value.as_object() else {
+        return Err(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "persisted review details must be an object or step-result array",
+        )));
+    };
+    for key in object.keys() {
+        if ![
+            "ci_steps",
+            "conformance",
+            "auditor",
+            "user_approval",
+            "execution",
+            "execution_retry",
+        ]
+        .contains(&key.as_str())
+        {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown persisted review detail field: {key}"),
+            )));
+        }
+    }
+    if let Some(ci_steps) = object.get("ci_steps") {
+        if !ci_steps.is_array() {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "persisted review ci_steps must be an array",
+            )));
+        }
+    }
+    for key in ["user_approval", "execution", "execution_retry"] {
+        if let Some(value) = object.get(key) {
+            if !value.is_object() {
+                return Err(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("persisted review {key} must be an object"),
+                )));
+            }
+        }
     }
     serde_json::from_value(value)
 }
@@ -1231,5 +1620,26 @@ mod execution_liveness_response_tests {
         let interruption = response.interruption.expect("timeout interruption");
         assert_eq!(interruption.kind.as_deref(), Some("agent_timeout"));
         assert_eq!(interruption.reason, "agent_timeout");
+    }
+}
+
+#[cfg(test)]
+mod agent_activity_status_tests {
+    use super::projected_agent_status;
+
+    #[test]
+    fn running_execution_projects_idle_agent_as_busy() {
+        assert_eq!(
+            projected_agent_status(&db::AgentStatus::Idle, Some(1)),
+            api_types::AgentStatus::Busy
+        );
+        assert_eq!(
+            projected_agent_status(&db::AgentStatus::Idle, Some(0)),
+            api_types::AgentStatus::Idle
+        );
+        assert_eq!(
+            projected_agent_status(&db::AgentStatus::Error, Some(1)),
+            api_types::AgentStatus::Error
+        );
     }
 }

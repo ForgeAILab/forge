@@ -4,7 +4,10 @@ use crate::{
     memory::MemoryService,
     merge_service::MergeService,
     terminal_service::TerminalActivityTracker,
-    workflow::{default_states, engine::WorkflowEngine},
+    workflow::{
+        default_states,
+        engine::{WorkflowAuthority, WorkflowEngine},
+    },
     workspace_cleanup::WorkspaceCleanupScheduler,
     workspace_execution_lock::WorkspaceExecutionLockManager,
     Assignee, Result, ServiceError,
@@ -18,9 +21,9 @@ use db::{
     new_uuid_v4, now_rfc3339, Agent, AgentRepo, ArchiveTask, AssigneeKind, ClaimExecutionLease,
     ClaimTask, ClaimedTask, CommentAuthorType, CreateDomainEvent, CreateExecution, CreateTask,
     CreateTaskComment, CreateTaskRoleAssignment, CreateWorkspace, CreateWorkspaceLease, DbError,
-    DomainEventRepo, Execution, ExecutionLeaseDisposition, ExecutionRepo, ExecutionStatus,
-    ExecutionTerminalOutcome, PageRequest, ProjectRepo, RepoRepo, Review, ReviewRepo, ReviewStatus,
-    SoftDeleteTask, SortBy, SortOrder, SqliteDb, Task, TaskBoardRepo, TaskComment, TaskCommentRepo,
+    DomainEventRepo, Execution, ExecutionAdmission, ExecutionLeaseDisposition, ExecutionRepo,
+    ExecutionStatus, ExecutionTerminalOutcome, ProjectRepo, RepoRepo, Review, ReviewRepo,
+    ReviewStatus, SoftDeleteTask, SqliteDb, Task, TaskBoardRepo, TaskComment, TaskCommentRepo,
     TaskDependencyRepo, TaskMetadata, TaskRepo, TaskRoleAssignment, TaskRoleAssignmentRepo,
     TaskStatus, TerminalizeExecution, TransitionLogRepo, Workspace, WorkspaceLeaseRepo,
     WorkspaceRepo, WorkspaceStatus,
@@ -82,16 +85,139 @@ pub use proposal::{
 pub(crate) use repository_authority::resolve_task_repository_authority;
 pub(crate) use subtask::{
     coordination_review_pending, coordination_root_has_subtasks,
-    coordination_root_sequence_complete, mark_coordination_review_pending_if_root,
-    subtask_dispatch_ready, subtask_is_terminal,
+    coordination_root_sequence_complete, subtask_dispatch_ready, subtask_is_terminal,
 };
 pub use subtask::{is_root_task, is_subtask, root_for};
+
+/// Decode persisted review details before any endpoint or workflow mutates the
+/// row. Legacy CI-only arrays are still readable, but every other malformed
+/// syntax or shape is persisted server corruption and must fail closed.
+pub(crate) fn strict_review_details(review: &Review) -> Result<Value> {
+    let corrupt = |reason: String| {
+        ServiceError::Db(DbError::ReviewDetailsCorrupt {
+            review_id: review.id.clone(),
+            reason,
+        })
+    };
+    let value = serde_json::from_str::<Value>(&review.step_results_json)
+        .map_err(|error| corrupt(error.to_string()))?;
+    if let Value::Array(ci_steps) = value {
+        serde_json::from_value::<Vec<api_types::StepResultEntry>>(Value::Array(ci_steps.clone()))
+            .map_err(|error| corrupt(error.to_string()))?;
+        return Ok(json!({ "ci_steps": ci_steps }));
+    }
+    if !value.is_object() {
+        return Err(corrupt(format!(
+            "expected review details object or legacy step array, got {value}"
+        )));
+    }
+    let object = value
+        .as_object()
+        .expect("value was checked to be an object");
+    for key in object.keys() {
+        if ![
+            "ci_steps",
+            "conformance",
+            "auditor",
+            "user_approval",
+            "execution",
+            "execution_retry",
+        ]
+        .contains(&key.as_str())
+        {
+            return Err(corrupt(format!(
+                "unknown persisted review detail field: {key}"
+            )));
+        }
+    }
+    if let Some(ci_steps) = object.get("ci_steps") {
+        if !ci_steps.is_array() {
+            return Err(corrupt("persisted review ci_steps must be an array".into()));
+        }
+    }
+    for key in ["user_approval", "execution", "execution_retry"] {
+        if let Some(value) = object.get(key) {
+            if !value.is_object() {
+                return Err(corrupt(format!("persisted review {key} must be an object")));
+            }
+        }
+    }
+    serde_json::from_value::<api_types::ReviewDetails>(value.clone())
+        .map_err(|error| corrupt(error.to_string()))?;
+    Ok(value)
+}
 
 #[cfg(test)]
 use self::config::{
     execution_overrides_to_config_layer, merge_config_layers, override_value_or_empty,
     parse_config_override_layer, OverridesApplied,
 };
+
+/// Build the immutable facts that a workflow dispatch used to choose an
+/// execution. The DB admission transaction re-reads these facts under its
+/// writer lock; this is deliberately based on the same governing-workflow
+/// rule as `WorkflowEngine::resolve_workflow_for_task`, including inherited
+/// subtask states.
+pub(crate) async fn execution_admission_for_task(
+    db: &SqliteDb,
+    task: &Task,
+    project_workflow_definition: &str,
+    role: &str,
+    agent: Option<&Agent>,
+    expected_project_version: i64,
+) -> Result<ExecutionAdmission> {
+    let inherited_subtask_workflow = task.parent_task_id.is_some()
+        && WorkflowEngine::resolve_subtask_workflow()
+            .states
+            .iter()
+            .any(|state| state.name == task.status);
+    let expected_assignment = if role == crate::workflow::default_roles::INTERACTIVE {
+        None
+    } else {
+        let assignment_role = if role == "executor" {
+            crate::workflow::default_roles::CODER
+        } else {
+            role
+        };
+        Some(
+            TaskRoleAssignmentRepo::get_by_task_and_role(db, &task.id, assignment_role)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::conflict(format!(
+                        "task {} has no assignment for workflow role {}",
+                        task.id, assignment_role
+                    ))
+                })?,
+        )
+    };
+    Ok(ExecutionAdmission {
+        expected_project_version: Some(expected_project_version),
+        expected_task_version: task.version,
+        expected_task_status: task.status.clone(),
+        expected_effective_role: (role != crate::workflow::default_roles::INTERACTIVE)
+            .then(|| role.to_owned()),
+        expected_agent_version: agent.map(|agent| agent.version),
+        expected_agent_max_concurrent_tasks: agent.map(|agent| agent.max_concurrent_tasks),
+        expected_reviewer_parent_execution_id: None,
+        expected_latest_review_candidate_execution_id: None,
+        expected_reviewer_id: None,
+        expected_reviewer_attempt_number: None,
+        expected_reviewer_status: None,
+        expected_reviewer_updated_at: None,
+        expected_reviewer_execution_id: None,
+        expected_auditor_execution_id: None,
+        expected_assignment_id: expected_assignment
+            .as_ref()
+            .map(|assignment| assignment.id.clone()),
+        expected_assignment_updated_at: expected_assignment
+            .as_ref()
+            .map(|assignment| assignment.updated_at.clone()),
+        expected_workflow_definition: (role != crate::workflow::default_roles::INTERACTIVE
+            && !inherited_subtask_workflow)
+            .then(|| project_workflow_definition.to_owned()),
+    })
+}
+
 use self::{
     config::{
         build_executor_config_snapshot, create_failed_execution_record,
@@ -438,6 +564,75 @@ impl TaskService {
         self.event_bus.publish(event);
     }
 
+    /// Make a forced Project deletion safe to commit. Every running execution
+    /// is terminalized through the owner/version CAS and its provider is asked
+    /// to stop; any provider failure is returned. Leases that are not attached
+    /// to one of those executions are revoked explicitly as well. The caller
+    /// still performs a final DB in-use check immediately before deletion to
+    /// catch work admitted concurrently with this pass.
+    pub async fn prepare_project_deletion(&self, project_id: &str) -> Result<()> {
+        validate_required("project_id", project_id)?;
+
+        let running = ExecutionRepo::list_running_for_project(&*self.db, project_id).await?;
+        for execution in running {
+            let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, true)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
+            // A concurrent Task move can change the join result after the
+            // scoped read. Never cancel an execution that no longer belongs
+            // to this Project; the final DB guard will re-check its current
+            // owner before deletion.
+            if task.project_id != project_id {
+                continue;
+            }
+            self.cancel_active_execution_for_project_deletion(&execution)
+                .await?;
+        }
+
+        for mut lease in WorkspaceLeaseRepo::list_active_for_project(&*self.db, project_id).await? {
+            // Revocation is versioned because a renewal/revocation may win
+            // between the scoped snapshot and this write.  A lease that is
+            // already terminal is a successful force-delete outcome; an
+            // active lease that keeps changing must remain a blocker.
+            let mut revoked = false;
+            for _ in 0..3 {
+                match WorkspaceLeaseRepo::revoke(
+                    &*self.db,
+                    &lease.id,
+                    lease.version,
+                    &now_rfc3339(),
+                )
+                .await
+                {
+                    Ok(_) => {
+                        revoked = true;
+                        break;
+                    }
+                    Err(DbError::VersionConflict) => {
+                        let Some(current) =
+                            WorkspaceLeaseRepo::get_by_id(&*self.db, &lease.id).await?
+                        else {
+                            break;
+                        };
+                        if current.status != "active" {
+                            break;
+                        }
+                        lease = current;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if !revoked {
+                if let Some(current) = WorkspaceLeaseRepo::get_by_id(&*self.db, &lease.id).await? {
+                    if current.status == "active" {
+                        return Err(ServiceError::Db(DbError::VersionConflict));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Prepare the scheduler-owned lease installed with a newly-created
     /// running execution.  A currently authenticated daemon connection owns
     /// the attempt from the first row write; all other dispatches receive an
@@ -506,8 +701,153 @@ impl TaskService {
     /// workspace created by this attempt is rolled back.
     pub(crate) async fn create_running_execution(
         &self,
+        mut input: CreateExecution,
+        workspace_created_by_attempt: bool,
+    ) -> Result<Execution> {
+        let repository_context = if let Some(workspace_id) = input.workspace_id.as_deref() {
+            let task = TaskRepo::get_by_id(&*self.db, &input.task_id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", input.task_id.clone()))?;
+            let workspace = WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?;
+            Some((task, workspace))
+        } else {
+            return Err(ServiceError::invalid_operation(
+                "repository execution requires a scheduler WorkspaceLease-backed workspace",
+            ));
+        };
+
+        // Capacity is part of the same snapshot as the task/workflow facts.
+        // The authoritative transaction will compare this max and count
+        // running executions again before INSERT.
+        let agent = match input.agent_id.as_deref() {
+            Some(agent_id) => AgentRepo::get_by_id(&*self.db, agent_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?,
+            None => {
+                return Err(ServiceError::invalid_operation(
+                    "running execution requires an agent principal",
+                ))
+            }
+        };
+
+        // Carry the role and exact governing-workflow decision made by the
+        // caller into the authoritative transaction. Interactive executions
+        // are deliberately outside the workflow-role admission check; every
+        // workflow role (including the historical `executor`/`coder` alias)
+        // is revalidated immediately before INSERT and fails closed if the
+        // Task or workflow no longer grants that role.
+        let reviewer_snapshot = if input.role == crate::workflow::default_roles::REVIEWER {
+            let reviews = ReviewRepo::list_by_task(&*self.db, &input.task_id).await?;
+            // A correctly bound reviewer resume already carries the candidate
+            // as its parent. Prefer that exact Review row; legacy reviewer
+            // rows used the reviewer execution itself as parent, so fall back
+            // to the latest task review while repairing their lineage.
+            let bound_review = input.parent_execution_id.as_deref().and_then(|parent_id| {
+                reviews
+                    .iter()
+                    .find(|review| review.execution_id == parent_id)
+                    .cloned()
+            });
+            bound_review
+                .or_else(|| {
+                    reviews
+                        .into_iter()
+                        .max_by_key(|review| (review.attempt_number, review.id.clone()))
+                })
+                .map(|review| {
+                    (
+                        review.id,
+                        review.execution_id,
+                        review.attempt_number,
+                        review.status.to_string(),
+                        review.updated_at,
+                        review.reviewer_execution_id,
+                        review.auditor_execution_id,
+                    )
+                })
+        } else {
+            None
+        };
+        let mut admission = if input.role == crate::workflow::default_roles::INTERACTIVE {
+            let (task, _) = repository_context
+                .as_ref()
+                .expect("repository context exists for running execution");
+            let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+            Some(
+                self::execution_admission_for_task(
+                    &self.db,
+                    task,
+                    "",
+                    &input.role,
+                    Some(&agent),
+                    project.version,
+                )
+                .await?,
+            )
+        } else {
+            let (task, _) = repository_context
+                .as_ref()
+                .expect("repository context exists for running execution");
+            let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+            Some(
+                self::execution_admission_for_task(
+                    &self.db,
+                    task,
+                    &project.workflow_definition,
+                    &input.role,
+                    Some(&agent),
+                    project.version,
+                )
+                .await?,
+            )
+        };
+        if input.role == crate::workflow::default_roles::REVIEWER {
+            let Some((
+                id,
+                execution_id,
+                attempt_number,
+                status,
+                updated_at,
+                reviewer_execution_id,
+                auditor_execution_id,
+            )) = reviewer_snapshot
+            else {
+                return Err(ServiceError::conflict(
+                    "reviewer execution requires a current review candidate",
+                ));
+            };
+            // Review::execution_id is the candidate being reviewed, not the
+            // reviewer execution that supplied the resume session. Keep the
+            // latter in the executor snapshot/session fields, but persist the
+            // candidate as the durable lineage parent used by reviewer
+            // cascade/reconciliation.
+            input.parent_execution_id = Some(execution_id.clone());
+            if let Some(admission) = admission.as_mut() {
+                admission.expected_reviewer_parent_execution_id = Some(execution_id.clone());
+                admission.expected_latest_review_candidate_execution_id = Some(execution_id);
+                admission.expected_reviewer_id = Some(id);
+                admission.expected_reviewer_attempt_number = Some(attempt_number);
+                admission.expected_reviewer_status = Some(status);
+                admission.expected_reviewer_updated_at = Some(updated_at);
+                admission.expected_reviewer_execution_id = reviewer_execution_id;
+                admission.expected_auditor_execution_id = auditor_execution_id;
+            }
+        }
+        self.create_running_execution_with_admission(input, workspace_created_by_attempt, admission)
+            .await
+    }
+
+    pub(crate) async fn create_running_execution_with_admission(
+        &self,
         input: CreateExecution,
         workspace_created_by_attempt: bool,
+        admission: Option<ExecutionAdmission>,
     ) -> Result<Execution> {
         let repository_context = if let Some(workspace_id) = input.workspace_id.as_deref() {
             let task = TaskRepo::get_by_id(&*self.db, &input.task_id, false)
@@ -525,7 +865,13 @@ impl TaskService {
 
         let create_result = if input.status == ExecutionStatus::Running {
             let lease = self.initial_execution_lease(&input).await?;
-            ExecutionRepo::create_with_lease(&*self.db, input.clone(), lease).await
+            ExecutionRepo::create_with_lease_and_admission(
+                &*self.db,
+                input.clone(),
+                lease,
+                admission,
+            )
+            .await
         } else {
             ExecutionRepo::create(&*self.db, input.clone()).await
         };

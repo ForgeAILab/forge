@@ -10,6 +10,7 @@ use axum::{
     http::{header, Method, Request, StatusCode},
     Router,
 };
+use db::{CreateTransitionLog, TaskRepo, TransitionLogRepo};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -51,6 +52,123 @@ async fn review_retry_budget_reports_exhaustion_without_blocking_gate_entry() {
         task.blocked.is_none(),
         "entering review should not block before review execution fails"
     );
+}
+
+#[tokio::test]
+async fn task_response_remaining_retries_resets_at_recovery_boundary() {
+    let harness = test_app().await;
+    let (project_id, _repo_id) = create_project_and_repo(&harness.app).await;
+    let _: Value = json_request(
+        &harness.app,
+        Method::PUT,
+        &format!("/api/v1/projects/{project_id}/workflow"),
+        json!({ "definition": review_budget_workflow() }),
+        StatusCode::OK,
+    )
+    .await;
+
+    let task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({ "title": "Retry boundary projection" }),
+        StatusCode::OK,
+    )
+    .await;
+    let task = TaskRepo::update_status(
+        &*harness._state.db,
+        db::UpdateTaskStatus {
+            id: task.id.clone(),
+            expected_version: task.version,
+            status: "review".to_owned(),
+            assignee_id: None,
+            error_annotation: None,
+            blocked_json: None,
+            failed_json: None,
+            updated_at: db::now_rfc3339(),
+        },
+    )
+    .await
+    .expect("task enters review");
+
+    TransitionLogRepo::insert(
+        &*harness._state.db,
+        CreateTransitionLog {
+            id: db::new_uuid_v4(),
+            task_id: task.id.clone(),
+            from_state: "review".to_owned(),
+            to_state: "in_progress".to_owned(),
+            trigger_name: Some("reject".to_owned()),
+            triggered_by: "test".to_owned(),
+            trigger_reason: "first rejection".to_owned(),
+            hook_results_json: None,
+            rejection: true,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+        },
+    )
+    .await
+    .expect("rejection log inserts");
+    TransitionLogRepo::insert(
+        &*harness._state.db,
+        CreateTransitionLog {
+            id: db::new_uuid_v4(),
+            task_id: task.id.clone(),
+            from_state: "review".to_owned(),
+            to_state: "in_progress".to_owned(),
+            trigger_name: Some("review_refresh".to_owned()),
+            triggered_by: "system:workflow".to_owned(),
+            trigger_reason: "[review-refresh] target advanced".to_owned(),
+            hook_results_json: None,
+            rejection: false,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+        },
+    )
+    .await
+    .expect("review-refresh bridge inserts");
+
+    let response: TaskResponse = json_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", task.id),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        response.remaining_retries.get("review"),
+        Some(&0),
+        "a review-refresh bridge must not reset the runtime/API retry window"
+    );
+
+    TransitionLogRepo::insert(
+        &*harness._state.db,
+        CreateTransitionLog {
+            id: db::new_uuid_v4(),
+            task_id: task.id.clone(),
+            from_state: "review".to_owned(),
+            to_state: "review".to_owned(),
+            trigger_name: Some("reset_to_initial".to_owned()),
+            triggered_by: "test".to_owned(),
+            trigger_reason: "reset retry window".to_owned(),
+            hook_results_json: None,
+            rejection: false,
+            // Keep the boundary at the same timestamp as the preceding rows;
+            // list ordering must still follow the database's row order.
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+        },
+    )
+    .await
+    .expect("recovery boundary inserts");
+
+    let response: TaskResponse = json_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", task.id),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(response.remaining_retries.get("review"), Some(&1));
 }
 
 fn review_budget_workflow() -> Value {

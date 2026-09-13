@@ -88,8 +88,14 @@ impl TaskService {
         )
         .await?;
         if review_scope_changed && updated.review_passed_at.is_some() {
-            updated = TaskRepo::set_review_passed_at(&*self.db, &updated.id, None, &now_rfc3339())
-                .await?;
+            updated = TaskRepo::set_review_passed_at_cas(
+                &*self.db,
+                &updated.id,
+                updated.version,
+                None,
+                &now_rfc3339(),
+            )
+            .await?;
         }
         Ok(updated)
     }

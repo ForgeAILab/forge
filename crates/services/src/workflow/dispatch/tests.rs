@@ -6,13 +6,29 @@ use crate::workflow::{
         apply_prompt_overrides, build_effective_prompt, effective_prompt_selection,
         generic_prompt::GenericPromptBuilder, planner_prompt::PlannerPromptBuilder,
         resolve_prompt_builder, reviewer_prompt::ReviewerPromptBuilder, AgentDispatchContext,
-        DispatchIntent, PromptBuilder, BUILDER_ID_CODER_IMPLEMENTATION_V2,
+        AgentPrompt, DispatchIntent, PromptBuilder, BUILDER_ID_CODER_IMPLEMENTATION_V2,
         BUILDER_ID_CODER_MERGE_FIX_V2, BUILDER_ID_CODER_REVIEW_FIX_V2,
         BUILDER_ID_GENERIC_DEFAULT_V2, BUILDER_ID_PLANNER_DEFAULT_V2, BUILDER_ID_READ_ONLY_TASK_V1,
         BUILDER_ID_REVIEWER_CONFORMANCE_V1, BUILDER_ID_WORKER_AUTONOMOUS_V1,
         BUILDER_ID_WORKER_MERGE_FIX_V1, BUILDER_ID_WORKER_REVIEW_FIX_V1,
     },
 };
+
+#[test]
+fn execution_input_preserves_role_contract_and_user_request() {
+    let prompt = AgentPrompt {
+        system: "Worker boundary: do not integrate the target branch.".to_owned(),
+        user: "Implement the parser.".to_owned(),
+        tools: Vec::new(),
+    };
+
+    let input = prompt.execution_input(Some("Keep the public format stable."));
+
+    assert!(input.starts_with("Forge role contract (authoritative):"));
+    assert!(input.contains("do not integrate the target branch"));
+    assert!(input.contains("[User context: Keep the public format stable.]"));
+    assert!(input.ends_with("Implement the parser."));
+}
 
 fn fake_task(id: &str, title: &str, description: Option<&str>) -> db::Task {
     db::Task {
@@ -51,6 +67,8 @@ fn fake_review(attempt_number: i64, status: db::ReviewStatus) -> db::Review {
         id: format!("review-{attempt_number}"),
         task_id: "task-1".to_string(),
         execution_id: format!("execution-{attempt_number}"),
+        reviewer_execution_id: None,
+        auditor_execution_id: None,
         attempt_number,
         status,
         step_results_json: "{}".to_string(),
@@ -115,7 +133,7 @@ fn default_prompt_builders_include_managed_contract_and_role_boundaries() {
             default_roles::CODER,
             vec![
                 "Merge-fix boundary:",
-                "Must resolve merge conflicts minimally while preserving implementation intent",
+                "must not rebase or attempt a real branch conflict repair",
                 "Must not rewrite the feature or add unrelated cleanup.",
             ],
         ),
@@ -219,7 +237,8 @@ fn worker_prompt_builders_cover_autonomous_handoff_and_use_coder_tools() {
 
     let merge_fix = resolve_prompt_builder(BUILDER_ID_WORKER_MERGE_FIX_V1)
         .build(&fake_context(default_roles::WORKER));
-    assert!(merge_fix.user.contains("Merge repair is required"));
+    assert!(merge_fix.user.contains("real branch conflict"));
+    assert!(merge_fix.user.contains("Do not rebase"));
 }
 
 /// The coder reports through the worklog the reviewer reads, and proves
@@ -323,14 +342,41 @@ fn coder_prompt_merge_failed_follow_up_contains_rereview_directive() {
     ctx.state_name = default_states::MERGE_FAILED.to_string();
     ctx.continuation_of_execution_id = Some("parent-exec".to_string());
     ctx.task.review_passed_at = Some("2026-04-17T10:00:00Z".to_string());
+    ctx.task.error_annotation = Some(json!({"type": "merge_conflict"}).to_string());
 
     let prompt = resolve_prompt_builder(BUILDER_ID_CODER_MERGE_FIX_V2).build(&ctx);
 
-    assert!(prompt.user.contains("merge failed due to conflicts"));
-    assert!(
-        prompt.user.contains("review already passed")
-            || prompt.user.contains("reviewer will not re-review")
+    assert!(prompt.user.contains("real merge conflict"));
+    assert!(prompt.user.contains("Do not rebase"));
+    assert!(prompt.user.contains("manual task-worktree repair"));
+    // The repaired commit is re-reviewed, so the prompt must not promise the
+    // reviewer is done with it.
+    assert!(prompt.user.contains("fresh review"));
+    assert!(!prompt.user.contains("will not re-review"));
+}
+
+#[test]
+fn coder_prompt_dirty_worktree_does_not_rebase_or_discard_changes() {
+    let mut ctx = fake_context(default_roles::CODER);
+    ctx.state_name = default_states::MERGE_FAILED.to_string();
+    ctx.task.review_passed_at = Some("2026-04-17T10:00:00Z".to_string());
+    ctx.task.error_annotation = Some(
+        json!({
+            "type": "dirty_worktree",
+            "message": "worktree has uncommitted changes: src/lib.rs"
+        })
+        .to_string(),
     );
+
+    let prompt = resolve_prompt_builder(BUILDER_ID_CODER_MERGE_FIX_V2).build(&ctx);
+
+    assert!(prompt.user.contains("uncommitted changes"));
+    assert!(prompt.user.contains("not a merge conflict"));
+    assert!(prompt.user.contains("do not rebase or discard it"));
+    assert!(!prompt.user.contains("real merge conflict"));
+    assert!(!prompt
+        .user
+        .contains("Rebase your worktree branch onto the latest default branch"));
 }
 
 #[test]

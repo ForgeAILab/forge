@@ -49,11 +49,13 @@ const SOLO_AGENT_REGISTRATION_KEY: &str = "forge_solo_registration_key";
 const PROJECT_AGENT_BINDING_SETUP_STATE: &str = "agent_setup_required";
 const PROJECT_CHAT_SETUP_STATUS: &str = "agent_setup_required";
 const PROJECT_CHAT_READY_STATUS: &str = "ready";
-// Legacy Charter adoption may converse with the selected Project Agent, but
-// it must not grant task mutation authority before the Charter command has
-// produced the current admission authority. Keep this ceiling canonical so a
-// replay cannot widen the setup binding accidentally.
-const SOLO_PROJECT_SETUP_PERMISSION_CEILING_JSON: &str = r#"{"permissions":["read_project","read_agent_chat","read_memory","propose_message","propose_project"]}"#;
+// Persist the Project Agent's post-adoption ceiling while the Charter gate is
+// still closed. The canonical Agent Chat scope intersects this ceiling with
+// `project.charter_setup_required`, so Task and other operational proposals
+// remain unavailable until the approval transaction commits. Keeping the
+// future ceiling here lets that transaction preserve a deliberately narrowed
+// binding for ordinary Projects without leaving Solo permanently setup-only.
+const SOLO_PROJECT_PERMISSION_CEILING_JSON: &str = r#"{"permissions":["read_project","read_agent_chat","read_task","read_memory","propose_task","propose_project","propose_message","propose_review","propose_commitment","propose_memory","propose_decision","propose_session"]}"#;
 const SOLO_PROJECT_NAME_MAX_CHARS: usize = 200;
 const MAX_RECONCILIATION_PAGES: usize = 1024;
 
@@ -449,9 +451,9 @@ impl SoloBootstrapService {
 
         // A confirmed Project Agent is allowed to conduct the legacy Charter
         // adoption conversation. This is a binding replacement, not Charter
-        // approval: the replacement remains `charter_setup_required` and its
-        // permission ceiling intentionally excludes task mutation. Recheck
-        // the selected source immediately before this authority-bearing
+        // approval: the replacement remains `charter_setup_required`, and the
+        // canonical scope gate withholds its latent operational permissions.
+        // Recheck the selected source immediately before this authority-bearing
         // binding write; no alternate identity is ever substituted.
         if project.charter_status == "legacy_unverified"
             && project.charter_setup_required
@@ -1338,8 +1340,7 @@ impl SoloBootstrapService {
                         || binding.charter_id.is_some()
                         || binding.charter_revision_id.is_some()
                         || chat.status != PROJECT_CHAT_READY_STATUS
-                        || binding.permission_ceiling_json
-                            != SOLO_PROJECT_SETUP_PERMISSION_CEILING_JSON
+                        || binding.permission_ceiling_json != SOLO_PROJECT_PERMISSION_CEILING_JSON
                     {
                         return Err(conflict(
                                 "active legacy Project Agent binding/chat is not in the adoption-only state",
@@ -1415,7 +1416,7 @@ impl SoloBootstrapService {
                 identity_id: Some(identity_id.to_owned()),
                 state: "active".to_owned(),
                 autonomy_policy_json: "{}".to_owned(),
-                permission_ceiling_json: SOLO_PROJECT_SETUP_PERMISSION_CEILING_JSON.to_owned(),
+                permission_ceiling_json: SOLO_PROJECT_PERMISSION_CEILING_JSON.to_owned(),
                 subscriptions_json: "[]".to_owned(),
                 // This is the existing typed binding field; a one-turn
                 // adoption budget is sufficient and does not become Task
@@ -2427,7 +2428,7 @@ mod tests {
         assert!(binding.charter_setup_required);
         assert_eq!(
             binding.permission_ceiling_json,
-            SOLO_PROJECT_SETUP_PERMISSION_CEILING_JSON
+            SOLO_PROJECT_PERMISSION_CEILING_JSON
         );
         assert!(binding.admission_receipt_id.is_none());
         assert!(binding.charter_approval_id.is_none());

@@ -9,6 +9,11 @@ use crate::{Result, ServiceError};
 
 pub(super) fn is_io_or_workspace_error(error: &ServiceError) -> bool {
     match error {
+        // Workspace preparation preserves Git/process/filesystem failures as
+        // typed `ServiceError::Git` values. They must fall through the active
+        // recovery loop so the next scan retries them; this legacy predicate
+        // is retained only for older InvalidOperation callers that still
+        // surface an untyped workspace I/O message.
         ServiceError::InvalidOperation { message } => {
             message.contains("io error:") || message.contains("No such file or directory")
         }
@@ -44,6 +49,11 @@ pub(super) fn is_deterministic_dispatch_refusal(error: &ServiceError) -> bool {
         | ServiceError::RepoMismatch { .. }
         | ServiceError::PrProviderMissing { .. } => true,
         ServiceError::GuardRejection { guard, .. } => guard == "dependency_gate",
+        // A slot held by a concurrently running execution frees itself the
+        // moment that execution terminalises, and nothing about that clears a
+        // disposition: the Task row does not change, so a park here survives
+        // until a human edits the Task. Always retried on the next scan.
+        ServiceError::ExecutionAlreadyRunning { .. } => false,
         // A malformed or contract-violating request cannot fix itself, but an
         // I/O or workspace failure surfaced through the same variant can.
         ServiceError::InvalidOperation { .. } => !is_io_or_workspace_error(error),
@@ -279,22 +289,10 @@ pub(super) async fn has_running_execution_for_roles(
     task_id: &str,
     roles: &[&str],
 ) -> Result<bool> {
-    let page = ExecutionRepo::list_by_task(
-        db,
-        task_id,
-        PageRequest {
-            cursor: None,
-            limit: 100,
-            include_total: false,
-            sort_by: SortBy::CreatedAt,
-            sort_order: SortOrder::Desc,
-        },
-    )
-    .await?;
-    Ok(page.items.iter().any(|execution| {
-        execution.status == ExecutionStatus::Running
-            && roles.iter().any(|role| execution.role == *role)
-    }))
+    let executions = ExecutionRepo::list_running_by_task(db, task_id).await?;
+    Ok(executions
+        .iter()
+        .any(|execution| roles.iter().any(|role| execution.role == *role)))
 }
 
 pub(super) fn first_transition_to_kind<'a>(

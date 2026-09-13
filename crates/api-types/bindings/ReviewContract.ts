@@ -2,7 +2,12 @@
 import type { ConformanceCheckResult } from "./ConformanceCheckResult";
 import type { ReviewGoverningContext } from "./ReviewGoverningContext";
 
-export type ReviewContract = { execution_id: string, policy: string, commit_sha: string, base_sha: string, context: ReviewGoverningContext,
+export type ReviewContract = { execution_id: string, policy: string, commit_sha: string, base_sha: string,
+/**
+ * Exact repository-relative paths changed by `base_sha..commit_sha`.
+ * Blocking file evidence must be attributable to this candidate delta.
+ */
+candidate_changed_paths: Array<string>, context: ReviewGoverningContext,
 /**
  * Results Forge recorded before dispatching the reviewer. These are
  * immutable reviewer inputs; conformance admission reruns required checks

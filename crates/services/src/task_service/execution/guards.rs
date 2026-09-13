@@ -203,25 +203,15 @@ impl TaskService {
         &self,
         task_id: &str,
     ) -> Result<()> {
-        let page = ExecutionRepo::list_by_task(
-            &*self.db,
-            task_id,
-            PageRequest {
-                cursor: None,
-                limit: 100,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Desc,
-            },
-        )
-        .await?;
-        if let Some(running) = page.items.into_iter().find(|execution| {
-            execution.role == "interactive" && execution.status == ExecutionStatus::Running
-        }) {
-            return Err(ServiceError::invalid_operation(format!(
-                "interactive execution already running: {}",
-                running.id
-            )));
+        if let Some(running) = ExecutionRepo::list_running_by_task(&*self.db, task_id)
+            .await?
+            .into_iter()
+            .find(|execution| execution.role == "interactive")
+        {
+            return Err(ServiceError::execution_already_running(
+                "interactive",
+                running.id,
+            ));
         }
         Ok(())
     }
@@ -247,10 +237,10 @@ impl TaskService {
             None
         };
         if let Some(running_execution_id) = running_execution_id {
-            return Err(ServiceError::invalid_operation(format!(
-                "repository execution already running: {}",
-                running_execution_id
-            )));
+            return Err(ServiceError::execution_already_running(
+                "repository",
+                running_execution_id,
+            ));
         }
         Ok(())
     }
@@ -271,22 +261,14 @@ impl TaskService {
         }
 
         for depends_on_id in &unsatisfied_dependencies {
-            let page = ExecutionRepo::list_by_task(
+            if ExecutionRepo::has_execution_by_task_role_and_agent(
                 &*self.db,
                 depends_on_id,
-                PageRequest {
-                    cursor: None,
-                    limit: 20,
-                    include_total: false,
-                    sort_by: SortBy::CreatedAt,
-                    sort_order: SortOrder::Desc,
-                },
+                "executor",
+                agent_id,
             )
-            .await?;
-            let context_holder_match = page.items.into_iter().any(|execution| {
-                execution.role == "executor" && execution.agent_id.as_deref() == Some(agent_id)
-            });
-            if context_holder_match {
+            .await?
+            {
                 return Ok(());
             }
         }

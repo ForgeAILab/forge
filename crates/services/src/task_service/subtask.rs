@@ -166,20 +166,6 @@ pub(crate) fn coordination_review_pending(task: &Task) -> bool {
         .unwrap_or(false)
 }
 
-/// Mark a coordination root for another aggregate-review pass after a
-/// mechanical repository update, such as a clean rebase onto a moved target.
-/// Standalone Tasks and children keep their ordinary recovery path.
-pub(crate) async fn mark_coordination_review_pending_if_root(
-    db: &SqliteDb,
-    task: &Task,
-) -> Result<bool> {
-    if !coordination_root_has_subtasks(db, task).await? {
-        return Ok(false);
-    }
-    update_coordination_review_pending(db, &task.id, true).await?;
-    Ok(true)
-}
-
 impl TaskService {
     pub(crate) async fn reconcile_terminal_subtask(&self, task: &Task) {
         if task.parent_task_id.is_none() {
@@ -433,18 +419,57 @@ async fn update_coordination_review_pending(
     let parent = TaskRepo::get_by_id(db, parent_task_id, false)
         .await?
         .ok_or_else(|| ServiceError::not_found("task", parent_task_id.to_owned()))?;
-    let mut metadata = TaskMetadata::parse(parent.metadata_json.as_deref()).map_err(|error| {
+    let metadata = TaskMetadata::parse(parent.metadata_json.as_deref()).map_err(|error| {
         ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", parent.id))
     })?;
     if pending {
-        metadata.extra.insert(
-            COORDINATION_REVIEW_PENDING_KEY.to_owned(),
-            Value::Bool(true),
-        );
-    } else {
-        metadata.extra.remove(COORDINATION_REVIEW_PENDING_KEY);
+        TaskRepo::mutate_metadata(
+            db,
+            parent_task_id,
+            Some(parent.version),
+            vec![
+                db::TaskMetadataMutation::Set {
+                    key: COORDINATION_REVIEW_PENDING_KEY.to_owned(),
+                    value: Value::Bool(true),
+                },
+                db::TaskMetadataMutation::Set {
+                    key: "coordination_review_pending_id".to_owned(),
+                    value: Value::String(new_uuid_v4()),
+                },
+            ],
+            &now_rfc3339(),
+        )
+        .await?;
+        return Ok(());
     }
-    TaskRepo::set_metadata_json(db, parent_task_id, metadata.to_json(), &now_rfc3339()).await?;
+    let Some(expected) = metadata
+        .extra
+        .get("coordination_review_pending_id")
+        .cloned()
+    else {
+        // Legacy markers have no identity that can distinguish this clear
+        // from a newer ordered-subtask sequence.
+        return Ok(());
+    };
+    TaskRepo::mutate_metadata(
+        db,
+        parent_task_id,
+        None,
+        vec![db::TaskMetadataMutation::CompareAndMutate {
+            key: "coordination_review_pending_id".to_owned(),
+            expected,
+            mutations: vec![
+                db::TaskMetadataMutation::Remove {
+                    key: COORDINATION_REVIEW_PENDING_KEY.to_owned(),
+                },
+                db::TaskMetadataMutation::Remove {
+                    key: "coordination_review_pending_id".to_owned(),
+                },
+            ],
+        }],
+        &now_rfc3339(),
+    )
+    .await?;
     Ok(())
 }
 

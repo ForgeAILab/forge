@@ -2,6 +2,18 @@ use super::*;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
+/// Preserve Git and filesystem failures as typed transient service errors.
+/// Dispatch dispositions are for stable governance refusals; converting these
+/// failures to `InvalidOperation` text would park a Task until an unrelated
+/// version change even though the repository/process may recover on its own.
+fn map_workspace_error(error: ::workspace::WorkspaceError) -> ServiceError {
+    match error {
+        ::workspace::WorkspaceError::Git(error) => ServiceError::Git(error),
+        ::workspace::WorkspaceError::Io(error) => ServiceError::Git(git::GitError::Io(error)),
+        error => ServiceError::invalid_operation(error.to_string()),
+    }
+}
+
 pub(crate) async fn prepare_workspace(
     db: &SqliteDb,
     workspace_root: &std::path::Path,
@@ -40,7 +52,7 @@ pub(crate) async fn prepare_workspace_owned(
             // The root is a coordination container, so its first runnable
             // child creates the shared root-owned worktree on demand. A child
             // admission failure must not clean up that shared workspace.
-            let workspace = create_fresh_workspace(
+            let (workspace, _) = create_fresh_workspace(
                 db,
                 workspace_root,
                 &authority.repo,
@@ -127,17 +139,14 @@ pub(crate) async fn prepare_workspace_owned(
         )));
     }
 
-    Ok((
-        create_fresh_workspace(
-            db,
-            workspace_root,
-            &authority.repo,
-            task_id,
-            repo_cache_locks,
-        )
-        .await?,
-        true,
-    ))
+    create_fresh_workspace(
+        db,
+        workspace_root,
+        &authority.repo,
+        task_id,
+        repo_cache_locks,
+    )
+    .await
 }
 
 async fn ensure_workspace_repository_current(
@@ -221,7 +230,7 @@ async fn recover_missing_worktree(
         let worktree_path = manager
             .recover_worktree_named(&repo_source, task_id, &repo.name, branch)
             .await
-            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+            .map_err(map_workspace_error)?;
         let before_sha = git::get_current_sha(&worktree_path).await.ok();
         let now = now_rfc3339();
         WorkspaceRepo::update_status(db, &workspace.id, WorkspaceStatus::Ready, None, &now).await?;
@@ -344,11 +353,7 @@ async fn move_unusable_worktree_aside(worktree_path: &Path) -> Result<()> {
     let backup_path: PathBuf = parent.join(format!("{name}.broken-{millis}"));
     tokio::fs::rename(worktree_path, &backup_path)
         .await
-        .map_err(|error| {
-            ServiceError::invalid_operation(format!(
-                "failed to move unusable worktree aside: {error}"
-            ))
-        })?;
+        .map_err(|error| ServiceError::Git(git::GitError::Io(error)))?;
     warn!(
         worktree_path = %worktree_path.display(),
         backup_path = %backup_path.display(),
@@ -363,19 +368,58 @@ async fn create_fresh_workspace(
     repo: &db::Repo,
     task_id: &str,
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
-) -> Result<Workspace> {
+) -> Result<(Workspace, bool)> {
     let repo_id = repo.id.as_str();
     let now = now_rfc3339();
-    let mut manager = WorkspaceManager::new(workspace_root.to_path_buf());
-    if let Some(locks) = repo_cache_locks {
-        manager = manager.with_repo_cache_locks(locks);
+    let lock_key = repo
+        .local_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty() && Path::new(path).exists())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            workspace_root
+                .join(".repos")
+                .join(repo_id)
+                .to_string_lossy()
+                .into_owned()
+        });
+    // The branch-existence check, Git worktree mutation, and unique Workspace
+    // insert form one per-repository critical section. Without this outer
+    // lock, two concurrent claims can both observe a missing branch and one
+    // leaks Git's raw "branch already exists" failure instead of losing the
+    // normal Task-version claim race.
+    let _repo_cache_guard = if let Some(locks) = &repo_cache_locks {
+        Some(locks.acquire(&lock_key).await)
+    } else {
+        None
+    };
+
+    if let Some(workspace) = WorkspaceRepo::get_by_task_id(db, task_id).await? {
+        return Ok((clear_workspace_cleanup_after(db, workspace).await?, false));
     }
-    let worktree_source = resolve_repo_source(repo, workspace_root).await?;
+
+    // The outer guard already owns the same key WorkspaceManager would use.
+    let manager = WorkspaceManager::new(workspace_root.to_path_buf());
+    let repo_cache_path = workspace_root.join(".repos").join(repo_id);
+    let worktree_source = match resolve_repo_source(repo, workspace_root).await {
+        Ok(source) => source,
+        Err(error) => {
+            cleanup_repo_cache_if_authority_gone(db, &repo.project_id, repo_id, &repo_cache_path)
+                .await;
+            return Err(error);
+        }
+    };
     let branch = ::workspace::task_branch_name(task_id);
-    let branch_exists = git::branch_exists(Path::new(&worktree_source), &branch)
-        .await
-        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
-    let worktree_path = if branch_exists {
+    let branch_exists = match git::branch_exists(Path::new(&worktree_source), &branch).await {
+        Ok(branch_exists) => branch_exists,
+        Err(error) => {
+            cleanup_repo_cache_if_authority_gone(db, &repo.project_id, repo_id, &repo_cache_path)
+                .await;
+            return Err(ServiceError::from(error));
+        }
+    };
+    let worktree_result = if branch_exists {
         // A rejected admission may have removed its fresh workspace row and
         // directory after Git created the task branch. Recover that exact
         // task-scoped branch so a corrected retry remains possible and no
@@ -387,8 +431,22 @@ async fn create_fresh_workspace(
         manager
             .create_worktree_named(&worktree_source, task_id, &repo.name, &repo.default_branch)
             .await
-    }
-    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+    };
+    let worktree_path = match worktree_result.map_err(map_workspace_error) {
+        Ok(worktree_path) => worktree_path,
+        Err(error) => {
+            if let Err(cleanup_error) = manager.cleanup_worktree(task_id).await {
+                tracing::error!(
+                    task_id,
+                    error = %cleanup_error,
+                    "workspace creation failed and its worktree cleanup also failed"
+                );
+            }
+            cleanup_repo_cache_if_authority_gone(db, &repo.project_id, repo_id, &repo_cache_path)
+                .await;
+            return Err(error);
+        }
+    };
     let before_sha = git::get_current_sha(&worktree_path).await.ok();
     let workspace_id = new_uuid_v4();
     let workspace = match WorkspaceRepo::create(
@@ -409,16 +467,35 @@ async fn create_fresh_workspace(
     {
         Ok(workspace) => workspace,
         Err(error) => {
-            // A concurrent creator may have won the Task-unique workspace
-            // row after this call observed no row.  Never remove its
-            // worktree when our INSERT loses that race.
+            // The final Project deletion transaction uses BEGIN IMMEDIATE. If
+            // it acquired the writer lock first, this INSERT waits for the
+            // task/project cascade and then fails its FK admission; no
+            // Workspace row exists, so the worktree created above belongs to
+            // this failed admission and must be cleaned. If another creator
+            // committed first, the row lookup proves the worktree is theirs,
+            // so never remove it. The deletion transaction collects rows that
+            // win this race and performs a post-commit path cleanup for the
+            // opposite ordering.
             if WorkspaceRepo::get_by_task_id(db, task_id)
                 .await
                 .ok()
                 .flatten()
                 .is_none()
             {
-                let _ = manager.cleanup_worktree(task_id).await;
+                if let Err(cleanup_error) = manager.cleanup_worktree(task_id).await {
+                    tracing::error!(
+                        task_id,
+                        error = %cleanup_error,
+                        "workspace admission failed and its worktree cleanup also failed"
+                    );
+                }
+                cleanup_repo_cache_if_authority_gone(
+                    db,
+                    &repo.project_id,
+                    repo_id,
+                    &repo_cache_path,
+                )
+                .await;
             }
             return Err(error.into());
         }
@@ -434,7 +511,7 @@ async fn create_fresh_workspace(
         "workspace created"
     );
 
-    Ok(workspace)
+    Ok((workspace, true))
 }
 
 /// Reusing a workspace revives its shared delivery branch. Any cleanup
@@ -466,6 +543,15 @@ pub async fn ensure_project_agent_workspace(
     workspaces_root: &Path,
     project_id: &str,
 ) -> Result<Option<PathBuf>> {
+    // Capture an immutable generation/repository snapshot before touching the
+    // filesystem. A Project ID can be explicitly reused after deletion; the
+    // operation ID distinguishes those generations even when both rows start
+    // at Project.version = 1.
+    let Some((authority, repo)) = capture_project_agent_workspace_authority(db, project_id).await?
+    else {
+        return Ok(None);
+    };
+
     // `git worktree add` runs with the repository as its working directory, so
     // a relative workspaces root (a `--data-dir ./test` server) would resolve
     // the checkout *inside the repository*. Anchor it absolutely first.
@@ -475,21 +561,24 @@ pub async fn ensure_project_agent_workspace(
             .unwrap_or_else(|_| workspaces_root.to_path_buf())
     });
     let workspace = workspaces_root.join(project_id);
+    // Reserve the path and stamp its generation before creating notes or a
+    // checkout. If a replacement Project already claimed the same ID, the
+    // old marker is atomically quarantined under the DB writer lock and never
+    // becomes part of the replacement workspace.
+    if !reserve_project_agent_workspace_path(db, &authority, &workspace).await? {
+        return Ok(None);
+    }
     std::fs::create_dir_all(workspace.join(PROJECT_AGENT_DOCS_DIR)).map_err(|error| {
         ServiceError::invalid_operation(format!("Project Agent workspace is unavailable: {error}"))
     })?;
     write_verification_workspace_boundary(&workspace)?;
-    let Some(repo_id) = ProjectRepo::get_by_id(db, project_id)
-        .await?
-        .and_then(|project| project.primary_repo_id)
-    else {
+
+    let Some(repo) = repo else {
         // No repository yet: the Agent still gets its durable docs directory.
-        return Ok(Some(workspace));
-    };
-    let Some(repo) = RepoRepo::get_by_id(db, &repo_id).await? else {
-        return Ok(Some(workspace));
+        return retain_project_agent_workspace_if_current(db, &authority, workspace, None).await;
     };
     let checkout = workspace.join(PROJECT_AGENT_CHECKOUT_DIR);
+    let repo_cache = workspaces_root.join(".repos").join(&repo.id);
     if checkout.is_dir() {
         // The checkout is a disposable read-and-run copy: re-point it at the
         // current default-branch tip every time it is handed out, so the
@@ -501,9 +590,28 @@ pub async fn ensure_project_agent_workspace(
             .await
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
     } else {
-        let source = resolve_repo_source(&repo, workspaces_root).await?;
+        let source = match resolve_repo_source(&repo, workspaces_root).await {
+            Ok(source) => source,
+            Err(error) => {
+                if let Err(cleanup_error) = retain_project_agent_workspace_if_current(
+                    db,
+                    &authority,
+                    workspace.clone(),
+                    Some(repo_cache.clone()),
+                )
+                .await
+                {
+                    tracing::error!(
+                        project_id,
+                        error = %cleanup_error,
+                        "Project Agent workspace cleanup after repository-source failure failed"
+                    );
+                }
+                return Err(error);
+            }
+        };
         let manager = WorkspaceManager::new(workspaces_root.to_path_buf());
-        manager
+        if let Err(error) = manager
             .create_detached_worktree_named(
                 &source,
                 project_id,
@@ -511,9 +619,210 @@ pub async fn ensure_project_agent_workspace(
                 &repo.default_branch,
             )
             .await
-            .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+        {
+            if let Err(cleanup_error) = retain_project_agent_workspace_if_current(
+                db,
+                &authority,
+                workspace.clone(),
+                Some(repo_cache.clone()),
+            )
+            .await
+            {
+                tracing::error!(
+                    project_id,
+                    error = %cleanup_error,
+                    "Project Agent workspace cleanup after checkout creation failure failed"
+                );
+            }
+            return Err(ServiceError::invalid_operation(error.to_string()));
+        }
     }
-    Ok(Some(workspace))
+    retain_project_agent_workspace_if_current(db, &authority, workspace, Some(repo_cache)).await
+}
+
+async fn retain_project_agent_workspace_if_current(
+    db: &SqliteDb,
+    authority: &ProjectAgentWorkspaceAuthority,
+    workspace: PathBuf,
+    repo_cache: Option<PathBuf>,
+) -> Result<Option<PathBuf>> {
+    let mut transaction = db::begin_immediate(db.pool()).await?;
+    let current =
+        query_project_agent_workspace_authority(&mut *transaction, &authority.project_id).await?;
+    if current
+        .as_ref()
+        .is_some_and(|current| authority.same_generation_and_repository(current))
+    {
+        transaction.commit().await?;
+        return Ok(Some(workspace));
+    }
+
+    // Only quarantine a workspace carrying this exact old generation's
+    // marker. A replacement Project may already have claimed the same path;
+    // in that case its marker makes the cleanup a no-op. A same-generation
+    // repository change preserves notes and discards only the checkout.
+    let stale_workspace = if current
+        .as_ref()
+        .is_some_and(|current| authority.same_generation(current))
+    {
+        quarantine_project_agent_checkout_if_repository_matches(
+            &workspace,
+            &authority.repository_marker_contents(),
+        )
+        .await?
+    } else {
+        quarantine_project_agent_workspace_if_marker_matches(
+            &workspace,
+            &authority.generation_marker_contents(),
+        )
+        .await?
+    };
+
+    // A cache is keyed by repository identity. Keep it whenever a live Repo
+    // row with that identity exists, including a replacement Project that
+    // reused the same repository ID; otherwise the captured generation owns
+    // the cache and it can be quarantined with this cleanup.
+    let stale_cache = if let (Some(repo_cache), Some(repository_identity)) = (
+        repo_cache.as_deref(),
+        authority.repository_identity.as_ref(),
+    ) {
+        let repo_live = sqlx::query_scalar::<_, i64>("SELECT 1 FROM repo WHERE id = ? LIMIT 1")
+            .bind(&repository_identity.0)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .is_some();
+        if repo_live {
+            None
+        } else {
+            quarantine_project_agent_cache(repo_cache).await?
+        }
+    } else {
+        None
+    };
+    transaction.commit().await?;
+
+    for path in [stale_workspace, stale_cache].into_iter().flatten() {
+        remove_quarantined_project_agent_path(&path).await?;
+    }
+    Ok(None)
+}
+
+/// A repository clone can finish after Project deletion's DB transaction has
+/// captured its repository rows. If the following Workspace admission then
+/// loses the Project FK race, the worktree cleanup above is not enough: this
+/// cache was created after the DB snapshot and would otherwise survive forever.
+/// Remove it only after both authorities are gone, so a normal unique-row
+/// admission failure cannot destroy a cache still owned by a live Project.
+async fn cleanup_repo_cache_if_authority_gone(
+    db: &SqliteDb,
+    project_id: &str,
+    repo_id: &str,
+    repo_cache: &Path,
+) {
+    // Serialize the authority check with Project/Repo admission. A plain
+    // read followed by remove could delete a replacement repository cache
+    // claimed in the gap between those operations.
+    let mut transaction = match db::begin_immediate(db.pool()).await {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            tracing::error!(
+                project_id,
+                repo_id,
+                error = %error,
+                "could not acquire database guard before repository-cache cleanup"
+            );
+            return;
+        }
+    };
+    let project_exists =
+        match sqlx::query_scalar::<_, i64>("SELECT 1 FROM project WHERE id = ? LIMIT 1")
+            .bind(project_id)
+            .fetch_optional(&mut *transaction)
+            .await
+        {
+            Ok(row) => row.is_some(),
+            Err(error) => {
+                tracing::error!(
+                    project_id,
+                    repo_id,
+                    error = %error,
+                    "could not verify Project authority before repository-cache cleanup"
+                );
+                return;
+            }
+        };
+    let repo_exists = match sqlx::query_scalar::<_, i64>("SELECT 1 FROM repo WHERE id = ? LIMIT 1")
+        .bind(repo_id)
+        .fetch_optional(&mut *transaction)
+        .await
+    {
+        Ok(row) => row.is_some(),
+        Err(error) => {
+            tracing::error!(
+                project_id,
+                repo_id,
+                error = %error,
+                "could not verify repository authority before repository-cache cleanup"
+            );
+            return;
+        }
+    };
+    if project_exists && repo_exists {
+        if let Err(error) = transaction.commit().await {
+            tracing::error!(
+                project_id,
+                repo_id,
+                error = %error,
+                "could not release database guard after repository-cache cleanup check"
+            );
+        }
+        return;
+    }
+
+    let quarantine = match quarantine_project_agent_cache(repo_cache).await {
+        Ok(quarantine) => quarantine,
+        Err(error) => {
+            tracing::error!(
+                project_id,
+                repo_id,
+                path = %repo_cache.display(),
+                error = %error,
+                "repository-cache quarantine after Project deletion failed"
+            );
+            return;
+        }
+    };
+    if let Err(error) = transaction.commit().await {
+        if let Some(quarantine) = quarantine.as_deref() {
+            if let Err(restore_error) = tokio::fs::rename(quarantine, repo_cache).await {
+                tracing::error!(
+                    project_id,
+                    repo_id,
+                    path = %repo_cache.display(),
+                    error = %restore_error,
+                    "repository-cache restore after database-guard failure also failed"
+                );
+            }
+        }
+        tracing::error!(
+            project_id,
+            repo_id,
+            error = %error,
+            "could not commit database guard after repository-cache quarantine"
+        );
+        return;
+    }
+    if let Some(quarantine) = quarantine {
+        if let Err(error) = remove_quarantined_project_agent_path(&quarantine).await {
+            tracing::error!(
+                project_id,
+                repo_id,
+                path = %quarantine.display(),
+                error = %error,
+                "repository-cache removal after Project deletion failed"
+            );
+        }
+    }
 }
 
 /// The manifest that stops cargo's upward workspace search at the
@@ -557,6 +866,726 @@ pub const PROJECT_AGENT_DOCS_DIR: &str = "forge";
 /// runtime runs the Agent's verification commands inside this directory.
 pub const PROJECT_AGENT_CHECKOUT_DIR: &str = forge_agent_host::PROJECT_VERIFICATION_CHECKOUT_DIR;
 
+/// Stored inside a Project Agent workspace before any notes or checkout files
+/// are created.  The directory name is intentionally still the public
+/// Project ID, but the marker makes that path an ownership claim for one
+/// immutable Project generation rather than for every future row with the
+/// same ID.
+const PROJECT_AGENT_GENERATION_MARKER: &str = ".forge-project-agent-generation";
+/// Stores only a non-secret digest of the repository snapshot. Raw remote
+/// URLs and local paths never enter the Agent-visible workspace.
+const PROJECT_AGENT_REPOSITORY_MARKER: &str = ".forge-project-agent-repository";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectAgentWorkspaceAuthority {
+    project_id: String,
+    project_created_at: String,
+    provisioning_operation_id: Option<String>,
+    primary_repo_id: Option<String>,
+    /// `(id, remote_url, local_path, default_branch)` for the exact primary
+    /// repository snapshot used to build the checkout.
+    repository_identity: Option<(String, String, Option<String>, String)>,
+}
+
+impl ProjectAgentWorkspaceAuthority {
+    /// This marker is deliberately generation-only. Project.version and the
+    /// selected repository can change inside one Project generation without
+    /// invalidating the durable `forge/` notes.
+    fn generation_marker_contents(&self) -> String {
+        serde_json::to_string(&(
+            &self.project_id,
+            &self.project_created_at,
+            &self.provisioning_operation_id,
+        ))
+        .expect("Project Agent workspace authority is serializable")
+    }
+
+    fn repository_marker_contents(&self) -> String {
+        let serialized = serde_json::to_string(&self.repository_identity)
+            .expect("Project Agent repository authority is serializable");
+        let mut digest = Sha256::new();
+        digest.update(serialized.as_bytes());
+        hex::encode(digest.finalize())
+    }
+
+    fn same_generation(&self, other: &Self) -> bool {
+        self.project_id == other.project_id
+            && self.project_created_at == other.project_created_at
+            && match (
+                self.provisioning_operation_id.as_deref(),
+                other.provisioning_operation_id.as_deref(),
+            ) {
+                (Some(left), Some(right)) => left == right,
+                // Legacy rows without a provisioning operation have no
+                // durable generation token; created_at is their immutable
+                // generation fallback. Do not fold mutable Project.version
+                // into the workspace marker.
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    fn same_repository(&self, other: &Self) -> bool {
+        self.primary_repo_id == other.primary_repo_id
+            && self.repository_identity == other.repository_identity
+    }
+
+    fn same_generation_and_repository(&self, other: &Self) -> bool {
+        self.same_generation(other) && self.same_repository(other)
+    }
+}
+
+type ProjectAgentWorkspaceAuthorityRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+async fn query_project_agent_workspace_authority<'e, E>(
+    executor: E,
+    project_id: &str,
+) -> Result<Option<ProjectAgentWorkspaceAuthority>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let row = sqlx::query_as::<_, ProjectAgentWorkspaceAuthorityRow>(
+        "SELECT p.id, p.created_at, p.primary_repo_id,
+                operation.id,
+                repo.id, repo.remote_url, repo.local_path, repo.default_branch
+         FROM project p
+         LEFT JOIN project_provisioning_operation operation
+           ON operation.project_id = p.id
+         LEFT JOIN repo
+           ON repo.id = p.primary_repo_id AND repo.project_id = p.id
+         WHERE p.id = ?",
+    )
+    .bind(project_id)
+    .fetch_optional(executor)
+    .await?;
+
+    Ok(row.map(
+        |(
+            project_id,
+            project_created_at,
+            primary_repo_id,
+            provisioning_operation_id,
+            repository_id,
+            remote_url,
+            local_path,
+            default_branch,
+        )| ProjectAgentWorkspaceAuthority {
+            project_id,
+            project_created_at,
+            provisioning_operation_id,
+            primary_repo_id,
+            repository_identity: repository_id.zip(remote_url).zip(default_branch).map(
+                |((repository_id, remote_url), default_branch)| {
+                    (repository_id, remote_url, local_path, default_branch)
+                },
+            ),
+        },
+    ))
+}
+
+async fn capture_project_agent_workspace_authority(
+    db: &SqliteDb,
+    project_id: &str,
+) -> Result<Option<(ProjectAgentWorkspaceAuthority, Option<db::Repo>)>> {
+    let Some(authority) = query_project_agent_workspace_authority(db.pool(), project_id).await?
+    else {
+        return Ok(None);
+    };
+    let repo = match authority.primary_repo_id.as_deref() {
+        Some(repo_id) => match RepoRepo::get_by_id(db, repo_id).await? {
+            Some(repo) if repo.project_id == authority.project_id => Some(repo),
+            Some(_) => {
+                return Err(ServiceError::RepoMismatch {
+                    project_id: authority.project_id.clone(),
+                });
+            }
+            None => None,
+        },
+        None => None,
+    };
+    Ok(Some((authority, repo)))
+}
+
+async fn quarantine_project_agent_workspace_if_marker_differs(
+    workspace: &Path,
+    expected_marker: &str,
+) -> Result<Option<PathBuf>> {
+    let metadata = match tokio::fs::symlink_metadata(workspace).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ServiceError::invalid_operation(format!(
+                "inspect Project Agent workspace {}: {error}",
+                workspace.display()
+            )));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(ServiceError::invalid_operation(format!(
+            "Project Agent workspace is a symlink: {}",
+            workspace.display()
+        )));
+    }
+
+    let marker_path = workspace.join(PROJECT_AGENT_GENERATION_MARKER);
+    let marker_matches = if metadata.is_dir() {
+        match tokio::fs::read_to_string(&marker_path).await {
+            Ok(marker) => marker == expected_marker,
+            // A markerless workspace predates generation stamping. The
+            // current authority owns the path at this point, so adopt it and
+            // stamp it rather than deleting durable Project Agent notes.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(ServiceError::invalid_operation(format!(
+                    "read Project Agent workspace generation {}: {error}",
+                    marker_path.display()
+                )));
+            }
+        }
+    } else {
+        false
+    };
+    if marker_matches {
+        return Ok(None);
+    }
+
+    let parent = workspace.parent().ok_or_else(|| {
+        ServiceError::invalid_operation(format!(
+            "Project Agent workspace has no parent: {}",
+            workspace.display()
+        ))
+    })?;
+    let name = workspace
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("project-agent");
+    let quarantine = parent.join(format!(
+        ".{name}.forge-project-agent-stale-{}",
+        new_uuid_v4()
+    ));
+    tokio::fs::rename(workspace, &quarantine)
+        .await
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "quarantine stale Project Agent workspace {}: {error}",
+                workspace.display()
+            ))
+        })?;
+    Ok(Some(quarantine))
+}
+
+async fn quarantine_project_agent_workspace_if_marker_matches(
+    workspace: &Path,
+    expected_marker: &str,
+) -> Result<Option<PathBuf>> {
+    let metadata = match tokio::fs::symlink_metadata(workspace).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ServiceError::invalid_operation(format!(
+                "inspect Project Agent workspace {}: {error}",
+                workspace.display()
+            )));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(ServiceError::invalid_operation(format!(
+            "Project Agent workspace is a symlink: {}",
+            workspace.display()
+        )));
+    }
+    if !metadata.is_dir() {
+        return Ok(None);
+    }
+    let marker =
+        match tokio::fs::read_to_string(workspace.join(PROJECT_AGENT_GENERATION_MARKER)).await {
+            Ok(marker) => marker,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(ServiceError::invalid_operation(format!(
+                    "read Project Agent workspace authority {}: {error}",
+                    workspace.display()
+                )));
+            }
+        };
+    if marker != expected_marker {
+        return Ok(None);
+    }
+    let parent = workspace.parent().ok_or_else(|| {
+        ServiceError::invalid_operation(format!(
+            "Project Agent workspace has no parent: {}",
+            workspace.display()
+        ))
+    })?;
+    let name = workspace
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("project-agent");
+    let quarantine = parent.join(format!(
+        ".{name}.forge-project-agent-stale-{}",
+        new_uuid_v4()
+    ));
+    tokio::fs::rename(workspace, &quarantine)
+        .await
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "quarantine stale Project Agent workspace {}: {error}",
+                workspace.display()
+            ))
+        })?;
+    Ok(Some(quarantine))
+}
+
+/// Quarantine an unowned repository cache after the database check has proved
+/// that no live Repo row still owns its exact repository ID. Caches do not
+/// carry a Project-Agent generation marker, so this helper is intentionally
+/// separate from marker-aware workspace adoption.
+async fn quarantine_project_agent_cache(path: &Path) -> Result<Option<PathBuf>> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ServiceError::invalid_operation(format!(
+                "inspect repository cache {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+    let parent = path.parent().ok_or_else(|| {
+        ServiceError::invalid_operation(format!(
+            "repository cache has no parent: {}",
+            path.display()
+        ))
+    })?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("repo-cache");
+    let quarantine = parent.join(format!(
+        ".{name}.forge-project-agent-stale-{}",
+        new_uuid_v4()
+    ));
+    tokio::fs::rename(path, &quarantine)
+        .await
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "quarantine repository cache {}: {error}",
+                path.display()
+            ))
+        })?;
+    Ok(Some(quarantine))
+}
+
+/// A primary repository can change within one Project generation. Preserve
+/// the durable `forge/` notes, but discard only a checkout whose stamped
+/// repository snapshot is no longer the current one. A markerless checkout
+/// is disposable by definition: its repository origin cannot be proven, so
+/// it is quarantined and rebuilt for the current repository.
+async fn quarantine_project_agent_checkout_if_repository_differs(
+    workspace: &Path,
+    expected_repository_marker: &str,
+) -> Result<Option<PathBuf>> {
+    let checkout = workspace.join(PROJECT_AGENT_CHECKOUT_DIR);
+    let metadata = match tokio::fs::symlink_metadata(&checkout).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ServiceError::invalid_operation(format!(
+                "inspect Project Agent checkout {}: {error}",
+                checkout.display()
+            )));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(ServiceError::invalid_operation(format!(
+            "Project Agent checkout is a symlink: {}",
+            checkout.display()
+        )));
+    }
+    if !metadata.is_dir() {
+        return Ok(None);
+    }
+    let repository_marker =
+        match tokio::fs::read_to_string(workspace.join(PROJECT_AGENT_REPOSITORY_MARKER)).await {
+            Ok(marker) => marker,
+            // The workspace marker may be adopted from a legacy markerless
+            // directory, but its checkout is disposable and unproven. Let
+            // the mismatch path below quarantine it for a clean rebuild.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                return Err(ServiceError::invalid_operation(format!(
+                    "read Project Agent repository authority {}: {error}",
+                    workspace.join(PROJECT_AGENT_REPOSITORY_MARKER).display()
+                )));
+            }
+        };
+    if repository_marker == expected_repository_marker {
+        return Ok(None);
+    }
+    let parent = checkout.parent().ok_or_else(|| {
+        ServiceError::invalid_operation(format!(
+            "Project Agent checkout has no parent: {}",
+            checkout.display()
+        ))
+    })?;
+    let name = checkout
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("checkout");
+    let quarantine = parent.join(format!(
+        ".{name}.forge-project-agent-stale-{}",
+        new_uuid_v4()
+    ));
+    tokio::fs::rename(&checkout, &quarantine)
+        .await
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "quarantine stale Project Agent checkout {}: {error}",
+                checkout.display()
+            ))
+        })?;
+    Ok(Some(quarantine))
+}
+
+/// A stale creator may finish after a same-generation repository change has
+/// already reserved and rebuilt the checkout. In that ordering it must only
+/// quarantine a checkout still stamped with its own repository snapshot; a
+/// differing marker belongs to the newer repository admission and is left
+/// untouched.
+async fn quarantine_project_agent_checkout_if_repository_matches(
+    workspace: &Path,
+    expected_repository_marker: &str,
+) -> Result<Option<PathBuf>> {
+    let checkout = workspace.join(PROJECT_AGENT_CHECKOUT_DIR);
+    let metadata = match tokio::fs::symlink_metadata(&checkout).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ServiceError::invalid_operation(format!(
+                "inspect Project Agent checkout {}: {error}",
+                checkout.display()
+            )));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(ServiceError::invalid_operation(format!(
+            "Project Agent checkout is a symlink: {}",
+            checkout.display()
+        )));
+    }
+    if !metadata.is_dir() {
+        return Ok(None);
+    }
+    let repository_marker =
+        match tokio::fs::read_to_string(workspace.join(PROJECT_AGENT_REPOSITORY_MARKER)).await {
+            Ok(marker) => marker,
+            // Markerless legacy checkouts have no provenance that permits a
+            // destructive cleanup, so preserve them conservatively.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(ServiceError::invalid_operation(format!(
+                    "read Project Agent repository authority {}: {error}",
+                    workspace.join(PROJECT_AGENT_REPOSITORY_MARKER).display()
+                )));
+            }
+        };
+    if repository_marker != expected_repository_marker {
+        return Ok(None);
+    }
+    let parent = checkout.parent().ok_or_else(|| {
+        ServiceError::invalid_operation(format!(
+            "Project Agent checkout has no parent: {}",
+            checkout.display()
+        ))
+    })?;
+    let name = checkout
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("checkout");
+    let quarantine = parent.join(format!(
+        ".{name}.forge-project-agent-stale-{}",
+        new_uuid_v4()
+    ));
+    tokio::fs::rename(&checkout, &quarantine)
+        .await
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "quarantine stale Project Agent checkout {}: {error}",
+                checkout.display()
+            ))
+        })?;
+    Ok(Some(quarantine))
+}
+
+async fn remove_quarantined_project_agent_path(path: &Path) -> Result<()> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(ServiceError::invalid_operation(format!(
+                "inspect Project Agent quarantine {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let result = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        tokio::fs::remove_dir_all(path).await
+    } else {
+        tokio::fs::remove_file(path).await
+    };
+    result.map_err(|error| {
+        ServiceError::invalid_operation(format!(
+            "remove Project Agent quarantine {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+/// Restore a path moved aside by a reservation when the DB admission cannot
+/// commit. The original name is restored only while it is still free; a
+/// concurrent creator's occupied path is never overwritten, and the unique
+/// quarantine remains available for recovery.
+async fn restore_project_agent_quarantine_if_path_free(
+    original: &Path,
+    quarantine: Option<PathBuf>,
+) {
+    let Some(quarantine) = quarantine else {
+        return;
+    };
+    let original_is_free = match tokio::fs::symlink_metadata(original).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Ok(_) => false,
+        Err(error) => {
+            tracing::error!(
+                original = %original.display(),
+                quarantine = %quarantine.display(),
+                error = %error,
+                "failed to inspect Project Agent path after reservation rollback"
+            );
+            false
+        }
+    };
+    if original_is_free {
+        if let Err(error) = tokio::fs::rename(&quarantine, original).await {
+            tracing::error!(
+                original = %original.display(),
+                quarantine = %quarantine.display(),
+                error = %error,
+                "failed to restore Project Agent path after reservation rollback"
+            );
+        }
+    } else {
+        tracing::error!(
+            original = %original.display(),
+            quarantine = %quarantine.display(),
+            "preserving Project Agent quarantine because the original path is occupied"
+        );
+    }
+}
+
+/// Move a replacement workspace created after a whole-workspace quarantine
+/// aside before restoring the original tree. The generation marker proves it
+/// is the replacement this reservation attempted to stamp; a markerless
+/// partial is also safe to move because the caller has already reserved the
+/// original path under the DB writer lock.
+async fn quarantine_partial_project_agent_workspace(
+    workspace: &Path,
+    expected_marker: &str,
+) -> Result<Option<PathBuf>> {
+    let metadata = match tokio::fs::symlink_metadata(workspace).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ServiceError::invalid_operation(format!(
+                "inspect partial Project Agent workspace {}: {error}",
+                workspace.display()
+            )));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+    if !metadata.is_dir() {
+        return Ok(None);
+    }
+    match tokio::fs::read_to_string(workspace.join(PROJECT_AGENT_GENERATION_MARKER)).await {
+        Ok(marker) if marker != expected_marker => return Ok(None),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ServiceError::invalid_operation(format!(
+                "read partial Project Agent workspace generation {}: {error}",
+                workspace.join(PROJECT_AGENT_GENERATION_MARKER).display()
+            )));
+        }
+    }
+    let parent = workspace.parent().ok_or_else(|| {
+        ServiceError::invalid_operation(format!(
+            "partial Project Agent workspace has no parent: {}",
+            workspace.display()
+        ))
+    })?;
+    let name = workspace
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("project-agent");
+    let quarantine = parent.join(format!(
+        ".{name}.forge-project-agent-reservation-failed-{}",
+        new_uuid_v4()
+    ));
+    tokio::fs::rename(workspace, &quarantine)
+        .await
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "quarantine partial Project Agent workspace {}: {error}",
+                workspace.display()
+            ))
+        })?;
+    Ok(Some(quarantine))
+}
+
+async fn rollback_project_agent_reservation(
+    workspace: &Path,
+    expected_marker: &str,
+    stale_workspace: Option<PathBuf>,
+    stale_checkout: Option<PathBuf>,
+) {
+    let partial_workspace = if stale_workspace.is_some() {
+        match quarantine_partial_project_agent_workspace(workspace, expected_marker).await {
+            Ok(partial_workspace) => partial_workspace,
+            Err(error) => {
+                tracing::error!(
+                    workspace = %workspace.display(),
+                    error = %error,
+                    "failed to quarantine partial Project Agent replacement during rollback"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    restore_project_agent_quarantine_if_path_free(workspace, stale_workspace).await;
+    restore_project_agent_quarantine_if_path_free(
+        &workspace.join(PROJECT_AGENT_CHECKOUT_DIR),
+        stale_checkout,
+    )
+    .await;
+    if let Some(partial_workspace) = partial_workspace {
+        // The reservation has not admitted this replacement. Keep the
+        // quarantine for recovery rather than deleting bytes on a rollback.
+        tracing::warn!(
+            workspace = %workspace.display(),
+            quarantine = %partial_workspace.display(),
+            "preserved partial Project Agent replacement quarantine after reservation rollback"
+        );
+    }
+}
+
+async fn reserve_project_agent_workspace_path(
+    db: &SqliteDb,
+    authority: &ProjectAgentWorkspaceAuthority,
+    workspace: &Path,
+) -> Result<bool> {
+    let mut transaction = db::begin_immediate(db.pool()).await?;
+    let Some(current) =
+        query_project_agent_workspace_authority(&mut *transaction, &authority.project_id).await?
+    else {
+        transaction.commit().await?;
+        return Ok(false);
+    };
+    if !authority.same_generation_and_repository(&current) {
+        transaction.commit().await?;
+        return Ok(false);
+    }
+
+    let expected_generation_marker = authority.generation_marker_contents();
+    let stale_workspace = quarantine_project_agent_workspace_if_marker_differs(
+        workspace,
+        &expected_generation_marker,
+    )
+    .await?;
+    let stale_checkout = if stale_workspace.is_none() {
+        quarantine_project_agent_checkout_if_repository_differs(
+            workspace,
+            &authority.repository_marker_contents(),
+        )
+        .await?
+    } else {
+        None
+    };
+    if let Err(error) = tokio::fs::create_dir_all(workspace).await {
+        drop(transaction);
+        rollback_project_agent_reservation(
+            workspace,
+            &expected_generation_marker,
+            stale_workspace,
+            stale_checkout,
+        )
+        .await;
+        return Err(ServiceError::Git(git::GitError::Io(error)));
+    }
+    if let Err(error) = tokio::fs::write(
+        workspace.join(PROJECT_AGENT_GENERATION_MARKER),
+        &expected_generation_marker,
+    )
+    .await
+    {
+        drop(transaction);
+        rollback_project_agent_reservation(
+            workspace,
+            &expected_generation_marker,
+            stale_workspace,
+            stale_checkout,
+        )
+        .await;
+        return Err(ServiceError::Git(git::GitError::Io(error)));
+    }
+    if let Err(error) = tokio::fs::write(
+        workspace.join(PROJECT_AGENT_REPOSITORY_MARKER),
+        authority.repository_marker_contents(),
+    )
+    .await
+    {
+        drop(transaction);
+        rollback_project_agent_reservation(
+            workspace,
+            &expected_generation_marker,
+            stale_workspace,
+            stale_checkout,
+        )
+        .await;
+        return Err(ServiceError::Git(git::GitError::Io(error)));
+    }
+    if let Err(error) = transaction.commit().await {
+        rollback_project_agent_reservation(
+            workspace,
+            &expected_generation_marker,
+            stale_workspace,
+            stale_checkout,
+        )
+        .await;
+        return Err(error.into());
+    }
+
+    for stale in [stale_workspace, stale_checkout].into_iter().flatten() {
+        remove_quarantined_project_agent_path(&stale).await?;
+    }
+    Ok(true)
+}
+
 async fn resolve_repo_source(repo: &db::Repo, workspace_root: &std::path::Path) -> Result<String> {
     if let Some(local_path) = repo
         .local_path
@@ -576,9 +1605,7 @@ async fn resolve_repo_source(repo: &db::Repo, workspace_root: &std::path::Path) 
                 .ok_or_else(|| ServiceError::invalid_operation("repo cache path has no parent"))?,
         )
         .await
-        .map_err(|error| {
-            ServiceError::invalid_operation(format!("failed to create repo cache: {error}"))
-        })?;
+        .map_err(|error| ServiceError::Git(git::GitError::Io(error)))?;
         let output = Command::new("git")
             .args(["clone", &repo.remote_url, &clone_path.to_string_lossy()])
             .env_remove("GIT_DIR")
@@ -586,15 +1613,13 @@ async fn resolve_repo_source(repo: &db::Repo, workspace_root: &std::path::Path) 
             .env_remove("GIT_INDEX_FILE")
             .output()
             .await
-            .map_err(|error| {
-                ServiceError::invalid_operation(format!("failed to clone repo: {error}"))
-            })?;
+            .map_err(|error| ServiceError::Git(git::GitError::Io(error)))?;
         if !output.status.success() {
-            return Err(ServiceError::invalid_operation(format!(
-                "failed to clone repo from {}: {}",
-                repo.remote_url,
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
+            return Err(ServiceError::Git(git::GitError::CommandFailed {
+                command: format!("git clone {} {}", repo.remote_url, clone_path.display()),
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            }));
         }
     }
     Ok(clone_path.to_string_lossy().into_owned())
@@ -669,14 +1694,15 @@ pub(super) async fn reset_workspace(
         .await?
         .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
 
-    create_fresh_workspace(
+    let (workspace, _) = create_fresh_workspace(
         db,
         workspace_root,
         &authority.repo,
         &refreshed.id,
         repo_cache_locks,
     )
-    .await
+    .await?;
+    Ok(workspace)
 }
 
 pub(crate) fn default_workspace_root() -> PathBuf {
@@ -806,6 +1832,630 @@ mod tests {
             .expect("pool creates");
         run_migrations(&pool).await.expect("migrations run");
         SqliteDb::new(pool)
+    }
+
+    #[tokio::test]
+    async fn project_agent_generation_reuse_quarantines_old_workspace_without_touching_replacement()
+    {
+        let db = sqlite_db().await;
+        let root = TempDir::new().expect("workspace root creates");
+        let project_id = new_uuid_v4();
+        let old_created_at = now_rfc3339();
+        ProjectRepo::create(
+            &db,
+            CreateProject {
+                id: project_id.clone(),
+                name: "old generation".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: old_created_at.clone(),
+                updated_at: old_created_at,
+            },
+        )
+        .await
+        .expect("old Project creates");
+        let (old_authority, _) = capture_project_agent_workspace_authority(&db, &project_id)
+            .await
+            .expect("old authority query")
+            .expect("old authority exists");
+        let workspace = root.path().join(&project_id);
+        assert!(
+            reserve_project_agent_workspace_path(&db, &old_authority, &workspace)
+                .await
+                .expect("old workspace reserves")
+        );
+        std::fs::create_dir_all(workspace.join(PROJECT_AGENT_DOCS_DIR))
+            .expect("old notes directory creates");
+        std::fs::create_dir_all(workspace.join(PROJECT_AGENT_CHECKOUT_DIR))
+            .expect("old checkout directory creates");
+        std::fs::write(
+            workspace.join(PROJECT_AGENT_DOCS_DIR).join("old-note"),
+            "old generation",
+        )
+        .expect("old note writes");
+        std::fs::write(
+            workspace.join(PROJECT_AGENT_CHECKOUT_DIR).join("old-file"),
+            "old generation",
+        )
+        .expect("old checkout writes");
+
+        ProjectRepo::delete(&db, &project_id)
+            .await
+            .expect("old Project deletes");
+        // Project IDs are normally generated afresh. This low-level fixture
+        // deliberately models an explicit ID-reuse operation after the old
+        // creation event has been archived by the caller.
+        sqlx::query("DELETE FROM domain_event WHERE dedupe_key = ?")
+            .bind(format!("project-created:{project_id}"))
+            .execute(db.pool())
+            .await
+            .expect("old creation event archives");
+        let replacement_created_at = now_rfc3339();
+        ProjectRepo::create(
+            &db,
+            CreateProject {
+                id: project_id.clone(),
+                name: "replacement generation".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: replacement_created_at,
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .expect("replacement Project creates with reused ID");
+        let (replacement_authority, _) =
+            capture_project_agent_workspace_authority(&db, &project_id)
+                .await
+                .expect("replacement authority query")
+                .expect("replacement authority exists");
+        assert_ne!(
+            old_authority.provisioning_operation_id,
+            replacement_authority.provisioning_operation_id,
+            "Project ID reuse must create a new immutable generation"
+        );
+
+        // This is the late-admission ordering: the replacement reserves the
+        // shared Project-ID path before the stale creator gets its final
+        // retention check. Reservation quarantines the old tree, stamps the
+        // replacement marker, and only then permits replacement data.
+        assert!(
+            reserve_project_agent_workspace_path(&db, &replacement_authority, &workspace)
+                .await
+                .expect("replacement workspace reserves")
+        );
+        std::fs::create_dir_all(workspace.join(PROJECT_AGENT_DOCS_DIR))
+            .expect("replacement notes directory creates");
+        std::fs::create_dir_all(workspace.join(PROJECT_AGENT_CHECKOUT_DIR))
+            .expect("replacement checkout directory creates");
+        std::fs::write(
+            workspace
+                .join(PROJECT_AGENT_DOCS_DIR)
+                .join("replacement-note"),
+            "replacement generation",
+        )
+        .expect("replacement note writes");
+        std::fs::write(
+            workspace
+                .join(PROJECT_AGENT_CHECKOUT_DIR)
+                .join("replacement-file"),
+            "replacement generation",
+        )
+        .expect("replacement checkout writes");
+
+        assert!(retain_project_agent_workspace_if_current(
+            &db,
+            &old_authority,
+            workspace.clone(),
+            None,
+        )
+        .await
+        .expect("stale retention check succeeds")
+        .is_none());
+        assert!(!workspace
+            .join(PROJECT_AGENT_DOCS_DIR)
+            .join("old-note")
+            .exists());
+        assert!(!workspace
+            .join(PROJECT_AGENT_CHECKOUT_DIR)
+            .join("old-file")
+            .exists());
+        assert_eq!(
+            std::fs::read_to_string(
+                workspace
+                    .join(PROJECT_AGENT_DOCS_DIR)
+                    .join("replacement-note")
+            )
+            .expect("replacement note remains"),
+            "replacement generation"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                workspace
+                    .join(PROJECT_AGENT_CHECKOUT_DIR)
+                    .join("replacement-file")
+            )
+            .expect("replacement checkout remains"),
+            "replacement generation"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join(PROJECT_AGENT_GENERATION_MARKER))
+                .expect("replacement marker remains"),
+            replacement_authority.generation_marker_contents()
+        );
+    }
+
+    #[tokio::test]
+    async fn project_agent_adopts_markerless_workspace_without_losing_legacy_notes() {
+        let db = sqlite_db().await;
+        let root = TempDir::new().expect("workspace root creates");
+        let project_id = new_uuid_v4();
+        let now = now_rfc3339();
+        ProjectRepo::create(
+            &db,
+            CreateProject {
+                id: project_id.clone(),
+                name: "legacy workspace".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("Project creates");
+        let (authority, _) = capture_project_agent_workspace_authority(&db, &project_id)
+            .await
+            .expect("authority query")
+            .expect("authority exists");
+        let workspace = root.path().join(&project_id);
+        std::fs::create_dir_all(workspace.join(PROJECT_AGENT_DOCS_DIR))
+            .expect("legacy notes directory creates");
+        std::fs::write(
+            workspace.join(PROJECT_AGENT_DOCS_DIR).join("legacy-note"),
+            "must survive upgrade",
+        )
+        .expect("legacy note writes");
+        let legacy_checkout = workspace.join(PROJECT_AGENT_CHECKOUT_DIR);
+        std::fs::create_dir_all(&legacy_checkout).expect("legacy checkout directory creates");
+        std::fs::write(legacy_checkout.join("legacy-file"), "must be rebuilt")
+            .expect("legacy checkout writes");
+
+        assert!(
+            reserve_project_agent_workspace_path(&db, &authority, &workspace)
+                .await
+                .expect("legacy workspace adopts")
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join(PROJECT_AGENT_DOCS_DIR).join("legacy-note"))
+                .expect("legacy note remains"),
+            "must survive upgrade"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join(PROJECT_AGENT_GENERATION_MARKER))
+                .expect("generation marker stamped"),
+            authority.generation_marker_contents()
+        );
+        assert!(
+            !legacy_checkout.exists(),
+            "markerless disposable checkout is not adopted with durable notes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_agent_reservation_failure_restores_quarantined_checkout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let db = sqlite_db().await;
+        let root = TempDir::new().expect("workspace root creates");
+        let project_id = new_uuid_v4();
+        let now = now_rfc3339();
+        ProjectRepo::create(
+            &db,
+            CreateProject {
+                id: project_id.clone(),
+                name: "reservation rollback".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("Project creates");
+        let (authority, _) = capture_project_agent_workspace_authority(&db, &project_id)
+            .await
+            .expect("authority query")
+            .expect("authority exists");
+        let workspace = root.path().join(&project_id);
+        assert!(
+            reserve_project_agent_workspace_path(&db, &authority, &workspace)
+                .await
+                .expect("initial workspace reserves")
+        );
+        let checkout = workspace.join(PROJECT_AGENT_CHECKOUT_DIR);
+        std::fs::create_dir_all(&checkout).expect("checkout directory creates");
+        std::fs::write(checkout.join("old-file"), "old checkout").expect("old checkout writes");
+        std::fs::write(
+            workspace.join(PROJECT_AGENT_REPOSITORY_MARKER),
+            "old-repository-marker",
+        )
+        .expect("old repository marker writes");
+        let marker = workspace.join(PROJECT_AGENT_REPOSITORY_MARKER);
+        let mut permissions = std::fs::metadata(&marker)
+            .expect("repository marker metadata")
+            .permissions();
+        permissions.set_mode(0o444);
+        std::fs::set_permissions(&marker, permissions).expect("repository marker locks");
+
+        let error = reserve_project_agent_workspace_path(&db, &authority, &workspace)
+            .await
+            .expect_err("locked repository marker rejects reservation");
+        assert!(error.to_string().contains("Permission denied"));
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("old-file"))
+                .expect("old checkout restores after failure"),
+            "old checkout"
+        );
+
+        let mut permissions = std::fs::metadata(&marker)
+            .expect("repository marker metadata after failure")
+            .permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&marker, permissions).expect("repository marker unlocks");
+    }
+
+    #[tokio::test]
+    async fn project_agent_whole_workspace_rollback_restores_old_tree() {
+        let root = TempDir::new().expect("workspace root creates");
+        let workspace = root.path().join("project");
+        let old_marker = "old-generation";
+        let new_marker = "new-generation";
+        std::fs::create_dir_all(workspace.join(PROJECT_AGENT_DOCS_DIR))
+            .expect("old notes directory creates");
+        std::fs::write(workspace.join(PROJECT_AGENT_GENERATION_MARKER), old_marker)
+            .expect("old generation marker writes");
+        std::fs::write(
+            workspace.join(PROJECT_AGENT_DOCS_DIR).join("old-note"),
+            "old durable note",
+        )
+        .expect("old note writes");
+
+        let stale_workspace =
+            quarantine_project_agent_workspace_if_marker_differs(&workspace, new_marker)
+                .await
+                .expect("old workspace quarantines")
+                .expect("old workspace quarantine exists");
+        std::fs::create_dir_all(workspace.join(PROJECT_AGENT_DOCS_DIR))
+            .expect("partial notes directory creates");
+        std::fs::write(workspace.join(PROJECT_AGENT_GENERATION_MARKER), new_marker)
+            .expect("partial generation marker writes");
+        std::fs::write(
+            workspace.join(PROJECT_AGENT_DOCS_DIR).join("partial-note"),
+            "partial replacement",
+        )
+        .expect("partial note writes");
+
+        rollback_project_agent_reservation(&workspace, new_marker, Some(stale_workspace), None)
+            .await;
+        assert_eq!(
+            std::fs::read_to_string(workspace.join(PROJECT_AGENT_DOCS_DIR).join("old-note"))
+                .expect("old note restores"),
+            "old durable note"
+        );
+        assert!(!workspace
+            .join(PROJECT_AGENT_DOCS_DIR)
+            .join("partial-note")
+            .exists());
+        assert_eq!(
+            std::fs::read_to_string(workspace.join(PROJECT_AGENT_GENERATION_MARKER))
+                .expect("old marker restores"),
+            old_marker
+        );
+        assert!(
+            std::fs::read_dir(root.path())
+                .expect("workspace parent reads")
+                .filter_map(|entry| entry.ok())
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".project.forge-project-agent-reservation-failed-")),
+            "partial replacement remains quarantined for recovery"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_agent_rejects_symlink_checkout_without_following() {
+        use std::os::unix::fs::symlink;
+
+        let db = sqlite_db().await;
+        let root = TempDir::new().expect("workspace root creates");
+        let project_id = new_uuid_v4();
+        let now = now_rfc3339();
+        ProjectRepo::create(
+            &db,
+            CreateProject {
+                id: project_id.clone(),
+                name: "symlink checkout".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("Project creates");
+        let (authority, _) = capture_project_agent_workspace_authority(&db, &project_id)
+            .await
+            .expect("authority query")
+            .expect("authority exists");
+        let workspace = root.path().join(&project_id);
+        assert!(
+            reserve_project_agent_workspace_path(&db, &authority, &workspace)
+                .await
+                .expect("initial workspace reserves")
+        );
+        let external = root.path().join("external-checkout");
+        std::fs::create_dir_all(&external).expect("external directory creates");
+        std::fs::write(external.join("sentinel"), "must remain").expect("external sentinel writes");
+        symlink(&external, workspace.join(PROJECT_AGENT_CHECKOUT_DIR))
+            .expect("checkout symlink creates");
+
+        let error = reserve_project_agent_workspace_path(&db, &authority, &workspace)
+            .await
+            .expect_err("symlink checkout rejects reservation");
+        assert!(error.to_string().contains("checkout is a symlink"));
+        assert_eq!(
+            std::fs::read_to_string(external.join("sentinel"))
+                .expect("external target remains untouched"),
+            "must remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_agent_version_and_repo_changes_preserve_notes_but_replace_checkout() {
+        let db = sqlite_db().await;
+        let root = TempDir::new().expect("workspace root creates");
+        let project_id = new_uuid_v4();
+        let repo_one_id = new_uuid_v4();
+        let repo_two_id = new_uuid_v4();
+        let now = now_rfc3339();
+        ProjectRepo::create(
+            &db,
+            CreateProject {
+                id: project_id.clone(),
+                name: "mutable generation".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("Project creates");
+        RepoRepo::create(
+            &db,
+            CreateRepo {
+                id: repo_one_id.clone(),
+                project_id: project_id.clone(),
+                name: "first repository".to_owned(),
+                remote_url: "https://example.invalid/first.git".to_owned(),
+                local_path: None,
+                work_mode: db::WorkMode::DirectMerge,
+                default_branch: "main".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("first repository creates");
+        ProjectRepo::update_at_version(
+            &db,
+            UpdateProject {
+                id: project_id.clone(),
+                name: None,
+                settings: None,
+                primary_repo_id: Some(Some(repo_one_id.clone())),
+                paused_at: None,
+                updated_at: now_rfc3339(),
+            },
+            ProjectRepo::get_by_id(&db, &project_id)
+                .await
+                .expect("Project lookup")
+                .expect("Project exists")
+                .version,
+            None,
+        )
+        .await
+        .expect("first repository binds");
+        let (authority_one, _) = capture_project_agent_workspace_authority(&db, &project_id)
+            .await
+            .expect("first authority query")
+            .expect("first authority exists");
+        let workspace = root.path().join(&project_id);
+        assert!(
+            reserve_project_agent_workspace_path(&db, &authority_one, &workspace)
+                .await
+                .expect("first workspace reserves")
+        );
+        let first_repository_marker =
+            std::fs::read_to_string(workspace.join(PROJECT_AGENT_REPOSITORY_MARKER))
+                .expect("first repository marker is stamped");
+        assert_eq!(first_repository_marker.len(), 64);
+        assert!(!first_repository_marker.contains("example.invalid"));
+        assert!(!first_repository_marker.contains("first.git"));
+        assert!(!first_repository_marker.contains(&repo_one_id));
+        assert_eq!(
+            std::fs::read_to_string(workspace.join(PROJECT_AGENT_GENERATION_MARKER))
+                .expect("first generation marker is stamped"),
+            authority_one.generation_marker_contents()
+        );
+        std::fs::create_dir_all(workspace.join(PROJECT_AGENT_DOCS_DIR))
+            .expect("notes directory creates");
+        std::fs::create_dir_all(workspace.join(PROJECT_AGENT_CHECKOUT_DIR))
+            .expect("checkout directory creates");
+        std::fs::write(
+            workspace.join(PROJECT_AGENT_DOCS_DIR).join("note"),
+            "keep this",
+        )
+        .expect("note writes");
+        std::fs::write(
+            workspace.join(PROJECT_AGENT_CHECKOUT_DIR).join("old-tree"),
+            "replace this",
+        )
+        .expect("old checkout writes");
+
+        let version_before_edit = ProjectRepo::get_by_id(&db, &project_id)
+            .await
+            .expect("Project lookup")
+            .expect("Project exists")
+            .version;
+        ProjectRepo::update_at_version(
+            &db,
+            UpdateProject {
+                id: project_id.clone(),
+                name: Some("renamed generation".to_owned()),
+                settings: None,
+                primary_repo_id: None,
+                paused_at: None,
+                updated_at: now_rfc3339(),
+            },
+            version_before_edit,
+            None,
+        )
+        .await
+        .expect("Project version bumps");
+        let (authority_after_version, _) =
+            capture_project_agent_workspace_authority(&db, &project_id)
+                .await
+                .expect("version authority query")
+                .expect("version authority exists");
+        assert_eq!(
+            authority_one.provisioning_operation_id,
+            authority_after_version.provisioning_operation_id
+        );
+        assert!(
+            reserve_project_agent_workspace_path(&db, &authority_after_version, &workspace)
+                .await
+                .expect("version-bumped workspace reserves")
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join(PROJECT_AGENT_GENERATION_MARKER))
+                .expect("generation marker survives version bump"),
+            authority_one.generation_marker_contents()
+        );
+        assert!(workspace.join(PROJECT_AGENT_DOCS_DIR).join("note").exists());
+        assert!(workspace
+            .join(PROJECT_AGENT_CHECKOUT_DIR)
+            .join("old-tree")
+            .exists());
+
+        RepoRepo::create(
+            &db,
+            CreateRepo {
+                id: repo_two_id.clone(),
+                project_id: project_id.clone(),
+                name: "second repository".to_owned(),
+                remote_url: "https://example.invalid/second.git".to_owned(),
+                local_path: None,
+                work_mode: db::WorkMode::DirectMerge,
+                default_branch: "main".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("second repository creates");
+        let version_before_repo_change = ProjectRepo::get_by_id(&db, &project_id)
+            .await
+            .expect("Project lookup")
+            .expect("Project exists")
+            .version;
+        ProjectRepo::update_at_version(
+            &db,
+            UpdateProject {
+                id: project_id.clone(),
+                name: None,
+                settings: None,
+                primary_repo_id: Some(Some(repo_two_id.clone())),
+                paused_at: None,
+                updated_at: now_rfc3339(),
+            },
+            version_before_repo_change,
+            None,
+        )
+        .await
+        .expect("second repository binds");
+        let (authority_two, _) = capture_project_agent_workspace_authority(&db, &project_id)
+            .await
+            .expect("second authority query")
+            .expect("second authority exists");
+        assert!(
+            reserve_project_agent_workspace_path(&db, &authority_two, &workspace)
+                .await
+                .expect("repository-changed workspace reserves")
+        );
+        let second_repository_marker =
+            std::fs::read_to_string(workspace.join(PROJECT_AGENT_REPOSITORY_MARKER))
+                .expect("second repository marker is stamped");
+        assert_ne!(first_repository_marker, second_repository_marker);
+        assert_eq!(second_repository_marker.len(), 64);
+        assert!(!second_repository_marker.contains("example.invalid"));
+        assert!(!second_repository_marker.contains("second.git"));
+        assert!(!second_repository_marker.contains(&repo_two_id));
+        assert!(workspace.join(PROJECT_AGENT_DOCS_DIR).join("note").exists());
+        assert!(
+            !workspace
+                .join(PROJECT_AGENT_CHECKOUT_DIR)
+                .join("old-tree")
+                .exists(),
+            "repository changes replace only the disposable checkout"
+        );
+        // The newer admission may finish building its replacement checkout
+        // before an older creator gets its final retention check. The stale
+        // finalizer must not mistake the newer repository marker for its own
+        // checkout and remove the replacement.
+        std::fs::create_dir_all(workspace.join(PROJECT_AGENT_CHECKOUT_DIR))
+            .expect("replacement checkout directory creates");
+        std::fs::write(
+            workspace
+                .join(PROJECT_AGENT_CHECKOUT_DIR)
+                .join("replacement-tree"),
+            "new repository",
+        )
+        .expect("replacement checkout writes");
+        assert!(retain_project_agent_workspace_if_current(
+            &db,
+            &authority_one,
+            workspace.clone(),
+            None,
+        )
+        .await
+        .expect("stale repository retention check succeeds")
+        .is_none());
+        assert_eq!(
+            std::fs::read_to_string(
+                workspace
+                    .join(PROJECT_AGENT_CHECKOUT_DIR)
+                    .join("replacement-tree")
+            )
+            .expect("replacement checkout remains"),
+            "new repository"
+        );
     }
 
     async fn seed_project_repo(db: &SqliteDb) -> (String, String) {

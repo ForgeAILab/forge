@@ -2140,7 +2140,14 @@ fn parse_review_checks(raw: &str) -> Vec<SoloCheckSnapshot> {
                 .and_then(Value::as_str)
                 .and_then(safe_diagnostic);
             let exit_code = object.get("exit_code").and_then(Value::as_i64);
-            let success = object.get("success").and_then(Value::as_bool);
+            // ReviewRunner's durable CI rows use exit_code as the canonical
+            // outcome today; older/custom producers may also supply the
+            // explicit boolean. Keep both shapes visible in Solo instead of
+            // rendering a successful completed check as pending.
+            let success = object
+                .get("success")
+                .and_then(Value::as_bool)
+                .or_else(|| exit_code.map(|code| code == 0));
             Some(SoloCheckSnapshot {
                 index,
                 command,
@@ -3070,6 +3077,22 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    #[test]
+    fn review_checks_derive_completion_from_exit_code() {
+        let checks = parse_review_checks(
+            r#"{"ci_steps":[
+                {"index":0,"command":"cargo test","exit_code":0},
+                {"index":1,"command":"cargo clippy","exit_code":1},
+                {"index":2,"command":"manual","success":true}
+            ]}"#,
+        );
+
+        assert_eq!(checks.len(), 3);
+        assert_eq!(checks[0].success, Some(true));
+        assert_eq!(checks[1].success, Some(false));
+        assert_eq!(checks[2].success, Some(true));
     }
 
     #[test]

@@ -15,6 +15,7 @@ use db::{
     now_rfc3339, ApplyProjectExecutionSetupCommand, CommandReceiptRepo, CreateCommandReceipt,
     Project, ProjectExecutionSetupCommandRepo, ProjectProvisioningRepo, ProjectRepo,
     ReconcileProjectProvisioningMetadata, RepoRepo, ScheduleProjectProvisioningRetry, SqliteDb,
+    TaskRepo,
 };
 use serde_json::{json, Value};
 
@@ -448,6 +449,11 @@ impl ProjectExecutionSetupService {
         )
         .await?;
         if receipt.is_some() {
+            // The original command commits the Project mutation before the
+            // caller can observe its response.  A replay must still repair
+            // the post-commit dispatch wake if the process stopped in that
+            // small window; clearing an already-absent marker is idempotent.
+            TaskRepo::wake_dispatch_for_project(&*self.db, project_id, &now_rfc3339()).await?;
             return self.get(project_id).await.map(Some);
         }
         Ok(None)
@@ -511,6 +517,20 @@ impl ProjectExecutionSetupService {
             },
         )
         .await?;
+        // Project repository and default-role setup are governance inputs to
+        // dispatch. The repository command already clears every parked
+        // Task's deterministic refusal inside its commit transaction; retain
+        // this idempotent post-commit repair for older/replayed receipts and
+        // response-loss recovery.
+        let woken =
+            TaskRepo::wake_dispatch_for_project(&*self.db, project_id, &now_rfc3339()).await?;
+        if woken > 0 {
+            tracing::info!(
+                project_id,
+                woken,
+                "project execution setup woke parked task dispatch"
+            );
+        }
         self.get(project_id).await
     }
 }

@@ -35,7 +35,8 @@ pub(crate) async fn has_running_execution_capacity(
         return Ok(true);
     };
     let running_count = count_running_executions_for_daemon(db, daemon_id).await?;
-    Ok(running_count < max_sessions)
+    let chat_count = count_active_chat_turns_for_daemon(db, daemon_id).await?;
+    Ok(running_count.saturating_add(chat_count) < max_sessions)
 }
 
 pub(crate) async fn count_running_executions_for_daemon(
@@ -47,6 +48,20 @@ pub(crate) async fn count_running_executions_for_daemon(
          FROM execution
          JOIN agent_current AS agent ON agent.id = execution.agent_id
          WHERE agent.daemon_id = ? AND execution.status = 'running'",
+    )
+    .bind(daemon_id)
+    .fetch_one(db.pool())
+    .await?)
+}
+
+async fn count_active_chat_turns_for_daemon(db: &db::SqliteDb, daemon_id: &str) -> Result<i64> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)
+         FROM agent_chat_turn_job
+         JOIN agent_current AS agent
+           ON agent.id = agent_chat_turn_job.responder_identity_id
+         WHERE agent.daemon_id = ?
+           AND agent_chat_turn_job.status IN ('leased', 'running')",
     )
     .bind(daemon_id)
     .fetch_one(db.pool())

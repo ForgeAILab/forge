@@ -29,7 +29,7 @@ database for historical provenance.
 | GET    | `/api/v1/projects` | List projects |
 | GET    | `/api/v1/projects/{id}` | Get project |
 | PATCH  | `/api/v1/projects/{id}` | Update project |
-| DELETE | `/api/v1/projects/{id}` | Delete a Project through the guarded, transactional teardown of its Project-owned records |
+| DELETE | `/api/v1/projects/{id}` | Delete a Project through the guarded, transactional teardown of its Project-owned records; returns `409 project_in_use` while an Execution or Workspace lease is live, while `?force=true` requests cancellation before retrying the guard |
 | GET    | `/api/v1/projects/{id}/analytics` | Read authorized Project analytics for a half-open window (CI steps, review summary, typed usage/cost breakdown, and released-milestone outcome economics) |
 | POST   | `/api/v1/projects/{id}/cost-estimation-previews` | Preview exact retrospective estimates for eligible legacy Project usage against one immutable catalog snapshot |
 | POST   | `/api/v1/projects/{id}/cost-estimation-runs` | Commit one preview's retrospective estimates idempotently |
@@ -101,6 +101,9 @@ database for historical provenance.
 | GET    | `/api/v1/projects/{id}/project_hook_runs` | List project hook run history |
 | POST   | `/api/v1/projects/{id}/repos` | Create repo |
 | GET    | `/api/v1/projects/{id}/repos` | List repos |
+| GET    | `/api/v1/repos/{id}` | Get repo |
+| PATCH  | `/api/v1/repos/{id}` | Update repo |
+| DELETE | `/api/v1/repos/{id}` | Delete an idle repo; returns `409 repo_in_use` while an execution or Workspace lease still uses it |
 | POST   | `/api/v1/projects/{id}/tasks` | Create a Task; omitted governance is derived from the current approved Charter |
 | GET    | `/api/v1/projects/{id}/tasks` | List tasks (paginated, filterable) |
 | GET    | `/api/v1/tasks/{id}` | Get task |
@@ -108,7 +111,7 @@ database for historical provenance.
 | PATCH  | `/api/v1/tasks/{id}` | Update task |
 | DELETE | `/api/v1/tasks/{id}` | Soft-delete task |
 | POST   | `/api/v1/tasks/{id}/claim` | Claim a standalone Task or the first eligible ordered child (auto-dispatches); a root with children is a non-executing coordinator and cannot be claimed |
-| GET    | `/api/v1/tasks/{id}/actions` | List the intent actions currently available for the task (`{"available_actions": [...]}`), so clients need not provoke a 409 to discover them |
+| GET    | `/api/v1/tasks/{id}/actions` | List ordinary intent actions and typed exception recovery actions (`{"available_actions": [...], "recovery_actions": [...]}`) |
 | POST   | `/api/v1/tasks/{id}/start` | Start standalone or eligible child work; coordination roots never start implementation |
 | POST   | `/api/v1/tasks/{id}/pause` | Stop the current execution without changing task state |
 | POST   | `/api/v1/tasks/{id}/resume` | Resume the latest worker session, or dispatch fresh work when no session exists |
@@ -162,6 +165,25 @@ ratio:
 | --- | --- |
 | `active_assigned_task_count` | Tasks assigned to this identity that sit in an active or gate workflow state, plus its in-flight chat turns. This is assigned workload. It is **not** bounded by `max_concurrent_tasks` and routinely exceeds it. |
 | `running_execution_count` | Executions currently running for this identity. This is the quantity `max_concurrent_tasks` gates, and the one to pair with it when rendering `n/cap`. |
+
+`max_concurrent_tasks` is an execution cap, not an assignment or chat-turn
+cap: an assigned Task with no Running execution consumes no Task slot, and Main
+or Project Agent chat turns do not consume Task quota. Independently, a daemon
+may advertise a positive session cap in `labels_json` under
+`max_concurrent_sessions`, `max_sessions`, `active_session_cap`, or the legacy
+`max_concurrent_tasks` key. That daemon cap counts its Running Task executions
+plus leased/running Agent Chat turns. Both caps are rechecked in the same
+`BEGIN IMMEDIATE` transaction that inserts a Running execution; read-side
+`effective_status` and capacity checks are advisory only. The same boundary
+also rejects an identity that became paused or selected a newer profile after
+dispatch preflight. Profile replacement covers daemon, provider, and executor
+configuration reassignment even when the numeric task cap is unchanged.
+
+`status` is the identity's visible activity state: a persisted `idle` identity
+projects `busy` while `running_execution_count > 0`. `effective_status` remains
+the scheduling/availability projection (including capacity, pause, daemon, and
+credential health), so it may be `active` below the concurrency cap while
+`status` is `busy`.
 
 | GET    | `/api/v1/executor-types/{type}/discovered-options` | Get adapter options before creating an agent |
 | POST   | `/api/v1/embedded-agents` | Create a direct (embedded-runtime) agent referencing an existing provider entry (`credential_id`); returns identity, profile, health, and initial account session |
@@ -506,6 +528,12 @@ unapproved draft's `charter_id`, `revision_id`, `revision`, Charter `version`,
 It is null when no draft exists or adoption is complete. This draft remains
 separate from `effective_state.governing_charter`; reading it grants no approval
 or repository authority.
+
+Effective governing-Charter and approved-Document references include the exact
+`render_version` beside their content and render digests. Agent-authored
+`ArtifactRef` payloads must copy those values exactly (or omit an optional value
+that the projection did not supply); an artifact's mutable row `version` is not
+its renderer version.
 
 The Project Charter route exposes immutable revisions, exact content/render
 digests, approval/supersession history, and the current-approved pointer.
@@ -1769,17 +1797,35 @@ binding, Chat, Charter attachment, handoff, target message/turn, events, and
 Genesis transition together. Replay returns the original result, while a
 failure leaves no Project or handoff and keeps Genesis ready for retry.
 
-`DELETE /api/v1/projects/{id}` performs one guarded transaction that removes
+`DELETE /api/v1/projects/{id}` requires an authenticated Project owner/admin;
+unauthorized members cannot observe in-use counts or filesystem state. It
+refuses with `409 project_in_use` while the
+Project still holds a running Execution or an active Workspace lease, and its
+`details` report `running_executions` and `active_leases`. With
+`?force=true`, Forge requests provider-acknowledged cancellation for every
+running Execution, terminalizes those rows, revokes active Workspace leases,
+and retries the same guarded deletion. A provider or database failure stops
+the request before authoritative deletion; if any execution or lease is still
+live, the request remains a `409` and the Project is left intact. Force does
+not mean "delete anyway".
+
+Once admitted, it performs one guarded transaction that removes
 the Project-owned dependency graph before deleting the Project, including
 Project/Task/Project-Chat `agent_lcm_*` rows and Project chat/handoff state.
-Before the transaction, Forge stages repositories managed as direct children
-of `<workspace_root>/repos`, each repository cache under
-`<workspace_root>/.repos/<repo_id>`, every Task directory that belongs to the
-Project under `<workspace_root>`, and the Project Agent directory at
-`<data_dir>/projects/<project_id>`. It restores every staged path on rollback
-and removes them after commit. Only direct children of those Forge-controlled
-roots are eligible; linked repositories elsewhere on disk and symlink
-candidates are never deleted.
+The same final write transaction captures the exact Task IDs, Workspace
+worktree paths, and Project repository paths present at the deletion boundary;
+it does not rename or stage live filesystem paths before that commit. After a
+successful commit, Forge best-effort removes the captured Task/worktree paths,
+managed repositories and caches, and the Project Agent directory. Immediately
+before each cleanup it reacquires `BEGIN IMMEDIATE` and rechecks live
+Project/Task/Workspace/Repo ownership; an eligible direct child is atomically
+moved to a unique quarantine sibling while that lock is held, then removed
+after the transaction. A path claimed by a new owner is skipped. Only direct
+children of Forge-controlled roots are eligible; linked
+repositories elsewhere on disk and symlink candidates are never deleted.
+Cleanup failures are logged for recovery while the already-committed deletion
+still returns `204`, so a client is not invited to retry an operation whose
+authoritative rows are gone.
 Immutable-row guards are relaxed only for that exact teardown transaction;
 individual Charter, milestone, readiness, release, decision, lease,
 evidence, review-contract, and review-assessment records remain non-deletable
@@ -1843,6 +1889,10 @@ may dispatch it when its independent Charter, workflow, dependency, assignment,
 capability, retry, and version gates pass. A missing, nonexistent, or
 cross-Project primary pointer is returned as Project setup required; Forge
 issues no Workspace or lease and never substitutes another Repo row.
+Deleting a Repo clears the Project's primary pointer while retaining historical
+Workspace provenance. The delete is atomic and returns HTTP `409` with
+`code: "repo_in_use"` if a running Execution or active Workspace lease is still
+bound to that Repo; it never tears repository authority out from under a run.
 
 The response also includes `availability` for each dimension. `current` means
 the authoritative rows were read; `unavailable` (with a `refresh_and_retry`
@@ -2071,7 +2121,35 @@ latest awaiting-human review when present and otherwise use gate capabilities.
 manual-stop annotation plus an audit comment. `resume` uses the existing
 session-follow-up/recovery primitives and falls back to a fresh dispatch.
 The manual-stop annotation keeps recovery controls available to the user;
-it does not itself request a Project-Agent recovery wake.
+it does not itself request a Project-Agent recovery wake. A non-manual blocking
+annotation does not advertise the generic `resume` action; clients use the typed
+actions in `workflow_exception` instead, so a displayed recovery action cannot
+be a successful no-op. The `manual_stop` annotation is the exception: it keeps
+generic `resume` available so a user pause can continue the existing session
+(or fall back to a fresh dispatch). `submit` is offered only after the current
+role's agent execution has completed and no execution is running; an assigned,
+never-run Task remains on the automatic `start`/dispatch path.
+
+`GET /api/v1/tasks/{id}/actions` returns two deliberately separate authority
+sets:
+
+```json
+{
+  "available_actions": ["cancel"],
+  "recovery_actions": ["retry_hook", "cancel_task"]
+}
+```
+
+`available_actions` contains workflow intents. `recovery_actions` is the closed,
+typed allowlist from the current blocking annotation. When that list is
+non-empty, `POST /api/v1/tasks/{id}/recover` rejects every action outside it
+without clearing or otherwise mutating the annotation.
+
+Task `workflow_health` also represents active non-agent work. A running
+interactive execution reports `kind: "running"`, label `Interactive`. A
+deferred execution retry reports `kind: "waiting_for_agent"` with label
+`Retry Scheduled` before its eligibility time and `Retry Queued` afterward;
+the latter means it is waiting for capacity, not wedged or idle.
 
 When an action is not available, the endpoint returns `409` with
 `code: "task_action.unavailable"` and structured `details`:
@@ -2921,7 +2999,7 @@ Common HTTP mappings:
 |--------|------|
 | 400 | Validation failure |
 | 404 | Resource not found |
-| 409 | Optimistic task/board version conflict, move operation conflict, role assignment conflict |
+| 409 | Optimistic task/board version conflict, move operation conflict, role assignment conflict, or execution admission conflict |
 | 412 | Workflow guard rejection (`before_exit` blocked the transition) |
 | 422 | Illegal state transition |
 | 500 | Internal error |
@@ -2932,6 +3010,15 @@ repository, or other prerequisite is missing return HTTP `409` with code
 contains the typed missing requirements and permitted remediation actions;
 clients must not infer readiness from the HTTP status of Project creation or
 from a different setup dimension.
+
+When a follow-up, re-execute, or launch collides with an already-running
+execution, REST returns HTTP `409` with code `execution.already_running`.
+`details.scope` is `repository` for a shared Workspace slot or `interactive`
+for the Task's interactive slot, and
+`details.execution_id` is the opaque id of the execution currently occupying
+it. Malformed persisted review details are server corruption, not caller
+validation errors: review reads and mutation responses return HTTP `500` with
+code `internal_error`.
 
 For service-level invalid command arguments, REST returns HTTP 400 with code
 `validation_error`, matching the native orchestration outcome code. Transport
@@ -2956,6 +3043,7 @@ The envelope has these fields:
   "setup_requirements": null,
   "current_version_or_revision": null,
   "retry": null,
+  "details": null,
   "safe_message": "command completed",
   "correlation_id": "correlation-uuid",
   "replayed": false,
@@ -2965,7 +3053,7 @@ The envelope has these fields:
 ```
 
 `result`, `approval_target`, `setup_requirements`,
-`current_version_or_revision`, `retry`, `receipt_id`, and `event_id` are
+`current_version_or_revision`, `retry`, `details`, `receipt_id`, and `event_id` are
 optional and omitted when they do not apply; the `null` entries above are
 schema placeholders. `scope.scope_type` is one of `account`,
 `project`, `agent_chat`, or `task`. `result` is the operation-specific
@@ -3224,6 +3312,10 @@ JSON text. Clients should inspect `structuredContent.code` and its typed
 corrections. JSON-RPC parse/invalid-request errors and unknown methods remain
 top-level `error` responses, as described in [Native and MCP orchestration
 outcomes](#native-and-mcp-orchestration-outcomes).
+For an execution admission conflict, `structuredContent.code` remains the
+generic `transient_failure`; its bounded `details` carries
+`code: "execution_already_running"`, the execution `scope`, and the
+occupying opaque `execution_id`.
 
 `forge_create_task` is a separate direct Task-service API, not the
 `task.propose` action/receipt operation; its result therefore has no
@@ -3345,6 +3437,7 @@ Task review responses include `details.conformance` with `status` (`not_assessed
 missing historical assessments are explicitly `not_assessed`.
 
 The contract identifies its execution, policy revision, candidate/target commits,
+the exact `candidate_changed_paths` in `base_sha..commit_sha`,
 Charter revision/digest, Project/Task/repository scope, requirement entries, linked
 Documents, pre-review `check_results`, and source/contract digests. Each frozen
 check result carries `check_id`, exact `command`, `exit_code`, and bounded
@@ -3356,25 +3449,31 @@ source pointer, stable ID, universal flag, and optional authoritative allocation
 remaining Project requirements that milestone readiness must settle.
 
 The assessment contains `contract_digest`, `verdict` (`pass` or `fail`),
-`requirements` coverage and `findings`. Policy `forge.review-conformance/2` accepts
+`requirements` coverage and `findings`. Policy `forge.review-conformance/3` accepts
 the requirement dispositions `satisfied`, `violated`, and `unverified`.
-`outside_task_scope` remains deserializable only for immutable v1 history; new
-reports cannot use it because out-of-scope requirements are omitted from the
-contract. Findings include `blocking`, `expected`, `actual`, and evidence. File
+It is the only current policy; v1 and v2 contracts remain historical and require
+a fresh review before their result can authorize current integration.
+`outside_task_scope` is historical-only: immutable v1/v2 assessments may retain
+it for requirements allocated outside the reviewed Task, while current v3
+contracts omit out-of-scope requirements and reject that disposition. Findings
+include `blocking`, `expected`, `actual`, and evidence. File
 evidence is `{kind:"file",path,commit_sha,start_line,end_line}`; check evidence is
 `{kind:"check",check_id}`. Satisfied claims require evidence. A violated claim or
-blocking finding may use an empty evidence array for an absence that has no positive
-file to cite, with the inspected surface explained in its rationale. The final
+blocking finding with file evidence must cite a path in `candidate_changed_paths`;
+otherwise the assessment is retained as `unverified` and cannot send the Task to
+coder remediation. It may use an empty evidence array for an absence that has no
+positive file to cite, with the inspected surface explained in its rationale. The final
 response must be one JSON object: Markdown fences, marker-only verdicts,
 multiple reports, and unknown fields fail structurally. A structurally valid
 partial report is retained and omitted contract requirements make its conformance
 status `unverified`; it therefore cannot pass but does not discard valid findings.
 
 A structurally valid assessment is retained when a semantic claim or citation
-cannot be verified, and its conformance status becomes `unverified`; it follows the
-normal failed-review remediation path and does not consume execution retry budget.
-Only a response that cannot bind to the frozen contract is a reviewer execution
-failure eligible for bounded execution retry. Neither case can grant acceptance.
+cannot be verified, and its conformance status becomes `unverified`. Both an
+unverified result and a response that cannot bind to the frozen contract use the
+bounded reviewer execution-retry path and eventually expose a durable recovery
+blocker; neither dispatches a coder or can grant acceptance. A verified `fail`
+assessment follows the normal review-remediation path.
 
 `default_review_config` on Project settings and Task review state configuration
 accepts `requirement_ids` and `conformance_checks`. `requirement_ids` names the
@@ -3407,7 +3506,27 @@ auditor review, then routes the result through the normal workflow. A pass enter
 merging, a failure returns to remediation or records the exhausted-budget blocker,
 and a passing gate configured for user approval remains in review with an
 `awaiting_human` review. The response contains the settled Task snapshot and the
-new review attempt.
+new review attempt. Attempt allocation and the Running reviewer execution/lease
+are one database admission boundary; the selected Task role assignment, Agent
+identity, workflow snapshot, and current candidate execution must still match
+when that boundary commits. Reviewer capacity counts live Running executions,
+with only an explicitly configured daemon session cap added to that check.
+The candidate must be a completed implementation execution at the insert
+boundary. Failed or cancelled remediation executions do not displace the last
+completed candidate, but a newer running implementation still fences review
+admission. For a coordination-root Task, that candidate may be a completed
+direct-child implementation execution; an unrelated Task execution is
+rejected. If Task/Project/workflow authority changes after reservation, Forge
+terminalizes the reviewer execution and uses an exact Review status/timestamp
+CAS to cancel the still-running Review; it never leaves a stale running
+attempt or lease as the apparent current authority.
+The persisted reviewer/auditor execution binding identifies the exact Review
+attempt; a shared candidate parent or timestamp is not used to associate an
+execution with a newer attempt. Unbound legacy reviewer executions require an
+explicit retry or recovery action.
+When review configuration names an auditor, the Task's reviewer role
+assignment must already materialize that authority; configuration alone does
+not synthesize an Agent-backed reviewer during a rerun.
 
 `conformance_checks` is an array of `{id, command, requirement_ids}`. IDs must be
 unique, commands nonempty, and requirement IDs present in the resulting Task

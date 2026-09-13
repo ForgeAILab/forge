@@ -22,22 +22,12 @@ pub(crate) async fn latest_executor_execution_for_task(
 
     let mut latest = None;
     for task_id in task_ids {
-        let page = ExecutionRepo::list_by_task(
+        let Some(candidate) = ExecutionRepo::latest_review_candidate_by_task_and_roles(
             db,
             &task_id,
-            PageRequest {
-                cursor: None,
-                limit: 100,
-                include_total: false,
-                sort_by: SortBy::CreatedAt,
-                sort_order: SortOrder::Desc,
-            },
+            &["executor", "coder", "worker"],
         )
-        .await?;
-        let Some(candidate) = page
-            .items
-            .into_iter()
-            .find(|execution| matches!(execution.role.as_str(), "executor" | "coder" | "worker"))
+        .await?
         else {
             continue;
         };

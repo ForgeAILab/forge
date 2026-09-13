@@ -41,6 +41,33 @@ impl TaskExecutor for NoDiffExecutor {
     }
 }
 
+struct HostFinalizingExecutor;
+
+#[async_trait]
+impl TaskExecutor for HostFinalizingExecutor {
+    async fn execute(
+        &self,
+        ctx: ExecutionContext,
+    ) -> std::result::Result<ExecutionResult, ExecutorError> {
+        tokio::fs::write(
+            std::path::Path::new(&ctx.worktree_path).join("delivered.rs"),
+            "fn delivered() {}\n",
+        )
+        .await?;
+        let after_sha = cli_adapters::commit::commit_execution_changes(&ctx).await?;
+        Ok(ExecutionResult {
+            status: ExecutionOutcome::Completed,
+            after_sha,
+            agent_session_id: Some("managed-finalization-session".to_owned()),
+            ..Default::default()
+        })
+    }
+
+    async fn cancel(&self, _execution_id: &str) -> std::result::Result<(), ExecutorError> {
+        Ok(())
+    }
+}
+
 struct UncommittedWorktreeFailureExecutor;
 
 #[async_trait]

@@ -3,11 +3,13 @@ use crate::auditor::AuditorVerdict;
 use async_trait::async_trait;
 use db::{
     create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CommentAuthorType, CreateAgent,
-    CreateProject, CreateRepo, CreateTask, CreateTaskComment, CreateTaskMedia, CreateWorkspace,
-    DaemonRepo, DaemonStatus, ProjectRepo, RepoRepo, ReviewConformanceRepo, TaskCommentRepo,
-    TaskMediaRepo, TaskRepo, UpdateProject, UpsertDaemon, WorkspaceRepo, WorkspaceStatus,
+    CreateProject, CreateRepo, CreateTask, CreateTaskComment, CreateTaskMedia,
+    CreateTaskRoleAssignment, CreateWorkspace, DaemonRepo, DaemonStatus, ProjectRepo, RepoRepo,
+    ReviewConformanceRepo, TaskCommentRepo, TaskMediaRepo, TaskRepo, TaskRoleAssignmentRepo,
+    UpdateProject, UpsertDaemon, WorkspaceRepo, WorkspaceStatus,
 };
 use serde_json::{json, Value};
+use sqlx::Row;
 use std::path::Path;
 use tempfile::TempDir;
 
@@ -163,7 +165,7 @@ async fn seeded_review(ci_steps: Vec<&str>) -> SeededReview {
             title: "Review me".to_owned(),
             description: None,
             task_type: "task".to_owned(),
-            status: "in_progress".to_string(),
+            status: "review".to_string(),
             is_automation: false,
             priority: 0,
             task_state_config: Some(task_state_config),
@@ -175,6 +177,21 @@ async fn seeded_review(ci_steps: Vec<&str>) -> SeededReview {
     )
     .await
     .expect("task creates");
+
+    TaskRoleAssignmentRepo::assign(
+        &*db,
+        CreateTaskRoleAssignment {
+            id: Uuid::new_v4().to_string(),
+            task_id: task_id.to_string(),
+            role_name: "reviewer".to_owned(),
+            assignee_type: Some(db::AssigneeKind::Agent),
+            assignee_id: Some(agent_id.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("reviewer assignment creates");
 
     WorkspaceRepo::create(
         &*db,
@@ -234,6 +251,84 @@ async fn seeded_review(ci_steps: Vec<&str>) -> SeededReview {
     }
 }
 
+#[test]
+fn malformed_review_ci_steps_are_not_treated_as_empty() {
+    for value in [
+        json!({"ci_steps": "not-an-array"}),
+        json!({"ci_steps": ["cargo test", 7]}),
+        json!({"ci_steps": ["   "]}),
+    ] {
+        let error = read_ci_steps(&value).expect_err("malformed CI config must fail closed");
+        assert!(error.to_string().contains("ci_steps"));
+    }
+    assert_eq!(read_ci_steps(&json!({})).unwrap(), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn unbound_reviewer_contract_cannot_use_empty_or_legacy_ci_results() {
+    let seed = seeded_review(Vec::new()).await;
+    let workspace = WorkspaceRepo::get_by_task_id(&*seed.db, &seed.task_id.to_string())
+        .await
+        .expect("workspace lookup succeeds")
+        .expect("seed workspace exists");
+    let now = now_rfc3339();
+    let reviewer = ExecutionRepo::create(
+        &*seed.db,
+        CreateExecution {
+            id: new_uuid_v4(),
+            task_id: seed.task_id.to_string(),
+            agent_id: Some(seed.auditor_agent_id.clone()),
+            role: "reviewer".to_owned(),
+            status: ExecutionStatus::Running,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: Some(seed.executor_execution_id.to_string()),
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace.id.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("unbound reviewer creates");
+    ReviewRepo::create(
+        &*seed.db,
+        CreateReview {
+            id: new_uuid_v4(),
+            task_id: seed.task_id.to_string(),
+            execution_id: seed.executor_execution_id.to_string(),
+            attempt_number: 1,
+            status: ReviewStatus::Running,
+            step_results_json: json!({"ci_steps": []}).to_string(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("legacy unbound Review creates");
+
+    let error = crate::contract::admit(
+        &seed.db,
+        &reviewer.id,
+        &seed.task_id.to_string(),
+        seed.workspace.path(),
+    )
+    .await
+    .expect_err("unbound reviewer must fail closed before CI admission");
+    assert!(error.contains("no review attempt is bound"));
+}
+
 fn request(seed: &SeededReview) -> ReviewRequest {
     ReviewRequest {
         task_id: seed.task_id,
@@ -246,6 +341,57 @@ fn request(seed: &SeededReview) -> ReviewRequest {
         executor_thread_id: None,
         requires_user_approval: false,
     }
+}
+
+async fn set_roleless_review_workflow(seed: &SeededReview, requires_user_approval: bool) {
+    let task = TaskRepo::get_by_id(&*seed.db, &seed.task_id.to_string(), false)
+        .await
+        .unwrap()
+        .unwrap();
+    let project = ProjectRepo::get_by_id(&*seed.db, &task.project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let workflow = json!({
+        "roles": [],
+        "states": [{
+            "name": "review",
+            "kind": "gate",
+            "column": "Review",
+            "display_name": "Review",
+            "role": null,
+            "hooks": {},
+            "cleanup": null,
+            "canonical_phase": "review",
+            "gate_config": {
+                "reject_target": null,
+                "max_rejections": null,
+                "approve_label": "Accept",
+                "reject_label": "Reject",
+                "requires_user_approval": requires_user_approval,
+                "optional_when_unassigned": !requires_user_approval
+            },
+            "dispatch": null,
+            "triggers": {},
+            "config": {}
+        }],
+        "configuration": [],
+        "cancellation_state": null
+    })
+    .to_string();
+    ProjectRepo::update_workflow(
+        &*seed.db,
+        &project.id,
+        &workflow,
+        None,
+        project.version,
+        &now_rfc3339(),
+    )
+    .await
+    .unwrap();
+    TaskRoleAssignmentRepo::remove(&*seed.db, &seed.task_id.to_string(), "reviewer")
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -537,12 +683,91 @@ async fn reviewer_receives_and_can_cite_the_recorded_pre_review_ci_result() {
     assert_eq!(outcome, ReviewOutcome::Passed);
     let details: api_types::ReviewDetails =
         serde_json::from_str(&review.step_results_json).unwrap();
+    assert!(review.reviewer_execution_id.is_some());
+    let auditor_execution_id: String =
+        sqlx::query_scalar("SELECT id FROM execution WHERE task_id = ? AND role = 'auditor'")
+            .bind(seed.task_id.to_string())
+            .fetch_one(seed.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        review.auditor_execution_id.as_deref(),
+        Some(auditor_execution_id.as_str())
+    );
     assert_eq!(
         details.conformance.status,
         api_types::ConformanceStatus::Passed
     );
     assert_eq!(details.conformance.checks[0].check_id, "ci:0");
     assert_eq!(details.conformance.checks[0].exit_code, 0);
+}
+
+#[tokio::test]
+async fn distinct_auditor_agent_binds_to_the_reviewer_attempt() {
+    let seed = seeded_review(vec!["true"]).await;
+    git::init(seed.workspace.path()).await.unwrap();
+    tokio::fs::write(seed.workspace.path().join("README.md"), "candidate\n")
+        .await
+        .unwrap();
+    git::commit_all(seed.workspace.path(), "candidate")
+        .await
+        .unwrap();
+    let reviewer_agent = AgentRepo::get_by_id(&*seed.db, &seed.auditor_agent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let auditor_id = Uuid::new_v4().to_string();
+    let now = now_rfc3339();
+    AgentRepo::create(
+        &*seed.db,
+        CreateAgent {
+            id: auditor_id.clone(),
+            name: "distinct-auditor".to_owned(),
+            description: None,
+            executor_type: reviewer_agent.executor_type,
+            model: reviewer_agent.model,
+            reasoning_effort: reviewer_agent.reasoning_effort,
+            permission_policy: reviewer_agent.permission_policy,
+            prompt_template: reviewer_agent.prompt_template,
+            capabilities_json: reviewer_agent.capabilities_json,
+            config_json: reviewer_agent.config_json,
+            credential_ref: reviewer_agent.credential_ref,
+            daemon_id: reviewer_agent.daemon_id,
+            max_concurrent_tasks: reviewer_agent.max_concurrent_tasks,
+            heartbeat_interval_seconds: reviewer_agent.heartbeat_interval_seconds,
+            max_missed_heartbeats: reviewer_agent.max_missed_heartbeats,
+            status: AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: None,
+            visibility: "global".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    let logs = tempfile::tempdir().expect("logs tempdir creates");
+    let mut req = request(&seed);
+    req.logs_path = logs.path().join("review.jsonl").display().to_string();
+    req.auditor_agent_id = Some(auditor_id.clone());
+    let runner = ReviewRunner::new_for_tests(
+        Arc::clone(&seed.db),
+        Arc::clone(&seed.event_bus),
+        Arc::new(CheckResultAwareAuditor),
+    );
+
+    let (review, outcome) = runner.run(req).await.unwrap();
+
+    assert_eq!(outcome, ReviewOutcome::Passed);
+    let bound_auditor: String =
+        sqlx::query_scalar("SELECT agent_id FROM execution WHERE id = ? AND role = 'auditor'")
+            .bind(review.auditor_execution_id.as_deref().unwrap())
+            .fetch_one(seed.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(bound_auditor, auditor_id);
 }
 
 #[tokio::test]
@@ -644,7 +869,9 @@ async fn attach_rust_charter(seed: &SeededReview) {
         "INSERT INTO project_charter(id,account_id,project_id,project_mode,maturity,created_at,updated_at) VALUES ('charter','owner',?,'compact','mvp','now','now')",
     ] {
         let mut query = sqlx::query(sql);
-        if sql.contains('?') { query = query.bind(&task.project_id); }
+        if sql.contains('?') {
+            query = query.bind(&task.project_id);
+        }
         query.execute(seed.db.pool()).await.unwrap();
     }
     sqlx::query("INSERT INTO project_charter_revision(id,charter_id,revision,lifecycle,schema_version,render_version,content_json,rendered_view,author_type,content_digest,rendered_digest,created_at) VALUES ('charter-r1','charter',1,'approved','v1','v1',?,'','user',?,'render','now')")
@@ -758,8 +985,6 @@ async fn charter_check_rejects_wrong_product_and_empty_manifest_but_allows_rust_
         let mut req = request(&seed);
         req.logs_path = logs.path().join("review.jsonl").display().to_string();
         req.auditor_agent_id = Some(seed.auditor_agent_id.clone());
-        sqlx::query("INSERT INTO task_role_assignment(id,task_id,role_name,assignee_type,assignee_id,created_at,updated_at) VALUES ('reviewer-role',?,'reviewer','agent',?,'now','now')")
-            .bind(seed.task_id.to_string()).bind(&seed.auditor_agent_id).execute(seed.db.pool()).await.unwrap();
         let runner = ReviewRunner::new_for_tests(
             seed.db.clone(),
             seed.event_bus.clone(),
@@ -1370,4 +1595,584 @@ async fn attempt_numbers_increment() {
     assert_eq!(second_outcome, ReviewOutcome::PassedCiOnly);
     assert_eq!(first.attempt_number, 1);
     assert_eq!(second.attempt_number, 2);
+}
+
+#[tokio::test]
+async fn assigned_reviewer_rerun_binds_agent_and_candidate_lineage() {
+    let seed = seeded_review(Vec::new()).await;
+    let runner = ReviewRunner::new(
+        seed.db.clone(),
+        seed.event_bus.clone(),
+        Arc::new(AdapterRegistry::new()),
+    );
+
+    let (first, _) = runner.run(request(&seed)).await.unwrap();
+    let (second, _) = runner.run(request(&seed)).await.unwrap();
+    assert_eq!(first.attempt_number, 1);
+    assert_eq!(second.attempt_number, 2);
+    assert_eq!(first.execution_id, seed.executor_execution_id.to_string());
+    assert_eq!(second.execution_id, seed.executor_execution_id.to_string());
+
+    let rows = sqlx::query(
+        "SELECT agent_id, parent_execution_id, status, lease_owner
+         FROM execution
+         WHERE task_id = ? AND role = 'reviewer'
+         ORDER BY created_at, id",
+    )
+    .bind(seed.task_id.to_string())
+    .fetch_all(seed.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert_eq!(
+            row.try_get::<Option<String>, _>("agent_id").unwrap(),
+            Some(seed.auditor_agent_id.clone())
+        );
+        assert_eq!(
+            row.try_get::<Option<String>, _>("parent_execution_id")
+                .unwrap(),
+            Some(seed.executor_execution_id.to_string())
+        );
+        assert_eq!(row.try_get::<String, _>("status").unwrap(), "completed");
+        assert!(row
+            .try_get::<Option<String>, _>("lease_owner")
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[tokio::test]
+async fn review_runner_accepts_direct_child_candidate_for_coordination_root() {
+    let seed = seeded_review(Vec::new()).await;
+    let root_task = TaskRepo::get_by_id(&*seed.db, &seed.task_id.to_string(), false)
+        .await
+        .unwrap()
+        .unwrap();
+    let root_workspace = WorkspaceRepo::get_by_task_id(&*seed.db, &root_task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let child_id = Uuid::new_v4().to_string();
+    let now = now_rfc3339();
+    TaskRepo::create(
+        &*seed.db,
+        CreateTask {
+            id: child_id.clone(),
+            project_id: root_task.project_id.clone(),
+            parent_task_id: Some(root_task.id.clone()),
+            subtask_order: Some(0),
+            assignee_type: None,
+            assignee_id: None,
+            title: "coordination review child".to_owned(),
+            description: None,
+            task_type: "task".to_owned(),
+            status: "in_progress".to_owned(),
+            is_automation: false,
+            priority: 0,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let child_workspace_dir = tempfile::tempdir().unwrap();
+    let child_workspace_id = Uuid::new_v4().to_string();
+    WorkspaceRepo::create(
+        &*seed.db,
+        CreateWorkspace {
+            id: child_workspace_id.clone(),
+            task_id: child_id.clone(),
+            repo_id: root_workspace.repo_id.clone(),
+            worktree_path: child_workspace_dir.path().display().to_string(),
+            branch: format!("forge/{child_id}"),
+            status: WorkspaceStatus::Ready,
+            before_sha: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let candidate_id = Uuid::new_v4();
+    ExecutionRepo::create(
+        &*seed.db,
+        CreateExecution {
+            id: candidate_id.to_string(),
+            task_id: child_id,
+            agent_id: Some(seed.auditor_agent_id.clone()),
+            role: "executor".to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(child_workspace_id),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+
+    let runner = ReviewRunner::new(
+        seed.db.clone(),
+        seed.event_bus.clone(),
+        Arc::new(AdapterRegistry::new()),
+    );
+    let mut review_request = request(&seed);
+    review_request.executor_execution_id = candidate_id;
+    review_request.workspace_path = child_workspace_dir.path().to_path_buf();
+    review_request.logs_path = child_workspace_dir
+        .path()
+        .join("review.jsonl")
+        .display()
+        .to_string();
+    let (review, outcome) = runner.run(review_request).await.unwrap();
+    assert_eq!(outcome, ReviewOutcome::Passed);
+    assert_eq!(review.task_id, root_task.id);
+    assert_eq!(review.execution_id, candidate_id.to_string());
+}
+
+#[tokio::test]
+async fn rerun_binds_new_candidate_when_prior_review_names_old_candidate() {
+    let seed = seeded_review(vec!["false"]).await;
+    let runner = ReviewRunner::new(
+        seed.db.clone(),
+        seed.event_bus.clone(),
+        Arc::new(AdapterRegistry::new()),
+    );
+    let (first, first_outcome) = runner.run(request(&seed)).await.unwrap();
+    assert!(matches!(first_outcome, ReviewOutcome::CiFailed { .. }));
+    assert_eq!(first.status, ReviewStatus::Failed);
+
+    let workspace = WorkspaceRepo::get_by_task_id(&*seed.db, &seed.task_id.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    let candidate_b = Uuid::new_v4();
+    let now = now_rfc3339();
+    ExecutionRepo::create(
+        &*seed.db,
+        CreateExecution {
+            id: candidate_b.to_string(),
+            task_id: seed.task_id.to_string(),
+            agent_id: Some(seed.auditor_agent_id.clone()),
+            role: "executor".to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: None,
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace.id.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+        .bind(json!({"review":{"ci_steps":["true"]}}).to_string())
+        .bind(seed.task_id.to_string())
+        .execute(seed.db.pool())
+        .await
+        .unwrap();
+
+    let task = TaskRepo::get_by_id(&*seed.db, &seed.task_id.to_string(), false)
+        .await
+        .unwrap()
+        .unwrap();
+    let project = ProjectRepo::get_by_id(&*seed.db, &task.project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let assignment = TaskRoleAssignmentRepo::get_by_task_and_role(&*seed.db, &task.id, "reviewer")
+        .await
+        .unwrap();
+    let agent = runner
+        .load_assigned_agent(assignment.as_ref())
+        .await
+        .unwrap();
+    let latest = ReviewRepo::list_by_task(&*seed.db, &task.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .max_by_key(|review| (review.attempt_number, review.id.clone()));
+    let stale_admission = review_execution_admission(
+        &task,
+        &project,
+        assignment.as_ref(),
+        agent.as_ref(),
+        latest.as_ref(),
+        &candidate_b.to_string(),
+    );
+
+    let mut rerun_request = request(&seed);
+    rerun_request.executor_execution_id = candidate_b;
+    let (second, second_outcome) = runner.run(rerun_request).await.unwrap();
+    assert_eq!(second_outcome, ReviewOutcome::Passed);
+    assert_eq!(second.execution_id, candidate_b.to_string());
+    assert_ne!(second.execution_id, first.execution_id);
+    let reviewer_parent: String =
+        sqlx::query_scalar("SELECT parent_execution_id FROM execution WHERE id = ?")
+            .bind(second.reviewer_execution_id.as_deref().unwrap())
+            .fetch_one(seed.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(reviewer_parent, candidate_b.to_string());
+
+    let stale_result = runner
+        .create_reviewer_attempt(
+            &task.id,
+            &candidate_b.to_string(),
+            workspace.id,
+            &request(&seed),
+            agent.as_ref(),
+            stale_admission,
+        )
+        .await;
+    assert!(matches!(
+        stale_result,
+        Err(ReviewError::Db(db::DbError::VersionConflict))
+    ));
+    let reviewer_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution WHERE task_id = ? AND role = 'reviewer'",
+    )
+    .bind(&task.id)
+    .fetch_one(seed.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(reviewer_count, 2);
+}
+
+#[tokio::test]
+async fn stale_task_or_workflow_snapshot_rejects_reviewer_attempt_without_orphan() {
+    for mutate_workflow in [false, true] {
+        let seed = seeded_review(Vec::new()).await;
+        let runner = ReviewRunner::new(
+            seed.db.clone(),
+            seed.event_bus.clone(),
+            Arc::new(AdapterRegistry::new()),
+        );
+        let task = TaskRepo::get_by_id(&*seed.db, &seed.task_id.to_string(), false)
+            .await
+            .unwrap()
+            .unwrap();
+        let project = ProjectRepo::get_by_id(&*seed.db, &task.project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let assignment =
+            TaskRoleAssignmentRepo::get_by_task_and_role(&*seed.db, &task.id, "reviewer")
+                .await
+                .unwrap();
+        let agent = runner
+            .load_assigned_agent(assignment.as_ref())
+            .await
+            .unwrap();
+        let admission = review_execution_admission(
+            &task,
+            &project,
+            assignment.as_ref(),
+            agent.as_ref(),
+            None,
+            &seed.executor_execution_id.to_string(),
+        );
+
+        if mutate_workflow {
+            ProjectRepo::update_workflow(
+                &*seed.db,
+                &project.id,
+                "{}",
+                None,
+                project.version,
+                &now_rfc3339(),
+            )
+            .await
+            .unwrap();
+        } else {
+            sqlx::query("UPDATE task SET version = version + 1, updated_at = ? WHERE id = ?")
+                .bind(now_rfc3339())
+                .bind(&task.id)
+                .execute(seed.db.pool())
+                .await
+                .unwrap();
+        }
+
+        let workspace = WorkspaceRepo::get_by_task_id(&*seed.db, &task.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let result = runner
+            .create_reviewer_attempt(
+                &task.id,
+                &seed.executor_execution_id.to_string(),
+                workspace.id,
+                &request(&seed),
+                agent.as_ref(),
+                admission,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ReviewError::Db(db::DbError::VersionConflict))
+        ));
+        let reviewer_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution WHERE task_id = ? AND role = 'reviewer'",
+        )
+        .bind(&task.id)
+        .fetch_one(seed.db.pool())
+        .await
+        .unwrap();
+        let review_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM review WHERE task_id = ?")
+            .bind(&task.id)
+            .fetch_one(seed.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            reviewer_count, 0,
+            "stale admission must not insert a reviewer"
+        );
+        assert_eq!(review_count, 0, "stale admission must not insert a Review");
+    }
+}
+
+#[tokio::test]
+async fn task_authority_loss_cancels_review_after_reviewer_execution_terminalizes() {
+    let seed = seeded_review(vec!["sleep 1"]).await;
+    let runner = Arc::new(ReviewRunner::new(
+        seed.db.clone(),
+        seed.event_bus.clone(),
+        Arc::new(AdapterRegistry::new()),
+    ));
+    let task_id = seed.task_id.to_string();
+    let run = tokio::spawn({
+        let runner = Arc::clone(&runner);
+        let seed_request = request(&seed);
+        async move { runner.run(seed_request).await }
+    });
+
+    for _ in 0..100 {
+        let reviewer_running: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution
+             WHERE task_id = ? AND role = 'reviewer' AND status = 'running'",
+        )
+        .bind(&task_id)
+        .fetch_one(seed.db.pool())
+        .await
+        .unwrap();
+        if reviewer_running == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    sqlx::query("UPDATE task SET version = version + 1, updated_at = ? WHERE id = ?")
+        .bind(now_rfc3339())
+        .bind(&task_id)
+        .execute(seed.db.pool())
+        .await
+        .unwrap();
+
+    let result = run.await.unwrap();
+    assert!(matches!(
+        result,
+        Err(ReviewError::Db(db::DbError::VersionConflict))
+    ));
+    let review_status: String = sqlx::query_scalar(
+        "SELECT status FROM review WHERE task_id = ? ORDER BY attempt_number DESC LIMIT 1",
+    )
+    .bind(&task_id)
+    .fetch_one(seed.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(review_status, "cancelled");
+    let (execution_status, lease_owner): (String, Option<String>) = sqlx::query_as(
+        "SELECT status, lease_owner FROM execution
+         WHERE task_id = ? AND role = 'reviewer'",
+    )
+    .bind(&task_id)
+    .fetch_one(seed.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(execution_status, "completed");
+    assert!(lease_owner.is_none());
+}
+
+#[tokio::test]
+async fn ci_only_review_without_reviewer_assignment_uses_synthetic_principal() {
+    let seed = seeded_review(Vec::new()).await;
+    TaskRoleAssignmentRepo::remove(&*seed.db, &seed.task_id.to_string(), "reviewer")
+        .await
+        .unwrap();
+    let runner = ReviewRunner::new(
+        seed.db.clone(),
+        seed.event_bus.clone(),
+        Arc::new(AdapterRegistry::new()),
+    );
+
+    let (review, outcome) = runner.run(request(&seed)).await.unwrap();
+
+    assert_eq!(outcome, ReviewOutcome::Passed);
+    assert_eq!(review.execution_id, seed.executor_execution_id.to_string());
+    let agent_id: Option<String> = sqlx::query_scalar(
+        "SELECT agent_id FROM execution
+         WHERE task_id = ? AND role = 'reviewer'",
+    )
+    .bind(seed.task_id.to_string())
+    .fetch_one(seed.db.pool())
+    .await
+    .unwrap();
+    assert!(agent_id.is_none());
+}
+
+#[tokio::test]
+async fn no_review_rerun_uses_bounded_server_owned_ci_execution() {
+    let seed = seeded_review(Vec::new()).await;
+    set_roleless_review_workflow(&seed, false).await;
+    let runner = ReviewRunner::new(
+        seed.db.clone(),
+        seed.event_bus.clone(),
+        Arc::new(AdapterRegistry::new()),
+    );
+
+    let (review, outcome) = runner.run(request(&seed)).await.unwrap();
+
+    assert_eq!(outcome, ReviewOutcome::Passed);
+    assert_eq!(review.status, ReviewStatus::Passed);
+    assert!(review.reviewer_execution_id.is_some());
+    let reviewer_agent: Option<String> =
+        sqlx::query_scalar("SELECT agent_id FROM execution WHERE id = ?")
+            .bind(review.reviewer_execution_id.as_deref().unwrap())
+            .fetch_one(seed.db.pool())
+            .await
+            .unwrap();
+    assert!(reviewer_agent.is_none());
+}
+
+#[tokio::test]
+async fn human_required_rerun_runs_server_owned_ci_then_awaits_human() {
+    let seed = seeded_review(Vec::new()).await;
+    set_roleless_review_workflow(&seed, true).await;
+    let runner = ReviewRunner::new(
+        seed.db.clone(),
+        seed.event_bus.clone(),
+        Arc::new(AdapterRegistry::new()),
+    );
+    let mut req = request(&seed);
+    req.requires_user_approval = true;
+
+    let (review, outcome) = runner.run(req).await.unwrap();
+
+    assert_eq!(outcome, ReviewOutcome::AwaitingHuman);
+    assert_eq!(review.status, ReviewStatus::AwaitingHuman);
+    assert!(review.reviewer_execution_id.is_some());
+}
+
+#[tokio::test]
+async fn configured_auditor_without_reviewer_assignment_is_rejected_before_insert() {
+    let seed = seeded_review(Vec::new()).await;
+    TaskRoleAssignmentRepo::remove(&*seed.db, &seed.task_id.to_string(), "reviewer")
+        .await
+        .unwrap();
+    let mut req = request(&seed);
+    req.auditor_agent_id = Some(seed.auditor_agent_id.clone());
+    let runner = ReviewRunner::new(
+        seed.db.clone(),
+        seed.event_bus.clone(),
+        Arc::new(AdapterRegistry::new()),
+    );
+
+    let result = runner.run(req).await;
+    assert!(matches!(
+        result,
+        Err(ReviewError::Db(db::DbError::VersionConflict))
+    ));
+    let reviewer_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution WHERE task_id = ? AND role = 'reviewer'",
+    )
+    .bind(seed.task_id.to_string())
+    .fetch_one(seed.db.pool())
+    .await
+    .unwrap();
+    let review_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM review WHERE task_id = ?")
+        .bind(seed.task_id.to_string())
+        .fetch_one(seed.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(reviewer_count, 0);
+    assert_eq!(review_count, 0);
+}
+
+#[tokio::test]
+async fn concurrent_review_attempts_leave_no_orphan_running_execution_or_lease() {
+    let seed = seeded_review(vec!["sleep 2"]).await;
+    let runner = Arc::new(ReviewRunner::new(
+        seed.db.clone(),
+        seed.event_bus.clone(),
+        Arc::new(AdapterRegistry::new()),
+    ));
+    let first_request = request(&seed);
+    let second_request = request(&seed);
+    let (first, second) = tokio::join!(runner.run(first_request), runner.run(second_request),);
+    assert!(
+        first.is_ok() ^ second.is_ok(),
+        "exactly one rerun must win: {first:?} {second:?}"
+    );
+
+    let review_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM review WHERE task_id = ?")
+        .bind(seed.task_id.to_string())
+        .fetch_one(seed.db.pool())
+        .await
+        .unwrap();
+    let reviewer_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution WHERE task_id = ? AND role = 'reviewer'",
+    )
+    .bind(seed.task_id.to_string())
+    .fetch_one(seed.db.pool())
+    .await
+    .unwrap();
+    let orphan_running: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution
+         WHERE task_id = ? AND role = 'reviewer' AND status = 'running'",
+    )
+    .bind(seed.task_id.to_string())
+    .fetch_one(seed.db.pool())
+    .await
+    .unwrap();
+    let stale_lease: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution
+         WHERE task_id = ? AND role = 'reviewer' AND status != 'running'
+           AND lease_owner IS NOT NULL",
+    )
+    .bind(seed.task_id.to_string())
+    .fetch_one(seed.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(review_count, 1);
+    assert_eq!(reviewer_count, 1);
+    assert_eq!(orphan_running, 0);
+    assert_eq!(stale_lease, 0);
 }

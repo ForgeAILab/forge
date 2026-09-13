@@ -256,6 +256,9 @@ pub(super) async fn apply_adaptive_task_command(
                 };
                 let task = TaskRepo::create_in_tx(db, &mut tx, create).await?;
                 if let Some(metadata) = TaskMetadata::default().to_json() {
+                    // The child was just inserted in this transaction and is
+                    // not visible before commit, so this complete default
+                    // document cannot race an independent marker writer.
                     sqlx::query(
                         "UPDATE task SET metadata_json = ?, updated_at = ?
                          WHERE id = ? AND project_id = ?",

@@ -349,6 +349,86 @@ async fn test_retry_exhausted_blocked_metadata_takes_precedence_over_stale_error
 }
 
 #[tokio::test]
+async fn explicit_recovery_actions_take_precedence_over_blocked_metadata_in_projection() {
+    let db = Arc::new(sqlite_db().await);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task = seed_task_with_status(
+        &db,
+        &project_id,
+        crate::workflow::default_states::MERGE_FAILED,
+    )
+    .await;
+    let annotation = api_types::TaskAnnotation::Blocking(api_types::TaskBlockingAnnotation {
+        annotation_type: api_types::FailureKind::RecoveryRequired,
+        blocking_reason: "crash_recovery".to_owned(),
+        blocked_by: Some("system:crash_recovery".to_owned()),
+        blocked_at: Some(now_rfc3339()),
+        blocked_execution_id: None,
+        artifact: None,
+        message: Some("Recovered after server restart".to_owned()),
+        hook: None,
+        recovery_actions: vec![
+            api_types::RecoveryAction::Reexecute,
+            api_types::RecoveryAction::ResetToInitial,
+            api_types::RecoveryAction::CancelTask,
+        ],
+    });
+    let task = db::TaskRepo::update(
+        &*db,
+        db::UpdateTask {
+            id: task.id.clone(),
+            expected_version: task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(Some(
+                serde_json::to_string(&annotation).expect("annotation serializes"),
+            )),
+            blocked_json: Some(Some(
+                json!({
+                    "reason": "gate rejection budget exhausted: 1/1",
+                    "created_at": now_rfc3339(),
+                    "kind": "retry_exhausted"
+                })
+                .to_string(),
+            )),
+            failed_json: None,
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("task updates");
+
+    let exception = crate::task_diagnostics::derive_workflow_exception(
+        &task,
+        &crate::workflow::default_workflow::default_workflow(),
+        &[],
+        None,
+        None,
+        &std::collections::HashMap::new(),
+    )
+    .expect("workflow exception derives");
+
+    assert_eq!(exception.exception_type, "recovery_required");
+    assert_eq!(
+        exception
+            .actions
+            .iter()
+            .map(|action| action.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            api_types::RecoveryAction::Reexecute,
+            api_types::RecoveryAction::ResetToInitial,
+            api_types::RecoveryAction::CancelTask,
+        ]
+    );
+}
+
+#[tokio::test]
 async fn test_merge_gate_stale_error_annotation_offers_retry_merge_when_window_available() {
     let db = Arc::new(sqlite_db().await);
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
@@ -807,6 +887,124 @@ async fn test_resume_session_requires_the_execution_agent_to_own_its_role() {
         .expect("resume action remains visible");
     assert!(resume.enabled);
     assert_eq!(resume.disabled_reason, None);
+}
+
+#[tokio::test]
+async fn test_resume_session_rejects_stale_terminal_review_without_mutating_task() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let task =
+        seed_task_with_status(&db, &project_id, crate::workflow::default_states::REVIEW).await;
+    let agent_id = seed_agent(&db).await;
+    seed_role_assignment(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::REVIEWER,
+        Some(&agent_id),
+    )
+    .await;
+    let execution = seed_execution(
+        &db,
+        &task.id,
+        Some(&agent_id),
+        crate::workflow::default_roles::REVIEWER,
+        ExecutionStatus::Failed,
+        Some("review-session"),
+        "2026-05-02T10:00:00Z",
+    )
+    .await;
+    let review =
+        seed_failed_review(&db, &task.id, &execution.id, 1, json!({ "ci_steps": [] })).await;
+    sqlx::query("UPDATE review SET reviewer_execution_id = ? WHERE id = ?")
+        .bind(&execution.id)
+        .bind(&review.id)
+        .execute(db.pool())
+        .await
+        .expect("review binding updates");
+
+    let annotation = api_types::TaskBlockingAnnotation {
+        annotation_type: api_types::FailureKind::ExecutorFailed,
+        blocking_reason: "reviewer execution stopped".to_owned(),
+        blocked_by: Some("system".to_owned()),
+        blocked_at: Some(now_rfc3339()),
+        blocked_execution_id: Some(execution.id.clone()),
+        artifact: None,
+        message: None,
+        hook: None,
+        recovery_actions: vec![api_types::RecoveryAction::ResumeSession],
+    };
+    let task = TaskRepo::update(
+        &*db,
+        db::UpdateTask {
+            id: task.id.clone(),
+            expected_version: task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(Some(
+                serde_json::to_string(&annotation).expect("annotation serializes"),
+            )),
+            blocked_json: None,
+            failed_json: None,
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("task annotation persists");
+    let role_assignments = TaskRoleAssignmentRepo::list_by_task(&*db, &task.id)
+        .await
+        .expect("role assignments load");
+    let bound_review = ReviewRepo::get_by_id(&*db, &review.id)
+        .await
+        .expect("review reloads")
+        .expect("review exists");
+    let exception = crate::task_diagnostics::derive_workflow_exception(
+        &task,
+        &crate::workflow::default_workflow::default_workflow(),
+        &role_assignments,
+        Some(&bound_review),
+        Some(&execution),
+        &std::collections::HashMap::new(),
+    )
+    .expect("workflow exception derives");
+    let resume = exception
+        .actions
+        .iter()
+        .find(|action| action.kind == api_types::RecoveryAction::ResumeSession)
+        .expect("resume action remains visible for the stale annotation");
+    assert!(!resume.enabled);
+    assert!(resume
+        .disabled_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("Review attempt is terminal")));
+    let error = service
+        .recover_task(
+            task.id.clone(),
+            api_types::RecoveryAction::ResumeSession,
+            None,
+            None,
+        )
+        .await
+        .expect_err("terminal Review cannot be resumed");
+    assert!(matches!(error, ServiceError::InvalidOperation { .. }));
+    assert!(error.to_string().contains("Review attempt is terminal"));
+
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    assert_eq!(current.status, task.status);
+    assert_eq!(current.version, task.version);
+    assert_eq!(current.error_annotation, task.error_annotation);
+    assert!(ExecutionRepo::get_by_id(&*db, &execution.id)
+        .await
+        .expect("execution reloads")
+        .is_some_and(|row| row.status == ExecutionStatus::Failed));
 }
 
 #[tokio::test]

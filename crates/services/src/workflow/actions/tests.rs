@@ -8,7 +8,7 @@ use db::{
     CreateTaskRoleAssignment, CreateWorkspace, DaemonRepo, DaemonStatus, ExecutionRepo,
     ExecutionStatus, PageRequest, ProjectRepo, RepoRepo, ReviewRepo, ReviewStatus, SortBy,
     SortOrder, SqliteDb, TaskRepo, TaskRoleAssignmentRepo, UpdateDaemonReport, UpdateProject,
-    UpsertDaemon, WorkspaceRepo, WorkspaceStatus,
+    UpdateTaskStatus, UpsertDaemon, WorkspaceRepo, WorkspaceStatus,
 };
 use events::{EventBus, EventContext};
 use executors::{ExecutionContext, ExecutionResult, ExecutorError, TaskExecutor};
@@ -17,6 +17,7 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 use workspace::RepoCacheLockManager;
 
+use super::merge::merge_failure_result;
 use super::{
     AutoCascadeOnReviewPass, CheckRetryBudget, DependencyGate, DispatchRoleAgent, NotifyRoleHolder,
     RequireUpstreamRolesCompleted, RunCiSteps,
@@ -402,6 +403,13 @@ async fn build_role_dispatch_harness(
         seed_local_project_repo_and_task(&db, repo_dir.path(), task_id, to_state).await;
     seed_agent_with_max(&db, agent_id, max_concurrent_tasks).await;
     assign_agent_role(&db, task_id, role, agent_id).await;
+    if role == default_roles::REVIEWER {
+        configure_review_defaults(&db, &project_id, &[json!("test -d .")]).await;
+    }
+    let project = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("project reloads")
+        .expect("project exists");
 
     let workflow = Arc::new(default_workflow::default_workflow());
     let gate_config = workflow
@@ -421,6 +429,8 @@ async fn build_role_dispatch_harness(
             event_bus: Arc::new(EventBus::new(16)),
             gate_config,
             workflow,
+            project_version: Some(project.version),
+            project_workflow_definition: Some(project.workflow_definition),
             triggered_by: api_types::Actor::system(api_types::SystemComponent::Test),
             review_runner: None,
             merge_service: None,
@@ -473,6 +483,8 @@ async fn build_no_repo_dispatch_harness(
             event_bus: Arc::new(EventBus::new(16)),
             gate_config,
             workflow,
+            project_version: None,
+            project_workflow_definition: None,
             triggered_by: api_types::Actor::system(api_types::SystemComponent::Test),
             review_runner: None,
             merge_service: None,
@@ -560,6 +572,10 @@ async fn build_test_ctx(
         .iter()
         .find(|state| state.name == to_state)
         .and_then(|state| state.gate_config.clone());
+    let project = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("project reloads")
+        .expect("project exists");
 
     HookContext {
         task_id: task_id.to_owned(),
@@ -570,6 +586,8 @@ async fn build_test_ctx(
         event_bus: Arc::new(EventBus::new(16)),
         gate_config,
         workflow,
+        project_version: Some(project.version),
+        project_workflow_definition: Some(project.workflow_definition),
         triggered_by: api_types::Actor::system(api_types::SystemComponent::Test),
         review_runner: None,
         merge_service: None,
@@ -977,6 +995,246 @@ async fn run_ci_steps_pass_then_dispatches_reviewer() {
 }
 
 #[tokio::test]
+async fn review_create_rejects_stale_task_snapshot_without_inserting_attempt() {
+    let task_id = new_uuid_v4();
+    let harness =
+        build_reviewer_dispatch_harness(&task_id, "agent-review-authority-create", 1, vec!["true"])
+            .await;
+    let ctx = harness.ctx;
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let candidate_id = ctx
+        .execution_id
+        .clone()
+        .expect("implementation candidate seeded");
+    let stale_version = task.version;
+
+    TaskRepo::set_entry_barrier(
+        &*ctx.db,
+        &task.id,
+        stale_version,
+        Some(json!({ "authority_race": true }).to_string()),
+        &now_rfc3339(),
+    )
+    .await
+    .expect("competing Task update wins");
+
+    let now = now_rfc3339();
+    let error = ReviewRepo::create_with_task_authority(
+        &*ctx.db,
+        CreateReview {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            execution_id: candidate_id.clone(),
+            attempt_number: 0,
+            status: ReviewStatus::Running,
+            step_results_json: json!({ "ci_steps": [] }).to_string(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+        stale_version,
+        default_states::REVIEW,
+        ctx.project_version,
+        ctx.project_workflow_definition.as_deref(),
+        Some(&candidate_id),
+    )
+    .await
+    .expect_err("stale Task authority must reject the Review insert");
+    assert!(matches!(error, db::DbError::VersionConflict));
+    assert!(ReviewRepo::list_by_task(&*ctx.db, &task.id)
+        .await
+        .expect("reviews load")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn review_settlement_rejects_stale_project_authority_without_mutation() {
+    let task_id = new_uuid_v4();
+    let harness =
+        build_reviewer_dispatch_harness(&task_id, "agent-review-authority-settle", 1, vec!["true"])
+            .await;
+    let ctx = harness.ctx;
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let project = ProjectRepo::get_by_id(&*ctx.db, &task.project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists");
+    let candidate_id = ctx
+        .execution_id
+        .clone()
+        .expect("implementation candidate seeded");
+    let now = now_rfc3339();
+    let review = ReviewRepo::create_with_task_authority(
+        &*ctx.db,
+        CreateReview {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            execution_id: candidate_id.clone(),
+            attempt_number: 0,
+            status: ReviewStatus::Running,
+            step_results_json: json!({ "ci_steps": [] }).to_string(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+        task.version,
+        default_states::REVIEW,
+        Some(project.version),
+        Some(project.workflow_definition.as_str()),
+        Some(&candidate_id),
+    )
+    .await
+    .expect("review creates under the captured authority");
+
+    ProjectRepo::update_workflow(
+        &*ctx.db,
+        &project.id,
+        "{\"workflow\":\"edited\"}",
+        None,
+        project.version,
+        &now_rfc3339(),
+    )
+    .await
+    .expect("competing Project workflow update wins");
+
+    let error = ReviewRepo::update_status_with_review_authority_and_task_projection(
+        &*ctx.db,
+        &review.id,
+        ReviewStatus::Failed,
+        json!({ "ci_steps": [] }).to_string(),
+        Some(now_rfc3339()),
+        &now_rfc3339(),
+        task.version,
+        default_states::REVIEW,
+        Some(project.version),
+        Some(project.workflow_definition.as_str()),
+        review.status.clone(),
+        &review.updated_at,
+        &candidate_id,
+        Some(None),
+    )
+    .await
+    .expect_err("stale Project authority must reject settlement");
+    assert!(matches!(error, db::DbError::VersionConflict));
+
+    let review_after = ReviewRepo::get_by_id(&*ctx.db, &review.id)
+        .await
+        .expect("review reloads")
+        .expect("review remains present");
+    assert_eq!(review_after.status, ReviewStatus::Running);
+    let task_after = TaskRepo::get_by_id(&*ctx.db, &task.id, false)
+        .await
+        .expect("task reloads")
+        .expect("task remains present");
+    assert_eq!(task_after.version, task.version);
+    assert!(task_after.review_passed_at.is_none());
+}
+
+#[tokio::test]
+async fn review_authority_loss_cancels_after_candidate_moves_without_task_projection() {
+    let task_id = new_uuid_v4();
+    let harness =
+        build_reviewer_dispatch_harness(&task_id, "agent-review-authority-cancel", 1, Vec::new())
+            .await;
+    let ctx = harness.ctx;
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let project = ProjectRepo::get_by_id(&*ctx.db, &task.project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists");
+    let candidate_id = ctx
+        .execution_id
+        .clone()
+        .expect("implementation candidate seeded");
+    let now = now_rfc3339();
+    let review = ReviewRepo::create_with_task_authority(
+        &*ctx.db,
+        CreateReview {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            execution_id: candidate_id,
+            attempt_number: 0,
+            status: ReviewStatus::Running,
+            step_results_json: json!({ "ci_steps": [] }).to_string(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+        task.version,
+        default_states::REVIEW,
+        Some(project.version),
+        Some(project.workflow_definition.as_str()),
+        ctx.execution_id.as_deref(),
+    )
+    .await
+    .expect("review creates under the captured authority");
+    let workspace = WorkspaceRepo::get_by_task_id(&*ctx.db, &ctx.task_id)
+        .await
+        .expect("workspace loads")
+        .expect("workspace exists");
+    let replacement_candidate_id = new_uuid_v4();
+    let now = now_rfc3339();
+    ExecutionRepo::create(
+        &*ctx.db,
+        CreateExecution {
+            id: replacement_candidate_id,
+            task_id: ctx.task_id.clone(),
+            agent_id: None,
+            role: "executor".to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("replacement executor summary".to_owned()),
+            logs_path: None,
+            before_sha: workspace.before_sha.clone(),
+            after_sha: workspace.before_sha,
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace.id),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("replacement execution creates");
+
+    super::common::cancel_review_after_authority_loss(&ctx, &review, "candidate moved").await;
+
+    let cancelled = ReviewRepo::get_by_id(&*ctx.db, &review.id)
+        .await
+        .expect("review reloads")
+        .expect("review exists");
+    assert_eq!(cancelled.status, ReviewStatus::Cancelled);
+    let details: serde_json::Value =
+        serde_json::from_str(&cancelled.step_results_json).expect("review details parse");
+    assert_eq!(
+        details["execution_retry"]["status"],
+        "cancelled_authority_lost"
+    );
+    let task_after = TaskRepo::get_by_id(&*ctx.db, &task.id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    assert_eq!(task_after.version, task.version);
+    assert_eq!(task_after.review_passed_at, task.review_passed_at);
+}
+
+#[tokio::test]
 async fn merge_fix_re_review_still_requires_an_assigned_reviewer() {
     let agent_id = "agent-reviewer-ci-only";
     let mut harness = build_role_dispatch_harness(
@@ -1140,6 +1398,113 @@ async fn run_ci_steps_keeps_review_running_when_reviewer_at_capacity() {
 }
 
 #[tokio::test]
+async fn no_ci_review_attempt_starts_before_pause_and_capacity_checks() {
+    let agent_id = "agent-reviewer-no-ci-capacity";
+    let mut harness = build_role_dispatch_harness(
+        "task-review-no-ci-capacity",
+        default_states::MERGE_FAILED,
+        default_states::REVIEW,
+        default_roles::REVIEWER,
+        agent_id,
+        1,
+    )
+    .await;
+    let mut ctx = harness.ctx.clone();
+    ctx.state_config = json!({ "ci_steps": [] });
+
+    let old_candidate = seed_review(&ctx, ReviewStatus::Passed, 1).await;
+    sqlx::query("UPDATE execution SET created_at = ?, updated_at = ? WHERE id = ?")
+        .bind("2000-01-01T00:00:00Z")
+        .bind("2000-01-01T00:00:01Z")
+        .bind(&old_candidate)
+        .execute(ctx.db.pool())
+        .await
+        .expect("old candidate timestamp updates");
+    let current_candidate = seed_completed_executor_execution(&ctx).await;
+    ctx.execution_id = Some(current_candidate.clone());
+
+    let current_task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let other_task_id = "task-review-no-ci-capacity-other";
+    TaskRepo::create(
+        &*ctx.db,
+        CreateTask {
+            id: other_task_id.to_owned(),
+            project_id: current_task.project_id.clone(),
+            parent_task_id: None,
+            subtask_order: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "other review task".to_owned(),
+            description: Some("echo other".to_owned()),
+            task_type: "task".to_owned(),
+            status: default_states::REVIEW.to_owned(),
+            is_automation: false,
+            priority: 0,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("other task creates");
+    assign_agent_role(&ctx.db, other_task_id, default_roles::REVIEWER, agent_id).await;
+    seed_running_execution_for_task(&ctx.db, other_task_id, agent_id, default_roles::REVIEWER)
+        .await;
+    crate::test_support::set_test_agent_capacity(&ctx.db, agent_id, 1).await;
+
+    ProjectRepo::set_paused_at(&*ctx.db, &current_task.project_id, Some(now_rfc3339()))
+        .await
+        .expect("project pauses");
+    let paused_result = DispatchRoleAgent.execute(&ctx).await;
+    match paused_result {
+        HookResult::Skipped { reason } => assert_eq!(reason, "project paused"),
+        other => panic!("expected pause skip, got {other:?}"),
+    }
+    let paused_reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
+        .await
+        .expect("reviews load while paused");
+    assert_eq!(
+        paused_reviews.len(),
+        1,
+        "paused dispatch must not create a review attempt"
+    );
+    ProjectRepo::set_paused_at(&*ctx.db, &current_task.project_id, None)
+        .await
+        .expect("project resumes");
+
+    let dispatch_result = DispatchRoleAgent.execute(&ctx).await;
+    match dispatch_result {
+        HookResult::Skipped { reason } => assert_eq!(reason, "agent at capacity"),
+        other => panic!("expected capacity skip, got {other:?}"),
+    }
+
+    let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
+        .await
+        .expect("reviews load");
+    assert_eq!(reviews.len(), 2);
+    let current_review = reviews
+        .iter()
+        .max_by_key(|review| review.attempt_number)
+        .expect("current review exists");
+    assert_eq!(current_review.status, ReviewStatus::Running);
+    assert_eq!(current_review.execution_id, current_candidate);
+    assert!(matches!(
+        AutoCascadeOnReviewPass.execute(&ctx).await,
+        HookResult::Ok
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), harness.rx.recv())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn run_ci_steps_without_reviewer_cascades_to_merging() {
     let task_id = new_uuid_v4();
     let mut ctx = build_test_ctx(
@@ -1163,6 +1528,88 @@ async fn run_ci_steps_without_reviewer_cascades_to_merging() {
         }
         other => panic!("expected cascade to merging, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn cached_passed_review_cannot_cascade_after_its_authority_is_cleared() {
+    let task_id = new_uuid_v4();
+    let mut ctx = build_test_ctx(
+        &task_id,
+        default_states::IN_PROGRESS,
+        default_states::REVIEW,
+        None,
+    )
+    .await;
+    let execution_id = seed_completed_executor_execution(&ctx).await;
+    ctx.execution_id = Some(execution_id);
+    ctx.state_config = json!({ "ci_steps": ["test -d ."] });
+    let ci_result = RunCiSteps.execute(&ctx).await;
+    assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
+    TaskRepo::set_review_passed_at(&*ctx.db, &ctx.task_id, None, &now_rfc3339())
+        .await
+        .expect("cached review authority clears");
+
+    let cascade_result = AutoCascadeOnReviewPass.execute(&ctx).await;
+
+    assert!(
+        matches!(cascade_result, HookResult::Ok),
+        "an old passed row without current review authority must be inert: {cascade_result:?}"
+    );
+}
+
+#[tokio::test]
+async fn passed_review_defers_integration_while_project_is_paused() {
+    let task_id = new_uuid_v4();
+    let mut ctx = build_test_ctx(
+        &task_id,
+        default_states::IN_PROGRESS,
+        default_states::REVIEW,
+        None,
+    )
+    .await;
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    TaskRepo::update_status(
+        &*ctx.db,
+        UpdateTaskStatus {
+            id: task.id,
+            expected_version: task.version,
+            status: default_states::REVIEW.to_owned(),
+            assignee_id: None,
+            error_annotation: None,
+            blocked_json: None,
+            failed_json: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("task enters review");
+    let execution_id = seed_completed_executor_execution(&ctx).await;
+    ctx.execution_id = Some(execution_id);
+    ctx.state_config = json!({ "ci_steps": ["test -d ."] });
+    let ci_result = RunCiSteps.execute(&ctx).await;
+    assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
+    ProjectRepo::set_paused_at(&*ctx.db, &ctx.project_id, Some(now_rfc3339()))
+        .await
+        .expect("project pauses");
+
+    let cascade_result = AutoCascadeOnReviewPass.execute(&ctx).await;
+
+    match cascade_result {
+        HookResult::Skipped { reason } => {
+            assert_eq!(reason, "project paused; integration deferred")
+        }
+        other => panic!("expected paused integration skip, got {other:?}"),
+    }
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let deferred = crate::deferred_dispatch::paused_integration(&task)
+        .expect("paused integration marker exists");
+    assert_eq!(deferred.state, default_states::REVIEW);
 }
 
 #[tokio::test]
@@ -1468,7 +1915,7 @@ async fn dispatch_role_agent_skips_without_coder_assignment() {
 #[tokio::test]
 async fn dispatch_role_agent_emits_event_for_coder_assignment() {
     let agent_id = "agent-coder-dispatch";
-    let harness = build_initial_dispatch_harness("task-dispatch-coder", agent_id, 1).await;
+    let mut harness = build_initial_dispatch_harness("task-dispatch-coder", agent_id, 1).await;
     let ctx = harness.ctx.clone();
     let mut rx = ctx.event_bus.subscribe();
 
@@ -1497,6 +1944,301 @@ async fn dispatch_role_agent_emits_event_for_coder_assignment() {
         }
         other => panic!("unexpected event context: {other:?}"),
     }
+
+    let execution_ctx = tokio::time::timeout(std::time::Duration::from_secs(1), harness.rx.recv())
+        .await
+        .expect("executor receives dispatch")
+        .expect("executor context exists");
+    assert!(execution_ctx
+        .description
+        .contains("Forge role contract (authoritative):"));
+    assert!(execution_ctx.description.contains("Coder boundary:"));
+    assert!(execution_ctx.description.contains("test task"));
+}
+
+#[tokio::test]
+async fn dispatch_role_agent_uses_dirty_worktree_prompt_from_task_annotation() {
+    let agent_id = "agent-coder-dirty-worktree";
+    let mut harness = build_role_dispatch_harness(
+        "task-dispatch-dirty-worktree",
+        default_states::MERGING,
+        default_states::MERGE_FAILED,
+        default_roles::CODER,
+        agent_id,
+        1,
+    )
+    .await;
+    sqlx::query(
+        "UPDATE task
+         SET review_passed_at = ?, error_annotation = ?
+         WHERE id = ?",
+    )
+    .bind("2026-04-17T10:00:00Z")
+    .bind(
+        json!({
+            "type": "dirty_worktree",
+            "message": "worktree has uncommitted changes: src/lib.rs"
+        })
+        .to_string(),
+    )
+    .bind(&harness.ctx.task_id)
+    .execute(harness.ctx.db.pool())
+    .await
+    .expect("dirty worktree annotation persists");
+
+    let dispatch_result = DispatchRoleAgent.execute(&harness.ctx).await;
+    assert!(
+        matches!(dispatch_result, HookResult::Ok),
+        "{dispatch_result:?}"
+    );
+
+    let execution_ctx = tokio::time::timeout(std::time::Duration::from_secs(1), harness.rx.recv())
+        .await
+        .expect("coder executor spawned in time")
+        .expect("coder execution context received");
+    assert!(execution_ctx.description.contains("uncommitted changes"));
+    assert!(execution_ctx
+        .description
+        .contains("do not rebase or discard it"));
+    assert!(!execution_ctx
+        .description
+        .contains("Rebase your worktree branch onto the latest default branch"));
+}
+
+#[tokio::test]
+async fn review_refresh_bypasses_merge_fix_notification_and_dispatch() {
+    let agent_id = "agent-coder-review-refresh";
+    let mut harness = build_role_dispatch_harness(
+        "task-review-refresh",
+        default_states::MERGING,
+        default_states::MERGE_FAILED,
+        default_roles::CODER,
+        agent_id,
+        1,
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO transition_log
+         (id, task_id, from_state, to_state, trigger_name, triggered_by,
+          trigger_reason, hook_results_json, rejection, created_at)
+         VALUES (?, ?, ?, ?, 'retry', 'system:workflow', ?, NULL, 0, ?)",
+    )
+    .bind(new_uuid_v4())
+    .bind(&harness.ctx.task_id)
+    .bind(default_states::MERGING)
+    .bind(default_states::MERGE_FAILED)
+    .bind(format!(
+        "{} reviewed commit changed; fresh review required",
+        crate::workflow::REVIEW_REFRESH_MARKER
+    ))
+    .bind(now_rfc3339())
+    .execute(harness.ctx.db.pool())
+    .await
+    .expect("review-refresh transition inserts");
+
+    let notify = NotifyRoleHolder.execute(&harness.ctx).await;
+    assert!(matches!(
+        notify,
+        HookResult::Skipped { reason } if reason.contains("requires review")
+    ));
+
+    let dispatch = DispatchRoleAgent.execute(&harness.ctx).await;
+    assert!(matches!(
+        dispatch,
+        HookResult::Cascade { to, reason }
+            if to == default_states::REVIEW
+                && reason.contains(crate::workflow::REVIEW_REFRESH_MARKER)
+    ));
+    assert!(harness.rx.try_recv().is_err());
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(
+            &*harness.ctx.db,
+            &harness.ctx.task_id,
+            default_roles::CODER,
+        )
+        .await
+        .expect("coder execution count loads"),
+        0
+    );
+}
+
+#[test]
+fn review_refresh_bridge_does_not_reset_or_spend_merge_fix_window() {
+    let task_id = "task-merge-fix-boundary".to_owned();
+    let workflow_actor = api_types::Actor::system(api_types::SystemComponent::Workflow).display();
+    let now = now_rfc3339();
+    let rejection = |reason: &str| db::TransitionLog {
+        id: new_uuid_v4(),
+        task_id: task_id.clone(),
+        from_state: default_states::MERGING.to_owned(),
+        to_state: default_states::MERGE_FAILED.to_owned(),
+        trigger_name: Some("retry".to_owned()),
+        triggered_by: workflow_actor.clone(),
+        trigger_reason: reason.to_owned(),
+        hook_results_json: None,
+        rejection: true,
+        created_at: now.clone(),
+    };
+    let bridge = db::TransitionLog {
+        id: new_uuid_v4(),
+        task_id: task_id.clone(),
+        from_state: default_states::MERGING.to_owned(),
+        to_state: default_states::MERGE_FAILED.to_owned(),
+        trigger_name: Some("retry".to_owned()),
+        triggered_by: workflow_actor.clone(),
+        trigger_reason: format!(
+            "{} target advanced; re-review required",
+            crate::workflow::REVIEW_REFRESH_MARKER
+        ),
+        hook_results_json: None,
+        // A direct caller may supply rejection=true; the engine normalizes the
+        // durable row, and the counter remains defensive for pre-existing rows.
+        rejection: true,
+        created_at: now.clone(),
+    };
+
+    assert_eq!(
+        crate::task_diagnostics::count_gate_rejections_since_boundary(
+            &[rejection("merge conflict"), bridge],
+            default_states::MERGING,
+        ),
+        1,
+        "a review-refresh bridge must not erase or consume the prior window"
+    );
+}
+
+#[tokio::test]
+async fn coordination_root_merge_conflict_becomes_manual_repair_block() {
+    let ctx = build_test_ctx(
+        "task-root-merge-conflict",
+        default_states::MERGING,
+        default_states::MERGING,
+        None,
+    )
+    .await;
+    let now = now_rfc3339();
+    TaskRepo::create(
+        &*ctx.db,
+        CreateTask {
+            id: new_uuid_v4(),
+            project_id: ctx.project_id.clone(),
+            parent_task_id: Some(ctx.task_id.clone()),
+            subtask_order: Some(0),
+            assignee_type: None,
+            assignee_id: None,
+            title: "completed child".to_owned(),
+            description: None,
+            task_type: "task".to_owned(),
+            status: default_states::DONE.to_owned(),
+            is_automation: false,
+            priority: 0,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("coordination child creates");
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("root loads")
+        .expect("root exists");
+
+    let result = merge_failure_result(
+        &ctx,
+        &task,
+        "merge conflict in shared branch".to_owned(),
+        api_types::FailureKind::MergeConflict,
+    )
+    .await;
+
+    assert!(matches!(result, HookResult::Ok));
+    let blocked = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("blocked root loads")
+        .expect("blocked root exists");
+    assert!(blocked.blocked_json.is_some());
+    let annotation: api_types::TaskAnnotation = serde_json::from_str(
+        blocked
+            .error_annotation
+            .as_deref()
+            .expect("root has recovery annotation"),
+    )
+    .expect("recovery annotation parses");
+    let api_types::TaskAnnotation::Blocking(annotation) = annotation else {
+        panic!("coordination merge block must be typed")
+    };
+    assert_eq!(annotation.blocked_by.as_deref(), Some("coordination_root"));
+    assert_eq!(
+        annotation.recovery_actions,
+        vec![
+            api_types::RecoveryAction::RetryHook,
+            api_types::RecoveryAction::CancelTask
+        ]
+    );
+}
+
+#[tokio::test]
+async fn ordinary_merge_conflict_parks_for_manual_repair_and_invalidates_review() {
+    let ctx = build_test_ctx(
+        "task-merge-conflict",
+        default_states::MERGING,
+        default_states::MERGING,
+        None,
+    )
+    .await;
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let task = TaskRepo::set_review_passed_at_cas(
+        &*ctx.db,
+        &task.id,
+        task.version,
+        Some("2026-09-12T10:00:00Z".to_owned()),
+        &now_rfc3339(),
+    )
+    .await
+    .expect("review marker sets");
+
+    let result = merge_failure_result(
+        &ctx,
+        &task,
+        "conflict in src/lib.rs".to_owned(),
+        api_types::FailureKind::MergeConflict,
+    )
+    .await;
+
+    assert!(matches!(result, HookResult::Ok));
+    let blocked = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("blocked task loads")
+        .expect("blocked task exists");
+    assert!(blocked.blocked_json.is_some());
+    assert_eq!(blocked.review_passed_at, None);
+    let annotation: api_types::TaskAnnotation = serde_json::from_str(
+        blocked
+            .error_annotation
+            .as_deref()
+            .expect("task has recovery annotation"),
+    )
+    .expect("recovery annotation parses");
+    let api_types::TaskAnnotation::Blocking(annotation) = annotation else {
+        panic!("merge conflict block must be typed")
+    };
+    assert_eq!(
+        annotation.blocked_by.as_deref(),
+        Some("manual_workspace_repair")
+    );
+    assert_eq!(
+        annotation.recovery_actions,
+        vec![
+            api_types::RecoveryAction::RetryHook,
+            api_types::RecoveryAction::CancelTask
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1727,6 +2469,16 @@ async fn build_reviewer_dispatch_harness(
         .map(|step| serde_json::Value::String(step.to_owned()))
         .collect();
 
+    // The reviewer admission now creates the immutable review contract at
+    // execution start. Keep this direct action harness equivalent to the
+    // default workflow's merged Review state config by persisting the same CI
+    // commands in the Project defaults that the contract source reads.
+    configure_review_defaults(&db, &project_id, &ci_steps_value).await;
+    let project = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("project reloads")
+        .expect("project exists");
+
     let mut harness = DispatchHarness {
         ctx: HookContext {
             task_id: task_id.to_owned(),
@@ -1737,6 +2489,8 @@ async fn build_reviewer_dispatch_harness(
             event_bus: Arc::new(EventBus::new(16)),
             gate_config,
             workflow,
+            project_version: Some(project.version),
+            project_workflow_definition: Some(project.workflow_definition),
             triggered_by: api_types::Actor::system(api_types::SystemComponent::Test),
             review_runner: None,
             merge_service: None,
@@ -1760,6 +2514,35 @@ async fn build_reviewer_dispatch_harness(
     let execution_id = seed_completed_executor_execution(&harness.ctx).await;
     harness.ctx.execution_id = Some(execution_id);
     harness
+}
+
+async fn configure_review_defaults(
+    db: &SqliteDb,
+    project_id: &str,
+    ci_steps: &[serde_json::Value],
+) {
+    let project = ProjectRepo::get_by_id(db, project_id)
+        .await
+        .expect("project reloads")
+        .expect("project exists");
+    let mut settings: serde_json::Value =
+        serde_json::from_str(&project.settings).expect("project settings are valid JSON");
+    settings["default_review_config"] = json!({ "ci_steps": ci_steps });
+    ProjectRepo::update_at_version(
+        db,
+        UpdateProject {
+            id: project_id.to_owned(),
+            name: None,
+            settings: Some(settings.to_string()),
+            primary_repo_id: None,
+            paused_at: None,
+            updated_at: now_rfc3339(),
+        },
+        project.version,
+        None,
+    )
+    .await
+    .expect("review defaults update");
 }
 
 #[tokio::test]
@@ -1816,6 +2599,144 @@ async fn ci_passes_then_reviewer_dispatched_via_dispatch_role_agent() {
     assert_eq!(executions.items[0].status, db::ExecutionStatus::Running);
     assert_eq!(executions.items[0].agent_id.as_deref(), Some(reviewer_id));
     assert_eq!(executions.items[0].role, default_roles::REVIEWER);
+}
+
+#[tokio::test]
+async fn reviewer_follow_up_dispatch_uses_captured_review_admission() {
+    let task_id = new_uuid_v4();
+    let reviewer_id = "agent-reviewer-follow-up-admission";
+    let mut harness = build_reviewer_dispatch_harness(&task_id, reviewer_id, 2, Vec::new()).await;
+    let mut ctx = harness.ctx.clone();
+
+    let candidate_id = ctx
+        .execution_id
+        .clone()
+        .expect("implementation candidate seeded");
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let now = now_rfc3339();
+    let review = ReviewRepo::create_with_task_authority(
+        &*ctx.db,
+        CreateReview {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            execution_id: candidate_id.clone(),
+            attempt_number: 0,
+            status: ReviewStatus::Running,
+            step_results_json: json!({ "ci_steps": [] }).to_string(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+        task.version,
+        default_states::REVIEW,
+        ctx.project_version,
+        ctx.project_workflow_definition.as_deref(),
+        Some(&candidate_id),
+    )
+    .await
+    .expect("review creates under captured authority");
+    let candidate = ExecutionRepo::get_by_id(&*ctx.db, &candidate_id)
+        .await
+        .expect("candidate loads")
+        .expect("candidate exists");
+
+    let prior_reviewer_id = new_uuid_v4();
+    let now = now_rfc3339();
+    ExecutionRepo::create(
+        &*ctx.db,
+        CreateExecution {
+            id: prior_reviewer_id.clone(),
+            task_id: task.id.clone(),
+            agent_id: Some(reviewer_id.to_owned()),
+            role: default_roles::REVIEWER.to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: Some(candidate_id.clone()),
+            agent_session_id: Some("review-session".to_owned()),
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("previous reviewer turn".to_owned()),
+            logs_path: None,
+            before_sha: candidate.before_sha.clone(),
+            after_sha: candidate.after_sha.clone(),
+            error: None,
+            executor_config_snapshot_json: Some(
+                r#"{"executor_type":"shell","config":{}}"#.to_owned(),
+            ),
+            workspace_id: candidate.workspace_id.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("prior reviewer execution creates");
+    sqlx::query("UPDATE review SET reviewer_execution_id = ? WHERE id = ?")
+        .bind(&prior_reviewer_id)
+        .bind(&review.id)
+        .execute(ctx.db.pool())
+        .await
+        .expect("review attempt binds prior reviewer");
+
+    let mut workflow = default_workflow::default_workflow();
+    workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == default_states::REVIEW)
+        .expect("review state exists")
+        .dispatch
+        .as_mut()
+        .expect("review dispatch exists")
+        .execution_policy = Some(api_types::WorkflowExecutionPolicy::ResumeLatestTargetRoleThread);
+    ctx.workflow = Arc::new(workflow);
+
+    let dispatch_result = DispatchRoleAgent.execute(&ctx).await;
+    assert!(
+        matches!(dispatch_result, HookResult::Ok),
+        "reviewer follow-up dispatch should succeed: {dispatch_result:?}"
+    );
+    let execution_ctx = tokio::time::timeout(std::time::Duration::from_secs(1), harness.rx.recv())
+        .await
+        .expect("follow-up executor spawned in time")
+        .expect("follow-up execution context received");
+
+    let executions = ExecutionRepo::list_by_task_and_role(
+        &*ctx.db,
+        &ctx.task_id,
+        default_roles::REVIEWER,
+        PageRequest {
+            cursor: None,
+            limit: 10,
+            include_total: false,
+            sort_by: SortBy::CreatedAt,
+            sort_order: SortOrder::Desc,
+        },
+    )
+    .await
+    .expect("reviewer executions load");
+    assert_eq!(executions.items.len(), 2);
+    let follow_up = executions
+        .items
+        .iter()
+        .find(|execution| execution.id == execution_ctx.execution_id)
+        .expect("follow-up reviewer execution persists");
+    assert_eq!(
+        follow_up.parent_execution_id.as_deref(),
+        Some(candidate_id.as_str())
+    );
+    let review_after = ReviewRepo::get_by_id(&*ctx.db, &review.id)
+        .await
+        .expect("review reloads")
+        .expect("review exists");
+    assert_eq!(
+        review_after.reviewer_execution_id.as_deref(),
+        Some(follow_up.id.as_str())
+    );
 }
 
 #[tokio::test]
@@ -2009,6 +2930,117 @@ async fn ci_fails_reviewer_not_dispatched_cascade_handles_bounce() {
             .expect("reviewer execution count"),
         0,
         "no reviewer execution should be created when CI fails"
+    );
+}
+
+#[tokio::test]
+async fn reviewer_dispatch_creates_fresh_attempt_after_prior_failure() {
+    let task_id = new_uuid_v4();
+    let reviewer_id = "agent-reviewer-fresh-attempt";
+    let mut harness = build_reviewer_dispatch_harness(&task_id, reviewer_id, 2, Vec::new()).await;
+    let mut ctx = harness.ctx.clone();
+
+    let failed_candidate_id = ctx
+        .execution_id
+        .clone()
+        .expect("prior review candidate is present");
+    let task = TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+        .await
+        .expect("task loads")
+        .expect("task exists");
+    let project = ProjectRepo::get_by_id(&*ctx.db, &task.project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists");
+    let now = now_rfc3339();
+    ReviewRepo::create_with_task_authority(
+        &*ctx.db,
+        CreateReview {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            execution_id: failed_candidate_id.clone(),
+            attempt_number: 0,
+            status: ReviewStatus::Failed,
+            step_results_json: json!({ "ci_steps": [] }).to_string(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+        task.version,
+        default_states::REVIEW,
+        Some(project.version),
+        Some(project.workflow_definition.as_str()),
+        Some(failed_candidate_id.as_str()),
+    )
+    .await
+    .expect("prior failed review creates");
+
+    // A remediation run supplies a new implementation candidate. The old
+    // Failed Review remains immutable; reviewer dispatch must create a new
+    // Running attempt bound to this candidate before launching the reviewer.
+    let workspace = WorkspaceRepo::get_by_task_id(&*ctx.db, &ctx.task_id)
+        .await
+        .expect("workspace loads")
+        .expect("workspace exists");
+    let replacement_candidate_id = new_uuid_v4();
+    let now = now_rfc3339();
+    ExecutionRepo::create(
+        &*ctx.db,
+        CreateExecution {
+            id: replacement_candidate_id.clone(),
+            task_id: ctx.task_id.clone(),
+            agent_id: None,
+            role: "executor".to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: None,
+            resume_policy: None,
+            stopped_at: None,
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some("replacement executor summary".to_owned()),
+            logs_path: None,
+            before_sha: workspace.before_sha.clone(),
+            after_sha: workspace.before_sha.clone(),
+            error: None,
+            executor_config_snapshot_json: None,
+            workspace_id: Some(workspace.id),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("replacement execution creates");
+    ctx.execution_id = Some(replacement_candidate_id.clone());
+    let dispatch_result = DispatchRoleAgent.execute(&ctx).await;
+    assert!(
+        matches!(dispatch_result, HookResult::Ok),
+        "fresh reviewer attempt should dispatch: {dispatch_result:?}"
+    );
+    let _execution_ctx = tokio::time::timeout(std::time::Duration::from_secs(1), harness.rx.recv())
+        .await
+        .expect("replacement reviewer spawned in time")
+        .expect("replacement reviewer context received");
+
+    let reviews = ReviewRepo::list_by_task(&*ctx.db, &ctx.task_id)
+        .await
+        .expect("reviews load");
+    assert_eq!(reviews.len(), 2);
+    let failed = reviews
+        .iter()
+        .find(|review| review.execution_id == failed_candidate_id)
+        .expect("failed review remains present");
+    assert_eq!(failed.status, ReviewStatus::Failed);
+    let running = reviews
+        .iter()
+        .find(|review| review.execution_id == replacement_candidate_id)
+        .expect("fresh review binds replacement candidate");
+    assert_eq!(running.status, ReviewStatus::Running);
+    assert!(
+        running.attempt_number > failed.attempt_number,
+        "fresh reviewer attempt must advance the terminal review attempt"
     );
 }
 

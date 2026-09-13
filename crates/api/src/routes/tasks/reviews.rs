@@ -1,4 +1,5 @@
 use super::*;
+use crate::routes::reviews::review_response_server_checked;
 
 pub async fn trigger_review(
     State(state): State<AppState>,
@@ -18,7 +19,7 @@ pub async fn trigger_review(
     let (task, review) = state.task_service.rerun_review(task_id).await?;
     Ok(Json(TransitionTaskResponse {
         task: task_response(&state.db, task).await?,
-        review: Some(review_response(review)),
+        review: Some(review_response_server_checked(review)?),
     }))
 }
 
@@ -27,7 +28,11 @@ pub async fn list_reviews(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Vec<api_types::ReviewResponse>>> {
     let reviews = db::ReviewRepo::list_by_task(&*state.db, &id).await?;
-    Ok(Json(reviews.into_iter().map(review_response).collect()))
+    let responses = reviews
+        .into_iter()
+        .map(review_response_server_checked)
+        .collect::<ApiResult<Vec<_>>>()?;
+    Ok(Json(responses))
 }
 
 pub async fn approve_review(
@@ -41,7 +46,7 @@ pub async fn approve_review(
         .map_err(map_manual_review_error)?;
     Ok(Json(ReviewDecisionResponse {
         task: task_response(&state.db, task).await?,
-        review: review_response(review),
+        review: review_response_server_checked(review)?,
     }))
 }
 
@@ -57,6 +62,6 @@ pub async fn reject_review(
         .map_err(map_manual_review_error)?;
     Ok(Json(ReviewDecisionResponse {
         task: task_response(&state.db, task).await?,
-        review: review_response(review),
+        review: review_response_server_checked(review)?,
     }))
 }

@@ -140,6 +140,75 @@ async fn repo_with_local_path(db: &SqliteDb, project_id: &str, local_path: Optio
 }
 
 #[tokio::test]
+async fn attach_primary_repository_wakes_parked_tasks_at_the_command_boundary() {
+    let db = database().await;
+    let project = project(&db, "setup wake boundary").await;
+    let repo_id = repo(&db, &project.id).await;
+    let task_id = new_uuid_v4();
+    let now = now_rfc3339();
+    TaskRepo::create(
+        &*db,
+        CreateTask {
+            id: task_id.clone(),
+            project_id: project.id.clone(),
+            parent_task_id: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "parked setup task".to_owned(),
+            description: None,
+            task_type: "task".to_owned(),
+            status: "todo".to_owned(),
+            is_automation: false,
+            priority: 0,
+            subtask_order: None,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("task creates");
+    sqlx::query("UPDATE task SET metadata_json = ? WHERE id = ?")
+        .bind(r#"{"dispatch_disposition":{"capability":"worker"},"deferred_dispatch":{"target_state":"todo"}}"#)
+        .bind(&task_id)
+        .execute(db.pool())
+        .await
+        .expect("parked markers seed");
+
+    let response = ProjectExecutionSetupService::new(Arc::clone(&db))
+        .attach_primary_repository(
+            &project.id,
+            &AttachPrimaryRepositoryRequest {
+                repo_id,
+                expected_project_version: project.version,
+                idempotency_key: "setup-wake-boundary".to_owned(),
+            },
+            OWNER_ID,
+        )
+        .await
+        .expect("repository attachment commits");
+    assert_eq!(response.execution_setup_state, ExecutionSetupState::Ready);
+
+    let metadata: Option<String> =
+        sqlx::query_scalar("SELECT metadata_json FROM task WHERE id = ?")
+            .bind(&task_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("task metadata reads");
+    let metadata = metadata.map(|metadata| {
+        serde_json::from_str::<serde_json::Value>(&metadata).expect("metadata parses")
+    });
+    assert!(metadata
+        .as_ref()
+        .is_none_or(|metadata| metadata.get("dispatch_disposition").is_none()));
+    assert!(metadata
+        .as_ref()
+        .is_none_or(|metadata| metadata.get("deferred_dispatch").is_none()));
+}
+
+#[tokio::test]
 async fn setup_actions_replay_exactly_and_reconcile_ready_metadata() {
     let db = database().await;
     let project = project(&db, "setup action replay").await;

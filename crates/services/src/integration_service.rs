@@ -7,7 +7,8 @@ use crate::{
 use db::{
     new_uuid_v4, now_rfc3339, AssigneeKind, CreateProjectIntegration, CreateTaskExternalLink,
     CreateTaskRoleAssignment, ExternalLinkRepo, IntegrationPlatform, IntegrationRepo,
-    ProjectIntegration, ProjectRepo, SqliteDb, TaskRoleAssignmentRepo, UpdateProjectIntegration,
+    ProjectIntegration, ProjectRepo, SqliteDb, TaskRepo, TaskRoleAssignmentRepo,
+    UpdateProjectIntegration,
 };
 use events::EventBus;
 use std::{str::FromStr, sync::Arc};
@@ -297,19 +298,35 @@ async fn assign_default_coder(
     let assignee_type =
         AssigneeKind::from_str(assignee_type).map_err(ServiceError::invalid_operation)?;
     let now = now_rfc3339();
-    TaskRoleAssignmentRepo::assign(
-        db,
-        CreateTaskRoleAssignment {
-            id: new_uuid_v4(),
-            task_id: task_id.to_owned(),
-            role_name: "coder".to_owned(),
-            assignee_type: Some(assignee_type),
-            assignee_id: Some(assignee_id.to_owned()),
-            created_at: now.clone(),
-            updated_at: now,
-        },
-    )
-    .await?;
+    let task = TaskRepo::get_by_id(db, task_id, false)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+    let previous = TaskRoleAssignmentRepo::get_by_task_and_role(db, task_id, "coder").await?;
+    let input = CreateTaskRoleAssignment {
+        id: new_uuid_v4(),
+        task_id: task_id.to_owned(),
+        role_name: "coder".to_owned(),
+        assignee_type: Some(assignee_type),
+        assignee_id: Some(assignee_id.to_owned()),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    if previous.as_ref().is_some_and(|previous| {
+        previous.assignee_type == input.assignee_type && previous.assignee_id == input.assignee_id
+    }) {
+        let previous = previous.as_ref().expect("same-assignment branch has a row");
+        TaskRoleAssignmentRepo::assign_if_unchanged(db, input, Some(previous)).await?;
+    } else {
+        TaskRoleAssignmentRepo::assign_and_clear_review_authority(
+            db,
+            input,
+            previous.as_ref(),
+            task.version,
+            &now,
+        )
+        .await?;
+    }
+    crate::wake_task_dispatch(db, task_id, "integration default coder assignment changed").await?;
     Ok(())
 }
 

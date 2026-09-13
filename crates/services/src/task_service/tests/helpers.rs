@@ -309,7 +309,7 @@ pub(super) async fn seed_passed_review(
     attempt_number: i64,
 ) -> Review {
     let now = now_rfc3339();
-    ReviewRepo::create(
+    let review = ReviewRepo::create(
         db,
         CreateReview {
             id: new_uuid_v4(),
@@ -324,7 +324,14 @@ pub(super) async fn seed_passed_review(
         },
     )
     .await
-    .expect("passed review creates")
+    .expect("passed review creates");
+    // A review that really passed also grants the Task review authority; a
+    // passed row without it is deliberately inert, so a fixture that omits it
+    // is not modelling a passed review at all.
+    TaskRepo::set_review_passed_at(db, task_id, Some(now_rfc3339()), &now_rfc3339())
+        .await
+        .expect("review authority records");
+    review
 }
 
 pub(super) async fn seed_review_rejection_log(

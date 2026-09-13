@@ -40,6 +40,22 @@ pub enum DbError {
     #[error("agent at capacity")]
     AgentAtCapacity,
 
+    #[error("agent {agent_id} is paused")]
+    AgentPaused { agent_id: String },
+
+    #[error("project {project_id} is paused")]
+    ProjectPaused { project_id: String },
+
+    #[error("repo {repo_id} has active executions or workspace leases")]
+    RepoInUse { repo_id: String },
+
+    #[error("project {project_id} has {running_executions} running execution(s) and {active_leases} active workspace lease(s)")]
+    ProjectInUse {
+        project_id: String,
+        running_executions: i64,
+        active_leases: i64,
+    },
+
     #[error("dependency gate")]
     DependencyGate,
 
@@ -51,6 +67,12 @@ pub enum DbError {
 
     #[error("check constraint failed: {0}")]
     Check(String),
+
+    #[error("review {review_id} has corrupt persisted step_results_json: {reason}")]
+    ReviewDetailsCorrupt { review_id: String, reason: String },
+
+    #[error("{scope} execution already running: {execution_id}")]
+    ExecutionAlreadyRunning { scope: String, execution_id: String },
 
     #[error("failed to read migration directory {path}: {source}")]
     ReadMigrationDir { path: PathBuf, source: io::Error },

@@ -13,6 +13,7 @@ use super::transition::{
     clear_manual_review_awaiting_metadata, should_clear_review_passed_at,
     should_clear_transient_error_annotation,
 };
+use crate::workflow::engine::WorkflowAuthority;
 
 impl TaskService {
     pub async fn move_task(
@@ -114,7 +115,14 @@ impl TaskService {
 
         if source_task.status == request.target_status {
             return self
-                .reorder_within_column(source_task, request, target_column_statuses, &workflow)
+                .reorder_within_column(
+                    source_task,
+                    request,
+                    target_column_statuses,
+                    &workflow,
+                    project.version,
+                    project.workflow_definition.clone(),
+                )
                 .await;
         }
 
@@ -171,7 +179,7 @@ impl TaskService {
             repo_cache_locks: self.repo_cache_locks.clone(),
         };
         let engine_result = engine
-            .move_task(
+            .move_task_with_authority(
                 &task_id,
                 &request.target_status,
                 request.task_version,
@@ -186,6 +194,10 @@ impl TaskService {
                     before_id: request.before_id.clone(),
                     after_id: request.after_id.clone(),
                 },
+                Some(WorkflowAuthority {
+                    project_version: project.version,
+                    workflow_definition: project.workflow_definition.clone(),
+                }),
             )
             .await?;
         let direct_result = match engine_result.board_move {
@@ -211,8 +223,14 @@ impl TaskService {
             });
         }
         if should_clear_review_passed_at(&workflow, &previous_status, &task.status, false, &actor) {
-            task =
-                TaskRepo::set_review_passed_at(&*self.db, &task.id, None, &now_rfc3339()).await?;
+            task = TaskRepo::set_review_passed_at_cas(
+                &*self.db,
+                &task.id,
+                task.version,
+                None,
+                &now_rfc3339(),
+            )
+            .await?;
         }
         if previous_status == default_states::PLANNING && task.status != default_states::PLANNING {
             task = super::execution::set_planning_awaiting_review_metadata(
@@ -281,6 +299,8 @@ impl TaskService {
         request: MoveTaskRequest,
         target_column_statuses: Vec<String>,
         workflow: &api_types::WorkflowDefinition,
+        expected_project_version: i64,
+        expected_workflow_definition: String,
     ) -> Result<MoveTaskResult> {
         let workflow_snapshot = crate::workflow::transition_event::transition_workflow_snapshot(
             &task,
@@ -307,6 +327,8 @@ impl TaskService {
                 triggered_by: Actor::user(UserActionSource::BoardDrag).display(),
                 trigger_reason: "board reorder".to_owned(),
                 rejection: false,
+                expected_project_version: Some(expected_project_version),
+                expected_workflow_definition: Some(expected_workflow_definition),
                 updated_at: now_rfc3339(),
             },
         )

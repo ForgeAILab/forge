@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
-pub const REVIEW_CONFORMANCE_POLICY: &str = "forge.review-conformance/2";
+pub const REVIEW_CONFORMANCE_POLICY: &str = "forge.review-conformance/3";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[ts(export)]
@@ -62,6 +62,10 @@ pub struct ReviewContract {
     pub policy: String,
     pub commit_sha: String,
     pub base_sha: String,
+    /// Exact repository-relative paths changed by `base_sha..commit_sha`.
+    /// Blocking file evidence must be attributable to this candidate delta.
+    #[serde(default)]
+    pub candidate_changed_paths: Vec<String>,
     pub context: ReviewGoverningContext,
     /// Results Forge recorded before dispatching the reviewer. These are
     /// immutable reviewer inputs; conformance admission reruns required checks
