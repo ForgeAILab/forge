@@ -237,7 +237,8 @@ impl TaskExecutor for AdapterExecutor {
     }
 
     async fn execute(&self, mut ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
-        let (kind, config) = resolve_context_config(&ctx.agent_config)?;
+        let runtime_scope = ctx.agent_config.clone();
+        let (kind, config) = resolve_context_config(&runtime_scope)?;
         let adapter = self.registry.get(&kind).ok_or_else(|| {
             ExecutorError::Other(format!("No adapter registered for executor type: {kind}"))
         })?;
@@ -249,6 +250,7 @@ impl TaskExecutor for AdapterExecutor {
             kind,
             config: ctx.agent_config.clone(),
         };
+        apply_runtime_scope(&runtime_scope, &mut ctx.agent_config);
         let admission = self
             .provider_admissions
             .lock()
@@ -585,6 +587,7 @@ impl TaskExecutor for FallbackExecutor {
 
                 let mut candidate_ctx = ctx.clone();
                 candidate_ctx.agent_config = candidate.config.clone();
+                apply_runtime_scope(&ctx.agent_config, &mut candidate_ctx.agent_config);
                 let admission = self
                     .provider_admissions
                     .lock()
@@ -775,6 +778,18 @@ fn resolve_context_config(
     let config = object.get("config").unwrap_or(agent_config);
     let config = resolve_config_value(kind.clone(), config, &ExecutionOverrides::default())?;
     Ok((kind, config))
+}
+
+/// Carry server-derived execution authority through typed config
+/// normalization and fallback selection without persisting it as authored
+/// profile configuration or folding it into candidate identity.
+fn apply_runtime_scope(source: &serde_json::Value, target: &mut serde_json::Value) {
+    if crate::is_worktree_read_only(source) {
+        crate::mark_worktree_read_only(target);
+    }
+    if let Some(role) = crate::task_role(source) {
+        crate::mark_task_role(target, role);
+    }
 }
 
 #[cfg(test)]
@@ -976,6 +991,31 @@ mod tests {
         assert_eq!(
             codex_config.command_overrides.additional_params.as_deref(),
             Some(["--verbose".to_owned()].as_slice())
+        );
+    }
+
+    #[test]
+    fn runtime_scope_survives_typed_candidate_normalization() {
+        let mut snapshot = serde_json::json!({
+            "executor_type": "codex",
+            "config": {
+                "model": "gpt-5-codex",
+                "permission_policy": "yolo"
+            }
+        });
+        crate::mark_task_role(&mut snapshot, "worker");
+        crate::mark_worktree_read_only(&mut snapshot);
+        let (kind, mut candidate) = resolve_context_config(&snapshot).expect("snapshot resolves");
+        let candidate_key_before = crate::candidate_key(&kind, &candidate);
+
+        apply_runtime_scope(&snapshot, &mut candidate);
+
+        assert_eq!(crate::task_role(&candidate), Some("worker"));
+        assert!(crate::is_worktree_read_only(&candidate));
+        assert_eq!(
+            crate::candidate_key_from_snapshot(&kind, &candidate),
+            candidate_key_before,
+            "runtime authority must not change durable candidate identity"
         );
     }
 

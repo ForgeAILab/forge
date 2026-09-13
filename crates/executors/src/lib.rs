@@ -41,6 +41,28 @@ const READ_ONLY_WORKTREE_KEY: &str = "_forge_read_only_worktree";
 /// use the same key.
 pub const TASK_ROLE_CONFIG_KEY: &str = "_forge_task_role";
 
+/// Stamp the server-selected Task role onto an in-memory executor config.
+///
+/// This is runtime authority, not authored profile configuration. Callers
+/// must add it after loading the immutable execution snapshot so a profile
+/// cannot grant itself a different role or execution boundary.
+pub fn mark_task_role(config: &mut serde_json::Value, role: &str) {
+    if let Some(object) = config.as_object_mut() {
+        object.insert(
+            TASK_ROLE_CONFIG_KEY.to_owned(),
+            serde_json::Value::String(role.to_owned()),
+        );
+    }
+}
+
+/// Return the server-selected Task role carried by an in-memory config.
+pub fn task_role(config: &serde_json::Value) -> Option<&str> {
+    config
+        .get(TASK_ROLE_CONFIG_KEY)
+        .and_then(serde_json::Value::as_str)
+        .filter(|role| !role.trim().is_empty())
+}
+
 /// Mark an executor config so the runtime restores the worktree after execution.
 pub fn mark_worktree_read_only(config: &mut serde_json::Value) {
     if let Some(object) = config.as_object_mut() {

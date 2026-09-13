@@ -16,10 +16,7 @@ use executors::{
     ExecutionOutcome, ExecutorError, LogKind, LogStream, LogWriter, UsageCounters, UsageReport,
 };
 use serde_json::{Value, json};
-use std::{
-    path::{Component, Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 use tokio::{
     process::{ChildStdin, ChildStdout},
     sync::{Mutex as AsyncMutex, mpsc},
@@ -30,7 +27,6 @@ use tokio_util::sync::CancellationToken;
 pub struct CodexClient {
     rpc: JsonRpcPeer,
     messages: mpsc::Receiver<ServerMessage>,
-    worktree_path: PathBuf,
     cancel: CancellationToken,
     chat_tools: Option<Arc<dyn ChatToolHandler>>,
     suppress_next_response: bool,
@@ -69,7 +65,7 @@ impl CodexClient {
     pub fn spawn_with_chat_tools(
         stdin: ChildStdin,
         stdout: ChildStdout,
-        worktree_path: impl Into<PathBuf>,
+        _worktree_path: impl Into<PathBuf>,
         cancel: CancellationToken,
         chat_tools: Option<Arc<dyn ChatToolHandler>>,
     ) -> Self {
@@ -77,7 +73,6 @@ impl CodexClient {
         Self {
             rpc,
             messages,
-            worktree_path: normalize_path(worktree_path.into()),
             cancel,
             chat_tools,
             suppress_next_response: false,
@@ -433,12 +428,12 @@ impl CodexClient {
         writer: &Arc<AsyncMutex<LogWriter>>,
         kind: ApprovalRequestKind,
     ) -> Result<(), ExecutorError> {
-        let allowed = self.chat_tools.is_none() && self.approval_allowed(&params);
-        let decision = if allowed {
-            ApprovalDecision::Accept
-        } else {
-            ApprovalDecision::Decline
-        };
+        // Forge has no user-facing bridge for Codex's built-in command/file
+        // approval prompts. Auto-accepting here would turn a request to leave
+        // the Task sandbox into host authority, so every such request is
+        // fail-closed. Commands that fit the declared sandbox run without
+        // reaching this callback.
+        let decision = ApprovalDecision::Decline;
         match kind {
             ApprovalRequestKind::Command => {
                 self.rpc
@@ -462,42 +457,25 @@ impl CodexClient {
             }
         }
 
-        if !allowed {
-            write_log(
-                writer,
-                LogKind::ToolResult,
-                json!({
-                    "type": "approval_denied",
-                    "rationale": if self.chat_tools.is_some() {
-                        "builtin command/file approvals are disabled for chat turns"
-                    } else {
-                        "requested path is outside the worktree"
-                    },
-                    "params": params,
-                }),
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
-    fn approval_allowed(&self, params: &Value) -> bool {
-        let mut paths = Vec::new();
-        collect_path_candidates(params, &mut paths);
-        paths
-            .iter()
-            .filter(|path| !path.trim().is_empty())
-            .all(|path| self.path_inside_worktree(path))
-    }
-
-    fn path_inside_worktree(&self, path: &str) -> bool {
-        let candidate = Path::new(path);
-        let absolute = if candidate.is_absolute() {
-            normalize_path(candidate.to_path_buf())
-        } else {
-            normalize_path(self.worktree_path.join(candidate))
-        };
-        absolute.starts_with(&self.worktree_path)
+        write_log(
+            writer,
+            LogKind::ToolResult,
+            json!({
+                "type": "approval_response",
+                "request_kind": match kind {
+                    ApprovalRequestKind::Command => "command",
+                    ApprovalRequestKind::File => "file",
+                },
+                "decision": "decline",
+                "rationale": if self.chat_tools.is_some() {
+                    "builtin command/file approvals are disabled for chat turns"
+                } else {
+                    "managed executions cannot escalate beyond the declared Task sandbox"
+                },
+                "params": params,
+            }),
+        )
+        .await
     }
 }
 
@@ -737,44 +715,6 @@ pub(crate) fn append_usage_report(reports: &mut Vec<UsageReport>, next: UsageRep
     reports.push(next);
 }
 
-fn collect_path_candidates(value: &Value, output: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            for (key, value) in map {
-                let lower = key.to_ascii_lowercase();
-                if matches!(lower.as_str(), "path" | "cwd" | "workingdirectory")
-                    && let Some(path) = value.as_str()
-                {
-                    output.push(path.to_owned());
-                }
-                collect_path_candidates(value, output);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                collect_path_candidates(item, output);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn normalize_path(path: PathBuf) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::Normal(part) => normalized.push(part),
-        }
-    }
-    normalized
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -943,6 +883,73 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("forge_echo")
+        );
+
+        cancel.cancel();
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+
+    #[tokio::test]
+    async fn builtin_approvals_fail_closed_with_or_without_path_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let log_path = dir.path().join("codex.jsonl");
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("cat starts");
+        let stdin = child.stdin.take().expect("cat stdin");
+        let stdout = child.stdout.take().expect("cat stdout");
+        let cancel = CancellationToken::new();
+        let mut client = CodexClient::spawn(stdin, stdout, dir.path(), cancel.clone());
+        let writer = Arc::new(AsyncMutex::new(LogWriter::new(
+            &log_path,
+            "execution-id".to_owned(),
+            1024 * 1024,
+        )));
+
+        for (id, method, params) in [
+            (
+                11,
+                "item/commandExecution/requestApproval",
+                json!({"command": "git merge task/unsafe"}),
+            ),
+            (
+                12,
+                "item/fileChange/requestApproval",
+                json!({"path": dir.path().join("inside.txt")}),
+            ),
+        ] {
+            client
+                .handle_server_request(RequestId::Number(id), method, params, &writer)
+                .await
+                .expect("approval request handled");
+            let message =
+                tokio::time::timeout(std::time::Duration::from_secs(1), client.messages.recv())
+                    .await
+                    .expect("response arrives")
+                    .expect("response message");
+            let ServerMessage::Response(raw) = message else {
+                panic!("expected JSON-RPC response, got another message");
+            };
+            assert_eq!(raw["id"], id);
+            assert_eq!(raw["result"]["decision"], "decline");
+        }
+
+        let entries = executors::LogReader::read(&log_path, 0, 20)
+            .await
+            .expect("logs read")
+            .entries;
+        let decisions: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.payload["type"] == "approval_response")
+            .collect();
+        assert_eq!(decisions.len(), 2);
+        assert!(
+            decisions
+                .iter()
+                .all(|entry| entry.payload["decision"] == "decline")
         );
 
         cancel.cancel();

@@ -1,0 +1,8 @@
+prefix_rule(pattern=["git", "-C"], decision="forbidden", justification="Run Git only from the Forge Task worktree.")
+prefix_rule(pattern=["git", "merge"], decision="forbidden", justification="Forge integrates only after accepted review.")
+prefix_rule(pattern=["git", "rebase"], decision="forbidden", justification="Forge owns target-branch integration and rebase.")
+prefix_rule(pattern=["git", "cherry-pick"], decision="forbidden", justification="Forge owns target-branch integration.")
+prefix_rule(pattern=["git", "push"], decision="forbidden", justification="Forge owns publication after review.")
+prefix_rule(pattern=["git", "worktree"], decision="forbidden", justification="Use only the Task worktree Forge provided.")
+prefix_rule(pattern=["git", "switch"], decision="forbidden", justification="Stay on the Forge Task branch.")
+prefix_rule(pattern=["git", "checkout"], decision="forbidden", justification="Stay on the Forge Task branch.")

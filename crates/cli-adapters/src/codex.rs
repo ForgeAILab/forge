@@ -29,6 +29,10 @@ use tokio_util::sync::CancellationToken;
 const DEFAULT_CODEX_VERSION: &str = "0.154.0";
 const DEFAULT_MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
 pub(crate) const CODEX_SYSTEM_ERROR_FALLBACK: &str = "codex thread entered systemError status";
+const MANAGED_CONFIG: &str = "suppress_unstable_features_warning = true\n";
+const MANAGED_WRITE_DELIVERY_INSTRUCTIONS: &str = "Forge-managed Codex Task delivery (authoritative): do not stage or commit changes. Leave completed file changes in the Task worktree. Forge finalizes them into the Task-branch commit outside this sandbox. Never request broader filesystem access to reach linked Git metadata.";
+const MANAGED_RULES_FILE: &str = "forge-task-boundary.rules";
+const MANAGED_RULES: &str = include_str!("../tests/fixtures/forge-task-boundary.rules");
 
 const CODEX_MODELS: &[&str] = &[
     "gpt-6-astra",
@@ -119,7 +123,10 @@ impl CodexAdapter {
         serde_json::from_value(ctx.agent_config.clone()).unwrap_or_default()
     }
 
-    fn build_command(config: &CodexConfig) -> tokio::process::Command {
+    fn build_command(
+        config: &CodexConfig,
+        managed_codex_home: Option<&Path>,
+    ) -> tokio::process::Command {
         let overrides = &config.command_overrides;
         let builder = crate::command::CommandBuilder::new("npx")
             .default_args(vec![
@@ -137,12 +144,30 @@ impl CodexAdapter {
             .env("NODE_NO_WARNINGS", "1")
             .env("NO_COLOR", "1")
             .env("RUST_LOG", "error");
+        // Workflow Tasks run with a Forge-owned Codex configuration root.
+        // Apply this after profile command overrides so an authored profile
+        // cannot reintroduce ambient rules, hooks, plugins, or connectors.
+        if let Some(home) = managed_codex_home {
+            let scratch = home.join("task-scratch");
+            cmd.env("CODEX_HOME", home)
+                .env("TMPDIR", &scratch)
+                .env("TMP", &scratch)
+                .env("TEMP", &scratch);
+        }
         cmd
     }
 
-    fn thread_start_params(config: &CodexConfig, worktree_path: &str) -> ThreadStartParams {
+    fn thread_start_params(
+        config: &CodexConfig,
+        worktree_path: &str,
+        runtime_scope: &Value,
+        mcp_server_names: &[String],
+        managed_scratch_root: Option<&Path>,
+    ) -> ThreadStartParams {
         let permission = config.permission_policy.clone().unwrap_or_default();
         let is_yolo = matches!(permission, PermissionPolicy::Yolo);
+        let managed_task = executors::task_role(runtime_scope).is_some();
+        let managed_read_only = executors::is_worktree_read_only(runtime_scope);
         let fallback_sandbox = match permission {
             PermissionPolicy::Yolo => SandboxMode::DangerFullAccess,
             PermissionPolicy::Auto | PermissionPolicy::Supervised => SandboxMode::WorkspaceWrite,
@@ -166,23 +191,96 @@ impl CodexAdapter {
                 Value::String(summary.clone()),
             );
         }
-        if let Some(profile) = &config.profile {
+        if let Some(profile) = &config.profile
+            && !managed_task
+        {
             config_overrides.insert("profile".to_owned(), Value::String(profile.clone()));
         }
         if let Some(include) = config.include_apply_patch_tool {
             config_overrides.insert("include_apply_patch_tool".to_owned(), Value::Bool(include));
         }
+        if managed_task {
+            // Task execution is a Forge-owned runtime boundary.  An isolated
+            // CODEX_HOME removes filesystem-backed configuration, while these
+            // per-thread overrides also suppress host-discovered skills and
+            // account/plugin tools injected independently of that directory.
+            config_overrides.insert(
+                "features".to_owned(),
+                json!({
+                    "apps": false,
+                    "plugins": false,
+                    "remote_plugin": false,
+                    "plugin_sharing": false,
+                    "hooks": false,
+                    "skill_search": false,
+                    "skip_host_skill_discovery": true,
+                    "tool_suggest": false,
+                    "browser_use": false,
+                    "computer_use": false,
+                    "enable_mcp_apps": false,
+                }),
+            );
+            config_overrides.insert(
+                "skills".to_owned(),
+                json!({
+                    "include_instructions": false,
+                    "config": [],
+                }),
+            );
+            config_overrides.insert(
+                "web_search".to_owned(),
+                Value::String("disabled".to_owned()),
+            );
+            config_overrides.insert(
+                "mcp_servers".to_owned(),
+                Value::Object(
+                    mcp_server_names
+                        .iter()
+                        .map(|name| (name.clone(), json!({ "enabled": false })))
+                        .collect(),
+                ),
+            );
+            if !managed_read_only {
+                let writable_roots = managed_scratch_root
+                    .map(|path| vec![Value::String(path.to_string_lossy().into_owned())])
+                    .unwrap_or_default();
+                config_overrides.insert(
+                    "sandbox_workspace_write".to_owned(),
+                    json!({
+                        "network_access": false,
+                        "exclude_slash_tmp": true,
+                        "exclude_tmpdir_env_var": true,
+                        "writable_roots": writable_roots,
+                    }),
+                );
+            }
+        }
+
+        let developer_instructions = if managed_task && !managed_read_only {
+            Some(match config.developer_instructions.as_deref() {
+                Some(existing) if !existing.trim().is_empty() => {
+                    format!("{existing}\n\n{MANAGED_WRITE_DELIVERY_INSTRUCTIONS}")
+                }
+                _ => MANAGED_WRITE_DELIVERY_INSTRUCTIONS.to_owned(),
+            })
+        } else {
+            config.developer_instructions.clone()
+        };
 
         ThreadStartParams {
             model: config.model.clone(),
             model_provider: None,
             cwd: Some(worktree_path.to_owned()),
-            approval_policy: Some(if is_yolo {
+            approval_policy: Some(if managed_task || is_yolo {
                 AskForApproval::Never
             } else {
                 AskForApproval::from_config(config.ask_for_approval.as_deref(), fallback_approval)
             }),
-            sandbox: Some(if is_yolo {
+            sandbox: Some(if managed_read_only {
+                SandboxMode::ReadOnly
+            } else if managed_task {
+                SandboxMode::WorkspaceWrite
+            } else if is_yolo {
                 SandboxMode::DangerFullAccess
             } else {
                 SandboxMode::from_config(config.sandbox.as_deref(), fallback_sandbox)
@@ -194,7 +292,7 @@ impl CodexAdapter {
                 .base_instructions
                 .clone()
                 .or_else(|| config.prompt_template.clone()),
-            developer_instructions: config.developer_instructions.clone(),
+            developer_instructions,
             service_tier: None,
         }
     }
@@ -202,10 +300,11 @@ impl CodexAdapter {
     fn chat_thread_start_params(
         config: &CodexConfig,
         worktree_path: &str,
+        runtime_scope: &Value,
         dynamic_tools: Vec<DynamicToolSpec>,
         mcp_server_names: &[String],
     ) -> ThreadStartParams {
-        let mut params = Self::thread_start_params(config, worktree_path);
+        let mut params = Self::thread_start_params(config, worktree_path, runtime_scope, &[], None);
         params.approval_policy = Some(AskForApproval::Never);
         params.sandbox = Some(SandboxMode::ReadOnly);
         params.dynamic_tools = Some(promote_payload_guidance(dynamic_tools));
@@ -228,6 +327,12 @@ impl CodexAdapter {
                 "apply_patch_freeform": false,
                 "apps": false,
                 "plugins": false,
+                "remote_plugin": false,
+                "plugin_sharing": false,
+                "hooks": false,
+                "skill_search": false,
+                "skip_host_skill_discovery": true,
+                "tool_suggest": false,
                 "connectors": false,
                 "browser_use": false,
                 "computer_use": false,
@@ -239,6 +344,13 @@ impl CodexAdapter {
             "web_search".to_owned(),
             Value::String("disabled".to_owned()),
         );
+        overrides.insert(
+            "skills".to_owned(),
+            json!({
+                "include_instructions": false,
+                "config": [],
+            }),
+        );
         let mcp_servers = mcp_server_names
             .iter()
             .map(|name| (name.clone(), json!({ "enabled": false })))
@@ -246,6 +358,18 @@ impl CodexAdapter {
         overrides.insert("mcp_servers".to_owned(), Value::Object(mcp_servers));
         params.config = Some(overrides);
         params
+    }
+
+    fn managed_codex_home(ctx: &ExecutionContext) -> Result<Option<PathBuf>, ExecutorError> {
+        if executors::task_role(&ctx.agent_config).is_none() {
+            return Ok(None);
+        }
+        let logs_parent = Path::new(&ctx.logs_path).parent().ok_or_else(|| {
+            ExecutorError::Other("managed Codex execution has no log directory".to_owned())
+        })?;
+        let managed_home = logs_parent.join(".codex-managed-home");
+        prepare_managed_codex_home(&managed_home, &ambient_codex_home())?;
+        Ok(Some(managed_home))
     }
 
     fn insert_process(
@@ -420,7 +544,11 @@ impl CodingExecutorAdapter for CodexAdapter {
 
     async fn execute(&self, ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
         let config = Self::resolve_config(&ctx);
-        let mut command = Self::build_command(&config);
+        let managed_codex_home = Self::managed_codex_home(&ctx)?;
+        let managed_scratch_root = managed_codex_home
+            .as_ref()
+            .map(|home| home.join("task-scratch"));
+        let mut command = Self::build_command(&config, managed_codex_home.as_deref());
         crate::command::run_in_worktree(&mut command, &ctx.worktree_path);
         let mut child = command.group_spawn()?;
 
@@ -481,6 +609,7 @@ impl CodingExecutorAdapter for CodexAdapter {
             .drive_codex(
                 ctx.clone(),
                 config,
+                managed_scratch_root,
                 stdin,
                 stdout,
                 stderr_rx,
@@ -522,6 +651,8 @@ impl CodexAdapter {
         config: &CodexConfig,
         ctx: &ExecutionContext,
         client: &mut C,
+        mcp_server_names: &[String],
+        managed_scratch_root: Option<&Path>,
     ) -> Result<(String, Option<String>), ExecutorError>
     where
         C: CodexSessionClient + Send,
@@ -535,7 +666,13 @@ impl CodexAdapter {
                 let resumed_thread_id = match client
                     .thread_resume(ThreadResumeParams::from_start(
                         resume_thread_id,
-                        Self::thread_start_params(config, &ctx.worktree_path),
+                        Self::thread_start_params(
+                            config,
+                            &ctx.worktree_path,
+                            &ctx.agent_config,
+                            mcp_server_names,
+                            managed_scratch_root,
+                        ),
                     ))
                     .await
                 {
@@ -548,7 +685,13 @@ impl CodexAdapter {
                     }
                     Err(error) if is_missing_codex_thread_error(&error) => {
                         let response = client
-                            .thread_start(Self::thread_start_params(config, &ctx.worktree_path))
+                            .thread_start(Self::thread_start_params(
+                                config,
+                                &ctx.worktree_path,
+                                &ctx.agent_config,
+                                mcp_server_names,
+                                managed_scratch_root,
+                            ))
                             .await?;
                         let thread_id =
                             response.thread_id().map(ToOwned::to_owned).ok_or_else(|| {
@@ -570,22 +713,49 @@ impl CodexAdapter {
                     .await?;
                 return Ok((resumed_thread_id, turn.turn_id));
             }
-            let thread_params = Self::thread_start_params(config, &ctx.worktree_path);
-            let fork = client
+            let thread_params = Self::thread_start_params(
+                config,
+                &ctx.worktree_path,
+                &ctx.agent_config,
+                mcp_server_names,
+                managed_scratch_root,
+            );
+            let forked_thread_id = match client
                 .thread_fork(ThreadForkParams::from_start(
                     resume_thread_id,
-                    thread_params,
+                    thread_params.clone(),
                 ))
-                .await?;
-            let forked_thread_id = fork.thread_id().map(ToOwned::to_owned).ok_or_else(|| {
-                ExecutorError::Other("codex thread/fork response missing thread id".to_owned())
-            })?;
+                .await
+            {
+                Ok(fork) => fork.thread_id().map(ToOwned::to_owned).ok_or_else(|| {
+                    ExecutorError::Other("codex thread/fork response missing thread id".to_owned())
+                })?,
+                // A Task thread created before Forge isolated managed Codex
+                // homes is not visible from the new home. Start clean inside
+                // the managed boundary instead of importing ambient history
+                // or making the Task permanently unrecoverable.
+                Err(error) if is_missing_codex_thread_error(&error) => {
+                    let response = client.thread_start(thread_params).await?;
+                    response.thread_id().map(ToOwned::to_owned).ok_or_else(|| {
+                        ExecutorError::Other(
+                            "codex thread/start response missing thread id".to_owned(),
+                        )
+                    })?
+                }
+                Err(error) => return Err(error),
+            };
             let turn = client
                 .turn_start(forked_thread_id.clone(), ctx.description.clone())
                 .await?;
             Ok((forked_thread_id, turn.turn_id))
         } else {
-            let thread_params = Self::thread_start_params(config, &ctx.worktree_path);
+            let thread_params = Self::thread_start_params(
+                config,
+                &ctx.worktree_path,
+                &ctx.agent_config,
+                mcp_server_names,
+                managed_scratch_root,
+            );
             let response = client.thread_start(thread_params).await?;
             let thread_id = response.thread_id().map(ToOwned::to_owned).ok_or_else(|| {
                 ExecutorError::Other("codex thread/start response missing thread id".to_owned())
@@ -614,6 +784,7 @@ impl CodexAdapter {
             .thread_start(Self::chat_thread_start_params(
                 config,
                 &ctx.worktree_path,
+                &ctx.agent_config,
                 dynamic_tools,
                 mcp_server_names,
             ))
@@ -632,6 +803,7 @@ impl CodexAdapter {
         &self,
         ctx: ExecutionContext,
         config: CodexConfig,
+        managed_scratch_root: Option<PathBuf>,
         stdin: tokio::process::ChildStdin,
         stdout: tokio::process::ChildStdout,
         stderr_rx: mpsc::Receiver<String>,
@@ -646,6 +818,28 @@ impl CodexAdapter {
             cancel.clone(),
             chat_tools.clone(),
         );
+
+        let managed_task = executors::task_role(&ctx.agent_config).is_some();
+        if let Some(role) = executors::task_role(&ctx.agent_config) {
+            write_shared_log(
+                &writer,
+                LogKind::SessionInfo,
+                json!({
+                    "type": "managed_execution_scope",
+                    "task_role": role,
+                    "sandbox": if executors::is_worktree_read_only(&ctx.agent_config) {
+                        "read-only"
+                    } else {
+                        "workspace-write"
+                    },
+                    "approval_policy": "never",
+                    "isolated_codex_home": true,
+                    "ambient_temp_roots_writable": false,
+                    "task_scratch_root": managed_scratch_root.as_ref().map(|path| path.display().to_string()),
+                }),
+            )
+            .await?;
+        }
 
         client.initialize().await?;
         client.initialized().await?;
@@ -662,7 +856,20 @@ impl CodexAdapter {
             )
             .await?
         } else {
-            Self::start_codex_session(&config, &ctx, &mut client).await?
+            let mcp_server_names = if managed_task {
+                let effective_config = client.config_read(&ctx.worktree_path).await?;
+                configured_mcp_server_names(&effective_config)
+            } else {
+                Vec::new()
+            };
+            Self::start_codex_session(
+                &config,
+                &ctx,
+                &mut client,
+                &mcp_server_names,
+                managed_scratch_root.as_deref(),
+            )
+            .await?
         };
 
         write_shared_log(
@@ -686,9 +893,17 @@ impl CodexAdapter {
             let _ = client.cancel_turn(thread_id.clone(), turn_id).await;
         }
 
-        let auto_commit = chat_tools.is_none() && config.auto_commit.unwrap_or(true);
-        // Commit reminder: if completed but worktree is dirty, nudge Codex once
+        let force_managed_host_commit =
+            managed_task && !executors::is_worktree_read_only(&ctx.agent_config);
+        let auto_commit = chat_tools.is_none()
+            && (force_managed_host_commit || crate::commit::auto_commit_enabled(&ctx));
+        // Unmanaged Codex runs may still be configured to author their own
+        // commit. Managed Task runs deliberately cannot write the linked Git
+        // metadata outside their sandbox; Forge performs their host-side
+        // finalization below, so a reminder would only provoke a doomed
+        // approval/escalation attempt and a second provider turn.
         if auto_commit
+            && !managed_task
             && outcome == ExecutionOutcome::Completed
             && let Ok(false) = git::is_worktree_clean(Path::new(&ctx.worktree_path)).await
         {
@@ -758,7 +973,12 @@ impl CodexAdapter {
                 ..Default::default()
             });
         }
-        let after_sha = match crate::commit::commit_execution_changes(&ctx).await {
+        let after_sha = match crate::commit::commit_execution_changes_with_policy(
+            &ctx,
+            force_managed_host_commit,
+        )
+        .await
+        {
             Ok(Some(sha)) => Some(sha),
             Ok(None) => git::get_current_sha(Path::new(&ctx.worktree_path))
                 .await
@@ -970,6 +1190,176 @@ fn dirs_path(name: &str) -> PathBuf {
         .join(format!(".{name}"))
 }
 
+fn ambient_codex_home() -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs_path("codex"))
+}
+
+/// Build the smallest Codex home a managed Task needs. Authentication is the
+/// only shared state; personal configuration inputs are deliberately absent.
+/// The home lives beside Task logs, outside the worktree sandbox, so a Worker
+/// cannot seed rules for a later execution.
+fn prepare_managed_codex_home(
+    managed_home: &Path,
+    ambient_home: &Path,
+) -> Result<(), ExecutorError> {
+    std::fs::create_dir_all(managed_home).map_err(|error| {
+        ExecutorError::Other(format!(
+            "failed to create managed Codex home {}: {error}",
+            managed_home.display()
+        ))
+    })?;
+    let home_metadata = managed_home.symlink_metadata().map_err(ExecutorError::Io)?;
+    if home_metadata.file_type().is_symlink() || !home_metadata.is_dir() {
+        return Err(ExecutorError::Other(format!(
+            "managed Codex home is not a Forge-owned directory: {}",
+            managed_home.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(managed_home, std::fs::Permissions::from_mode(0o700)).map_err(
+            |error| {
+                ExecutorError::Other(format!(
+                    "failed to protect managed Codex home {}: {error}",
+                    managed_home.display()
+                ))
+            },
+        )?;
+    }
+
+    // Codex materializes config.toml (project trust) and bundled system skills
+    // in its home while it runs. They are runtime cache, not durable authority:
+    // discard them before every execution and recreate only Forge's canonical
+    // config. This also makes a second attempt safe when it reuses the Task log
+    // directory. Files that Codex does not create remain fail-closed.
+    reset_managed_runtime_path(&managed_home.join("config.toml"))?;
+    reset_managed_runtime_path(&managed_home.join("skills"))?;
+    reset_managed_runtime_path(&managed_home.join("task-scratch"))?;
+    for forbidden in ["AGENTS.md", "hooks.json", "plugins"] {
+        let path = managed_home.join(forbidden);
+        if path.exists() {
+            return Err(ExecutorError::Other(format!(
+                "managed Codex home contains forbidden configuration input: {}",
+                path.display()
+            )));
+        }
+    }
+    ensure_managed_config(managed_home)?;
+    ensure_managed_rules(managed_home)?;
+    let scratch = managed_home.join("task-scratch");
+    std::fs::create_dir(&scratch).map_err(ExecutorError::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700))
+            .map_err(ExecutorError::Io)?;
+    }
+
+    let source_auth = ambient_home.join("auth.json");
+    if !source_auth.is_file() {
+        // Environment- or keyring-backed authentication does not need a file.
+        return Ok(());
+    }
+    let managed_auth = managed_home.join("auth.json");
+    if managed_auth.symlink_metadata().is_ok() {
+        let source = source_auth.canonicalize().map_err(ExecutorError::Io)?;
+        let linked = managed_auth.canonicalize().map_err(ExecutorError::Io)?;
+        if linked != source {
+            return Err(ExecutorError::Other(format!(
+                "managed Codex authentication link points at an unexpected file: {}",
+                managed_auth.display()
+            )));
+        }
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&source_auth, &managed_auth).map_err(ExecutorError::Io)?;
+    #[cfg(windows)]
+    std::fs::hard_link(&source_auth, &managed_auth).map_err(ExecutorError::Io)?;
+    Ok(())
+}
+
+fn reset_managed_runtime_path(path: &Path) -> Result<(), ExecutorError> {
+    match path.symlink_metadata() {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            std::fs::remove_dir_all(path).map_err(ExecutorError::Io)
+        }
+        Ok(_) => std::fs::remove_file(path).map_err(ExecutorError::Io),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ExecutorError::Io(error)),
+    }
+}
+
+fn ensure_managed_config(managed_home: &Path) -> Result<(), ExecutorError> {
+    let path = managed_home.join("config.toml");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    use std::io::Write;
+    let mut file = options.open(path).map_err(ExecutorError::Io)?;
+    file.write_all(MANAGED_CONFIG.as_bytes())
+        .map_err(ExecutorError::Io)
+}
+
+fn ensure_managed_rules(managed_home: &Path) -> Result<(), ExecutorError> {
+    let rules_dir = managed_home.join("rules");
+    match rules_dir.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(ExecutorError::Other(format!(
+                "managed Codex rules path is not a Forge-owned directory: {}",
+                rules_dir.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&rules_dir).map_err(ExecutorError::Io)?;
+        }
+        Err(error) => return Err(ExecutorError::Io(error)),
+    }
+
+    let expected = rules_dir.join(MANAGED_RULES_FILE);
+    for entry in std::fs::read_dir(&rules_dir).map_err(ExecutorError::Io)? {
+        let entry = entry.map_err(ExecutorError::Io)?;
+        if entry.path() != expected {
+            return Err(ExecutorError::Other(format!(
+                "managed Codex home contains an unexpected rules file: {}",
+                entry.path().display()
+            )));
+        }
+    }
+    match std::fs::read_to_string(&expected) {
+        Ok(contents) if contents == MANAGED_RULES => return Ok(()),
+        Ok(_) => {
+            return Err(ExecutorError::Other(format!(
+                "managed Codex Task boundary rules were modified: {}",
+                expected.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ExecutorError::Io(error)),
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    use std::io::Write;
+    let mut file = options.open(&expected).map_err(ExecutorError::Io)?;
+    file.write_all(MANAGED_RULES.as_bytes())
+        .map_err(ExecutorError::Io)
+}
+
 fn availability_from_codex_home(codex_home: &Path) -> AvailabilityInfo {
     let auth_path = codex_home.join("auth.json");
     if auth_path.exists() {
@@ -1012,7 +1402,7 @@ mod tests {
             ..CodexConfig::default()
         };
 
-        let cmd = CodexAdapter::build_command(&config);
+        let cmd = CodexAdapter::build_command(&config, None);
         assert_eq!(cmd.as_std().get_program(), "npx");
         let args: Vec<_> = cmd
             .as_std()
@@ -1078,7 +1468,8 @@ mod tests {
             ..CodexConfig::default()
         };
 
-        let params = CodexAdapter::thread_start_params(&config, "/tmp/worktree");
+        let params =
+            CodexAdapter::thread_start_params(&config, "/tmp/worktree", &json!({}), &[], None);
 
         assert_eq!(params.model.as_deref(), Some("gpt-5-codex"));
         assert!(matches!(params.sandbox, Some(SandboxMode::ReadOnly)));
@@ -1105,7 +1496,8 @@ mod tests {
             ..CodexConfig::default()
         };
 
-        let params = CodexAdapter::thread_start_params(&config, "/tmp/worktree");
+        let params =
+            CodexAdapter::thread_start_params(&config, "/tmp/worktree", &json!({}), &[], None);
 
         assert!(matches!(
             params.sandbox,
@@ -1115,6 +1507,194 @@ mod tests {
             params.approval_policy,
             Some(AskForApproval::Never)
         ));
+    }
+
+    #[test]
+    fn managed_task_scope_overrides_yolo_and_profile_approval_settings() {
+        let config = CodexConfig {
+            permission_policy: Some(PermissionPolicy::Yolo),
+            sandbox: Some("danger-full-access".to_owned()),
+            ask_for_approval: Some("on-request".to_owned()),
+            profile: Some("ambient-profile".to_owned()),
+            ..CodexConfig::default()
+        };
+        let mut runtime_scope = json!({});
+        executors::mark_task_role(&mut runtime_scope, "worker");
+
+        let params = CodexAdapter::thread_start_params(
+            &config,
+            "/tmp/worktree",
+            &runtime_scope,
+            &["project-local".to_owned()],
+            Some(Path::new("/tmp/forge-task-scratch")),
+        );
+
+        assert!(matches!(params.sandbox, Some(SandboxMode::WorkspaceWrite)));
+        assert!(matches!(
+            params.approval_policy,
+            Some(AskForApproval::Never)
+        ));
+        let overrides = params.config.expect("managed overrides are present");
+        assert_eq!(overrides.get("profile"), None);
+        assert_eq!(overrides["features"]["apps"], json!(false));
+        assert_eq!(overrides["features"]["plugins"], json!(false));
+        assert_eq!(overrides["features"]["hooks"], json!(false));
+        assert_eq!(overrides["features"]["skill_search"], json!(false));
+        assert_eq!(
+            overrides["features"]["skip_host_skill_discovery"],
+            json!(true)
+        );
+        assert_eq!(overrides["skills"]["include_instructions"], json!(false));
+        assert_eq!(overrides["web_search"], json!("disabled"));
+        assert_eq!(
+            overrides["mcp_servers"]["project-local"]["enabled"],
+            json!(false)
+        );
+        assert_eq!(
+            overrides["sandbox_workspace_write"],
+            json!({
+                "network_access": false,
+                "exclude_slash_tmp": true,
+                "exclude_tmpdir_env_var": true,
+                "writable_roots": ["/tmp/forge-task-scratch"],
+            })
+        );
+        assert_eq!(
+            params.developer_instructions.as_deref(),
+            Some(MANAGED_WRITE_DELIVERY_INSTRUCTIONS)
+        );
+    }
+
+    #[test]
+    fn managed_read_only_role_stays_read_only() {
+        let config = CodexConfig {
+            permission_policy: Some(PermissionPolicy::Yolo),
+            ..CodexConfig::default()
+        };
+        let mut runtime_scope = json!({});
+        executors::mark_task_role(&mut runtime_scope, "reviewer");
+        executors::mark_worktree_read_only(&mut runtime_scope);
+
+        let params =
+            CodexAdapter::thread_start_params(&config, "/tmp/worktree", &runtime_scope, &[], None);
+
+        assert!(matches!(params.sandbox, Some(SandboxMode::ReadOnly)));
+        assert!(matches!(
+            params.approval_policy,
+            Some(AskForApproval::Never)
+        ));
+    }
+
+    #[test]
+    fn managed_codex_home_shares_only_authentication() {
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let ambient = dir.path().join("ambient");
+        let managed = dir.path().join("logs/task/.codex-managed-home");
+        fs::create_dir_all(ambient.join("rules")).expect("ambient rules dir creates");
+        fs::write(ambient.join("auth.json"), "{\"auth_mode\":\"chatgpt\"}")
+            .expect("ambient auth writes");
+        fs::write(ambient.join("config.toml"), "approval_policy = 'never'")
+            .expect("ambient config writes");
+        fs::write(
+            ambient.join("rules/default.rules"),
+            "prefix_rule(pattern=[\"git\",\"merge\"], decision=\"allow\")",
+        )
+        .expect("ambient rule writes");
+
+        prepare_managed_codex_home(&managed, &ambient).expect("managed home prepares");
+
+        assert_eq!(
+            managed
+                .join("auth.json")
+                .canonicalize()
+                .expect("managed auth resolves"),
+            ambient
+                .join("auth.json")
+                .canonicalize()
+                .expect("ambient auth resolves")
+        );
+        assert_eq!(
+            fs::read_to_string(managed.join("config.toml")).expect("managed config reads"),
+            MANAGED_CONFIG
+        );
+        let managed_rules = fs::read_to_string(managed.join("rules").join(MANAGED_RULES_FILE))
+            .expect("managed deny rules read");
+        assert!(managed_rules.contains("decision=\"forbidden\""));
+        assert!(managed_rules.contains("[\"git\", \"merge\"]"));
+        assert!(!managed_rules.contains("decision=\"allow\""));
+
+        fs::write(
+            managed.join("config.toml"),
+            format!("{MANAGED_CONFIG}\n[projects.\"/tmp/generated\"]\ntrust_level = \"trusted\"\n"),
+        )
+        .expect("Codex-generated project trust writes");
+        fs::create_dir_all(managed.join("skills/.system/generated"))
+            .expect("Codex-generated skill directory writes");
+        fs::write(
+            managed.join("skills/.system/generated/SKILL.md"),
+            "runtime-generated",
+        )
+        .expect("Codex-generated skill writes");
+        fs::write(managed.join("task-scratch/transient"), "temporary")
+            .expect("Task scratch writes");
+
+        prepare_managed_codex_home(&managed, &ambient)
+            .expect("managed home safely prepares for another execution");
+        assert_eq!(
+            fs::read_to_string(managed.join("config.toml")).expect("reset managed config reads"),
+            MANAGED_CONFIG
+        );
+        assert!(!managed.join("skills").exists());
+        assert!(managed.join("task-scratch").is_dir());
+        assert!(
+            fs::read_dir(managed.join("task-scratch"))
+                .expect("Task scratch reads")
+                .next()
+                .is_none(),
+            "Task scratch is reset between attempts"
+        );
+
+        fs::write(managed.join("rules/foreign.rules"), "# not Forge-owned")
+            .expect("foreign rule writes");
+        let error = prepare_managed_codex_home(&managed, &ambient)
+            .expect_err("managed authority inputs fail closed");
+        assert!(error.to_string().contains("unexpected rules file"));
+    }
+
+    #[test]
+    fn managed_codex_home_overrides_profile_environment() {
+        let config = CodexConfig {
+            command_overrides: CommandOverrides {
+                env: Some(HashMap::from([(
+                    "CODEX_HOME".to_owned(),
+                    "/tmp/profile-home".to_owned(),
+                )])),
+                ..CommandOverrides::default()
+            },
+            ..CodexConfig::default()
+        };
+        let managed = Path::new("/tmp/forge-managed-home");
+
+        let cmd = CodexAdapter::build_command(&config, Some(managed));
+        let command = cmd.as_std();
+        let actual = command
+            .get_envs()
+            .find_map(|(key, value)| {
+                (key == "CODEX_HOME").then(|| value.expect("CODEX_HOME has value"))
+            })
+            .expect("CODEX_HOME is set");
+
+        assert_eq!(actual, managed.as_os_str());
+        let expected_scratch = managed.join("task-scratch");
+        for key in ["TMPDIR", "TMP", "TEMP"] {
+            let actual = command
+                .get_envs()
+                .find_map(|(candidate, value)| {
+                    (candidate == key).then(|| value.expect("scratch variable has value"))
+                })
+                .unwrap_or_else(|| panic!("{key} is set"));
+            assert_eq!(actual, expected_scratch.as_os_str());
+        }
     }
 
     #[test]
@@ -1136,6 +1716,7 @@ mod tests {
         let params = CodexAdapter::chat_thread_start_params(
             &config,
             "/tmp/worktree",
+            &json!({}),
             tools,
             &["inherited-server".to_owned()],
         );
@@ -1153,12 +1734,19 @@ mod tests {
         assert_eq!(wire["config"]["features"]["apply_patch_freeform"], false);
         assert_eq!(wire["config"]["features"]["apps"], false);
         assert_eq!(wire["config"]["features"]["plugins"], false);
+        assert_eq!(wire["config"]["features"]["hooks"], false);
+        assert_eq!(wire["config"]["features"]["skill_search"], false);
+        assert_eq!(
+            wire["config"]["features"]["skip_host_skill_discovery"],
+            true
+        );
         assert_eq!(wire["config"]["features"]["connectors"], false);
         assert_eq!(wire["config"]["features"]["browser_use"], false);
         assert_eq!(wire["config"]["features"]["computer_use"], false);
         assert_eq!(wire["config"]["features"]["enable_mcp_apps"], false);
         assert_eq!(wire["config"]["features"]["web_search"], false);
         assert_eq!(wire["config"]["web_search"], "disabled");
+        assert_eq!(wire["config"]["skills"]["include_instructions"], false);
         assert_eq!(
             wire["config"]["mcp_servers"]["inherited-server"]["enabled"],
             false
@@ -1171,6 +1759,7 @@ mod tests {
         let params = CodexAdapter::chat_thread_start_params(
             &CodexConfig::default(),
             "/tmp/worktree",
+            &json!({}),
             vec![DynamicToolSpec {
                 name: "forge_project_orchestration_propose".to_owned(),
                 description: "Submit a typed Forge proposal.".to_owned(),
@@ -1267,6 +1856,7 @@ mod tests {
         turn_thread_id: Option<String>,
         turn_prompt: Option<String>,
         fail_resume_with_missing_thread: bool,
+        fail_fork_with_missing_thread: bool,
         turn_attempts: usize,
     }
 
@@ -1293,6 +1883,11 @@ mod tests {
         ) -> Result<ThreadForkResponse, ExecutorError> {
             self.calls.push("thread_fork");
             self.fork_params = Some(params);
+            if self.fail_fork_with_missing_thread {
+                return Err(ExecutorError::Other(
+                    "thread/fork failed: thread not found: source-thread (-32600)".to_owned(),
+                ));
+            }
             Ok(ThreadForkResponse {
                 thread: Some(protocol::ThreadInfo {
                     id: "forked-thread".to_owned(),
@@ -1358,9 +1953,10 @@ mod tests {
             log_sender: None,
         };
 
-        let (thread_id, turn_id) = CodexAdapter::start_codex_session(&config, &ctx, &mut client)
-            .await
-            .expect("session starts");
+        let (thread_id, turn_id) =
+            CodexAdapter::start_codex_session(&config, &ctx, &mut client, &[], None)
+                .await
+                .expect("session starts");
 
         assert_eq!(thread_id, "forked-thread");
         assert_eq!(turn_id.as_deref(), Some("turn-1"));
@@ -1373,6 +1969,45 @@ mod tests {
         assert_eq!(fork_params.thread_id, "source-thread");
         assert_eq!(fork_params.cwd.as_deref(), Some(ctx.worktree_path.as_str()));
         assert_eq!(fork_params.model.as_deref(), Some("gpt-5-codex"));
+    }
+
+    #[tokio::test]
+    async fn resume_review_starts_fresh_when_legacy_source_thread_is_missing() {
+        let mut client = StubCodexSessionClient {
+            fail_fork_with_missing_thread: true,
+            ..StubCodexSessionClient::default()
+        };
+        let config = CodexConfig {
+            resume_thread_id: Some("source-thread".to_owned()),
+            model: Some("gpt-5-codex".to_owned()),
+            permission_policy: Some(PermissionPolicy::Supervised),
+            ..CodexConfig::default()
+        };
+        let ctx = ExecutionContext {
+            task_id: "task-1".to_owned(),
+            execution_id: "exec-1".to_owned(),
+            worktree_path: "/tmp/forge-codex-worktree".to_owned(),
+            description: "Review the changes".to_owned(),
+            agent_config: json!({}),
+            logs_path: "/tmp/forge-codex.log".to_owned(),
+            heartbeat_interval_seconds: 30,
+            max_turns: None,
+            log_sender: None,
+        };
+
+        let (thread_id, turn_id) =
+            CodexAdapter::start_codex_session(&config, &ctx, &mut client, &[], None)
+                .await
+                .expect("missing legacy session starts fresh");
+
+        assert_eq!(thread_id, "fresh-thread");
+        assert_eq!(turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(
+            client.calls,
+            vec!["thread_fork", "thread_start", "turn_start"]
+        );
+        assert_eq!(client.turn_thread_id.as_deref(), Some("fresh-thread"));
+        assert_eq!(client.turn_prompt.as_deref(), Some("Review the changes"));
     }
 
     #[tokio::test]
@@ -1398,9 +2033,10 @@ mod tests {
             log_sender: None,
         };
 
-        let (thread_id, turn_id) = CodexAdapter::start_codex_session(&config, &ctx, &mut client)
-            .await
-            .expect("session starts");
+        let (thread_id, turn_id) =
+            CodexAdapter::start_codex_session(&config, &ctx, &mut client, &[], None)
+                .await
+                .expect("session starts");
 
         assert_eq!(thread_id, "source-thread");
         assert_eq!(turn_id.as_deref(), Some("turn-1"));
@@ -1448,9 +2084,10 @@ mod tests {
             log_sender: None,
         };
 
-        let (thread_id, turn_id) = CodexAdapter::start_codex_session(&config, &ctx, &mut client)
-            .await
-            .expect("session starts");
+        let (thread_id, turn_id) =
+            CodexAdapter::start_codex_session(&config, &ctx, &mut client, &[], None)
+                .await
+                .expect("session starts");
 
         assert_eq!(thread_id, "fresh-thread");
         assert_eq!(turn_id.as_deref(), Some("turn-1"));
