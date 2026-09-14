@@ -489,6 +489,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- The release lockfile upgrades `rustls` 0.23.38 -> 0.23.45 (and
+  `rustls-webpki` to 0.103.15), clearing RUSTSEC-2026-0285 (TLS 1.3
+  handshake messages accepted across encryption level boundaries); the
+  workspace had no direct `rustls` dependency, so no source changes were
+  needed.
+
 - A user cancel and the recovery reaper can stop an execution whose owner lease
   has expired. The ledger terminal CAS demanded a live `lease_expires_at` from
   every caller rather than only from a remote owner proving it still holds the
