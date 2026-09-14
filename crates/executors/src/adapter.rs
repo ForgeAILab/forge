@@ -185,6 +185,37 @@ fn configured_provider_model(config: &serde_json::Value) -> (Option<&str>, Optio
     (provider, model)
 }
 
+/// Normalize an adapter-reported USD amount to the ledger contract: a plain
+/// non-negative decimal with no exponent and at most nine fractional digits.
+/// CLI harnesses report full-precision floats such as `1.6888534999999991`,
+/// and rejecting that text at the ledger fails an otherwise finished
+/// execution. The fallback layer therefore rounds every report to nano-USD;
+/// text that is not a non-negative finite decimal loses its cost field rather
+/// than the execution.
+fn normalize_reported_cost_usd(reported: Option<&str>) -> Option<String> {
+    let text = reported?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let value: f64 = text.parse().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let nanos = (value * 1_000_000_000.0).round();
+    if !(0.0..=i64::MAX as f64).contains(&nanos) {
+        return None;
+    }
+    let nanos = nanos as i64;
+    let mut rendered = format!("{}.{:09}", nanos / 1_000_000_000, nanos % 1_000_000_000);
+    while rendered.ends_with('0') {
+        rendered.pop();
+    }
+    if rendered.ends_with('.') {
+        rendered.pop();
+    }
+    Some(rendered)
+}
+
 /// Add deterministic route identity and configured identity to adapter
 /// reports. An adapter that made a provider call but has no telemetry receives
 /// one unmetered disposition; no zero counters are fabricated.
@@ -206,6 +237,8 @@ fn normalize_candidate_reports(
         .enumerate()
         .map(|(sequence, mut report)| {
             report.fill_identity(configured_provider, configured_model);
+            report.reported_cost_usd =
+                normalize_reported_cost_usd(report.reported_cost_usd.as_deref());
             report.outcome = Some(outcome);
             report.for_candidate(
                 execution_id,
@@ -965,6 +998,72 @@ mod tests {
         assert_eq!(
             plan.env_set.get("FORGE_MAX_TURNS").map(String::as_str),
             Some("2")
+        );
+    }
+
+    #[test]
+    fn normalize_reported_cost_usd_rounds_float_precision_to_nano_usd() {
+        // CLI harnesses report full float precision, e.g. Claude Code's
+        // `1.6888534999999991`; the ledger contract allows at most nine
+        // fractional digits and no exponent.
+        assert_eq!(
+            normalize_reported_cost_usd(Some("1.6888534999999991")),
+            Some("1.6888535".to_owned())
+        );
+        assert_eq!(
+            normalize_reported_cost_usd(Some("8.3e-7")),
+            Some("0.00000083".to_owned())
+        );
+        assert_eq!(
+            normalize_reported_cost_usd(Some("12")),
+            Some("12".to_owned())
+        );
+        assert_eq!(
+            normalize_reported_cost_usd(Some("0.000000")),
+            Some("0".to_owned())
+        );
+        assert_eq!(
+            normalize_reported_cost_usd(Some("  0.5  ")),
+            Some("0.5".to_owned())
+        );
+        assert_eq!(normalize_reported_cost_usd(Some("-1")), None);
+        assert_eq!(normalize_reported_cost_usd(Some("nan")), None);
+        assert_eq!(normalize_reported_cost_usd(Some("inf")), None);
+        assert_eq!(normalize_reported_cost_usd(Some("not-a-number")), None);
+        assert_eq!(normalize_reported_cost_usd(Some("")), None);
+        assert_eq!(normalize_reported_cost_usd(None), None);
+    }
+
+    #[test]
+    fn normalize_candidate_reports_conforms_reported_cost_to_ledger_contract() {
+        let candidate = RouteCandidate {
+            kind: ExecutorKind::Shell,
+            config: serde_json::json!({}),
+            candidate_key: "candidate".to_owned(),
+            account_key: "account".to_owned(),
+        };
+        let mut report = UsageReport::metered(
+            String::new(),
+            crate::UsageCounters {
+                input_tokens: Some(10),
+                ..Default::default()
+            },
+        );
+        report.reported_cost_usd = Some("1.6888534999999991".to_owned());
+
+        let normalized = normalize_candidate_reports(
+            "execution",
+            &candidate,
+            0,
+            vec![report],
+            crate::config::RouteAttemptOutcome::Completed,
+            false,
+        );
+
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(
+            normalized[0].reported_cost_usd.as_deref(),
+            Some("1.6888535")
         );
     }
 

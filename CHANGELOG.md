@@ -8,7 +8,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
-- CLI-harness agents and per-execution overrides now offer an explicit `YOLO`
   permission policy. It selects the executor's full-access/no-prompt mode where
   the transport can honor it without crossing a Forge-owned role boundary;
   managed Codex Tasks apply the stricter confinement described below. Existing
@@ -146,6 +145,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Adapter usage reports now normalize a CLI-reported USD amount to the ledger
+  contract (plain non-negative decimal, no exponent, at most nine fractional
+  digits) instead of failing the finished execution at ledger validation.
+  Claude Code reports full float precision such as `1.6888534999999991`, which
+  previously failed every claude_code Task with `reported USD amount must have
+  at most nine fractional digits` after the work had already completed; the
+  report is rounded to nano-USD, and text that is not a non-negative finite
+  decimal loses its cost field rather than the execution.
 - Forge Solo now unlocks the Project Agent's scoped operational proposal
   catalog after Charter adoption, including `task.propose`. The Charter gate
   still withholds those permissions before approval, and a narrow migration
