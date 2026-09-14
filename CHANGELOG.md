@@ -6,6 +6,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-14
+
 ### Added
 
 - Forge Solo can now run without any local CLI harness login: provider
