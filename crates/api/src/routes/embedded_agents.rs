@@ -49,7 +49,7 @@ pub async fn create_embedded_agent(
                 .unwrap_or_else(default_account_permissions),
             tool_policy: request
                 .tool_policy
-                .unwrap_or_else(default_profile_tool_policy),
+                .unwrap_or_else(services::embedded_agent_service::default_profile_tool_policy),
             context_tokens: request.context_tokens,
             max_input_tokens: request.max_input_tokens,
             max_output_tokens: request.max_output_tokens,
@@ -84,7 +84,7 @@ pub async fn connect_embedded_profile(
             permission_policy: request.permission_policy,
             tool_policy: request
                 .tool_policy
-                .unwrap_or_else(default_profile_tool_policy),
+                .unwrap_or_else(services::embedded_agent_service::default_profile_tool_policy),
             context_tokens: request.context_tokens,
             max_input_tokens: request.max_input_tokens,
             max_output_tokens: request.max_output_tokens,
@@ -569,33 +569,7 @@ fn parse_json(value: &str) -> serde_json::Value {
 }
 
 fn default_account_permissions() -> serde_json::Value {
-    default_profile_tool_policy()
-}
-
-fn default_profile_tool_policy() -> serde_json::Value {
-    // A profile is a capability ceiling, not a scope grant. Keep the reusable
-    // profile broad enough for later Project/Agent Chat/Task admission; the account
-    // ceiling, membership/participation, workflow admission, and canonical
-    // scope are still intersected server-side and therefore remain decisive.
-    serde_json::json!({
-        "allowed": [
-            "read_account",
-            "read_project",
-            "read_agent_chat",
-            "read_task",
-            "read_memory",
-            "propose_task",
-            "propose_discovery",
-            "propose_project",
-            "propose_handoff",
-            "propose_message",
-            "propose_review",
-            "propose_commitment",
-            "propose_memory",
-            "propose_decision",
-            "propose_session",
-            "task_read",
-            "task_write"
-        ]
-    })
+    // The profile ceiling and the account ceiling start from the same broad
+    // default; scope admission remains the decisive intersection.
+    services::embedded_agent_service::default_profile_tool_policy()
 }

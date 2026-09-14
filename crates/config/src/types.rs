@@ -26,6 +26,46 @@ pub struct ForgeConfig {
     #[serde(default)]
     pub scaffold: ScaffoldConfig,
     pub project: ProjectSettings,
+    #[serde(default)]
+    pub providers: ProviderDeclarations,
+}
+
+/// Model providers declared in the user-owned Forge config file. Solo uses
+/// these declarations to create protected provider entries and direct
+/// embedded Agents, so a repository-scoped Solo session does not depend on a
+/// local CLI harness login. The config file is the onboarding surface: the
+/// TUI never prompts for provider credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderDeclarations {
+    pub entries: BTreeMap<String, ProviderDeclaration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderDeclaration {
+    /// Provider transport kind. One of the embedded runtime's supported
+    /// kinds: `openai`, `openai_compatible`, `openrouter`, `xai`, `gemini`.
+    pub kind: String,
+    /// API root for `openai_compatible`/`openrouter`/`xai` endpoints.
+    /// Defaults to the kind's canonical base URL when omitted.
+    pub base_url: Option<String>,
+    /// Inline API key. The config file is owner-owned host configuration;
+    /// prefer `api_key_env` when the deployment cannot protect the file.
+    pub api_key: Option<String>,
+    /// Environment variable that holds the API key at launch time.
+    pub api_key_env: Option<String>,
+    pub models: Vec<ProviderModelDeclaration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderModelDeclaration {
+    pub model: String,
+    pub reasoning_effort: Option<String>,
+    pub context_tokens: Option<u32>,
+    pub max_input_tokens: Option<u32>,
+    pub max_output_tokens: Option<u32>,
 }
 
 /// Optional least-privilege endpoint used by Main and Project Agent Chat
@@ -107,7 +147,70 @@ pub struct TerminalConfig {
     pub reconnect_scrollback_bytes: usize,
 }
 
+impl ProviderDeclarations {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        const SUPPORTED_KINDS: [&str; 5] =
+            ["openai", "openai_compatible", "openrouter", "xai", "gemini"];
+        for (name, declaration) in &self.entries {
+            if name.trim().is_empty() {
+                return Err(ConfigError::InvalidConfig {
+                    message: "provider declaration name must not be empty".to_owned(),
+                });
+            }
+            if !SUPPORTED_KINDS.contains(&declaration.kind.as_str()) {
+                return Err(ConfigError::InvalidConfig {
+                    message: format!(
+                        "provider `{name}` has unsupported kind `{}`; expected one of {}",
+                        declaration.kind,
+                        SUPPORTED_KINDS.join(", ")
+                    ),
+                });
+            }
+            match (&declaration.api_key, &declaration.api_key_env) {
+                (None, None) => {
+                    return Err(ConfigError::InvalidConfig {
+                        message: format!("provider `{name}` must set api_key or api_key_env"),
+                    });
+                }
+                (Some(_), Some(_)) => {
+                    return Err(ConfigError::InvalidConfig {
+                        message: format!(
+                            "provider `{name}` sets both api_key and api_key_env; pick one"
+                        ),
+                    });
+                }
+                _ => {}
+            }
+            if declaration.kind == "openai_compatible"
+                && declaration
+                    .base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_none()
+            {
+                return Err(ConfigError::InvalidConfig {
+                    message: format!(
+                        "provider `{name}` uses kind `openai_compatible` and must set base_url"
+                    ),
+                });
+            }
+            for model in &declaration.models {
+                if model.model.trim().is_empty() {
+                    return Err(ConfigError::InvalidConfig {
+                        message: format!(
+                            "provider `{name}` declares a model with an empty model id"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProjectSettings {
     pub values: BTreeMap<String, String>,
 }
@@ -217,7 +320,8 @@ impl ForgeConfig {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.terminal.validate()?;
-        self.public_search.validate()
+        self.public_search.validate()?;
+        self.providers.validate()
     }
 
     #[must_use]
@@ -254,6 +358,7 @@ impl Default for ForgeConfig {
             terminal: TerminalConfig::default(),
             scaffold: ScaffoldConfig::default(),
             project: ProjectSettings::default(),
+            providers: ProviderDeclarations::default(),
         }
     }
 }

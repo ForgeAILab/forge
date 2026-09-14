@@ -23,6 +23,7 @@ pub use runtime::{
     read_server_state, server_state_path, write_server_state, ServerState, SERVER_STATE_FILE,
 };
 pub use types::{
-    AgentDefaults, ConfigOverrides, ForgeConfig, ForgePaths, ProjectSettings, PublicSearchConfig,
-    ScaffoldConfig, ServerConfig, TerminalConfig, WorkspaceConfig,
+    AgentDefaults, ConfigOverrides, ForgeConfig, ForgePaths, ProjectSettings, ProviderDeclaration,
+    ProviderDeclarations, ProviderModelDeclaration, PublicSearchConfig, ScaffoldConfig,
+    ServerConfig, TerminalConfig, WorkspaceConfig,
 };

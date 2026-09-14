@@ -17,15 +17,33 @@ use forge_solo::{
 
 const FORCED_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run(Cli::parse()).await {
-        Ok(()) => ExitCode::SUCCESS,
+/// Forge's tool -> service -> repository -> `sqlx` call chains compose deep
+/// async futures, and a debug build makes each frame larger still. The server
+/// binary already raises its worker stack for exactly this reason; Solo runs
+/// the same services in-process, so it must not inherit Tokio's 2 MiB default.
+const RUNTIME_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+fn main() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(RUNTIME_THREAD_STACK_SIZE)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("forge-solo: {}", safe_diagnostic(error));
-            ExitCode::FAILURE
+            eprintln!("forge-solo: failed to build the Forge runtime: {error}");
+            return ExitCode::FAILURE;
         }
-    }
+    };
+    runtime.block_on(async {
+        match run(Cli::parse()).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("forge-solo: {}", safe_diagnostic(error));
+                ExitCode::FAILURE
+            }
+        }
+    })
 }
 
 async fn run(cli: Cli) -> Result<(), String> {

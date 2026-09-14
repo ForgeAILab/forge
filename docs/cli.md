@@ -82,6 +82,20 @@ small marker is written into the tracked checkout. A malformed marker, a
 repository/data-root mismatch, or an active lock fails closed. Solo starts
 ordinary crash recovery before enabling the composer.
 
+### Model providers in the config file
+
+Solo can run without any local CLI harness login by reading provider
+declarations from the user-owned Forge config file (`~/.forge/forge.yaml`).
+Each provider sets a supported `kind` (`openai`, `openai_compatible`,
+`openrouter`, `xai`, or `gemini`), exactly one of `api_key` / `api_key_env`,
+an optional `base_url` (required for `openai_compatible`), and a list of
+models. Solo materializes them as protected provider entries plus direct
+embedded Agents named `<provider>/<model>`, idempotently on every launch, and
+offers them in the Agent picker alongside CLI harnesses. A provider that
+cannot be connected is skipped with a log line; it never blocks startup. See
+[getting-started.md](getting-started.md#config-declared-model-providers) for
+the full schema and an example.
+
 ### Solo key bindings
 
 The key map is available from `?` or `F1` while no other modal is active.

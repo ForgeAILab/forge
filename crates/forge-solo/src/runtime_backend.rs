@@ -319,6 +319,15 @@ impl RuntimeBackend {
             });
         }
 
+        // Config-declared direct Agents stay in the picker across refreshes;
+        // they were materialized by the bootstrap provider sync.
+        candidates.extend(
+            self.bootstrap_service
+                .config_agent_candidates(&current.owner_id)
+                .await
+                .map_err(map_service_error)?,
+        );
+
         let mut request = self.bootstrap_template.clone();
         request.agent_candidates = candidates;
         request.selected_project_agent_id = current.selected_project_agent_id.clone();

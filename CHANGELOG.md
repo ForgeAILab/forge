@@ -8,6 +8,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Forge Solo can now run without any local CLI harness login: provider
+  declarations in the user-owned Forge config file (`~/.forge/forge.yaml`)
+  materialize as protected provider entries plus direct embedded Agents named
+  `<provider>/<model>`. Supported kinds are `openai`, `openai_compatible`,
+  `openrouter`, `xai`, and `gemini`; exactly one of `api_key`/`api_key_env`
+  is required per provider and `openai_compatible` additionally requires
+  `base_url`. Config-declared Agents appear in the Solo Agent picker next to
+  CLI harnesses and can serve as Project Agent, Task Worker, or both, so
+  different roles can use different providers and models. The sync is
+  idempotent and per-provider failure-tolerant: an unreachable endpoint or an
+  unset `api_key_env` skips that provider with a log line instead of blocking
+  bootstrap. The direct-agent profile ceiling default moved to a shared
+  `services::embedded_agent_service::default_profile_tool_policy`; behavior
+  is unchanged.
+- CLI-harness agents and per-execution overrides now offer an explicit `YOLO`
   permission policy. It selects the executor's full-access/no-prompt mode where
   the transport can honor it without crossing a Forge-owned role boundary;
   managed Codex Tasks apply the stricter confinement described below. Existing

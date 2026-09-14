@@ -2035,6 +2035,35 @@ impl EmbeddedAgentService {
     }
 }
 
+/// Default profile capability ceiling for direct (embedded-runtime) agents.
+/// A profile is a ceiling, not a scope grant: account ceiling, membership,
+/// workflow admission, and the canonical scope still intersect server-side
+/// and therefore remain decisive.
+#[must_use]
+pub fn default_profile_tool_policy() -> Value {
+    serde_json::json!({
+        "allowed": [
+            "read_account",
+            "read_project",
+            "read_agent_chat",
+            "read_task",
+            "read_memory",
+            "propose_task",
+            "propose_discovery",
+            "propose_project",
+            "propose_handoff",
+            "propose_message",
+            "propose_review",
+            "propose_commitment",
+            "propose_memory",
+            "propose_decision",
+            "propose_session",
+            "task_read",
+            "task_write"
+        ]
+    })
+}
+
 /// Environment variable a CLI harness reads for each provider's API key.
 fn provider_env_variable(provider: &str) -> Option<&'static str> {
     match provider {

@@ -1,6 +1,6 @@
 use crate::{
     default_config_path, error::ConfigError, file::FileConfig, path::expand_path, ConfigOverrides,
-    ForgeConfig,
+    ForgeConfig, ProviderDeclaration, ProviderModelDeclaration,
 };
 use std::{env, fs, path::Path};
 
@@ -127,6 +127,42 @@ impl ForgeConfig {
 
         if let Some(project) = file.project {
             self.project.values.extend(project);
+        }
+
+        if let Some(providers) = file.providers {
+            for (name, declaration) in providers {
+                let models = declaration
+                    .models
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|model| {
+                        let file_model = model;
+                        (!file_model
+                            .model
+                            .as_deref()
+                            .map(str::trim)
+                            .unwrap_or_default()
+                            .is_empty())
+                        .then(|| ProviderModelDeclaration {
+                            model: file_model.model.unwrap_or_default(),
+                            reasoning_effort: file_model.reasoning_effort,
+                            context_tokens: file_model.context_tokens,
+                            max_input_tokens: file_model.max_input_tokens,
+                            max_output_tokens: file_model.max_output_tokens,
+                        })
+                    })
+                    .collect();
+                self.providers.entries.insert(
+                    name,
+                    ProviderDeclaration {
+                        kind: declaration.kind.unwrap_or_default(),
+                        base_url: declaration.base_url,
+                        api_key: declaration.api_key,
+                        api_key_env: declaration.api_key_env,
+                        models,
+                    },
+                );
+            }
         }
     }
 

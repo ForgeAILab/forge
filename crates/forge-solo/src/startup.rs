@@ -240,7 +240,9 @@ impl SoloStartup {
             }
         };
 
-        let bootstrap_service = SoloBootstrapService::new(Arc::clone(&db));
+        let bootstrap_service = SoloBootstrapService::new(Arc::clone(&db))
+            .with_embedded_agents(Arc::clone(&runtime.embedded_agent_service))
+            .with_config_providers(config.providers.clone());
         let base_request = bootstrap_request(&repository, &paths);
         let setup = async {
             // First reconcile creates/resumes the owner and Project, giving
@@ -485,5 +487,8 @@ async fn ensure_owned_agents(
             display_name: Some(candidate.display_name),
         });
     }
+    // Config-declared direct Agents are appended after the CLI harnesses so
+    // the first-run picker offers provider-backed models too.
+    candidates.extend(bootstrap_service.config_agent_candidates(owner_id).await?);
     Ok(candidates)
 }

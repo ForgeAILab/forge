@@ -128,11 +128,49 @@ Before first launch, make sure that:
 - stdin and stdout are interactive terminals. Solo refuses redirected or
   piped execution before it creates a marker or writes a database.
 
-Solo v1 discovers only authenticated, healthy local CLI harnesses: `codex`,
-`claude_code`, `cursor`, `opencode`, `gemini`, and `smith`. `shell`,
-`embedded`, and `null` are not first-run Solo chat harnesses. Provider API-key
-entry, OAuth, browser login, and credential-cache import are outside the TUI;
-complete the selected CLI's own login flow and then retry Solo.
+Solo v1 discovers authenticated, healthy local CLI harnesses: `codex`,
+`claude_code`, `cursor`, `opencode`, `gemini`, and `smith`. `shell` and `null`
+are not first-run Solo chat harnesses. Provider API-key entry, OAuth, browser
+login, and credential-cache import are outside the TUI; complete the selected
+CLI's own login flow and then retry Solo.
+
+### Config-declared model providers
+
+Solo also accepts direct Agents backed by providers declared in the user-owned
+Forge config file (`~/.forge/forge.yaml` by default). This is the onboarding
+path when you do not want to depend on a local CLI harness login — for example
+a z.ai GLM endpoint or a Google Gemini key:
+
+```yaml
+providers:
+  zai:
+    kind: openai_compatible          # openai | openai_compatible | openrouter | xai | gemini
+    base_url: https://api.z.ai/api/coding/paas/v4
+    api_key: <key>                   # or api_key_env: ZAI_API_KEY
+    models:
+      - model: glm-5.3
+        context_tokens: 1000000
+        max_output_tokens: 131072
+      - model: glm-4.7
+  google:
+    kind: gemini
+    api_key: <key>
+    models:
+      - model: gemini-3.8-flash
+```
+
+On every launch Solo syncs these declarations into its isolated store: one
+protected provider entry per provider (label `config:<name>`) and one direct
+embedded Agent per declared model (named `<provider>/<model>`). The sync is
+idempotent and per-provider failure-tolerant — a provider that cannot be
+reached, or whose `api_key_env` variable is unset, is skipped with a log line
+and never blocks bootstrap or removes existing candidates. Config-declared
+Agents appear in the first-run Agent picker next to local CLI harnesses and
+can serve as the Project Agent, the Task Worker, or both, so different roles
+can use different providers and models. Exactly one of `api_key` /
+`api_key_env` must be set per provider; the config file is owner-owned host
+configuration, so prefer `api_key_env` when the deployment cannot protect it.
+An `openai_compatible` provider must set `base_url`.
 
 On Unix systems (including Linux and macOS), Solo enforces owner-only POSIX
 mode bits for its marker and data root. Other platforms do not receive those

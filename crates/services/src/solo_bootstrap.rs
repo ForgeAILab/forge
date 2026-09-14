@@ -325,6 +325,8 @@ struct CandidateEvaluation {
 #[derive(Clone)]
 pub struct SoloBootstrapService {
     db: Arc<SqliteDb>,
+    embedded_agents: Option<Arc<crate::EmbeddedAgentService>>,
+    config_providers: config::ProviderDeclarations,
 }
 
 impl std::fmt::Debug for SoloBootstrapService {
@@ -338,7 +340,30 @@ impl std::fmt::Debug for SoloBootstrapService {
 impl SoloBootstrapService {
     #[must_use]
     pub fn new(db: Arc<SqliteDb>) -> Self {
-        Self { db }
+        Self {
+            db,
+            embedded_agents: None,
+            config_providers: config::ProviderDeclarations::default(),
+        }
+    }
+
+    /// Supply the embedded Agent runtime used to materialize config-declared
+    /// provider entries and direct Agents.  Without it, config provider
+    /// declarations are ignored and Solo keeps its CLI-harness-only candidate
+    /// set.
+    #[must_use]
+    pub fn with_embedded_agents(mut self, service: Arc<crate::EmbeddedAgentService>) -> Self {
+        self.embedded_agents = Some(service);
+        self
+    }
+
+    /// Supply the provider declarations parsed from the user-owned Forge
+    /// config file.  Solo is the consumer: the server keeps its own
+    /// UI/API-driven provider onboarding.
+    #[must_use]
+    pub fn with_config_providers(mut self, providers: config::ProviderDeclarations) -> Self {
+        self.config_providers = providers;
+        self
     }
 
     /// Create or resume the one Solo owner/Project/repository/chat setup for
@@ -369,6 +394,13 @@ impl SoloBootstrapService {
                 return Err(conflict("Solo owner does not match the Project owner"));
             }
         }
+
+        // Config-declared providers are synced before candidate discovery so
+        // the picker can offer direct Agents alongside local CLI harnesses.
+        // Each provider syncs independently: an unreachable endpoint or a
+        // missing env secret skips that provider instead of failing the
+        // bootstrap, and the CLI-harness candidates remain unaffected.
+        self.sync_config_provider_agents(&owner_id).await;
 
         let mut evaluations = self
             .candidate_evaluations(&request, &owner_id, existing_project_metadata.as_ref())
@@ -790,6 +822,139 @@ impl SoloBootstrapService {
             .collect())
     }
 
+    /// Config-declared direct Agents owned by the Solo owner. These were
+    /// materialized by the bootstrap provider sync; startup appends them to
+    /// the explicit CLI candidate list so the picker shows both families.
+    pub async fn config_agent_candidates(
+        &self,
+        owner_id: &str,
+    ) -> Result<Vec<SoloAgentCandidateInput>> {
+        Ok(list_agents(&self.db)
+            .await?
+            .into_iter()
+            .filter(|agent| {
+                agent.owner_id.as_deref() == Some(owner_id)
+                    && agent.backend_kind == "native"
+                    && agent.executor_type == "embedded"
+            })
+            .map(|agent| SoloAgentCandidateInput {
+                identity_id: agent.id,
+                profile_id: Some(agent.profile_id),
+                executor_type: "embedded".to_owned(),
+                availability: SoloAgentAvailability::Authenticated,
+                display_name: Some(agent.name),
+            })
+            .collect())
+    }
+
+    /// Materialize the config-declared providers as protected provider
+    /// entries and direct embedded Agents owned by the Solo owner.  The sync
+    /// is idempotent: entries are keyed by a `config:` label and Agents by a
+    /// `provider/model` name, so repeated launches reuse the durable records.
+    /// A provider that cannot be connected is skipped with a log line; it
+    /// never blocks bootstrap or removes existing candidates.
+    #[tracing::instrument(skip(self, owner_id), fields(providers = self.config_providers.entries.len()))]
+    async fn sync_config_provider_agents(&self, owner_id: &str) {
+        let Some(embedded) = self.embedded_agents.as_ref() else {
+            return;
+        };
+        if self.config_providers.entries.is_empty() {
+            return;
+        }
+        let existing_handles =
+            db::CredentialHandleRepo::list_credential_handles(&*self.db, owner_id)
+                .await
+                .unwrap_or_default();
+        let existing_agents: Vec<Agent> = list_agents(&self.db)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|agent| agent.owner_id.as_deref() == Some(owner_id))
+            .collect();
+
+        for (provider_name, declaration) in &self.config_providers.entries {
+            let secret = match resolve_provider_secret(provider_name, declaration) {
+                Ok(secret) => secret,
+                Err(reason) => {
+                    tracing::warn!(
+                        provider = provider_name.as_str(),
+                        reason,
+                        "skipping config provider"
+                    );
+                    continue;
+                }
+            };
+            let label = format!("config:{provider_name}");
+            let credential_id = match existing_handles
+                .iter()
+                .find(|handle| handle.label == label && handle.enabled)
+            {
+                Some(existing) => existing.id.clone(),
+                None => {
+                    match embedded
+                        .connect_api_key_credential(
+                            crate::embedded_agent_service::ConnectApiKeyCredential {
+                                owner_user_id: owner_id.to_owned(),
+                                provider: declaration.kind.clone(),
+                                label: label.clone(),
+                                credential: secret,
+                                base_url: declaration.base_url.clone(),
+                            },
+                        )
+                        .await
+                    {
+                        Ok(handle) => handle.id,
+                        Err(error) => {
+                            tracing::warn!(
+                                provider = provider_name.as_str(),
+                                error = %error,
+                                "config provider entry could not be created"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
+            for model in &declaration.models {
+                let name = format!("{provider_name}/{}", model.model);
+                if existing_agents
+                    .iter()
+                    .any(|agent| agent.name == name && agent.backend_kind == "native")
+                {
+                    continue;
+                }
+                if let Err(error) = embedded
+                    .create_agent_from_entry(crate::embedded_agent_service::CreateEmbeddedAgent {
+                        owner_user_id: owner_id.to_owned(),
+                        name,
+                        description: Some(format!(
+                            "Config-declared provider agent ({})",
+                            declaration.kind
+                        )),
+                        credential_id: credential_id.clone(),
+                        model: model.model.clone(),
+                        reasoning_effort: model.reasoning_effort.clone(),
+                        system_prompt: None,
+                        account_permission_ceiling:
+                            crate::embedded_agent_service::default_profile_tool_policy(),
+                        tool_policy: crate::embedded_agent_service::default_profile_tool_policy(),
+                        context_tokens: model.context_tokens,
+                        max_input_tokens: model.max_input_tokens,
+                        max_output_tokens: model.max_output_tokens,
+                    })
+                    .await
+                {
+                    tracing::warn!(
+                        provider = provider_name.as_str(),
+                        model = model.model.as_str(),
+                        error = %error,
+                        "config provider agent could not be created"
+                    );
+                }
+            }
+        }
+    }
+
     async fn evaluate_candidate_inputs(
         &self,
         owner_id: &str,
@@ -848,7 +1013,10 @@ impl SoloBootstrapService {
             next_step: None,
         };
 
-        if !allowed_cli_executor(&executor_type) {
+        // Direct embedded Agents are config/provider-backed: they carry a
+        // protected credential instead of a CLI login and are validated by the
+        // native profile alignment check below.
+        if !allowed_cli_executor(&executor_type) && executor_type != "embedded" {
             candidate.reason = Some("unsupported_cli_executor".to_owned());
             candidate.next_step = Some("choose a supported authenticated CLI harness".to_owned());
             return Ok(CandidateEvaluation {
@@ -916,9 +1084,12 @@ impl SoloBootstrapService {
                 agent: Some(agent),
             });
         };
-        if profile.backend_kind != "cli"
+        if (profile.backend_kind != "cli"
             || profile.executor_type != executor_type
-            || agent.backend_kind != "cli"
+            || agent.backend_kind != "cli")
+            && (profile.backend_kind != "native"
+                || executor_type != "embedded"
+                || agent.backend_kind != "native")
         {
             candidate.reason = Some("not_a_local_cli_profile".to_owned());
             candidate.next_step = Some("choose a supported local CLI harness".to_owned());
@@ -2103,6 +2274,35 @@ fn agent_registration_key(agent: &Agent) -> Option<String> {
         })
 }
 
+/// Resolve a config-declared provider's API key.  An inline key wins over the
+/// environment reference; both being set was already rejected by config
+/// validation, and neither being set is a config error surfaced at load.
+fn resolve_provider_secret(
+    provider_name: &str,
+    declaration: &config::ProviderDeclaration,
+) -> std::result::Result<forge_agent_host::Secret, String> {
+    if let Some(api_key) = declaration
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(forge_agent_host::Secret::new(api_key.to_owned()));
+    }
+    let env_name = declaration
+        .api_key_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "provider declares neither api_key nor api_key_env".to_owned())?;
+    std::env::var(env_name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| forge_agent_host::Secret::new(value.trim().to_owned()))
+        .ok_or_else(|| format!("environment variable {env_name} is not set"))
+        .map_err(|reason| format!("provider `{provider_name}`: {reason}"))
+}
+
 async fn list_agents(db: &SqliteDb) -> Result<Vec<Agent>> {
     list_pages(
         |page| {
@@ -2171,8 +2371,8 @@ where
 mod tests {
     use super::*;
     use db::{
-        create_sqlite_pool, run_migrations, AgentRepo, CreateAgent, DaemonStatus,
-        UpdateDaemonReport, UpsertDaemon,
+        create_sqlite_pool, run_migrations, AgentRepo, CreateAgent, CreateAgentIdentity,
+        CreateAgentProfile, DaemonStatus, UpdateDaemonReport, UpsertDaemon,
     };
     use tempfile::tempdir;
 
@@ -2193,6 +2393,223 @@ mod tests {
         );
         request.repository_name = Some("demo".to_owned());
         request
+    }
+
+    #[tokio::test]
+    async fn config_embedded_candidates_are_eligible_for_solo_selection() {
+        let (db, service) = fixture().await;
+        let source = tempdir().expect("temp repository");
+        let repo_id = db::new_uuid_v4();
+        let initial = service
+            .bootstrap(request(source.path(), &repo_id))
+            .await
+            .expect("owner bootstrap");
+        let owner_id = initial.owner_id.clone();
+        let now = db::now_rfc3339();
+
+        // The config sync creates protected entries through the embedded
+        // service; the eligibility gate only reads the handle row, so the
+        // test seeds that row directly.
+        let handle_id = db::new_uuid_v4();
+        sqlx::query(
+            "INSERT INTO credential_handle (
+                id, owner_user_id, provider, label, status, enabled,
+                credential_method, metadata_json, version, created_at, updated_at
+             ) VALUES (?, ?, 'openai_compatible', 'config:zai', 'configured', 1, 'api_key', '{}', 1, ?, ?)",
+        )
+        .bind(&handle_id)
+        .bind(&owner_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("credential handle");
+
+        let identity_id = db::new_uuid_v4();
+        let profile_id = db::new_uuid_v4();
+        let agent = AgentRepo::create_identity_with_profile(
+            &*db,
+            CreateAgentIdentity {
+                id: identity_id.clone(),
+                name: "zai/glm-5.3".to_owned(),
+                description: None,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: AgentStatus::Idle,
+                last_heartbeat_at: Some(now.clone()),
+                is_default: false,
+                paused: false,
+                owner_id: Some(owner_id.clone()),
+                visibility: "account".to_owned(),
+                account_permission_ceiling: "null".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            CreateAgentProfile {
+                id: profile_id.clone(),
+                identity_id: identity_id.clone(),
+                backend_kind: "native".to_owned(),
+                executor_type: "embedded".to_owned(),
+                provider: Some("openai_compatible".to_owned()),
+                model: Some("glm-5.3".to_owned()),
+                reasoning_effort: None,
+                permission_policy: Some("scoped_proposals".to_owned()),
+                prompt_template: None,
+                capabilities_json: "[]".to_owned(),
+                tool_policy_json: crate::embedded_agent_service::default_profile_tool_policy()
+                    .to_string(),
+                config_json: "{}".to_owned(),
+                credential_ref: Some(handle_id.clone()),
+                daemon_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("native agent");
+
+        db::AgentConnectionHealthRepo::upsert_connection_health(
+            &*db,
+            db::UpsertAgentConnectionHealth {
+                profile_id: profile_id.clone(),
+                status: "healthy".to_owned(),
+                capability_status_json: "{}".to_owned(),
+                checked_at: Some(now.clone()),
+                error_code: None,
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("connection health");
+
+        let mut confirmed = request(source.path(), &repo_id);
+        confirmed.agent_candidates = vec![SoloAgentCandidateInput {
+            identity_id: agent.id.clone(),
+            profile_id: Some(agent.profile_id.clone()),
+            executor_type: "embedded".to_owned(),
+            availability: SoloAgentAvailability::Authenticated,
+            display_name: Some("zai/glm-5.3".to_owned()),
+        }];
+        confirmed.selected_project_agent_id = Some(agent.id.clone());
+        confirmed.selected_worker_agent_id = Some(agent.id.clone());
+        let selected = service
+            .bootstrap(confirmed)
+            .await
+            .expect("embedded agent selection");
+        assert_eq!(
+            selected.readiness,
+            SoloBootstrapReadiness::CharterAdoptionRequired
+        );
+        assert!(
+            selected.agent_candidates[0].eligible,
+            "config-backed embedded candidate should be eligible"
+        );
+        assert_eq!(
+            selected.agent_candidates[0].reason.as_deref(),
+            None,
+            "eligible candidate carries no blocking reason"
+        );
+        assert_eq!(
+            selected.selected_project_agent_id.as_deref(),
+            Some(agent.id.as_str())
+        );
+        assert_eq!(
+            selected.worker_identity_id.as_deref(),
+            Some(agent.id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_candidates_with_misaligned_backends_are_rejected() {
+        let (db, service) = fixture().await;
+        let source = tempdir().expect("temp repository");
+        let repo_id = db::new_uuid_v4();
+        let initial = service
+            .bootstrap(request(source.path(), &repo_id))
+            .await
+            .expect("owner bootstrap");
+        let owner_id = initial.owner_id.clone();
+        let now = db::now_rfc3339();
+
+        let handle_id = db::new_uuid_v4();
+        sqlx::query(
+            "INSERT INTO credential_handle (
+                id, owner_user_id, provider, label, status, enabled,
+                credential_method, metadata_json, version, created_at, updated_at
+             ) VALUES (?, ?, 'gemini', 'config:google', 'configured', 1, 'api_key', '{}', 1, ?, ?)",
+        )
+        .bind(&handle_id)
+        .bind(&owner_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .expect("credential handle");
+
+        // backend_kind "cli" with executor "embedded" is a misalignment that
+        // must never pass the native gate.
+        let identity_id = db::new_uuid_v4();
+        let profile_id = db::new_uuid_v4();
+        let agent = AgentRepo::create_identity_with_profile(
+            &*db,
+            CreateAgentIdentity {
+                id: identity_id.clone(),
+                name: "misaligned".to_owned(),
+                description: None,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: AgentStatus::Idle,
+                last_heartbeat_at: Some(now.clone()),
+                is_default: false,
+                paused: false,
+                owner_id: Some(owner_id.clone()),
+                visibility: "account".to_owned(),
+                account_permission_ceiling: "null".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            CreateAgentProfile {
+                id: profile_id.clone(),
+                identity_id: identity_id.clone(),
+                backend_kind: "cli".to_owned(),
+                executor_type: "embedded".to_owned(),
+                provider: Some("gemini".to_owned()),
+                model: Some("gemini-3.8-flash".to_owned()),
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "[]".to_owned(),
+                tool_policy_json: "null".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: Some(handle_id),
+                daemon_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .expect("misaligned agent");
+
+        let mut listed = request(source.path(), &repo_id);
+        listed.agent_candidates = vec![SoloAgentCandidateInput {
+            identity_id: agent.id.clone(),
+            profile_id: Some(agent.profile_id.clone()),
+            executor_type: "embedded".to_owned(),
+            availability: SoloAgentAvailability::Authenticated,
+            display_name: None,
+        }];
+        let result = service.bootstrap(listed).await.expect("candidate listed");
+        let candidate = &result.agent_candidates[0];
+        assert!(
+            !candidate.eligible,
+            "misaligned cli-backend/embedded-executor candidate must not be eligible"
+        );
+        assert!(
+            candidate.reason.is_some(),
+            "ineligible candidate carries a structured reason"
+        );
     }
 
     #[tokio::test]

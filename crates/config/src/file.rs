@@ -11,6 +11,25 @@ pub(crate) struct FileConfig {
     pub terminal: Option<FileTerminalConfig>,
     pub scaffold: Option<FileScaffoldConfig>,
     pub project: Option<BTreeMap<String, String>>,
+    pub providers: Option<BTreeMap<String, FileProviderDeclaration>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct FileProviderDeclaration {
+    pub kind: Option<String>,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub api_key_env: Option<String>,
+    pub models: Option<Vec<FileProviderModel>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct FileProviderModel {
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub context_tokens: Option<u32>,
+    pub max_input_tokens: Option<u32>,
+    pub max_output_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]

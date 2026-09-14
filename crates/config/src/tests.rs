@@ -214,6 +214,104 @@ terminal:
 }
 
 #[test]
+fn provider_declarations_load_from_file() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    clear_forge_env();
+
+    let dir = tempdir().expect("tempdir");
+    let config_path = dir.path().join("forge.yaml");
+    fs::write(
+        &config_path,
+        r#"
+providers:
+  zai:
+    kind: openai_compatible
+    base_url: https://api.z.ai/api/coding/paas/v4
+    api_key_env: ZAI_API_KEY
+    models:
+      - model: glm-5.3
+        context_tokens: 1000000
+        max_output_tokens: 131072
+      - model: glm-4.7
+  google:
+    kind: gemini
+    api_key: test-key
+    models:
+      - model: gemini-3.8-flash
+"#,
+    )
+    .expect("write config");
+
+    let config = ForgeConfig::load(Some(&config_path), ConfigOverrides::default())
+        .expect("provider config loads");
+
+    assert_eq!(config.providers.entries.len(), 2);
+    let zai = &config.providers.entries["zai"];
+    assert_eq!(zai.kind, "openai_compatible");
+    assert_eq!(
+        zai.base_url.as_deref(),
+        Some("https://api.z.ai/api/coding/paas/v4")
+    );
+    assert!(zai.api_key.is_none());
+    assert_eq!(zai.api_key_env.as_deref(), Some("ZAI_API_KEY"));
+    assert_eq!(zai.models.len(), 2);
+    assert_eq!(zai.models[0].model, "glm-5.3");
+    assert_eq!(zai.models[0].context_tokens, Some(1_000_000));
+    assert_eq!(zai.models[0].max_output_tokens, Some(131_072));
+    assert_eq!(zai.models[1].model, "glm-4.7");
+
+    let google = &config.providers.entries["google"];
+    assert_eq!(google.kind, "gemini");
+    assert_eq!(google.api_key.as_deref(), Some("test-key"));
+    assert!(google.base_url.is_none());
+    assert_eq!(google.models.len(), 1);
+    assert_eq!(google.models[0].model, "gemini-3.8-flash");
+}
+
+#[test]
+fn provider_declarations_reject_invalid_kinds_and_credential_shapes() {
+    let _guard = env_lock().lock().expect("env lock poisoned");
+    clear_forge_env();
+
+    let cases: [(&str, &str, &str); 4] = [
+        (
+            "unknown kind",
+            "providers:\n  zai:\n    kind: anthropic\n    api_key: k\n    models: [{model: m}]\n",
+            "unsupported kind",
+        ),
+        (
+            "missing credential",
+            "providers:\n  zai:\n    kind: openai\n    models: [{model: m}]\n",
+            "must set api_key or api_key_env",
+        ),
+        (
+            "both credentials",
+            "providers:\n  zai:\n    kind: openai\n    api_key: k\n    api_key_env: K\n    models: [{model: m}]\n",
+            "pick one",
+        ),
+        (
+            "openai_compatible without base_url",
+            "providers:\n  zai:\n    kind: openai_compatible\n    api_key: k\n    models: [{model: m}]\n",
+            "must set base_url",
+        ),
+    ];
+    for (name, body, expected) in cases {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("forge.yaml");
+        fs::write(&config_path, body).expect("write config");
+        let error = ForgeConfig::load(Some(&config_path), ConfigOverrides::default())
+            .expect_err("invalid provider declaration rejects on load");
+        assert!(
+            matches!(
+                &error,
+                ConfigError::InvalidConfig { message } if message.contains(expected)
+            ),
+            "{name}: unexpected error {error:?}"
+        );
+    }
+}
+
+#[test]
 fn precedence_is_cli_over_env_over_file_over_defaults() {
     let _guard = env_lock().lock().expect("env lock poisoned");
     clear_forge_env();
