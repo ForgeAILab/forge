@@ -672,7 +672,7 @@ fn decode_base64_standard(input: &str) -> Vec<u8> {
 async fn setup_git_repo(path: &Path) -> std::path::PathBuf {
     let repo_path = path.join("repo");
     std::fs::create_dir_all(&repo_path).expect("repo dir creates");
-    run_git(&repo_path, &["init"]);
+    run_git(&repo_path, &["init", "--initial-branch=main"]);
     run_git(&repo_path, &["config", "user.email", "test@forge.dev"]);
     run_git(&repo_path, &["config", "user.name", "Forge Test"]);
     std::fs::write(repo_path.join("README.md"), "# Happy Path\n").expect("README writes");

@@ -47,7 +47,7 @@ async fn sqlite_db() -> db::SqliteDb {
 }
 
 fn setup_git_repo(path: &Path) -> String {
-    run_git(path, &["init"]);
+    run_git(path, &["init", "--initial-branch=main"]);
     // Pin the initial branch the way `git::init` does. Repository readiness
     // requires the registered default branch to be `main` and to exist on
     // disk, so inheriting the host's `init.defaultBranch` makes an

@@ -582,7 +582,7 @@ async fn create_agent(app: &Router, name: &str, daemon_id: &str) -> AgentRespons
 async fn setup_git_repo(path: &Path) -> PathBuf {
     let repo_path = path.join("repo");
     std::fs::create_dir_all(&repo_path).expect("repo dir creates");
-    run_git(&repo_path, &["init"]);
+    run_git(&repo_path, &["init", "--initial-branch=main"]);
     run_git(&repo_path, &["config", "user.email", "test@forge.dev"]);
     run_git(&repo_path, &["config", "user.name", "Forge Test"]);
     std::fs::write(repo_path.join("README.md"), "# Follow Up Chat\n").expect("README writes");

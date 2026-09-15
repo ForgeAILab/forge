@@ -85,7 +85,7 @@ async fn embedded_daemon_marks_git_repo_directories() {
     let plain_dir = dir.path().join("plain-dir");
     fs::create_dir_all(&git_dir).expect("create git dir");
     fs::create_dir_all(&plain_dir).expect("create plain dir");
-    run_git(&git_dir, &["init"]);
+    run_git(&git_dir, &["init", "--initial-branch=main"]);
 
     let response: FsListResponse = empty_request(
         &app,
@@ -192,7 +192,7 @@ async fn embedded_daemon_filters_git_internal_dir() {
     let dir = TestDir::new("forge-api-fs-routing-git-filter");
     let repo_path = dir.path().join("repo");
     fs::create_dir_all(&repo_path).expect("create repo dir");
-    run_git(&repo_path, &["init"]);
+    run_git(&repo_path, &["init", "--initial-branch=main"]);
 
     let repo_response: FsListResponse = empty_request(
         &app,

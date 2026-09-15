@@ -357,7 +357,7 @@ async fn poll_agent_active(app: &Router, agent_id: &str) -> AgentResponse {
 
 fn setup_git_repo(path: &Path) -> PathBuf {
     let repo_path = path.to_path_buf();
-    run_git(&repo_path, &["init"]);
+    run_git(&repo_path, &["init", "--initial-branch=main"]);
     run_git(&repo_path, &["config", "user.email", "test@forge.dev"]);
     run_git(&repo_path, &["config", "user.name", "Forge Test"]);
     std::fs::write(repo_path.join("README.md"), "# Test").expect("write README");

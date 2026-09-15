@@ -457,7 +457,7 @@ async fn seed_awaiting_human_review_with_passed_flag(
 fn setup_git_repo(path: &Path) -> PathBuf {
     let repo_path = path.join("repo");
     std::fs::create_dir_all(&repo_path).expect("repo dir creates");
-    run_git(&repo_path, &["init"]);
+    run_git(&repo_path, &["init", "--initial-branch=main"]);
     run_git(&repo_path, &["checkout", "-B", "main"]);
     run_git(&repo_path, &["config", "user.email", "test@forge.dev"]);
     run_git(&repo_path, &["config", "user.name", "Forge Test"]);

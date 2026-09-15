@@ -6,6 +6,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Fixed
+
+- Test fixtures now create their git repositories with
+  `git init --initial-branch=main`, matching the branch the repository
+  readiness check requires. Hosts whose git default branch is not `main`
+  (GitHub-hosted CI runners default to `master`) made every
+  repository-dependent suite fail with `execution_setup_required`.
+- `services` is warning-free under Rust 1.98 clippy: the planning-review
+  metadata helper's late-initialized binding is now a plain `if`
+  expression.
+
 ## [0.12.0] - 2026-09-14
 
 ### Added

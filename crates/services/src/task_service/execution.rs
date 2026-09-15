@@ -123,8 +123,7 @@ pub(super) async fn set_planning_awaiting_review_metadata(
     let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
         ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
     })?;
-    let mutations;
-    if awaiting {
+    let mutations = if awaiting {
         let completed_at = now_rfc3339();
         let marker_id = new_uuid_v4();
         let mut next = vec![
@@ -151,7 +150,7 @@ pub(super) async fn set_planning_awaiting_review_metadata(
                 value: Value::String(execution_id.to_owned()),
             });
         }
-        mutations = next;
+        next
     } else if metadata
         .extra
         .get("awaiting_human_reason")
@@ -176,7 +175,7 @@ pub(super) async fn set_planning_awaiting_review_metadata(
             // with the same reason.
             return Ok(task.clone());
         };
-        mutations = vec![db::TaskMetadataMutation::CompareAndMutate {
+        vec![db::TaskMetadataMutation::CompareAndMutate {
             key: identity_key.to_owned(),
             expected,
             mutations: vec![
@@ -196,10 +195,10 @@ pub(super) async fn set_planning_awaiting_review_metadata(
                     key: "awaiting_human_marker_id".to_owned(),
                 },
             ],
-        }];
+        }]
     } else {
         return Ok(task.clone());
-    }
+    };
 
     TaskRepo::mutate_metadata(db, &task.id, Some(task.version), mutations, &now_rfc3339())
         .await

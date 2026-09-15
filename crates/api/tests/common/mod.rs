@@ -102,7 +102,7 @@ pub async fn test_app(workspace_root: &Path, prefix: &str) -> Harness {
 pub fn setup_git_repo(root: &Path) -> PathBuf {
     let repo_path = root.join("repo");
     std::fs::create_dir_all(&repo_path).expect("repo dir creates");
-    run_git(&repo_path, &["init"]);
+    run_git(&repo_path, &["init", "--initial-branch=main"]);
     run_git(&repo_path, &["config", "user.email", "test@forge.dev"]);
     run_git(&repo_path, &["config", "user.name", "Forge Test"]);
     std::fs::write(repo_path.join("README.md"), "# Forge\n").expect("README writes");

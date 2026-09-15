@@ -166,7 +166,7 @@ async fn seed_project_without_repo_and_task(db: &SqliteDb, task_id: &str, status
 }
 
 fn setup_git_repo(path: &std::path::Path) -> String {
-    run_git(path, &["init"]);
+    run_git(path, &["init", "--initial-branch=main"]);
     run_git(path, &["config", "user.email", "test@forge.dev"]);
     run_git(path, &["config", "user.name", "Forge Test"]);
     std::fs::write(path.join("README.md"), "# Forge\n").expect("README writes");

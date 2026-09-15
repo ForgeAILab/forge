@@ -304,7 +304,7 @@ async fn create_agent(harness: &Harness) -> String {
 }
 
 fn setup_git_repo(path: &Path) {
-    run_git(path, &["init"]);
+    run_git(path, &["init", "--initial-branch=main"]);
     run_git(path, &["config", "user.email", "test@forge.dev"]);
     run_git(path, &["config", "user.name", "Forge Test"]);
     std::fs::write(path.join("README.md"), "# Task diff\n").expect("README writes");
