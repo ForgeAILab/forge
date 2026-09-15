@@ -14,6 +14,14 @@
 set -uo pipefail
 
 export FORGE_SKIP_WEB_BUILD=1
+# GitHub runner images ship git-lfs, whose global `filter.lfs.*` entries make
+# the hardened commit finalization fail closed (by design for real users) and
+# whose other global settings leak into fixtures. Run the suite against an
+# empty global config and no system config so hosts cannot change test
+# outcomes. Fixtures pin `init -b main` and set repo-local identity, so they
+# need nothing from the host.
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_NOSYSTEM=1
 
 failed=()
 
