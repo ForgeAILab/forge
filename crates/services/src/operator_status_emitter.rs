@@ -1,7 +1,4 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 use std::time::Duration;
 
 use events::{
@@ -9,6 +6,8 @@ use events::{
 };
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
+
+const ACTIVITY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct OperatorStatusEmitter {
     event_bus: Arc<EventBus>,
@@ -27,9 +26,12 @@ impl OperatorStatusEmitter {
             }
 
             let mut rx = task_event_bus.subscribe();
-            let dirty = AtomicBool::new(false);
+            let mut dirty = false;
+            let mut activity_dirty = false;
+            let mut last_publish = tokio::time::Instant::now();
             let mut last_event_type: Option<String> = None;
             let mut interval = tokio::time::interval(Duration::from_millis(500));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             interval.tick().await;
 
             loop {
@@ -40,18 +42,29 @@ impl OperatorStatusEmitter {
                                 let event_type = event.event_type;
                                 if is_status_affecting_event(&event_type) {
                                     last_event_type = Some(event_type);
-                                    dirty.store(true, Ordering::Release);
+                                    dirty = true;
+                                } else if event_type == "execution.log" {
+                                    activity_dirty = true;
                                 }
                             }
-                            Err(broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                // Lost notifications require a reconciliation, not silence.
+                                dirty = true;
+                                last_event_type = Some("events.resync_required".to_owned());
+                            }
                             Err(broadcast::error::RecvError::Closed) => break,
                         }
                     }
                     _ = interval.tick() => {
-                        if dirty.swap(false, Ordering::AcqRel) {
-                            let trigger = last_event_type
-                                .clone()
-                                .unwrap_or_else(|| "unknown".to_string());
+                        if refresh_due(dirty, activity_dirty, last_publish.elapsed()) {
+                            let trigger = if dirty {
+                                last_event_type.take().unwrap_or_else(|| "unknown".to_owned())
+                            } else {
+                                "execution.log".to_owned()
+                            };
+                            dirty = false;
+                            activity_dirty = false;
+                            last_publish = tokio::time::Instant::now();
                             task_event_bus.publish(ForgeEvent {
                                 event_type: OPERATIONS_STATUS_CHANGED_EVENT.to_string(),
                                 entity_id: "operations".to_string(),
@@ -71,8 +84,15 @@ impl OperatorStatusEmitter {
     }
 }
 
+// Streaming text is activity, not a lifecycle transition. It still refreshes
+// the Operations read model at a bounded cadence; terminal/capacity changes
+// keep the existing 500ms coalescing latency.
+fn refresh_due(dirty: bool, activity_dirty: bool, elapsed: Duration) -> bool {
+    dirty || (activity_dirty && elapsed >= ACTIVITY_REFRESH_INTERVAL)
+}
+
 fn is_status_affecting_event(event_type: &str) -> bool {
-    if event_type == OPERATIONS_STATUS_CHANGED_EVENT {
+    if event_type == OPERATIONS_STATUS_CHANGED_EVENT || event_type == "execution.log" {
         return false;
     }
 
@@ -104,6 +124,18 @@ mod tests {
         assert!(is_status_affecting_event("merge.started"));
         assert!(!is_status_affecting_event(OPERATIONS_STATUS_CHANGED_EVENT));
         assert!(!is_status_affecting_event("unknown.event"));
+        assert!(!is_status_affecting_event("execution.log"));
+        assert!(is_status_affecting_event("execution.completed"));
+    }
+
+    #[test]
+    fn log_activity_is_bounded_without_delaying_lifecycle_changes() {
+        assert!(!refresh_due(false, false, Duration::from_secs(60)));
+        assert!(!refresh_due(false, true, Duration::from_millis(500)));
+        assert!(!refresh_due(false, true, Duration::from_millis(4_999)));
+        assert!(refresh_due(false, true, Duration::from_secs(5)));
+        assert!(refresh_due(true, true, Duration::ZERO));
+        assert!(refresh_due(true, false, Duration::ZERO));
     }
 
     #[tokio::test]
