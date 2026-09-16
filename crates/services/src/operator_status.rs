@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc};
+use std::{sync::Arc, time::Instant};
 
 use api_types::{
     ActiveExecutionSummary, AgentPressureSummary, BlockedTaskSummary, DaemonIssueSummary,
@@ -8,7 +8,6 @@ use api_types::{
 };
 use chrono::{DateTime, Duration, Utc};
 use db::SqliteDb;
-use executors::{LogKind, LogReader};
 use serde_json::Value;
 use sqlx::Row;
 
@@ -19,21 +18,41 @@ use crate::{
     ServiceError,
 };
 
+mod log_snapshot;
+
+use log_snapshot::ExecutionLogSnapshots;
+
 pub struct OperatorStatusService {
     db: Arc<SqliteDb>,
+    log_snapshots: ExecutionLogSnapshots,
 }
 
 impl OperatorStatusService {
     pub fn new(db: Arc<SqliteDb>) -> Self {
-        Self { db }
+        Self {
+            db,
+            log_snapshots: ExecutionLogSnapshots::default(),
+        }
     }
 
     pub async fn compute_status(&self) -> Result<OperatorStatusResponse, ServiceError> {
+        let started = Instant::now();
+        let result = self.compute_status_inner().await;
+        tracing::debug!(
+            target: "forge::perf",
+            operation = "operations_status",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            success = result.is_ok(),
+            "performance sample"
+        );
+        result
+    }
+
+    async fn compute_status_inner(&self) -> Result<OperatorStatusResponse, ServiceError> {
         let now = Utc::now();
         let computed_at = now.to_rfc3339();
 
         let active_executions = self.active_executions(now).await?;
-        let _queued_tasks = self.queued_dispatchable_tasks().await?;
         let blocked_tasks = self.blocked_tasks().await?;
         let daemon_issues = self.daemon_issues(now).await?;
         let daemon_error_count = self.daemon_error_count().await?;
@@ -119,8 +138,10 @@ impl OperatorStatusService {
                 Some(workspace_path) => plan_progress(workspace_path).await?,
                 None => None,
             };
-            let log_snapshot =
-                execution_log_snapshot(row.try_get::<Option<String>, _>("logs_path")?).await;
+            let log_snapshot = self
+                .log_snapshots
+                .read(row.try_get::<Option<String>, _>("logs_path")?)
+                .await;
             let execution_id: String = row.try_get("execution_id")?;
             let usage = usage_aggregate_for_source_state(&self.db, &execution_id, true).await?;
             let token_totals = Some(TokenTotalsSummary {
@@ -156,31 +177,14 @@ impl OperatorStatusService {
         Ok(active_executions)
     }
 
-    async fn queued_dispatchable_tasks(&self) -> Result<Vec<String>, ServiceError> {
-        let rows = sqlx::query(
-            "SELECT t.id
-             FROM task t
-             WHERE t.status IN ('todo', 'backlog')
-               AND t.deleted_at IS NULL
-               AND NOT EXISTS (
-                   SELECT 1 FROM execution e
-                   WHERE e.task_id = t.id AND e.status = 'running'
-               )
-             ORDER BY t.priority DESC, t.created_at ASC, t.id ASC",
-        )
-        .fetch_all(self.db.pool())
-        .await?;
-
-        rows.into_iter()
-            .map(|row| row.try_get("id").map_err(ServiceError::from))
-            .collect()
-    }
-
     async fn blocked_tasks(&self) -> Result<Vec<BlockedTaskSummary>, ServiceError> {
         let rows = sqlx::query(
             "SELECT id, title, error_annotation, blocked_json, updated_at
              FROM task
-             WHERE status = 'blocked' AND deleted_at IS NULL
+             WHERE (status = 'blocked' OR blocked_json IS NOT NULL)
+               AND deleted_at IS NULL
+               AND archived_at IS NULL
+               AND status NOT IN ('done', 'cancelled')
              ORDER BY updated_at DESC, id ASC",
         )
         .fetch_all(self.db.pool())
@@ -193,7 +197,7 @@ impl OperatorStatusService {
                 Ok(BlockedTaskSummary {
                     task_id: row.try_get("id")?,
                     title: row.try_get("title")?,
-                    blocked_reason: error_annotation.or_else(|| blocked_reason(&blocked_json)),
+                    blocked_reason: blocked_reason(&blocked_json).or(error_annotation),
                     blocked_since: Some(row.try_get("updated_at")?),
                 })
             })
@@ -503,48 +507,6 @@ fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .ok()
         .map(|value| value.with_timezone(&Utc))
-}
-
-#[derive(Default)]
-struct ExecutionLogSnapshot {
-    turn_count: u32,
-    last_event: Option<String>,
-    last_event_time: Option<String>,
-}
-
-async fn execution_log_snapshot(logs_path: Option<String>) -> ExecutionLogSnapshot {
-    let Some(logs_path) = logs_path else {
-        return ExecutionLogSnapshot::default();
-    };
-    let path = Path::new(&logs_path);
-    let mut from_sequence = 0;
-    let mut snapshot = ExecutionLogSnapshot::default();
-
-    loop {
-        let result = match LogReader::read(path, from_sequence, 500).await {
-            Ok(result) => result,
-            Err(error) => {
-                tracing::debug!(logs_path = %logs_path, %error, "failed to read execution log snapshot");
-                return snapshot;
-            }
-        };
-        for entry in &result.entries {
-            if entry.kind == LogKind::Assistant {
-                snapshot.turn_count = snapshot.turn_count.saturating_add(1);
-            }
-            snapshot.last_event = Some(entry.kind.to_string());
-            snapshot.last_event_time = Some(entry.timestamp.clone());
-        }
-        if !result.has_more {
-            break;
-        }
-        let Some(next_sequence) = result.next_sequence else {
-            break;
-        };
-        from_sequence = next_sequence;
-    }
-
-    snapshot
 }
 
 fn rate_limit_snapshot(snapshot_json: Option<&str>) -> Option<Value> {
@@ -1105,5 +1067,68 @@ mod tests {
         assert!(!status.daemon_issues.is_empty());
         assert_eq!(status.daemon_issues[0].daemon_id, daemon_id);
         assert!(!status.workspace_cleanup.is_empty());
+    }
+
+    #[tokio::test]
+    async fn blocked_annotation_preserves_workflow_phase_and_clears_independently() {
+        let (db, service) = test_service().await;
+        let task_id = insert_task(&db, "review").await;
+        sqlx::query("UPDATE task SET blocked_json = ?, error_annotation = ? WHERE id = ?")
+            .bind(r#"{"reason":"dependency unavailable"}"#)
+            .bind("old diagnostic")
+            .bind(&task_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let status = service.compute_status().await.unwrap();
+        assert_eq!(status.overall_severity, OperatorSeverity::Blocked);
+        assert_eq!(status.blocked_tasks.len(), 1);
+        assert_eq!(status.blocked_tasks[0].task_id, task_id);
+        assert_eq!(
+            status.blocked_tasks[0].blocked_reason.as_deref(),
+            Some("dependency unavailable")
+        );
+        let phase: String = sqlx::query_scalar("SELECT status FROM task WHERE id = ?")
+            .bind(&task_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(phase, "review");
+        sqlx::query("UPDATE task SET blocked_json = NULL WHERE id = ?")
+            .bind(&task_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(service
+            .compute_status()
+            .await
+            .unwrap()
+            .blocked_tasks
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn inactive_tasks_do_not_report_stale_blocked_annotations() {
+        let (db, service) = test_service().await;
+        for phase in ["done", "cancelled", "review", "todo"] {
+            let task_id = insert_task(&db, phase).await;
+            sqlx::query(
+                "UPDATE task SET blocked_json = '{\"reason\":\"old blocker\"}',
+                 archived_at = CASE WHEN status = 'review' THEN ? ELSE NULL END,
+                 deleted_at = CASE WHEN status = 'todo' THEN ? ELSE NULL END WHERE id = ?",
+            )
+            .bind(Utc::now().to_rfc3339())
+            .bind(Utc::now().to_rfc3339())
+            .bind(&task_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        assert!(service
+            .compute_status()
+            .await
+            .unwrap()
+            .blocked_tasks
+            .is_empty());
     }
 }
