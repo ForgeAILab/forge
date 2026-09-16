@@ -6,7 +6,29 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Changed
+
+- Operations coalesces log-only refresh notifications at five-second
+  intervals. Lifecycle changes retain 500ms coalescing; the live execution
+  log stream is not throttled.
+
+### Added
+
+- Local `forge::perf` tracing and `scripts/collect_performance.py` summarize
+  Operations timings, log-scan work and cache hits, with optional HAR
+  aggregates. Collection uploads nothing and exports only allowlisted
+  aggregate measurements; see `docs/performance-testing.md`.
+
 ### Fixed
+
+- Operations builds execution-log summaries with one bounded sequential
+  scan instead of repeatedly parsing each 500-entry page from the file
+  beginning. A bounded, file-stamp-validated summary cache shares
+  concurrent reads and avoids rescanning unchanged logs until expiry.
+- Operations reports `blocked_json` on active tasks independently of
+  workflow phase, excluding deleted, archived, done and cancelled tasks.
+  The existing `error_annotation`-first reason display is preserved,
+  and no task phase or lifecycle transition is changed.
 
 - Test fixtures now create their git repositories with
   `git init --initial-branch=main`, matching the branch the repository

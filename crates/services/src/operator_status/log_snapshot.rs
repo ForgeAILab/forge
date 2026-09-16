@@ -278,9 +278,7 @@ mod tests {
             .open(&path)
             .await
             .unwrap();
-        file.write_all(complete[cut..].as_bytes())
-            .await
-            .unwrap();
+        file.write_all(&complete.as_bytes()[cut..]).await.unwrap();
         file.flush().await.unwrap();
         drop(file);
         assert_eq!(cache.read_measured(&path).await.snapshot.turn_count, 1);

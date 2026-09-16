@@ -22,8 +22,9 @@ Task lifecycle, API response, or execution-log schema changes are required.
   throttle the execution log stream itself.
 - Operations recognizes `blocked_json` independently of workflow phase.
   Deleted, archived, `done`, and `cancelled` tasks are excluded from this
-  blocker list. The current structured blocker takes precedence over an old
-  free-text diagnostic. The query never changes a Task's phase.
+  blocker list. The existing display priority is preserved: `error_annotation`
+  takes precedence, with the structured blocker reason used only when it is
+  absent. The query never changes a Task's phase.
 - The unused queued-task scan is removed from Operations status computation.
 
 The cache is a rebuildable display optimization. It is not used to authorize

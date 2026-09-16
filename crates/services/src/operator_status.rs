@@ -197,7 +197,7 @@ impl OperatorStatusService {
                 Ok(BlockedTaskSummary {
                     task_id: row.try_get("id")?,
                     title: row.try_get("title")?,
-                    blocked_reason: blocked_reason(&blocked_json).or(error_annotation),
+                    blocked_reason: error_annotation.or_else(|| blocked_reason(&blocked_json)),
                     blocked_since: Some(row.try_get("updated_at")?),
                 })
             })
@@ -1086,7 +1086,7 @@ mod tests {
         assert_eq!(status.blocked_tasks[0].task_id, task_id);
         assert_eq!(
             status.blocked_tasks[0].blocked_reason.as_deref(),
-            Some("dependency unavailable")
+            Some("old diagnostic")
         );
         let phase: String = sqlx::query_scalar("SELECT status FROM task WHERE id = ?")
             .bind(&task_id)
