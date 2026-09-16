@@ -1,0 +1,122 @@
+name: PR 49 corrective checks
+
+on:
+  push:
+    branches: [maintenance/pr49-corrective-runner]
+    paths: [.github/workflows/pr49-corrective.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  correct:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      FORGE_SKIP_WEB_BUILD: '1'
+      GIT_CONFIG_GLOBAL: /dev/null
+      GIT_CONFIG_NOSYSTEM: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: 83e0e83805d102b53d73864783c9c89570670ce1
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Apply only requested corrections
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 83e0e83805d102b53d73864783c9c89570670ce1
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              assert text.count(old) == 1, f'unexpected source in {path}'
+              p.write_text(text.replace(old, new, 1))
+
+          replace_once(
+              'crates/services/src/operator_status/log_snapshot.rs',
+              'file.write_all(complete[cut..].as_bytes())',
+              'file.write_all(&complete.as_bytes()[cut..])',
+          )
+          replace_once(
+              'crates/services/src/operator_status.rs',
+              'blocked_reason: blocked_reason(&blocked_json).or(error_annotation),',
+              'blocked_reason: error_annotation.or_else(|| blocked_reason(&blocked_json)),',
+          )
+          # Only the regression test introduced by PR 49 changes: it must assert
+          # the preserved main-branch precedence when both fields are populated.
+          replace_once(
+              'crates/services/src/operator_status.rs',
+              'status.blocked_tasks[0].blocked_reason.as_deref(),\n            Some("dependency unavailable")',
+              'status.blocked_tasks[0].blocked_reason.as_deref(),\n            Some("old diagnostic")',
+          )
+          replace_once(
+              'docs/performance-testing.md',
+              'blocker list. The current structured blocker takes precedence over an old\n  free-text diagnostic. The query never changes a Task\'s phase.',
+              'blocker list. The existing display priority is preserved: `error_annotation`\n  takes precedence, with the structured blocker reason used only when it is\n  absent. The query never changes a Task\'s phase.',
+          )
+          replace_once(
+              'CHANGELOG.md',
+              '## [Unreleased]\n\n### Fixed\n',
+              '## [Unreleased]\n\n### Changed\n\n'
+              '- Operations coalesces log-only refresh notifications at five-second\n'
+              '  intervals. Lifecycle changes retain 500ms coalescing; the live execution\n'
+              '  log stream is not throttled.\n\n'
+              '### Added\n\n'
+              '- Local `forge::perf` tracing and `scripts/collect_performance.py` summarize\n'
+              '  Operations timings, log-scan work and cache hits, with optional HAR\n'
+              '  aggregates. Collection uploads nothing and exports only allowlisted\n'
+              '  aggregate measurements; see `docs/performance-testing.md`.\n\n'
+              '### Fixed\n\n'
+              '- Operations builds execution-log summaries with one bounded sequential\n'
+              '  scan instead of repeatedly parsing each 500-entry page from the file\n'
+              '  beginning. A bounded, file-stamp-validated summary cache shares\n'
+              '  concurrent reads and avoids rescanning unchanged logs until expiry.\n'
+              '- Operations reports `blocked_json` on active tasks independently of\n'
+              '  workflow phase, excluding deleted, archived, done and cancelled tasks.\n'
+              '  The existing `error_annotation`-first reason display is preserved,\n'
+              '  and no task phase or lifecycle transition is changed.\n',
+          )
+          PY
+      - name: Run cargo fmt
+        run: cargo fmt --all
+      - name: Verify correction scope and formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          git diff --check
+          python3 - <<'PY'
+          import subprocess
+          expected = {
+              'CHANGELOG.md',
+              'crates/services/src/operator_status.rs',
+              'crates/services/src/operator_status/log_snapshot.rs',
+              'docs/performance-testing.md',
+          }
+          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
+          assert changed == expected, (changed, expected)
+          PY
+          git diff --stat
+          git diff
+      - name: Publish candidate without changing the PR branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --local user.name 'github-actions[bot]'
+          git config --local user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add CHANGELOG.md crates/services/src/operator_status.rs crates/services/src/operator_status/log_snapshot.rs docs/performance-testing.md
+          git commit -m 'fix(perf): correct Rust checks and preserve blocker reason precedence'
+          git push origin HEAD:refs/heads/maintenance/pr49-corrected-candidate
+          echo "CORRECTED_COMMIT=$(git rev-parse HEAD)"
+          echo "Corrective commit: \`$(git rev-parse HEAD)\`" >> "$GITHUB_STEP_SUMMARY"
+      - name: Run cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run focused snapshot regressions
+        run: cargo test -p services operator_status::log_snapshot::tests
