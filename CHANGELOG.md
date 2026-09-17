@@ -8,6 +8,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Direct (embedded) Agents on an OpenAI-compatible provider survive past
+  their first turn. `agent-runtime` shed a prior turn's unsigned reasoning by
+  rewriting canonical history, which then no longer matched the protected LCM
+  checkpoint that fingerprinted it, so the second turn of every such chat
+  failed with `Conflict: LCM canonical history no longer matches its
+  protected checkpoint` and the session stayed wedged. The OpenAI-compatible
+  wire carries no reasoning signature at all, so this hit every thinking
+  model reached that way — z.ai GLM among them — as Main Agent, Project
+  Agent, or in any chat. Runtime pin moved to `28c772c`.
 - Test fixtures now create their git repositories with
   `git init --initial-branch=main`, matching the branch the repository
   readiness check requires. Hosts whose git default branch is not `main`
