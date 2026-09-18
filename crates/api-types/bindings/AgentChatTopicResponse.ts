@@ -8,7 +8,7 @@ import type { AgentChatTopicPrincipalType } from "./AgentChatTopicPrincipalType"
  * visible divider message that opens it; a new Main turn's episodic context
  * is bounded to messages at or after this value in the current topic.
  */
-export type AgentChatTopicResponse = { id: string, chat_id: string, sequence: bigint, label: string, summary: string | null, starting_message_id: string | null, starting_message_sequence: bigint, principal_type: AgentChatTopicPrincipalType, principal_id: string | null, created_at: string,
+export type AgentChatTopicResponse = { id: string, chat_id: string, sequence: bigint, label: string, summary: string | null, starting_message_id: string | null, starting_message_sequence: bigint, principal_type: AgentChatTopicPrincipalType, principal_id: string | null, created_at: string, 
 /**
  * True for exactly one topic per chat: the most recently started one.
  */

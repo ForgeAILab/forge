@@ -2826,6 +2826,15 @@ async fn delete_lifecycle_foreign_keys_match_repository_operations() {
     WorkspaceRepo::delete(&db, &workspace_id)
         .await
         .expect("workspace delete clears execution link");
+    // Project deletion refuses while an Execution is still running, which is
+    // a separate guard from the cascade this case covers: settle the
+    // execution first so the cascade itself is what gets exercised.
+    sqlx::query("UPDATE execution SET status = 'completed', stopped_at = ? WHERE id = ?")
+        .bind(now_rfc3339())
+        .bind(&execution.id)
+        .execute(db.pool())
+        .await
+        .expect("running execution settles before the project is deleted");
     let execution = ExecutionRepo::get_by_id(&db, &execution.id)
         .await
         .expect("execution loads")

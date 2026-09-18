@@ -388,6 +388,41 @@ struct DispatchHarness {
     _workspace_root: TempDir,
 }
 
+/// Move the Task into the state whose entry hooks are under test.
+///
+/// The engine persists a transition with a blocking `before_enter` hook
+/// before it runs that hook: the Task is already in the target state, behind
+/// an entry barrier, when `run_ci_steps` and the review hooks execute. A
+/// fixture that leaves the Task in the previous state instead makes every
+/// review hook fail its authority check on a state mismatch that cannot
+/// happen in production.
+async fn enter_target_state(ctx: &HookContext) {
+    sqlx::query("UPDATE task SET status = ?, version = version + 1, updated_at = ? WHERE id = ?")
+        .bind(&ctx.to_state)
+        .bind(now_rfc3339())
+        .bind(&ctx.task_id)
+        .execute(ctx.db.pool())
+        .await
+        .expect("task enters the state under test");
+}
+
+/// Re-snapshot the Project authority a hook context carries.
+///
+/// A hook context is built once per transition in production, so its Project
+/// version and workflow definition are always the live ones. A fixture that
+/// mutates the Project after building the context (pausing it, changing
+/// review defaults) has to re-snapshot, or every review hook fails closed
+/// with "review authority changed: project workflow changed" -- which is the
+/// contract working, not the case under test.
+async fn refresh_project_authority(ctx: &mut HookContext) {
+    let project = ProjectRepo::get_by_id(&*ctx.db, &ctx.project_id)
+        .await
+        .expect("project reloads")
+        .expect("project exists");
+    ctx.project_version = Some(project.version);
+    ctx.project_workflow_definition = Some(project.workflow_definition);
+}
+
 async fn build_role_dispatch_harness(
     task_id: &str,
     from_state: &str,
@@ -937,6 +972,7 @@ async fn run_ci_steps_creates_passed_review_record() {
     ctx.execution_id = Some(execution_id);
     ctx.state_config = json!({ "ci_steps": ["test -d ."] });
 
+    enter_target_state(&ctx).await;
     let result = RunCiSteps.execute(&ctx).await;
 
     assert!(matches!(result, HookResult::Ok));
@@ -1460,6 +1496,7 @@ async fn no_ci_review_attempt_starts_before_pause_and_capacity_checks() {
     ProjectRepo::set_paused_at(&*ctx.db, &current_task.project_id, Some(now_rfc3339()))
         .await
         .expect("project pauses");
+    refresh_project_authority(&mut ctx).await;
     let paused_result = DispatchRoleAgent.execute(&ctx).await;
     match paused_result {
         HookResult::Skipped { reason } => assert_eq!(reason, "project paused"),
@@ -1476,6 +1513,7 @@ async fn no_ci_review_attempt_starts_before_pause_and_capacity_checks() {
     ProjectRepo::set_paused_at(&*ctx.db, &current_task.project_id, None)
         .await
         .expect("project resumes");
+    refresh_project_authority(&mut ctx).await;
 
     let dispatch_result = DispatchRoleAgent.execute(&ctx).await;
     match dispatch_result {
@@ -1518,6 +1556,7 @@ async fn run_ci_steps_without_reviewer_cascades_to_merging() {
     ctx.execution_id = Some(execution_id);
     ctx.state_config = json!({ "ci_steps": ["test -d ."] });
 
+    enter_target_state(&ctx).await;
     let ci_result = RunCiSteps.execute(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
 
@@ -1543,6 +1582,7 @@ async fn cached_passed_review_cannot_cascade_after_its_authority_is_cleared() {
     let execution_id = seed_completed_executor_execution(&ctx).await;
     ctx.execution_id = Some(execution_id);
     ctx.state_config = json!({ "ci_steps": ["test -d ."] });
+    enter_target_state(&ctx).await;
     let ci_result = RunCiSteps.execute(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
     TaskRepo::set_review_passed_at(&*ctx.db, &ctx.task_id, None, &now_rfc3339())
@@ -1594,6 +1634,7 @@ async fn passed_review_defers_integration_while_project_is_paused() {
     ProjectRepo::set_paused_at(&*ctx.db, &ctx.project_id, Some(now_rfc3339()))
         .await
         .expect("project pauses");
+    refresh_project_authority(&mut ctx).await;
 
     let cascade_result = AutoCascadeOnReviewPass.execute(&ctx).await;
 
@@ -1630,6 +1671,7 @@ async fn run_ci_steps_with_user_approval_gate_waits_for_human() {
     ctx.execution_id = Some(execution_id);
     ctx.state_config = json!({ "ci_steps": ["test -d ."] });
 
+    enter_target_state(&ctx).await;
     let ci_result = RunCiSteps.execute(&ctx).await;
     assert!(matches!(ci_result, HookResult::Ok), "{ci_result:?}");
 
@@ -1664,6 +1706,7 @@ async fn unconfigured_review_with_user_approval_gate_waits_for_human() {
     let execution_id = seed_completed_executor_execution(&ctx).await;
     ctx.execution_id = Some(execution_id);
 
+    enter_target_state(&ctx).await;
     let result = super::AutoCascadeOnUnconfiguredReview.execute(&ctx).await;
 
     assert!(matches!(result, HookResult::Ok), "{result:?}");

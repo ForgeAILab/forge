@@ -6315,12 +6315,14 @@ mod tests {
             },
             "governing_charter": {
                 "id": "charter-1", "revision_id": "charter-revision-2", "revision": 2,
-                "version": 3, "content_digest": "charter-content", "render_digest": "charter-render"
+                "version": 3, "content_digest": "charter-content",
+                "render_version": "charter-render-v1", "render_digest": "charter-render"
             },
             "approved_documents": [{
                 "id": "document-1", "kind": "delivery_brief", "title": "Brief",
                 "revision_id": "document-revision-3", "revision": 3, "version": 2,
-                "lifecycle": "approved", "content_digest": "document-content", "render_digest": "document-render"
+                "lifecycle": "approved", "content_digest": "document-content",
+                "render_version": "document-render-v1", "render_digest": "document-render"
             }],
             "active_decisions": [{
                 "id": "decision-1", "state": "active", "decision_class": "project_implementation",

@@ -2,7 +2,7 @@
 import type { MutationEnvelope } from "./MutationEnvelope";
 import type { ProjectMode } from "./ProjectMode";
 
-export type ApproveProjectCharterRequest = { mutation: MutationEnvelope, charter_id: string, revision_id: string, content_digest: string, render_digest: string, expected_charter_version: bigint,
+export type ApproveProjectCharterRequest = { mutation: MutationEnvelope, charter_id: string, revision_id: string, content_digest: string, render_digest: string, expected_charter_version: bigint, 
 /**
  * Project version observed while the user reviewed this exact Charter
  * revision. Genesis approvals have no Project and must omit this field;

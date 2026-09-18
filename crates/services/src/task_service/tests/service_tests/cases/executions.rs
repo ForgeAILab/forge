@@ -1,5 +1,5 @@
 use super::super::*;
-use crate::task_service::tests::helpers::seed_execution;
+use crate::task_service::tests::helpers::{seed_execution, seed_role_assignment};
 use db::{PageRequest, SortBy, SortOrder};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -10,7 +10,10 @@ async fn run_execution_dispatches_shell_adapter_and_updates_execution() {
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
-    let agent_id = seed_agent_with_executor_type(&db, "claude_code", "{}").await;
+    // This case drives the real adapter registry, so the agent has to be the
+    // shell harness: it runs the Task's own command and logs its output.
+    // Any other harness shells out to a CLI that is not on the host.
+    let agent_id = seed_agent(&db).await;
     let task = service
         .create_task(
             project_id,
@@ -340,6 +343,38 @@ async fn reviewer_provider_unavailability_defers_without_consuming_task_retry_bu
         .execute(db.pool())
         .await
         .expect("execution becomes reviewer-scoped");
+    // A reviewer execution is only authorized while the Task is the
+    // reviewer's to work, so move the Task with its assignment the way the
+    // workflow would before the reviewer runs.
+    seed_role_assignment(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::REVIEWER,
+        claimed.execution.agent_id.as_deref(),
+    )
+    .await;
+    sqlx::query("UPDATE task SET status = 'review', version = version + 1 WHERE id = ?")
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .expect("task enters review");
+    let now = now_rfc3339();
+    ReviewRepo::create(
+        &*db,
+        db::CreateReview {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            execution_id: claimed.execution.id.clone(),
+            attempt_number: 1,
+            status: ReviewStatus::Running,
+            step_results_json: json!({ "ci_steps": [] }).to_string(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("running review binds the reviewer attempt");
 
     let updated = service
         .run_execution(claimed.execution.id.clone(), &ExecutorUnavailableExecutor)
@@ -1027,6 +1062,13 @@ async fn dispatch_initial_role_execution_creates_execution_and_spawns() {
     let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
     let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
+    seed_role_assignment(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        Some(&agent_id),
+    )
+    .await;
 
     let execution = service
         .dispatch_initial_role_execution(
@@ -1074,6 +1116,13 @@ async fn planner_completion_marks_task_awaiting_plan_review_until_approved() {
         &db,
         &project_id,
         crate::workflow::default_states::PLANNING.to_owned(),
+    )
+    .await;
+    seed_role_assignment(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::PLANNER,
+        Some(&agent_id),
     )
     .await;
 
@@ -1213,6 +1262,11 @@ async fn before_enter_runs_required_before_work_hook_before_role_dispatch() {
         .await
         .expect("coder role assignment succeeds");
 
+    let task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task reloads after the role assignment")
+        .expect("task exists");
+
     let transitioned = service
         .transition(task.id.clone(), "in_progress".to_owned(), task.version)
         .await
@@ -1296,6 +1350,11 @@ async fn before_enter_blocks_when_required_before_work_hook_fails() {
         )
         .await
         .expect("coder role assignment succeeds");
+
+    let task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task reloads after the role assignment")
+        .expect("task exists");
 
     let result = service
         .transition(task.id.clone(), "in_progress".to_owned(), task.version)
@@ -1424,6 +1483,11 @@ async fn retry_hook_reruns_blocked_before_enter_and_dispatches_when_it_passes() 
         )
         .await
         .expect("coder role assignment succeeds");
+
+    let task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task reloads after the role assignment")
+        .expect("task exists");
 
     service
         .transition(task.id.clone(), "in_progress".to_owned(), task.version)
@@ -1658,6 +1722,11 @@ async fn update_workspace_and_retry_hook_rebases_before_retrying_blocked_hook() 
         .await
         .expect("coder role assignment succeeds");
 
+    let task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task reloads after the role assignment")
+        .expect("task exists");
+
     service
         .transition(task.id.clone(), "in_progress".to_owned(), task.version)
         .await
@@ -1754,6 +1823,11 @@ async fn skip_hook_once_bypasses_only_one_dispatch_attempt() {
         .await
         .expect("coder role assignment succeeds");
 
+    let task = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task reloads after the role assignment")
+        .expect("task exists");
+
     service
         .transition(task.id.clone(), "planning".to_owned(), task.version)
         .await
@@ -1849,12 +1923,61 @@ async fn dispatch_initial_role_execution_runs_reviewer_when_agent_is_busy_on_sam
     .await
     .expect("reviewer assignment created");
 
+    // The same agent already holds this Task's executor attempt, which is
+    // also the candidate the review is bound to. A reviewer execution is
+    // only admissible against that exact candidate, so build the review-bound
+    // admission the workflow dispatcher builds.
+    let candidate = seed_completed_coder_execution(&db, &task, &agent_id, None).await;
+    let now = now_rfc3339();
+    let review = ReviewRepo::create(
+        &*db,
+        db::CreateReview {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            execution_id: candidate.id.clone(),
+            attempt_number: 1,
+            status: ReviewStatus::Running,
+            step_results_json: json!({ "ci_steps": [] }).to_string(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("running review creates");
+    let project = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("project loads")
+        .expect("project exists");
+    let agent = AgentRepo::get_by_id(&*db, &agent_id)
+        .await
+        .expect("agent loads")
+        .expect("agent exists");
+    let mut admission = crate::task_service::execution_admission_for_task(
+        &db,
+        &task,
+        &project.workflow_definition,
+        crate::workflow::default_roles::REVIEWER,
+        Some(&agent),
+        project.version,
+    )
+    .await
+    .expect("reviewer admission builds");
+    admission.expected_reviewer_parent_execution_id = Some(candidate.id.clone());
+    admission.expected_latest_review_candidate_execution_id = Some(candidate.id.clone());
+    admission.expected_reviewer_id = Some(review.id.clone());
+    admission.expected_reviewer_attempt_number = Some(review.attempt_number);
+    admission.expected_reviewer_status = Some(review.status.to_string());
+    admission.expected_reviewer_updated_at = Some(review.updated_at.clone());
+
     let execution = service
-        .dispatch_initial_role_execution(
+        .dispatch_initial_role_execution_with_metadata_and_admission(
             &task.id,
             &agent_id,
             crate::workflow::default_roles::REVIEWER,
             "review the task".to_owned(),
+            None,
+            admission,
         )
         .await
         .expect("reviewer dispatch succeeds");
@@ -3972,10 +4095,22 @@ async fn re_execute_rejects_running_parent() {
 async fn re_execute_rejects_concurrent_running_execution() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
-    let service = TaskService::new(Arc::clone(&db), event_bus);
-    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let workspace_root = TempDir::new().expect("workspace temp dir creates");
+    let service = TaskService::new(Arc::clone(&db), event_bus)
+        .with_workspace_root(workspace_root.path().to_path_buf());
+    let (project_id, repo_id, _repo_dir) = seed_project_repo(&db).await;
     let agent_id = seed_agent(&db).await;
     let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
+    seed_role_assignment(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        Some(&agent_id),
+    )
+    .await;
+    // The concurrency guard is workspace-scoped: a second worker is only a
+    // conflict when it would enter the same worktree.
+    let workspace_id = seed_workspace_for_task(&db, &task, &repo_id, workspace_root.path()).await;
     let now = now_rfc3339();
     let parent_execution = ExecutionRepo::create(
         &*db,
@@ -4001,7 +4136,7 @@ async fn re_execute_rejects_concurrent_running_execution() {
             executor_config_snapshot_json: Some(
                 r#"{"executor_type":"shell","config":{}}"#.to_owned(),
             ),
-            workspace_id: None,
+            workspace_id: Some(workspace_id.clone()),
             created_at: now.clone(),
             updated_at: now.clone(),
         },
@@ -4032,7 +4167,7 @@ async fn re_execute_rejects_concurrent_running_execution() {
             executor_config_snapshot_json: Some(
                 r#"{"executor_type":"shell","config":{}}"#.to_owned(),
             ),
-            workspace_id: None,
+            workspace_id: Some(workspace_id.clone()),
             created_at: now.clone(),
             updated_at: now,
         },
@@ -4042,10 +4177,11 @@ async fn re_execute_rejects_concurrent_running_execution() {
 
     let result = service.re_execute_execution(parent_execution.id).await;
 
-    assert!(matches!(
-        result,
-        Err(ServiceError::ExecutionAlreadyRunning { .. })
-    ));
+    assert!(
+        matches!(result, Err(ServiceError::ExecutionAlreadyRunning { .. })),
+        "a running sibling must reject re-execution, got {:?}",
+        result.as_ref().err()
+    );
 }
 
 #[tokio::test]
@@ -5147,6 +5283,13 @@ async fn executor_completion_guard_rejection_follows_up_before_blocking() {
     let task = seed_task_with_status(&db, &project_id, "in_progress".to_owned()).await;
     let workspace =
         seed_workspace_with_plan(&db, &task, &repo_id, "- [ ] finish implementation\n").await;
+    seed_role_assignment(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::CODER,
+        Some(&agent_id),
+    )
+    .await;
     let execution =
         seed_completed_coder_execution(&db, &task, &agent_id, Some(&workspace.id)).await;
 

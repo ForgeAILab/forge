@@ -845,24 +845,38 @@ impl SqliteDb {
             .bind(assignment_role)
             .fetch_optional(&mut **transaction)
             .await?;
-            let assignment_agent_id = if input.role == "auditor" {
-                let reviewer_execution_id = admission
-                    .and_then(|admission| admission.expected_reviewer_execution_id.as_deref())
-                    .ok_or(DbError::VersionConflict)?;
-                Some(
-                    sqlx::query_scalar::<_, String>(
-                        "SELECT agent_id FROM execution
-                     WHERE id = ? AND agent_id IS NOT NULL",
-                    )
-                    .bind(reviewer_execution_id)
-                    .fetch_optional(&mut **transaction)
-                    .await?
-                    .ok_or(DbError::VersionConflict)?,
-                )
-            } else {
-                input.agent_id.clone()
-            };
             if let Some(role_assignment) = role_assignment {
+                // An auditor runs under a separately selected Agent while the
+                // reviewer assignment stays the authority, so its principal is
+                // the reviewer execution's Agent -- which only the admission
+                // snapshot names. Resolve that here, where the comparison
+                // actually happens: demanding it for every auditor row
+                // rejected an auditor execution created without an admission
+                // as a bare version conflict, even with no assignment to
+                // compare it against.
+                let assignment_agent_id = if input.role == "auditor" {
+                    let Some(reviewer_execution_id) = admission
+                        .and_then(|admission| admission.expected_reviewer_execution_id.as_deref())
+                    else {
+                        return Err(DbError::Check(
+                            "auditor execution requires the reviewer execution its admission \
+                             selected before it can be matched to the reviewer assignment"
+                                .to_owned(),
+                        ));
+                    };
+                    Some(
+                        sqlx::query_scalar::<_, String>(
+                            "SELECT agent_id FROM execution
+                         WHERE id = ? AND agent_id IS NOT NULL",
+                        )
+                        .bind(reviewer_execution_id)
+                        .fetch_optional(&mut **transaction)
+                        .await?
+                        .ok_or(DbError::VersionConflict)?,
+                    )
+                } else {
+                    input.agent_id.clone()
+                };
                 let assignee_type: Option<String> = role_assignment.try_get("assignee_type")?;
                 let assignee_id: Option<String> = role_assignment.try_get("assignee_id")?;
                 let matches_agent = assignee_type.as_deref() == Some("agent")
@@ -1050,8 +1064,24 @@ impl SqliteDb {
         {
             return Err(DbError::VersionConflict);
         }
-        if admission.expected_workflow_definition.as_deref() != actual_workflow_definition {
-            return Err(DbError::VersionConflict);
+        // The workflow definition is pinned by whoever let the workflow choose
+        // the role. An interactive execution is the user reaching into the
+        // workspace directly, so it owes no pin -- and requiring one rejected
+        // every interactive execution in a Project that has a workflow
+        // definition, which is every Project, as a bare version conflict. A
+        // pin an admission does carry is still compared.
+        let pin_required = !workflow_is_inherited && input.role != "interactive";
+        match admission.expected_workflow_definition.as_deref() {
+            Some(expected) => {
+                if Some(expected) != actual_workflow_definition {
+                    return Err(DbError::VersionConflict);
+                }
+            }
+            None => {
+                if pin_required {
+                    return Err(DbError::VersionConflict);
+                }
+            }
         }
 
         // Dependency edges are independent rows and do not advance Task

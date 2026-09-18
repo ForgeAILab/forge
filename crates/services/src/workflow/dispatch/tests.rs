@@ -789,6 +789,14 @@ async fn review_feedback_comes_from_the_reviewer_execution_not_the_reviewed_one(
     )
     .await
     .expect("review creates");
+    // Dispatching a reviewer binds its execution to the attempt; without
+    // that binding the attempt only names the execution it reviewed.
+    sqlx::query("UPDATE review SET reviewer_execution_id = ? WHERE id = ?")
+        .bind(&reviewer_id)
+        .bind(&review.id)
+        .execute(db.pool())
+        .await
+        .expect("reviewer execution binds to the attempt");
     ReviewRepo::update_status(
         &*db,
         &review.id,

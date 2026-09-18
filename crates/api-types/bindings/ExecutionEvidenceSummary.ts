@@ -6,7 +6,7 @@ import type { ExecutionProgress } from "./ExecutionProgress";
  * language surface so a committed result can never regress to "not
  * started" copy on a different screen (F12).
  */
-export type ExecutionEvidenceSummary = { attempt_count: bigint, execution_count: bigint, has_commit: boolean, latest_commit_sha: string | null, progress: ExecutionProgress,
+export type ExecutionEvidenceSummary = { attempt_count: bigint, execution_count: bigint, has_commit: boolean, latest_commit_sha: string | null, progress: ExecutionProgress, 
 /**
  * The exact canonical phrase for `progress`. Surfaces render this
  * string directly instead of re-deriving their own from `progress` or

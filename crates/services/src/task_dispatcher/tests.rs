@@ -1470,6 +1470,9 @@ async fn dispatcher_recovers_undispatched_reviewer_task() {
     let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
     let task = seed_task(&db, &project_id, "review", "review", 0).await;
+    // Review is entered from a finished implementation attempt, and that
+    // attempt is what the recovered reviewer reviews.
+    seed_completed_coder_execution(&db, &task.id).await;
     assign_role(
         &db,
         &task.id,
@@ -1826,6 +1829,9 @@ async fn reviewer_assignment_after_stopped_attempt_dispatches_without_separate_r
     let (project_id, _repo_id) = seed_project_repo(&db, repo_dir.path()).await;
     let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
     let task = seed_task(&db, &project_id, "review retry", "review", 0).await;
+    // The reviewer retry reviews the implementation attempt that put this
+    // Task in review.
+    seed_completed_coder_execution(&db, &task.id).await;
     assign_role(
         &db,
         &task.id,
@@ -2607,7 +2613,7 @@ async fn dispatcher_skips_reviewer_until_configured_ci_has_finished() {
         &db,
         &task.id,
         &coder_execution_id,
-        r#"{"ci_steps":[{"index":0,"command":"test -d .","exit_code":0}]}"#,
+        r#"{"ci_steps":[{"index":0,"command":"test -d .","exit_code":0,"stderr_tail":"","output_tail":""}]}"#,
     )
     .await;
 

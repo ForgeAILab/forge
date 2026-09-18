@@ -15,7 +15,7 @@ import type { RetryAction } from "./RetryAction";
  * causes, and unredacted internal error text must never be added to this
  * type or assigned into `safe_message`.
  */
-export type ToolResultSummary = { status: OutcomeStatus, code: OutcomeCode, safe_message: string, retryable: boolean, recovery_action: RetryAction | null, correlation_id: string,
+export type ToolResultSummary = { status: OutcomeStatus, code: OutcomeCode, safe_message: string, retryable: boolean, recovery_action: RetryAction | null, correlation_id: string, 
 /**
  * The typed Forge operation the call executed (for example
  * `task.propose` or `skill.section`), when the tool returned an

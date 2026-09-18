@@ -1586,6 +1586,16 @@ async fn reserve_project_agent_workspace_path(
     Ok(true)
 }
 
+/// The filesystem path a repository's remote points at, when that remote is
+/// a local path and the path is missing. A URL-shaped remote is never a local
+/// path and is left to git.
+fn missing_local_repo_source(remote_url: &str) -> Option<&str> {
+    let remote = remote_url.trim();
+    let path = remote.strip_prefix("file://").unwrap_or(remote);
+    let is_local_path = path.starts_with('/') || path.starts_with('.') || path.starts_with('~');
+    (is_local_path && !Path::new(path).exists()).then_some(path)
+}
+
 async fn resolve_repo_source(repo: &db::Repo, workspace_root: &std::path::Path) -> Result<String> {
     if let Some(local_path) = repo
         .local_path
@@ -1599,6 +1609,16 @@ async fn resolve_repo_source(repo: &db::Repo, workspace_root: &std::path::Path) 
     }
     let clone_path = workspace_root.join(".repos").join(&repo.id);
     if !clone_path.exists() {
+        // A remote that is itself a filesystem path can only be cloned while
+        // that path is there. Letting git fail instead reports a command
+        // error, which callers classify as potentially transient and retry on
+        // every scan -- but a source directory that is gone is not coming
+        // back on its own, and the Task should park saying exactly that.
+        if let Some(missing) = missing_local_repo_source(&repo.remote_url) {
+            return Err(ServiceError::invalid_operation(format!(
+                "repo source path does not exist: {missing}"
+            )));
+        }
         tokio::fs::create_dir_all(
             clone_path
                 .parent()

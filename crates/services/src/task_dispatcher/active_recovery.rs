@@ -367,6 +367,17 @@ impl TaskDispatcher {
 
         let state_dispatch = dispatch_intent_from_workflow_dispatch(state.dispatch.as_ref());
         let selection = effective_prompt_selection(role_name, None, state_dispatch.as_ref());
+        // A reviewer execution is bound to its Review attempt inside the
+        // admitting transaction, so recovery has to establish that attempt
+        // the same way a transition into review does. Without it the bind
+        // step fails closed as a bare version conflict, which this scan then
+        // logs as a lost race and retries forever: a Task parked in review
+        // with no Review row -- a read-only Task whose CI hook skipped, or
+        // any Task whose reviewer never launched -- could never be recovered.
+        if role_name == crate::workflow::default_roles::REVIEWER {
+            self.ensure_review_attempt_for_recovery(project, task, &state.name)
+                .await?;
+        }
         let dispatch_ctx = load_agent_dispatch_context(
             Arc::clone(&self.db),
             &task.id,
@@ -464,6 +475,70 @@ impl TaskDispatcher {
             )
             .await?;
         Ok(true)
+    }
+
+    /// Establish the Review attempt a recovered reviewer dispatch binds to.
+    ///
+    /// Mirrors the transition-time helper: an attempt already Running or
+    /// AwaitingHuman for the current candidate is left alone, and a Task with
+    /// no implementation candidate gets no attempt, because a Review has no
+    /// authority without the execution it reviews.
+    async fn ensure_review_attempt_for_recovery(
+        &self,
+        project: &Project,
+        task: &Task,
+        to_state: &str,
+    ) -> Result<()> {
+        if task.review_passed_at.is_some() {
+            return Ok(());
+        }
+        let Some(candidate) =
+            crate::task_service::latest_executor_execution_for_task(&self.db, task).await?
+        else {
+            // Reviewing nothing is not a transient condition: a Task in
+            // review with no implementation attempt has nothing to bind a
+            // Review to, and retrying every scan only hides that. Refuse
+            // deterministically so the Task parks with the actual reason.
+            return Err(ServiceError::conflict(format!(
+                "task {} is in review with no implementation execution to review",
+                task.id
+            )));
+        };
+        let reviews = ReviewRepo::list_by_task(&*self.db, &task.id).await?;
+        let current = reviews
+            .iter()
+            .max_by_key(|review| (review.attempt_number, review.id.clone()));
+        if current.is_some_and(|review| {
+            review.execution_id == candidate.id
+                && matches!(
+                    review.status,
+                    db::ReviewStatus::Running | db::ReviewStatus::AwaitingHuman
+                )
+        }) {
+            return Ok(());
+        }
+        let now = db::now_rfc3339();
+        ReviewRepo::create_with_task_authority(
+            &*self.db,
+            db::CreateReview {
+                id: db::new_uuid_v4(),
+                task_id: task.id.clone(),
+                execution_id: candidate.id.clone(),
+                attempt_number: 0,
+                status: db::ReviewStatus::Running,
+                step_results_json: serde_json::json!({ "ci_steps": [] }).to_string(),
+                started_at: now.clone(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+            task.version,
+            to_state,
+            Some(project.version),
+            Some(project.workflow_definition.as_str()),
+            Some(candidate.id.as_str()),
+        )
+        .await?;
+        Ok(())
     }
 
     /// Settle a reviewer execution whose terminal event was lost before it

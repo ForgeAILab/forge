@@ -8,6 +8,36 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Interactive executions can start again. Admission required every execution
+  to pin the Project's workflow definition, but an interactive execution is
+  the user reaching into the workspace directly and the workflow never chose
+  its role, so it pins nothing — and the mismatch rejected `Launch` in every
+  Project that has a workflow definition, which is every Project, as an
+  opaque `version conflict`. A pin an admission does carry is still compared.
+- A Task sitting in `review` can be recovered. A reviewer execution binds to
+  its Review attempt inside the admitting transaction, and the dispatcher's
+  recovery path never created that attempt, so the bind failed as a bare
+  version conflict that the scan logged as a lost race and retried forever.
+  Recovery now establishes the attempt the way a transition into review does.
+  A Task in review with no implementation execution to review is refused
+  explicitly instead of retried: it parks with that reason.
+- Reassigning or removing a non-coder role no longer discards a passed
+  review. `review_passed_at` is authority over the implementation that was
+  reviewed, so only a change to who owns that implementation clears it;
+  swapping the reviewer used to send the Task back through a review it had
+  already earned.
+- A repository whose local source directory is gone now fails with
+  `repo source path does not exist` instead of the raw `git clone` error.
+  The git error is classified as potentially transient, so the dispatcher
+  retried a permanently missing repository on every scan instead of parking
+  the Task with the reason.
+- `frozen pricing selection violates semantic invariants` now names the
+  invariant it violated. Eleven distinct checks shared one opaque message,
+  which said nothing about which provenance field was wrong.
+- Creating an auditor execution without an admission no longer fails as a
+  version conflict. The reviewer-derived principal is resolved where it is
+  actually compared against the reviewer assignment, and an auditor that
+  needs that principal and has no admission is told so.
 - An embedded execution on a provider whose Forge label differs from its
   models.dev catalog id can dispatch again. Admission froze the runtime
   provider (`gemini`) beside the catalog provider its rate came from
