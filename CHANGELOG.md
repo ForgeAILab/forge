@@ -8,6 +8,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- The typed proposal surface now declares `review_requirement_ids`, the one
+  field `task.propose` requires. It was described in prose but never declared
+  as a property, and providers that expose only declared properties to the
+  model (Gemini, and the OpenAI-compatible function calling z.ai serves)
+  dropped it from every call — so a Project Agent on such a provider could
+  not create a single Task, whatever it wrote. A contract test now fails if
+  any operation requires a payload field the flat surface does not declare.
 - Direct (embedded) Agents on an OpenAI-compatible provider survive past
   their first turn. `agent-runtime` shed a prior turn's unsigned reasoning by
   rewriting canonical history, which then no longer matched the protected LCM

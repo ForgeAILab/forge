@@ -29,7 +29,7 @@ homepage = "https://github.com/ForgeAILab/forge"
 repository = "https://github.com/ForgeAILab/forge"
 
 [workspace.dependencies]
-agent-runtime = { git = "https://github.com/ForgeAILab/agent-runtime.git", rev = "28c772c10a218f6daf7436a7a3fed5240cf25cbc", version = "0.1.0" }
+agent-runtime = { git = "https://github.com/ForgeAILab/agent-runtime.git", rev = "380f73b959e1134ad2e489d48eaf17e333a26404", version = "0.1.0" }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }

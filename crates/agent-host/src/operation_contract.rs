@@ -993,6 +993,17 @@ pub(crate) fn coordination_payload_properties(operations: &BTreeSet<String>) -> 
             "type": ["string", "null"],
             "description": "task.propose: optional; only when the baseline declares allowed risk classes."
         },
+        "review_requirement_ids": {
+            "type": ["array", "null"],
+            "items": {"type": "string", "minLength": 1},
+            "description": concat!(
+                "task.propose: required. Exact non-universal requirement IDs from the ",
+                "approved Charter that this Task owns, copied verbatim from ",
+                "selectable_review_requirements in the project.charter read, or [] when ",
+                "it owns none. Do not construct these strings: an ID that does not match ",
+                "the catalog exactly is rejected and no Task is created."
+            )
+        },
         "depends_on_task_ids": {
             "type": ["array", "null"],
             "items": {"type": "string", "minLength": 1},
@@ -1513,6 +1524,28 @@ mod tests {
                 .expect("flat prerequisite guidance")
                 .contains("prerequisite DAG edges only")
         );
+        // A field the server requires but the flat surface never declares is
+        // a field a declared-properties-only provider cannot send at all:
+        // the Task can then never be created, however the model writes it.
+        for required in required_payload_fields(TASK_PROPOSE_OPERATION) {
+            assert!(
+                properties.get(&required).is_some(),
+                "task.propose requires `{required}`, so the flat payload surface must declare it"
+            );
+        }
+    }
+
+    /// The payload fields `operation` declares as required, minus `action`,
+    /// which the envelope derives from the operation itself.
+    fn required_payload_fields(operation: &str) -> Vec<String> {
+        orchestration_payload_schema(operation)["required"]
+            .as_array()
+            .expect("required fields")
+            .iter()
+            .filter_map(|field| field.as_str())
+            .filter(|field| *field != "action")
+            .map(str::to_owned)
+            .collect()
     }
 
     #[test]
