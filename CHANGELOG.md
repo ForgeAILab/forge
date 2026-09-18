@@ -8,6 +8,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- An embedded execution on a provider whose Forge label differs from its
+  models.dev catalog id can dispatch again. Admission froze the runtime
+  provider (`gemini`) beside the catalog provider its rate came from
+  (`google`) and a pricing invariant required the two to be equal, so every
+  dispatch died with `frozen pricing selection violates semantic invariants`
+  before the worker started. The two are separate namespaces, and admission
+  never intended to compare them; whether an execution really ran on its
+  admitted provider is still settled against reported evidence.
 - The typed proposal surface now declares `review_requirement_ids`, the one
   field `task.propose` requires. It was described in prose but never declared
   as a property, and providers that expose only declared properties to the

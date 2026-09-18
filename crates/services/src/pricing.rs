@@ -4084,11 +4084,14 @@ fn validate_frozen_selection_semantics(
             {
                 return invalid();
             }
-            if selection.admitted_provider_id.is_some()
-                && selection.admitted_provider_id != selection.catalog_provider_id
-            {
-                return invalid();
-            }
+            // The admitted provider and the catalog provider are two
+            // namespaces, not two copies of one fact: the first is the
+            // runtime identity Forge dispatched (`gemini`), the second is
+            // the models.dev row the rate came from (`google`). Requiring
+            // them to match makes every provider whose labels differ
+            // unpriceable, and admission deliberately does not compare them.
+            // Settlement is where a provider claim is checked, against the
+            // actual provider an execution reported.
             if selection.status == PriceSelectionStatus::Unpriced
                 && !matches!(
                     selection.reason,
@@ -6182,15 +6185,20 @@ mod catalog_domain_tests {
             Err(FrozenPriceSelectionError::SemanticInvariantViolation)
         );
 
-        let catalog_with_conflicting_provider = FrozenPriceSelection::from_parts(
+        // A runtime provider label that differs from the catalog provider id
+        // is the ordinary case, not a contradiction: Forge dispatches
+        // `gemini` and models.dev prices the same model under `google`.
+        // Whether the execution actually ran on the admitted provider is
+        // settlement's question, answered against reported evidence.
+        let catalog_provider_in_its_own_namespace = FrozenPriceSelection::from_parts(
             None,
             None,
-            Some("gpt".to_owned()),
+            Some("gemini-3.8-flash".to_owned()),
             None,
             0,
-            Some("different-provider".to_owned()),
-            Some("openai".to_owned()),
-            Some("gpt-5".to_owned()),
+            Some("gemini".to_owned()),
+            Some("google".to_owned()),
+            Some("gemini-3.8-flash".to_owned()),
             Some(PricingSourceKind::ModelsDevCatalog),
             Some("catalog-rate-1".to_owned()),
             Some("catalog-snapshot-1".to_owned()),
@@ -6201,10 +6209,8 @@ mod catalog_domain_tests {
             PriceSelectionStatus::Priced,
             None,
         );
-        assert_eq!(
-            catalog_with_conflicting_provider.validate(),
-            Err(FrozenPriceSelectionError::SemanticInvariantViolation)
-        );
+        assert_eq!(catalog_provider_in_its_own_namespace.validate(), Ok(()));
+        assert!(catalog_provider_in_its_own_namespace.is_priced());
     }
 
     #[test]
