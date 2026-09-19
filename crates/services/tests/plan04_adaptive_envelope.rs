@@ -417,11 +417,16 @@ async fn plan04_split_sequence_replace_preserve_the_approved_boundaries() {
                     description: Some("same acceptance".to_owned()),
                     assignee_id: None,
                 },
+                services::NewSubtaskInput {
+                    title: "Third bounded slice".to_owned(),
+                    description: Some("same acceptance".to_owned()),
+                    assignee_id: None,
+                },
             ],
         )
         .await
         .expect("split is inside the adaptive envelope");
-    assert_eq!(children.len(), 2);
+    assert_eq!(children.len(), 3);
     for child in &children {
         let (plan_item, risk, provenance) = governance_row(&db, &child.id).await;
         assert_eq!(plan_item, "plan-1");
@@ -438,18 +443,39 @@ async fn plan04_split_sequence_replace_preserve_the_approved_boundaries() {
         assert_eq!(provenance["elevated_operations"], json!(["none"]));
     }
 
+    // The sequence cursor is durable: the terminal prefix and the current
+    // first-incomplete child stay pinned because another worker may already
+    // have observed or dispatched them, and only the untouched `todo` suffix
+    // after that cursor may be permuted.
     service
         .reorder_subtasks(
             ROOT_TASK_ID.to_owned(),
-            children.iter().rev().map(|task| task.id.clone()).collect(),
+            vec![
+                children[0].id.clone(),
+                children[2].id.clone(),
+                children[1].id.clone(),
+            ],
         )
         .await
         .expect("sequence is inside the adaptive envelope");
     let ordered = TaskRepo::list_subtasks_ordered(&*db, ROOT_TASK_ID)
         .await
         .expect("ordered children");
-    assert_eq!(ordered[0].id, children[1].id);
-    assert_eq!(ordered[1].id, children[0].id);
+    assert_eq!(ordered[0].id, children[0].id);
+    assert_eq!(ordered[1].id, children[2].id);
+    assert_eq!(ordered[2].id, children[1].id);
+
+    // Moving the pinned current child is outside the envelope.
+    assert!(
+        service
+            .reorder_subtasks(
+                ROOT_TASK_ID.to_owned(),
+                children.iter().rev().map(|task| task.id.clone()).collect(),
+            )
+            .await
+            .is_err(),
+        "the current child may not be resequenced"
+    );
 
     let replacement = service
         .replace_task(
@@ -559,7 +585,8 @@ async fn plan04_project_agent_adapter_invokes_split_sequence_replace_and_replays
         "rationale": "keep the approved outcome executable",
         "items": [
             {"title": "First bounded slice", "description": "same acceptance"},
-            {"title": "Second bounded slice", "description": "same acceptance"}
+            {"title": "Second bounded slice", "description": "same acceptance"},
+            {"title": "Third bounded slice", "description": "same acceptance"}
         ]
     });
     let first = adapter_propose(
@@ -584,7 +611,7 @@ async fn plan04_project_agent_adapter_invokes_split_sequence_replace_and_replays
     .fetch_all(fixture.db.pool())
     .await
     .expect("split children");
-    assert_eq!(children.len(), 2);
+    assert_eq!(children.len(), 3);
 
     // The receipt is the replay boundary, not the current Task projection.
     // Mutate a live child between attempts: the exact retry must return the
@@ -615,7 +642,7 @@ async fn plan04_project_agent_adapter_invokes_split_sequence_replace_and_replays
         .fetch_one(fixture.db.pool())
         .await
         .expect("split count after replay"),
-        2
+        3
     );
 
     // Reusing the receipt key with a changed title is an input conflict,
@@ -670,7 +697,13 @@ async fn plan04_project_agent_adapter_invokes_split_sequence_replace_and_replays
         "same key with changed description/acceptance must not be a replay"
     );
 
-    let ordered_ids = vec![children[1].0.clone(), children[0].0.clone()];
+    // Only the untouched `todo` suffix after the current child may be
+    // permuted; the first-incomplete child is a pinned sequence cursor.
+    let ordered_ids = vec![
+        children[0].0.clone(),
+        children[2].0.clone(),
+        children[1].0.clone(),
+    ];
     let root_version: i64 = sqlx::query_scalar("SELECT version FROM task WHERE id = ?")
         .bind(ROOT_TASK_ID)
         .fetch_one(fixture.db.pool())
@@ -703,7 +736,7 @@ async fn plan04_project_agent_adapter_invokes_split_sequence_replace_and_replays
         .into_iter()
         .map(|task| task.id)
         .collect();
-    assert_eq!(ordered, vec![children[1].0.clone(), children[0].0.clone()]);
+    assert_eq!(ordered, ordered_ids);
 
     let root_version: i64 = sqlx::query_scalar("SELECT version FROM task WHERE id = ?")
         .bind(ROOT_TASK_ID)
