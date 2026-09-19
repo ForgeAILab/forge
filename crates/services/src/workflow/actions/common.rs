@@ -314,12 +314,18 @@ pub(super) async fn create_system_comment(ctx: &HookContext, content: String) ->
     Ok(())
 }
 
+/// Records why integration failed and returns the Task as that write left it.
+///
+/// The caller's next compare-and-set has to carry this version: two sequential
+/// writes from one snapshot make the second fail as a version conflict, and in
+/// a non-blocking hook that failure is swallowed -- leaving the Task in
+/// `merging` with nothing recorded at all.
 pub(super) async fn persist_merge_error(
     ctx: &HookContext,
     task: &db::Task,
     error_type: api_types::FailureKind,
     message: &str,
-) -> db::Result<()> {
+) -> db::Result<db::Task> {
     let detected_at = now_rfc3339();
     let annotation = json!({
         "type": error_type,
@@ -344,8 +350,7 @@ pub(super) async fn persist_merge_error(
             updated_at: now_rfc3339(),
         },
     )
-    .await?;
-    Ok(())
+    .await
 }
 
 pub(super) async fn persist_target_repo_dirty_error(
@@ -353,7 +358,7 @@ pub(super) async fn persist_target_repo_dirty_error(
     task: &db::Task,
     message: &str,
     _files: &[String],
-) -> db::Result<()> {
+) -> db::Result<db::Task> {
     persist_merge_error(ctx, task, api_types::FailureKind::TargetRepoDirty, message).await
 }
 

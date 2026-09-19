@@ -408,9 +408,11 @@ impl TaskService {
             }
         }
 
-        if is_root {
-            self.assign_project_default_roles(&task).await?;
-        }
+        let task = if is_root {
+            self.assign_project_default_roles(&task).await?
+        } else {
+            task
+        };
 
         self.publish(ForgeEvent {
             event_type: "task.created".to_owned(),
@@ -648,7 +650,11 @@ impl TaskService {
     /// does not already cover. Task creation does this for a Task created
     /// once the defaults exist; the dispatcher does it again when it releases
     /// a Task that was parked before provisioning wrote those defaults.
-    pub(crate) async fn assign_project_default_roles(&self, task: &Task) -> Result<()> {
+    /// Returns the Task as the last assignment left it, because each
+    /// assignment CAS advances the version: a caller that keeps its own
+    /// pre-assignment snapshot hands that stale version to whoever it
+    /// answers, whose next optimistic write then fails as a conflict.
+    pub(crate) async fn assign_project_default_roles(&self, task: &Task) -> Result<Task> {
         let covered_roles = TaskRoleAssignmentRepo::list_by_task(&*self.db, &task.id)
             .await?
             .into_iter()
@@ -682,6 +688,6 @@ impl TaskService {
                 .await?
                 .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
         }
-        Ok(())
+        Ok(current)
     }
 }

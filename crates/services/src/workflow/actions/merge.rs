@@ -32,12 +32,20 @@ impl HookAction for RunMerge {
             };
         }
 
+        let outcome = merge_service.merge(ctx.task_id.clone()).await;
+        // The merge writes through the workspace and execution ledgers, so a
+        // Task snapshot read before it is already stale. Every compare-and-set
+        // below has to carry the version the merge left behind: with the
+        // pre-merge version they all fail as a version conflict, and because
+        // this hook is not blocking that failure is swallowed -- the Task sits
+        // in `merging` with no blocker, no annotation and no follow-up, which
+        // is what every real merge conflict did.
         let mut task = match task(ctx).await {
             Ok(task) => task,
             Err(reason) => return HookResult::Failed { reason },
         };
 
-        match merge_service.merge(ctx.task_id.clone()).await {
+        match outcome {
             Ok(MergeOutcome::ReviewRequired { reason }) => {
                 if let Err(error) = db::TaskRepo::set_review_passed_at_cas(
                     &*ctx.db,
@@ -141,13 +149,20 @@ impl HookAction for RunMerge {
                         reason: error.to_string(),
                     };
                 }
-                if let Err(error) =
-                    persist_merge_error(ctx, &task, api_types::FailureKind::MergeConflict, &details)
-                        .await
+                match persist_merge_error(
+                    ctx,
+                    &task,
+                    api_types::FailureKind::MergeConflict,
+                    &details,
+                )
+                .await
                 {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
+                    Ok(updated) => task = updated,
+                    Err(error) => {
+                        return HookResult::Failed {
+                            reason: error.to_string(),
+                        }
+                    }
                 }
                 ctx.event_bus.publish(ForgeEvent {
                     event_type: "merge.failed".to_string(),
@@ -172,13 +187,20 @@ impl HookAction for RunMerge {
                 } else {
                     format!("worktree has uncommitted changes: {}", files.join(", "))
                 };
-                if let Err(error) =
-                    persist_merge_error(ctx, &task, api_types::FailureKind::DirtyWorktree, &details)
-                        .await
+                match persist_merge_error(
+                    ctx,
+                    &task,
+                    api_types::FailureKind::DirtyWorktree,
+                    &details,
+                )
+                .await
                 {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
+                    Ok(updated) => task = updated,
+                    Err(error) => {
+                        return HookResult::Failed {
+                            reason: error.to_string(),
+                        }
+                    }
                 }
                 // The merging gate's only defined reject edge is merge_failed;
                 // cascading to review wedges the task in merging forever.
@@ -204,12 +226,13 @@ impl HookAction for RunMerge {
                         reason: error.to_string(),
                     };
                 }
-                if let Err(error) =
-                    persist_target_repo_dirty_error(ctx, &task, &details, &files).await
-                {
-                    return HookResult::Failed {
-                        reason: error.to_string(),
-                    };
+                match persist_target_repo_dirty_error(ctx, &task, &details, &files).await {
+                    Ok(updated) => task = updated,
+                    Err(error) => {
+                        return HookResult::Failed {
+                            reason: error.to_string(),
+                        }
+                    }
                 }
                 ctx.event_bus.publish(ForgeEvent {
                     event_type: "merge.failed".to_string(),

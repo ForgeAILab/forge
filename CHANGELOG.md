@@ -8,6 +8,38 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- A reviewer's verdict is no longer discarded for having a sentence in front of
+  it. The review contract asks for exactly one bare JSON object and the parser
+  took that literally — `serde_json::from_str` over the whole final message — so
+  a reviewer that led with "Evidence gathering is complete." had its entire
+  assessment thrown away as `expected value at line 1 column 1`, the Review
+  never settled, and another full reviewer run was dispatched. Observed live:
+  three reviewer runs on one Task, same commit, same findings, differing only
+  in whether the model's first character was `{`; two runs and roughly half a
+  dollar were spent to reach the verdict the first run had already produced.
+  The assessment is now recovered from the message. Two whole assessments in
+  one message stay ambiguous and are still rejected.
+- A completed reviewer execution no longer refunds the Task retry budget it
+  has spent. The reviewer process exiting cleanly says nothing about whether
+  its verdict was usable, but the completion path cleared
+  `execution_retry_count` regardless, so the counter was reset to zero and set
+  back to one on every attempt: `attempt > budget` could never trip and a
+  reviewer whose assessment would not parse was re-dispatched without bound.
+  A verdict that does settle leaves `review`, and that state change clears the
+  budget as before. The existing bounded-retry tests seed the counter directly
+  and drive the cascade, so none of them covered this reset.
+- A merge conflict no longer wedges a Task silently. The conflict path took
+  two compare-and-sets from one Task snapshot, so the second always failed as
+  a version conflict — and `run_merge` is not a blocking hook, so that failure
+  was swallowed: the Task sat in `merging` with no blocker, no annotation and
+  no follow-up, forever. Integration now carries the version each write left
+  behind, and a conflict parks the worktree visibly, with
+  `manual_workspace_repair` and the `retry_hook` recovery action the design
+  intended.
+- `POST /api/v1/tasks` returns the Task as its default role assignments left
+  it. Creation committed those assignments after snapshotting the response,
+  so the version a client got back was already stale and its next optimistic
+  write failed with `409 version_conflict`.
 - Interactive executions can start again. Admission required every execution
   to pin the Project's workflow definition, but an interactive execution is
   the user reaching into the workspace directly and the workflow never chose
@@ -31,6 +63,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   The git error is classified as potentially transient, so the dispatcher
   retried a permanently missing repository on every scan instead of parking
   the Task with the reason.
+- The api integration suite is green again. Its fixtures pinned
+  `forge.project.orchestration/v1@15` while migration V137 published `@16`,
+  so every Charter approval failed as `project_agent_selection_conflict`;
+  they now read the revision the server offers. The three cases that asserted
+  the managed merge-fix follow-up for a real conflict are removed: that flow
+  was deliberately replaced by manual-repair parking, which
+  `follow_up_merge_conflict` now covers. The merge-fix retry budget, which is
+  still live for non-conflict integration failures, has no end-to-end
+  coverage as a result.
 - `frozen pricing selection violates semantic invariants` now names the
   invariant it violated. Eleven distinct checks shared one opaque message,
   which said nothing about which provenance field was wrong.

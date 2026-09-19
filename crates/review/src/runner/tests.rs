@@ -906,7 +906,9 @@ async fn shell_governing_context_is_data_and_preserves_the_command() {
         .unwrap();
     let prompt = crate::contract::prepare_prompt(
         &seed.db,
-        "worker",
+        // The governing context is resolved through the execution being
+        // prepared, so this has to be the Task's real executor attempt.
+        &seed.executor_execution_id.to_string(),
         &seed.task_id.to_string(),
         seed.workspace.path(),
         false,

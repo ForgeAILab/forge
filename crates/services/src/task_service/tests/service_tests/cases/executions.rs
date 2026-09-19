@@ -314,6 +314,98 @@ async fn finalized_completion_does_not_run_repository_fsmonitor_diagnostic() {
 }
 
 #[tokio::test]
+async fn completed_reviewer_execution_keeps_the_task_retry_budget_it_has_spent() {
+    // A reviewer process exiting cleanly says nothing about whether its verdict
+    // was usable. Clearing the retry budget on that completion reset the counter
+    // on every attempt, so `attempt > budget` never tripped and a reviewer whose
+    // assessment could not be parsed was re-dispatched without bound. The
+    // sibling bounded-retry tests pre-seed `execution_retry_count` and drive the
+    // cascade directly, so none of them covered this reset.
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(16));
+    let service = TaskService::new(Arc::clone(&db), event_bus);
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let agent_id = seed_agent(&db).await;
+    let task = service
+        .create_task(
+            project_id,
+            "Reviewer completes without a usable verdict",
+            Some("review the current worktree".to_owned()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("task creates");
+    let claimed = service
+        .claim_task(task.id.clone(), Assignee::Agent(agent_id), None)
+        .await
+        .expect("task claims");
+    sqlx::query("UPDATE execution SET role = 'reviewer' WHERE id = ?")
+        .bind(&claimed.execution.id)
+        .execute(db.pool())
+        .await
+        .expect("execution becomes reviewer-scoped");
+    seed_role_assignment(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::REVIEWER,
+        claimed.execution.agent_id.as_deref(),
+    )
+    .await;
+    sqlx::query(
+        "UPDATE task SET status = 'review', metadata_json = ?, version = version + 1 WHERE id = ?",
+    )
+    .bind(r#"{"execution_retry_count":2}"#)
+    .bind(&task.id)
+    .execute(db.pool())
+    .await
+    .expect("task enters review carrying spent budget");
+    let now = now_rfc3339();
+    ReviewRepo::create(
+        &*db,
+        db::CreateReview {
+            id: new_uuid_v4(),
+            task_id: task.id.clone(),
+            execution_id: claimed.execution.id.clone(),
+            attempt_number: 1,
+            status: ReviewStatus::Running,
+            step_results_json: json!({ "ci_steps": [] }).to_string(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("running review binds the reviewer attempt");
+
+    let updated = service
+        .run_execution(claimed.execution.id.clone(), &NoDiffExecutor)
+        .await
+        .expect("reviewer execution completes");
+    assert_eq!(updated.status, ExecutionStatus::Completed);
+    assert_eq!(updated.role, crate::workflow::default_roles::REVIEWER);
+
+    let task_after = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .expect("task reloads")
+        .expect("task exists");
+    let metadata: serde_json::Value =
+        serde_json::from_str(task_after.metadata_json.as_deref().unwrap_or("{}"))
+            .expect("task metadata parses");
+    assert_eq!(
+        metadata
+            .get("execution_retry_count")
+            .and_then(|v| v.as_u64()),
+        Some(2),
+        "a completed reviewer must not refund the retry budget it has already spent: {metadata}"
+    );
+}
+
+#[tokio::test]
 async fn reviewer_provider_unavailability_defers_without_consuming_task_retry_budget() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));

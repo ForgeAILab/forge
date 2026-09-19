@@ -947,6 +947,82 @@ pub async fn prepare_prompt(
     Ok(prompt)
 }
 
+/// Recover the one JSON assessment object from a reviewer's final message.
+///
+/// The contract asks for exactly one bare JSON object, but models routinely
+/// lead with a sentence of narration ("Evidence gathering is complete...") or
+/// wrap the object in a markdown fence. The verdict itself is still the exact
+/// object that was asked for, so recovering it keeps a complete, well-formed
+/// review instead of discarding it and re-running the reviewer from scratch.
+///
+/// Returns the single longest balanced top-level `{...}` span, which is the
+/// assessment: any incidental object quoted in prose is far smaller. A tie for
+/// longest is ambiguous — two whole assessments in one message must not be
+/// silently resolved in favour of either — and falls back, as does a message
+/// with no object at all, so callers still report a parse error against what
+/// the reviewer actually said.
+pub fn extract_assessment_json(message: &str) -> &str {
+    let trimmed = message.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return trimmed;
+    }
+    longest_balanced_object(trimmed).unwrap_or(trimmed)
+}
+
+fn longest_balanced_object(message: &str) -> Option<&str> {
+    let bytes = message.as_bytes();
+    let mut best: Option<(usize, usize)> = None;
+    let mut best_is_tied = false;
+    let mut start: Option<usize> = None;
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' => {
+                if depth == 0 {
+                    start = Some(index);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    if let Some(open) = start.take() {
+                        let span = (open, index + 1);
+                        let width = span.1 - span.0;
+                        match best {
+                            Some((bo, bc)) if width > bc - bo => {
+                                best = Some(span);
+                                best_is_tied = false;
+                            }
+                            Some((bo, bc)) if width == bc - bo => best_is_tied = true,
+                            Some(_) => {}
+                            None => best = Some(span),
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if best_is_tied {
+        return None;
+    }
+    best.map(|(open, close)| &message[open..close])
+}
+
 pub fn parse_assessment(
     message: &str,
     contract: &ReviewContract,
@@ -954,7 +1030,7 @@ pub fn parse_assessment(
     if message.len() > MAX_REPORT_BYTES {
         return Err("review report exceeds size budget".into());
     }
-    let report: ReviewAssessment = serde_json::from_str(message.trim())
+    let report: ReviewAssessment = serde_json::from_str(extract_assessment_json(message))
         .map_err(|e| format!("review must return one structured JSON assessment: {e}"))?;
     if report.contract_digest != contract.digest {
         return Err("review contract digest mismatch".into());
@@ -1540,6 +1616,22 @@ mod tests {
         let issues = assessment_coverage_issues(&partial, &c);
         assert_eq!(issues.len(), 1);
         assert!(issues[0].contains("review omitted 1 governing requirement"));
+        // A reviewer that narrates before the required object still delivered
+        // a complete assessment; re-running the whole review instead is pure
+        // waste. Two whole assessments stay ambiguous (asserted below).
+        assert!(parse_assessment(
+            &format!(
+                "Evidence gathering is complete. Analysis summary before the verdict:\n\n{}",
+                serde_json::to_string(&good).unwrap()
+            ),
+            &c
+        )
+        .is_ok());
+        assert!(parse_assessment(
+            &format!("```json\n{}\n```", serde_json::to_string(&good).unwrap()),
+            &c
+        )
+        .is_ok());
         assert!(parse_assessment("===REVIEW: PASS===", &c).is_err());
         assert!(parse_assessment(
             &format!(
