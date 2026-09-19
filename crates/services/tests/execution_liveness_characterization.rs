@@ -10,9 +10,10 @@ use std::sync::Arc;
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
     ClaimExecutionLease, CreateAgent, CreateExecution, CreateProject, CreateRepo, CreateTask,
-    CreateWorkspaceLease, ExecutionLeaseDisposition, ExecutionLeaseMutation, ExecutionRepo,
-    ExecutionStatus, ExecutionTerminalOutcome, ProjectRepo, RepoRepo, SqliteDb, TaskRepo,
-    TerminalizeExecution, WorkMode, WorkspaceLeaseRepo,
+    CreateWorkspace, CreateWorkspaceLease, ExecutionLeaseDisposition, ExecutionLeaseMutation,
+    ExecutionRepo, ExecutionStatus, ExecutionTerminalOutcome, ProjectRepo, RepoRepo, SqliteDb,
+    TaskRepo, TerminalizeExecution, UpdateProject, WorkMode, WorkspaceLeaseRepo, WorkspaceRepo,
+    WorkspaceStatus,
 };
 
 const STALE_PROGRESS: &str = "2020-01-01T00:00:00+00:00";
@@ -81,6 +82,27 @@ async fn fixture() -> ExecutionFixture {
     )
     .await
     .expect("repository fixture creates");
+    // V138 owns repository selection at the Project: the workspace-lease guard
+    // only accepts a binding that is the Project's primary repo.
+    let project = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .expect("project reloads")
+        .expect("project exists");
+    ProjectRepo::update_at_version(
+        &*db,
+        UpdateProject {
+            id: project_id.clone(),
+            name: None,
+            settings: None,
+            primary_repo_id: Some(Some(repo_id.clone())),
+            paused_at: None,
+            updated_at: now.clone(),
+        },
+        project.version,
+        None,
+    )
+    .await
+    .expect("project adopts its primary repo");
 
     let agent_id = new_uuid_v4();
     AgentRepo::create(
@@ -140,6 +162,24 @@ async fn fixture() -> ExecutionFixture {
     .await
     .expect("task fixture creates");
 
+    let workspace_id = new_uuid_v4();
+    WorkspaceRepo::create(
+        &*db,
+        CreateWorkspace {
+            id: workspace_id.clone(),
+            task_id: task_id.clone(),
+            repo_id: repo_id.clone(),
+            worktree_path: format!("/tmp/execution-liveness/{task_id}"),
+            branch: "execution-liveness".to_owned(),
+            status: WorkspaceStatus::Ready,
+            before_sha: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("workspace fixture creates");
+
     let execution_id = new_uuid_v4();
     ExecutionRepo::create(
         &*db,
@@ -163,7 +203,7 @@ async fn fixture() -> ExecutionFixture {
             after_sha: None,
             error: None,
             executor_config_snapshot_json: None,
-            workspace_id: None,
+            workspace_id: Some(workspace_id.clone()),
             created_at: now.clone(),
             updated_at: now.clone(),
         },

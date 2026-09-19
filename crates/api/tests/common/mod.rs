@@ -737,6 +737,22 @@ fn run_git(path: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
+/// The Project operating-skill revision the server will accept in a Project
+/// Agent selection.
+///
+/// Pinning a literal revision here means every migration that publishes a new
+/// one silently invalidates these fixtures: the approval then fails with
+/// `project_agent_selection_conflict` and says nothing about why. Read the
+/// current one instead, the way a client does.
+pub async fn current_project_operating_skill_revision(harness: &Harness) -> String {
+    db::ProjectAdmissionReceiptRepo::get_current_project_operating_skill_revision(
+        &*harness.state.db,
+    )
+    .await
+    .expect("current Project operating-skill revision loads")
+    .expect("the migrations publish a current Project operating-skill revision")
+}
+
 pub struct TestDir {
     path: PathBuf,
 }

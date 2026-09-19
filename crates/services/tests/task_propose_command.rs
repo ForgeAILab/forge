@@ -740,9 +740,22 @@ async fn task_review_requirement_ids_can_be_replaced_with_validation() {
     .await
     .expect("Task proposal succeeds")
     .task;
-    TaskRepo::set_review_passed_at(&*fixture.db, &created.id, Some(NOW.to_owned()), NOW)
+    // Creation now commits the Project's default role assignments, so the Task's
+    // `updated_at` is past the fixture's frozen NOW and the snapshot-free
+    // boundary's monotonic guard rejects it. Seed against what the Task
+    // actually carries.
+    let seeded = TaskRepo::get_by_id(&*fixture.db, &created.id, false)
         .await
-        .expect("seed prior acceptance");
+        .expect("task reloads")
+        .expect("task exists");
+    TaskRepo::set_review_passed_at(
+        &*fixture.db,
+        &created.id,
+        Some(NOW.to_owned()),
+        &seeded.updated_at,
+    )
+    .await
+    .expect("seed prior acceptance");
 
     let updated = fixture
         .task_service

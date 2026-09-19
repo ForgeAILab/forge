@@ -32,7 +32,7 @@ use tower::ServiceExt;
 const EXECUTOR_SESSION_ID: &str = "33333333-3333-4333-8333-333333333333";
 
 #[tokio::test]
-async fn merge_conflict_dispatches_follow_up_executor() {
+async fn merge_conflict_parks_the_worktree_for_manual_repair() {
     let repo_dir = common::TestDir::new("forge-merge-conflict-repo");
     let repo_path = setup_git_repo(repo_dir.path());
 
@@ -100,46 +100,13 @@ async fn merge_conflict_dispatches_follow_up_executor() {
         .transition(task_id.clone(), "merging".to_owned(), seeded_task.version)
         .await
         .expect("merge transition runs");
-    assert_eq!(transition.task.status, "merge_failed".to_owned());
-
-    let executions = poll_until_role_follow_up(&harness.app, &task_id, "coder").await;
-    let follow_up_execution = executions
-        .iter()
-        .find(|execution| {
-            execution.role == "coder"
-                && execution
-                    .executor_config_snapshot
-                    .as_ref()
-                    .and_then(|snapshot| snapshot["config"]["resume_thread_id"].as_str())
-                    == Some(EXECUTOR_SESSION_ID)
-        })
-        .expect("coder follow-up execution with resume_thread_id exists");
-    let follow_up_snapshot = follow_up_execution
-        .executor_config_snapshot
-        .as_ref()
-        .expect("coder follow-up records config snapshot");
-    assert_eq!(follow_up_snapshot["config"]["resume_thread_in_place"], true);
-    assert!(
-        follow_up_snapshot["config"]
-            .get("resume_fallback_prompt")
-            .is_none(),
-        "execution follow-up must not carry a reconstructed fallback prompt"
-    );
-    let follow_up_prompt = follow_up_execution.summary.as_deref().unwrap_or_default();
-    assert!(
-        follow_up_prompt.contains("merge failed due to conflicts"),
-        "follow-up prompt missing CI-only directive: {follow_up_prompt}"
-    );
-    assert!(
-        follow_up_prompt.contains("reviewer will not re-review"),
-        "follow-up prompt missing auditor skip directive: {follow_up_prompt}"
-    );
-    assert!(
-        !follow_up_prompt.contains("Implementation objective:")
-            && !follow_up_prompt.contains("Task: Merge conflict task")
-            && !follow_up_prompt.contains("resolve a conflicting change"),
-        "merge follow-up prompt should not rebuild the initial coder prompt: {follow_up_prompt}"
-    );
+    // A real conflict is not managed work: a coder agent cannot rebase or
+    // write linked git metadata, so integration parks the worktree for a
+    // human instead of dispatching a follow-up it cannot complete. What the
+    // Task must never do is sit in `merging` with nothing recorded, which is
+    // what a swallowed version conflict in the merge bookkeeping used to
+    // leave behind.
+    assert_eq!(transition.task.status, "merging".to_owned());
 
     let task: api_types::TaskResponse = empty_request(
         &harness.app,
@@ -148,10 +115,41 @@ async fn merge_conflict_dispatches_follow_up_executor() {
         StatusCode::OK,
     )
     .await;
-    assert_eq!(task.status, "merge_failed".to_owned());
+    assert_eq!(task.status, "merging".to_owned());
+    let blocked = task
+        .blocked
+        .as_ref()
+        .expect("merge conflict blocks the Task");
+    assert_eq!(blocked.kind, Some(api_types::FailureKind::MergeConflict));
     assert!(
-        task.error_annotation.is_none(),
-        "merge conflict annotation should clear once auto-fix work resumes"
+        blocked
+            .reason
+            .contains("manual task-worktree repair is required"),
+        "the blocker must say what the human has to do: {}",
+        blocked.reason
+    );
+    let annotation = match task
+        .error_annotation
+        .as_ref()
+        .expect("merge conflict records an error annotation")
+    {
+        api_types::TaskAnnotation::Blocking(annotation) => annotation,
+        other => panic!("expected a blocking annotation, got {other:?}"),
+    };
+    assert_eq!(
+        annotation.annotation_type,
+        api_types::FailureKind::MergeConflict
+    );
+    assert_eq!(
+        annotation.blocked_by.as_deref(),
+        Some("manual_workspace_repair")
+    );
+    assert!(
+        annotation
+            .recovery_actions
+            .contains(&api_types::RecoveryAction::RetryHook),
+        "a repaired worktree has to be retryable: {:?}",
+        annotation.recovery_actions
     );
 
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -169,55 +167,26 @@ async fn merge_conflict_dispatches_follow_up_executor() {
         .collect::<Vec<_>>();
     assert_eq!(
         coder_executions.len(),
-        2,
-        "merge conflict creates a follow-up coder execution with session continuity"
+        1,
+        "a parked conflict must not dispatch a follow-up coder"
     );
 
     let events = drain_events(&mut events_rx).await;
-    let follow_up_events = events
-        .iter()
-        .filter(|event| {
-            matches!(
-                &event.context,
-                EventContext::FollowUpDispatched { task_id: event_task_id, trigger, .. }
-                    if event_task_id == &task_id && trigger == "merge_failed"
-            )
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        follow_up_events.len(),
-        1,
-        "merge conflicts should dispatch one follow-up execution; got {events:?}"
-    );
-    let initial_coder = executions
-        .iter()
-        .find(|execution| execution.role == "coder" && execution.parent_execution_id.is_none())
-        .expect("initial coder execution exists");
-    match &follow_up_events[0].context {
-        EventContext::FollowUpDispatched {
-            parent_execution_id,
-            execution_id,
-            ..
-        } => {
-            assert_eq!(parent_execution_id, &initial_coder.id);
-            assert_ne!(
-                execution_id, parent_execution_id,
-                "follow-up creates a new execution"
-            );
-        }
-        other => panic!("unexpected follow-up event context: {other:?}"),
-    }
-
-    let transition_logs = db::TransitionLogRepo::list_by_task(&*harness.state.db, &task_id)
-        .await
-        .expect("transition logs load");
-    let merge_failed_log = transition_logs
-        .iter()
-        .find(|entry| entry.from_state == "merging" && entry.to_state == "merge_failed")
-        .expect("missing merging -> merge_failed transition log");
     assert!(
-        merge_failed_log.rejection,
-        "merging -> merge_failed transition log should count as the merge gate rejection"
+        events.iter().any(|event| matches!(
+            &event.context,
+            EventContext::MergeFailed { task_id: event_task_id, .. }
+                if event_task_id == &task_id
+        )),
+        "the parked conflict is announced: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            &event.context,
+            EventContext::FollowUpDispatched { task_id: event_task_id, .. }
+                if event_task_id == &task_id
+        )),
+        "no follow-up is dispatched for a conflict a managed agent cannot fix: {events:?}"
     );
 }
 

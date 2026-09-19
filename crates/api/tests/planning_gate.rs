@@ -55,6 +55,17 @@ async fn entering_planning_dispatches_assigned_planner_role() {
     )
     .await;
 
+    // Assigning the planner advanced the Task version.
+    let task: TaskResponse = json_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", task.id),
+        &admin_jwt(),
+        Value::Null,
+        StatusCode::OK,
+    )
+    .await;
+
     let mut rx = harness.event_bus.subscribe();
     let moved: TransitionTaskResponse = json_request_with_bearer(
         &harness.app,
