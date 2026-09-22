@@ -63,6 +63,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+
+
+- A Codex Task can run more than once. Codex writes a `plugins` directory into
+  its managed home while it runs, and that directory was on Forge's
+  fail-closed list of configuration inputs — so the first execution in a
+  Task's log directory always succeeded and every later one died
+  deterministically with `managed Codex home contains forbidden configuration
+  input`. Every re-review, and every retry after a review, was therefore
+  unreachable: observed as three identical reviewer failures on a Task whose
+  first reviewer attempt had completed normally. `plugins` is now discarded
+  before each execution like `config.toml` and `skills`. `AGENTS.md` and
+  `hooks.json`, which Codex never writes, stay fail-closed — a repository or a
+  user planting one is the case that guard exists for.
 - A fetched web page is no longer returned empty (agent-runtime `65a3970`).
   `meta` and `link` are content-skipping tags and also HTML void elements, so
   the converter counted each `<meta charset="utf-8">` as an opening tag and
