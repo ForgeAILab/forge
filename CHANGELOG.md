@@ -63,7 +63,36 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Recovering a Task parked in `review` opens a new review attempt instead of
+  failing forever. A reviewer execution durably binds the current Review row
+  and that binding only accepts an attempt still in `running`; entering
+  `review` opens one through the transition hooks, but `task.recover`
+  `reexecute` re-runs inside the state, where no hook runs. So once a reviewer
+  execution died and settled its attempt — the ordinary shape after any
+  executor failure — every recovery attempt was rejected as a bare
+  `version_conflict`, with `cancel_task` the only other advertised action.
+  Recovery now applies the rule dispatch already used: reuse a live attempt,
+  otherwise open one for the current implementation candidate, carrying the
+  replaced attempt's pre-review check results across (and only those, never
+  its verdict) so the reviewer has the results it cannot start without.
+  An attempt awaiting human approval is left alone and says so, rather than
+  silently discarding the gate. Both re-execute paths — recovery from a
+  blocked execution and re-execute in the current state — go through the same
+  rule.
 
+- Re-executing a Task follows a reassigned role principal instead of failing.
+  `POST /api/v1/tasks/{id}/recover` with `reexecute` carried the parent
+  execution's Agent over, but the execution INSERT compares the launched Agent
+  against the current `task_role_assignment` row — so once a role had been
+  pointed at a different Agent, every recovery attempt failed the assignment
+  CAS and returned a bare `version_conflict` with nothing naming the mismatch.
+  That made recovery impossible in exactly the case it exists for: swapping a
+  broken principal for a working one. Observed on two Tasks parked in `review`
+  after their Codex reviewer broke, where each attempt also churned the Task
+  version by two (clear, then restore) while never launching. The launcher now
+  reads the assignment, the same way follow-up dispatch already did;
+  `interactive` (no assignment) and `auditor` (a separately selected Agent
+  beneath the reviewer's assignment) keep the parent principal.
 
 - A Codex Task can run more than once. Codex writes a `plugins` directory into
   its managed home while it runs, and that directory was on Forge's

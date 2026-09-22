@@ -655,12 +655,34 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &parent_execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", parent_execution.task_id.clone()))?;
-        let agent_id = parent_execution.agent_id.clone().ok_or_else(|| {
-            ServiceError::invalid_operation(format!(
-                "parent execution {} missing agent_id",
-                parent_execution.id
-            ))
-        })?;
+        // The role assignment owns the execution principal: the INSERT
+        // transaction compares the launched Agent against that row. Carrying
+        // the parent execution's Agent over made re-execute fail as a bare
+        // version conflict once the role had been reassigned -- exactly the
+        // case recovery exists for. An `auditor` runs under a separately
+        // selected Agent beneath the reviewer's assignment and an
+        // `interactive` execution owes no assignment, so both keep the parent
+        // principal.
+        let assignment_role = match parent_execution.role.as_str() {
+            crate::workflow::default_roles::INTERACTIVE | "auditor" => None,
+            "executor" => Some(crate::workflow::default_roles::CODER),
+            role => Some(role),
+        };
+        let assigned_agent_id = match assignment_role {
+            Some(role) => {
+                super::follow_up::assigned_agent_for_role(self, &parent_execution.task_id, role)
+                    .await?
+            }
+            None => None,
+        };
+        let agent_id = assigned_agent_id
+            .or_else(|| parent_execution.agent_id.clone())
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(format!(
+                    "parent execution {} missing agent_id",
+                    parent_execution.id
+                ))
+            })?;
         let agent = AgentRepo::get_by_id(&*self.db, &agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
@@ -731,6 +753,26 @@ impl TaskService {
         } else {
             task
         };
+        // A reviewer execution binds the current Review attempt, which only
+        // accepts an attempt still Running. Re-executing happens inside
+        // `review`, where the transition hooks that open an attempt never
+        // run, so a settled attempt has to be replaced here or the execution
+        // INSERT rejects the launch as a bare version conflict. This must
+        // precede the dispatch context, which snapshots the attempt.
+        if parent_execution.role == crate::workflow::default_roles::REVIEWER {
+            if let Err(error) = self.ensure_review_attempt_for_recovery(&task, &project).await {
+                if let Some(original) = original_recovery_task.as_ref() {
+                    self.restore_recovery_metadata_after_failed_resume(
+                        &task,
+                        original,
+                        None,
+                        &parent_execution.role,
+                    )
+                    .await;
+                }
+                return Err(error);
+            }
+        }
         let mut admission = match crate::task_service::execution_admission_for_task(
             &self.db,
             &task,
